@@ -30,8 +30,10 @@ Approved by the owner: "Approve, merge when green". Same merge rules as the over
 | Part | Content | Agent | Branch | State |
 |---|---|---|---|---|
 | A | Scale estimate ignores keys that vanish between `SCAN` and the per-key lookups (counts come out low); live partial results in the Patterns view | implementer [opus] | `wave6/scan` (worktree `.claude/worktrees/w6-scan`) | in progress |
-| B | Redis 6.2 in the integration job; TLS replica-scan test on Redis and Valkey | implementer [sonnet] | `wave6/tests` (worktree `.claude/worktrees/w6-tests`) | in progress |
+| B | Redis 6.2 in the integration job, as a new CI job (existing required check names unchanged) | implementer [sonnet] | `wave6/tests` (worktree `.claude/worktrees/w6-tests`) | in progress |
 | V | Verifier on the merged `wave6/fixes` | verifier [opus] | pinned detached worktree | pending |
+
+**TLS replica test: blocked, waiting on the owner.** `src/conn/mod.rs:119` builds TLS connections with `tls_params: None` on redis-rs's `tls-rustls-webpki-roots`, so only public CAs are trusted and a test with a throwaway CA can't connect. This is also a product gap: a server behind a private or corporate CA can't be reached. It needs a decision (OS trust store, or a per-profile CA file) before a test can be written.
 
 Integration branch: `wave6/fixes` (worktree `.claude/worktrees/wave6`). Out of scope: Entra ID against real Azure and managed identity (needs Azure; feature idea 10), and the `--prefer-replica` trust boundary (a documented design trade-off).
 
