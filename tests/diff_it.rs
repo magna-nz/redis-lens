@@ -40,6 +40,7 @@ fn temp_config(port: u16) -> PathBuf {
         db: 0,
         auth: Auth::None,
         read_only: None,
+        prefer_replica: false,
     };
     let path = temp_dir("diff-it-config").join("config.toml");
     Config {

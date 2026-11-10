@@ -26,6 +26,7 @@ fn profile(name: &str, port: u16, auth: Auth) -> Profile {
         db: 0,
         auth,
         read_only: None,
+        prefer_replica: false,
     }
 }
 
@@ -301,6 +302,7 @@ async fn conn_add_keeps_credentials_out_of_the_config_file() {
         ask_password: false,
         entra: false,
         force: false,
+        prefer_replica: false,
     };
     let msg = cli_conn::add(&path, &secrets, &args, Some("uniq-pw-4242\n".into()))
         .await

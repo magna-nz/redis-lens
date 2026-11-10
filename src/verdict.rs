@@ -39,7 +39,7 @@ impl TtlVerdict {
 
 /// Judge one pattern. `change` is its entry in a diff against the previous snapshot,
 /// if one exists. "Growing" means `delta_bytes` > max(1 MiB, 5% of before), or, without
-/// sizes, `delta_keys` > 5% of the keys before; `Cause::New` with no TTL also counts.
+/// sizes, `delta_keys` > 5% of the keys before; `Cause::New` with no TTL also counts, unless either scan was partial: then it must pass the same threshold.
 /// `Cause::Unknown` (the other scan didn't look at these keys) never counts as growing.
 pub fn ttl_verdict(stats: &PatternStats, change: Option<&PatternDiff>) -> TtlVerdict {
     let ratio = stats.no_ttl_ratio();
@@ -70,7 +70,9 @@ fn short_lived(stats: &PatternStats) -> bool {
 fn is_growing(change: Option<&PatternDiff>) -> bool {
     let Some(c) = change else { return false };
     match c.cause {
-        Cause::New => return true,
+        // After a partial scan "new" may only mean "not sampled before", so it has to
+        // pass the size test below like any other change.
+        Cause::New if !c.partial => return true,
         Cause::Unknown => return false,
         _ => {}
     }
@@ -218,6 +220,7 @@ mod tests {
             delta_bytes: delta,
             delta_keys: dkeys,
             cause,
+            partial: false,
         }
     }
 
@@ -294,6 +297,40 @@ mod tests {
             explain(&persistent(), Some(&new))
                 .join(" ")
                 .contains("new since the last snapshot")
+        );
+    }
+
+    #[test]
+    fn new_after_a_partial_scan_must_pass_the_threshold() {
+        let new = |delta: i64, partial: bool| {
+            let mut c = change(Cause::New, None, Some(delta), 100);
+            c.keys_before = None;
+            c.partial = partial;
+            c
+        };
+        let small = new(500 * 1024, true);
+        assert_eq!(
+            ttl_verdict(&persistent(), Some(&small)),
+            TtlVerdict::PersistentStable
+        );
+        let big = new(2 * MB as i64, true);
+        assert_eq!(
+            ttl_verdict(&persistent(), Some(&big)),
+            TtlVerdict::PersistentGrowing
+        );
+        // Both scans complete: a new pattern is growing whatever its size.
+        let complete = new(500 * 1024, false);
+        assert_eq!(
+            ttl_verdict(&persistent(), Some(&complete)),
+            TtlVerdict::PersistentGrowing
+        );
+        // Without sizes the key count decides.
+        let mut no_keys = new(0, true);
+        no_keys.delta_bytes = None;
+        no_keys.delta_keys = 0;
+        assert_eq!(
+            ttl_verdict(&persistent(), Some(&no_keys)),
+            TtlVerdict::PersistentStable
         );
     }
 

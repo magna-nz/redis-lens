@@ -266,7 +266,7 @@ pub enum Auth {
     None,
     /// Username and password, both stored in the OS keychain under [`Profile::secret_ref`].
     Keychain,
-    /// Microsoft Entra ID through `DefaultAzureCredential`. Needs the `entra-id` feature.
+    /// Microsoft Entra ID through the redis-rs developer-tools credential chain (az login and similar). Needs the `entra-id` feature.
     EntraId,
 }
 
@@ -287,6 +287,9 @@ pub struct Profile {
     /// Force read-only on or off. `None` means read-only exactly when `env` is `Prod`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    /// Scan a replica of this server instead of the primary, when one is reachable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefer_replica: bool,
 }
 
 /// Service name for every keychain entry this tool creates.
@@ -417,6 +420,7 @@ mod tests {
             db: 0,
             auth: Auth::None,
             read_only: None,
+            prefer_replica: false,
         };
         assert!(p.is_read_only());
         p.env = Env::Local;
@@ -449,6 +453,7 @@ mod tests {
             db: 0,
             auth: Auth::Keychain,
             read_only: None,
+            prefer_replica: false,
         };
         let text = toml::to_string(&p).unwrap();
         for word in ["password", "username", "user", "secret", "token"] {

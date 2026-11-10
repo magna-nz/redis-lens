@@ -30,6 +30,7 @@ fn profile(name: &str, env: Env, host: &str, port: u16, tls: bool, auth: Auth) -
         db: 0,
         auth,
         read_only: None,
+        prefer_replica: false,
     }
 }
 

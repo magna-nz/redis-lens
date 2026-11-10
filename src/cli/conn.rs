@@ -98,6 +98,10 @@ fn trim_newline(s: &str) -> &str {
     s.strip_suffix('\r').unwrap_or(s)
 }
 
+/// Profile names starting with this are reserved: the TUI snapshots Docker containers
+/// under `docker:<container>`.
+pub const DOCKER_PREFIX: &str = "docker:";
+
 /// Save a connection. `stdin_password` is everything read from standard input when
 /// `--password-stdin` was given. Returns the line to print.
 pub async fn add(
@@ -106,6 +110,9 @@ pub async fn add(
     args: &ConnAddArgs,
     stdin_password: Option<String>,
 ) -> anyhow::Result<String> {
+    if args.name.starts_with(DOCKER_PREFIX) {
+        bail!("names starting with {DOCKER_PREFIX} are reserved for discovered containers");
+    }
     let parsed = parse_connection_string(&args.url)?;
     let mut config = Config::load(path)?;
     let existing = config.get(&args.name).cloned();
@@ -168,6 +175,7 @@ pub async fn add(
         db: parsed.db,
         auth,
         read_only: None,
+        prefer_replica: args.prefer_replica,
     };
 
     let r = profile.secret_ref();
@@ -354,7 +362,44 @@ mod tests {
             ask_password: false,
             entra: false,
             force: false,
+            prefer_replica: false,
         }
+    }
+
+    #[tokio::test]
+    async fn add_rejects_the_docker_prefix() {
+        let path = temp_path("docker-prefix");
+        let store = MemoryStore::default();
+        let e = add(
+            &path,
+            &store,
+            &args("docker:cache", "redis://localhost"),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "names starting with docker: are reserved for discovered containers"
+        );
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn add_prefer_replica_is_saved_only_when_set() {
+        let path = temp_path("replica");
+        let store = MemoryStore::default();
+        let mut a = args("r", "redis://localhost:6390");
+        a.prefer_replica = true;
+        add(&path, &store, &a, None).await.unwrap();
+        add(&path, &store, &args("n", "redis://localhost:6391"), None)
+            .await
+            .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.get("r").unwrap().prefer_replica);
+        assert!(!cfg.get("n").unwrap().prefer_replica);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("prefer_replica").count(), 1, "{text}");
     }
 
     #[tokio::test]
@@ -603,6 +648,7 @@ mod tests {
                 db: 0,
                 auth: Auth::Keychain,
                 read_only: None,
+                prefer_replica: false,
             },
             credentials: Some(Credentials {
                 username: None,

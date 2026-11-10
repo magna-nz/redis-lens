@@ -54,6 +54,9 @@ pub struct PatternDiff {
     pub delta_bytes: Option<i64>,
     pub delta_keys: i64,
     pub cause: Cause,
+    /// At least one of the two scans did not see the whole keyspace, so a `New` pattern
+    /// may only be one the older scan missed.
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -84,6 +87,7 @@ pub fn sub(a: u64, b: u64) -> i64 {
 /// keyspace or used the same `MATCH` glob; otherwise it is `Unknown`.
 pub fn diff(before: &ScanReport, after: &ScanReport) -> ReportDiff {
     let sizes = before.sizes_available && after.sizes_available;
+    let partial = !(before.complete && after.complete);
     let comparable = (before.complete && after.complete) || before.match_glob == after.match_glob;
     let mut names: Vec<&str> = before
         .patterns
@@ -99,7 +103,7 @@ pub fn diff(before: &ScanReport, after: &ScanReport) -> ReportDiff {
         .map(|name| {
             let b = before.patterns.iter().find(|p| p.pattern == name);
             let a = after.patterns.iter().find(|p| p.pattern == name);
-            pattern_diff(name, b, a, sizes, comparable)
+            pattern_diff(name, b, a, sizes, comparable, partial)
         })
         .collect();
     let magnitude = |p: &PatternDiff| match p.delta_bytes {
@@ -126,6 +130,7 @@ fn pattern_diff(
     a: Option<&PatternStats>,
     sizes: bool,
     comparable: bool,
+    partial: bool,
 ) -> PatternDiff {
     let keys_before = b.map(|p| p.est_keys);
     let keys_after = a.map(|p| p.est_keys);
@@ -163,6 +168,7 @@ fn pattern_diff(
         delta_bytes,
         delta_keys,
         cause,
+        partial,
     }
 }
 
@@ -267,6 +273,18 @@ mod tests {
     fn one(before: PatternStats, after: PatternStats, sizes: bool) -> PatternDiff {
         let d = diff(&report(vec![before], sizes), &report(vec![after], sizes));
         d.patterns[0].clone()
+    }
+
+    #[test]
+    fn partial_flag_follows_completeness() {
+        let mk = |complete: bool| {
+            let mut r = report(vec![stats("a", 1, Some(1))], true);
+            r.complete = complete;
+            r
+        };
+        assert!(diff(&mk(true), &mk(false)).patterns[0].partial);
+        assert!(diff(&mk(false), &mk(true)).patterns[0].partial);
+        assert!(!diff(&mk(true), &mk(true)).patterns[0].partial);
     }
 
     #[test]

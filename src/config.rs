@@ -157,6 +157,7 @@ mod tests {
             db: 2,
             auth: Auth::Keychain,
             read_only: Some(true),
+            prefer_replica: false,
         }
     }
 

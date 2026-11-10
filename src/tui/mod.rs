@@ -128,7 +128,7 @@ async fn event_loop(
                 Some(Incoming::Msg(m)) => pending = app.apply(m),
                 None => return Ok(()),
             },
-            _ = tick.tick() => pending = app.apply(Msg::Tick),
+            _ = tick.tick() => pending = app.apply(Msg::TickAt(std::time::Instant::now())),
         }
     }
 }
@@ -268,7 +268,7 @@ fn scrub(text: String, secret: Option<&str>) -> String {
 
 /// Prefix of the report (and so snapshot) name of a Docker container, so a container
 /// called `cache` never shares history with a saved profile called `cache`.
-const DOCKER_PREFIX: &str = "docker:";
+const DOCKER_PREFIX: &str = crate::cli::conn::DOCKER_PREFIX;
 
 /// The name a scan of `profile` is reported and snapshotted under: the profile name for
 /// saved profiles, `docker:<container>` for containers found in Docker.
@@ -297,7 +297,7 @@ async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, t
     };
     let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
 
-    let mut c = match conn::connect(&profile, store.as_ref()).await {
+    let (mut c, target) = match conn::connect_for_scan(&profile, store.as_ref()).await {
         Ok(c) => c,
         Err(e) => {
             send(
@@ -318,6 +318,7 @@ async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, t
             id,
             server,
             perms: perms.clone(),
+            target,
         },
     ) {
         return;
@@ -386,6 +387,7 @@ mod tests {
             db: 0,
             auth: Auth::Keychain,
             read_only: None,
+            prefer_replica: false,
         }
     }
 

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::DiffArgs;
-use super::scan::{scan_profile, truncate, with_progress};
+use super::scan::{scan_profile_with_target, target_line, truncate, with_progress};
 use crate::config::Config;
 use crate::diff::{self, Cause, PatternDiff, ReportDiff};
 use crate::format;
@@ -41,13 +41,14 @@ pub async fn diff_profile(
     let against = match &args.against {
         Some(path) => Some(snapshot::load(path)?),
         None => {
-            if snapshot::list(dir, &args.profile)?.is_empty() {
+            // The scan uses no MATCH glob, so only a baseline with none counts.
+            if snapshot::latest_before(dir, &args.profile, i64::MAX, None)?.is_none() {
                 return Err(no_snapshot(&args.profile));
             }
             None
         }
     };
-    let (new, _perms) = scan_profile(
+    let (new, _perms, target) = scan_profile_with_target(
         config_path,
         secrets,
         &args.profile,
@@ -68,6 +69,9 @@ pub async fn diff_profile(
         .ok_or_else(|| no_snapshot(&args.profile))?,
     };
     let result = diff::diff(&before, &new);
+    if let Some(line) = target_line(&target) {
+        eprintln!("{line}");
+    }
     let path = snapshot::save(dir, &new)?;
     eprintln!("Saved snapshot {}", path.display());
     Ok((result, new))
@@ -251,6 +255,7 @@ mod tests {
             delta_bytes: Some(ba.unwrap_or(0) as i64 - bb.unwrap_or(0) as i64),
             delta_keys: ka.unwrap_or(0) as i64 - kb.unwrap_or(0) as i64,
             cause,
+            partial: false,
         }
     }
 
@@ -381,6 +386,52 @@ mod tests {
         let t = render_diff(&d, 100);
         let row = t.lines().find(|l| l.starts_with("job:")).unwrap();
         assert!(row.ends_with("not in the other scan"), "{row}");
+    }
+
+    #[tokio::test]
+    async fn precheck_ignores_snapshots_taken_with_a_glob() {
+        use crate::model::{ServerFlavor, ServerInfo, ServerMode};
+        let dir = std::env::temp_dir().join(format!("redis-lens-diff-pre-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let report = ScanReport {
+            profile: "p".into(),
+            taken_at_unix: 100,
+            server: ServerInfo {
+                flavor: ServerFlavor::Redis,
+                version: "7".into(),
+                mode: ServerMode::Standalone,
+                used_memory: 1,
+                maxmemory: 0,
+                maxmemory_policy: "noeviction".into(),
+                total_keys: 0,
+            },
+            sampled_keys: 0,
+            patterns: vec![],
+            sizes_available: true,
+            hot_keys: vec![],
+            complete: false,
+            match_glob: Some("user:*".into()),
+        };
+        snapshot::save(&dir, &report).unwrap();
+        let args = DiffArgs {
+            profile: "p".into(),
+            against: None,
+            max_rate: None,
+            json: false,
+        };
+        // The config doesn't exist: if the pre-check let this through, the error would
+        // be about the config rather than the missing snapshot.
+        let err = diff_profile(
+            &dir.join("no-such-config.toml"),
+            &crate::secrets::MemoryStore::default(),
+            &args,
+            &dir,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), no_snapshot("p").to_string());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

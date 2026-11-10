@@ -11,8 +11,8 @@ use redis::{
 use secrecy::ExposeSecret;
 
 use crate::model::{
-    Auth, PERM_FREQ, PERM_INFO, PERM_LABELS, PERM_MEMORY, PERM_SCAN, PERM_TYPE_TTL, PermCheck,
-    PermStatus, PermissionReport, Profile,
+    Auth, Endpoint, PERM_FREQ, PERM_INFO, PERM_LABELS, PERM_MEMORY, PERM_SCAN, PERM_TYPE_TTL,
+    PermCheck, PermStatus, PermissionReport, Profile,
 };
 use crate::secrets::{SecretError, SecretStore};
 
@@ -50,7 +50,15 @@ pub async fn connect(
     profile: &Profile,
     secrets: &dyn SecretStore,
 ) -> Result<MultiplexedConnection, ConnError> {
-    let ep = &profile.endpoint;
+    connect_endpoint(profile, &profile.endpoint, secrets).await
+}
+
+/// [`connect`] to `ep` with the profile's credentials, TLS setting and database.
+async fn connect_endpoint(
+    profile: &Profile,
+    ep: &Endpoint,
+    secrets: &dyn SecretStore,
+) -> Result<MultiplexedConnection, ConnError> {
     let addr = if ep.tls {
         ConnectionAddr::TcpTls {
             host: ep.host.clone(),
@@ -88,6 +96,117 @@ pub async fn connect(
     Ok(client
         .get_multiplexed_async_connection_with_config(&config)
         .await?)
+}
+
+/// Which server a scan reads from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanTarget {
+    Primary,
+    /// A replica, at this endpoint. Also used when the profile already points at one.
+    Replica(Endpoint),
+    /// `prefer_replica` was set but no replica could be used; the reason is shown.
+    PrimaryFallback(String),
+}
+
+impl std::fmt::Display for ScanTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Primary => write!(f, "primary"),
+            Self::Replica(ep) => write!(f, "replica {ep}"),
+            Self::PrimaryFallback(why) => write!(f, "primary (replica unreachable: {why})"),
+        }
+    }
+}
+
+const REPLICA_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What `INFO replication` says about a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Replication {
+    /// `role:master`, with the replicas reported as `state=online`, in order.
+    Master { online: Vec<(String, u16)> },
+    /// `role:slave`.
+    Replica,
+    /// Anything else, or no role line.
+    Unknown,
+}
+
+/// Parse the text of `INFO replication` (Redis and Valkey).
+pub fn parse_replication(info: &str) -> Replication {
+    let mut role = None;
+    let mut online = Vec::new();
+    for line in info.lines() {
+        let line = line.trim();
+        if let Some(r) = line.strip_prefix("role:") {
+            role = Some(r.trim().to_string());
+        } else if let Some((key, rest)) = line.split_once(':')
+            && key
+                .strip_prefix("slave")
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            let field = |name: &str| {
+                rest.split(',')
+                    .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+            };
+            if field("state") == Some("online")
+                && let (Some(ip), Some(port)) = (field("ip"), field("port"))
+                && let Ok(port) = port.parse::<u16>()
+                && !ip.is_empty()
+            {
+                online.push((ip.to_string(), port));
+            }
+        }
+    }
+    match role.as_deref() {
+        Some("master") => Replication::Master { online },
+        Some("slave") => Replication::Replica,
+        _ => Replication::Unknown,
+    }
+}
+
+/// Connect for a scan. Connects to the primary as [`connect`] does; with
+/// `profile.prefer_replica` it then looks for an online replica and connects to the
+/// first one with the same credentials and TLS (2 s timeout). A replica that can't be
+/// used leaves the scan on the primary as `PrimaryFallback`. A profile that already
+/// points at a replica is scanned as is.
+pub async fn connect_for_scan(
+    profile: &Profile,
+    secrets: &dyn SecretStore,
+) -> Result<(MultiplexedConnection, ScanTarget), ConnError> {
+    let mut primary = connect(profile, secrets).await?;
+    if !profile.prefer_replica {
+        return Ok((primary, ScanTarget::Primary));
+    }
+    let fallback = |c, why: String| Ok((c, ScanTarget::PrimaryFallback(why)));
+    let info: Result<String, _> = redis::cmd("INFO")
+        .arg("replication")
+        .query_async(&mut primary)
+        .await;
+    let info = match info {
+        Ok(i) => i,
+        Err(e) => return fallback(primary, format!("INFO replication: {}", server_message(&e))),
+    };
+    match parse_replication(&info) {
+        Replication::Replica => Ok((primary, ScanTarget::Replica(profile.endpoint.clone()))),
+        Replication::Unknown => Ok((primary, ScanTarget::Primary)),
+        Replication::Master { online } => {
+            let Some((host, port)) = online.into_iter().next() else {
+                return fallback(primary, "no online replica".to_string());
+            };
+            let ep = Endpoint {
+                host,
+                port,
+                tls: profile.endpoint.tls,
+            };
+            match tokio::time::timeout(REPLICA_TIMEOUT, connect_endpoint(profile, &ep, secrets))
+                .await
+            {
+                Ok(Ok(c)) => Ok((c, ScanTarget::Replica(ep))),
+                Ok(Err(e)) => fallback(primary, format!("{ep}: {e}")),
+                Err(_) => fallback(primary, format!("{ep}: timed out")),
+            }
+        }
+    }
 }
 
 #[cfg(not(feature = "entra-id"))]
@@ -241,6 +360,63 @@ mod tests {
         let info = "# Memory\r\nused_memory:1\r\nmaxmemory_policy:allkeys-lfu\r\n";
         assert_eq!(policy_from_info(info).as_deref(), Some("allkeys-lfu"));
         assert_eq!(policy_from_info("# Memory\r\n"), None);
+    }
+
+    const REDIS7_MASTER: &str = "# Replication\r\nrole:master\r\nconnected_slaves:2\r\nslave0:ip=172.17.0.3,port=6379,state=online,offset=1540,lag=0\r\nslave1:ip=172.17.0.4,port=6380,state=online,offset=1540,lag=1\r\nmaster_failover_state:no-failover\r\nmaster_replid:8a5a1d0b8f0e5b4a3c9d1e2f3a4b5c6d7e8f9a0b\r\nmaster_replid2:0000000000000000000000000000000000000000\r\nmaster_repl_offset:1540\r\nsecond_repl_offset:-1\r\nrepl_backlog_active:1\r\nrepl_backlog_size:1048576\r\nrepl_backlog_first_byte_offset:1\r\nrepl_backlog_histlen:1540\r\n";
+    const VALKEY8_MASTER: &str = "# Replication\r\nrole:master\r\nconnected_slaves:1\r\nslave0:ip=10.0.1.21,port=6379,state=online,offset=98,lag=0\r\nmaster_failover_state:no-failover\r\nmaster_replid:b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0\r\nmaster_replid2:0000000000000000000000000000000000000000\r\nmaster_repl_offset:98\r\nsecond_repl_offset:-1\r\nrepl_backlog_active:1\r\nrepl_backlog_size:10485760\r\nrepl_backlog_first_byte_offset:1\r\nrepl_backlog_histlen:98\r\n";
+    const REDIS7_REPLICA: &str = "# Replication\r\nrole:slave\r\nmaster_host:172.17.0.2\r\nmaster_port:6379\r\nmaster_link_status:up\r\nmaster_last_io_seconds_ago:1\r\nmaster_sync_in_progress:0\r\nslave_read_repl_offset:1540\r\nslave_repl_offset:1540\r\nslave_priority:100\r\nslave_read_only:1\r\nreplica_announced:1\r\nconnected_slaves:0\r\n";
+    const VALKEY8_REPLICA: &str = "# Replication\r\nrole:slave\r\nmaster_host:10.0.1.20\r\nmaster_port:6379\r\nmaster_link_status:up\r\nslave_read_repl_offset:98\r\nslave_repl_offset:98\r\nreplica_announced:1\r\nconnected_slaves:0\r\n";
+
+    #[test]
+    fn replication_parsing() {
+        assert_eq!(
+            parse_replication(REDIS7_MASTER),
+            Replication::Master {
+                online: vec![("172.17.0.3".into(), 6379), ("172.17.0.4".into(), 6380)]
+            }
+        );
+        assert_eq!(
+            parse_replication(VALKEY8_MASTER),
+            Replication::Master {
+                online: vec![("10.0.1.21".into(), 6379)]
+            }
+        );
+        assert_eq!(parse_replication(REDIS7_REPLICA), Replication::Replica);
+        assert_eq!(parse_replication(VALKEY8_REPLICA), Replication::Replica);
+        assert_eq!(parse_replication("# Replication\r\n"), Replication::Unknown);
+    }
+
+    #[test]
+    fn replication_skips_replicas_that_are_not_online() {
+        let info = "role:master\r\nconnected_slaves:2\r\nslave0:ip=10.0.0.1,port=6379,state=wait_bgsave,offset=0,lag=0\r\nslave1:ip=10.0.0.2,port=6379,state=online,offset=5,lag=0\r\nslave_read_only:1\r\nslaveX:ip=10.0.0.9,port=1,state=online\r\nslave2:ip=10.0.0.3,port=bad,state=online\r\n";
+        assert_eq!(
+            parse_replication(info),
+            Replication::Master {
+                online: vec![("10.0.0.2".into(), 6379)]
+            }
+        );
+        assert_eq!(
+            parse_replication("role:master\r\nconnected_slaves:0\r\n"),
+            Replication::Master { online: vec![] }
+        );
+    }
+
+    #[test]
+    fn scan_target_text() {
+        let ep = Endpoint {
+            host: "10.0.1.21".into(),
+            port: 6379,
+            tls: false,
+        };
+        assert_eq!(ScanTarget::Primary.to_string(), "primary");
+        assert_eq!(
+            ScanTarget::Replica(ep).to_string(),
+            "replica 10.0.1.21:6379"
+        );
+        assert_eq!(
+            ScanTarget::PrimaryFallback("timed out".into()).to_string(),
+            "primary (replica unreachable: timed out)"
+        );
     }
 
     #[test]

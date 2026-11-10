@@ -80,6 +80,9 @@ pub struct ConnAddArgs {
     /// Replace an existing profile with the same name.
     #[arg(long)]
     pub force: bool,
+    /// Scan a replica instead of the primary when one is reachable.
+    #[arg(long)]
+    pub prefer_replica: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
