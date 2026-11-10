@@ -1,0 +1,323 @@
+//! View 3: the current scan against the previous snapshot of the same profile.
+
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+
+use crate::diff::{Cause, PatternDiff, ReportDiff};
+use crate::format;
+use crate::snapshot::format_utc;
+use crate::tui::app::{App, History};
+
+use super::delta::{Change, cause_words, ratio_change, signed_bytes, signed_percent};
+use super::widgets::{fit, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset};
+use super::{notice_panels, report_or_wait, spinner, split_body, style};
+
+const NUM_W: usize = 7;
+const PCT_W: usize = 6;
+/// Cells on each side of the bar's centre line.
+const HALF: usize = 12;
+const BAR_W: usize = HALF * 2 + 1 + 3;
+/// Wide enough for `smaller values`.
+const WHY_W: usize = 14;
+
+fn name_width(inner: usize) -> usize {
+    let fixed = (NUM_W + 2) * 3 + PCT_W + 2 + BAR_W + WHY_W;
+    inner.saturating_sub(fixed).max(12)
+}
+
+pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
+    let Some((session, _)) = report_or_wait(frame, area, app, "Diff") else {
+        return;
+    };
+    let line = |text: String, st: Style| Line::from(Span::styled(text, st));
+    match &session.history {
+        History::Pending => notice_panels(
+            frame,
+            area,
+            "Diff",
+            "",
+            vec![Line::from(vec![
+                Span::raw(" "),
+                Span::styled(spinner(app.tick), style::amber()),
+                Span::styled(" Looking for an earlier snapshot…", style::dim()),
+            ])],
+        ),
+        History::NoSnapshot => notice_panels(
+            frame,
+            area,
+            "Diff",
+            "no history",
+            vec![
+                line(
+                    format!(" No earlier snapshot for {}.", session.profile.name),
+                    style::fgb(),
+                ),
+                line(
+                    " Press s to save one; the next scan compares against it.".to_string(),
+                    style::dim(),
+                ),
+            ],
+        ),
+        History::Failed(e) => notice_panels(
+            frame,
+            area,
+            "Diff",
+            "",
+            vec![
+                line(format!(" ✗ Could not load snapshots: {e}"), style::warn()),
+                line(
+                    " The other views still work; only the comparison is missing.".to_string(),
+                    style::dim(),
+                ),
+            ],
+        ),
+        History::Diff(d) => draw_diff(frame, area, app, d),
+    }
+}
+
+fn header(d: &ReportDiff) -> String {
+    let (b, a) = (d.used_memory_before, d.used_memory_after);
+    format!(
+        "snapshot {} → now · used {} → {} ({})",
+        format_utc(d.before_taken_at_unix),
+        format::bytes(b),
+        format::bytes(a),
+        signed_bytes(a as i64 - b as i64)
+    )
+}
+
+fn draw_diff(frame: &mut Frame, area: Rect, app: &App, d: &ReportDiff) {
+    if d.patterns.is_empty() {
+        notice_panels(
+            frame,
+            area,
+            "Diff",
+            &header(d),
+            vec![Line::from(Span::styled(
+                " Neither scan sampled any keys.",
+                style::dim(),
+            ))],
+        );
+        return;
+    }
+    let (main, detail) = split_body(area);
+    let sel = app.sel.diff.min(d.patterns.len() - 1);
+    let inner = panel(frame, main, "Diff", &header(d));
+    let name = name_width(usize::from(inner.width));
+    let head = Line::from(vec![
+        Span::styled(pad_r(" PATTERN", name), style::hd()),
+        Span::styled(format!("{}  ", pad_l("BEFORE", NUM_W)), style::hd()),
+        Span::styled(format!("{}  ", pad_l("NOW", NUM_W)), style::hd()),
+        Span::styled(format!("{}  ", pad_l("Δ", NUM_W)), style::hd()),
+        Span::styled(format!("{}  ", pad_l("Δ%", PCT_W)), style::hd()),
+        Span::styled(
+            pad_r(&format!("{} grew", pad_l("shrank", HALF)), BAR_W),
+            style::hd(),
+        ),
+        Span::styled("WHY", style::hd()),
+    ]);
+    rows(frame, inner, vec![head], None);
+    let body = Rect {
+        y: inner.y + 1,
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let max = d
+        .patterns
+        .iter()
+        .map(|p| Change::of(p).value.unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    let off = scroll_offset(sel, usize::from(body.height));
+    let lines: Vec<Line<'static>> = d
+        .patterns
+        .iter()
+        .skip(off)
+        .take(usize::from(body.height))
+        .map(|p| diff_row(p, max, name))
+        .collect();
+    rows(frame, body, lines, Some(sel - off));
+    detail_panel(frame, detail, &d.patterns[sel]);
+}
+
+/// Formats a byte or key figure.
+type Fmt = fn(u64) -> String;
+
+/// Before and after as text: bytes when both scans had sizes, keys otherwise.
+fn sides(p: &PatternDiff) -> (Option<u64>, Option<u64>, Fmt) {
+    if p.delta_bytes.is_some() {
+        (p.bytes_before, p.bytes_after, format::bytes)
+    } else {
+        (p.keys_before, p.keys_after, format::count)
+    }
+}
+
+/// The relative change, `new` without a before, or `—` when before was empty.
+fn percent_text(p: &PatternDiff, before: Option<u64>, after: Option<u64>) -> String {
+    if p.cause == Cause::New || before.is_none() {
+        return "new".to_string();
+    }
+    ratio_change(before, Some(after.unwrap_or(0))).map_or_else(|| "—".to_string(), signed_percent)
+}
+
+fn grew_style(c: Change) -> Style {
+    if c.is_alarming() {
+        style::warn()
+    } else {
+        style::amber()
+    }
+}
+
+fn diff_row(p: &PatternDiff, max: u64, name: usize) -> Line<'static> {
+    let dash = || "—".to_string();
+    let c = Change::of(p);
+    let (before, after, fmt) = sides(p);
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(pattern_spans(&p.pattern, style::fg(), style::ph()));
+    let mut spans = fit(spans, name.saturating_sub(1));
+    spans.push(Span::raw(" "));
+    let len = if c.unchanged || c.value == 0 || max == 0 {
+        0
+    } else {
+        ((c.value.unsigned_abs() as f64 / max as f64 * HALF as f64).round() as usize).clamp(1, HALF)
+    };
+    let (neg, pos) = if c.value < 0 { (len, 0) } else { (0, len) };
+    let why_style = if p.cause == Cause::New {
+        style::warn()
+    } else {
+        style::dim()
+    };
+    spans.extend([
+        Span::styled(
+            format!("{}  ", pad_l(&before.map_or_else(dash, fmt), NUM_W)),
+            style::dim(),
+        ),
+        Span::styled(
+            format!("{}  ", pad_l(&after.map_or_else(dash, fmt), NUM_W)),
+            style::fg(),
+        ),
+        Span::styled(format!("{}  ", pad_l(&c.text(), NUM_W)), c.style()),
+        Span::styled(
+            format!("{}  ", pad_l(&percent_text(p, before, after), PCT_W)),
+            c.style(),
+        ),
+        Span::raw(" ".repeat(HALF - neg)),
+        Span::styled("█".repeat(neg), style::ok()),
+        Span::styled("│", style::border()),
+        Span::styled("█".repeat(pos), grew_style(c)),
+        Span::raw(" ".repeat(HALF - pos + 3)),
+        Span::styled(cause_words(p.cause), why_style),
+    ]);
+    Line::from(spans)
+}
+
+fn avg(bytes: Option<u64>, keys: Option<u64>) -> Option<u64> {
+    match (bytes, keys) {
+        (Some(b), Some(k)) if k > 0 => Some(b / k),
+        _ => None,
+    }
+}
+
+/// One `label  before  now  change` row of the detail panel.
+fn compare_line(
+    p: &PatternDiff,
+    label: &str,
+    before: Option<u64>,
+    after: Option<u64>,
+    fmt: fn(u64) -> String,
+    available: bool,
+) -> Line<'static> {
+    let dash = || "—".to_string();
+    let (change, st) = if !available {
+        (dash(), style::dim())
+    } else if p.cause == Cause::New {
+        ("new".to_string(), style::warn())
+    } else if p.cause == Cause::Gone {
+        ("gone".to_string(), style::ok())
+    } else {
+        match ratio_change(before, after) {
+            Some(r) if r > 0.05 => (signed_percent(r), style::amber()),
+            Some(r) if r < -0.05 => (signed_percent(r), style::ok()),
+            Some(r) => (signed_percent(r), style::dim()),
+            None => (dash(), style::dim()),
+        }
+    };
+    Line::from(vec![
+        Span::styled(pad_r(&format!(" {label}"), 16), style::dim()),
+        Span::styled(pad_l(&before.map_or_else(dash, fmt), 10), style::fg()),
+        Span::styled(pad_l(&after.map_or_else(dash, fmt), 10), style::fgb()),
+        Span::styled(pad_l(&change, 10), st),
+    ])
+}
+
+/// A sentence about why the pattern changed.
+fn cause_sentence(p: &PatternDiff) -> (&'static str, Style) {
+    let c = Change::of(p);
+    let text = match p.cause {
+        Cause::New => "▲ New since the snapshot: nothing matched this pattern then.",
+        Cause::Gone => "Gone: no sampled key matches this pattern any more.",
+        Cause::MoreKeys => "The change comes mostly from more keys; the average size moved less.",
+        Cause::FewerKeys => "The change comes mostly from fewer keys; the average size moved less.",
+        Cause::BiggerValues => {
+            "The change comes mostly from bigger values; the key count moved less."
+        }
+        Cause::SmallerValues => {
+            "The change comes mostly from smaller values; the key count moved less."
+        }
+        Cause::Unchanged => "No meaningful change.",
+    };
+    let st = match p.cause {
+        Cause::Gone => style::ok(),
+        Cause::Unchanged => style::dim(),
+        _ => c.style(),
+    };
+    (text, st)
+}
+
+fn detail_panel(frame: &mut Frame, area: Rect, p: &PatternDiff) {
+    let c = Change::of(p);
+    let right = format!("{} since the snapshot", c.text());
+    let inner = panel(frame, area, &p.pattern, &right);
+    let sizes = p.delta_bytes.is_some();
+    let (sentence, st) = cause_sentence(p);
+    let mut lines = vec![
+        Line::from(Span::styled(" WHERE THE CHANGE CAME FROM", style::hd())),
+        Line::from(vec![
+            Span::raw(" ".repeat(16)),
+            Span::styled(pad_l("BEFORE", 10), style::hd()),
+            Span::styled(pad_l("NOW", 10), style::hd()),
+            Span::styled(pad_l("CHANGE", 10), style::hd()),
+        ]),
+        compare_line(p, "keys", p.keys_before, p.keys_after, format::count, true),
+        compare_line(
+            p,
+            "avg size",
+            avg(p.bytes_before, p.keys_before),
+            avg(p.bytes_after, p.keys_after),
+            format::bytes,
+            sizes,
+        ),
+        compare_line(
+            p,
+            "memory",
+            p.bytes_before,
+            p.bytes_after,
+            format::bytes,
+            sizes,
+        ),
+        Line::default(),
+        Line::from(fit(
+            vec![Span::styled(format!(" {sentence}"), st)],
+            usize::from(inner.width),
+        )),
+    ];
+    if !sizes {
+        lines.push(Line::from(Span::styled(
+            " Sizes unavailable: one of the scans could not run MEMORY USAGE.",
+            style::dim(),
+        )));
+    }
+    rows(frame, inner, lines, None);
+}

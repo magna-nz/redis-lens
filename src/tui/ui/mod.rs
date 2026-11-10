@@ -9,17 +9,20 @@ use ratatui::text::{Line, Span};
 
 use crate::conn::parse::mask;
 use crate::format;
-use crate::model::{PERM_MEMORY, ServerFlavor, ServerInfo};
+use crate::model::{PERM_MEMORY, ScanReport, ServerFlavor, ServerInfo};
 
 use super::app::{App, Phase, Session, View};
 
 mod connections;
+mod delta;
+mod diff;
+mod hot;
 mod patterns;
-mod placeholder;
 pub mod style;
+mod ttl;
 pub mod widgets;
 
-use widgets::{bar, rows, trunc, width};
+use widgets::{bar, panel, rows, trunc, width};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -41,7 +44,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.view {
         View::Connections => connections::draw(frame, body, app),
         View::Patterns => patterns::draw(frame, body, app),
-        other => placeholder::draw(frame, body, other),
+        View::Ttl => ttl::draw(frame, body, app),
+        View::Diff => diff::draw(frame, body, app),
+        View::HotKeys => hot::draw(frame, body, app),
     }
     footer(frame, foot, app);
 }
@@ -51,6 +56,106 @@ pub fn split_body(area: Rect) -> (Rect, Rect) {
     let [main, detail] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(DETAIL_ROWS + 2)]).areas(area);
     (main, detail)
+}
+
+/// The session and its finished report. Without one, draws a message (no connection
+/// yet, connecting, scanning, or failed) into the `title` panel and returns `None`.
+pub fn report_or_wait<'a>(
+    frame: &mut Frame,
+    area: Rect,
+    app: &'a App,
+    title: &str,
+) -> Option<(&'a Session, &'a ScanReport)> {
+    let (main, detail) = split_body(area);
+    let Some(session) = &app.session else {
+        let inner = panel(frame, main, title, "");
+        let text = Span::styled(
+            " No scan yet. Open 0 Connections, pick a connection and press enter.",
+            style::dim(),
+        );
+        rows(frame, inner, vec![Line::default(), Line::from(text)], None);
+        panel(frame, detail, "Details", "");
+        return None;
+    };
+    if let Some(report) = &session.report {
+        return Some((session, report));
+    }
+    waiting(frame, main, detail, app, session, title);
+    None
+}
+
+fn waiting(frame: &mut Frame, main: Rect, detail: Rect, app: &App, s: &Session, title: &str) {
+    let spin = spinner(app.tick);
+    let p = &s.profile;
+    let inner = panel(frame, main, title, &p.name);
+    let mut lines = vec![Line::default()];
+    match &s.phase {
+        Phase::Failed(e) => {
+            lines.push(Line::from(Span::styled(format!(" ✗ {e}"), style::warn())));
+            lines.push(Line::from(Span::styled(
+                " Press 0 to go back to Connections and try again.",
+                style::dim(),
+            )));
+        }
+        Phase::Connecting => lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(spin, style::amber()),
+            Span::styled(
+                format!(
+                    " Connecting to {} ({}) and checking permissions…",
+                    p.name, p.endpoint
+                ),
+                style::dim(),
+            ),
+        ])),
+        Phase::Scanning | Phase::Done => {
+            let pr = s.progress.unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(spin, style::amber()),
+                Span::styled(" Sampled ", style::dim()),
+                Span::styled(
+                    format!(
+                        "{} / {}",
+                        format::grouped(pr.sampled),
+                        format::grouped(pr.target)
+                    ),
+                    style::fgb(),
+                ),
+                Span::styled(" keys", style::dim()),
+            ]));
+            let ratio = if pr.target == 0 {
+                0.0
+            } else {
+                pr.sampled as f64 / pr.target as f64
+            };
+            let w = usize::from(inner.width).saturating_sub(4).min(40);
+            let (fill, track) = bar(ratio, w);
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(fill, style::amber()),
+                Span::styled(track, style::track()),
+            ]));
+        }
+    }
+    rows(frame, inner, lines, None);
+    panel(frame, detail, "Details", "");
+}
+
+/// A panel holding a few lines of explanation, with an empty detail panel below.
+pub fn notice_panels(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    right: &str,
+    lines: Vec<Line<'static>>,
+) {
+    let (main, detail) = split_body(area);
+    let inner = panel(frame, main, title, right);
+    let mut all = vec![Line::default()];
+    all.extend(lines);
+    rows(frame, inner, all, None);
+    panel(frame, detail, "Details", "");
 }
 
 fn flavor(f: ServerFlavor) -> &'static str {
@@ -330,6 +435,12 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
                 ("↑↓", "Move"),
                 ("→←", "Fold"),
                 ("/", "Filter"),
+                ("s", "Snapshot"),
+                ("0-4", "View"),
+                ("q", "Quit"),
+            ],
+            View::Ttl | View::Diff | View::HotKeys if app.report().is_some() => &[
+                ("↑↓", "Move"),
                 ("s", "Snapshot"),
                 ("0-4", "View"),
                 ("q", "Quit"),
