@@ -257,6 +257,7 @@ mod tests {
             cause,
             partial: false,
             sampled_keys_after: 0,
+            pattern_sampled_keys_after: 0,
         }
     }
 

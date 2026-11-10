@@ -2,7 +2,7 @@
 //!
 //! Owner: connections.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use redis::aio::{ConnectionLike, MultiplexedConnection};
@@ -222,29 +222,62 @@ fn replica_host(ip: &str) -> Option<String> {
     (bare.len() <= 253 && bare.split('.').all(label_ok)).then(|| bare.to_string())
 }
 
-/// Loopback: `localhost` (and `*.localhost`), `127.0.0.0/8`, `::1`, and `::ffff:127.x`.
-fn is_loopback(host: &str) -> bool {
+/// Loopback by name alone: `localhost` (and `*.localhost`), `127.0.0.0/8`, `::1`, and
+/// `::ffff:127.x`. [`resolve`] also looks at what a name resolves to.
+fn is_loopback_name(host: &str) -> bool {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
-    h == "localhost"
-        || h.ends_with(".localhost")
-        || h.parse::<IpAddr>()
-            .is_ok_and(|a| a.to_canonical().is_loopback())
+    h == "localhost" || h.ends_with(".localhost") || h.parse::<IpAddr>().is_ok_and(is_local_ip)
 }
 
-/// Whether credentials may go to a replica candidate that could not be checked without
-/// them. Only when it is on the primary's host (any two loopback names count as the same
-/// host), or it is not a loopback address: a loopback address announced by a remote
-/// primary names this machine, not the primary's, so whatever listens there is not the
-/// replica.
-fn may_send_credentials(primary_host: &str, candidate_host: &str) -> bool {
-    let same_ip = matches!(
-        (primary_host.parse::<IpAddr>(), candidate_host.parse::<IpAddr>()),
-        (Ok(a), Ok(b)) if a.to_canonical() == b.to_canonical()
-    );
-    primary_host.eq_ignore_ascii_case(candidate_host)
-        || same_ip
-        || (is_loopback(primary_host) && is_loopback(candidate_host))
-        || !is_loopback(candidate_host)
+/// An address that reaches this machine: loopback, or unspecified (`0.0.0.0`, `::`).
+fn is_local_ip(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    ip.is_loopback() || ip.is_unspecified()
+}
+
+/// A host name resolved once, so the address that was checked is the one connected to.
+struct Resolved {
+    addrs: Vec<SocketAddr>,
+    /// The name is loopback, or any address it resolves to is loopback or unspecified.
+    local: bool,
+}
+
+async fn resolve(host: &str, port: u16) -> std::io::Result<Resolved> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the name has no addresses",
+        ));
+    }
+    let local = is_loopback_name(host) || addrs.iter().any(|a| is_local_ip(a.ip()));
+    Ok(Resolved { addrs, local })
+}
+
+/// A DNS resolver for redis-rs that always returns addresses resolved earlier. The host
+/// name still goes to TLS for certificate checks; only the lookup is skipped, so a name
+/// can't resolve to one address for the check and another for the connection.
+struct Pinned(Vec<SocketAddr>);
+
+impl redis::io::AsyncDNSResolver for Pinned {
+    fn resolve<'a, 'b: 'a>(
+        &'a self,
+        _host: &'b str,
+        _port: u16,
+    ) -> redis::RedisFuture<'a, Box<dyn Iterator<Item = SocketAddr> + Send + 'a>> {
+        let addrs = self.0.clone();
+        Box::pin(async move {
+            Ok(Box::new(addrs.into_iter()) as Box<dyn Iterator<Item = SocketAddr> + Send>)
+        })
+    }
+}
+
+/// Whether credentials may go to a candidate that answered `NOAUTH`: only when it is
+/// not on this machine, or the primary is on this machine too. A loopback address
+/// announced by a remote primary names the machine running redis-lens, not the replica.
+/// Both flags come from [`resolve`].
+fn may_send_credentials(primary_local: bool, candidate_local: bool) -> bool {
+    !candidate_local || primary_local
 }
 
 /// Whether `INFO replication` from a candidate shows a replica of the primary whose
@@ -260,6 +293,8 @@ enum Unusable {
     NotAReplica,
     /// It needs credentials to be checked and is not somewhere they may be sent.
     WontSendCredentials,
+    /// Its host name did not resolve.
+    Resolve(std::io::Error),
     Conn(ConnError),
 }
 
@@ -282,49 +317,59 @@ async fn info_replication(c: &mut MultiplexedConnection) -> Result<String, redis
 /// Open a connection to the candidate at `ep` and check that it is a replica of the
 /// primary with `primary_replid`, before anything is scanned.
 ///
-/// When the profile has credentials, the candidate is first asked for `INFO replication`
-/// on a connection that sends none (no `AUTH`, no `HELLO`, no `CLIENT SETINFO`). If it
-/// answers, it is checked there and credentials go only to a verified replica. If it
-/// wants authentication, credentials are sent only when [`may_send_credentials`]
-/// allows, and the candidate is checked again on the authenticated connection, which
-/// is the one returned.
+/// The candidate's name is resolved once and every connection to it uses those
+/// addresses. It is first asked for `INFO replication` on a connection that sends no
+/// credentials (no `AUTH`, no `HELLO`, no `CLIENT SETINFO`). A candidate that answers
+/// and passes is scanned on that same connection and never gets credentials. Only a
+/// candidate that answers `NOAUTH` may get them, and only when the profile has some and
+/// [`may_send_credentials`] allows; it is then checked again on the authenticated
+/// connection, which is the one returned.
 async fn verified_replica(
     auth: &ResolvedAuth,
-    primary_host: &str,
+    db: u32,
+    primary: &Endpoint,
     primary_replid: &str,
     ep: &Endpoint,
 ) -> Result<MultiplexedConnection, Unusable> {
-    if auth.sends_credentials {
-        let settings = RedisConnectionInfo::default().set_skip_set_lib_name();
-        let mut probe = open(ep, settings, &base_config()).await?;
-        match info_replication(&mut probe).await {
-            Ok(info) if is_replica_of(&info, primary_replid) => {}
-            Ok(_) => return Err(Unusable::NotAReplica),
-            // A server reply such as NOAUTH: it can only be checked with credentials.
-            Err(e) if e.code().is_some() || is_server_error(&e) => {
-                if !may_send_credentials(primary_host, &ep.host) {
-                    return Err(Unusable::WontSendCredentials);
-                }
+    let candidate = resolve(&ep.host, ep.port)
+        .await
+        .map_err(Unusable::Resolve)?;
+    let pinned =
+        |config: AsyncConnectionConfig| config.set_dns_resolver(Pinned(candidate.addrs.clone()));
+
+    let settings = RedisConnectionInfo::default().set_skip_set_lib_name();
+    let mut probe = open(ep, settings, &pinned(base_config())).await?;
+    match info_replication(&mut probe).await {
+        Ok(info) if is_replica_of(&info, primary_replid) => {
+            if db != 0 {
+                redis::cmd("SELECT")
+                    .arg(db)
+                    .query_async::<()>(&mut probe)
+                    .await?;
             }
-            Err(e) => return Err(e.into()),
+            return Ok(probe);
         }
+        Ok(_) => return Err(Unusable::NotAReplica),
+        Err(e) if auth.sends_credentials && e.code() == Some("NOAUTH") => {}
+        Err(e) => return Err(e.into()),
     }
-    let mut c = auth.open(ep).await?;
+    drop(probe);
+
+    // A primary whose name no longer resolves counts as remote, which only restricts.
+    let primary_local = match resolve(&primary.host, primary.port).await {
+        Ok(r) => r.local,
+        Err(_) => false,
+    };
+    if !may_send_credentials(primary_local, candidate.local) {
+        return Err(Unusable::WontSendCredentials);
+    }
+    let mut c = open(ep, auth.settings.clone(), &pinned(auth.config.clone())).await?;
     let info = info_replication(&mut c).await?;
     if is_replica_of(&info, primary_replid) {
         Ok(c)
     } else {
         Err(Unusable::NotAReplica)
     }
-}
-
-fn is_server_error(e: &redis::RedisError) -> bool {
-    matches!(
-        e.kind(),
-        redis::ErrorKind::Server(_)
-            | redis::ErrorKind::AuthenticationFailed
-            | redis::ErrorKind::Extension
-    )
 }
 
 /// The `master_replid` field of `INFO replication`. A primary reports its own
@@ -377,7 +422,7 @@ pub async fn connect_for_scan(
                 port,
                 tls: profile.endpoint.tls,
             };
-            let attempt = verified_replica(&auth, &profile.endpoint.host, &replid, &ep);
+            let attempt = verified_replica(&auth, profile.db, &profile.endpoint, &replid, &ep);
             match tokio::time::timeout(REPLICA_TIMEOUT, attempt).await {
                 Ok(Ok(c)) => Ok((c, ScanTarget::Replica(ep))),
                 Ok(Err(Unusable::NotAReplica)) => fallback(
@@ -391,6 +436,9 @@ pub async fn connect_for_scan(
                          address that is not the primary's host"
                     ),
                 ),
+                Ok(Err(Unusable::Resolve(e))) => {
+                    fallback(primary, format!("{ep}: could not resolve the host: {e}"))
+                }
                 Ok(Err(Unusable::Conn(e))) => fallback(primary, format!("{ep}: {e}")),
                 Err(_) => fallback(primary, format!("{ep}: timed out")),
             }
@@ -636,26 +684,60 @@ mod tests {
     }
 
     #[test]
-    fn credentials_go_to_the_primary_host_or_a_non_loopback_address() {
-        // Same host as the primary.
-        assert!(may_send_credentials("127.0.0.1", "127.0.0.1"));
-        assert!(may_send_credentials("cache.internal", "CACHE.internal"));
-        assert!(may_send_credentials("::1", "0:0:0:0:0:0:0:1"));
-        // Both loopback: the same machine.
-        assert!(may_send_credentials("localhost", "127.0.0.1"));
-        assert!(may_send_credentials("127.0.0.1", "::1"));
-        // Non-loopback addresses the primary announced.
-        assert!(may_send_credentials("cache.internal", "10.0.1.21"));
-        assert!(may_send_credentials("127.0.0.1", "10.0.1.21"));
-        assert!(may_send_credentials("10.0.1.20", "replica-1.internal"));
-        assert!(may_send_credentials("10.0.1.20", "2001:db8::5"));
-        // A loopback address announced by a remote primary names this machine.
-        assert!(!may_send_credentials("cache.internal", "127.0.0.1"));
-        assert!(!may_send_credentials("10.0.1.20", "127.0.0.2"));
-        assert!(!may_send_credentials("10.0.1.20", "::1"));
-        assert!(!may_send_credentials("10.0.1.20", "::ffff:127.0.0.1"));
-        assert!(!may_send_credentials("10.0.1.20", "localhost"));
-        assert!(!may_send_credentials("10.0.1.20", "evil.localhost"));
+    fn credentials_go_only_off_this_machine_unless_the_primary_is_on_it() {
+        assert!(may_send_credentials(false, false));
+        assert!(may_send_credentials(true, false));
+        assert!(may_send_credentials(true, true));
+        assert!(!may_send_credentials(false, true));
+    }
+
+    #[tokio::test]
+    async fn resolution_decides_what_is_on_this_machine() {
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "127.0.0.2",
+            "::1",
+            "0.0.0.0",
+            "::",
+        ] {
+            let r = resolve(host, 6379).await.unwrap();
+            assert!(r.local, "{host}");
+            assert!(!r.addrs.is_empty(), "{host}");
+        }
+        // Names that resolve to loopback but are not recognisable from the text. The
+        // system resolver on macOS and Linux accepts these legacy forms; where one
+        // does not resolve there is nothing to connect to anyway.
+        for host in ["127.1", "2130706433"] {
+            assert!(!is_loopback_name(host), "{host}");
+            if let Ok(r) = resolve(host, 6379).await {
+                assert!(r.local, "{host} resolved to {:?}", r.addrs);
+            }
+        }
+        for host in ["10.0.1.21", "2001:db8::5"] {
+            let r = resolve(host, 6379).await.unwrap();
+            assert!(!r.local, "{host}");
+            assert_eq!(r.addrs[0].ip(), host.parse::<IpAddr>().unwrap());
+        }
+        // A remote primary announcing a name that resolves to loopback: refused.
+        let primary = resolve("10.0.1.20", 6379).await.unwrap();
+        let candidate = resolve("localhost", 6379).await.unwrap();
+        assert!(!may_send_credentials(primary.local, candidate.local));
+        if let Ok(candidate) = resolve("127.1", 6379).await {
+            assert!(!may_send_credentials(primary.local, candidate.local));
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_resolver_ignores_the_name() {
+        use redis::io::AsyncDNSResolver;
+        let addr: SocketAddr = "10.0.1.21:6379".parse().unwrap();
+        let got: Vec<_> = Pinned(vec![addr])
+            .resolve("evil.example.com", 1)
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(got, vec![addr]);
     }
 
     #[test]

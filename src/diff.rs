@@ -61,6 +61,10 @@ pub struct PatternDiff {
     /// pattern without sizes needs before it counts as growing.
     #[serde(skip)]
     pub sampled_keys_after: u64,
+    /// This pattern's `sampled_keys` in the newer report (0 when it is not there), in
+    /// the same units as [`Self::sampled_keys_after`].
+    #[serde(skip)]
+    pub pattern_sampled_keys_after: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -175,6 +179,7 @@ fn pattern_diff(
         cause,
         partial,
         sampled_keys_after,
+        pattern_sampled_keys_after: a.map_or(0, |p| p.sampled_keys),
     }
 }
 
@@ -289,9 +294,16 @@ mod tests {
         after.sampled_keys = 4000;
         let d = diff(&before, &after);
         assert!(d.patterns.iter().all(|p| p.sampled_keys_after == 4000));
+        assert_eq!(d.pattern("b").unwrap().pattern_sampled_keys_after, 60);
+        // Scaled: 10 sampled keys standing for 1,000.
+        let mut scaled = stats("c", 1000, None);
+        scaled.sampled_keys = 10;
+        after.patterns.push(scaled);
+        let c = diff(&before, &after).pattern("c").unwrap().clone();
+        assert_eq!((c.delta_keys, c.pattern_sampled_keys_after), (1000, 10));
         // Not part of the JSON output.
         let json = serde_json::to_string(&d).unwrap();
-        assert!(!json.contains("sampled_keys_after"));
+        assert!(!json.contains("sampled_keys_after"), "{json}");
     }
 
     #[test]

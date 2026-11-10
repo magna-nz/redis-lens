@@ -23,8 +23,9 @@ All notable changes to this project are documented here. The format follows
   first online replica, and falls back to the primary (saying why) if it can't reach it.
 - Replica verification: before a replica is scanned, its `INFO replication` must show it is a replica with the
   primary's replication ID (`master_replid`). A different server on the announced address is never scanned or
-  snapshotted. Credentials go only to a candidate that passes the check without them, or, when it needs them, one on
-  the primary's host or at a non-loopback address. Announced addresses of `0.0.0.0`, `::` or empty are skipped;
+  snapshotted. A replica that passes without credentials is scanned without them. Credentials go only to a
+  candidate that demands auth and is on the primary's host or not loopback after DNS resolution; the resolved
+  address is the one connected to. Announced addresses of `0.0.0.0`, `::` or empty are skipped;
   IPv6 addresses and host names are accepted.
 - The TUI says when it is waiting on the OS keychain, so a hidden macOS permission dialog doesn't look like a hang.
 
@@ -34,7 +35,8 @@ All notable changes to this project are documented here. The format follows
 - Documentation: a full README, a logo, a demo GIF, and a changelog.
 - Profile names starting with `docker:`, in any case, are reserved for containers found by discovery.
 - A pattern that only appears after a sampled (partial) scan no longer counts as growing unless it passes a
-  threshold: more than 1 MiB with sizes, or without sizes at least 50 keys and 1% of the newer scan's sampled keys.
+  threshold: more than 1 MiB with sizes, or without sizes at least 50 sampled keys and 1% of the newer scan's
+  sampled keys.
 - `--prefer-replica` reads the keychain once per scan and uses the same credentials for the primary and the replica.
   The 2 s replica timeout covers only connecting to and verifying the replica.
 - `make gif` uses a temporary config with its own demo connections and removes them afterwards.

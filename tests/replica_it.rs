@@ -428,3 +428,148 @@ async fn a_candidate_that_never_answers_times_out() {
         assert!(info(&mut c).await.contains("role:master"));
     }
 }
+
+/// Every command a [`FakeReplica`] received, one `Vec` of arguments per command.
+type Received = std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+/// A RESP server on 127.0.0.1 that claims to be a replica: `INFO` answers `role:slave`
+/// with whatever replication ID is set, without asking for `AUTH`. Every other command
+/// gets `+OK`, so a client that sends `AUTH` carries on as it would with a real server.
+struct FakeReplica {
+    port: u16,
+    replid: std::sync::Arc<std::sync::Mutex<String>>,
+    received: Received,
+}
+
+impl FakeReplica {
+    fn start() -> Self {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let replid = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let received: Received = Default::default();
+        let (id, log) = (replid.clone(), received.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let (id, log) = (id.clone(), log.clone());
+                std::thread::spawn(move || {
+                    let mut out = stream.try_clone().unwrap();
+                    let mut r = BufReader::new(stream);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if r.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let Some(n) = line.trim_end().strip_prefix('*') else {
+                            return;
+                        };
+                        let n: usize = n.parse().unwrap();
+                        let mut args = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            line.clear();
+                            r.read_line(&mut line).unwrap();
+                            let len: usize = line.trim_end()[1..].parse().unwrap();
+                            let mut buf = vec![0; len + 2];
+                            r.read_exact(&mut buf).unwrap();
+                            args.push(String::from_utf8_lossy(&buf[..len]).into_owned());
+                        }
+                        let reply = if args[0].eq_ignore_ascii_case("INFO") {
+                            let body = format!(
+                                "# Replication\r\nrole:slave\r\nmaster_host:10.0.0.1\r\nmaster_port:6379\r\nmaster_link_status:up\r\nmaster_replid:{}\r\n",
+                                id.lock().unwrap()
+                            );
+                            format!("${}\r\n{body}\r\n", body.len())
+                        } else {
+                            "+OK\r\n".to_string()
+                        };
+                        log.lock().unwrap().push(args);
+                        if out.write_all(reply.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self {
+            port,
+            replid,
+            received,
+        }
+    }
+
+    fn received(&self) -> Vec<Vec<String>> {
+        self.received.lock().unwrap().clone()
+    }
+}
+
+/// `master_replid` is not secret, so passing the check without credentials proves
+/// nothing about who holds the address. A candidate that answers without `AUTH` is
+/// scanned on that same connection and is never sent the profile's credentials.
+#[tokio::test]
+async fn a_fake_replica_that_needs_no_auth_never_gets_credentials() {
+    for valkey in [false, true] {
+        let fake = FakeReplica::start();
+        let primary = common::server_with(valkey, &LENS_USER).await;
+        seed(&primary).await;
+        let replica = common::replica_of(&primary, valkey, Some(fake.port)).await;
+        wait_for_replication(&primary, &replica).await;
+        let id = conn::master_replid(&info(&mut primary.admin().await).await).unwrap();
+        *fake.replid.lock().unwrap() = id;
+
+        let p = keychain_profile(primary.port);
+        let store = CountingStore::with_lens(&p);
+        let (_c, target) = conn::connect_for_scan(&p, &store).await.unwrap();
+        assert_eq!(
+            target,
+            ScanTarget::Replica(local(fake.port)),
+            "valkey={valkey}"
+        );
+
+        let got = fake.received();
+        assert!(!got.is_empty(), "the fake was never asked");
+        for cmd in &got {
+            assert!(
+                !cmd[0].eq_ignore_ascii_case("AUTH") && !cmd[0].eq_ignore_ascii_case("HELLO"),
+                "the fake received {} (valkey={valkey})",
+                cmd[0]
+            );
+            assert!(
+                !cmd.iter().any(|a| a == PASSWORD || a == USER),
+                "the fake received credentials in {} (valkey={valkey})",
+                cmd[0]
+            );
+        }
+    }
+}
+
+/// A real replica whose default user is open is scanned without the profile's
+/// credentials: no `AUTH` or `HELLO` reaches it.
+#[tokio::test]
+async fn an_open_replica_is_scanned_without_credentials() {
+    for valkey in [false, true] {
+        let primary = common::server_with(valkey, &LENS_USER).await;
+        seed(&primary).await;
+        let replica = common::replica_of(&primary, valkey, None).await;
+        wait_for_replication(&primary, &replica).await;
+
+        let p = keychain_profile(primary.port);
+        let store = CountingStore::with_lens(&p);
+        let (mut c, target) = conn::connect_for_scan(&p, &store).await.unwrap();
+        assert_eq!(
+            target,
+            ScanTarget::Replica(local(replica.port)),
+            "valkey={valkey}"
+        );
+        assert!(info(&mut c).await.contains("role:slave"));
+        scan_sees_only_the_primary(&mut c, primary.port).await;
+        let stats = command_stats(&mut replica.admin().await).await;
+        for cmd in ["auth", "hello"] {
+            assert!(
+                !stats.contains(&format!("cmdstat_{cmd}:")),
+                "{cmd} reached the replica (valkey={valkey}): {stats}"
+            );
+        }
+    }
+}
