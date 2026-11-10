@@ -137,7 +137,7 @@ redis-lens discover
 
 ## Snapshots (v0.2)
 
-`s` writes the current `ScanReport` as JSON to the platform data directory, named `<profile>-<timestamp>.json`. The Diff view compares against the latest snapshot or a chosen one. A snapshot holds patterns and example key names, never values or credentials.
+`s` (or `redis-lens scan --save`) writes the current `ScanReport` as JSON to `<data dir>/redis-lens/snapshots/<profile>/<YYYYMMDDTHHMMSSZ>.json`. `redis-lens diff <profile>` scans, compares with the newest earlier snapshot (or `--against <file>`), then saves the new scan. The Diff view compares against the latest snapshot or a chosen one. A snapshot holds patterns and example key names, never values or credentials.
 
 ## Quality bar
 
