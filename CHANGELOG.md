@@ -22,8 +22,8 @@ All notable changes to this project are documented here. The format follows
 - Scan a replica instead of the primary: `conn add --prefer-replica`. redis-lens reads `INFO replication`, uses the
   first online replica, and falls back to the primary (saying why) if it can't reach it.
 - Replica verification: before a replica is scanned, its `INFO replication` must show it is a replica with the
-  primary's replication ID (`master_replid`). A different server on the announced address is never scanned or
-  snapshotted. A replica that passes without credentials is scanned without them. Credentials go only to a
+  primary's replication ID (`master_replid`). An unrelated server on the announced address fails the check and is
+  not scanned; one built to imitate a replica could pass it, but never receives credentials. A replica that passes without credentials is scanned without them. Credentials go only to a
   candidate that demands auth and is on the primary's host or not loopback after DNS resolution; the resolved
   address is the one connected to. Announced addresses of `0.0.0.0`, `::` or empty are skipped;
   IPv6 addresses and host names are accepted.

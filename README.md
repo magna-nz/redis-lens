@@ -224,9 +224,12 @@ missing permission.
   everything else. Change it with `--max-rate`.
 - With `conn add --prefer-replica`, scans run against an online replica found through `INFO replication`, so the
   primary serves no scan traffic. The replica is verified first: its `INFO replication` must say it is a replica and
-  carry the primary's replication ID (`master_replid`), so a different server listening on the announced address is
-  never scanned. A replica that passes without credentials is scanned without them. Credentials go only to an
-  announced host that demands auth and is on the primary's host or not loopback (after DNS resolution). This trusts
+  carry the primary's replication ID (`master_replid`). An ordinary unrelated server on the announced address fails
+  that check and is not scanned. The replication ID is not secret, though, so a server built to imitate a replica can
+  pass it and be scanned (without credentials). A replica that passes without credentials is scanned without them. Credentials go only to an
+  announced host that demands auth and is on the primary's host or not loopback (after DNS resolution). If you reach
+  the primary through an SSH tunnel on 127.0.0.1, any local service on the announced port counts as "on the primary's
+  host". This trusts
   the address the primary announces, the way Cluster and Sentinel clients do: anyone who can make the primary
   announce a host they control that demands auth can collect the credentials, which is why `--prefer-replica` is
   opt-in. If no replica is reachable or verified, redis-lens scans the primary and says why. A replica can lag behind
