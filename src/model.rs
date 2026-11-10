@@ -206,6 +206,14 @@ pub struct ScanReport {
     /// LFU counters were unavailable. Missing in snapshots written before v0.2.
     #[serde(default)]
     pub hot_keys: Vec<KeySample>,
+    /// Every key in the database was looked at: the `SCAN` cursor returned to 0, no
+    /// sample limit cut the walk short and no `MATCH` glob narrowed it. `false` in
+    /// snapshots written before this field existed.
+    #[serde(default)]
+    pub complete: bool,
+    /// The `SCAN MATCH` glob the scan used, if any.
+    #[serde(default)]
+    pub match_glob: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

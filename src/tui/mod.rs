@@ -224,7 +224,12 @@ impl Runner {
 /// The diff between the newest snapshot older than `report` and `report`.
 fn load_history(report: &ScanReport) -> Result<Option<diff::ReportDiff>, snapshot::SnapshotError> {
     let dir = snapshot::default_dir()?;
-    let prev = snapshot::latest_before(&dir, &report.profile, report.taken_at_unix)?;
+    let prev = snapshot::latest_before(
+        &dir,
+        &report.profile,
+        report.taken_at_unix,
+        report.match_glob.as_deref(),
+    )?;
     Ok(prev.map(|p| diff::diff(&p, report)))
 }
 
@@ -261,7 +266,21 @@ fn scrub(text: String, secret: Option<&str>) -> String {
     }
 }
 
+/// Prefix of the report (and so snapshot) name of a Docker container, so a container
+/// called `cache` never shares history with a saved profile called `cache`.
+const DOCKER_PREFIX: &str = "docker:";
+
+/// The name a scan of `profile` is reported and snapshotted under: the profile name for
+/// saved profiles, `docker:<container>` for containers found in Docker.
+fn report_name(profile: &Profile, secrets: &SecretSource) -> String {
+    match secrets {
+        SecretSource::Keychain => profile.name.clone(),
+        SecretSource::Container(_) => format!("{DOCKER_PREFIX}{}", profile.name),
+    }
+}
+
 async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, tx: Tx) {
+    let name = report_name(&profile, &secrets);
     let (store, secret): (Box<dyn SecretStore>, Option<String>) = match secrets {
         SecretSource::Keychain => (Box::new(KeyringStore), None),
         SecretSource::Container(creds) => {
@@ -315,7 +334,7 @@ async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, t
         }
     });
     let result = scan::scan(
-        &profile.name,
+        &name,
         &mut c,
         &ScanOptions::for_profile(&profile),
         &perms,
@@ -431,6 +450,24 @@ mod tests {
         assert_eq!(got.password.expose_secret(), "leftover");
         assert!(Config::load(&path).unwrap().profiles.is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn docker_scans_are_filed_apart_from_saved_profiles() {
+        let p = profile("cache");
+        assert_eq!(report_name(&p, &SecretSource::Keychain), "cache");
+        assert_eq!(
+            report_name(&p, &SecretSource::Container(None)),
+            "docker:cache"
+        );
+        let creds = Credentials {
+            username: None,
+            password: SecretString::from("pw"),
+        };
+        assert_eq!(
+            report_name(&p, &SecretSource::Container(Some(creds))),
+            "docker:cache"
+        );
     }
 
     #[test]

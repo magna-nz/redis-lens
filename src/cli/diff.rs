@@ -59,8 +59,13 @@ pub async fn diff_profile(
     .await?;
     let before = match against {
         Some(r) => r,
-        None => snapshot::latest_before(dir, &new.profile, new.taken_at_unix)?
-            .ok_or_else(|| no_snapshot(&args.profile))?,
+        None => snapshot::latest_before(
+            dir,
+            &new.profile,
+            new.taken_at_unix,
+            new.match_glob.as_deref(),
+        )?
+        .ok_or_else(|| no_snapshot(&args.profile))?,
     };
     let result = diff::diff(&before, &new);
     let path = snapshot::save(dir, &new)?;
@@ -69,15 +74,7 @@ pub async fn diff_profile(
 }
 
 fn cause_words(c: Cause) -> &'static str {
-    match c {
-        Cause::New => "new",
-        Cause::Gone => "gone",
-        Cause::MoreKeys => "more keys",
-        Cause::FewerKeys => "fewer keys",
-        Cause::BiggerValues => "bigger values",
-        Cause::SmallerValues => "smaller values",
-        Cause::Unchanged => "unchanged",
-    }
+    c.words()
 }
 
 fn signed(n: i64, fmt: impl Fn(u64) -> String) -> String {
@@ -103,7 +100,7 @@ pub fn render_diff(d: &ReportDiff, width: usize) -> String {
             format::bytes(d.used_memory_before),
             format::bytes(d.used_memory_after),
             signed(
-                d.used_memory_after as i64 - d.used_memory_before as i64,
+                diff::sub(d.used_memory_after, d.used_memory_before),
                 format::bytes
             )
         ),
@@ -364,6 +361,26 @@ mod tests {
         assert!(t.contains("… and 5 more patterns; use --json for all"));
         assert!(t.contains("unchanged"));
         assert!(t.contains("0%"));
+    }
+
+    #[test]
+    fn huge_memory_does_not_overflow() {
+        let mut d = sample();
+        d.used_memory_before = 0;
+        d.used_memory_after = u64::MAX;
+        assert!(render_diff(&d, 80).contains("used (+"));
+        d.used_memory_before = 1 << 63;
+        d.used_memory_after = 0;
+        assert!(render_diff(&d, 80).contains("used (-"));
+    }
+
+    #[test]
+    fn unknown_cause_is_spelled_out() {
+        let mut d = sample();
+        d.patterns[2].cause = Cause::Unknown;
+        let t = render_diff(&d, 100);
+        let row = t.lines().find(|l| l.starts_with("job:")).unwrap();
+        assert!(row.ends_with("not in the other scan"), "{row}");
     }
 
     #[test]

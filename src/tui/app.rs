@@ -468,8 +468,10 @@ impl App {
                  maxmemory-policy to allkeys-lfu or volatile-lfu to see hot keys.",
                 r.server.maxmemory_policy
             )
+        } else if r.sampled_keys == 0 {
+            "The scan sampled no keys.".to_string()
         } else {
-            "No key has been read often enough yet.".to_string()
+            "No sampled key has an LFU counter above 0 yet.".to_string()
         })
     }
 
@@ -1623,7 +1625,16 @@ mod tests {
         let (app, _) = scanned_with(fixtures::report(true), fixtures::perms_ok());
         assert_eq!(
             app.hot_keys_reason().as_deref(),
-            Some("No key has been read often enough yet.")
+            Some("No sampled key has an LFU counter above 0 yet.")
+        );
+
+        let mut empty = fixtures::report(true);
+        empty.sampled_keys = 0;
+        empty.patterns.clear();
+        let (app, _) = scanned_with(empty, fixtures::perms_ok());
+        assert_eq!(
+            app.hot_keys_reason().as_deref(),
+            Some("The scan sampled no keys.")
         );
 
         // Nothing to explain before a scan.

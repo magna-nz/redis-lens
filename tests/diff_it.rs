@@ -18,6 +18,9 @@ use redis_lens::snapshot;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Seeded into values; must never show up in a snapshot file.
+const MARKER: &str = "VALUE-MARKER-123";
+
 fn temp_dir(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("redis-lens-{tag}-{}-{n}", std::process::id()));
@@ -94,10 +97,15 @@ async fn diff_finds_causes_on_redis_and_valkey() {
             set(
                 &mut admin,
                 format!("user:{}:profile", 1000 + i),
-                "x".repeat(2000),
+                format!("{MARKER}{}", "x".repeat(2000)),
             )
             .await;
-            hset(&mut admin, format!("order:{}", 9000 + i), "v".repeat(100)).await;
+            hset(
+                &mut admin,
+                format!("order:{}", 9000 + i),
+                format!("{MARKER}{}", "v".repeat(100)),
+            )
+            .await;
             set(&mut admin, format!("flag:{}", 100 + i), "1".to_string()).await;
         }
         let config = temp_config(server.port);
@@ -118,11 +126,20 @@ async fn diff_finds_causes_on_redis_and_valkey() {
         let (first, _) = report(&config, &secrets, &args, None).await.unwrap();
         let saved = save_if_requested(&dir, &args, &first).unwrap().unwrap();
         assert!(saved.starts_with(&dir));
+        let text = std::fs::read_to_string(&saved).unwrap();
+        assert!(!text.contains("password"));
         assert!(
-            !std::fs::read_to_string(&saved)
-                .unwrap()
-                .contains("password")
+            !text.contains(MARKER),
+            "a value leaked into {}",
+            saved.display()
         );
+        // The data was really there to leak.
+        let v: String = redis::cmd("GET")
+            .arg("user:1000:profile")
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        assert!(v.starts_with(MARKER));
 
         // Snapshots are named by the second, and the baseline must be strictly older.
         tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -159,7 +176,12 @@ async fn diff_finds_causes_on_redis_and_valkey() {
             assert!(l.chars().count() <= 60, "{l:?}");
         }
         // The diff saved the new scan, so it is now the newest snapshot.
-        assert_eq!(snapshot::list(&dir, "it").unwrap().len(), 2);
+        let saved_all = snapshot::list(&dir, "it").unwrap();
+        assert_eq!(saved_all.len(), 2);
+        for info in &saved_all {
+            let text = std::fs::read_to_string(&info.path).unwrap();
+            assert!(!text.contains(MARKER), "{}", info.path.display());
+        }
 
         // --against compares with a chosen file.
         let mut against = diff_args();
@@ -173,8 +195,16 @@ async fn diff_finds_causes_on_redis_and_valkey() {
 }
 
 #[tokio::test]
-async fn hot_keys_with_lfu() {
-    let server = common::redis_with(&["--maxmemory-policy", "allkeys-lfu"]).await;
+async fn hot_keys_with_lfu_redis() {
+    hot_keys_with_lfu(common::redis_with(&["--maxmemory-policy", "allkeys-lfu"]).await).await;
+}
+
+#[tokio::test]
+async fn hot_keys_with_lfu_valkey() {
+    hot_keys_with_lfu(common::valkey_with(&["--maxmemory-policy", "allkeys-lfu"]).await).await;
+}
+
+async fn hot_keys_with_lfu(server: common::TestServer) {
     let mut admin = server.admin().await;
     for i in 0..50 {
         set(&mut admin, format!("item:{i}"), "x".to_string()).await;
@@ -194,7 +224,7 @@ async fn hot_keys_with_lfu() {
         .unwrap();
     assert!(!r.hot_keys.is_empty());
     assert!(r.hot_keys.len() <= 50);
-    assert!(r.hot_keys.iter().all(|k| k.lfu_freq.is_some()));
+    assert!(r.hot_keys.iter().all(|k| k.lfu_freq.is_some_and(|f| f > 0)));
     for w in r.hot_keys.windows(2) {
         let (a, b) = (&w[0], &w[1]);
         assert!(
@@ -206,4 +236,40 @@ async fn hot_keys_with_lfu() {
     let table = render_table(&r, &perms, 100);
     println!("{table}");
     assert!(table.contains("Hot:     item:"), "{table}");
+}
+
+#[tokio::test]
+async fn match_snapshot_is_not_a_baseline() {
+    for server in [common::redis().await, common::valkey().await] {
+        let mut admin = server.admin().await;
+        for i in 0..20 {
+            set(&mut admin, format!("user:{i}"), "u".to_string()).await;
+            set(&mut admin, format!("order:{i}"), "o".to_string()).await;
+        }
+        let config = temp_config(server.port);
+        let dir = temp_dir("diff-it-match");
+        let secrets = MemoryStore::default();
+        let mut args = scan_args(true);
+        args.match_glob = Some("user:*".to_string());
+        let (partial, _) = report(&config, &secrets, &args, None).await.unwrap();
+        assert!(!partial.complete);
+        save_if_requested(&dir, &args, &partial).unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        // A full diff must not compare against the user:* snapshot, which would call
+        // every order key new.
+        let err = diff_profile(&config, &secrets, &diff_args(), &dir, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().starts_with("no snapshot for it"), "{err}");
+
+        // Asked for explicitly, it can be compared, but nothing is called new.
+        let mut against = diff_args();
+        against.against = Some(snapshot::list(&dir, "it").unwrap()[0].path.clone());
+        let (d, _) = diff_profile(&config, &secrets, &against, &dir, None)
+            .await
+            .unwrap();
+        assert_eq!(d.pattern("order:{id}").unwrap().cause, Cause::Unknown);
+        assert!(d.patterns.iter().all(|p| p.cause != Cause::New));
+    }
 }

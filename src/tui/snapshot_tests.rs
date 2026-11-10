@@ -413,6 +413,34 @@ fn every_tab_at_60x20_and_200x60() {
 #[test]
 fn small_terminals_do_not_panic() {
     let mut apps = vec![App::new(vec![]), scanned(true), scanned(false)];
+    // History and hot keys, with and without sizes.
+    apps.push(scanned_with_history(true));
+    apps.push(scanned_with_history(false));
+    // No earlier snapshot, and history whose other scan used a different MATCH.
+    let (mut no_history, id) = scanned_with(fixtures::report(true), fixtures::perms_ok());
+    set_history(&mut no_history, id, None);
+    apps.push(no_history);
+    let mut other = fixtures::previous_report(true);
+    other.match_glob = Some("session:*".into());
+    let mut report = fixtures::report(true);
+    report.hot_keys = fixtures::hot_keys();
+    let unsure = crate::diff::diff(&other, &report);
+    assert!(
+        unsure
+            .patterns
+            .iter()
+            .any(|p| p.cause == crate::diff::Cause::Unknown)
+    );
+    let (mut unknown, id) = scanned_with(report, fixtures::perms_ok());
+    set_history(&mut unknown, id, Some(unsure));
+    apps.push(unknown);
+    // Every reason the Hot keys view can be empty.
+    apps.push(scanned_with(fixtures::report_lru(), fixtures::perms_freq_skipped()).0);
+    apps.push(scanned_with(fixtures::report(true), fixtures::perms_freq_denied()).0);
+    let mut empty = fixtures::report(true);
+    empty.sampled_keys = 0;
+    empty.patterns.clear();
+    apps.push(scanned_with(empty, fixtures::perms_ok()).0);
     let mut adding = App::new(fixtures::profiles());
     adding.handle_key(ch('a'));
     adding.handle_paste(fixtures::PROD_URL.into());

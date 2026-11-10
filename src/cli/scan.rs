@@ -77,10 +77,20 @@ pub fn save_if_requested(
     args: &ScanArgs,
     report: &ScanReport,
 ) -> anyhow::Result<Option<PathBuf>> {
+    save_into(|| Ok(dir.to_path_buf()), args, report)
+}
+
+/// [`save_if_requested`], finding the directory only when `--save` was given, so a
+/// plain scan never fails for want of a data directory.
+fn save_into(
+    dir: impl FnOnce() -> Result<PathBuf, snapshot::SnapshotError>,
+    args: &ScanArgs,
+    report: &ScanReport,
+) -> anyhow::Result<Option<PathBuf>> {
     if !args.save {
         return Ok(None);
     }
-    let path = snapshot::save(dir, report)?;
+    let path = snapshot::save(&dir()?, report)?;
     eprintln!("Saved snapshot {}", path.display());
     Ok(Some(path))
 }
@@ -299,7 +309,7 @@ pub async fn run(config: Option<PathBuf>, args: ScanArgs) -> anyhow::Result<()> 
     })
     .await;
     let (report, perms) = result?;
-    save_if_requested(&snapshot::default_dir()?, &args, &report)?;
+    save_into(snapshot::default_dir, &args, &report)?;
 
     if args.json {
         println!(
@@ -354,6 +364,8 @@ mod tests {
             patterns,
             sizes_available: sizes,
             hot_keys: Vec::new(),
+            complete: false,
+            match_glob: None,
         }
     }
 
@@ -367,6 +379,30 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn args(save: bool) -> ScanArgs {
+        ScanArgs {
+            profile: "local".into(),
+            sample: 10,
+            match_glob: None,
+            json: false,
+            max_rate: None,
+            save,
+        }
+    }
+
+    #[test]
+    fn data_dir_is_only_needed_with_save() {
+        let r = report(vec![], true, "noeviction");
+        let none = save_into(
+            || panic!("looked up the data directory without --save"),
+            &args(false),
+            &r,
+        );
+        assert!(none.unwrap().is_none());
+        let err = save_into(|| Err(snapshot::SnapshotError::NoDataDir), &args(true), &r);
+        assert!(err.is_err());
     }
 
     #[test]
