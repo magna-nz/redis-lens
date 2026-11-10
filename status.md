@@ -67,7 +67,6 @@ See the overnight table above.
 
 - Add a `CARGO_REGISTRY_TOKEN` repository secret before the first release.
 - Decide whether to publish a placeholder 0.0.1 to reserve the crate name early.
-- Two hung test processes from an early scanner run (pids 14237 and 16998, `scan_it`) hold 3 test containers. An agent's attempt to kill them was blocked, so they're left for the owner: `kill 14237 16998`.
 
 ## Known issues and notes
 
