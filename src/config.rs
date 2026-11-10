@@ -1,6 +1,6 @@
 //! Saved connection profiles, stored as TOML. Never holds credentials.
 //!
-//! Owner: connections. Contract only; bodies are stubs.
+//! Owner: connections.
 
 use std::path::{Path, PathBuf};
 
@@ -39,29 +39,191 @@ pub struct Config {
 impl Config {
     /// `<config dir>/redis-lens/config.toml`, e.g. `~/Library/Application Support/redis-lens/config.toml`.
     pub fn default_path() -> Result<PathBuf, ConfigError> {
-        todo!("Config::default_path")
+        let dirs =
+            directories::ProjectDirs::from("", "", "redis-lens").ok_or(ConfigError::NoConfigDir)?;
+        Ok(dirs.config_dir().join("config.toml"))
     }
 
     /// A missing file is an empty config, not an error.
-    pub fn load(_path: &Path) -> Result<Self, ConfigError> {
-        todo!("Config::load")
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        toml::from_str(&text).map_err(|e| ConfigError::Parse {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })
     }
 
     /// Writes atomically (temp file and rename), creating the directory if needed.
-    pub fn save(&self, _path: &Path) -> Result<(), ConfigError> {
-        todo!("Config::save")
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        let werr = |source| ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        };
+        let text = toml::to_string_pretty(self).map_err(|e| {
+            werr(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            ))
+        })?;
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        std::fs::create_dir_all(&dir).map_err(werr)?;
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "config.toml".to_string());
+        let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+        let result = (|| {
+            std::fs::write(&tmp, text.as_bytes())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            }
+            std::fs::rename(&tmp, path)
+        })();
+        if let Err(e) = result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(werr(e));
+        }
+        Ok(())
     }
 
-    pub fn get(&self, _name: &str) -> Option<&Profile> {
-        todo!("Config::get")
+    pub fn get(&self, name: &str) -> Option<&Profile> {
+        self.profiles.iter().find(|p| p.name == name)
     }
 
     /// Fails with [`ConfigError::Exists`] unless `replace` is true.
-    pub fn add(&mut self, _profile: Profile, _replace: bool) -> Result<(), ConfigError> {
-        todo!("Config::add")
+    pub fn add(&mut self, profile: Profile, replace: bool) -> Result<(), ConfigError> {
+        match self.profiles.iter().position(|p| p.name == profile.name) {
+            Some(_) if !replace => Err(ConfigError::Exists(profile.name)),
+            Some(i) => {
+                self.profiles[i] = profile;
+                Ok(())
+            }
+            None => {
+                self.profiles.push(profile);
+                Ok(())
+            }
+        }
     }
 
-    pub fn remove(&mut self, _name: &str) -> Result<Profile, ConfigError> {
-        todo!("Config::remove")
+    pub fn remove(&mut self, name: &str) -> Result<Profile, ConfigError> {
+        match self.profiles.iter().position(|p| p.name == name) {
+            Some(i) => Ok(self.profiles.remove(i)),
+            None => Err(ConfigError::NotFound(name.to_string())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Auth, Endpoint, Env};
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "redis-lens-config-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn profile(name: &str, port: u16) -> Profile {
+        Profile {
+            name: name.into(),
+            env: Env::Stage,
+            endpoint: Endpoint {
+                host: "cache.example.com".into(),
+                port,
+                tls: true,
+            },
+            db: 2,
+            auth: Auth::Keychain,
+            read_only: Some(true),
+        }
+    }
+
+    #[test]
+    fn round_trip_creates_directory() {
+        let dir = temp_dir("rt");
+        let path = dir.join("nested").join("config.toml");
+        let mut c = Config::default();
+        c.add(profile("a", 1), false).unwrap();
+        c.add(profile("b", 2), false).unwrap();
+        c.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[[profile]]"), "{text}");
+        assert_eq!(Config::load(&path).unwrap(), c);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // no temp files left behind
+        let leftovers = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_file_is_empty() {
+        let dir = temp_dir("missing");
+        let c = Config::load(&dir.join("nope.toml")).unwrap();
+        assert!(c.profiles.is_empty());
+    }
+
+    #[test]
+    fn bad_toml_is_parse_error() {
+        let dir = temp_dir("bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[[profile]\nname = ").unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::Parse { .. })
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn add_replace_remove() {
+        let mut c = Config::default();
+        c.add(profile("a", 1), false).unwrap();
+        assert!(matches!(
+            c.add(profile("a", 9), false),
+            Err(ConfigError::Exists(n)) if n == "a"
+        ));
+        assert_eq!(c.get("a").unwrap().endpoint.port, 1);
+        c.add(profile("a", 9), true).unwrap();
+        assert_eq!(c.profiles.len(), 1);
+        assert_eq!(c.get("a").unwrap().endpoint.port, 9);
+        assert!(c.get("zzz").is_none());
+        assert_eq!(c.remove("a").unwrap().name, "a");
+        assert!(matches!(c.remove("a"), Err(ConfigError::NotFound(_))));
+    }
+
+    #[test]
+    fn default_path_ends_with_config_toml() {
+        if let Ok(p) = Config::default_path() {
+            assert!(p.ends_with("config.toml"));
+        }
     }
 }
