@@ -20,8 +20,8 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 |---|---|---|---|---|
 | 2 | Scanner and connections | implementer ×2 [sonnet] | `wave2/*` → `v0.1-core` | **done**, merged into `v0.1-core` |
 | 3 | TUI (Connections and Patterns views), `scan` command, verifier fixes | | `v0.1-core` → PR #6 | **done**: verified, CI green, merged into main (6dc45c6) |
-| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | | `v0.2-views` → PR after the fixes | verifier **BLOCKED** (snapshot directories collide across profiles) plus should-fixes; fix agent [opus] on `wave4/fixes` (`.claude/worktrees/v02fix`), then re-verify and open the PR |
-| 5 | README (redis-near-cache style, logo, badges), CHANGELOG, Dependabot ignore for the MSRV pin, `make gif`; then the GIF, replica preference, and the keychain-wait hint | implementer [sonnet] (docs, running on `wave5/docs`), then more | `v0.2-polish` | docs agent running; GIF, replicas and the keychain hint wait for the wave 4 fixes |
+| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | | `v0.2-views` → PR #7 | **verifier PASS** after fixes; PR #7 open; merge once CI is green |
+| 5 | README, logo, CHANGELOG, Dependabot ignore, GIF (`wave5/docs`, done: GIF recorded and checked against the demo); replica preference, keychain-wait hint, verifier follow-ups (`wave5/polish`, implementer [sonnet] running) | | `v0.2-polish` → PR after #7 | in progress |
 
 ### How to resume after a restart or compaction
 
