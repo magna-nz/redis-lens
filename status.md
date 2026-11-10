@@ -20,8 +20,8 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 |---|---|---|---|---|
 | 2 | Scanner and connections | implementer ×2 [sonnet] | `wave2/*` → `v0.1-core` | **done**, merged into `v0.1-core` |
 | 3 | TUI (Connections and Patterns views), `scan` command, verifier fixes | | `v0.1-core` → PR #6 | **done**: verified, CI green, merged into main (6dc45c6) |
-| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | | `v0.2-views` → PR #7 | **verifier PASS** after fixes; PR #7 open; merge once CI is green |
-| 5 | README, logo, CHANGELOG, Dependabot ignore, GIF (`wave5/docs`, done: GIF recorded and checked against the demo); replica preference, keychain-wait hint, verifier follow-ups (`wave5/polish`, implementer [sonnet] running) | | `v0.2-polish` → PR after #7 | in progress |
+| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | | `v0.2-views` → PR #7 | **done**: verified, CI green, merged into main |
+| 5 | Docs, logo, GIF, CHANGELOG, Dependabot ignore; replica preference; keychain-wait hint; v0.2 verifier follow-ups | implementer [sonnet] ×2, verifier [opus] | `wave5/polish` → PR after verification | combined on `wave5/polish` (a292fa3), 210 unit tests pass; **verifier running** in `.claude/worktrees/verify5`; feature research agent running |
 
 ### How to resume after a restart or compaction
 
