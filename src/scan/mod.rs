@@ -749,6 +749,8 @@ mod tests {
             Expired,
             /// Hidden by a key ACL: TYPE and PTTL fail with NOPERM.
             NoPerm,
+            /// TYPE works, PTTL fails with NOPERM.
+            PttlDenied,
         }
 
         pub struct Server {
@@ -763,6 +765,9 @@ mod tests {
             /// of the partial published so far.
             pub observer: Option<watch::Receiver<Option<Arc<PartialPatterns>>>>,
             pub seen_partials: Vec<Option<(u64, u64)>>,
+            /// Fail this SCAN call (0-based) with an I/O error.
+            pub fail_scan: Option<usize>,
+            scans: usize,
         }
 
         impl Server {
@@ -776,7 +781,22 @@ mod tests {
                     log: Vec::new(),
                     observer: None,
                     seen_partials: Vec::new(),
+                    fail_scan: None,
+                    scans: 0,
                 }
+            }
+
+            /// `Err` when this is the SCAN call set to fail.
+            fn fails(&mut self, cmd: &Cmd) -> bool {
+                let is_scan = cmd
+                    .args_iter()
+                    .next()
+                    .is_some_and(|a| matches!(a, Arg::Simple(b) if b == b"SCAN"));
+                if !is_scan {
+                    return false;
+                }
+                self.scans += 1;
+                self.fail_scan == Some(self.scans - 1)
             }
 
             fn reply(&mut self, cmd: &Cmd) -> Value {
@@ -821,13 +841,15 @@ mod tests {
                         ])
                     }
                     "TYPE" => match fate() {
-                        Some(Fate::Present | Fate::Expired) => Value::SimpleString("string".into()),
+                        Some(Fate::Present | Fate::Expired | Fate::PttlDenied) => {
+                            Value::SimpleString("string".into())
+                        }
                         Some(Fate::NoPerm) => noperm(),
                         Some(Fate::Gone) | None => Value::SimpleString("none".into()),
                     },
                     "PTTL" => match fate() {
                         Some(Fate::Present) => Value::Int(-1),
-                        Some(Fate::NoPerm) => noperm(),
+                        Some(Fate::NoPerm | Fate::PttlDenied) => noperm(),
                         Some(Fate::Gone | Fate::Expired) | None => Value::Int(-2),
                     },
                     "MEMORY" if text("USAGE") => match self.fates.get(&args[2]) {
@@ -842,6 +864,10 @@ mod tests {
 
         impl redis::aio::ConnectionLike for Server {
             fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
+                if self.fails(cmd) {
+                    let e = redis::RedisError::from((redis::ErrorKind::Io, "connection reset"));
+                    return Box::pin(std::future::ready(Err(e)));
+                }
                 let v = self.reply(cmd);
                 Box::pin(std::future::ready(Ok(v)))
             }
@@ -1022,6 +1048,146 @@ mod tests {
         assert_eq!(last.sampled, 500);
         assert_eq!(last.target, 500);
         assert!(last.sizes_available);
+    }
+
+    #[test]
+    fn unreadable_and_non_utf8_keys_count_as_present() {
+        // 10,000 keys. The first 1,000 (one SCAN page) are looked at: 500 readable, 200
+        // NOPERM on TYPE, 100 NOPERM on PTTL only, 100 not UTF-8, 100 gone. 900 still
+        // exist, so the scale is 10,000 / 900.
+        let mut keys = keyspace(900, |i| match i % 9 {
+            0 | 1 => Fate::NoPerm,
+            2 => Fate::PttlDenied,
+            3 => Fate::Gone,
+            _ => Fate::Present,
+        });
+        for i in 0..100u8 {
+            keys.insert(usize::from(i) * 9, (vec![0xff, b':', i], Fate::Present));
+        }
+        keys.extend((0..9_000).map(|i| (format!("extra:{i}").into_bytes(), Fate::Present)));
+        // The sample limit counts UTF-8 keys: 900 of them end the first page.
+        let o = opts(900, 100);
+        let mut server = fake::Server::new(keys, 1_000);
+        let outcome = run(sample_keys_detailed(&mut server, &o, true, false, None)).unwrap();
+        assert!(!outcome.complete);
+        assert_eq!(outcome.keys_seen, 1_000);
+        assert_eq!(outcome.vanished, 100);
+        assert_eq!(outcome.keys_present(), 900);
+        assert_eq!(outcome.samples.len(), 500);
+
+        let mut server = fake::Server::new(server.keys, 1_000);
+        let report = run(scan("t", &mut server, &o, &perms_all(), None)).unwrap();
+        // 500 * 10,000 / 900 = 5,555.6, rounded per pattern.
+        let est = est_total(&report);
+        assert!(est.abs_diff(5_556) <= 2, "est {est}");
+    }
+
+    #[test]
+    fn match_reports_the_sample_as_it_is() {
+        // DBSIZE counts every key, not the matching ones: no scaling with MATCH, even
+        // with vanished keys. (The fake ignores the glob.)
+        let keys = keyspace(1_000, |i| {
+            if i % 4 == 0 {
+                Fate::Gone
+            } else {
+                Fate::Present
+            }
+        });
+        let mut server = fake::Server::new(keys, 100);
+        let o = ScanOptions {
+            match_glob: Some("*".into()),
+            ..opts(200, 50)
+        };
+        let report = run(scan("t", &mut server, &o, &perms_all(), None)).unwrap();
+        assert!(!report.complete);
+        assert_eq!(report.sampled_keys, 150);
+        assert_eq!(est_total(&report), 150);
+    }
+
+    #[test]
+    fn dbsize_below_the_keys_looked_up_clamps_to_one() {
+        // Keys were added after DBSIZE: the estimate never goes below the sample.
+        let keys = keyspace(1_000, |_| Fate::Present);
+        let mut server = fake::Server::new(keys, 100);
+        server.dbsize = 100;
+        let report = run(scan("t", &mut server, &opts(500, 100), &perms_all(), None)).unwrap();
+        assert!(!report.complete);
+        assert_eq!(report.sampled_keys, 500);
+        assert_eq!(est_total(&report), 500);
+    }
+
+    #[test]
+    fn empty_database_samples_nothing() {
+        let mut server = fake::Server::new(Vec::new(), 100);
+        let (tx, rx) = watch::channel(None);
+        let report = run(scan_with_partial(
+            "t",
+            &mut server,
+            &opts(100, 50),
+            &perms_all(),
+            None,
+            Some(&tx),
+        ))
+        .unwrap();
+        assert!(report.complete);
+        assert_eq!(report.sampled_keys, 0);
+        assert!(report.patterns.is_empty());
+        // The final update is still published, empty.
+        let last = rx.borrow().clone().unwrap();
+        assert!(last.patterns.is_empty());
+        assert_eq!((last.sampled, last.target), (0, 0));
+    }
+
+    #[test]
+    fn partial_sink_skips_empty_samples_and_waits_for_the_throttle() {
+        let (tx, rx) = watch::channel(None);
+        let mut sink = PartialSink {
+            tx: &tx,
+            total_keys: 1_000,
+            target: 500,
+            has_match: false,
+            sizes_available: false,
+            throttle: Throttle::default(),
+        };
+        let t0 = Instant::now();
+        sink.maybe_publish(&[], 0, t0);
+        assert!(rx.borrow().is_none(), "nothing sampled: nothing published");
+
+        let samples: Vec<KeySample> = (0..10).map(|i| sample(&format!("k:{i}"), None)).collect();
+        sink.maybe_publish(&samples, 20, t0);
+        let first = rx.borrow().clone().unwrap();
+        assert_eq!((first.sampled, first.target), (10, 500));
+        assert!(!first.sizes_available);
+        // 10 samples, 20 keys present of 1,000: scale 50.
+        assert_eq!(first.patterns[0].est_keys, 500);
+
+        // Too soon: the previous update stays.
+        sink.maybe_publish(&samples[..5], 5, t0 + Duration::from_millis(100));
+        assert_eq!(rx.borrow().as_ref().unwrap().sampled, 10);
+        // Later: published.
+        sink.maybe_publish(&samples[..5], 5, t0 + Duration::from_secs(10));
+        assert_eq!(rx.borrow().as_ref().unwrap().sampled, 5);
+    }
+
+    #[test]
+    fn failed_scan_returns_the_error_after_partials() {
+        // The third SCAN fails: two batches were sampled and one partial published.
+        let keys = keyspace(1_000, |_| Fate::Present);
+        let mut server = fake::Server::new(keys, 100);
+        server.fail_scan = Some(2);
+        let (tx, rx) = watch::channel(None);
+        let err = run(scan_with_partial(
+            "t",
+            &mut server,
+            &opts(500, 100),
+            &perms_all(),
+            None,
+            Some(&tx),
+        ))
+        .unwrap_err();
+        assert!(matches!(err, ScanError::Redis(_)), "{err}");
+        // The last partial stays in the channel; the caller (the TUI) drops it.
+        assert!(rx.borrow().as_ref().unwrap().sampled < 500);
     }
 
     proptest::proptest! {

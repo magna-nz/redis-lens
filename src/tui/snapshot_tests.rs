@@ -225,6 +225,128 @@ fn patterns_with_sizes() {
     insta::assert_snapshot!(t.backend());
 }
 
+/// A finished scan of prod-cache-01 with a diff, then a connect to staging-cache that
+/// has published partial results.
+fn partial_after_previous_profile() -> App {
+    let mut app = scanned_with_history(true);
+    app.handle_key(ch('0'));
+    app.handle_key(ch('j'));
+    let id = connect_selected(&mut app);
+    app.apply(Msg::Connected {
+        id,
+        server: Some(fixtures::server()),
+        perms: fixtures::perms_ok(),
+        target: ScanTarget::Primary,
+    });
+    let partial = fixtures::partial(true);
+    app.apply(Msg::ScanProgress {
+        id,
+        progress: ScanProgress {
+            sampled: partial.sampled,
+            target: partial.target,
+            done: false,
+        },
+    });
+    app.apply(Msg::ScanPartial { id, partial });
+    app
+}
+
+#[test]
+fn patterns_partial() {
+    let app = partial_after_previous_profile();
+    assert_eq!(app.session.as_ref().unwrap().profile.name, "staging-cache");
+    let t = render(&app, 120, 36);
+    let lines = buffer_lines(&t);
+    assert!(
+        lines[3].contains("partial · 3,200 / 100,000 sampled"),
+        "{}",
+        lines[3]
+    );
+    // The previous profile's diff is not shown against partial data.
+    assert!(!lines[4].contains("Δ"), "{}", lines[4]);
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn partial_marker_survives_narrow_terminals() {
+    let app = partial_after_previous_profile();
+    let lines = buffer_lines(&render(&app, 80, 24));
+    assert!(
+        lines[3].contains("partial · 3,200 / 100,000"),
+        "{}",
+        lines[3]
+    );
+}
+
+#[test]
+fn other_views_wait_while_partial() {
+    let mut app = partial_after_previous_profile();
+    for (view, title) in [('2', "TTL"), ('3', "Diff"), ('4', "Hot keys")] {
+        app.handle_key(ch(view));
+        let lines = buffer_lines(&render(&app, 120, 36));
+        assert!(lines[3].contains(title), "{}", lines[3]);
+        assert!(
+            lines[5].contains("Sampled 3,200 / 100,000 keys"),
+            "{view}: {}",
+            lines[5]
+        );
+        // Nothing from prod-cache-01's report or diff.
+        for line in &lines[3..] {
+            assert!(!line.contains("cache:search"), "{view}: {line}");
+        }
+    }
+}
+
+#[test]
+fn failed_scan_drops_partial_results_from_the_screen() {
+    let mut app = partial_after_previous_profile();
+    let id = app.session.as_ref().unwrap().id;
+    app.apply(Msg::ScanFailed {
+        id,
+        error: "connection reset by peer".into(),
+    });
+    app.handle_key(ch('x')); // clear the error notice
+    let lines = buffer_lines(&render(&app, 120, 36));
+    assert!(
+        lines[5].contains("✗ connection reset by peer"),
+        "{}",
+        lines[5]
+    );
+    for line in &lines {
+        assert!(!line.contains("partial"), "{line}");
+        assert!(!line.contains("cache:search"), "{line}");
+    }
+}
+
+#[test]
+fn empty_partial_says_nothing_sampled_yet() {
+    let mut app = App::new(fixtures::profiles());
+    let id = connect_selected(&mut app);
+    app.apply(Msg::Connected {
+        id,
+        server: Some(fixtures::server()),
+        perms: fixtures::perms_ok(),
+        target: ScanTarget::Primary,
+    });
+    let mut partial = (*fixtures::partial(true)).clone();
+    partial.patterns.clear();
+    partial.sampled = 0;
+    app.apply(Msg::ScanPartial {
+        id,
+        partial: std::sync::Arc::new(partial),
+    });
+    let lines = buffer_lines(&render(&app, 120, 36));
+    assert!(
+        lines[3].contains("partial · 0 / 100,000 sampled"),
+        "{}",
+        lines[3]
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("No keys sampled yet.")),
+        "{lines:#?}"
+    );
+}
+
 #[test]
 fn patterns_without_sizes() {
     let mut app = scanned(false);

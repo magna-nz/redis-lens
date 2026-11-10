@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -13,9 +14,10 @@ use crate::conn::docker::DiscoveredInstance;
 use crate::conn::parse::{ParsedConnection, mask, parse_connection_string};
 use crate::diff::ReportDiff;
 use crate::model::{
-    Auth, Credentials, PERM_FREQ, PermStatus, PermissionReport, Profile, ScanReport, ServerInfo,
+    Auth, Credentials, PERM_FREQ, PatternStats, PermStatus, PermissionReport, Profile, ScanReport,
+    ServerInfo,
 };
-use crate::scan::ScanProgress;
+use crate::scan::{PartialPatterns, ScanProgress};
 use crate::verdict::ttl_verdict;
 
 use super::tree::{PatternTree, Root, Row};
@@ -176,6 +178,12 @@ pub enum Msg {
         id: ConnId,
         progress: ScanProgress,
     },
+    /// Pattern stats from the keys sampled so far. Shown on the Patterns view until the
+    /// scan finishes or fails; never saved.
+    ScanPartial {
+        id: ConnId,
+        partial: Arc<PartialPatterns>,
+    },
     ScanDone {
         id: ConnId,
         report: ScanReport,
@@ -227,6 +235,10 @@ pub struct Session {
     pub target: Option<ScanTarget>,
     pub progress: Option<ScanProgress>,
     pub phase: Phase,
+    /// The latest partial pattern stats while the scan runs. Cleared when the scan
+    /// finishes (the report replaces it) or fails, so it is only `Some` in
+    /// [`Phase::Scanning`] with no report.
+    pub partial: Option<Arc<PartialPatterns>>,
     pub report: Option<ScanReport>,
     pub history: History,
 }
@@ -239,6 +251,15 @@ impl Session {
             _ => None,
         }
     }
+}
+
+/// The patterns the Patterns view shows.
+#[derive(Debug, Clone, Copy)]
+pub struct PatternData<'a> {
+    pub patterns: &'a [PatternStats],
+    pub sizes_available: bool,
+    /// `Some` while these are partial results of a running scan.
+    pub partial: Option<&'a PartialPatterns>,
 }
 
 /// The add-connection input. Holds what the user typed, which may include a
@@ -453,11 +474,31 @@ impl App {
         }
     }
 
+    /// What the Patterns view shows: the finished report's patterns, or the partial
+    /// results while the scan runs, or `None`. `self.patterns.tree` is always built
+    /// from these.
+    pub fn pattern_data(&self) -> Option<PatternData<'_>> {
+        let s = self.session.as_ref()?;
+        if let Some(r) = &s.report {
+            return Some(PatternData {
+                patterns: &r.patterns,
+                sizes_available: r.sizes_available,
+                partial: None,
+            });
+        }
+        let p = s.partial.as_deref()?;
+        Some(PatternData {
+            patterns: &p.patterns,
+            sizes_available: p.sizes_available,
+            partial: Some(p),
+        })
+    }
+
     /// Rows currently visible on the Patterns view.
     pub fn pattern_rows(&self) -> Vec<Row> {
-        match self.session.as_ref().and_then(|s| s.report.as_ref()) {
-            Some(r) => self.patterns.tree.visible(
-                &r.patterns,
+        match self.pattern_data() {
+            Some(d) => self.patterns.tree.visible(
+                d.patterns,
                 &self.patterns.collapsed,
                 &self.patterns.filter,
             ),
@@ -581,9 +622,16 @@ impl App {
         }
     }
 
+    /// Only a finished report is ever saved, never partial results.
     fn save_snapshot(&mut self) -> Vec<Effect> {
         match self.report() {
             Some(r) => vec![Effect::SaveSnapshot(Box::new(r.clone()))],
+            None if self.session.as_ref().is_some_and(|s| s.partial.is_some()) => {
+                self.set_info(
+                    "These are partial results. Press s again when the scan finishes to save it.",
+                );
+                Vec::new()
+            }
             None => {
                 self.set_info("Nothing to save yet: connect and wait for the scan to finish.");
                 Vec::new()
@@ -820,6 +868,7 @@ impl App {
             target: None,
             progress: None,
             phase: Phase::Connecting,
+            partial: None,
             report: None,
             history: History::Pending,
         });
@@ -1013,6 +1062,19 @@ impl App {
                     s.progress = Some(progress);
                 }
             }
+            Msg::ScanPartial { id, partial } => {
+                // Only while this session's scan runs: not before it is connected (a
+                // scan of the same entry that was replaced), not after it finished or
+                // failed.
+                let Some(s) = self.session.as_mut() else {
+                    return Vec::new();
+                };
+                if s.id != id || s.phase != Phase::Scanning || s.report.is_some() {
+                    return Vec::new();
+                }
+                self.patterns.tree = PatternTree::build(&partial.patterns, partial.sizes_available);
+                s.partial = Some(partial);
+            }
             Msg::ScanDone { id, report } => {
                 if !self.is_session(id) {
                     return Vec::new();
@@ -1030,6 +1092,7 @@ impl App {
                 if let Some(s) = self.session.as_mut() {
                     s.server = Some(report.server.clone());
                     s.phase = Phase::Done;
+                    s.partial = None;
                     s.report = Some(report);
                     s.history = History::Pending;
                 }
@@ -1070,6 +1133,11 @@ impl App {
                 }
                 if let Some(s) = self.session.as_mut() {
                     s.phase = Phase::Failed(error.clone());
+                    // Partial results of a failed scan must not stay up as if final.
+                    if s.partial.take().is_some() {
+                        self.patterns.tree = PatternTree::default();
+                        self.patterns.sel = 0;
+                    }
                 }
                 self.set_error(format!("Scan failed: {error}"));
             }
@@ -1187,6 +1255,245 @@ mod tests {
         for c in s.chars() {
             app.handle_key(ch(c));
         }
+    }
+
+    /// Connected to the first profile and scanning.
+    fn scanning() -> (App, ConnId) {
+        let mut app = App::new(fixtures::profiles());
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { id, .. }] = effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        app.apply(Msg::Connected {
+            id,
+            server: Some(fixtures::server()),
+            perms: fixtures::perms_ok(),
+            target: ScanTarget::Primary,
+        });
+        (app, id)
+    }
+
+    #[test]
+    fn partial_results_then_done_replaces_them() {
+        let (mut app, id) = scanning();
+        assert!(app.pattern_data().is_none());
+        let partial = fixtures::partial(true);
+        app.apply(Msg::ScanPartial {
+            id,
+            partial: partial.clone(),
+        });
+        let data = app.pattern_data().unwrap();
+        assert_eq!(data.partial, Some(&*partial));
+        assert_eq!(data.patterns, &partial.patterns[..]);
+        assert!(!app.pattern_rows().is_empty());
+        // Not a report: the TTL, Diff and Hot keys views keep waiting.
+        assert!(app.report().is_none());
+        assert!(app.ttl_rows().is_empty());
+        assert!(app.hot_keys_reason().is_none());
+
+        // Move down, then a newer partial with fewer patterns keeps the tree in step.
+        app.handle_key(key(KeyCode::Down));
+        let mut fewer = (*partial).clone();
+        fewer.patterns.truncate(1);
+        fewer.sampled = 6_400;
+        app.apply(Msg::ScanPartial {
+            id,
+            partial: Arc::new(fewer),
+        });
+        assert_eq!(app.pattern_data().unwrap().patterns.len(), 1);
+        assert_eq!(app.pattern_rows().len(), 1);
+
+        let report = fixtures::report(true);
+        app.apply(Msg::ScanDone {
+            id,
+            report: report.clone(),
+        });
+        let s = app.session.as_ref().unwrap();
+        assert!(s.partial.is_none());
+        let data = app.pattern_data().unwrap();
+        assert!(data.partial.is_none());
+        assert_eq!(data.patterns, &report.patterns[..]);
+        assert_eq!(
+            app.pattern_rows(),
+            PatternTree::build(&report.patterns, true).visible(
+                &report.patterns,
+                &HashSet::new(),
+                ""
+            )
+        );
+        // Now `s` saves the final report.
+        let effects = app.handle_key(ch('s'));
+        let [Effect::SaveSnapshot(r)] = &effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        assert_eq!(**r, report);
+
+        // A partial arriving after the scan finished is ignored.
+        app.apply(Msg::ScanPartial { id, partial });
+        assert!(app.session.as_ref().unwrap().partial.is_none());
+        assert_eq!(app.pattern_data().unwrap().patterns, &report.patterns[..]);
+    }
+
+    #[test]
+    fn snapshot_key_while_partial_shows_hint() {
+        let (mut app, id) = scanning();
+        app.apply(Msg::ScanPartial {
+            id,
+            partial: fixtures::partial(true),
+        });
+        // `s` does not save partial results, on any report view; it says why.
+        for view in ['1', '2', '3', '4'] {
+            app.handle_key(ch(view));
+            assert!(app.handle_key(ch('s')).is_empty(), "view {view}");
+            let notice = app.notice.clone().unwrap();
+            assert!(!notice.error);
+            assert_eq!(
+                notice.text,
+                "These are partial results. Press s again when the scan finishes to save it."
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_scan_drops_partial_results() {
+        // Pressing enter again on the same connection cancels its scan (the runtime
+        // aborts the task) and starts a new one under the same id.
+        let (mut app, id) = scanning();
+        app.apply(Msg::ScanPartial {
+            id,
+            partial: fixtures::partial(true),
+        });
+        app.handle_key(ch('0'));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { id: again, .. }] = effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        assert_eq!(again, id);
+        let s = app.session.as_ref().unwrap();
+        assert_eq!(s.phase, Phase::Connecting);
+        assert!(s.partial.is_none());
+        assert!(app.pattern_data().is_none());
+        assert!(app.patterns.tree.roots.is_empty());
+        // A partial the cancelled scan sent before it stopped arrives while the new
+        // one is still connecting: ignored.
+        app.apply(Msg::ScanPartial {
+            id,
+            partial: fixtures::partial(true),
+        });
+        assert!(app.pattern_data().is_none());
+        // The new scan's own partials show once it is connected.
+        app.apply(Msg::Connected {
+            id,
+            server: Some(fixtures::server()),
+            perms: fixtures::perms_ok(),
+            target: ScanTarget::Primary,
+        });
+        app.apply(Msg::ScanPartial {
+            id,
+            partial: fixtures::partial(false),
+        });
+        assert!(!app.pattern_data().unwrap().sizes_available);
+    }
+
+    #[test]
+    fn switching_profile_while_partial_drops_it() {
+        let (mut app, first) = scanning();
+        app.apply(Msg::ScanPartial {
+            id: first,
+            partial: fixtures::partial(true),
+        });
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(ch('0'));
+        app.handle_key(ch('j'));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { id: second, .. }] = effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        assert_ne!(second, first);
+        let s = app.session.as_ref().unwrap();
+        assert_eq!(s.profile.name, "staging-cache");
+        assert!(s.partial.is_none());
+        assert!(app.pattern_data().is_none());
+        assert!(app.patterns.tree.roots.is_empty());
+        assert_eq!(app.patterns.sel, 0);
+        app.apply(Msg::Connected {
+            id: second,
+            server: Some(fixtures::server()),
+            perms: fixtures::perms_ok(),
+            target: ScanTarget::Primary,
+        });
+        // The first profile's partials stay out even once the second is scanning.
+        app.apply(Msg::ScanPartial {
+            id: first,
+            partial: fixtures::partial(true),
+        });
+        assert!(app.pattern_data().is_none());
+    }
+
+    #[test]
+    fn partial_results_then_failure_clears_them() {
+        let (mut app, id) = scanning();
+        app.apply(Msg::ScanPartial {
+            id,
+            partial: fixtures::partial(true),
+        });
+        assert!(app.pattern_data().is_some());
+        app.apply(Msg::ScanFailed {
+            id,
+            error: "connection reset".into(),
+        });
+        let s = app.session.as_ref().unwrap();
+        assert_eq!(s.phase, Phase::Failed("connection reset".into()));
+        assert!(s.partial.is_none());
+        assert!(app.pattern_data().is_none());
+        assert!(app.pattern_rows().is_empty());
+        assert!(app.patterns.tree.roots.is_empty());
+        // Late partials of the failed scan stay out.
+        app.apply(Msg::ScanPartial {
+            id,
+            partial: fixtures::partial(true),
+        });
+        assert!(app.pattern_data().is_none());
+        // `s` has nothing to save.
+        assert!(app.handle_key(ch('s')).is_empty());
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .text
+                .starts_with("Nothing to save")
+        );
+    }
+
+    #[test]
+    fn stale_partial_results_are_ignored() {
+        let (mut app, id) = scanning();
+        // Another connection's id.
+        app.apply(Msg::ScanPartial {
+            id: id + 100,
+            partial: fixtures::partial(true),
+        });
+        assert!(app.pattern_data().is_none());
+
+        // Switch to the second profile: the first one's partials no longer apply, and
+        // the new session takes none until it is connected.
+        app.handle_key(ch('0'));
+        app.handle_key(ch('j'));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { id: second, .. }] = effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        assert_ne!(second, id);
+        app.apply(Msg::ScanPartial {
+            id,
+            partial: fixtures::partial(true),
+        });
+        app.apply(Msg::ScanPartial {
+            id: second,
+            partial: fixtures::partial(true),
+        });
+        assert!(app.pattern_data().is_none());
+        assert!(app.patterns.tree.roots.is_empty());
     }
 
     #[test]
