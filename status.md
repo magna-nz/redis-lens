@@ -19,9 +19,9 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 | Wave | Content | Agents | Branch → PR | State |
 |---|---|---|---|---|
 | 2 | Scanner and connections | implementer ×2 [sonnet] | `wave2/*` → `v0.1-core` | **done**, merged into `v0.1-core` |
-| 3 | TUI (Connections and Patterns views), `scan` command | implementer [opus] (TUI), implementer [sonnet] (`scan`), verifier [opus] | `wave3/tui`, `wave3/scan-cli` → `v0.1-core` → PR #2 | merged into `v0.1-core`; waiting on the verifier and CI |
-| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | implementer [sonnet] (engine), implementer [opus] (views), verifier [opus] | `v0.2-views` → PR #3 | pending |
-| 5 | Replica preference; README modelled on redis-near-cache (logo, badges, `vhs` GIF), CHANGELOG, demo polish | implementer [sonnet] ×2, verifier [opus] | `v0.2-polish` → PR #4 | pending |
+| 3 | TUI (Connections and Patterns views), `scan` command | implementer [opus] (TUI), implementer [sonnet] (`scan`), verifier [opus] | `wave3/tui`, `wave3/scan-cli` → `v0.1-core` → PR #6 | merged into `v0.1-core`; waiting on the verifier and CI |
+| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | implementer [sonnet] (engine), implementer [opus] (views), verifier [opus] | `v0.2-views` → next PR | pending |
+| 5 | Replica preference; README modelled on redis-near-cache (logo, badges, `vhs` GIF), CHANGELOG, demo polish | implementer [sonnet] ×2, verifier [opus] | `v0.2-polish` → next PR | pending |
 
 ### How to resume after a restart or compaction
 
