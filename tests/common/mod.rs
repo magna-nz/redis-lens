@@ -5,8 +5,38 @@ use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-pub const REDIS_IMAGE: (&str, &str) = ("redis", "7.4-alpine");
-pub const VALKEY_IMAGE: (&str, &str) = ("valkey/valkey", "8.1-alpine");
+/// Environment variable that overrides the Redis image, as `name:tag`
+/// (e.g. `redis:6.2-alpine`). Unset, the default is `redis:7.4-alpine`.
+pub const REDIS_IMAGE_ENV: &str = "REDIS_LENS_IT_REDIS_IMAGE";
+const DEFAULT_REDIS_IMAGE: (&str, &str) = ("redis", "7.4-alpine");
+
+/// The Redis image tests run against: `redis:7.4-alpine` unless `REDIS_LENS_IT_REDIS_IMAGE`
+/// overrides it. The tag is split off at the last `:` after the last `/`.
+pub fn redis_image() -> (String, String) {
+    match std::env::var(REDIS_IMAGE_ENV) {
+        Ok(v) if !v.trim().is_empty() => {
+            let v = v.trim();
+            let name_start = v.rfind('/').map_or(0, |i| i + 1);
+            match v[name_start..].rfind(':') {
+                Some(i) => (
+                    v[..name_start + i].to_string(),
+                    v[name_start + i + 1..].to_string(),
+                ),
+                None => panic!("{REDIS_IMAGE_ENV} must be `name:tag`, got `{v}`"),
+            }
+        }
+        _ => (
+            DEFAULT_REDIS_IMAGE.0.to_string(),
+            DEFAULT_REDIS_IMAGE.1.to_string(),
+        ),
+    }
+}
+
+const VALKEY_IMAGE: (&str, &str) = ("valkey/valkey", "8.1-alpine");
+
+fn valkey_image() -> (String, String) {
+    (VALKEY_IMAGE.0.to_string(), VALKEY_IMAGE.1.to_string())
+}
 
 pub struct TestServer {
     pub port: u16,
@@ -46,13 +76,13 @@ impl TestServer {
     }
 }
 
-async fn start(image: (&str, &str), server_bin: &str, args: &[&str]) -> TestServer {
+async fn start(image: (String, String), server_bin: &str, args: &[&str]) -> TestServer {
     start_on(image, server_bin, args, None).await
 }
 
 /// [`start`], publishing port 6379 on `host_port` when given.
 async fn start_on(
-    image: (&str, &str),
+    image: (String, String),
     server_bin: &str,
     args: &[&str],
     host_port: Option<u16>,
@@ -77,29 +107,29 @@ async fn start_on(
     TestServer { port, container }
 }
 
-/// Redis 7.4 with no auth.
+/// Redis with no auth (7.4 by default; see [`redis_image`]).
 pub async fn redis() -> TestServer {
-    start(REDIS_IMAGE, "redis-server", &[]).await
+    start(redis_image(), "redis-server", &[]).await
 }
 
 /// Valkey 8.1 with no auth.
 pub async fn valkey() -> TestServer {
-    start(VALKEY_IMAGE, "valkey-server", &[]).await
+    start(valkey_image(), "valkey-server", &[]).await
 }
 
-/// Redis 7.4 started with extra server arguments, e.g. `&["--maxmemory-policy", "allkeys-lfu"]`.
+/// Redis (7.4 by default, overridable) started with extra server arguments, e.g. `&["--maxmemory-policy", "allkeys-lfu"]`.
 ///
 /// Pass every word as its own argument. For an ACL user that is
 /// `&["--user", "lens", "on", ">pw", "~*", "+@all"]`; a single `"lens on >pw"` string
 /// becomes a username with spaces in it and Redis refuses to start.
 pub async fn redis_with(args: &[&str]) -> TestServer {
-    start(REDIS_IMAGE, "redis-server", args).await
+    start(redis_image(), "redis-server", args).await
 }
 
 /// Valkey 8.1 started with extra server arguments, e.g. `&["--maxmemory-policy", "allkeys-lfu"]`.
 /// Pass every word as its own argument, as for [`redis_with`].
 pub async fn valkey_with(args: &[&str]) -> TestServer {
-    start(VALKEY_IMAGE, "valkey-server", args).await
+    start(valkey_image(), "valkey-server", args).await
 }
 
 /// A port that is free on the host right now. Another process could grab it before it is
@@ -112,7 +142,7 @@ pub fn free_port() -> u16 {
         .port()
 }
 
-/// A replica of `primary` (Redis 7.4, or Valkey 8.1 when `valkey`) that tells its primary
+/// A replica of `primary` (Redis, 7.4 by default and overridable, or Valkey 8.1 when `valkey`) that tells its primary
 /// to list it as `127.0.0.1:<announce_port>`. With `None` it announces the port it is
 /// published on, so the host can reach it through the primary's `INFO replication`.
 pub async fn replica_of(
@@ -145,14 +175,14 @@ pub async fn replica_of_with(
     ];
     args.extend_from_slice(extra);
     let (image, bin) = if valkey {
-        (VALKEY_IMAGE, "valkey-server")
+        (valkey_image(), "valkey-server")
     } else {
-        (REDIS_IMAGE, "redis-server")
+        (redis_image(), "redis-server")
     };
     start_on(image, bin, &args, Some(host_port)).await
 }
 
-/// Redis 7.4 (or Valkey 8.1 when `valkey`) with extra server arguments.
+/// Redis (7.4 by default, overridable; or Valkey 8.1 when `valkey`) with extra server arguments.
 pub async fn server_with(valkey: bool, args: &[&str]) -> TestServer {
     if valkey {
         valkey_with(args).await
