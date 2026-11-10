@@ -2,6 +2,12 @@
 
 A Rust TUI (ratatui + crossterm, tokio) that profiles Redis and Valkey keyspaces.
 
+## Spec and status
+
+- `spec.md` is the source of truth for behaviour. When a change alters behaviour, update `spec.md` in the same change.
+- `status.md` tracks what is done, in progress and next. Update it whenever work lands, starts or gets blocked, and change its "Last updated" date.
+- Agents working on a single module report back instead of editing these two files; whoever merges their work updates them.
+
 ## Commands
 
 - `cargo build` / `cargo test`: unit tests, no Docker needed.
