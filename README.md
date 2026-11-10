@@ -185,7 +185,8 @@ holds the profile name, host, port, TLS setting and environment, and nothing sec
 logs, error text or snapshots.
 
 On macOS, a keychain entry is tied to the binary that wrote it. After an upgrade or a rebuild, macOS asks once
-whether redis-lens may use it. Choose **Always Allow**. Until you answer, connecting waits.
+whether redis-lens may use it. Choose **Always Allow**. Until you answer, connecting waits; after two seconds the
+TUI tells you it is waiting on the keychain.
 
 ## Least-privilege ACL user
 
@@ -213,6 +214,8 @@ missing permission.
   ... SAMPLES 5`, `OBJECT FREQ`) are pipelined in batches.
 - A command budget limits load. The default is no limit for `local` profiles and 5,000 commands per second for
   everything else. Change it with `--max-rate`.
+- With `conn add --prefer-replica`, scans run against an online replica found through `INFO replication`, so the
+  primary serves no scan traffic. If no replica is reachable, redis-lens scans the primary and says why.
 - Scans stop at 100,000 keys by default. Counts are then scaled up to estimates using `DBSIZE`. If the whole
   keyspace was seen, or `--match` is used, no scaling is applied.
 

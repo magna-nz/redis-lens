@@ -19,11 +19,17 @@ All notable changes to this project are documented here. The format follows
 - `--max-rate` on `scan` and `diff`. `0` means no limit.
 - Optional Microsoft Entra ID sign-in, behind the `entra-id` cargo feature (developer-tools credential).
 - `make gif`, a Makefile target that records the demo GIF.
+- Scan a replica instead of the primary: `conn add --prefer-replica`. redis-lens reads `INFO replication`, uses the
+  first online replica, and falls back to the primary (saying why) if it can't reach it.
+- The TUI says when it is waiting on the OS keychain, so a hidden macOS permission dialog doesn't look like a hang.
 
 ### Changed
 
 - Local profiles have no command budget by default. Other profiles keep 5,000 commands per second.
-- Documentation: a full README, a logo, and a changelog.
+- Documentation: a full README, a logo, a demo GIF, and a changelog.
+- Profile names starting with `docker:` are reserved for containers found by discovery.
+- A pattern that only appears after a sampled (partial) scan no longer counts as growing unless it passes the
+  usual 1 MiB / 5% threshold.
 
 ## [0.1.0] - unreleased
 
