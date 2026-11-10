@@ -40,6 +40,7 @@ impl TtlVerdict {
 /// Judge one pattern. `change` is its entry in a diff against the previous snapshot,
 /// if one exists. "Growing" means `delta_bytes` > max(1 MiB, 5% of before), or, without
 /// sizes, `delta_keys` > 5% of the keys before; `Cause::New` with no TTL also counts.
+/// `Cause::Unknown` (the other scan didn't look at these keys) never counts as growing.
 pub fn ttl_verdict(stats: &PatternStats, change: Option<&PatternDiff>) -> TtlVerdict {
     let ratio = stats.no_ttl_ratio();
     if ratio >= PERSISTENT {
@@ -68,8 +69,10 @@ fn short_lived(stats: &PatternStats) -> bool {
 
 fn is_growing(change: Option<&PatternDiff>) -> bool {
     let Some(c) = change else { return false };
-    if c.cause == Cause::New {
-        return true;
+    match c.cause {
+        Cause::New => return true,
+        Cause::Unknown => return false,
+        _ => {}
     }
     match c.delta_bytes {
         Some(d) => {
@@ -115,6 +118,17 @@ fn growth(change: Option<&PatternDiff>) -> Option<String> {
     }
 }
 
+/// "All 100 keys never expire" when every sampled key has no TTL, otherwise
+/// "97% of the 100 keys never expire". The share is capped at 99% below 100%.
+fn persistent_share(stats: &PatternStats, keys: &str) -> String {
+    if stats.sampled_keys > 0 && stats.no_ttl >= stats.sampled_keys {
+        format!("All {keys} keys never expire")
+    } else {
+        let share = format::percent(stats.no_ttl_ratio().min(0.99));
+        format!("{share} of the {keys} keys never expire")
+    }
+}
+
 /// One or two plain sentences explaining the verdict for the detail panel.
 pub fn explain(stats: &PatternStats, change: Option<&PatternDiff>) -> Vec<String> {
     let keys = format::count(stats.est_keys);
@@ -122,7 +136,8 @@ pub fn explain(stats: &PatternStats, change: Option<&PatternDiff>) -> Vec<String
     match ttl_verdict(stats, change) {
         TtlVerdict::PersistentGrowing => {
             let mut v = vec![format!(
-                "All {keys} keys never expire and the pattern is growing."
+                "{} and the pattern is growing.",
+                persistent_share(stats, &keys)
             )];
             v.extend(growth(change));
             v.push("This is probably a leak: nothing ever removes these keys.".to_string());
@@ -139,13 +154,16 @@ pub fn explain(stats: &PatternStats, change: Option<&PatternDiff>) -> Vec<String
             ]
         }
         TtlVerdict::PersistentStable => {
-            let history = if change.is_some() {
-                "is not growing"
-            } else {
-                "has no earlier snapshot to compare with"
+            let history = match change.map(|c| c.cause) {
+                Some(Cause::Unknown) => "was not in the earlier scan, which used a different MATCH",
+                Some(_) => "is not growing",
+                None => "has no earlier snapshot to compare with",
             };
             vec![
-                format!("All {keys} keys never expire and the pattern {history}."),
+                format!(
+                    "{} and the pattern {history}.",
+                    persistent_share(stats, &keys)
+                ),
                 "This looks intentional.".to_string(),
             ]
         }
@@ -307,6 +325,41 @@ mod tests {
         assert!(TtlVerdict::ShortLived < TtlVerdict::Ok);
         assert!(TtlVerdict::MixedLikelyBug.is_warning());
         assert!(!TtlVerdict::PersistentStable.is_warning());
+    }
+
+    #[test]
+    fn all_only_at_one_hundred_percent() {
+        let s = stats(100, 97, [97, 0, 0, 0, 3, 0, 0]);
+        let t = explain(&s, None).join(" ");
+        assert!(
+            t.starts_with("97% of the 100 keys never expire and the pattern has no earlier"),
+            "{t}"
+        );
+        // 999 of 1000 rounds to 100%, but it isn't all of them.
+        let s = stats(1000, 999, [999, 1, 0, 0, 0, 0, 0]);
+        let t = explain(&s, None).join(" ");
+        assert!(t.starts_with("99% of the 1.0K keys never expire"), "{t}");
+        let grew = change(Cause::MoreKeys, None, None, 60);
+        let t = explain(&s, Some(&grew)).join(" ");
+        assert!(
+            t.starts_with("99% of the 1.0K keys never expire and the pattern is growing."),
+            "{t}"
+        );
+        let t = explain(&persistent(), None).join(" ");
+        assert!(t.starts_with("All 100 keys never expire"), "{t}");
+    }
+
+    #[test]
+    fn unknown_is_never_growing() {
+        let mut unsure = change(Cause::Unknown, None, Some(50 * MB as i64), 1000);
+        unsure.keys_before = None;
+        assert_eq!(
+            ttl_verdict(&persistent(), Some(&unsure)),
+            TtlVerdict::PersistentStable
+        );
+        let t = explain(&persistent(), Some(&unsure)).join(" ");
+        assert!(!t.contains("grew") && !t.contains("new since"), "{t}");
+        assert!(t.contains("different MATCH"), "{t}");
     }
 
     #[test]

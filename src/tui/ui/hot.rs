@@ -14,6 +14,8 @@ use super::{notice_panels, report_or_wait, split_body, style};
 
 /// A hot key at least this big is flagged.
 pub const HOT_BIG: u64 = 10 * 1024 * 1024;
+/// A key needs at least this LFU counter to count as hot for the hot+big flag.
+pub const HOT_FREQ: u8 = 100;
 
 const PATTERN_W: usize = 24;
 const TYPE_W: usize = 8;
@@ -28,7 +30,7 @@ fn key_width(inner: usize) -> usize {
 }
 
 fn is_hot_big(k: &KeySample) -> bool {
-    k.bytes.is_some_and(|b| b >= HOT_BIG)
+    k.bytes.is_some_and(|b| b >= HOT_BIG) && k.lfu_freq.is_some_and(|f| f >= HOT_FREQ)
 }
 
 fn policy(report: &ScanReport) -> String {
@@ -172,4 +174,34 @@ fn detail_panel(frame: &mut Frame, area: Rect, k: &KeySample) {
         )));
     }
     rows(frame, inner, lines, None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::KeyType;
+
+    fn key(bytes: u64, freq: u8) -> KeySample {
+        KeySample {
+            key: "k".into(),
+            key_type: KeyType::List,
+            bytes: Some(bytes),
+            ttl: Ttl::Persistent,
+            lfu_freq: Some(freq),
+        }
+    }
+
+    #[test]
+    fn hot_big_needs_both() {
+        assert!(is_hot_big(&key(HOT_BIG, HOT_FREQ)));
+        assert!(is_hot_big(&key(600 * 1024 * 1024, 243)));
+        // Big but barely read.
+        assert!(!is_hot_big(&key(600 * 1024 * 1024, 5)));
+        assert!(!is_hot_big(&key(HOT_BIG, HOT_FREQ - 1)));
+        // Hot but small.
+        assert!(!is_hot_big(&key(HOT_BIG - 1, 255)));
+        let mut unknown = key(HOT_BIG, 255);
+        unknown.bytes = None;
+        assert!(!is_hot_big(&unknown));
+    }
 }

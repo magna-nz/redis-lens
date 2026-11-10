@@ -66,3 +66,9 @@ pub async fn valkey() -> TestServer {
 pub async fn redis_with(args: &[&str]) -> TestServer {
     start(REDIS_IMAGE, "redis-server", args).await
 }
+
+/// Valkey 8.1 started with extra server arguments, e.g. `&["--maxmemory-policy", "allkeys-lfu"]`.
+/// Pass every word as its own argument, as for [`redis_with`].
+pub async fn valkey_with(args: &[&str]) -> TestServer {
+    start(VALKEY_IMAGE, "valkey-server", args).await
+}

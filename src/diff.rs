@@ -10,14 +10,34 @@ pub enum Cause {
     New,
     /// Not in the newer report.
     Gone,
-    /// The key count changed more than the average size did.
+    /// The key count changed more than the average size did, compared as log ratios.
+    /// The direction follows `delta_bytes` (or `delta_keys` without sizes).
     MoreKeys,
     FewerKeys,
-    /// The average size changed more than the key count did.
+    /// The average size changed more than the key count did, compared as log ratios.
     BiggerValues,
     SmallerValues,
-    /// Changed by less than 1% and less than 64 KiB (or 1% of keys when sizes are unavailable).
+    /// Changed by less than 1% or less than 64 KiB (or 1% of keys when sizes are unavailable).
     Unchanged,
+    /// In only one report, but the two reports didn't look at the same keys (a different
+    /// `MATCH` glob), so it can't be called new or gone.
+    Unknown,
+}
+
+impl Cause {
+    /// Lower-case words for tables, e.g. `more keys`.
+    pub fn words(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Gone => "gone",
+            Self::MoreKeys => "more keys",
+            Self::FewerKeys => "fewer keys",
+            Self::BiggerValues => "bigger values",
+            Self::SmallerValues => "smaller values",
+            Self::Unchanged => "unchanged",
+            Self::Unknown => "not in the other scan",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -28,8 +48,9 @@ pub struct PatternDiff {
     /// `None` when that report had no sizes.
     pub bytes_before: Option<u64>,
     pub bytes_after: Option<u64>,
-    /// `bytes_after - bytes_before`, treating a missing side as 0. `None` when either
-    /// report lacks sizes.
+    /// `bytes_after - bytes_before`, treating a pattern missing from one report as 0.
+    /// `None` when either report lacks sizes, or when the pattern is in both reports but
+    /// one of them has no size for it. Saturates at the `i64` range.
     pub delta_bytes: Option<i64>,
     pub delta_keys: i64,
     pub cause: Cause,
@@ -51,9 +72,19 @@ impl ReportDiff {
     }
 }
 
+/// `a - b` without overflow, clamped to the `i64` range.
+pub fn sub(a: u64, b: u64) -> i64 {
+    let d = i128::from(a) - i128::from(b);
+    d.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
 /// Compare an older report with a newer one, matching patterns by name.
+///
+/// A pattern in only one report is `New` or `Gone` when both reports saw the whole
+/// keyspace or used the same `MATCH` glob; otherwise it is `Unknown`.
 pub fn diff(before: &ScanReport, after: &ScanReport) -> ReportDiff {
     let sizes = before.sizes_available && after.sizes_available;
+    let comparable = (before.complete && after.complete) || before.match_glob == after.match_glob;
     let mut names: Vec<&str> = before
         .patterns
         .iter()
@@ -68,7 +99,7 @@ pub fn diff(before: &ScanReport, after: &ScanReport) -> ReportDiff {
         .map(|name| {
             let b = before.patterns.iter().find(|p| p.pattern == name);
             let a = after.patterns.iter().find(|p| p.pattern == name);
-            pattern_diff(name, b, a, sizes)
+            pattern_diff(name, b, a, sizes, comparable)
         })
         .collect();
     let magnitude = |p: &PatternDiff| match p.delta_bytes {
@@ -94,6 +125,7 @@ fn pattern_diff(
     b: Option<&PatternStats>,
     a: Option<&PatternStats>,
     sizes: bool,
+    comparable: bool,
 ) -> PatternDiff {
     let keys_before = b.map(|p| p.est_keys);
     let keys_after = a.map(|p| p.est_keys);
@@ -107,10 +139,13 @@ fn pattern_diff(
     } else {
         None
     };
-    let delta_bytes =
-        sizes.then(|| bytes_after.unwrap_or(0) as i64 - bytes_before.unwrap_or(0) as i64);
-    let delta_keys = keys_after.unwrap_or(0) as i64 - keys_before.unwrap_or(0) as i64;
+    // A side is known when the pattern is absent (0) or present with a size.
+    let known = |p: Option<&PatternStats>, bytes: Option<u64>| p.is_none() || bytes.is_some();
+    let delta_bytes = (sizes && known(b, bytes_before) && known(a, bytes_after))
+        .then(|| sub(bytes_after.unwrap_or(0), bytes_before.unwrap_or(0)));
+    let delta_keys = sub(keys_after.unwrap_or(0), keys_before.unwrap_or(0));
     let cause = match (b, a) {
+        (None, _) | (_, None) if !comparable => Cause::Unknown,
         (None, _) => Cause::New,
         (_, None) => Cause::Gone,
         (Some(_), Some(_)) => classify(
@@ -132,9 +167,13 @@ fn pattern_diff(
 }
 
 /// The cause for a pattern present in both reports.
+///
+/// Memory is keys × average size, so `ln(bytes ratio) = ln(keys ratio) + ln(avg ratio)`.
+/// Whichever term is larger in magnitude explains the change, and the direction always
+/// follows the sign of the byte change.
 fn classify(kb: u64, ka: u64, bytes: Option<(u64, u64)>) -> Cause {
     const FLOOR_BYTES: f64 = 64.0 * 1024.0;
-    let dk = ka as i64 - kb as i64;
+    let dk = sub(ka, kb);
     let Some((bb, ba)) = bytes else {
         if (dk.unsigned_abs() as f64) < (kb as f64 * 0.01).max(1.0) {
             return Cause::Unchanged;
@@ -145,40 +184,36 @@ fn classify(kb: u64, ka: u64, bytes: Option<(u64, u64)>) -> Cause {
             Cause::FewerKeys
         };
     };
-    let db = ba as i64 - bb as i64;
+    let db = sub(ba, bb);
     if (db.unsigned_abs() as f64) < (bb as f64 * 0.01).max(FLOOR_BYTES) {
         return Cause::Unchanged;
     }
-    let keys_cause = if dk > 0 {
+    let grew = db > 0;
+    let keys_cause = if grew {
         Cause::MoreKeys
     } else {
         Cause::FewerKeys
     };
-    let size_cause = if db > 0 {
+    let size_cause = if grew {
         Cause::BiggerValues
     } else {
         Cause::SmallerValues
     };
+    if dk == 0 {
+        return size_cause;
+    }
     if kb == 0 || ka == 0 {
         // No average size on one side: the key count is what changed.
-        return if dk != 0 { keys_cause } else { size_cause };
+        return keys_cause;
     }
-    let rel_keys = ka as f64 / kb as f64 - 1.0;
-    let rel_avg = (ba as f64 / ka as f64) / (bb as f64 / kb as f64).max(f64::MIN_POSITIVE) - 1.0;
-    if rel_keys.abs() >= rel_avg.abs() {
-        if dk == 0 { size_cause } else { keys_cause }
+    let ln_keys = (ka as f64 / kb as f64).ln();
+    let ln_bytes = (ba as f64 / bb as f64).ln();
+    let ln_avg = ln_bytes - ln_keys;
+    // A side with 0 bytes makes `ln_avg` infinite: then the size is what changed.
+    if ln_keys.abs() >= ln_avg.abs() {
+        keys_cause
     } else {
-        size_cause_by(rel_avg, size_cause)
-    }
-}
-
-fn size_cause_by(rel_avg: f64, fallback: Cause) -> Cause {
-    if rel_avg > 0.0 {
-        Cause::BiggerValues
-    } else if rel_avg < 0.0 {
-        Cause::SmallerValues
-    } else {
-        fallback
+        size_cause
     }
 }
 
@@ -224,6 +259,8 @@ mod tests {
             patterns,
             sizes_available: sizes,
             hot_keys: vec![],
+            complete: false,
+            match_glob: None,
         }
     }
 
@@ -386,6 +423,129 @@ mod tests {
         let order: Vec<_> = d.patterns.iter().map(|p| p.pattern.as_str()).collect();
         assert_eq!(order, ["c", "a", "b"]);
         assert_eq!(d.used_memory_before, 10);
+    }
+
+    #[test]
+    fn cause_direction_follows_memory() {
+        // Keys up 60%, memory down 20%: the average size halved, which explains it.
+        let d = one(
+            stats("a", 1000, Some(10 * MB)),
+            stats("a", 1600, Some(8 * MB)),
+            true,
+        );
+        assert_eq!(d.cause, Cause::SmallerValues);
+        assert!(d.delta_bytes.unwrap() < 0);
+        // The mirror image: keys down, memory up.
+        let d = one(
+            stats("a", 1600, Some(8 * MB)),
+            stats("a", 1000, Some(10 * MB)),
+            true,
+        );
+        assert_eq!(d.cause, Cause::BiggerValues);
+        // Every combination agrees with the sign of the byte change.
+        for kb in [1u64, 10, 999, 1000, 5000] {
+            for ka in [1u64, 10, 999, 1600, 9000] {
+                for (bb, ba) in [
+                    (10 * MB, 8 * MB),
+                    (8 * MB, 10 * MB),
+                    (MB, 40 * MB),
+                    (40 * MB, MB),
+                ] {
+                    let c = one(stats("a", kb, Some(bb)), stats("a", ka, Some(ba)), true).cause;
+                    if ba > bb {
+                        assert!(
+                            matches!(c, Cause::MoreKeys | Cause::BiggerValues),
+                            "{kb}->{ka} {bb}->{ba}: {c:?}"
+                        );
+                    } else {
+                        assert!(
+                            matches!(c, Cause::FewerKeys | Cause::SmallerValues),
+                            "{kb}->{ka} {bb}->{ba}: {c:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn huge_values_do_not_overflow() {
+        let big = 1u64 << 63;
+        for (b, a) in [(0, big), (big, 0), (0, u64::MAX), (u64::MAX, 0), (big, big)] {
+            let d = one(stats("a", b, Some(b)), stats("a", a, Some(a)), true);
+            let expect = (i128::from(a) - i128::from(b))
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+            assert_eq!(d.delta_bytes, Some(expect));
+            assert_eq!(d.delta_keys, expect);
+            let d = one(stats("a", b, None), stats("a", a, None), false);
+            assert_eq!(d.delta_keys, expect);
+        }
+        let d = diff(
+            &report(vec![], true),
+            &report(vec![stats("a", big, Some(u64::MAX))], true),
+        );
+        assert_eq!(d.patterns[0].delta_bytes, Some(i64::MAX));
+        assert_eq!(d.patterns[0].delta_keys, i64::MAX);
+    }
+
+    #[test]
+    fn missing_size_on_one_side_has_no_delta() {
+        let d = one(stats("a", 10, None), stats("a", 20, Some(MB)), true);
+        assert_eq!(d.delta_bytes, None);
+        assert_eq!(d.bytes_after, Some(MB));
+        assert_eq!(d.cause, Cause::MoreKeys);
+        let d = one(stats("a", 10, Some(MB)), stats("a", 20, None), true);
+        assert_eq!(d.delta_bytes, None);
+        // A pattern absent from one report still counts that side as 0.
+        let d = diff(
+            &report(vec![], true),
+            &report(vec![stats("a", 5, Some(MB))], true),
+        );
+        assert_eq!(d.patterns[0].delta_bytes, Some(MB as i64));
+    }
+
+    #[test]
+    fn new_and_gone_need_comparable_scans() {
+        let with = |glob: Option<&str>, complete: bool, p: Vec<PatternStats>| {
+            let mut r = report(p, true);
+            r.match_glob = glob.map(str::to_string);
+            r.complete = complete;
+            r
+        };
+        let old = || vec![stats("user:{id}", 10, Some(MB)), stats("old", 10, Some(MB))];
+        let new = || {
+            vec![
+                stats("user:{id}", 10, Some(MB)),
+                stats("fresh", 5, Some(MB)),
+            ]
+        };
+        // A MATCH scan compared with a full one: unsure.
+        let d = diff(
+            &with(Some("user:*"), false, old()),
+            &with(None, true, new()),
+        );
+        assert_eq!(d.pattern("fresh").unwrap().cause, Cause::Unknown);
+        assert_eq!(d.pattern("old").unwrap().cause, Cause::Unknown);
+        assert_eq!(d.pattern("user:{id}").unwrap().cause, Cause::Unchanged);
+        let d = diff(
+            &with(None, true, old()),
+            &with(Some("order:*"), false, new()),
+        );
+        assert_eq!(d.pattern("fresh").unwrap().cause, Cause::Unknown);
+        // The same glob, or two complete scans, can tell.
+        let d = diff(
+            &with(Some("u*"), false, old()),
+            &with(Some("u*"), false, new()),
+        );
+        assert_eq!(d.pattern("fresh").unwrap().cause, Cause::New);
+        assert_eq!(d.pattern("old").unwrap().cause, Cause::Gone);
+        let d = diff(&with(None, true, old()), &with(None, true, new()));
+        assert_eq!(d.pattern("fresh").unwrap().cause, Cause::New);
+        assert_eq!(Cause::Unknown.words(), "not in the other scan");
+        assert_eq!(
+            serde_json::to_string(&Cause::Unknown).unwrap(),
+            "\"unknown\""
+        );
     }
 
     #[test]

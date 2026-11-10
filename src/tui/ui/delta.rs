@@ -109,15 +109,7 @@ pub fn signed_percent(r: f64) -> String {
 }
 
 pub fn cause_words(c: Cause) -> &'static str {
-    match c {
-        Cause::New => "new",
-        Cause::Gone => "gone",
-        Cause::MoreKeys => "more keys",
-        Cause::FewerKeys => "fewer keys",
-        Cause::BiggerValues => "bigger values",
-        Cause::SmallerValues => "smaller values",
-        Cause::Unchanged => "unchanged",
-    }
+    c.words()
 }
 
 #[cfg(test)]

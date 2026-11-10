@@ -437,6 +437,8 @@ pub fn report(sizes: bool) -> ScanReport {
         patterns,
         sizes_available: sizes,
         hot_keys: Vec::new(),
+        complete: false,
+        match_glob: None,
     }
 }
 

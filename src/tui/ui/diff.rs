@@ -84,7 +84,7 @@ fn header(d: &ReportDiff) -> String {
         format_utc(d.before_taken_at_unix),
         format::bytes(b),
         format::bytes(a),
-        signed_bytes(a as i64 - b as i64)
+        signed_bytes(crate::diff::sub(a, b))
     )
 }
 
@@ -156,6 +156,9 @@ fn sides(p: &PatternDiff) -> (Option<u64>, Option<u64>, Fmt) {
 
 /// The relative change, `new` without a before, or `—` when before was empty.
 fn percent_text(p: &PatternDiff, before: Option<u64>, after: Option<u64>) -> String {
+    if p.cause == Cause::Unknown {
+        return "—".to_string();
+    }
     if p.cause == Cause::New || before.is_none() {
         return "new".to_string();
     }
@@ -267,10 +270,13 @@ fn cause_sentence(p: &PatternDiff) -> (&'static str, Style) {
             "The change comes mostly from smaller values; the key count moved less."
         }
         Cause::Unchanged => "No meaningful change.",
+        Cause::Unknown => {
+            "Not in the other scan, which used a different MATCH, so it may not be new or gone."
+        }
     };
     let st = match p.cause {
         Cause::Gone => style::ok(),
-        Cause::Unchanged => style::dim(),
+        Cause::Unchanged | Cause::Unknown => style::dim(),
         _ => c.style(),
     };
     (text, st)
@@ -320,4 +326,20 @@ fn detail_panel(frame: &mut Frame, area: Rect, p: &PatternDiff) {
         )));
     }
     rows(frame, inner, lines, None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_survives_huge_memory() {
+        let mut d = crate::tui::fixtures::history(true);
+        d.used_memory_before = 0;
+        d.used_memory_after = u64::MAX;
+        assert!(header(&d).contains("(+"));
+        d.used_memory_before = 1 << 63;
+        d.used_memory_after = 0;
+        assert!(header(&d).contains("(-"));
+    }
 }

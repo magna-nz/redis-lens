@@ -356,11 +356,11 @@ async fn fetch_batch<C: ConnectionLike + Send>(
 /// How many hot keys a report keeps.
 const HOT_KEY_LIMIT: usize = 50;
 
-/// The sampled keys that have an LFU counter: highest first, ties by key, top 50.
+/// The sampled keys with an LFU counter above 0: highest first, ties by key, top 50.
 pub fn hot_keys(samples: &[KeySample]) -> Vec<KeySample> {
     let mut hot: Vec<KeySample> = samples
         .iter()
-        .filter(|s| s.lfu_freq.is_some())
+        .filter(|s| s.lfu_freq.is_some_and(|f| f > 0))
         .cloned()
         .collect();
     hot.sort_by(|a, b| b.lfu_freq.cmp(&a.lfu_freq).then_with(|| a.key.cmp(&b.key)));
@@ -412,6 +412,8 @@ pub async fn scan<C: ConnectionLike + Send>(
         outcome.complete,
         opts.match_glob.is_some(),
     );
+    // With MATCH the walk only looks at matching keys, so it never saw the whole database.
+    let complete = outcome.complete && opts.match_glob.is_none();
     let samples = outcome.samples;
 
     let taken_at_unix = SystemTime::now()
@@ -425,6 +427,8 @@ pub async fn scan<C: ConnectionLike + Send>(
         patterns: crate::pattern::aggregate(&samples, scale),
         sizes_available: with_sizes,
         hot_keys: hot_keys(&samples),
+        complete,
+        match_glob: opts.match_glob.clone(),
     })
 }
 
@@ -452,7 +456,8 @@ mod tests {
             sample("zero", Some(0)),
         ];
         let keys: Vec<_> = hot_keys(&samples).into_iter().map(|s| s.key).collect();
-        assert_eq!(keys, ["z", "a", "b", "zero"]);
+        // A counter of 0 means the key hasn't been read since its counter decayed.
+        assert_eq!(keys, ["z", "a", "b"]);
     }
 
     #[test]
