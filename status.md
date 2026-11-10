@@ -19,8 +19,8 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 | Wave | Content | Agents | Branch → PR | State |
 |---|---|---|---|---|
 | 2 | Scanner and connections | implementer ×2 [sonnet] | `wave2/*` → `v0.1-core` | **done**, merged into `v0.1-core` |
-| 3 | TUI (Connections and Patterns views), `scan` command | implementer [opus] (TUI), implementer [sonnet] (`scan`), verifier [opus] | `wave3/tui`, `wave3/scan-cli` → `v0.1-core` → PR #6 | **verifier BLOCKED** (unmasked StackExchange passwords with spaces; scale collapsing to 1 when keys vanish), plus should-fixes. Fix agent [opus] working on `wave3/fixes` in `.claude/worktrees/v01fix`; then re-verify, merge into `v0.1-core`, and merge `v0.1-core` into `v0.2-views` |
-| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | implementer [sonnet] (engine), then implementer [opus] (views), verifier [opus] | `wave4/engine`, `wave4/views` → `v0.2-views` → next PR | engine merged into `v0.2-views`; the views agent is running in `.claude/worktrees/views` |
+| 3 | TUI (Connections and Patterns views), `scan` command, verifier fixes | implementer [opus] ×2, implementer [sonnet], verifier [opus] | `v0.1-core` → PR #6 | **verifier PASS** after fixes (fadc85a); merge once CI is green |
+| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | implementer [sonnet], implementer [opus], verifier [opus] | `v0.2-views` (includes the v0.1 fixes) → PR after #6 merges | engine and views merged; 177 unit and 38 integration tests pass; checked in a real terminal against the demo; **verifier running** in `.claude/worktrees/verify4` |
 | 5 | Replica preference; README modelled on redis-near-cache (logo, badges, `vhs` GIF), CHANGELOG, demo polish | implementer [sonnet] ×2, verifier [opus] | `v0.2-polish` → next PR | pending |
 
 ### How to resume after a restart or compaction
@@ -73,6 +73,8 @@ See the overnight table above.
 - Decide whether to publish a placeholder 0.0.1 to reserve the crate name early.
 
 ## Known issues and notes
+
+- **macOS keychain prompt after rebuilds.** Keychain entries are tied to the binary that wrote them. A rebuilt or upgraded binary has to ask macOS for access, and until someone answers the dialog, connecting hangs. Wave 5: add a README note (click "Always Allow") and a TUI hint when a keychain read takes more than 2 s.
 
 - **Lesson:** never switch the main checkout's branch while an agent is reading it. Do all work in worktrees.
 
