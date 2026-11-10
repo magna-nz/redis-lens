@@ -11,3 +11,6 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The @1.89 pin is the MSRV. Do not bump it.
+      - dependency-name: "dtolnay/rust-toolchain"

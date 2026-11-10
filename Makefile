@@ -1,6 +1,6 @@
 DEMO := docker compose -f demo/compose.yml
 
-.PHONY: help build test it lint fmt demo-up demo-seed demo-profiles demo demo-down
+.PHONY: help build test it lint fmt demo-up demo-seed demo-profiles demo demo-down gif
 
 help:
 	@echo "make build          build a release binary"
@@ -10,6 +10,7 @@ help:
 	@echo "make demo-up        start and seed the demo Redis (6390) and Valkey (6391)"
 	@echo "make demo           demo-up, save the demo connections, open the TUI"
 	@echo "make demo-down      stop the demo and delete its data"
+	@echo "make gif            record docs/demo.gif from demo/gif-steps.json (needs the demo up, python3 and agg)"
 
 build:
 	cargo build --release --locked
@@ -42,3 +43,9 @@ demo: demo-up demo-profiles
 
 demo-down:
 	$(DEMO) down -v
+
+# Needs the demo servers up (make demo-up), a release build, and agg (https://github.com/asciinema/agg).
+# demo/gif-steps.json lists the keystrokes to replay.
+gif: build
+	python3 demo/record.py demo/demo.cast demo/gif-steps.json -- ./target/release/redis-lens
+	agg demo/demo.cast docs/demo.gif
