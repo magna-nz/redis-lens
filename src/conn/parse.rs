@@ -275,7 +275,42 @@ fn mask_uri_userinfo(s: &str) -> String {
     {
         return format!("{}{}{}", &s[..start + colon + 1], MASK, &rest[at..]);
     }
+    // Half-typed input such as `rediss://user:pass` has no '@' yet, so `user:pass` looks
+    // like `host:port`. Mask whatever follows the colon unless it could be a port.
+    if !rest.contains('@')
+        && let Some(colon) = rest.find(':')
+    {
+        let after = &rest[colon + 1..];
+        let end = after.find(['/', '?', ',']).unwrap_or(after.len());
+        let candidate = &after[..end];
+        let looks_like_port = !candidate.is_empty()
+            && candidate.len() <= 5
+            && candidate.bytes().all(|b| b.is_ascii_digit());
+        if !candidate.is_empty() && !looks_like_port {
+            return format!("{}{}{}", &s[..start + colon + 1], MASK, &after[end..]);
+        }
+    }
     s.to_string()
+}
+
+#[cfg(test)]
+mod partial_mask_tests {
+    use super::mask;
+
+    #[test]
+    fn half_typed_password_is_masked() {
+        assert_eq!(mask("rediss://user:Sup3rS3cret"), "rediss://user:******");
+        assert_eq!(mask("rediss://user:Sup3r"), "rediss://user:******");
+        assert!(!mask("redis://lens:pw/0").contains("pw"));
+    }
+
+    #[test]
+    fn host_and_port_are_left_alone() {
+        assert_eq!(mask("redis://localhost:6379"), "redis://localhost:6379");
+        assert_eq!(mask("redis://localhost:6379/0"), "redis://localhost:6379/0");
+        assert_eq!(mask("redis://localhost:"), "redis://localhost:");
+        assert_eq!(mask("redis://localhost"), "redis://localhost");
+    }
 }
 
 /// `password=VALUE` (StackExchange or URI query) -> `password=******`.
