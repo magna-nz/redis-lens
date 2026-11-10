@@ -19,7 +19,7 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 | Wave | Content | Agents | Branch → PR | State |
 |---|---|---|---|---|
 | 2 | Scanner and connections | implementer ×2 [sonnet] | `wave2/*` → `v0.1-core` | **done**, merged into `v0.1-core` |
-| 3 | TUI (Connections and Patterns views), `scan` command | implementer [opus] (TUI), implementer [sonnet] (`scan`), verifier [opus] | `wave3/tui`, `wave3/scan-cli` → `v0.1-core` → PR #6 | merged into `v0.1-core`; waiting on the verifier and CI |
+| 3 | TUI (Connections and Patterns views), `scan` command | implementer [opus] (TUI), implementer [sonnet] (`scan`), verifier [opus] | `wave3/tui`, `wave3/scan-cli` → `v0.1-core` → PR #6 | **verifier BLOCKED** (unmasked StackExchange passwords with spaces; scale collapsing to 1 when keys vanish), plus should-fixes. Fix agent [opus] working on `wave3/fixes` in `.claude/worktrees/v01fix`; then re-verify, merge into `v0.1-core`, and merge `v0.1-core` into `v0.2-views` |
 | 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | implementer [sonnet] (engine), then implementer [opus] (views), verifier [opus] | `wave4/engine`, `wave4/views` → `v0.2-views` → next PR | engine merged into `v0.2-views`; the views agent is running in `.claude/worktrees/views` |
 | 5 | Replica preference; README modelled on redis-near-cache (logo, badges, `vhs` GIF), CHANGELOG, demo polish | implementer [sonnet] ×2, verifier [opus] | `v0.2-polish` → next PR | pending |
 
@@ -73,6 +73,8 @@ See the overnight table above.
 - Decide whether to publish a placeholder 0.0.1 to reserve the crate name early.
 
 ## Known issues and notes
+
+- **Lesson:** never switch the main checkout's branch while an agent is reading it. Do all work in worktrees.
 
 - **`vhs` doesn't work here.** It drives headless Chromium, which produces no output, and turning off its browser sandbox was refused. Use `demo/record.py` with `agg` for GIFs instead.
 - **The Patterns view stays empty while a scan runs.** Showing partial results is a follow-up.
