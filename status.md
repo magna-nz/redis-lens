@@ -19,9 +19,9 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 | Wave | Content | Agents | Branch → PR | State |
 |---|---|---|---|---|
 | 2 | Scanner and connections | implementer ×2 [sonnet] | `wave2/*` → `v0.1-core` | **done**, merged into `v0.1-core` |
-| 3 | TUI (Connections and Patterns views), `scan` command, verifier fixes | implementer [opus] ×2, implementer [sonnet], verifier [opus] | `v0.1-core` → PR #6 | **verifier PASS** after fixes (fadc85a); merge once CI is green |
-| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | implementer [sonnet], implementer [opus], verifier [opus] | `v0.2-views` (includes the v0.1 fixes) → PR after #6 merges | engine and views merged; 177 unit and 38 integration tests pass; checked in a real terminal against the demo; **verifier running** in `.claude/worktrees/verify4` |
-| 5 | Replica preference; README modelled on redis-near-cache (logo, badges, `vhs` GIF), CHANGELOG, demo polish | implementer [sonnet] ×2, verifier [opus] | `v0.2-polish` → next PR | pending |
+| 3 | TUI (Connections and Patterns views), `scan` command, verifier fixes | | `v0.1-core` → PR #6 | **done**: verified, CI green, merged into main (6dc45c6) |
+| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | | `v0.2-views` → PR after the fixes | verifier **BLOCKED** (snapshot directories collide across profiles) plus should-fixes; fix agent [opus] on `wave4/fixes` (`.claude/worktrees/v02fix`), then re-verify and open the PR |
+| 5 | README (redis-near-cache style, logo, badges), CHANGELOG, Dependabot ignore for the MSRV pin, `make gif`; then the GIF, replica preference, and the keychain-wait hint | implementer [sonnet] (docs, running on `wave5/docs`), then more | `v0.2-polish` | docs agent running; GIF, replicas and the keychain hint wait for the wave 4 fixes |
 
 ### How to resume after a restart or compaction
 
