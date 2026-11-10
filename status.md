@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** v0.2 done on main; next is v0.3 (cluster) or the feature ideas below
-**Last updated:** 2026-11-11 (overnight run complete: waves 2 to 5 merged)
+**Current milestone:** v0.2 done on main; wave 6 (bug fixes and rough edges) in progress; then v0.3 (cluster) or the feature ideas below
+**Last updated:** 2026-11-11 (wave 6 started)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -22,6 +22,18 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 | 3 | TUI (Connections and Patterns views), `scan` command, verifier fixes | | `v0.1-core` → PR #6 | **done**: verified, CI green, merged into main (6dc45c6) |
 | 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | | `v0.2-views` → PR #7 | **done**: verified, CI green, merged into main |
 | 5 | Docs, logo, GIF, CHANGELOG, Dependabot ignore; replica preference with verification; keychain-wait hint; v0.2 follow-ups | implementer [sonnet] ×2, implementer [opus], verifier [opus] | `wave5/polish` → PR | **done**: verified after three rounds (the first two BLOCKED on replica trust, both fixed), CI green, merged into main as PR #8 (0f981e9) |
+
+## Wave 6 (2026-11-11): bugs and rough edges
+
+Approved by the owner: "Approve, merge when green". Same merge rules as the overnight run: all required checks green and verifier sign-off, `gh pr merge --merge --admin`, no tag, release or publish.
+
+| Part | Content | Agent | Branch | State |
+|---|---|---|---|---|
+| A | Scale estimate ignores keys that vanish between `SCAN` and the per-key lookups (counts come out low); live partial results in the Patterns view | implementer [opus] | `wave6/scan` (worktree `.claude/worktrees/w6-scan`) | in progress |
+| B | Redis 6.2 in the integration job; TLS replica-scan test on Redis and Valkey | implementer [sonnet] | `wave6/tests` (worktree `.claude/worktrees/w6-tests`) | in progress |
+| V | Verifier on the merged `wave6/fixes` | verifier [opus] | pinned detached worktree | pending |
+
+Integration branch: `wave6/fixes` (worktree `.claude/worktrees/wave6`). Out of scope: Entra ID against real Azure and managed identity (needs Azure; feature idea 10), and the `--prefer-replica` trust boundary (a documented design trade-off).
 
 ### How to resume after a restart or compaction
 
