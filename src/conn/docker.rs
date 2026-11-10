@@ -1,8 +1,13 @@
 //! Finding Redis and Valkey containers in Docker.
 //!
-//! Owner: connections. Contract only; bodies are stubs.
+//! Owner: connections.
 
-use crate::model::{Credentials, Profile};
+use bollard::Docker;
+use bollard::models::{ContainerSummary, PortSummaryTypeEnum};
+use bollard::query_parameters::{InspectContainerOptionsBuilder, ListContainersOptionsBuilder};
+use secrecy::SecretString;
+
+use crate::model::{Auth, Credentials, Endpoint, Env, Profile};
 
 use super::ConnError;
 
@@ -17,8 +22,217 @@ pub struct DiscoveredInstance {
     pub credentials: Option<Credentials>,
 }
 
+const UNREACHABLE: &str = "Docker isn't running or can't be reached";
+
+/// True for images of redis, valkey and redis-stack, e.g. `redis:7.4-alpine`,
+/// `valkey/valkey:8.1-alpine`, `bitnami/redis:7.2`, `docker.io/library/redis`. Not for
+/// look-alikes such as `redis-commander` or `myredisapp`.
+pub fn is_redis_image(image: &str) -> bool {
+    let no_digest = image.split('@').next().unwrap_or(image);
+    let last = no_digest.rsplit('/').next().unwrap_or(no_digest);
+    let repo = last.split(':').next().unwrap_or(last).to_ascii_lowercase();
+    matches!(
+        repo.as_str(),
+        "redis" | "valkey" | "redis-stack" | "redis-stack-server"
+    )
+}
+
+/// The host port published for container port 6379/tcp.
+fn host_port(ports: &[bollard::models::PortSummary]) -> Option<u16> {
+    ports
+        .iter()
+        .filter(|p| p.private_port == 6379)
+        .filter(|p| {
+            matches!(
+                p.typ,
+                None | Some(PortSummaryTypeEnum::TCP) | Some(PortSummaryTypeEnum::EMPTY)
+            )
+        })
+        .find_map(|p| p.public_port)
+}
+
+/// A password from `--requirepass <pw>` in the command args, else `REDIS_PASSWORD` or
+/// `VALKEY_PASSWORD` in the environment (`KEY=value` entries).
+pub fn find_password(args: &[String], env: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--requirepass" {
+            if let Some(v) = it.next().filter(|v| !v.is_empty()) {
+                return Some(v.clone());
+            }
+        } else if let Some(v) = a.strip_prefix("--requirepass=")
+            && !v.is_empty()
+        {
+            return Some(v.to_string());
+        }
+    }
+    ["REDIS_PASSWORD", "VALKEY_PASSWORD"]
+        .iter()
+        .find_map(|key| {
+            env.iter()
+                .filter_map(|e| e.split_once('='))
+                .find(|(k, v)| k == key && !v.is_empty())
+                .map(|(_, v)| v.to_string())
+        })
+}
+
+fn profile_for(name: String, port: u16, password: bool) -> Profile {
+    Profile {
+        name,
+        env: Env::Local,
+        endpoint: Endpoint {
+            host: "127.0.0.1".to_string(),
+            port,
+            tls: false,
+        },
+        db: 0,
+        auth: if password { Auth::Keychain } else { Auth::None },
+        read_only: None,
+    }
+}
+
 /// Running containers whose image is redis, valkey or redis-stack and that publish
 /// container port 6379 on the host.
 pub async fn discover() -> Result<Vec<DiscoveredInstance>, ConnError> {
-    todo!("discover")
+    let unreachable = || ConnError::Docker(UNREACHABLE.to_string());
+    let docker = Docker::connect_with_local_defaults().map_err(|_| unreachable())?;
+    let list = docker
+        .list_containers(Some(ListContainersOptionsBuilder::new().build()))
+        .await
+        .map_err(|_| unreachable())?;
+
+    let mut found = Vec::new();
+    for c in list {
+        if let Some(inst) = instance(&docker, c).await {
+            found.push(inst);
+        }
+    }
+    found.sort_by(|a, b| a.container.cmp(&b.container));
+    Ok(found)
+}
+
+async fn instance(docker: &Docker, c: ContainerSummary) -> Option<DiscoveredInstance> {
+    let image = c.image.clone()?;
+    if !is_redis_image(&image) {
+        return None;
+    }
+    let port = host_port(c.ports.as_deref()?)?;
+    let id = c.id.clone()?;
+    let name = c
+        .names
+        .as_ref()
+        .and_then(|n| n.first())
+        .map(|n| n.trim_start_matches('/').to_string())
+        .unwrap_or_else(|| id.chars().take(12).collect());
+
+    // A failed inspect only means we cannot read a password; keep the container.
+    let password = match docker
+        .inspect_container(&id, Some(InspectContainerOptionsBuilder::new().build()))
+        .await
+    {
+        Ok(info) => {
+            let mut args = info.args.unwrap_or_default();
+            let mut env = Vec::new();
+            if let Some(cfg) = info.config {
+                args.extend(cfg.cmd.unwrap_or_default());
+                env = cfg.env.unwrap_or_default();
+            }
+            find_password(&args, &env)
+        }
+        Err(_) => None,
+    };
+    Some(DiscoveredInstance {
+        container: name.clone(),
+        image,
+        profile: profile_for(name, port, password.is_some()),
+        credentials: password.map(|pw| Credentials {
+            username: None,
+            password: SecretString::from(pw),
+        }),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_matching() {
+        for yes in [
+            "redis:7.4-alpine",
+            "valkey/valkey:8.1-alpine",
+            "redis/redis-stack-server:latest",
+            "bitnami/redis:7.2",
+            "docker.io/library/redis",
+            "localhost:5000/redis:7",
+            "redis@sha256:abcd",
+        ] {
+            assert!(is_redis_image(yes), "{yes}");
+        }
+        for no in [
+            "redis-commander",
+            "redis-commander:latest",
+            "redislabs/redisinsight:latest",
+            "redisinsight",
+            "myredisapp",
+            "nginx:1.27",
+            "",
+        ] {
+            assert!(!is_redis_image(no), "{no}");
+        }
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn password_from_args() {
+        assert_eq!(
+            find_password(&s(&["redis-server", "--requirepass", "pw1"]), &[]).as_deref(),
+            Some("pw1")
+        );
+        assert_eq!(
+            find_password(&s(&["--requirepass=pw2"]), &[]).as_deref(),
+            Some("pw2")
+        );
+    }
+
+    #[test]
+    fn password_from_env() {
+        assert_eq!(
+            find_password(&[], &s(&["PATH=/bin", "REDIS_PASSWORD=pw3"])).as_deref(),
+            Some("pw3")
+        );
+        assert_eq!(
+            find_password(&[], &s(&["VALKEY_PASSWORD=pw4"])).as_deref(),
+            Some("pw4")
+        );
+        assert_eq!(find_password(&[], &s(&["REDIS_PASSWORD="])), None);
+        assert_eq!(find_password(&s(&["redis-server"]), &s(&["A=b"])), None);
+    }
+
+    #[test]
+    fn args_win_over_env() {
+        assert_eq!(
+            find_password(&s(&["--requirepass", "a"]), &s(&["REDIS_PASSWORD=b"])).as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn host_port_picks_mapped_6379_tcp() {
+        use bollard::models::PortSummary;
+        let p = |private, public| PortSummary {
+            ip: None,
+            private_port: private,
+            public_port: public,
+            typ: Some(PortSummaryTypeEnum::TCP),
+        };
+        assert_eq!(
+            host_port(&[p(6379, None), p(16379, Some(1)), p(6379, Some(49153))]),
+            Some(49153)
+        );
+        assert_eq!(host_port(&[p(6379, None)]), None);
+    }
 }

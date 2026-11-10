@@ -1,0 +1,347 @@
+//! Pure rendering: `draw(frame, &app)` paints the whole screen from the state.
+//!
+//! Layout, from the design mockup: three header lines (brand and connection, the
+//! memory gauge, the tabs), the view's panels, and a key bar at the bottom.
+
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::text::{Line, Span};
+
+use crate::conn::parse::mask;
+use crate::format;
+use crate::model::{PERM_MEMORY, ServerFlavor, ServerInfo};
+
+use super::app::{App, Phase, Session, View};
+
+mod connections;
+mod patterns;
+mod placeholder;
+pub mod style;
+pub mod widgets;
+
+use widgets::{bar, rows, trunc, width};
+
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Rows inside a detail panel.
+pub const DETAIL_ROWS: u16 = 8;
+
+pub fn spinner(tick: u64) -> &'static str {
+    SPINNER[(tick % SPINNER.len() as u64) as usize]
+}
+
+pub fn draw(frame: &mut Frame, app: &App) {
+    let [head, body, foot] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    header(frame, head, app);
+    match app.view {
+        View::Connections => connections::draw(frame, body, app),
+        View::Patterns => patterns::draw(frame, body, app),
+        other => placeholder::draw(frame, body, other),
+    }
+    footer(frame, foot, app);
+}
+
+/// The main table above, the 8-row detail panel below.
+pub fn split_body(area: Rect) -> (Rect, Rect) {
+    let [main, detail] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(DETAIL_ROWS + 2)]).areas(area);
+    (main, detail)
+}
+
+fn flavor(f: ServerFlavor) -> &'static str {
+    match f {
+        ServerFlavor::Redis => "Redis",
+        ServerFlavor::Valkey => "Valkey",
+        ServerFlavor::Unknown => "Server",
+    }
+}
+
+pub fn server_label(s: &ServerInfo) -> String {
+    format!("{} {}", flavor(s.flavor), s.version)
+}
+
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|s| width(&s.content)).sum()
+}
+
+/// `left`, then `right` pushed against the right edge when there is room.
+fn justify(mut left: Vec<Span<'static>>, right: Vec<Span<'static>>, w: usize) -> Line<'static> {
+    let lw = spans_width(&left);
+    let rw = spans_width(&right);
+    if !right.is_empty() && lw + rw + 2 <= w {
+        left.push(Span::raw(" ".repeat(w - lw - rw - 1)));
+        left.extend(right);
+    }
+    Line::from(left)
+}
+
+fn utc_time(unix: i64) -> String {
+    let s = unix.rem_euclid(86_400);
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+fn sizes_unavailable(app: &App, s: &Session) -> bool {
+    match &s.report {
+        Some(r) => !r.sizes_available,
+        None => app
+            .entry(s.id)
+            .and_then(|e| e.perms.as_ref())
+            .is_some_and(|p| !p.allowed(PERM_MEMORY)),
+    }
+}
+
+fn header(frame: &mut Frame, area: Rect, app: &App) {
+    let w = usize::from(area.width);
+    let spin = spinner(app.tick);
+    let brand = Span::styled(
+        format!(" redis-lens {} ", env!("CARGO_PKG_VERSION")),
+        style::brand(),
+    );
+    let (l0, l1) = match &app.session {
+        None => (
+            Line::from(vec![brand, Span::styled("  not connected", style::dim())]),
+            Line::from(Span::styled(
+                " Pick a connection and press enter to scan it.",
+                style::dim(),
+            )),
+        ),
+        Some(s) => {
+            let p = &s.profile;
+            let mut left = vec![
+                brand,
+                Span::raw("  "),
+                Span::styled(format!(" {} ", p.env.label()), style::env_badge(p.env)),
+                Span::styled(format!("  {}", p.name), style::fgb()),
+                Span::styled(
+                    format!(
+                        "  {}",
+                        trunc(&p.endpoint.to_string(), if w >= 100 { 30 } else { 18 })
+                    ),
+                    style::dim(),
+                ),
+            ];
+            if p.is_read_only() {
+                left.push(Span::styled("  read-only", style::amber()));
+            }
+            let right = match &s.phase {
+                Phase::Connecting => {
+                    vec![Span::styled(format!("{spin} connecting…"), style::amber())]
+                }
+                Phase::Scanning => vec![
+                    Span::styled(spin, style::amber()),
+                    Span::styled(" scanning", style::dim()),
+                ],
+                Phase::Done => vec![
+                    Span::styled("● ", style::ok()),
+                    Span::styled(
+                        format!(
+                            "scan complete {} UTC",
+                            utc_time(s.report.as_ref().map_or(0, |r| r.taken_at_unix))
+                        ),
+                        style::dim(),
+                    ),
+                ],
+                Phase::Failed(_) => vec![Span::styled("✗ failed", style::warn())],
+            };
+            (justify(left, right, w), server_line(app, s, w))
+        }
+    };
+    rows(frame, area, vec![l0, l1, tabs(app)], None);
+}
+
+fn server_line(app: &App, s: &Session, w: usize) -> Line<'static> {
+    let spin = spinner(app.tick);
+    let Some(srv) = &s.server else {
+        return Line::from(match &s.phase {
+            Phase::Failed(e) => vec![Span::styled(format!(" ✗ {e}"), style::warn())],
+            _ => vec![
+                Span::raw(" "),
+                Span::styled(spin, style::amber()),
+                Span::styled(
+                    format!(" Connecting to {}…", s.profile.endpoint),
+                    style::dim(),
+                ),
+            ],
+        });
+    };
+    let mut spans = vec![
+        Span::styled(format!(" {}", server_label(srv)), style::fgb()),
+        Span::styled("   MEM ", style::dim()),
+    ];
+    if srv.maxmemory > 0 {
+        let ratio = srv.used_memory as f64 / srv.maxmemory as f64;
+        let (fill, track) = bar(ratio, if w >= 130 { 20 } else { 10 });
+        spans.extend([
+            Span::styled(fill, style::amber()),
+            Span::styled(track, style::track()),
+            Span::styled(format!(" {}", format::bytes(srv.used_memory)), style::fgb()),
+            Span::styled(
+                format!(
+                    " / {}  {}",
+                    format::bytes(srv.maxmemory),
+                    format::percent(ratio)
+                ),
+                style::dim(),
+            ),
+        ]);
+    } else {
+        spans.extend([
+            Span::styled(format::bytes(srv.used_memory), style::fgb()),
+            Span::styled(" · no limit", style::dim()),
+        ]);
+    }
+    spans.extend([
+        Span::styled("   KEYS ", style::dim()),
+        Span::styled(format::count(srv.total_keys), style::fgb()),
+    ]);
+    match (&s.phase, &s.report) {
+        (Phase::Scanning | Phase::Connecting, _) => {
+            let p = s.progress.unwrap_or_default();
+            spans.extend([
+                Span::raw("   "),
+                Span::styled(spin, style::amber()),
+                Span::styled(" Sampled ", style::dim()),
+                Span::styled(
+                    format!(
+                        "{} / {}",
+                        format::grouped(p.sampled),
+                        format::grouped(p.target)
+                    ),
+                    style::fgb(),
+                ),
+            ]);
+        }
+        (_, Some(r)) => {
+            let ratio = if srv.total_keys == 0 {
+                1.0
+            } else {
+                r.sampled_keys as f64 / srv.total_keys as f64
+            };
+            spans.extend([
+                Span::styled("   SAMPLED ", style::dim()),
+                Span::styled(format::count(r.sampled_keys), style::fgb()),
+                Span::styled(format!(" ({})", format::percent(ratio)), style::dim()),
+            ]);
+        }
+        _ => {}
+    }
+    if sizes_unavailable(app, s) {
+        spans.push(Span::styled(
+            "  ▲ sizes unavailable: MEMORY USAGE denied",
+            style::warn(),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn tabs(app: &App) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, v) in View::ALL.iter().enumerate() {
+        let s = if *v == app.view {
+            style::tab_on()
+        } else {
+            style::tab()
+        };
+        spans.push(Span::styled(format!(" {i} {} ", v.title()), s));
+        spans.push(Span::raw(" "));
+    }
+    let p = &app.patterns;
+    if app.view == View::Patterns && !p.filter.is_empty() && !p.filtering {
+        spans.extend([
+            Span::styled("   filter: ", style::dim()),
+            Span::styled(p.filter.clone(), style::amber()),
+            Span::styled("  (esc to clear)", style::dim()),
+        ]);
+    }
+    Line::from(spans)
+}
+
+/// The last `w` cells of `s`, starting with `…` when cut.
+fn tail(s: &str, w: usize) -> String {
+    if width(s) <= w {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let keep = w.saturating_sub(1);
+    let start = chars.len().saturating_sub(keep);
+    let mut out = String::from("…");
+    out.extend(&chars[start..]);
+    out
+}
+
+fn input_line(label: &str, text: String, hint: &str, w: usize) -> Line<'static> {
+    let label = format!(" {label} ");
+    let room = w.saturating_sub(width(&label) + 2 + width(hint)).max(8);
+    Line::from(vec![
+        Span::styled(label, style::key()),
+        Span::styled(format!(" {}", tail(&text, room)), style::fgb()),
+        Span::styled("▏", style::amber()),
+        Span::styled(hint.to_string(), style::dim()),
+    ])
+}
+
+fn footer(frame: &mut Frame, area: Rect, app: &App) {
+    let w = usize::from(area.width);
+    let line = if let Some(add) = &app.add {
+        match &add.password {
+            Some(_) => input_line(
+                "password",
+                "••••••".to_string(),
+                "  enter save · esc cancel",
+                w,
+            ),
+            None => input_line(
+                "add",
+                mask(&add.input),
+                "  enter save · esc cancel · ctrl-u clear",
+                w,
+            ),
+        }
+    } else if app.view == View::Patterns && app.patterns.filtering {
+        input_line(
+            "/",
+            app.patterns.filter.clone(),
+            "   type to filter patterns · enter to apply · esc to clear",
+            w,
+        )
+    } else if let Some(n) = &app.notice {
+        let s = if n.error {
+            style::warn()
+        } else {
+            style::amber()
+        };
+        Line::from(Span::styled(format!(" {}", n.text), s))
+    } else {
+        let keys: &[(&str, &str)] = match app.view {
+            View::Connections => &[
+                ("↑↓", "Move"),
+                ("enter", "Connect"),
+                ("a", "Add"),
+                ("r", "Rescan Docker"),
+                ("0-4", "View"),
+                ("q", "Quit"),
+            ],
+            View::Patterns => &[
+                ("↑↓", "Move"),
+                ("→←", "Fold"),
+                ("/", "Filter"),
+                ("s", "Snapshot"),
+                ("0-4", "View"),
+                ("q", "Quit"),
+            ],
+            _ => &[("0-4", "View"), ("a", "Add"), ("q", "Quit")],
+        };
+        let mut spans = vec![Span::raw(" ")];
+        for (k, l) in keys {
+            spans.push(Span::styled(*k, style::key()));
+            spans.push(Span::styled(format!(" {l}   "), style::dim()));
+        }
+        Line::from(spans)
+    };
+    rows(frame, area, vec![line], None);
+}

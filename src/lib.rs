@@ -7,12 +7,14 @@
 //! - [`config`]: saved connection profiles (no secrets).
 //! - [`secrets`]: credentials in the OS keychain.
 //! - [`conn`]: parsing connection strings, connecting, permission checks, Docker discovery.
+//! - [`format`]: human-readable bytes, counts, durations and percentages.
 //! - [`cli`]: command-line entry points.
 //! - [`tui`]: the terminal UI.
 
 pub mod cli;
 pub mod config;
 pub mod conn;
+pub mod format;
 pub mod model;
 pub mod pattern;
 pub mod scan;
