@@ -1,0 +1,75 @@
+# Demo environment: a Redis with ACL users and a Valkey with no auth, both seeded
+# with a keyspace that has a few planted problems for redis-lens to find.
+#
+#   make demo-up     start and seed
+#   make demo        start, seed, save the two connections, open the TUI
+#   make demo-down   stop and delete everything
+#
+# The passwords in users.acl are for this demo only.
+name: redis-lens-demo
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --aclfile
+      - /etc/redis-lens/users.acl
+      - --maxmemory
+      - 768mb
+      - --maxmemory-policy
+      - allkeys-lfu
+      - --lfu-log-factor
+      - "1"
+      - --busy-reply-threshold
+      - "30000"
+    ports:
+      - "127.0.0.1:6390:6379"
+    volumes:
+      - ./users.acl:/etc/redis-lens/users.acl:ro
+    healthcheck:
+      test: ["CMD", "redis-cli", "--user", "admin", "--pass", "admin-demo-only", "--no-auth-warning", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  valkey:
+    image: valkey/valkey:8.1-alpine
+    command:
+      - valkey-server
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lfu
+      - --lfu-log-factor
+      - "1"
+      - --busy-reply-threshold
+      - "30000"
+    ports:
+      - "127.0.0.1:6391:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  seed:
+    image: redis:7.4-alpine
+    profiles: [seed]
+    depends_on:
+      redis:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    volumes:
+      - ./seed.lua:/seed/seed.lua:ro
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        set -e;
+        R="redis-cli -h redis --user admin --pass admin-demo-only --no-auth-warning";
+        $$R FLUSHALL > /dev/null;
+        echo "redis: seeded $$($$R --eval /seed/seed.lua , 1) keys";
+        V="redis-cli -h valkey";
+        $$V FLUSHALL > /dev/null;
+        echo "valkey: seeded $$($$V --eval /seed/seed.lua , 0.4) keys"
