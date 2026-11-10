@@ -168,13 +168,21 @@ fn parse<T: FromRedisValue>(v: &Value) -> Option<T> {
     T::from_redis_value(v.clone()).ok()
 }
 
+/// What [`sample_keys_detailed`] found.
+#[derive(Debug, Clone, Default)]
+pub struct SampleOutcome {
+    pub samples: Vec<KeySample>,
+    /// Distinct keys `SCAN` returned and the scan looked at. Includes keys that vanished
+    /// before `TYPE`/`PTTL` (TYPE `none`, PTTL -2) or that could not be read (for
+    /// example `NOPERM` from a key ACL), so it can be larger than `samples.len()`.
+    pub keys_seen: u64,
+    /// The `SCAN` cursor returned to 0 and every key it returned was looked at.
+    pub complete: bool,
+}
+
 /// Walk the keyspace with `SCAN` and collect up to `opts.sample_limit` samples.
 ///
-/// `with_sizes` and `with_freq` say whether `MEMORY USAGE` and `OBJECT FREQ` may be
-/// sent; when false the matching [`KeySample`] fields are `None`. Keys that disappear
-/// between `SCAN` and the batch are skipped. A failed `MEMORY USAGE` or `OBJECT FREQ`
-/// (for example `NOPERM`) leaves that field `None` and does not fail the scan.
-/// Keys that are not valid UTF-8 are skipped.
+/// The same as [`sample_keys_detailed`], returning only the samples.
 pub async fn sample_keys<C: ConnectionLike + Send>(
     conn: &mut C,
     opts: &ScanOptions,
@@ -182,27 +190,49 @@ pub async fn sample_keys<C: ConnectionLike + Send>(
     with_freq: bool,
     progress: Option<&watch::Sender<ScanProgress>>,
 ) -> Result<Vec<KeySample>, ScanError> {
+    Ok(
+        sample_keys_detailed(conn, opts, with_sizes, with_freq, progress)
+            .await?
+            .samples,
+    )
+}
+
+/// Walk the keyspace with `SCAN`, look at up to `opts.sample_limit` keys, and report
+/// how many keys were seen and whether the walk reached the end of the keyspace.
+///
+/// `with_sizes` and `with_freq` say whether `MEMORY USAGE` and `OBJECT FREQ` may be
+/// sent; when false the matching [`KeySample`] fields are `None`. Keys that disappear
+/// between `SCAN` and the batch are skipped. A failed `MEMORY USAGE` or `OBJECT FREQ`
+/// (for example `NOPERM`) leaves that field `None` and does not fail the scan.
+/// Keys that are not valid UTF-8 are skipped.
+pub async fn sample_keys_detailed<C: ConnectionLike + Send>(
+    conn: &mut C,
+    opts: &ScanOptions,
+    with_sizes: bool,
+    with_freq: bool,
+    progress: Option<&watch::Sender<ScanProgress>>,
+) -> Result<SampleOutcome, ScanError> {
     let limit = usize::try_from(opts.sample_limit).unwrap_or(usize::MAX);
     let batch_size = opts.batch_size.max(1);
     let mut limiter = Limiter::new(opts.max_commands_per_sec);
     let mut seen: HashSet<String> = HashSet::new();
+    // Keys that are not valid UTF-8: not sampled, but still part of the keyspace.
+    let mut skipped: HashSet<Vec<u8>> = HashSet::new();
+    // Keys SCAN returned that were dropped because the limit was reached.
+    let mut dropped = false;
+    // Set once a SCAN reply brings the cursor back to 0. The cursor starts at 0 too,
+    // so it can't be read on its own (a limit of 0 never scans).
+    let mut reached_end = false;
     let mut pending: Vec<String> = Vec::new();
     let mut samples: Vec<KeySample> = Vec::new();
     let mut cursor: u64 = 0;
 
+    // Keeps whatever target the caller set, including 0 for an empty database.
     let publish = |sampled: usize, done: bool| {
         if let Some(tx) = progress {
-            // Read the target first: holding the `borrow()` guard across
-            // `send_replace` would deadlock.
-            let target = tx.borrow().target;
-            tx.send_replace(ScanProgress {
-                sampled: sampled as u64,
-                target: if target == 0 {
-                    opts.sample_limit
-                } else {
-                    target
-                },
-                done,
+            tx.send_modify(|p| {
+                p.sampled = sampled as u64;
+                p.done = done;
             });
         }
     };
@@ -216,13 +246,19 @@ pub async fn sample_keys<C: ConnectionLike + Send>(
         let (next, keys): (u64, Vec<Vec<u8>>) = cmd.query_async(conn).await?;
         limiter.spent(1).await;
         cursor = next;
+        reached_end = cursor == 0;
 
         for raw in keys {
             if seen.len() >= limit {
+                dropped = true;
                 break;
             }
-            let Ok(key) = String::from_utf8(raw) else {
-                continue;
+            let key = match String::from_utf8(raw) {
+                Ok(k) => k,
+                Err(e) => {
+                    skipped.insert(e.into_bytes());
+                    continue;
+                }
             };
             if seen.insert(key.clone()) {
                 pending.push(key);
@@ -244,7 +280,11 @@ pub async fn sample_keys<C: ConnectionLike + Send>(
         }
     }
     publish(samples.len(), true);
-    Ok(samples)
+    Ok(SampleOutcome {
+        samples,
+        keys_seen: (seen.len() + skipped.len()) as u64,
+        complete: reached_end && !dropped,
+    })
 }
 
 /// Pipeline the per-key commands for one batch. Returns the number of commands sent.
@@ -328,6 +368,22 @@ pub fn hot_keys(samples: &[KeySample]) -> Vec<KeySample> {
     hot
 }
 
+/// The factor that turns sampled counts into keyspace-wide estimates.
+///
+/// - 1.0 when the scan saw the whole keyspace (`complete`).
+/// - 1.0 with `MATCH`: DBSIZE counts every key, not just those matching the glob, so
+///   it says nothing about how many matching keys exist.
+/// - Otherwise `total_keys / keys_seen`, at least 1.0. `keys_seen` counts every key
+///   SCAN returned, including ones that vanished or could not be read, so a key ACL
+///   that hides most keys does not shrink the estimate.
+fn estimate_scale(total_keys: u64, keys_seen: u64, complete: bool, has_match: bool) -> f64 {
+    if complete || has_match || keys_seen == 0 {
+        1.0
+    } else {
+        (total_keys as f64 / keys_seen as f64).max(1.0)
+    }
+}
+
 /// Run a full scan: server info, sampling, then [`crate::pattern::aggregate`].
 ///
 /// Uses `perms` to decide whether to ask for sizes and LFU counters.
@@ -349,18 +405,14 @@ pub async fn scan<C: ConnectionLike + Send>(
             done: false,
         });
     }
-    let samples = sample_keys(conn, opts, with_sizes, with_freq, progress).await?;
-
-    let scale = if (samples.len() as u64) < opts.sample_limit {
-        // The scan reached the end of the keyspace, so the sample is everything.
-        1.0
-    } else if opts.match_glob.is_some() {
-        // DBSIZE counts every key, not just those matching the glob, so it says nothing
-        // about how many matching keys exist. Report the sample as it is.
-        1.0
-    } else {
-        (server.total_keys as f64 / samples.len() as f64).max(1.0)
-    };
+    let outcome = sample_keys_detailed(conn, opts, with_sizes, with_freq, progress).await?;
+    let scale = estimate_scale(
+        server.total_keys,
+        outcome.keys_seen,
+        outcome.complete,
+        opts.match_glob.is_some(),
+    );
+    let samples = outcome.samples;
 
     let taken_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -447,6 +499,19 @@ mod tests {
     const VALKEY_SERVER: &str = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nvalkey_version:8.1.3\r\nredis_mode:standalone\r\nos:Linux 6.6 x86_64\r\n";
     const VALKEY_MEMORY: &str =
         "# Memory\r\nused_memory:943120\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\n";
+
+    #[test]
+    fn scale_uses_keys_seen_not_samples() {
+        // Saw 1,000 of 10,000 keys: scale 10, however many of them could be read.
+        assert_eq!(estimate_scale(10_000, 1_000, false, false), 10.0);
+        // A complete walk or MATCH reports the sample as it is.
+        assert_eq!(estimate_scale(10_000, 1_000, true, false), 1.0);
+        assert_eq!(estimate_scale(10_000, 1_000, false, true), 1.0);
+        // Never below 1, and no division by zero.
+        assert_eq!(estimate_scale(500, 1_000, false, false), 1.0);
+        assert_eq!(estimate_scale(10_000, 0, false, false), 1.0);
+        assert_eq!(estimate_scale(0, 0, true, false), 1.0);
+    }
 
     #[test]
     fn parses_redis() {

@@ -394,9 +394,9 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
     let w = usize::from(area.width);
     let line = if let Some(add) = &app.add {
         match &add.password {
-            Some(pw) => input_line(
+            Some(_) => input_line(
                 "password",
-                "•".repeat(pw.chars().count()),
+                "••••••".to_string(),
                 "  enter save · esc cancel",
                 w,
             ),

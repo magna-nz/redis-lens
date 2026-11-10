@@ -57,7 +57,7 @@ The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move,
 3. For each batch, pipeline `TYPE`, `PTTL`, `MEMORY USAGE key SAMPLES 5` (when allowed) and `OBJECT FREQ` (when allowed and the policy is LFU).
 4. Stop at the sample limit (default 100,000) or when the cursor returns to 0.
 5. Stay under a command budget (default 5,000 commands per second).
-6. Scale sampled counts to estimates with `DBSIZE / sampled`. The scale is 1 when the whole keyspace was seen or when `MATCH` is used.
+6. Scale sampled counts to estimates with `DBSIZE / keys seen`, where keys seen counts every distinct key SCAN returned, including keys that vanished or could not be read (for example `NOPERM` from a key ACL). The scale is never below 1, and it is 1 when the SCAN cursor returned to 0 (the whole keyspace was seen) or when `MATCH` is used.
 
 A per-key error such as `NOPERM` drops that field (sizes, frequency) and never aborts the scan.
 
@@ -73,7 +73,7 @@ Keys are split on `:` `/` `|`, and on `.` inside segments that aren't IPv4 addre
 | hex, at least 16 characters | `{hash}` |
 | IPv4 address | `{ip}` |
 
-After that, a literal segment position with 20 or more distinct values among otherwise identical patterns collapses to `{var}`.
+After that, a literal segment position other than the first with 20 or more distinct values among otherwise identical patterns collapses to `{var}`. The first segment names the namespace, so `user:{id}` and `order:{id}` stay apart, and single-segment keys never collapse.
 
 Examples: `user:88213:cart` → `user:{id}:cart`, `rl:10.0.4.12:29187460` → `rl:{ip}:{id}`.
 

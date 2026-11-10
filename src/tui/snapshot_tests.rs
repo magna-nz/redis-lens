@@ -205,7 +205,12 @@ fn add_password_step() {
     let lines = buffer_lines(&t);
     assert!(lines.iter().all(|l| !l.contains("hunter2")));
     assert!(lines.last().unwrap().contains("password"));
-    assert!(lines.last().unwrap().contains("•••••••"));
+    let last = lines.last().unwrap();
+    assert!(last.contains("••••••"));
+    assert!(
+        !last.contains("•••••••"),
+        "bullets must not reveal the password length"
+    );
 }
 
 #[test]

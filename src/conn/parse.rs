@@ -231,7 +231,7 @@ fn parse_stackexchange(s: &str) -> Result<ParsedConnection, ConnError> {
                 }
             }
             Some((k, v)) => match k.trim().to_ascii_lowercase().as_str() {
-                "password" => password = Some(v.to_string()),
+                "password" => password = Some(v.trim().to_string()),
                 "user" | "username" => user = Some(v.trim().to_string()),
                 "ssl" => tls = v.trim().eq_ignore_ascii_case("true"),
                 "defaultdatabase" => {
@@ -257,40 +257,117 @@ fn parse_stackexchange(s: &str) -> Result<ParsedConnection, ConnError> {
 }
 
 /// The input with any password replaced by `******`, safe to display or log.
+///
+/// Tokenises the way [`parse_connection_string`] does: a string starting with
+/// `redis://` or `rediss://` is a URI, anything else is a StackExchange string. It is
+/// also used on free text such as error messages, so a non-URI input that contains
+/// `://` gets the URI treatment too. When in doubt it hides more, never less.
 pub fn mask(s: &str) -> String {
-    mask_password_params(&mask_uri_userinfo(s))
+    let lower = s.trim_start().to_ascii_lowercase();
+    if lower.starts_with("redis://") || lower.starts_with("rediss://") {
+        return mask_uri(s);
+    }
+    let masked = mask_stackexchange(s);
+    if masked.contains("://") {
+        mask_uri(&masked)
+    } else {
+        masked
+    }
 }
 
-/// `scheme://user:PASSWORD@host` -> `scheme://user:******@host`.
-fn mask_uri_userinfo(s: &str) -> String {
+/// Whether the text before a `=` names a password. The parser trims the key and
+/// compares it case-insensitively; this also accepts `password` as the last word of
+/// the key, so free text such as `error: password=...` is caught too.
+fn is_password_key(k: &str) -> bool {
+    k.trim()
+        .rsplit(|c: char| c.is_whitespace() || matches!(c, ';' | '?' | '&'))
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("password"))
+}
+
+/// StackExchange: split on `,`, split each token at its first `=`, and replace the
+/// value of a `password` key. The key text is kept as it was.
+fn mask_stackexchange(s: &str) -> String {
+    s.split(',')
+        .map(|token| match token.split_once('=') {
+            Some((k, _)) if is_password_key(k) => format!("{k}={MASK}"),
+            _ => token.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The colon that would separate a username from a password in a URI that has no `@`
+/// yet. A bracketed IPv6 host is skipped, so its colons don't count.
+fn half_typed_colon(rest: &str) -> Option<usize> {
+    if rest.starts_with('[') {
+        let close = rest.find(']')?;
+        rest[close..].find(':').map(|c| close + c)
+    } else {
+        rest.find(':')
+    }
+}
+
+/// URIs: the userinfo password and any `password` query parameter.
+///
+/// - `scheme://user:PASSWORD@host`: the password may hold unencoded `@`, `/` or `?`,
+///   so it runs from the first `:` to the last `@`.
+/// - No `@` yet (half-typed, such as `rediss://user:pa`): everything after the first
+///   `:` is hidden, unless the text up to the next `/` is a 1 to 5 digit port.
+/// - The query is split on `&`. Every `?` is tried as the start of the query, because
+///   an unencoded `?` can also sit in the password.
+fn mask_uri(s: &str) -> String {
     let Some(i) = s.find("://") else {
         return s.to_string();
     };
     let start = i + 3;
     let rest = &s[start..];
-    // The password may hold unencoded '@' or '/', so take the last '@'.
-    if let Some(at) = rest.rfind('@')
-        && let Some(colon) = rest.find(':')
-        && colon < at
-    {
-        return format!("{}{}{}", &s[..start + colon + 1], MASK, &rest[at..]);
-    }
-    // Half-typed input such as `rediss://user:pass` has no '@' yet, so `user:pass` looks
-    // like `host:port`. Mask whatever follows the colon unless it could be a port.
-    if !rest.contains('@')
-        && let Some(colon) = rest.find(':')
-    {
+    // Byte ranges of `rest` to hide.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+
+    if let Some(at) = rest.rfind('@') {
+        if let Some(colon) = rest[..at].find(':') {
+            ranges.push((colon + 1, at));
+        }
+    } else if let Some(colon) = half_typed_colon(rest) {
         let after = &rest[colon + 1..];
-        let end = after.find(['/', '?', ',']).unwrap_or(after.len());
-        let candidate = &after[..end];
-        let looks_like_port = !candidate.is_empty()
-            && candidate.len() <= 5
-            && candidate.bytes().all(|b| b.is_ascii_digit());
-        if !candidate.is_empty() && !looks_like_port {
-            return format!("{}{}{}", &s[..start + colon + 1], MASK, &after[end..]);
+        let head = after.split('/').next().unwrap_or("");
+        let is_port = (1..=5).contains(&head.len()) && head.bytes().all(|b| b.is_ascii_digit());
+        if !is_port {
+            ranges.push((colon + 1, rest.len()));
         }
     }
-    s.to_string()
+
+    for (q, _) in rest.match_indices('?') {
+        let mut pos = q + 1;
+        for param in rest[q + 1..].split('&') {
+            if let Some((k, _)) = param.split_once('=')
+                && k.trim().eq_ignore_ascii_case("password")
+            {
+                ranges.push((pos + k.len() + 1, pos + param.len()));
+            }
+            pos += param.len() + 1;
+        }
+    }
+
+    ranges.retain(|(a, b)| a < b);
+    ranges.sort_unstable();
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..start]);
+    let mut pos = 0;
+    for (a, b) in ranges {
+        if b <= pos {
+            continue;
+        }
+        if a >= pos {
+            out.push_str(&rest[pos..a]);
+            out.push_str(MASK);
+        }
+        // An overlapping range extends the one already masked.
+        pos = b;
+    }
+    out.push_str(&rest[pos..]);
+    out
 }
 
 #[cfg(test)]
@@ -310,52 +387,15 @@ mod partial_mask_tests {
         assert_eq!(mask("redis://localhost:6379/0"), "redis://localhost:6379/0");
         assert_eq!(mask("redis://localhost:"), "redis://localhost:");
         assert_eq!(mask("redis://localhost"), "redis://localhost");
+        assert_eq!(mask("redis://[::1]:6390/1"), "redis://[::1]:6390/1");
     }
-}
 
-/// `password=VALUE` (StackExchange or URI query) -> `password=******`.
-fn mask_password_params(s: &str) -> String {
-    let lower = s.to_ascii_lowercase();
-    let mut out = String::with_capacity(s.len());
-    let mut pos = 0;
-    while let Some(found) = lower[pos..].find("password=") {
-        let key_start = pos + found;
-        let at_boundary = key_start == 0
-            || matches!(
-                lower.as_bytes()[key_start - 1],
-                b',' | b'?' | b'&' | b' ' | b';'
-            );
-        let val_start = key_start + "password=".len();
-        if !at_boundary {
-            out.push_str(&s[pos..val_start]);
-            pos = val_start;
-            continue;
-        }
-        out.push_str(&s[pos..val_start]);
-        out.push_str(MASK);
-        pos = value_end(s, val_start);
+    #[test]
+    fn half_typed_password_tail_is_masked() {
+        assert_eq!(mask("redis://u:ab/s3cretEEE"), "redis://u:******");
+        assert_eq!(mask("redis://u:ab?s3cretEEE"), "redis://u:******");
+        assert_eq!(mask("redis://u:123456/s3cretEEE"), "redis://u:******");
     }
-    out.push_str(&s[pos..]);
-    out
-}
-
-/// The value runs to the next `,key=` or `&key=`; anything else (including a stray
-/// comma) is treated as part of the password.
-fn value_end(s: &str, from: usize) -> usize {
-    let b = s.as_bytes();
-    for (off, &c) in b[from..].iter().enumerate() {
-        if c == b',' || c == b'&' {
-            let after = &s[from + off + 1..];
-            let key_len = after
-                .bytes()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
-                .count();
-            if key_len > 0 && after.as_bytes().get(key_len) == Some(&b'=') {
-                return from + off;
-            }
-        }
-    }
-    s.len()
 }
 
 #[cfg(test)]
@@ -527,6 +567,52 @@ mod tests {
         assert_eq!(mask("redis://u:p@w@host"), "redis://u:******@host");
     }
 
+    #[test]
+    fn mask_matches_parser_tokenising() {
+        for s in [
+            "host:6380, password = s3cretAAA ,ssl=True",
+            "host:6380,password =s3cretBBB",
+            "host:6380,\tpassword=s3cretCCC",
+            "host:6380,password=abc&x=s3cretDDD",
+            "redis://h?password=s3cretFFF",
+            "redis://u:pw@h:6379/0?ssl=true& Password =s3cretGGG",
+            "redis://h:6379/0?password=a@s3cretHHH",
+            "redis://u:a?b@h?password=s3cretIII",
+            "connect failed for redis://u:s3cretJJJ@h:6379",
+            "error: password=s3cretKKK",
+        ] {
+            let m = mask(s);
+            assert!(!m.contains("s3cret"), "{s:?} -> {m:?}");
+        }
+        assert_eq!(
+            mask("host:6380, password = s3cretAAA ,ssl=True"),
+            "host:6380, password =******,ssl=True"
+        );
+        assert_eq!(
+            mask("host:6380,password=abc&x=s3cretDDD"),
+            "host:6380,password=******"
+        );
+        assert_eq!(
+            mask("redis://h?password=s3cretFFF"),
+            "redis://h?password=******"
+        );
+        assert_eq!(
+            mask("redis://u:pw@h:6380/1?ssl=true&password=x&y=1"),
+            "redis://u:******@h:6380/1?ssl=true&password=******&y=1"
+        );
+        // Keys that only end in "password" are not passwords.
+        assert_eq!(mask("h,xpassword=keep"), "h,xpassword=keep");
+    }
+
+    #[test]
+    fn stackexchange_values_are_trimmed() {
+        let p = parse_connection_string("host:6380, password = s3cretAAA ,ssl=True").unwrap();
+        assert_eq!(pw(&p), Some("s3cretAAA"));
+        assert!(p.endpoint.tls);
+        let p = parse_connection_string("host:6380,\tpassword=s3cretCCC").unwrap();
+        assert_eq!(pw(&p), Some("s3cretCCC"));
+    }
+
     proptest! {
         #[test]
         fn parse_never_panics(s in "\\PC{0,80}") {
@@ -549,12 +635,40 @@ mod tests {
         }
 
         #[test]
-        fn mask_hides_stackexchange_password(p in "[A-Za-z0-9@:/?#!$&=%]{0,10}", core in "[A-Za-z0-9]{12,24}") {
+        fn mask_hides_uri_query_password(
+            p in "[A-Za-z0-9@:/?#!$=%]{0,10}",
+            core in "[A-Za-z0-9]{12,24}",
+            w1 in "[ \t]{0,2}",
+            w2 in "[ \t]{0,2}",
+            key in "(password|Password|PASSWORD)",
+            before in "(|ssl=true&|a=b&c=d&)",
+            userinfo in "(|u:pw@|:x@)",
+        ) {
             let pw = format!("PW{core}{p}");
-            let s = format!("host.example.com:6380,password={pw},ssl=True,abortConnect=False");
-            prop_assert!(!mask(&s).contains(&core));
-            let s = format!("host.example.com:6380,ssl=True,password={pw}");
-            prop_assert!(!mask(&s).contains(&core));
+            let uri = format!("redis://{userinfo}host.example.com:6380/1?{before}{w1}{key}{w2}={pw}&x=1");
+            prop_assert!(!mask(&uri).contains(&core), "{}", mask(&uri));
+            let uri = format!("redis://{userinfo}host.example.com?{before}{w1}{key}{w2}={pw}");
+            prop_assert!(!mask(&uri).contains(&core), "{}", mask(&uri));
+        }
+
+        #[test]
+        fn mask_hides_stackexchange_password(
+            p in "[A-Za-z0-9@:/?#!$&=%]{0,10}",
+            core in "[A-Za-z0-9]{12,24}",
+            w1 in "[ \t]{0,3}",
+            w2 in "[ \t]{0,3}",
+            w3 in "[ \t]{0,3}",
+            w4 in "[ \t]{0,3}",
+            key in "(password|Password|PASSWORD)",
+        ) {
+            let pw = format!("PW{core}{p}");
+            let field = format!("{w1}{key}{w2}={w3}{pw}{w4}");
+            let s = format!("host.example.com:6380,{field},ssl=True,abortConnect=False");
+            prop_assert!(!mask(&s).contains(&core), "{}", mask(&s));
+            let parsed = parse_connection_string(&s).unwrap();
+            prop_assert_eq!(super::tests::pw(&parsed), Some(pw.as_str()));
+            let s = format!("host.example.com:6380,ssl=True,{field}");
+            prop_assert!(!mask(&s).contains(&core), "{}", mask(&s));
         }
     }
 }

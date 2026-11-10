@@ -120,6 +120,10 @@ fn is_literal(token: &str) -> bool {
 
 /// Merge patterns that differ only at one literal position when at least
 /// [`COLLAPSE_THRESHOLD`] distinct values share it. Returns old pattern -> new pattern.
+///
+/// The first segment never collapses: it names the namespace (`user`, `order`, ...),
+/// and many unrelated namespaces with the same shape are normal. That also means a
+/// single-segment key never collapses.
 fn collapse(patterns: &BTreeSet<String>) -> BTreeMap<String, String> {
     let mut current: BTreeMap<String, String> =
         patterns.iter().map(|p| (p.clone(), p.clone())).collect();
@@ -130,7 +134,8 @@ fn collapse(patterns: &BTreeSet<String>) -> BTreeMap<String, String> {
         let live: BTreeSet<&String> = current.values().collect();
         for p in &live {
             let toks = tokens(p);
-            for i in (0..toks.len()).step_by(2) {
+            // Even indices are segments; index 0 is the first segment and is skipped.
+            for i in (2..toks.len()).step_by(2) {
                 if is_literal(toks[i]) {
                     let mut sig: Vec<String> = toks.iter().map(|t| t.to_string()).collect();
                     sig[i] = String::new();
@@ -169,7 +174,8 @@ fn collapse(patterns: &BTreeSet<String>) -> BTreeMap<String, String> {
 ///
 /// `scale` is `total_keys / sampled_keys` and turns sampled counts and bytes into
 /// keyspace-wide estimates. Patterns with the same shape that differ at one literal
-/// segment, with 20 or more distinct values there, merge into one `{var}` pattern.
+/// segment other than the first, with 20 or more distinct values there, merge into one
+/// `{var}` pattern.
 /// Patterns are sorted by `est_bytes` (None counts as 0), then `est_keys`, then name,
 /// largest first.
 pub fn aggregate(samples: &[KeySample], scale: f64) -> Vec<PatternStats> {
@@ -441,7 +447,7 @@ mod tests {
 
     fn tenants(n: usize) -> Vec<KeySample> {
         (1..=n)
-            .map(|i| s(&format!("tenant-{i:04}x:config"), Some(10)))
+            .map(|i| s(&format!("cfg:tenant-{i:04}x:flags"), Some(10)))
             .collect()
     }
 
@@ -449,11 +455,40 @@ mod tests {
     fn collapse_at_threshold() {
         let out = aggregate(&tenants(40), 1.0);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].pattern, "{var}:config");
+        assert_eq!(out[0].pattern, "cfg:{var}:flags");
         assert_eq!(out[0].sampled_keys, 40);
         let out = aggregate(&tenants(20), 1.0);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].pattern, "{var}:config");
+        assert_eq!(out[0].pattern, "cfg:{var}:flags");
+    }
+
+    #[test]
+    fn first_segment_never_collapses() {
+        let entities = [
+            "user", "order", "cart", "product", "invoice", "payment", "session", "token",
+            "account", "address", "review", "coupon", "shipment", "refund", "category", "vendor",
+            "wishlist", "ticket", "message", "device",
+        ];
+        assert_eq!(entities.len(), 20);
+        let samples: Vec<KeySample> = entities
+            .iter()
+            .flat_map(|e| (1..=3).map(move |n| s(&format!("{e}:{n}"), Some(1))))
+            .collect();
+        let out = aggregate(&samples, 1.0);
+        assert_eq!(out.len(), 20);
+        assert!(out.iter().all(|p| !p.pattern.contains("{var}")));
+        assert!(out.iter().any(|p| p.pattern == "user:{id}"));
+        assert!(out.iter().any(|p| p.pattern == "order:{id}"));
+
+        // Single-segment keys stay as they are, however many there are.
+        let singles: Vec<KeySample> = (0..30).map(|i| s(&format!("k{i}x"), Some(1))).collect();
+        assert_eq!(aggregate(&singles, 1.0).len(), 30);
+
+        // The old position-0 case no longer collapses.
+        let old: Vec<KeySample> = (1..=25)
+            .map(|i| s(&format!("tenant-{i:04}x:config"), Some(1)))
+            .collect();
+        assert_eq!(aggregate(&old, 1.0).len(), 25);
     }
 
     #[test]
@@ -465,12 +500,12 @@ mod tests {
     #[test]
     fn collapse_keeps_other_shapes_apart() {
         let mut samples = tenants(25);
-        samples.push(s("tenant-0001x:other", Some(1)));
+        samples.push(s("cfg:tenant-0001x:other", Some(1)));
         samples.push(s("queue:emails", Some(1)));
         let out = aggregate(&samples, 1.0);
         let names: BTreeSet<&str> = out.iter().map(|p| p.pattern.as_str()).collect();
-        assert!(names.contains("{var}:config"));
-        assert!(names.contains("tenant-0001x:other"));
+        assert!(names.contains("cfg:{var}:flags"));
+        assert!(names.contains("cfg:tenant-0001x:other"));
         assert!(names.contains("queue:emails"));
         assert_eq!(out.len(), 3);
     }
@@ -479,11 +514,11 @@ mod tests {
     fn collapse_with_ids_and_second_position() {
         // Two collapsible positions: both end up {var}.
         let samples: Vec<KeySample> = (0..20)
-            .flat_map(|a| (0..20).map(move |b| s(&format!("a{a}x:b{b}x:{b}"), Some(1))))
+            .flat_map(|a| (0..20).map(move |b| s(&format!("p:a{a}x:b{b}x:{b}"), Some(1))))
             .collect();
         let out = aggregate(&samples, 1.0);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].pattern, "{var}:{var}:{id}");
+        assert_eq!(out[0].pattern, "p:{var}:{var}:{id}");
         assert_eq!(out[0].sampled_keys, 400);
     }
 
