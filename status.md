@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** v0.1 → v0.2
-**Last updated:** 2026-11-10 (overnight run in progress)
+**Last updated:** 2026-11-11 (overnight run: final wave in its PR)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -20,8 +20,8 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 |---|---|---|---|---|
 | 2 | Scanner and connections | implementer ×2 [sonnet] | `wave2/*` → `v0.1-core` | **done**, merged into `v0.1-core` |
 | 3 | TUI (Connections and Patterns views), `scan` command, verifier fixes | | `v0.1-core` → PR #6 | **done**: verified, CI green, merged into main (6dc45c6) |
-| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | | `v0.2-views` → PR #7 | **verifier PASS** after fixes; PR #7 open; merge once CI is green |
-| 5 | README, logo, CHANGELOG, Dependabot ignore, GIF (`wave5/docs`, done: GIF recorded and checked against the demo); replica preference, keychain-wait hint, verifier follow-ups (`wave5/polish`, implementer [sonnet] running) | | `v0.2-polish` → PR after #7 | in progress |
+| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | | `v0.2-views` → PR #7 | **done**: verified, CI green, merged into main |
+| 5 | Docs, logo, GIF, CHANGELOG, Dependabot ignore; replica preference with verification; keychain-wait hint; v0.2 follow-ups | implementer [sonnet] ×2, implementer [opus], verifier [opus] | `wave5/polish` → PR | verification BLOCKED twice (unverified replica endpoint, then a credential bypass by a fake replica), both fixed with regression tests; **third verification PASS** (16e3596, docs corrected in d46399d); PR open, merge once CI is green |
 
 ### How to resume after a restart or compaction
 
@@ -74,6 +74,8 @@ See the overnight table above.
 
 ## Known issues and notes
 
+- **Replica scans (`--prefer-replica`) trust the announced address**, like Cluster and Sentinel clients do. A server that imitates a replica, since the replication ID isn't secret, can be scanned without credentials, and its data is filed under the profile. A profile that reaches prod through an SSH tunnel on 127.0.0.1 treats local services on the announced port as on the primary's host. A replica scanned without credentials runs as its default user. No TLS replica test yet.
+
 - **macOS keychain prompt after rebuilds.** Keychain entries are tied to the binary that wrote them. A rebuilt or upgraded binary has to ask macOS for access, and until someone answers the dialog, connecting hangs. Wave 5: add a README note (click "Always Allow") and a TUI hint when a keychain read takes more than 2 s.
 
 - **Lesson:** never switch the main checkout's branch while an agent is reading it. Do all work in worktrees.
@@ -92,4 +94,27 @@ See the overnight table above.
 
 ## Feature ideas
 
-Filled in after wave 5.
+Researched on 2026-11-11. Proposals only; nothing here is built. The full write-up, with evidence, scope, effort, risks and sources, is in [docs/feature-ideas.md](docs/feature-ideas.md).
+
+**Quick wins** (ranked by value against effort):
+1. `--check` thresholds with exit codes for CI and pre-deploy gates (S)
+2. Report export as Markdown, HTML or CSV (S)
+3. Detect ElastiCache, MemoryDB and Azure, and say plainly what degrades (S)
+4. Server-wide numbers from `INFO keysizes`, `INFO keyspace` and `MEMORY STATS` (S)
+5. An external token command for passwordless auth on GCP, AWS and Azure (S)
+6. Snapshot retention (`--keep`, `prune`) and a trend view (S–M)
+7. Compare two instances, for example staging against prod (S–M)
+
+**Bigger bets:**
+8. Hash field TTL awareness (`HEXPIRE`), to avoid false leak verdicts (M)
+9. Native AWS IAM auth for ElastiCache and MemoryDB (M)
+10. Azure managed identity and service principal, plus Azure Managed Redis cluster-policy handling (M)
+11. Prometheus textfile export (M)
+12. Server-side `HOTKEYS` (Redis 8.6+) in place of a `MONITOR` fallback (M)
+13. A per-slot view from `CLUSTER SLOT-STATS`, after v0.3 (M)
+14. Offline RDB analysis (L)
+
+**Verified facts that affect the roadmap:**
+- ElastiCache Serverless blocks `MEMORY USAGE` and `OBJECT FREQ`.
+- The OSS clustering policy on Azure Managed Redis needs v0.3 cluster support.
+- `HEXPIRE` exists in Redis from 7.4 and in Valkey only from 9.0, so CI would need a newer Valkey to test it.

@@ -251,9 +251,14 @@ pub struct Endpoint {
     pub tls: bool,
 }
 
+/// `host:port`, with an IPv6 address in brackets: `[::1]:6379`.
 impl fmt::Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.host, self.port)
+        if self.host.contains(':') && !self.host.starts_with('[') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
     }
 }
 
@@ -266,7 +271,7 @@ pub enum Auth {
     None,
     /// Username and password, both stored in the OS keychain under [`Profile::secret_ref`].
     Keychain,
-    /// Microsoft Entra ID through `DefaultAzureCredential`. Needs the `entra-id` feature.
+    /// Microsoft Entra ID through the redis-rs developer-tools credential chain (az login and similar). Needs the `entra-id` feature.
     EntraId,
 }
 
@@ -287,6 +292,9 @@ pub struct Profile {
     /// Force read-only on or off. `None` means read-only exactly when `env` is `Prod`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    /// Scan a replica of this server instead of the primary, when one is reachable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefer_replica: bool,
 }
 
 /// Service name for every keychain entry this tool creates.
@@ -377,6 +385,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn endpoint_text_brackets_ipv6() {
+        let ep = |host: &str| Endpoint {
+            host: host.into(),
+            port: 6379,
+            tls: false,
+        };
+        assert_eq!(ep("::1").to_string(), "[::1]:6379");
+        assert_eq!(ep("2001:db8::5").to_string(), "[2001:db8::5]:6379");
+        assert_eq!(ep("10.0.1.21").to_string(), "10.0.1.21:6379");
+        assert_eq!(ep("cache.internal").to_string(), "cache.internal:6379");
+    }
+
+    #[test]
     fn pttl_parsing() {
         assert_eq!(Ttl::from_pttl(-2), None);
         assert_eq!(Ttl::from_pttl(-1), Some(Ttl::Persistent));
@@ -417,6 +438,7 @@ mod tests {
             db: 0,
             auth: Auth::None,
             read_only: None,
+            prefer_replica: false,
         };
         assert!(p.is_read_only());
         p.env = Env::Local;
@@ -449,6 +471,7 @@ mod tests {
             db: 0,
             auth: Auth::Keychain,
             read_only: None,
+            prefer_replica: false,
         };
         let text = toml::to_string(&p).unwrap();
         for word in ["password", "username", "user", "secret", "token"] {

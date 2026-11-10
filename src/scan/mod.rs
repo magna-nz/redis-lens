@@ -485,6 +485,7 @@ mod tests {
             db: 0,
             auth: Auth::None,
             read_only: None,
+            prefer_replica: false,
         };
         assert_eq!(ScanOptions::for_profile(&p).max_commands_per_sec, None);
         p.env = Env::Prod;

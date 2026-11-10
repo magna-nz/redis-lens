@@ -88,6 +88,7 @@ fn profile_for(name: String, port: u16, password: bool) -> Profile {
         db: 0,
         auth: if password { Auth::Keychain } else { Auth::None },
         read_only: None,
+        prefer_replica: false,
     }
 }
 

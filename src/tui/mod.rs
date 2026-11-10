@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
-use crate::conn;
+use crate::conn::{self, ScanTarget};
 use crate::model::{Credentials, Profile, ScanReport};
 use crate::scan::{self, ScanOptions, ScanProgress};
 use crate::secrets::{KeyringStore, MemoryStore, SecretStore};
@@ -128,7 +128,7 @@ async fn event_loop(
                 Some(Incoming::Msg(m)) => pending = app.apply(m),
                 None => return Ok(()),
             },
-            _ = tick.tick() => pending = app.apply(Msg::Tick),
+            _ = tick.tick() => pending = app.apply(Msg::TickAt(std::time::Instant::now())),
         }
     }
 }
@@ -266,9 +266,18 @@ fn scrub(text: String, secret: Option<&str>) -> String {
     }
 }
 
+/// A fallback reason is free text built from server replies and addresses: it goes
+/// through the same `clean` as error messages before the TUI shows it.
+fn clean_target(target: ScanTarget, clean: impl Fn(String) -> String) -> ScanTarget {
+    match target {
+        ScanTarget::PrimaryFallback(why) => ScanTarget::PrimaryFallback(clean(why)),
+        t => t,
+    }
+}
+
 /// Prefix of the report (and so snapshot) name of a Docker container, so a container
 /// called `cache` never shares history with a saved profile called `cache`.
-const DOCKER_PREFIX: &str = "docker:";
+const DOCKER_PREFIX: &str = crate::cli::conn::DOCKER_PREFIX;
 
 /// The name a scan of `profile` is reported and snapshotted under: the profile name for
 /// saved profiles, `docker:<container>` for containers found in Docker.
@@ -297,8 +306,8 @@ async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, t
     };
     let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
 
-    let mut c = match conn::connect(&profile, store.as_ref()).await {
-        Ok(c) => c,
+    let (mut c, target) = match conn::connect_for_scan(&profile, store.as_ref()).await {
+        Ok((c, target)) => (c, clean_target(target, clean)),
         Err(e) => {
             send(
                 &tx,
@@ -318,6 +327,7 @@ async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, t
             id,
             server,
             perms: perms.clone(),
+            target,
         },
     ) {
         return;
@@ -386,6 +396,7 @@ mod tests {
             db: 0,
             auth: Auth::Keychain,
             read_only: None,
+            prefer_replica: false,
         }
     }
 
@@ -467,6 +478,28 @@ mod tests {
         assert_eq!(
             report_name(&p, &SecretSource::Container(Some(creds))),
             "docker:cache"
+        );
+    }
+
+    #[test]
+    fn fallback_reasons_are_cleaned() {
+        let secret = Some("hunter2");
+        let clean = |e: String| conn::parse::mask(&scrub(e, secret));
+        let t = clean_target(
+            ScanTarget::PrimaryFallback(
+                "10.0.0.1:6379: hunter2 refused for redis://u:s3cretAAA@h:6379".into(),
+            ),
+            clean,
+        );
+        let ScanTarget::PrimaryFallback(why) = t else {
+            panic!("{t:?}");
+        };
+        assert!(!why.contains("hunter2"), "{why}");
+        assert!(!why.contains("s3cretAAA"), "{why}");
+        assert!(why.starts_with("10.0.0.1:6379: ******"), "{why}");
+        assert_eq!(
+            clean_target(ScanTarget::Primary, clean),
+            ScanTarget::Primary
         );
     }
 

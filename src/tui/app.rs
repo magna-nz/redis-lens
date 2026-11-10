@@ -3,10 +3,12 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::conn::ScanTarget;
 use crate::conn::docker::DiscoveredInstance;
 use crate::conn::parse::{ParsedConnection, mask, parse_connection_string};
 use crate::diff::ReportDiff;
@@ -20,6 +22,11 @@ use super::tree::{PatternTree, Root, Row};
 
 /// Ticks (100 ms each) an info notice stays up.
 const NOTICE_TICKS: u64 = 40;
+/// How long a keychain connect may take before the TUI explains the wait.
+pub const KEYCHAIN_HINT_AFTER: Duration = Duration::from_secs(2);
+/// Shown while a connect is slow and the credentials come from the OS keychain.
+pub const KEYCHAIN_HINT: &str =
+    "Waiting for the OS keychain. If a permission dialog is open, choose Always Allow.";
 const MAX_INPUT: usize = 2048;
 const MAX_FILTER: usize = 64;
 
@@ -84,6 +91,8 @@ pub struct ConnEntry {
     pub status: ConnStatus,
     pub server: Option<ServerInfo>,
     pub perms: Option<PermissionReport>,
+    /// Which server the last connect reached.
+    pub target: Option<ScanTarget>,
     /// The last connect error. Never holds credentials.
     pub error: Option<String>,
     /// Added in this session through the add flow.
@@ -149,12 +158,15 @@ pub enum Effect {
 #[derive(Debug)]
 pub enum Msg {
     Tick,
+    /// A tick that also carries the time, so the app can tell how long a connect has taken.
+    TickAt(Instant),
     DockerFound(Vec<DiscoveredInstance>),
     DockerFailed(String),
     Connected {
         id: ConnId,
         server: Option<ServerInfo>,
         perms: PermissionReport,
+        target: ScanTarget,
     },
     ConnectFailed {
         id: ConnId,
@@ -211,6 +223,8 @@ pub struct Session {
     pub id: ConnId,
     pub profile: Profile,
     pub server: Option<ServerInfo>,
+    /// Which server is scanned, known once connected.
+    pub target: Option<ScanTarget>,
     pub progress: Option<ScanProgress>,
     pub phase: Phase,
     pub report: Option<ScanReport>,
@@ -287,6 +301,10 @@ pub struct App {
     pub sel: ViewSel,
     pub notice: Option<Notice>,
     pub tick: u64,
+    /// The latest time given by `Msg::TickAt`. The app never reads the clock itself.
+    now: Option<Instant>,
+    /// When the current connect started, by the clock above.
+    connect_started: Option<Instant>,
     next_id: ConnId,
 }
 
@@ -324,6 +342,8 @@ impl App {
             sel: ViewSel::default(),
             notice: None,
             tick: 0,
+            now: None,
+            connect_started: None,
             next_id: 1,
         };
         for p in profiles {
@@ -335,6 +355,7 @@ impl App {
                 status: ConnStatus::NotOpen,
                 server: None,
                 perms: None,
+                target: None,
                 error: None,
                 just_saved: false,
             });
@@ -355,6 +376,34 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    fn is_connecting(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.phase == Phase::Connecting)
+    }
+
+    /// True when the session's connect has run longer than [`KEYCHAIN_HINT_AFTER`] and its
+    /// credentials come from the OS keychain, so the wait is probably a permission dialog.
+    pub fn waiting_for_keychain(&self) -> bool {
+        let (Some(s), Some(started), Some(now)) =
+            (self.session.as_ref(), self.connect_started, self.now)
+        else {
+            return false;
+        };
+        let from_keychain = s.profile.auth == Auth::Keychain
+            && self
+                .entry(s.id)
+                .is_some_and(|e| matches!(e.source, Source::Saved));
+        from_keychain
+            && s.phase == Phase::Connecting
+            && now.saturating_duration_since(started) > KEYCHAIN_HINT_AFTER
+    }
+
+    /// The hint to show beside a slow connect, if any.
+    pub fn keychain_hint(&self) -> Option<&'static str> {
+        self.waiting_for_keychain().then_some(KEYCHAIN_HINT)
     }
 
     pub fn set_error(&mut self, text: impl Into<String>) {
@@ -625,6 +674,13 @@ impl App {
 
     /// A name no saved profile uses yet: `name`, else `name-2`, `name-3`, ...
     fn unique_name(&self, base: &str) -> String {
+        // `docker:` is reserved for discovered containers.
+        let base = if crate::cli::conn::has_docker_prefix(base) {
+            format!("docker-{}", &base[crate::cli::conn::DOCKER_PREFIX.len()..])
+        } else {
+            base.to_string()
+        };
+        let base = base.as_str();
         let taken = |n: &str| self.saved().any(|e| e.profile.name == n);
         if !taken(base) {
             return base.to_string();
@@ -688,6 +744,7 @@ impl App {
                 Auth::None
             },
             read_only: None,
+            prefer_replica: false,
         };
         if let Some(add) = self.add.as_mut() {
             add.saving = true;
@@ -760,11 +817,13 @@ impl App {
             id,
             profile: profile.clone(),
             server: entry.server.clone(),
+            target: None,
             progress: None,
             phase: Phase::Connecting,
             report: None,
             history: History::Pending,
         });
+        self.connect_started = self.now;
         self.patterns = PatternsState::default();
         self.sel = ViewSel::default();
         self.view = View::Patterns;
@@ -879,6 +938,13 @@ impl App {
     /// Apply a message. Returns follow-up work, e.g. loading history after a scan.
     pub fn apply(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
+            Msg::TickAt(now) => {
+                self.now = Some(now);
+                if self.connect_started.is_none() && self.is_connecting() {
+                    self.connect_started = Some(now);
+                }
+                return self.apply(Msg::Tick);
+            }
             Msg::Tick => {
                 self.tick += 1;
                 if self
@@ -895,10 +961,16 @@ impl App {
                 self.set_docker(Vec::new());
                 self.docker = DockerState::Unavailable;
             }
-            Msg::Connected { id, server, perms } => {
+            Msg::Connected {
+                id,
+                server,
+                perms,
+                target,
+            } => {
                 if !self.is_session(id) {
                     return Vec::new();
                 }
+                self.connect_started = None;
                 let limited = perms
                     .checks
                     .iter()
@@ -911,9 +983,11 @@ impl App {
                     };
                     e.server = server.clone();
                     e.perms = Some(perms);
+                    e.target = Some(target.clone());
                 }
                 if let Some(s) = self.session.as_mut() {
                     s.server = server;
+                    s.target = Some(target);
                     s.phase = Phase::Scanning;
                 }
             }
@@ -921,6 +995,7 @@ impl App {
                 if !self.is_session(id) {
                     return Vec::new();
                 }
+                self.connect_started = None;
                 if let Some(e) = self.entry_mut(id) {
                     e.status = ConnStatus::Failed;
                     e.error = Some(error.clone());
@@ -1023,6 +1098,7 @@ impl App {
                         status: ConnStatus::NotOpen,
                         server: None,
                         perms: None,
+                        target: None,
                         error: None,
                         just_saved: true,
                     },
@@ -1075,6 +1151,7 @@ impl App {
                     status: ConnStatus::NotOpen,
                     server: None,
                     perms: None,
+                    target: None,
                     error: None,
                     just_saved: false,
                 },
@@ -1178,6 +1255,101 @@ mod tests {
     }
 
     #[test]
+    fn keychain_hint_appears_after_two_seconds_on_a_fake_clock() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut app = App::new(fixtures::profiles());
+        app.apply(Msg::TickAt(t0));
+        app.handle_key(ch('j')); // staging-cache: keychain
+        let id = app.session.as_ref().map(|s| s.id);
+        assert!(id.is_none());
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { id, .. }] = &effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        let id = *id;
+        app.apply(Msg::TickAt(at(1900)));
+        assert_eq!(app.keychain_hint(), None);
+        app.apply(Msg::TickAt(at(2000)));
+        assert_eq!(
+            app.keychain_hint(),
+            None,
+            "exactly 2 s is not yet more than 2 s"
+        );
+        app.apply(Msg::TickAt(at(2100)));
+        assert_eq!(
+            app.keychain_hint(),
+            Some(
+                "Waiting for the OS keychain. If a permission dialog is open, choose Always Allow."
+            )
+        );
+        app.apply(Msg::Connected {
+            id,
+            server: Some(fixtures::server()),
+            perms: fixtures::perms_ok(),
+            target: ScanTarget::Primary,
+        });
+        assert_eq!(app.keychain_hint(), None);
+    }
+
+    #[test]
+    fn keychain_hint_needs_a_keychain_profile_and_a_clock() {
+        let t0 = Instant::now();
+        // No password profile: never a hint.
+        let mut app = App::new(fixtures::profiles());
+        app.apply(Msg::TickAt(t0));
+        app.handle_key(ch('j'));
+        app.handle_key(ch('j')); // local-6379: no auth
+        app.handle_key(key(KeyCode::Enter));
+        app.apply(Msg::TickAt(t0 + Duration::from_secs(30)));
+        assert_eq!(app.keychain_hint(), None);
+        // Connecting before the first clock reading: the timer starts at the first one.
+        let mut app = App::new(fixtures::profiles());
+        app.handle_key(ch('j'));
+        app.handle_key(key(KeyCode::Enter));
+        app.apply(Msg::TickAt(t0));
+        app.apply(Msg::TickAt(t0 + Duration::from_secs(1)));
+        assert_eq!(app.keychain_hint(), None);
+        app.apply(Msg::TickAt(t0 + Duration::from_millis(2500)));
+        assert!(app.keychain_hint().is_some());
+        // A failed connect clears it.
+        let id = app.session.as_ref().unwrap().id;
+        app.apply(Msg::ConnectFailed {
+            id,
+            error: "denied".into(),
+        });
+        assert_eq!(app.keychain_hint(), None);
+    }
+
+    #[test]
+    fn connected_session_remembers_the_scan_target() {
+        let mut app = App::new(fixtures::profiles());
+        app.handle_key(ch('j'));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { id, .. }] = &effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        let target = ScanTarget::PrimaryFallback("10.0.1.21:6379: timed out".into());
+        app.apply(Msg::Connected {
+            id: *id,
+            server: Some(fixtures::server()),
+            perms: fixtures::perms_ok(),
+            target: target.clone(),
+        });
+        assert_eq!(app.session.as_ref().unwrap().target, Some(target.clone()));
+        assert_eq!(app.entry(*id).unwrap().target, Some(target));
+    }
+
+    #[test]
+    fn guessed_names_avoid_the_docker_prefix() {
+        let app = App::new(fixtures::profiles());
+        assert_eq!(app.unique_name("docker:cache"), "docker-cache");
+        assert_eq!(app.unique_name("Docker:cache"), "docker-cache");
+        assert_eq!(app.unique_name("DOCKER:orders"), "docker-orders");
+        assert_eq!(app.unique_name("staging-cache"), "staging-cache-2");
+    }
+
+    #[test]
     fn enter_connects_saved_profile_with_keychain() {
         let mut app = App::new(fixtures::profiles());
         app.handle_key(ch('j'));
@@ -1201,6 +1373,7 @@ mod tests {
             id: *id,
             server: Some(fixtures::server()),
             perms: fixtures::perms_memory_denied(),
+            target: ScanTarget::Primary,
         });
         assert_eq!(app.entry(*id).unwrap().status, ConnStatus::Limited);
         assert!(
@@ -1280,6 +1453,7 @@ mod tests {
             id,
             server: Some(fixtures::server()),
             perms: fixtures::perms_ok(),
+            target: ScanTarget::Primary,
         });
         app.apply(Msg::ScanDone {
             id,
@@ -1374,6 +1548,7 @@ mod tests {
             id,
             server: Some(report.server.clone()),
             perms,
+            target: ScanTarget::Primary,
         });
         app.apply(Msg::ScanDone { id, report });
         (app, id)

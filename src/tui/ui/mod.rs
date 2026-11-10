@@ -7,6 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 
+use crate::conn::ScanTarget;
 use crate::conn::parse::mask;
 use crate::format;
 use crate::model::{PERM_MEMORY, ScanReport, ServerFlavor, ServerInfo};
@@ -97,17 +98,22 @@ fn waiting(frame: &mut Frame, main: Rect, detail: Rect, app: &App, s: &Session, 
                 style::dim(),
             )));
         }
-        Phase::Connecting => lines.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(spin, style::amber()),
-            Span::styled(
-                format!(
-                    " Connecting to {} ({}) and checking permissions…",
-                    p.name, p.endpoint
+        Phase::Connecting => {
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(spin, style::amber()),
+                Span::styled(
+                    format!(
+                        " Connecting to {} ({}) and checking permissions…",
+                        p.name, p.endpoint
+                    ),
+                    style::dim(),
                 ),
-                style::dim(),
-            ),
-        ])),
+            ]));
+            if let Some(hint) = app.keychain_hint() {
+                lines.push(Line::from(Span::styled(format!(" {hint}"), style::amber())));
+            }
+        }
         Phase::Scanning | Phase::Done => {
             let pr = s.progress.unwrap_or_default();
             lines.push(Line::from(vec![
@@ -230,6 +236,17 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
                     style::dim(),
                 ),
             ];
+            match &s.target {
+                Some(ScanTarget::Replica(ep)) => left.push(Span::styled(
+                    format!("  replica {}", trunc(&ep.to_string(), 24)),
+                    style::dim(),
+                )),
+                Some(ScanTarget::PrimaryFallback(_)) => left.push(Span::styled(
+                    "  primary (replica unreachable)",
+                    style::amber(),
+                )),
+                _ => {}
+            }
             if p.is_read_only() {
                 left.push(Span::styled("  read-only", style::amber()));
             }
@@ -264,14 +281,21 @@ fn server_line(app: &App, s: &Session, w: usize) -> Line<'static> {
     let Some(srv) = &s.server else {
         return Line::from(match &s.phase {
             Phase::Failed(e) => vec![Span::styled(format!(" ✗ {e}"), style::warn())],
-            _ => vec![
-                Span::raw(" "),
-                Span::styled(spin, style::amber()),
-                Span::styled(
-                    format!(" Connecting to {}…", s.profile.endpoint),
-                    style::dim(),
-                ),
-            ],
+            _ => match app.keychain_hint() {
+                Some(hint) => vec![
+                    Span::raw(" "),
+                    Span::styled(spin, style::amber()),
+                    Span::styled(format!(" {hint}"), style::amber()),
+                ],
+                None => vec![
+                    Span::raw(" "),
+                    Span::styled(spin, style::amber()),
+                    Span::styled(
+                        format!(" Connecting to {}…", s.profile.endpoint),
+                        style::dim(),
+                    ),
+                ],
+            },
         });
     };
     let mut spans = vec![

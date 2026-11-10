@@ -5,6 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use secrecy::ExposeSecret;
 
+use crate::conn::ScanTarget;
 use crate::conn::parse::{AzureKind, ConnFormat, ParsedConnection, mask};
 use crate::format;
 use crate::model::{Auth, Env, PERM_LABELS, PERM_MEMORY, PermStatus};
@@ -195,6 +196,10 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
     if p.db != 0 {
         endpoint.push_str(&format!(" · db {}", p.db));
     }
+    match &e.target {
+        None | Some(ScanTarget::Primary) => {}
+        Some(t) => endpoint.push_str(&format!(" · scanning {t}")),
+    }
     let server = match &e.server {
         Some(s) => (
             format!("{} · {}", server_label(s), mode(s.mode)),
@@ -206,7 +211,7 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
         (Some((_, _, true)), _) => ("password (default user)", "from the container, memory only"),
         (Some(_), _) | (None, Auth::None) => ("none", "none"),
         (None, Auth::Keychain) => ("password or ACL user", "OS keychain"),
-        (None, Auth::EntraId) => ("Entra ID", "DefaultAzureCredential"),
+        (None, Auth::EntraId) => ("Entra ID", "developer tools (az login)"),
     };
     let read_only = match (p.is_read_only(), p.env) {
         (true, Env::Prod) => "yes (production profile)",
@@ -281,6 +286,12 @@ fn note(app: &App, e: &ConnEntry, docker: Option<(&String, &String)>) -> Span<'s
     }
     match e.status {
         ConnStatus::Connecting => {
+            let hint = app
+                .keychain_hint()
+                .filter(|_| app.session.as_ref().is_some_and(|s| s.id == e.id));
+            if let Some(hint) = hint {
+                return Span::styled(format!(" {} {hint}", spinner(app.tick)), style::amber());
+            }
             return Span::styled(
                 format!(
                     " {} Connecting and checking permissions…",

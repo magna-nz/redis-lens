@@ -11,7 +11,7 @@ use tokio::sync::watch;
 
 use super::ScanArgs;
 use crate::config::Config;
-use crate::conn;
+use crate::conn::{self, ScanTarget};
 use crate::format;
 use crate::model::{PERM_FREQ, PatternStats, PermStatus, PermissionReport, ScanReport};
 use crate::scan::{self, ScanOptions, ScanProgress};
@@ -29,7 +29,18 @@ pub async fn report(
     args: &ScanArgs,
     progress: Option<&watch::Sender<ScanProgress>>,
 ) -> anyhow::Result<(ScanReport, PermissionReport)> {
-    scan_profile(
+    let (report, perms, _) = report_with_target(config_path, secrets, args, progress).await?;
+    Ok((report, perms))
+}
+
+/// [`report`], also saying which server was scanned.
+pub async fn report_with_target(
+    config_path: &Path,
+    secrets: &dyn SecretStore,
+    args: &ScanArgs,
+    progress: Option<&watch::Sender<ScanProgress>>,
+) -> anyhow::Result<(ScanReport, PermissionReport, ScanTarget)> {
+    scan_profile_with_target(
         config_path,
         secrets,
         &args.profile,
@@ -52,6 +63,29 @@ pub async fn scan_profile(
     max_rate: Option<u32>,
     progress: Option<&watch::Sender<ScanProgress>>,
 ) -> anyhow::Result<(ScanReport, PermissionReport)> {
+    let (report, perms, _) = scan_profile_with_target(
+        config_path,
+        secrets,
+        profile_name,
+        sample,
+        match_glob,
+        max_rate,
+        progress,
+    )
+    .await?;
+    Ok((report, perms))
+}
+
+/// [`scan_profile`], also saying which server was scanned (see [`conn::connect_for_scan`]).
+pub async fn scan_profile_with_target(
+    config_path: &Path,
+    secrets: &dyn SecretStore,
+    profile_name: &str,
+    sample: u64,
+    match_glob: Option<String>,
+    max_rate: Option<u32>,
+    progress: Option<&watch::Sender<ScanProgress>>,
+) -> anyhow::Result<(ScanReport, PermissionReport, ScanTarget)> {
     let config = Config::load(config_path)?;
     let profile = config.get(profile_name).ok_or_else(|| {
         anyhow::anyhow!(
@@ -59,7 +93,7 @@ pub async fn scan_profile(
             profile_name
         )
     })?;
-    let mut connection = conn::connect(profile, secrets).await?;
+    let (mut connection, target) = conn::connect_for_scan(profile, secrets).await?;
     let perms = conn::check_permissions(&mut connection).await;
     let mut opts = ScanOptions::for_profile(profile);
     opts.sample_limit = sample;
@@ -68,7 +102,7 @@ pub async fn scan_profile(
         opts.max_commands_per_sec = (rate > 0).then_some(rate);
     }
     let report = scan::scan(&profile.name, &mut connection, &opts, &perms, progress).await?;
-    Ok((report, perms))
+    Ok((report, perms, target))
 }
 
 /// With `--save`, write the report into `dir` and tell the user where on stderr.
@@ -147,6 +181,24 @@ fn flavor_str(r: &ScanReport) -> String {
 
 /// The report as plain text that fits `width` columns (at least 60).
 pub fn render_table(report: &ScanReport, perms: &PermissionReport, width: usize) -> String {
+    render_table_for(report, perms, &ScanTarget::Primary, width)
+}
+
+/// The `Target:` summary line, or `None` for a plain scan of the primary.
+pub fn target_line(target: &ScanTarget) -> Option<String> {
+    match target {
+        ScanTarget::Primary => None,
+        t => Some(format!("Target:  {t}")),
+    }
+}
+
+/// [`render_table`] with a `Target:` line when the scan did not read the primary as asked.
+pub fn render_table_for(
+    report: &ScanReport,
+    perms: &PermissionReport,
+    target: &ScanTarget,
+    width: usize,
+) -> String {
     let width = width.max(MIN_WIDTH);
     let s = &report.server;
     let mut lines: Vec<String> = Vec::new();
@@ -158,6 +210,7 @@ pub fn render_table(report: &ScanReport, perms: &PermissionReport, width: usize)
         s.version,
         mode_str(report)
     ));
+    lines.extend(target_line(target));
     let limit = if s.maxmemory == 0 {
         "no limit".to_string()
     } else {
@@ -305,10 +358,10 @@ pub async fn run(config: Option<PathBuf>, args: ScanArgs) -> anyhow::Result<()> 
     let secrets = KeyringStore;
     let result = with_progress(|tx| {
         let (path, secrets, args) = (&path, &secrets, &args);
-        async move { report(path, secrets, args, tx.as_ref()).await }
+        async move { report_with_target(path, secrets, args, tx.as_ref()).await }
     })
     .await;
-    let (report, perms) = result?;
+    let (report, perms, target) = result?;
     save_into(snapshot::default_dir, &args, &report)?;
 
     if args.json {
@@ -320,7 +373,7 @@ pub async fn run(config: Option<PathBuf>, args: ScanArgs) -> anyhow::Result<()> 
         let width = crossterm::terminal::size()
             .map(|(c, _)| c as usize)
             .unwrap_or(DEFAULT_WIDTH);
-        println!("{}", render_table(&report, &perms, width));
+        println!("{}", render_table_for(&report, &perms, &target, width));
     }
     Ok(())
 }
@@ -390,6 +443,35 @@ mod tests {
             max_rate: None,
             save,
         }
+    }
+
+    #[test]
+    fn target_line_shows_replicas_and_fallbacks_only() {
+        use crate::model::Endpoint;
+        assert_eq!(target_line(&ScanTarget::Primary), None);
+        let ep = Endpoint {
+            host: "10.0.1.21".into(),
+            port: 6379,
+            tls: false,
+        };
+        assert_eq!(
+            target_line(&ScanTarget::Replica(ep)).as_deref(),
+            Some("Target:  replica 10.0.1.21:6379")
+        );
+        let r = report(vec![], true, "noeviction");
+        let t = render_table_for(
+            &r,
+            &perms(),
+            &ScanTarget::PrimaryFallback("connection refused".into()),
+            100,
+        );
+        let lines: Vec<&str> = t.lines().collect();
+        assert!(lines[0].starts_with("Profile:"));
+        assert_eq!(
+            lines[1],
+            "Target:  primary (replica unreachable: connection refused)"
+        );
+        assert!(!render_table(&r, &perms(), 100).contains("Target:"));
     }
 
     #[test]

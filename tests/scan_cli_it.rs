@@ -40,6 +40,7 @@ fn profile(port: u16, auth: Auth) -> Profile {
         db: 0,
         auth,
         read_only: None,
+        prefer_replica: false,
     }
 }
 

@@ -2,3 +2,4 @@
 *.pending-snap
 *.snap.new
 .DS_Store
+/demo/demo.cast

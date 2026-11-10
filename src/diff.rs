@@ -54,6 +54,17 @@ pub struct PatternDiff {
     pub delta_bytes: Option<i64>,
     pub delta_keys: i64,
     pub cause: Cause,
+    /// At least one of the two scans did not see the whole keyspace, so a `New` pattern
+    /// may only be one the older scan missed.
+    pub partial: bool,
+    /// `sampled_keys` of the newer report: the scale for how many keys a partial `New`
+    /// pattern without sizes needs before it counts as growing.
+    #[serde(skip)]
+    pub sampled_keys_after: u64,
+    /// This pattern's `sampled_keys` in the newer report (0 when it is not there), in
+    /// the same units as [`Self::sampled_keys_after`].
+    #[serde(skip)]
+    pub pattern_sampled_keys_after: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -84,6 +95,7 @@ pub fn sub(a: u64, b: u64) -> i64 {
 /// keyspace or used the same `MATCH` glob; otherwise it is `Unknown`.
 pub fn diff(before: &ScanReport, after: &ScanReport) -> ReportDiff {
     let sizes = before.sizes_available && after.sizes_available;
+    let partial = !(before.complete && after.complete);
     let comparable = (before.complete && after.complete) || before.match_glob == after.match_glob;
     let mut names: Vec<&str> = before
         .patterns
@@ -99,7 +111,7 @@ pub fn diff(before: &ScanReport, after: &ScanReport) -> ReportDiff {
         .map(|name| {
             let b = before.patterns.iter().find(|p| p.pattern == name);
             let a = after.patterns.iter().find(|p| p.pattern == name);
-            pattern_diff(name, b, a, sizes, comparable)
+            pattern_diff(name, b, a, sizes, comparable, partial, after.sampled_keys)
         })
         .collect();
     let magnitude = |p: &PatternDiff| match p.delta_bytes {
@@ -126,6 +138,8 @@ fn pattern_diff(
     a: Option<&PatternStats>,
     sizes: bool,
     comparable: bool,
+    partial: bool,
+    sampled_keys_after: u64,
 ) -> PatternDiff {
     let keys_before = b.map(|p| p.est_keys);
     let keys_after = a.map(|p| p.est_keys);
@@ -163,6 +177,9 @@ fn pattern_diff(
         delta_bytes,
         delta_keys,
         cause,
+        partial,
+        sampled_keys_after,
+        pattern_sampled_keys_after: a.map_or(0, |p| p.sampled_keys),
     }
 }
 
@@ -267,6 +284,38 @@ mod tests {
     fn one(before: PatternStats, after: PatternStats, sizes: bool) -> PatternDiff {
         let d = diff(&report(vec![before], sizes), &report(vec![after], sizes));
         d.patterns[0].clone()
+    }
+
+    #[test]
+    fn carries_the_newer_reports_sample_size() {
+        let mut before = report(vec![stats("a", 1, None)], false);
+        before.sampled_keys = 10;
+        let mut after = report(vec![stats("a", 1, None), stats("b", 60, None)], false);
+        after.sampled_keys = 4000;
+        let d = diff(&before, &after);
+        assert!(d.patterns.iter().all(|p| p.sampled_keys_after == 4000));
+        assert_eq!(d.pattern("b").unwrap().pattern_sampled_keys_after, 60);
+        // Scaled: 10 sampled keys standing for 1,000.
+        let mut scaled = stats("c", 1000, None);
+        scaled.sampled_keys = 10;
+        after.patterns.push(scaled);
+        let c = diff(&before, &after).pattern("c").unwrap().clone();
+        assert_eq!((c.delta_keys, c.pattern_sampled_keys_after), (1000, 10));
+        // Not part of the JSON output.
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("sampled_keys_after"), "{json}");
+    }
+
+    #[test]
+    fn partial_flag_follows_completeness() {
+        let mk = |complete: bool| {
+            let mut r = report(vec![stats("a", 1, Some(1))], true);
+            r.complete = complete;
+            r
+        };
+        assert!(diff(&mk(true), &mk(false)).patterns[0].partial);
+        assert!(diff(&mk(false), &mk(true)).patterns[0].partial);
+        assert!(!diff(&mk(true), &mk(true)).patterns[0].partial);
     }
 
     #[test]

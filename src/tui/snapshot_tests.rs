@@ -9,6 +9,7 @@ use super::app::{App, ConnId, Effect, Msg};
 use super::fixtures;
 use super::tree::{Root, Row};
 use super::ui;
+use crate::conn::ScanTarget;
 use crate::model::{PermissionReport, ScanReport};
 use crate::scan::ScanProgress;
 
@@ -51,6 +52,7 @@ fn scanned_with(report: ScanReport, perms: PermissionReport) -> (App, ConnId) {
         id,
         server: Some(report.server.clone()),
         perms,
+        target: ScanTarget::Primary,
     });
     app.apply(Msg::ScanDone { id, report });
     (app, id)
@@ -138,6 +140,7 @@ fn connections_view() {
             ..fixtures::server()
         }),
         perms: fixtures::perms_memory_denied(),
+        target: ScanTarget::Primary,
     });
     app.apply(Msg::ScanProgress {
         id,
@@ -160,6 +163,7 @@ fn scanning_progress_header() {
         id,
         server: Some(fixtures::server()),
         perms: fixtures::perms_ok(),
+        target: ScanTarget::Primary,
     });
     app.apply(Msg::ScanProgress {
         id,
@@ -455,4 +459,38 @@ fn small_terminals_do_not_panic() {
             }
         }
     }
+}
+
+#[test]
+fn keychain_hint_and_scan_target_are_drawn() {
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    let mut app = App::new(fixtures::profiles());
+    app.apply(Msg::TickAt(t0));
+    app.handle_key(ch('j'));
+    let id = connect_selected(&mut app);
+    let text = |app: &App| buffer_lines(&render(app, 140, 40)).join("\n");
+    assert!(!text(&app).contains("Waiting for the OS keychain"));
+    app.apply(Msg::TickAt(t0 + Duration::from_secs(3)));
+    let t = text(&app);
+    assert!(t.matches("Waiting for the OS keychain").count() >= 2, "{t}");
+    assert!(t.contains("choose Always Allow."), "{t}");
+
+    let ep = crate::model::Endpoint {
+        host: "10.0.1.21".into(),
+        port: 6379,
+        tls: false,
+    };
+    app.apply(Msg::Connected {
+        id,
+        server: Some(fixtures::server()),
+        perms: fixtures::perms_ok(),
+        target: ScanTarget::Replica(ep),
+    });
+    let t = text(&app);
+    assert!(t.contains("replica 10.0.1.21:6379"), "{t}");
+    assert!(!t.contains("Waiting for the OS keychain"), "{t}");
+    app.handle_key(ch('0'));
+    let t = text(&app);
+    assert!(t.contains("scanning replica 10.0.1.21:6379"), "{t}");
 }

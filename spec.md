@@ -25,7 +25,7 @@ The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move,
 - For each one it shows the name, environment badge (PROD, STAGE, LOCAL, OTHER), endpoint, auth method, status and memory.
 - The detail panel shows the endpoint, server version and topology, auth, where the credentials come from, TLS, and the permission check results.
 - `a` adds a connection by pasting a connection string (see [Connection strings](#connection-strings)). The parsed result is previewed with the password masked before anything is saved.
-- `enter` connects to the selected profile.
+- `enter` connects to the selected profile. When a connect for a keychain profile takes longer than 2 s, the status line and the connecting panel say "Waiting for the OS keychain. If a permission dialog is open, choose Always Allow."
 
 ### 1 Patterns
 - Key patterns sorted by estimated memory. Each row shows the pattern, type, estimated keys, estimated memory, share bar, average size, percentage with no TTL, and the change since the last snapshot.
@@ -43,7 +43,7 @@ The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move,
 ### 3 Diff
 - Compares the current scan with the newest earlier snapshot of the same profile taken with the same `MATCH` glob. Comparing with a chosen snapshot is CLI-only, through `redis-lens diff --against`. For each pattern it shows before, after, the change, and the change as a percentage.
 - It also says whether the change came from the key count or the average size: more keys, fewer keys, bigger values or smaller values. Memory is keys × average size, so the cause is whichever of `ln(keys after / keys before)` and `ln(average after / average before)` is larger in magnitude, and its direction always follows the change in memory. A change under 1% or under 64 KiB is "unchanged".
-- New and gone patterns are flagged when both scans saw the whole keyspace or used the same `MATCH` glob. Otherwise a pattern found in only one scan is shown as "not in the other scan", and it never counts as growth in the TTL view.
+- New and gone patterns are flagged when both scans saw the whole keyspace or used the same `MATCH` glob. Otherwise a pattern found in only one scan is shown as "not in the other scan", and it never counts as growth in the TTL view. When either scan was partial (`complete` false), a `New` pattern counts as growing in the TTL view only if it passes a threshold; `PatternDiff.partial` records this. With sizes that is the usual byte threshold, which for a new pattern is more than 1 MiB. Without sizes there are no keys before, so 5% of them would let any key through: the pattern needs at least 50 sampled keys and at least 1% of the newer scan's sampled keys. Both sides are sampled counts (`PatternDiff.pattern_sampled_keys_after` and `PatternDiff.sampled_keys_after`, not part of the JSON output), because estimated keys are scaled up and a handful of sampled keys could pass a sampled floor.
 
 ### 4 Hot keys
 - Up to 50 sampled keys with an LFU counter (`OBJECT FREQ`) above 0, ranked by that counter, showing the key, pattern, type, counter and size. A node column comes with cluster support (v0.3).
@@ -84,7 +84,7 @@ Examples: `user:88213:cart` → `user:{id}:cart`, `rl:10.0.4.12:29187460` → `r
 | None | No `AUTH`. | v0.1 |
 | ACL user and password, or a password only | Both are kept in the OS keychain. | v0.1 |
 | TLS | `rediss://` or `ssl=True`, verified against webpki roots. | v0.1 |
-| Microsoft Entra ID | `DefaultAzureCredential` (az login, managed identity, workload identity) via redis-rs `entra-id`, behind the `entra-id` cargo feature. | v0.2 |
+| Microsoft Entra ID | redis-rs `EntraIdCredentialsProvider::new_developer_tools()`, the developer-tools credential chain (az login and similar), behind the `entra-id` cargo feature. Managed identity and workload identity are not covered yet. | v0.2 |
 | AWS ElastiCache IAM | | later |
 | Sentinel, SSH tunnel | | later |
 
@@ -99,7 +99,18 @@ Examples: `user:88213:cart` → `user:{id}:cart`, `rl:10.0.4.12:29187460` → `r
 ### Safety
 
 - Profiles with env `prod` are read-only by default. redis-lens never sends a write command, and the later `expire` command is refused on production profiles.
-- Scans can prefer replicas (planned for v0.2).
+- Scans can prefer replicas. It is opt-in per profile: `conn add --prefer-replica` sets `prefer_replica = true` in the config (absent when false). `conn::connect_for_scan` resolves the profile's credentials once (one keychain read, or one Entra ID token provider) and uses them for every connection it opens. It connects to the primary, reads `INFO replication` and, on `role:master`, takes the first `slaveN:…state=online` entry with a usable address: an IPv4 or IPv6 address other than `0.0.0.0` or `::`, or a host name, and a port other than 0. It connects to that candidate with the same credentials and TLS and verifies it (below); connecting and verifying share one 2 s timeout, and reading the keychain happens before it starts. On `role:slave` (or `role:replica`) the profile already points at a replica. The result is a `ScanTarget`: `Primary`, `Replica(endpoint)`, or `PrimaryFallback(reason)` when the replica could not be used or verified (the scan then runs on the primary). `scan` and `diff` print a `Target:` line for a replica or a fallback (`Target:  replica 10.0.1.21:6379`, `Target:  primary (replica unreachable: …)`); the TUI shows it in the header and the Connections detail panel, with the reason passed through the same masking as error messages. Endpoints with an IPv6 address are shown in brackets, `[::1]:6379`. A replica can lag, so counts and sizes may trail the primary slightly.
+- **Replica verification.** The address in `INFO replication` is whatever the replica announced, and anything may be listening there. redis-lens only scans a candidate it has checked against this primary (the replication ID is not secret, so a server built to imitate a replica can pass the check; it is then scanned without credentials, and its data is filed under the profile): the candidate's `INFO replication` must say `role:slave` (or `role:replica`) and its `master_replid` must equal the primary's. The steps:
+  1. Read the primary's `master_replid`. Without one, nothing can be verified: fall back.
+  2. Resolve the candidate's host once (`tokio::net::lookup_host`). Every connection to it uses those addresses, so DNS can't change between the check and the connection; TLS still checks the certificate against the announced name.
+  3. Ask the candidate for `INFO replication` on a connection that sends no credentials (no `AUTH`, `HELLO` or `CLIENT SETINFO`). If it answers and passes, the scan runs **on that same connection**, without credentials (it then reads as the replica's default user). It is never sent the profile's credentials: `master_replid` is not secret (anyone who can run `INFO`, or `PSYNC`, can learn it), so passing the check proves nothing about who holds the address.
+  4. Only a candidate that answers `NOAUTH`, for a profile that has credentials, may get them, and only when it is not on this machine or the primary is on this machine too. A host counts as on this machine when its name is loopback or any address it resolves to is loopback or unspecified; a loopback address announced by a remote primary names the machine running redis-lens, not the replica.
+  5. The authenticated connection is verified again, and it is the one scanned.
+
+  Resolving and every connection and check share the 2 s replica timeout. Any failure drops the candidate's connections and gives `PrimaryFallback("replica at <endpoint> is not a replica of this primary")`, or the reason it could not be checked (a refused loopback address, a host that does not resolve, a connection error, a timeout).
+
+  The trust boundary: with `--prefer-replica`, the address the primary announces for its replica is trusted the way Cluster and Sentinel clients trust addresses servers announce. Credentials go only to an announced host that demands auth and is on the primary's host or not loopback (after DNS resolution). Anyone who can make the primary announce a host they control that demands auth can collect the credentials. That is why `--prefer-replica` is opt-in.
+- Profile names starting with `docker:`, in any case (`Docker:`, `DOCKER:`), are reserved for discovered containers: `conn add` refuses them and the TUI add flow's guessed name avoids the prefix.
 
 ### Permission check
 
@@ -127,7 +138,7 @@ Lists running containers whose image is redis, valkey, redis-stack or bitnami/re
 
 ```
 redis-lens                         open the TUI
-redis-lens conn add <name> --url <url> [--env prod|stage|local|other] [--password-stdin | --ask-password] [--entra] [--force]
+redis-lens conn add <name> --url <url> [--env prod|stage|local|other] [--password-stdin | --ask-password] [--entra] [--prefer-replica] [--force]
 redis-lens conn list | remove <name> | test <name>
 redis-lens scan <name> [--sample N] [--match GLOB] [--max-rate N] [--save] [--json]
 redis-lens diff <name> [--against FILE] [--max-rate N] [--json]
@@ -145,7 +156,7 @@ redis-lens discover
 - **Reading:** a snapshot whose stored `profile` is not exactly the requested one is ignored, and so are files that can't be parsed. The baseline is the newest remaining snapshot taken strictly before the new scan with the same `MATCH` glob.
 - **Writing** goes to a uniquely named temp file that is flushed to disk and then renamed into place.
 
-`redis-lens diff <profile>` scans, compares with that baseline (or with `--against <file>`), then saves the new scan. The Diff view uses the same baseline.
+`redis-lens diff <profile>` first checks, before touching the server, that a baseline exists for the profile with no `MATCH` glob (the scan uses none), then scans, compares with that baseline (or with `--against <file>`), then saves the new scan. The Diff view uses the same baseline.
 
 ## Quality bar
 
