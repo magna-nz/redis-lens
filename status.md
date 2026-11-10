@@ -20,7 +20,7 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 |---|---|---|---|---|
 | 2 | Scanner and connections | implementer ×2 [sonnet] | `wave2/*` → `v0.1-core` | **done**, merged into `v0.1-core` |
 | 3 | TUI (Connections and Patterns views), `scan` command | implementer [opus] (TUI), implementer [sonnet] (`scan`), verifier [opus] | `wave3/tui`, `wave3/scan-cli` → `v0.1-core` → PR #6 | merged into `v0.1-core`; waiting on the verifier and CI |
-| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | implementer [sonnet] (engine), then implementer [opus] (views), verifier [opus] | `wave4/engine`, `wave4/views` → `v0.2-views` → next PR | contract committed on `v0.2-views` (0d1a07a); the engine agent is running; the views agent starts after the engine merges, because views call `verdict` and `diff` |
+| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | implementer [sonnet] (engine), then implementer [opus] (views), verifier [opus] | `wave4/engine`, `wave4/views` → `v0.2-views` → next PR | engine merged into `v0.2-views`; the views agent is running in `.claude/worktrees/views` |
 | 5 | Replica preference; README modelled on redis-near-cache (logo, badges, `vhs` GIF), CHANGELOG, demo polish | implementer [sonnet] ×2, verifier [opus] | `v0.2-polish` → next PR | pending |
 
 ### How to resume after a restart or compaction
