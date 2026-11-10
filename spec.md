@@ -12,7 +12,7 @@ A terminal UI that answers "what is using the memory in this Redis or Valkey, an
 
 ## Supported servers and platforms
 
-- **Servers:** Redis 7.x and Valkey 8.x, standalone, are tested in CI. Redis 6.2 should work (ACLs and `MEMORY USAGE` exist there) but isn't tested yet. Cluster comes in v0.3.
+- **Servers:** Redis 7.x and Valkey 8.x, standalone, are tested in CI. Redis 6.2 is tested in CI too (a separate integration job). Cluster comes in v0.3.
 - **Platforms:** macOS, Linux and Windows on x86_64, plus aarch64 for macOS and Linux.
 - **Minimum Rust version:** 1.89.
 
