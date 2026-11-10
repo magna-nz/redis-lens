@@ -14,8 +14,8 @@ use super::{ConnAddArgs, ConnCommand};
 use crate::config::Config;
 use crate::conn::docker::DiscoveredInstance;
 use crate::conn::{self, parse_connection_string};
-use crate::model::{Auth, Credentials, PermStatus, Profile};
-use crate::secrets::{KeyringStore, SecretStore};
+use crate::model::{Auth, Credentials, PermStatus, Profile, SecretRef};
+use crate::secrets::{KeyringStore, SecretError, SecretStore};
 
 fn config_path(config: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     match config {
@@ -51,6 +51,46 @@ pub async fn discover(_config: Option<PathBuf>) -> anyhow::Result<()> {
     let found = conn::docker::discover().await?;
     println!("{}", format_discovered(&found));
     Ok(())
+}
+
+/// The keychain entry under `r` as it is now, so a failed save can put it back. An
+/// entry that can't be decoded can't be restored either, so it counts as absent.
+fn previous_credentials(
+    secrets: &dyn SecretStore,
+    r: &SecretRef,
+) -> anyhow::Result<Option<Credentials>> {
+    match secrets.get(r) {
+        Ok(c) => Ok(c),
+        Err(SecretError::Corrupt) => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context("could not read the existing keychain entry")),
+    }
+}
+
+/// Store `creds` under `r`, then run `save` (the config write). If `save` fails, put
+/// the keychain back as it was: restore the previous credentials, or delete the new
+/// entry when there were none. Credentials go first so that a saved profile never
+/// points at a missing entry.
+pub(crate) fn set_credentials_then_save(
+    secrets: &dyn SecretStore,
+    r: &SecretRef,
+    creds: &Credentials,
+    save: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let previous = previous_credentials(secrets, r)?;
+    secrets.set(r, creds)?;
+    let Err(e) = save() else {
+        return Ok(());
+    };
+    let restored = match &previous {
+        Some(old) => secrets.set(r, old),
+        None => secrets.delete(r),
+    };
+    match restored {
+        Ok(()) => Err(e),
+        Err(re) => Err(anyhow::anyhow!(
+            "{e:#}; restoring the previous keychain entry also failed: {re}"
+        )),
+    }
 }
 
 fn trim_newline(s: &str) -> &str {
@@ -130,17 +170,26 @@ pub async fn add(
         read_only: None,
     };
 
-    // Credentials first: a saved profile must never point at a missing keychain entry.
+    let r = profile.secret_ref();
+    let mut save = || -> anyhow::Result<()> {
+        config.add(profile.clone(), args.force)?;
+        config.save(path)?;
+        Ok(())
+    };
     match &creds {
-        Some(c) => secrets.set(&profile.secret_ref(), c)?,
+        // Credentials first, rolled back if the config can't be written.
+        Some(c) => set_credentials_then_save(secrets, &r, c, save)?,
         None => {
+            // Switching to no stored credentials: the old entry goes only once the
+            // config no longer points at it.
+            save()?;
             if existing.is_some_and(|e| e.auth == Auth::Keychain) {
-                secrets.delete(&profile.secret_ref())?;
+                secrets.delete(&r).context(
+                    "the profile was saved, but its old keychain entry could not be deleted",
+                )?;
             }
         }
     }
-    config.add(profile.clone(), args.force)?;
-    config.save(path)?;
 
     let mut msg = format!(
         "Saved {} ({}, {}).",
@@ -215,7 +264,8 @@ pub fn list(path: &Path) -> anyhow::Result<String> {
     Ok(table(&["NAME", "ENV", "ENDPOINT", "TLS", "AUTH"], &rows))
 }
 
-/// Remove a profile from the config, then its keychain entry.
+/// Remove a profile from the config, then its keychain entry. The entry is deleted
+/// only after the config is saved, so a failed save leaves the keychain untouched.
 pub fn remove(path: &Path, secrets: &dyn SecretStore, name: &str) -> anyhow::Result<String> {
     let mut config = Config::load(path)?;
     let profile = config.remove(name)?;
@@ -425,6 +475,116 @@ mod tests {
         assert!(store.get(&one.secret_ref()).unwrap().is_none());
         assert!(Config::load(&path).unwrap().get("one").is_none());
         assert!(remove(&path, &store, "one").is_err());
+    }
+
+    /// A config path that loads (missing or present) but can't be saved: a directory
+    /// sits where `Config::save` writes its temp file. (A path whose parent is a regular
+    /// file would already fail in `Config::load`, before the keychain is touched.)
+    fn make_unsaveable(path: &Path) {
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        let tmp = dir.join(format!(".config.toml.{}.tmp", std::process::id()));
+        std::fs::create_dir_all(tmp.join("blocker")).unwrap();
+        assert!(Config::load(path).is_ok());
+        assert!(Config::load(path).unwrap().save(path).is_err());
+    }
+
+    fn sref(name: &str) -> SecretRef {
+        SecretRef {
+            service: crate::model::SECRET_SERVICE.to_string(),
+            account: format!("profile:{name}"),
+        }
+    }
+
+    /// The entry as plain values, to compare store states.
+    fn entry(store: &MemoryStore, name: &str) -> Option<(Option<String>, String)> {
+        store
+            .get(&sref(name))
+            .unwrap()
+            .map(|c| (c.username, c.password.expose_secret().to_string()))
+    }
+
+    #[tokio::test]
+    async fn failed_save_removes_new_entry() {
+        let path = temp_path("rb-new");
+        make_unsaveable(&path);
+        let store = MemoryStore::default();
+        store
+            .set(
+                &sref("other"),
+                &Credentials {
+                    username: None,
+                    password: SecretString::from("keep"),
+                },
+            )
+            .unwrap();
+        assert!(
+            add(&path, &store, &args("c", "redis://u:new-pw@h"), None)
+                .await
+                .is_err()
+        );
+        assert_eq!(entry(&store, "c"), None);
+        assert_eq!(entry(&store, "other"), Some((None, "keep".into())));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_force_save_restores_old_credentials() {
+        let path = temp_path("rb-force");
+        let store = MemoryStore::default();
+        add(&path, &store, &args("c", "redis://u:old-pw@h"), None)
+            .await
+            .unwrap();
+        let before = entry(&store, "c");
+        assert_eq!(before, Some((Some("u".into()), "old-pw".into())));
+        make_unsaveable(&path);
+
+        let mut a = args("c", "redis://v:new-pw@h2");
+        a.force = true;
+        assert!(add(&path, &store, &a, None).await.is_err());
+        assert_eq!(entry(&store, "c"), before);
+        assert_eq!(
+            Config::load(&path).unwrap().get("c").unwrap().endpoint.host,
+            "h"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_force_switch_to_no_auth_keeps_entry() {
+        let path = temp_path("rb-noauth");
+        let store = MemoryStore::default();
+        add(&path, &store, &args("c", "redis://u:old-pw@h"), None)
+            .await
+            .unwrap();
+        let before = entry(&store, "c");
+        make_unsaveable(&path);
+
+        let mut a = args("c", "redis://h2");
+        a.force = true;
+        assert!(add(&path, &store, &a, None).await.is_err());
+        assert_eq!(entry(&store, "c"), before);
+        assert_eq!(
+            Config::load(&path).unwrap().get("c").unwrap().auth,
+            Auth::Keychain
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_remove_keeps_entry() {
+        let path = temp_path("rb-remove");
+        let store = MemoryStore::default();
+        add(&path, &store, &args("c", "redis://u:old-pw@h"), None)
+            .await
+            .unwrap();
+        let before = entry(&store, "c");
+        make_unsaveable(&path);
+
+        assert!(remove(&path, &store, "c").is_err());
+        assert_eq!(entry(&store, "c"), before);
+        assert!(Config::load(&path).unwrap().get("c").is_some());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

@@ -197,7 +197,8 @@ impl Runner {
 }
 
 /// Save a new profile the way `conn add` does: credentials to the keychain first, so
-/// a saved profile never points at a missing entry, then the config file. Refuses to
+/// a saved profile never points at a missing entry, then the config file. If the
+/// config can't be written, the keychain entry is put back as it was. Refuses to
 /// replace an existing profile, and checks that before touching the keychain.
 fn save_connection(
     path: &Path,
@@ -209,12 +210,15 @@ fn save_connection(
     if config.get(&profile.name).is_some() {
         bail!("a profile named {} already exists", profile.name);
     }
-    if let Some(c) = credentials {
-        secrets.set(&profile.secret_ref(), c)?;
-    }
     config.add(profile.clone(), false)?;
-    config.save(path)?;
-    Ok(())
+    match credentials {
+        Some(c) => {
+            crate::cli::conn::set_credentials_then_save(secrets, &profile.secret_ref(), c, || {
+                Ok(config.save(path)?)
+            })
+        }
+        None => Ok(config.save(path)?),
+    }
 }
 
 /// Remove a known secret from error text, as a second line of defence.
@@ -361,6 +365,40 @@ mod tests {
         let still = store.get(&p.secret_ref()).unwrap().unwrap();
         assert_eq!(still.password.expose_secret(), "Sup3rS3cret");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_save_leaves_keychain_as_it_was() {
+        // A directory where `Config::save` writes its temp file makes the save fail
+        // while the load still works.
+        let path = temp_path("save-fails");
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        let tmp = dir.join(format!(".config.toml.{}.tmp", std::process::id()));
+        std::fs::create_dir_all(tmp.join("blocker")).unwrap();
+
+        let creds = Credentials {
+            username: Some("lens-ro".into()),
+            password: SecretString::from("Sup3rS3cret"),
+        };
+        // No entry before: none after.
+        let store = MemoryStore::default();
+        let p = profile("new-one");
+        assert!(save_connection(&path, &store, &p, Some(&creds)).is_err());
+        assert!(store.get(&p.secret_ref()).unwrap().is_none());
+
+        // A leftover entry before: the same entry after.
+        let old = Credentials {
+            username: None,
+            password: SecretString::from("leftover"),
+        };
+        store.set(&p.secret_ref(), &old).unwrap();
+        assert!(save_connection(&path, &store, &p, Some(&creds)).is_err());
+        let got = store.get(&p.secret_ref()).unwrap().unwrap();
+        assert_eq!(got.username, None);
+        assert_eq!(got.password.expose_secret(), "leftover");
+        assert!(Config::load(&path).unwrap().profiles.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

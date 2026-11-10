@@ -28,13 +28,23 @@ pub fn bytes(n: u64) -> String {
 }
 
 /// Counts as `9`, `212`, `1.5K`, `48K`, `1.84M` (powers of 1000).
+///
+/// The unit is picked after rounding, so `9_999` is `10K` rather than `10.0K` and
+/// `999_999` is `1.00M` rather than `1000K`. Halves round up.
 pub fn count(n: u64) -> String {
-    match n {
-        0..=999 => n.to_string(),
-        1_000..=9_999 => format!("{:.1}K", n as f64 / 1e3),
-        10_000..=999_999 => format!("{}K", (n as f64 / 1e3).round() as u64),
-        _ => format!("{:.2}M", n as f64 / 1e6),
+    if n < 1_000 {
+        return n.to_string();
     }
+    let tenths_k = n.saturating_add(50) / 100;
+    if tenths_k < 100 {
+        return format!("{}.{}K", tenths_k / 10, tenths_k % 10);
+    }
+    let k = n.saturating_add(500) / 1_000;
+    if k < 1_000 {
+        return format!("{k}K");
+    }
+    let hundredths_m = n.saturating_add(5_000) / 10_000;
+    format!("{}.{:02}M", hundredths_m / 100, hundredths_m % 100)
 }
 
 /// A count with thousands separators: `85,964`.
@@ -112,6 +122,23 @@ mod tests {
         assert_eq!(count(1_462), "1.5K");
         assert_eq!(count(48_000), "48K");
         assert_eq!(count(1_840_000), "1.84M");
+    }
+
+    #[test]
+    fn count_unit_boundaries_round_first() {
+        assert_eq!(count(999), "999");
+        assert_eq!(count(1_000), "1.0K");
+        assert_eq!(count(9_949), "9.9K");
+        assert_eq!(count(9_950), "10K");
+        assert_eq!(count(9_999), "10K");
+        assert_eq!(count(10_000), "10K");
+        assert_eq!(count(999_499), "999K");
+        assert_eq!(count(999_500), "1.00M");
+        assert_eq!(count(999_999), "1.00M");
+        assert_eq!(count(1_000_000), "1.00M");
+        assert_eq!(count(1_004_999), "1.00M");
+        assert_eq!(count(1_005_000), "1.01M");
+        assert!(count(u64::MAX).ends_with('M'));
     }
 
     #[test]

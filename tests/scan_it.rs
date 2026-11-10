@@ -284,3 +284,82 @@ async fn missing_memory_usage_acl_degrades() {
         101 // 100 carts + queue:big
     );
 }
+
+/// 10,000 keys `k:0` to `k:9999`, read by a user whose ACL only allows `k:1*` (1,111
+/// keys). SCAN still returns every key, so the 1,000 keys seen stand for a tenth of
+/// the keyspace even though only about 111 of them can be sampled.
+async fn key_acl_scale(server: &common::TestServer, user: &str) {
+    let mut admin = server.admin().await;
+    let mut pipe = redis::pipe();
+    for n in 0..10_000u32 {
+        pipe.set(format!("k:{n}"), n).ignore();
+    }
+    let _: () = pipe.query_async(&mut admin).await.unwrap();
+
+    let mut conn = redis::Client::open(format!("redis://{user}:pw@127.0.0.1:{}", server.port))
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let opts = ScanOptions {
+        sample_limit: 1_000,
+        max_commands_per_sec: None,
+        ..ScanOptions::default()
+    };
+    let report = scan("t", &mut conn, &opts, &perms(&[]), None)
+        .await
+        .unwrap();
+    assert_eq!(report.server.total_keys, 10_000);
+    assert!(report.sampled_keys < 300, "sampled {}", report.sampled_keys);
+    let est: u64 = report.patterns.iter().map(|p| p.est_keys).sum();
+    assert!((800..=1_500).contains(&est), "est {est}, truth 1,111");
+}
+
+#[tokio::test]
+async fn key_acl_does_not_collapse_scale_redis() {
+    let server = common::redis_with(&["--user", "lim", "on", ">pw", "~k:1*", "+@all"]).await;
+    key_acl_scale(&server, "lim").await;
+}
+
+#[tokio::test]
+async fn key_acl_does_not_collapse_scale_valkey() {
+    let server = common::valkey().await;
+    let mut admin = server.admin().await;
+    let _: () = redis::cmd("ACL")
+        .arg(&["SETUSER", "lim", "on", ">pw", "~k:1*", "+@all"])
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    key_acl_scale(&server, "lim").await;
+}
+
+/// An empty database has a progress target of 0, and it stays 0.
+async fn empty_progress(server: common::TestServer) {
+    let mut conn = server.admin().await;
+    let (tx, rx) = tokio::sync::watch::channel(Default::default());
+    let report = scan(
+        "t",
+        &mut conn,
+        &ScanOptions::default(),
+        &perms(&[]),
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.sampled_keys, 0);
+    assert!(report.patterns.is_empty());
+    let last = *rx.borrow();
+    assert!(last.done);
+    assert_eq!(last.sampled, 0);
+    assert_eq!(last.target, 0);
+}
+
+#[tokio::test]
+async fn empty_db_progress_target_redis() {
+    empty_progress(common::redis().await).await;
+}
+
+#[tokio::test]
+async fn empty_db_progress_target_valkey() {
+    empty_progress(common::valkey().await).await;
+}
