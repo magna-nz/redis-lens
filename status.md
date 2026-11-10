@@ -21,7 +21,7 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 | 2 | Scanner and connections | implementer ×2 [sonnet] | `wave2/*` → `v0.1-core` | **done**, merged into `v0.1-core` |
 | 3 | TUI (Connections and Patterns views), `scan` command, verifier fixes | | `v0.1-core` → PR #6 | **done**: verified, CI green, merged into main (6dc45c6) |
 | 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | | `v0.2-views` → PR #7 | **done**: verified, CI green, merged into main |
-| 5 | Docs, logo, GIF, CHANGELOG, Dependabot ignore; replica preference; keychain-wait hint; v0.2 verifier follow-ups | implementer [sonnet] ×2, verifier [opus] | `wave5/polish` → PR after verification | combined on `wave5/polish` (a292fa3), 210 unit tests pass; **verifier running** in `.claude/worktrees/verify5`; feature research agent running |
+| 5 | Docs, logo, GIF, CHANGELOG, Dependabot ignore; replica preference with verification; keychain-wait hint; v0.2 follow-ups | implementer [sonnet] ×2, implementer [opus] (fixes), verifier [opus] | `wave5/polish` → PR | first verification **BLOCKED**: an unverified replica endpoint could be scanned and sent credentials. Fixed in cc8a8b2 (role and `master_replid` check, credentials read once); **re-verification running** in `.claude/worktrees/verify5b` |
 
 ### How to resume after a restart or compaction
 
@@ -92,4 +92,27 @@ See the overnight table above.
 
 ## Feature ideas
 
-Filled in after wave 5.
+Researched on 2026-11-11. Proposals only; nothing here is built. The full write-up, with evidence, scope, effort, risks and sources, is in [docs/feature-ideas.md](docs/feature-ideas.md).
+
+**Quick wins** (ranked by value against effort):
+1. `--check` thresholds with exit codes for CI and pre-deploy gates (S)
+2. Report export as Markdown, HTML or CSV (S)
+3. Detect ElastiCache, MemoryDB and Azure, and say plainly what degrades (S)
+4. Server-wide numbers from `INFO keysizes`, `INFO keyspace` and `MEMORY STATS` (S)
+5. An external token command for passwordless auth on GCP, AWS and Azure (S)
+6. Snapshot retention (`--keep`, `prune`) and a trend view (S–M)
+7. Compare two instances, for example staging against prod (S–M)
+
+**Bigger bets:**
+8. Hash field TTL awareness (`HEXPIRE`), to avoid false leak verdicts (M)
+9. Native AWS IAM auth for ElastiCache and MemoryDB (M)
+10. Azure managed identity and service principal, plus Azure Managed Redis cluster-policy handling (M)
+11. Prometheus textfile export (M)
+12. Server-side `HOTKEYS` (Redis 8.6+) in place of a `MONITOR` fallback (M)
+13. A per-slot view from `CLUSTER SLOT-STATS`, after v0.3 (M)
+14. Offline RDB analysis (L)
+
+**Verified facts that affect the roadmap:**
+- ElastiCache Serverless blocks `MEMORY USAGE` and `OBJECT FREQ`.
+- The OSS clustering policy on Azure Managed Redis needs v0.3 cluster support.
+- `HEXPIRE` exists in Redis from 7.4 and in Valkey only from 9.0, so CI would need a newer Valkey to test it.
