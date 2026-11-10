@@ -287,6 +287,7 @@ mod tests {
             sampled_keys: 12_400,
             patterns,
             sizes_available: sizes,
+            hot_keys: Vec::new(),
         }
     }
 

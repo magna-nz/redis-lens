@@ -40,6 +40,14 @@ impl Default for ScanOptions {
     }
 }
 
+impl ScanOptions {
+    /// Defaults for a profile: no command budget for `Local` profiles, 5,000 commands per
+    /// second for everything else. Owner: engine (wave 4); stub.
+    pub fn for_profile(_profile: &crate::model::Profile) -> Self {
+        todo!("ScanOptions::for_profile")
+    }
+}
+
 /// Progress published while a scan runs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanProgress {
@@ -342,6 +350,7 @@ pub async fn scan<C: ConnectionLike + Send>(
         sampled_keys: samples.len() as u64,
         patterns: crate::pattern::aggregate(&samples, scale),
         sizes_available: with_sizes,
+        hot_keys: Vec::new(),
     })
 }
 

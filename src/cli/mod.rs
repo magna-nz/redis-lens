@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::model::Env;
 
 pub mod conn;
+pub mod diff;
 pub mod scan;
 
 #[derive(Debug, Parser)]
@@ -31,6 +32,8 @@ pub enum Command {
     Scan(ScanArgs),
     /// List Redis and Valkey containers running in Docker.
     Discover,
+    /// Scan a saved connection and compare it with its previous snapshot.
+    Diff(DiffArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -111,6 +114,28 @@ pub struct ScanArgs {
     /// Print the report as JSON instead of a table.
     #[arg(long)]
     pub json: bool,
+    /// Upper bound on commands per second (0 means no limit). Defaults to no limit for
+    /// local profiles and 5,000 otherwise.
+    #[arg(long)]
+    pub max_rate: Option<u32>,
+    /// Save the report as a snapshot for later comparison.
+    #[arg(long)]
+    pub save: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DiffArgs {
+    /// Profile name.
+    pub profile: String,
+    /// Compare with this snapshot file instead of the newest one for the profile.
+    #[arg(long)]
+    pub against: Option<PathBuf>,
+    /// Upper bound on commands per second (0 means no limit).
+    #[arg(long)]
+    pub max_rate: Option<u32>,
+    /// Print the diff as JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -120,5 +145,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Conn(cmd) => conn::run(config, cmd).await,
         Command::Scan(args) => scan::run(config, args).await,
         Command::Discover => conn::discover(config).await,
+        Command::Diff(args) => diff::run(config, args).await,
     }
 }

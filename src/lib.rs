@@ -8,15 +8,19 @@
 //! - [`secrets`]: credentials in the OS keychain.
 //! - [`conn`]: parsing connection strings, connecting, permission checks, Docker discovery.
 //! - [`format`]: human-readable bytes, counts, durations and percentages.
+//! - [`snapshot`], [`diff`], [`verdict`]: saved reports, comparing them, TTL risk.
 //! - [`cli`]: command-line entry points.
 //! - [`tui`]: the terminal UI.
 
 pub mod cli;
 pub mod config;
 pub mod conn;
+pub mod diff;
 pub mod format;
 pub mod model;
 pub mod pattern;
 pub mod scan;
 pub mod secrets;
+pub mod snapshot;
 pub mod tui;
+pub mod verdict;

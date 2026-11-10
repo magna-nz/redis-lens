@@ -435,5 +435,6 @@ pub fn report(sizes: bool) -> ScanReport {
         sampled_keys: SAMPLED,
         patterns,
         sizes_available: sizes,
+        hot_keys: Vec::new(),
     }
 }

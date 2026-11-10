@@ -49,6 +49,8 @@ fn args() -> ScanArgs {
         sample: 10_000,
         match_glob: None,
         json: false,
+        max_rate: None,
+        save: false,
     }
 }
 

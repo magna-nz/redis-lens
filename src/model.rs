@@ -202,6 +202,10 @@ pub struct ScanReport {
     pub patterns: Vec<PatternStats>,
     /// False when `MEMORY USAGE` was not allowed, so every byte figure is `None`.
     pub sizes_available: bool,
+    /// Up to 50 keys with the highest `OBJECT FREQ`, hottest first (ties by key). Empty when
+    /// LFU counters were unavailable. Missing in snapshots written before v0.2.
+    #[serde(default)]
+    pub hot_keys: Vec<KeySample>,
 }
 
 // ---------------------------------------------------------------------------
