@@ -1,15 +1,456 @@
 //! `redis-lens conn ...` and `redis-lens discover`.
 //!
-//! Owner: connections. Stub until implemented.
+//! Owner: connections. The logic lives in functions that take a config path and a
+//! [`SecretStore`] so tests can run them against a temp dir and a `MemoryStore`;
+//! `run` and `discover` wire them to the real keychain.
 
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
-use super::ConnCommand;
+use anyhow::{Context, bail};
+use secrecy::{ExposeSecret, SecretString};
 
-pub async fn run(_config: Option<PathBuf>, _cmd: ConnCommand) -> anyhow::Result<()> {
-    anyhow::bail!("`conn` is not implemented yet")
+use super::{ConnAddArgs, ConnCommand};
+use crate::config::Config;
+use crate::conn::docker::DiscoveredInstance;
+use crate::conn::{self, parse_connection_string};
+use crate::model::{Auth, Credentials, PermStatus, Profile};
+use crate::secrets::{KeyringStore, SecretStore};
+
+fn config_path(config: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    match config {
+        Some(p) => Ok(p),
+        None => Ok(Config::default_path()?),
+    }
+}
+
+pub async fn run(config: Option<PathBuf>, cmd: ConnCommand) -> anyhow::Result<()> {
+    let path = config_path(config)?;
+    let secrets = KeyringStore;
+    match cmd {
+        ConnCommand::Add(args) => {
+            let stdin_password = if args.password_stdin {
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .context("could not read the password from standard input")?;
+                Some(buf)
+            } else {
+                None
+            };
+            println!("{}", add(&path, &secrets, &args, stdin_password).await?);
+        }
+        ConnCommand::List => println!("{}", list(&path)?),
+        ConnCommand::Remove { name } => println!("{}", remove(&path, &secrets, &name)?),
+        ConnCommand::Test { name } => println!("{}", test(&path, &secrets, &name).await?),
+    }
+    Ok(())
 }
 
 pub async fn discover(_config: Option<PathBuf>) -> anyhow::Result<()> {
-    anyhow::bail!("`discover` is not implemented yet")
+    let found = conn::docker::discover().await?;
+    println!("{}", format_discovered(&found));
+    Ok(())
+}
+
+fn trim_newline(s: &str) -> &str {
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    s.strip_suffix('\r').unwrap_or(s)
+}
+
+/// Save a connection. `stdin_password` is everything read from standard input when
+/// `--password-stdin` was given. Returns the line to print.
+pub async fn add(
+    path: &Path,
+    secrets: &dyn SecretStore,
+    args: &ConnAddArgs,
+    stdin_password: Option<String>,
+) -> anyhow::Result<String> {
+    let parsed = parse_connection_string(&args.url)?;
+    let mut config = Config::load(path)?;
+    let existing = config.get(&args.name).cloned();
+    if existing.is_some() && !args.force {
+        bail!(
+            "a profile named {} already exists; pass --force to replace it",
+            args.name
+        );
+    }
+
+    let (url_user, url_password) = match &parsed.credentials {
+        Some(c) => (
+            c.username.clone(),
+            Some(c.password.expose_secret().to_string()).filter(|p| !p.is_empty()),
+        ),
+        None => (None, None),
+    };
+
+    let (auth, creds) = if args.entra {
+        (Auth::EntraId, None)
+    } else {
+        let password: Option<SecretString> = if let Some(p) = url_password {
+            eprintln!(
+                "warning: the password was given in the URL, so it may now be in your shell history. \
+                 Prefer --password-stdin or --ask-password."
+            );
+            Some(SecretString::from(p))
+        } else if args.password_stdin {
+            let raw = stdin_password.ok_or_else(|| {
+                anyhow::anyhow!("--password-stdin was given but nothing was read")
+            })?;
+            Some(SecretString::from(trim_newline(&raw).to_string()))
+        } else if args.ask_password {
+            let p =
+                rpassword::prompt_password("Password: ").context("could not read the password")?;
+            Some(SecretString::from(p))
+        } else {
+            None
+        };
+        match password {
+            Some(p) if p.expose_secret().is_empty() => bail!("the password is empty"),
+            Some(password) => (
+                Auth::Keychain,
+                Some(Credentials {
+                    username: url_user,
+                    password,
+                }),
+            ),
+            None if url_user.is_some() => bail!(
+                "the URL has a username but no password; pass --password-stdin or --ask-password"
+            ),
+            None => (Auth::None, None),
+        }
+    };
+
+    let profile = Profile {
+        name: args.name.clone(),
+        env: args.env.map(Into::into).unwrap_or(parsed.env_guess),
+        endpoint: parsed.endpoint,
+        db: parsed.db,
+        auth,
+        read_only: None,
+    };
+
+    // Credentials first: a saved profile must never point at a missing keychain entry.
+    match &creds {
+        Some(c) => secrets.set(&profile.secret_ref(), c)?,
+        None => {
+            if existing.is_some_and(|e| e.auth == Auth::Keychain) {
+                secrets.delete(&profile.secret_ref())?;
+            }
+        }
+    }
+    config.add(profile.clone(), args.force)?;
+    config.save(path)?;
+
+    let mut msg = format!(
+        "Saved {} ({}, {}).",
+        profile.name,
+        profile.endpoint,
+        profile.env.label()
+    );
+    if creds.is_some() {
+        msg.push_str(" Credentials are in the OS keychain.");
+    }
+    Ok(msg)
+}
+
+fn table(header: &[&str], rows: &[Vec<String>]) -> String {
+    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
+    for r in rows {
+        for (w, c) in widths.iter_mut().zip(r) {
+            *w = (*w).max(c.chars().count());
+        }
+    }
+    let line = |cells: Vec<&str>| {
+        let last = cells.len() - 1;
+        let s = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == last {
+                    c.to_string()
+                } else {
+                    format!("{c:<w$}", w = widths[i])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        s.trim_end().to_string()
+    };
+    let mut out = vec![line(header.to_vec())];
+    out.extend(
+        rows.iter()
+            .map(|r| line(r.iter().map(String::as_str).collect())),
+    );
+    out.join("\n")
+}
+
+fn auth_label(a: Auth) -> &'static str {
+    match a {
+        Auth::None => "none",
+        Auth::Keychain => "keychain",
+        Auth::EntraId => "entra-id",
+    }
+}
+
+/// An aligned table of the saved connections.
+pub fn list(path: &Path) -> anyhow::Result<String> {
+    let config = Config::load(path)?;
+    if config.profiles.is_empty() {
+        return Ok("No saved connections. Add one with `redis-lens conn add`.".to_string());
+    }
+    let rows: Vec<Vec<String>> = config
+        .profiles
+        .iter()
+        .map(|p| {
+            vec![
+                p.name.clone(),
+                p.env.label().to_string(),
+                p.endpoint.to_string(),
+                if p.endpoint.tls { "tls" } else { "plain" }.to_string(),
+                auth_label(p.auth).to_string(),
+            ]
+        })
+        .collect();
+    Ok(table(&["NAME", "ENV", "ENDPOINT", "TLS", "AUTH"], &rows))
+}
+
+/// Remove a profile from the config, then its keychain entry.
+pub fn remove(path: &Path, secrets: &dyn SecretStore, name: &str) -> anyhow::Result<String> {
+    let mut config = Config::load(path)?;
+    let profile = config.remove(name)?;
+    config.save(path)?;
+    secrets
+        .delete(&profile.secret_ref())
+        .context("the profile was removed, but its keychain entry could not be deleted")?;
+    Ok(format!("Removed {name}."))
+}
+
+/// Connect to a saved profile and report which commands are allowed.
+pub async fn test(path: &Path, secrets: &dyn SecretStore, name: &str) -> anyhow::Result<String> {
+    let config = Config::load(path)?;
+    let profile = config
+        .get(name)
+        .ok_or_else(|| crate::config::ConfigError::NotFound(name.to_string()))?;
+    let mut conn = conn::connect(profile, secrets).await?;
+    let report = conn::check_permissions(&mut conn).await;
+    let mut lines = vec![format!(
+        "Connected to {} ({}, {}).",
+        profile.name,
+        profile.endpoint,
+        profile.env.label()
+    )];
+    for c in &report.checks {
+        lines.push(match &c.status {
+            PermStatus::Allowed => format!("  ✓ {}", c.label),
+            PermStatus::Denied(m) => format!("  ✗ {}: {m}", c.label),
+            PermStatus::Skipped(r) => format!("  – {}: {r}", c.label),
+        });
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Discovered containers as a table. Passwords are never printed.
+pub fn format_discovered(found: &[DiscoveredInstance]) -> String {
+    if found.is_empty() {
+        return "No running Redis or Valkey containers with a published port were found."
+            .to_string();
+    }
+    let rows: Vec<Vec<String>> = found
+        .iter()
+        .map(|d| {
+            vec![
+                d.container.clone(),
+                d.image.clone(),
+                d.profile.endpoint.to_string(),
+                if d.credentials.is_some() {
+                    "password"
+                } else {
+                    "none"
+                }
+                .to_string(),
+            ]
+        })
+        .collect();
+    table(&["CONTAINER", "IMAGE", "ENDPOINT", "AUTH"], &rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::EnvArg;
+    use crate::model::{Endpoint, Env};
+    use crate::secrets::MemoryStore;
+
+    fn temp_path(tag: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "redis-lens-cli-{tag}-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .join("config.toml")
+    }
+
+    fn args(name: &str, url: &str) -> ConnAddArgs {
+        ConnAddArgs {
+            name: name.into(),
+            url: url.into(),
+            env: None,
+            password_stdin: false,
+            ask_password: false,
+            entra: false,
+            force: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn add_without_credentials() {
+        let path = temp_path("plain");
+        let store = MemoryStore::default();
+        let msg = add(&path, &store, &args("c", "redis://localhost:6390/1"), None)
+            .await
+            .unwrap();
+        assert_eq!(msg, "Saved c (localhost:6390, LOCAL).");
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.get("c").unwrap().auth, Auth::None);
+        assert_eq!(cfg.get("c").unwrap().db, 1);
+    }
+
+    #[tokio::test]
+    async fn add_stdin_password_goes_to_store_only() {
+        let path = temp_path("stdin");
+        let store = MemoryStore::default();
+        let mut a = args("prod1", "rediss://svc@cache-prod.example.com:6380");
+        a.password_stdin = true;
+        let msg = add(&path, &store, &a, Some("hunter2-pw\r\n".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            msg,
+            "Saved prod1 (cache-prod.example.com:6380, PROD). Credentials are in the OS keychain."
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("hunter2-pw") && !text.contains("svc"),
+            "{text}"
+        );
+        let p = Config::load(&path).unwrap().get("prod1").unwrap().clone();
+        assert_eq!(p.auth, Auth::Keychain);
+        let c = store.get(&p.secret_ref()).unwrap().unwrap();
+        assert_eq!(c.username.as_deref(), Some("svc"));
+        assert_eq!(c.password.expose_secret(), "hunter2-pw");
+    }
+
+    #[tokio::test]
+    async fn username_without_password_source_is_an_error() {
+        let path = temp_path("nopw");
+        let store = MemoryStore::default();
+        let e = add(&path, &store, &args("c", "redis://bob@h"), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--password-stdin"), "{e}");
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn duplicate_needs_force_and_env_override() {
+        let path = temp_path("dup");
+        let store = MemoryStore::default();
+        add(&path, &store, &args("c", "redis://h"), None)
+            .await
+            .unwrap();
+        assert!(
+            add(&path, &store, &args("c", "redis://h2"), None)
+                .await
+                .is_err()
+        );
+        let mut a = args("c", "redis://h2");
+        a.force = true;
+        a.env = Some(EnvArg::Prod);
+        add(&path, &store, &a, None).await.unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.profiles.len(), 1);
+        assert_eq!(cfg.get("c").unwrap().env, Env::Prod);
+        assert_eq!(cfg.get("c").unwrap().endpoint.host, "h2");
+    }
+
+    #[tokio::test]
+    async fn entra_stores_nothing() {
+        let path = temp_path("entra");
+        let store = MemoryStore::default();
+        let mut a = args("az", "rediss://x.redis.azure.net:10000");
+        a.entra = true;
+        let msg = add(&path, &store, &a, None).await.unwrap();
+        assert!(!msg.contains("keychain"));
+        assert_eq!(
+            Config::load(&path).unwrap().get("az").unwrap().auth,
+            Auth::EntraId
+        );
+    }
+
+    #[tokio::test]
+    async fn list_and_remove() {
+        let path = temp_path("list");
+        let store = MemoryStore::default();
+        assert!(list(&path).unwrap().starts_with("No saved"));
+        let mut a = args("one", "redis://:pw-1@localhost");
+        a.force = true;
+        add(&path, &store, &a, None).await.unwrap();
+        add(
+            &path,
+            &store,
+            &args("second-name", "rediss://h.example.com:6380"),
+            None,
+        )
+        .await
+        .unwrap();
+        let out = list(&path).unwrap();
+        assert!(!out.contains("pw-1"));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(lines[0].starts_with("NAME"));
+        // aligned: ENV column starts at the same offset on every row
+        let col = lines[0].find("ENV").unwrap();
+        assert_eq!(lines[1].find("LOCAL"), Some(col), "{out}");
+        assert_eq!(lines[2].find("OTHER"), Some(col), "{out}");
+
+        let one = Config::load(&path).unwrap().get("one").unwrap().clone();
+        assert!(store.get(&one.secret_ref()).unwrap().is_some());
+        remove(&path, &store, "one").unwrap();
+        assert!(store.get(&one.secret_ref()).unwrap().is_none());
+        assert!(Config::load(&path).unwrap().get("one").is_none());
+        assert!(remove(&path, &store, "one").is_err());
+    }
+
+    #[test]
+    fn discovered_output_hides_passwords() {
+        let d = DiscoveredInstance {
+            container: "cache".into(),
+            image: "redis:7".into(),
+            profile: Profile {
+                name: "cache".into(),
+                env: Env::Local,
+                endpoint: Endpoint {
+                    host: "127.0.0.1".into(),
+                    port: 49153,
+                    tls: false,
+                },
+                db: 0,
+                auth: Auth::Keychain,
+                read_only: None,
+            },
+            credentials: Some(Credentials {
+                username: None,
+                password: SecretString::from("s3cret".to_string()),
+            }),
+        };
+        let out = format_discovered(&[d]);
+        assert!(out.contains("127.0.0.1:49153") && out.contains("password"));
+        assert!(!out.contains("s3cret"));
+    }
 }
