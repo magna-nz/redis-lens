@@ -19,7 +19,7 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 | Wave | Content | Agents | Branch → PR | State |
 |---|---|---|---|---|
 | 2 | Scanner and connections | implementer ×2 [sonnet] | `wave2/*` → `v0.1-core` | **done**, merged into `v0.1-core` |
-| 3 | TUI (Connections and Patterns views), `scan` command | implementer [opus] (TUI), implementer [sonnet] (`scan`), verifier [opus] | `wave3/tui`, `wave3/scan-cli` → `v0.1-core` → PR #2 | in progress |
+| 3 | TUI (Connections and Patterns views), `scan` command | implementer [opus] (TUI), implementer [sonnet] (`scan`), verifier [opus] | `wave3/tui`, `wave3/scan-cli` → `v0.1-core` → PR #2 | merged into `v0.1-core`; waiting on the verifier and CI |
 | 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | implementer [sonnet] (engine), implementer [opus] (views), verifier [opus] | `v0.2-views` → PR #3 | pending |
 | 5 | Replica preference; README modelled on redis-near-cache (logo, badges, `vhs` GIF), CHANGELOG, demo polish | implementer [sonnet] ×2, verifier [opus] | `v0.2-polish` → PR #4 | pending |
 
@@ -59,6 +59,8 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 - 2026-11-10: `src/format.rs`: shared byte, count, duration, percentage and glob formatting.
 - Tests on `v0.1-core`: 71 unit tests (including proptests), plus 28 integration tests against Redis 7.4 and Valkey 8.1: 14 connection, 11 scanner, 3 smoke.
 
+- 2026-11-10: TUI with the Connections and Patterns views, merged into `v0.1-core`. Checked in a real terminal against the demo containers using `demo/record.py`, which drives the TUI in a pseudo-terminal and writes an asciinema cast; `agg` turns that into a GIF. The tree, the planted-problem flags, the detail panel and the add flow with the password masked all work.
+
 ## In progress
 
 See the overnight table above.
@@ -69,6 +71,9 @@ See the overnight table above.
 - Decide whether to publish a placeholder 0.0.1 to reserve the crate name early.
 
 ## Known issues and notes
+
+- **`vhs` doesn't work here.** It drives headless Chromium, which produces no output, and turning off its browser sandbox was refused. Use `demo/record.py` with `agg` for GIFs instead.
+- **The Patterns view stays empty while a scan runs.** Showing partial results is a follow-up.
 
 - **Scans of local servers are slow.** The default budget of 5,000 commands per second with 4 commands per key means 55K demo keys take about 45 s. Planned for wave 4: no limit by default for `Local` profiles, plus a `--max-rate` flag. Note that the demo's `rl:*` and `lock:*` keys expire after up to 30 minutes, so re-run `make demo-up` before recording.
 
