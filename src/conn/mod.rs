@@ -2,6 +2,7 @@
 //!
 //! Owner: connections.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use redis::aio::{ConnectionLike, MultiplexedConnection};
@@ -50,14 +51,70 @@ pub async fn connect(
     profile: &Profile,
     secrets: &dyn SecretStore,
 ) -> Result<MultiplexedConnection, ConnError> {
-    connect_endpoint(profile, &profile.endpoint, secrets).await
+    let auth = ResolvedAuth::new(profile, secrets)?;
+    auth.open(&profile.endpoint).await
 }
 
-/// [`connect`] to `ep` with the profile's credentials, TLS setting and database.
-async fn connect_endpoint(
-    profile: &Profile,
+/// A profile's credentials and connection settings, resolved once: one keychain read,
+/// or one Entra ID token provider, shared by every connection opened with it.
+struct ResolvedAuth {
+    /// Username, password and database.
+    settings: RedisConnectionInfo,
+    /// Timeouts, plus the Entra ID credentials provider when there is one.
+    config: AsyncConnectionConfig,
+    /// Whether connecting sends a username, password or token.
+    sends_credentials: bool,
+}
+
+impl ResolvedAuth {
+    fn new(profile: &Profile, secrets: &dyn SecretStore) -> Result<Self, ConnError> {
+        let mut settings = RedisConnectionInfo::default().set_db(i64::from(profile.db));
+        let mut config = base_config();
+        let mut sends_credentials = false;
+        match profile.auth {
+            Auth::None => {}
+            Auth::Keychain => {
+                let creds = secrets
+                    .get(&profile.secret_ref())?
+                    .ok_or_else(|| ConnError::MissingCredentials(profile.name.clone()))?;
+                if let Some(user) = &creds.username {
+                    settings = settings.set_username(user);
+                    sends_credentials = true;
+                }
+                let pw = creds.password.expose_secret();
+                if !pw.is_empty() {
+                    settings = settings.set_password(pw);
+                    sends_credentials = true;
+                }
+            }
+            Auth::EntraId => {
+                config = entra_config(config)?;
+                sends_credentials = true;
+            }
+        }
+        Ok(Self {
+            settings,
+            config,
+            sends_credentials,
+        })
+    }
+
+    /// Connect to `ep` with these credentials, the endpoint's TLS setting and the database.
+    async fn open(&self, ep: &Endpoint) -> Result<MultiplexedConnection, ConnError> {
+        open(ep, self.settings.clone(), &self.config).await
+    }
+}
+
+fn base_config() -> AsyncConnectionConfig {
+    AsyncConnectionConfig::new()
+        .set_connection_timeout(Some(CONNECT_TIMEOUT))
+        .set_response_timeout(Some(RESPONSE_TIMEOUT))
+}
+
+async fn open(
     ep: &Endpoint,
-    secrets: &dyn SecretStore,
+    settings: RedisConnectionInfo,
+    config: &AsyncConnectionConfig,
 ) -> Result<MultiplexedConnection, ConnError> {
     let addr = if ep.tls {
         ConnectionAddr::TcpTls {
@@ -69,32 +126,10 @@ async fn connect_endpoint(
     } else {
         ConnectionAddr::Tcp(ep.host.clone(), ep.port)
     };
-    let mut settings = RedisConnectionInfo::default().set_db(i64::from(profile.db));
-    let mut config = AsyncConnectionConfig::new()
-        .set_connection_timeout(Some(CONNECT_TIMEOUT))
-        .set_response_timeout(Some(RESPONSE_TIMEOUT));
-
-    match profile.auth {
-        Auth::None => {}
-        Auth::Keychain => {
-            let creds = secrets
-                .get(&profile.secret_ref())?
-                .ok_or_else(|| ConnError::MissingCredentials(profile.name.clone()))?;
-            if let Some(user) = &creds.username {
-                settings = settings.set_username(user);
-            }
-            let pw = creds.password.expose_secret();
-            if !pw.is_empty() {
-                settings = settings.set_password(pw);
-            }
-        }
-        Auth::EntraId => config = entra_config(config)?,
-    }
-
     let info = addr.into_connection_info()?.set_redis_settings(settings);
     let client = redis::Client::open(info)?;
     Ok(client
-        .get_multiplexed_async_connection_with_config(&config)
+        .get_multiplexed_async_connection_with_config(config)
         .await?)
 }
 
@@ -125,7 +160,7 @@ const REPLICA_TIMEOUT: Duration = Duration::from_secs(2);
 pub enum Replication {
     /// `role:master`, with the replicas reported as `state=online`, in order.
     Master { online: Vec<(String, u16)> },
-    /// `role:slave`.
+    /// `role:slave` (or `role:replica`).
     Replica,
     /// Anything else, or no role line.
     Unknown,
@@ -151,38 +186,175 @@ pub fn parse_replication(info: &str) -> Replication {
             if field("state") == Some("online")
                 && let (Some(ip), Some(port)) = (field("ip"), field("port"))
                 && let Ok(port) = port.parse::<u16>()
-                && !ip.is_empty()
+                && port != 0
+                && let Some(host) = replica_host(ip)
             {
-                online.push((ip.to_string(), port));
+                online.push((host, port));
             }
         }
     }
     match role.as_deref() {
         Some("master") => Replication::Master { online },
-        Some("slave") => Replication::Replica,
+        Some("slave" | "replica") => Replication::Replica,
         _ => Replication::Unknown,
     }
 }
 
+/// The host part of a `slaveN:ip=…` entry, or `None` when it can't be connected to.
+///
+/// An IP address is returned in its normal form, without brackets; the unspecified
+/// addresses (`0.0.0.0`, `::`) are refused. Anything else must look like a host name:
+/// dot-separated labels of ASCII letters, digits, `-` and `_`.
+fn replica_host(ip: &str) -> Option<String> {
+    let ip = ip.trim();
+    let bare = ip
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(ip);
+    if let Ok(addr) = bare.parse::<IpAddr>() {
+        return (!addr.to_canonical().is_unspecified()).then(|| addr.to_string());
+    }
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && l.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    (bare.len() <= 253 && bare.split('.').all(label_ok)).then(|| bare.to_string())
+}
+
+/// Loopback: `localhost` (and `*.localhost`), `127.0.0.0/8`, `::1`, and `::ffff:127.x`.
+fn is_loopback(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    h == "localhost"
+        || h.ends_with(".localhost")
+        || h.parse::<IpAddr>()
+            .is_ok_and(|a| a.to_canonical().is_loopback())
+}
+
+/// Whether credentials may go to a replica candidate that could not be checked without
+/// them. Only when it is on the primary's host (any two loopback names count as the same
+/// host), or it is not a loopback address: a loopback address announced by a remote
+/// primary names this machine, not the primary's, so whatever listens there is not the
+/// replica.
+fn may_send_credentials(primary_host: &str, candidate_host: &str) -> bool {
+    let same_ip = matches!(
+        (primary_host.parse::<IpAddr>(), candidate_host.parse::<IpAddr>()),
+        (Ok(a), Ok(b)) if a.to_canonical() == b.to_canonical()
+    );
+    primary_host.eq_ignore_ascii_case(candidate_host)
+        || same_ip
+        || (is_loopback(primary_host) && is_loopback(candidate_host))
+        || !is_loopback(candidate_host)
+}
+
+/// Whether `INFO replication` from a candidate shows a replica of the primary whose
+/// replication ID is `primary_replid`.
+fn is_replica_of(info: &str, primary_replid: &str) -> bool {
+    parse_replication(info) == Replication::Replica
+        && master_replid(info).as_deref() == Some(primary_replid)
+}
+
+/// Why a replica candidate was not used.
+enum Unusable {
+    /// It answered, but it is not a replica of this primary.
+    NotAReplica,
+    /// It needs credentials to be checked and is not somewhere they may be sent.
+    WontSendCredentials,
+    Conn(ConnError),
+}
+
+impl From<ConnError> for Unusable {
+    fn from(e: ConnError) -> Self {
+        Self::Conn(e)
+    }
+}
+
+impl From<redis::RedisError> for Unusable {
+    fn from(e: redis::RedisError) -> Self {
+        Self::Conn(e.into())
+    }
+}
+
+async fn info_replication(c: &mut MultiplexedConnection) -> Result<String, redis::RedisError> {
+    redis::cmd("INFO").arg("replication").query_async(c).await
+}
+
+/// Open a connection to the candidate at `ep` and check that it is a replica of the
+/// primary with `primary_replid`, before anything is scanned.
+///
+/// When the profile has credentials, the candidate is first asked for `INFO replication`
+/// on a connection that sends none (no `AUTH`, no `HELLO`, no `CLIENT SETINFO`). If it
+/// answers, it is checked there and credentials go only to a verified replica. If it
+/// wants authentication, credentials are sent only when [`may_send_credentials`]
+/// allows, and the candidate is checked again on the authenticated connection, which
+/// is the one returned.
+async fn verified_replica(
+    auth: &ResolvedAuth,
+    primary_host: &str,
+    primary_replid: &str,
+    ep: &Endpoint,
+) -> Result<MultiplexedConnection, Unusable> {
+    if auth.sends_credentials {
+        let settings = RedisConnectionInfo::default().set_skip_set_lib_name();
+        let mut probe = open(ep, settings, &base_config()).await?;
+        match info_replication(&mut probe).await {
+            Ok(info) if is_replica_of(&info, primary_replid) => {}
+            Ok(_) => return Err(Unusable::NotAReplica),
+            // A server reply such as NOAUTH: it can only be checked with credentials.
+            Err(e) if e.code().is_some() || is_server_error(&e) => {
+                if !may_send_credentials(primary_host, &ep.host) {
+                    return Err(Unusable::WontSendCredentials);
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mut c = auth.open(ep).await?;
+    let info = info_replication(&mut c).await?;
+    if is_replica_of(&info, primary_replid) {
+        Ok(c)
+    } else {
+        Err(Unusable::NotAReplica)
+    }
+}
+
+fn is_server_error(e: &redis::RedisError) -> bool {
+    matches!(
+        e.kind(),
+        redis::ErrorKind::Server(_)
+            | redis::ErrorKind::AuthenticationFailed
+            | redis::ErrorKind::Extension
+    )
+}
+
+/// The `master_replid` field of `INFO replication`. A primary reports its own
+/// replication ID there, and a replica reports the ID of the primary it follows.
+pub fn master_replid(info: &str) -> Option<String> {
+    info.lines()
+        .find_map(|l| l.trim().strip_prefix("master_replid:"))
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
 /// Connect for a scan. Connects to the primary as [`connect`] does; with
-/// `profile.prefer_replica` it then looks for an online replica and connects to the
-/// first one with the same credentials and TLS (2 s timeout). A replica that can't be
-/// used leaves the scan on the primary as `PrimaryFallback`. A profile that already
-/// points at a replica is scanned as is.
+/// `profile.prefer_replica` it then looks for an online replica and, within a 2 s
+/// timeout, connects to the first one with the same credentials and TLS and checks that
+/// it really is a replica of this primary (see [`verified_replica`]). A replica that
+/// can't be used or verified leaves the scan on the primary as `PrimaryFallback`. A
+/// profile that already points at a replica is scanned as is.
+///
+/// Credentials are resolved once, before any connection, and reused for the replica.
 pub async fn connect_for_scan(
     profile: &Profile,
     secrets: &dyn SecretStore,
 ) -> Result<(MultiplexedConnection, ScanTarget), ConnError> {
-    let mut primary = connect(profile, secrets).await?;
+    let auth = ResolvedAuth::new(profile, secrets)?;
+    let mut primary = auth.open(&profile.endpoint).await?;
     if !profile.prefer_replica {
         return Ok((primary, ScanTarget::Primary));
     }
     let fallback = |c, why: String| Ok((c, ScanTarget::PrimaryFallback(why)));
-    let info: Result<String, _> = redis::cmd("INFO")
-        .arg("replication")
-        .query_async(&mut primary)
-        .await;
-    let info = match info {
+    let info = match info_replication(&mut primary).await {
         Ok(i) => i,
         Err(e) => return fallback(primary, format!("INFO replication: {}", server_message(&e))),
     };
@@ -193,16 +365,33 @@ pub async fn connect_for_scan(
             let Some((host, port)) = online.into_iter().next() else {
                 return fallback(primary, "no online replica".to_string());
             };
+            let Some(replid) = master_replid(&info) else {
+                return fallback(
+                    primary,
+                    "the primary does not report master_replid, so no replica can be verified"
+                        .to_string(),
+                );
+            };
             let ep = Endpoint {
                 host,
                 port,
                 tls: profile.endpoint.tls,
             };
-            match tokio::time::timeout(REPLICA_TIMEOUT, connect_endpoint(profile, &ep, secrets))
-                .await
-            {
+            let attempt = verified_replica(&auth, &profile.endpoint.host, &replid, &ep);
+            match tokio::time::timeout(REPLICA_TIMEOUT, attempt).await {
                 Ok(Ok(c)) => Ok((c, ScanTarget::Replica(ep))),
-                Ok(Err(e)) => fallback(primary, format!("{ep}: {e}")),
+                Ok(Err(Unusable::NotAReplica)) => fallback(
+                    primary,
+                    format!("replica at {ep} is not a replica of this primary"),
+                ),
+                Ok(Err(Unusable::WontSendCredentials)) => fallback(
+                    primary,
+                    format!(
+                        "replica at {ep} needs credentials to be verified and is a loopback \
+                         address that is not the primary's host"
+                    ),
+                ),
+                Ok(Err(Unusable::Conn(e))) => fallback(primary, format!("{ep}: {e}")),
                 Err(_) => fallback(primary, format!("{ep}: timed out")),
             }
         }
@@ -399,6 +588,74 @@ mod tests {
             parse_replication("role:master\r\nconnected_slaves:0\r\n"),
             Replication::Master { online: vec![] }
         );
+    }
+
+    #[test]
+    fn replication_rejects_unusable_addresses() {
+        let info = "role:master\r\nslave0:ip=0.0.0.0,port=6379,state=online\r\nslave1:ip=,port=6379,state=online\r\nslave2:ip=::,port=6379,state=online\r\nslave3:ip=[::],port=6379,state=online\r\nslave4:ip=::ffff:0.0.0.0,port=6379,state=online\r\nslave5:ip=bad host,port=6379,state=online\r\nslave6:ip=a/b,port=6379,state=online\r\nslave7:ip=host..x,port=6379,state=online\r\nslave8:ip=10.0.0.5,port=0,state=online\r\nslave9:port=6379,state=online\r\n";
+        assert_eq!(
+            parse_replication(info),
+            Replication::Master { online: vec![] }
+        );
+    }
+
+    #[test]
+    fn replication_accepts_ipv6_and_host_names() {
+        let info = "role:master\r\nslave0:ip=::1,port=6379,state=online\r\nslave1:ip=2001:DB8::5,port=6380,state=online\r\nslave2:ip=[fe80::1],port=6381,state=online\r\nslave3:ip=replica-1.cache.internal,port=6382,state=online\r\nslave4:ip=cache_replica,port=6383,state=online\r\n";
+        assert_eq!(
+            parse_replication(info),
+            Replication::Master {
+                online: vec![
+                    ("::1".into(), 6379),
+                    ("2001:db8::5".into(), 6380),
+                    ("fe80::1".into(), 6381),
+                    ("replica-1.cache.internal".into(), 6382),
+                    ("cache_replica".into(), 6383),
+                ]
+            }
+        );
+        assert_eq!(parse_replication("role:replica\r\n"), Replication::Replica);
+    }
+
+    #[test]
+    fn replication_ids() {
+        assert_eq!(
+            master_replid(REDIS7_MASTER).as_deref(),
+            Some("8a5a1d0b8f0e5b4a3c9d1e2f3a4b5c6d7e8f9a0b")
+        );
+        assert_eq!(master_replid("role:master\r\nmaster_replid:\r\n"), None);
+        assert_eq!(master_replid(REDIS7_REPLICA), None);
+        let id = "8a5a1d0b8f0e5b4a3c9d1e2f3a4b5c6d7e8f9a0b";
+        let replica = format!("{REDIS7_REPLICA}master_replid:{id}\r\n");
+        assert!(is_replica_of(&replica, id));
+        assert!(!is_replica_of(&replica, "0000"));
+        // A primary with the same ID is not a replica of it.
+        assert!(!is_replica_of(REDIS7_MASTER, id));
+        // A replica that does not report an ID can't be verified.
+        assert!(!is_replica_of(REDIS7_REPLICA, id));
+    }
+
+    #[test]
+    fn credentials_go_to_the_primary_host_or_a_non_loopback_address() {
+        // Same host as the primary.
+        assert!(may_send_credentials("127.0.0.1", "127.0.0.1"));
+        assert!(may_send_credentials("cache.internal", "CACHE.internal"));
+        assert!(may_send_credentials("::1", "0:0:0:0:0:0:0:1"));
+        // Both loopback: the same machine.
+        assert!(may_send_credentials("localhost", "127.0.0.1"));
+        assert!(may_send_credentials("127.0.0.1", "::1"));
+        // Non-loopback addresses the primary announced.
+        assert!(may_send_credentials("cache.internal", "10.0.1.21"));
+        assert!(may_send_credentials("127.0.0.1", "10.0.1.21"));
+        assert!(may_send_credentials("10.0.1.20", "replica-1.internal"));
+        assert!(may_send_credentials("10.0.1.20", "2001:db8::5"));
+        // A loopback address announced by a remote primary names this machine.
+        assert!(!may_send_credentials("cache.internal", "127.0.0.1"));
+        assert!(!may_send_credentials("10.0.1.20", "127.0.0.2"));
+        assert!(!may_send_credentials("10.0.1.20", "::1"));
+        assert!(!may_send_credentials("10.0.1.20", "::ffff:127.0.0.1"));
+        assert!(!may_send_credentials("10.0.1.20", "localhost"));
+        assert!(!may_send_credentials("10.0.1.20", "evil.localhost"));
     }
 
     #[test]

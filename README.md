@@ -83,16 +83,22 @@ the host if you leave it out. `--force` replaces a profile with the same name.
 redis-lens
 ```
 
-| Key | Action |
-|---|---|
-| `0` to `4` | Switch view: Connections, Patterns, TTL, Diff, Hot keys |
-| `↑` `↓` | Move |
-| `→` `←` | Expand and collapse a pattern |
-| `/` | Filter |
-| `s` | Save a snapshot of the current scan |
-| `a` | Add a connection (Connections view). The password is masked in the preview. |
-| `enter` | Connect to the selected profile |
-| `q` | Quit |
+| Key | Where | Action |
+|---|---|---|
+| `0` to `4` | Every view | Switch view: Connections, Patterns, TTL, Diff, Hot keys |
+| `a` | Every view | Add a connection: opens the Connections view with a box to paste a connection string into. The password is masked in the preview. |
+| `↑` `↓` or `k` `j` | Every view | Move |
+| `enter` | Connections | Connect to the selected profile |
+| `r` | Connections | Look for Docker containers again |
+| `→` `←` or `l` `h` | Patterns | Expand and collapse a pattern group |
+| `enter` | Patterns | Expand or collapse the selected group |
+| `/` | Patterns | Filter patterns. Type the filter, `enter` keeps it, `esc` clears it. |
+| `esc` | Patterns | Clear the filter |
+| `g` `G` (or `Home` `End`) | TTL, Diff, Hot keys | Jump to the first or last row |
+| `s` | Every view but Connections | Save a snapshot of the current scan |
+| `q` | Every view | Quit |
+
+In the add box, `enter` saves, `esc` cancels and `ctrl-u` clears the field. `ctrl-c` quits from anywhere.
 
 Narrow terminals scroll sideways instead of wrapping.
 
@@ -121,7 +127,9 @@ redis-lens diff prod-cache --against ~/old-snapshot.json --json
 ```
 
 `diff` scans, compares with the newest earlier snapshot for that profile (or the file given to `--against`), and then
-saves the new scan. It takes `--max-rate` and `--json` too.
+saves the new scan. It takes `--max-rate` and `--json` too. `diff` scans the whole keyspace, so it needs a baseline
+taken without `--match`: run `redis-lens scan <profile> --save` (no `--match`) once first. Snapshots taken with
+`--match` are only compared with scans that used the same glob.
 
 ### Find containers
 
@@ -149,8 +157,8 @@ histogram over none, under 1 minute, 1 hour, 1 day, 7 days, 30 days and over 30 
 **Diff.** The current scan against a saved snapshot: before, after, change and percentage change for each pattern.
 It says whether growth came from more keys or from bigger values, and flags new patterns.
 
-**Hot keys.** Keys ranked by LFU counter (`OBJECT FREQ`), with pattern, type, size and node. Keys that are both hot
-and big are flagged. This needs an LFU eviction policy such as `allkeys-lfu`. Without one the view says so.
+**Hot keys.** Keys ranked by LFU counter (`OBJECT FREQ`), with pattern, type and size. Keys that are both hot and
+big are flagged. This needs an LFU eviction policy such as `allkeys-lfu`. Without one the view says so.
 
 Pattern inference splits keys on `:`, `/` and `|`, and replaces UUIDs, ULIDs, numeric ids, long hex hashes and IPv4
 addresses with placeholders. For example `user:88213:cart` becomes `user:{id}:cart`.
@@ -215,18 +223,25 @@ missing permission.
 - A command budget limits load. The default is no limit for `local` profiles and 5,000 commands per second for
   everything else. Change it with `--max-rate`.
 - With `conn add --prefer-replica`, scans run against an online replica found through `INFO replication`, so the
-  primary serves no scan traffic. If no replica is reachable, redis-lens scans the primary and says why.
+  primary serves no scan traffic. The replica is verified first: its `INFO replication` must say it is a replica and
+  carry the primary's replication ID (`master_replid`), so a different server listening on the announced address is
+  never scanned. Credentials go only to a candidate that answers that check without them, or that is on the
+  primary's host or at a non-loopback address. If no replica is reachable or verified, redis-lens scans the primary
+  and says why. A replica can lag behind its primary, so counts and sizes may trail the primary slightly.
 - Scans stop at 100,000 keys by default. Counts are then scaled up to estimates using `DBSIZE`. If the whole
   keyspace was seen, or `--match` is used, no scaling is applied.
 
 ## Snapshots and diffs
 
 `s` in the TUI, or `redis-lens scan --save`, writes the scan as JSON to
-`<data dir>/redis-lens/snapshots/<profile>/<YYYYMMDDTHHMMSSZ>.json`. On macOS the data dir is
-`~/Library/Application Support`. A snapshot holds patterns and example key names. It never holds values or
+`<data dir>/redis-lens/snapshots/<name>-<hash>/<YYYYMMDDTHHMMSSZ>.json`. `<name>` is the profile name lower-cased,
+with anything other than letters, digits, `.`, `_` and `-` replaced by `_`. `<hash>` is 12 hex digits of a hash of
+the exact profile name, so profiles whose names differ only in case or punctuation keep separate histories. On macOS
+the data dir is `~/Library/Application Support`. A snapshot holds patterns and example key names. It never holds values or
 credentials. Example key names can still be sensitive, so treat snapshot files like the data they describe.
 
-`redis-lens diff <profile>` and the Diff view compare a scan with the newest earlier snapshot.
+`redis-lens diff <profile>` and the Diff view compare a scan with the newest earlier snapshot taken with the same
+`--match` glob. For `diff` that means a snapshot taken without `--match`.
 
 A cron job that runs `redis-lens scan <profile> --save` once a day gives you something to diff against.
 
@@ -238,11 +253,13 @@ make it         # integration tests against Redis and Valkey in Docker
 make lint       # rustfmt check and clippy with -D warnings
 make demo-up    # start and seed the demo servers without opening the TUI
 make demo-down  # stop the demo and delete its data
-make gif        # record docs/demo.gif (needs agg and demo/gif-steps.json)
+make gif        # record docs/demo.gif (needs the demo up, python3 and agg)
 ```
 
 `demo/record.py` drives redis-lens in a pseudo-terminal from a JSON list of keystrokes and writes an asciinema cast.
-`make gif` runs it and then `agg`. See `make help` for the full list.
+`make gif` uses its own temporary config file, saves the `demo-cache` and `demo-valkey` connections that
+`demo/gif-steps.json` expects, records, renders with `agg`, then removes those connections and their keychain
+entries. See `make help` for the full list.
 
 `spec.md` describes the intended behaviour and `status.md` tracks progress.
 

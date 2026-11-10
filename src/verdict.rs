@@ -39,7 +39,8 @@ impl TtlVerdict {
 
 /// Judge one pattern. `change` is its entry in a diff against the previous snapshot,
 /// if one exists. "Growing" means `delta_bytes` > max(1 MiB, 5% of before), or, without
-/// sizes, `delta_keys` > 5% of the keys before; `Cause::New` with no TTL also counts, unless either scan was partial: then it must pass the same threshold.
+/// sizes, `delta_keys` > 5% of the keys before; `Cause::New` with no TTL also counts, unless either scan was partial: then it must pass the byte threshold, or, without
+/// sizes, have at least 50 keys and at least 1% of the newer scan's sampled keys.
 /// `Cause::Unknown` (the other scan didn't look at these keys) never counts as growing.
 pub fn ttl_verdict(stats: &PatternStats, change: Option<&PatternDiff>) -> TtlVerdict {
     let ratio = stats.no_ttl_ratio();
@@ -81,9 +82,21 @@ fn is_growing(change: Option<&PatternDiff>) -> bool {
             let threshold = (c.bytes_before.unwrap_or(0) as f64 * 0.05).max(1024.0 * 1024.0);
             d as f64 > threshold
         }
+        // A partial `New` has no keys before, so a share of them would pass anything:
+        // it needs an absolute floor instead.
+        None if c.cause == Cause::New => {
+            let floor = (c.sampled_keys_after as f64 * NEW_MIN_SHARE).max(NEW_MIN_KEYS);
+            c.delta_keys as f64 >= floor
+        }
         None => c.delta_keys as f64 > c.keys_before.unwrap_or(0) as f64 * 0.05,
     }
 }
+
+/// A `New` pattern after a partial scan, without sizes, counts as growing with at least
+/// this many keys...
+const NEW_MIN_KEYS: f64 = 50.0;
+/// ...and at least this share of the newer scan's sampled keys.
+const NEW_MIN_SHARE: f64 = 0.01;
 
 /// How long the keys that do expire live, in words, judged by the most common TTL bucket.
 fn typical_ttl(stats: &PatternStats) -> Option<&'static str> {
@@ -221,6 +234,7 @@ mod tests {
             delta_keys: dkeys,
             cause,
             partial: false,
+            sampled_keys_after: 0,
         }
     }
 
@@ -324,14 +338,31 @@ mod tests {
             ttl_verdict(&persistent(), Some(&complete)),
             TtlVerdict::PersistentGrowing
         );
-        // Without sizes the key count decides.
-        let mut no_keys = new(0, true);
-        no_keys.delta_bytes = None;
-        no_keys.delta_keys = 0;
-        assert_eq!(
-            ttl_verdict(&persistent(), Some(&no_keys)),
-            TtlVerdict::PersistentStable
-        );
+    }
+
+    #[test]
+    fn new_after_a_partial_scan_without_sizes_needs_an_absolute_floor() {
+        // No sizes and no keys before: at least 50 keys and 1% of the newer scan's
+        // sampled keys.
+        let new = |keys: i64, sampled_after: u64| {
+            let mut c = change(Cause::New, None, None, keys);
+            c.keys_before = None;
+            c.partial = true;
+            c.sampled_keys_after = sampled_after;
+            c
+        };
+        let verdict = |c: PatternDiff| ttl_verdict(&persistent(), Some(&c));
+        assert_eq!(verdict(new(10, 1000)), TtlVerdict::PersistentStable);
+        assert_eq!(verdict(new(49, 1000)), TtlVerdict::PersistentStable);
+        assert_eq!(verdict(new(50, 1000)), TtlVerdict::PersistentGrowing);
+        // 1% of 100,000 sampled keys is 1,000.
+        assert_eq!(verdict(new(999, 100_000)), TtlVerdict::PersistentStable);
+        assert_eq!(verdict(new(1000, 100_000)), TtlVerdict::PersistentGrowing);
+        assert_eq!(verdict(new(0, 0)), TtlVerdict::PersistentStable);
+        // Both scans complete: still growing whatever the count.
+        let mut complete = new(1, 100_000);
+        complete.partial = false;
+        assert_eq!(verdict(complete), TtlVerdict::PersistentGrowing);
     }
 
     #[test]

@@ -256,6 +256,7 @@ mod tests {
             delta_keys: ka.unwrap_or(0) as i64 - kb.unwrap_or(0) as i64,
             cause,
             partial: false,
+            sampled_keys_after: 0,
         }
     }
 

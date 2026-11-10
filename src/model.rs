@@ -251,9 +251,14 @@ pub struct Endpoint {
     pub tls: bool,
 }
 
+/// `host:port`, with an IPv6 address in brackets: `[::1]:6379`.
 impl fmt::Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.host, self.port)
+        if self.host.contains(':') && !self.host.starts_with('[') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
     }
 }
 
@@ -378,6 +383,19 @@ impl PermissionReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_text_brackets_ipv6() {
+        let ep = |host: &str| Endpoint {
+            host: host.into(),
+            port: 6379,
+            tls: false,
+        };
+        assert_eq!(ep("::1").to_string(), "[::1]:6379");
+        assert_eq!(ep("2001:db8::5").to_string(), "[2001:db8::5]:6379");
+        assert_eq!(ep("10.0.1.21").to_string(), "10.0.1.21:6379");
+        assert_eq!(ep("cache.internal").to_string(), "cache.internal:6379");
+    }
 
     #[test]
     fn pttl_parsing() {

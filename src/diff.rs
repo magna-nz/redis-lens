@@ -57,6 +57,10 @@ pub struct PatternDiff {
     /// At least one of the two scans did not see the whole keyspace, so a `New` pattern
     /// may only be one the older scan missed.
     pub partial: bool,
+    /// `sampled_keys` of the newer report: the scale for how many keys a partial `New`
+    /// pattern without sizes needs before it counts as growing.
+    #[serde(skip)]
+    pub sampled_keys_after: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -103,7 +107,7 @@ pub fn diff(before: &ScanReport, after: &ScanReport) -> ReportDiff {
         .map(|name| {
             let b = before.patterns.iter().find(|p| p.pattern == name);
             let a = after.patterns.iter().find(|p| p.pattern == name);
-            pattern_diff(name, b, a, sizes, comparable, partial)
+            pattern_diff(name, b, a, sizes, comparable, partial, after.sampled_keys)
         })
         .collect();
     let magnitude = |p: &PatternDiff| match p.delta_bytes {
@@ -131,6 +135,7 @@ fn pattern_diff(
     sizes: bool,
     comparable: bool,
     partial: bool,
+    sampled_keys_after: u64,
 ) -> PatternDiff {
     let keys_before = b.map(|p| p.est_keys);
     let keys_after = a.map(|p| p.est_keys);
@@ -169,6 +174,7 @@ fn pattern_diff(
         delta_keys,
         cause,
         partial,
+        sampled_keys_after,
     }
 }
 
@@ -273,6 +279,19 @@ mod tests {
     fn one(before: PatternStats, after: PatternStats, sizes: bool) -> PatternDiff {
         let d = diff(&report(vec![before], sizes), &report(vec![after], sizes));
         d.patterns[0].clone()
+    }
+
+    #[test]
+    fn carries_the_newer_reports_sample_size() {
+        let mut before = report(vec![stats("a", 1, None)], false);
+        before.sampled_keys = 10;
+        let mut after = report(vec![stats("a", 1, None), stats("b", 60, None)], false);
+        after.sampled_keys = 4000;
+        let d = diff(&before, &after);
+        assert!(d.patterns.iter().all(|p| p.sampled_keys_after == 4000));
+        // Not part of the JSON output.
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("sampled_keys_after"));
     }
 
     #[test]

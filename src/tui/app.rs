@@ -675,9 +675,10 @@ impl App {
     /// A name no saved profile uses yet: `name`, else `name-2`, `name-3`, ...
     fn unique_name(&self, base: &str) -> String {
         // `docker:` is reserved for discovered containers.
-        let base = match base.strip_prefix(crate::cli::conn::DOCKER_PREFIX) {
-            Some(rest) => format!("docker-{rest}"),
-            None => base.to_string(),
+        let base = if crate::cli::conn::has_docker_prefix(base) {
+            format!("docker-{}", &base[crate::cli::conn::DOCKER_PREFIX.len()..])
+        } else {
+            base.to_string()
         };
         let base = base.as_str();
         let taken = |n: &str| self.saved().any(|e| e.profile.name == n);
@@ -1343,6 +1344,8 @@ mod tests {
     fn guessed_names_avoid_the_docker_prefix() {
         let app = App::new(fixtures::profiles());
         assert_eq!(app.unique_name("docker:cache"), "docker-cache");
+        assert_eq!(app.unique_name("Docker:cache"), "docker-cache");
+        assert_eq!(app.unique_name("DOCKER:orders"), "docker-orders");
         assert_eq!(app.unique_name("staging-cache"), "staging-cache-2");
     }
 

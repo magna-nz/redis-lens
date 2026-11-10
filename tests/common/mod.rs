@@ -35,6 +35,15 @@ impl TestServer {
             .await
             .expect("connect")
     }
+
+    /// A connection as an ACL user, for servers whose default user is off.
+    pub async fn admin_as(&self, user: &str, password: &str) -> redis::aio::MultiplexedConnection {
+        redis::Client::open(format!("redis://{user}:{password}@127.0.0.1:{}", self.port))
+            .expect("valid url")
+            .get_multiplexed_async_connection()
+            .await
+            .expect("connect")
+    }
 }
 
 async fn start(image: (&str, &str), server_bin: &str, args: &[&str]) -> TestServer {
@@ -111,10 +120,21 @@ pub async fn replica_of(
     valkey: bool,
     announce_port: Option<u16>,
 ) -> TestServer {
+    replica_of_with(primary, valkey, announce_port, &[]).await
+}
+
+/// [`replica_of`] with extra server arguments, one per word as for [`redis_with`]. For
+/// a primary with ACL users that includes `--masteruser` and `--masterauth`.
+pub async fn replica_of_with(
+    primary: &TestServer,
+    valkey: bool,
+    announce_port: Option<u16>,
+    extra: &[&str],
+) -> TestServer {
     let host_port = free_port();
     let announce = announce_port.unwrap_or(host_port).to_string();
     let ip = primary.bridge_ip().await;
-    let args = [
+    let mut args = vec![
         "--replicaof",
         ip.as_str(),
         "6379",
@@ -123,10 +143,20 @@ pub async fn replica_of(
         "--replica-announce-port",
         announce.as_str(),
     ];
+    args.extend_from_slice(extra);
     let (image, bin) = if valkey {
         (VALKEY_IMAGE, "valkey-server")
     } else {
         (REDIS_IMAGE, "redis-server")
     };
     start_on(image, bin, &args, Some(host_port)).await
+}
+
+/// Redis 7.4 (or Valkey 8.1 when `valkey`) with extra server arguments.
+pub async fn server_with(valkey: bool, args: &[&str]) -> TestServer {
+    if valkey {
+        valkey_with(args).await
+    } else {
+        redis_with(args).await
+    }
 }

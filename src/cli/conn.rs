@@ -102,6 +102,12 @@ fn trim_newline(s: &str) -> &str {
 /// under `docker:<container>`.
 pub const DOCKER_PREFIX: &str = "docker:";
 
+/// Whether `name` starts with [`DOCKER_PREFIX`], in any case (`Docker:cache` too).
+pub fn has_docker_prefix(name: &str) -> bool {
+    name.get(..DOCKER_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(DOCKER_PREFIX))
+}
+
 /// Save a connection. `stdin_password` is everything read from standard input when
 /// `--password-stdin` was given. Returns the line to print.
 pub async fn add(
@@ -110,7 +116,7 @@ pub async fn add(
     args: &ConnAddArgs,
     stdin_password: Option<String>,
 ) -> anyhow::Result<String> {
-    if args.name.starts_with(DOCKER_PREFIX) {
+    if has_docker_prefix(&args.name) {
         bail!("names starting with {DOCKER_PREFIX} are reserved for discovered containers");
     }
     let parsed = parse_connection_string(&args.url)?;
@@ -383,6 +389,16 @@ mod tests {
             "names starting with docker: are reserved for discovered containers"
         );
         assert!(!path.exists());
+        for name in ["Docker:cache", "DOCKER:cache", "dOcKeR:x"] {
+            let e = add(&path, &store, &args(name, "redis://localhost"), None)
+                .await
+                .unwrap_err();
+            assert!(e.to_string().contains("reserved"), "{name}: {e}");
+        }
+        assert!(!path.exists());
+        assert!(!has_docker_prefix("docker"));
+        assert!(!has_docker_prefix("dockerx:cache"));
+        assert!(!has_docker_prefix("dö"));
     }
 
     #[tokio::test]
