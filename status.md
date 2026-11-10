@@ -20,7 +20,7 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 |---|---|---|---|---|
 | 2 | Scanner and connections | implementer ×2 [sonnet] | `wave2/*` → `v0.1-core` | **done**, merged into `v0.1-core` |
 | 3 | TUI (Connections and Patterns views), `scan` command | implementer [opus] (TUI), implementer [sonnet] (`scan`), verifier [opus] | `wave3/tui`, `wave3/scan-cli` → `v0.1-core` → PR #6 | merged into `v0.1-core`; waiting on the verifier and CI |
-| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | implementer [sonnet] (engine), implementer [opus] (views), verifier [opus] | `v0.2-views` → next PR | pending |
+| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | implementer [sonnet] (engine), then implementer [opus] (views), verifier [opus] | `wave4/engine`, `wave4/views` → `v0.2-views` → next PR | contract committed on `v0.2-views` (0d1a07a); the engine agent is running; the views agent starts after the engine merges, because views call `verdict` and `diff` |
 | 5 | Replica preference; README modelled on redis-near-cache (logo, badges, `vhs` GIF), CHANGELOG, demo polish | implementer [sonnet] ×2, verifier [opus] | `v0.2-polish` → next PR | pending |
 
 ### How to resume after a restart or compaction
@@ -66,6 +66,8 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 See the overnight table above.
 
 ## Needs a decision or action from the owner
+
+- **Dependabot PRs #2 to #5** are left for review. Don't merge #2: it bumps the MSRV job's pinned `dtolnay/rust-toolchain@1.89` to 1.120. Wave 5 adds a Dependabot ignore rule for that pin.
 
 - Add a `CARGO_REGISTRY_TOKEN` repository secret before the first release.
 - Decide whether to publish a placeholder 0.0.1 to reserve the crate name early.
