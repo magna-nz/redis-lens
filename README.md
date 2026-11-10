@@ -6,7 +6,7 @@
     <a href="https://github.com/magna-nz/redis-lens/actions/workflows/ci.yml"><img src="https://github.com/magna-nz/redis-lens/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
     <a href="https://crates.io/crates/redis-lens"><img src="https://img.shields.io/crates/v/redis-lens" alt="crates.io"></a>
     <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.89%2B-B7410E" alt="Rust 1.89+"></a>
-    <a href="https://valkey.io/"><img src="https://img.shields.io/badge/Redis-7%2B%20%7C%20Valkey-8-DC382D" alt="Redis 7+ and Valkey 8"></a>
+    <a href="https://valkey.io/"><img src="https://img.shields.io/badge/Redis-7%2B%20%7C%20Valkey%208-DC382D" alt="Redis 7+ and Valkey 8"></a>
     <a href="#license"><img src="https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-yellow.svg" alt="License MIT OR Apache-2.0"></a>
   </p>
   <p>

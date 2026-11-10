@@ -47,4 +47,4 @@ All notable changes to this project are documented here. The format follows
 
 - Password input is masked as fixed-width bullets, so its length is not revealed.
 - A half-typed URL password is masked before the `@` is entered.
-- Credential rollback fixes: a failed save no longer leaves a half-written keychain entry or profile.
+- Fixes to credential handling when saving a connection fails part-way (credential rollback).
