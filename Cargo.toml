@@ -9,7 +9,7 @@ repository = "https://github.com/magna-nz/redis-lens"
 readme = "README.md"
 keywords = ["redis", "valkey", "tui", "memory", "profiler"]
 categories = ["command-line-utilities", "database", "development-tools::profiling"]
-exclude = ["/demo", "/.github", "/CLAUDE.md", "/Makefile", "/spec.md", "/status.md"]
+exclude = ["/demo", "/.github", "/CLAUDE.md", "/Makefile", "/spec.md", "/status.md", "/docs"]
 
 [features]
 default = []
