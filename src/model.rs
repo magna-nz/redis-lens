@@ -202,6 +202,18 @@ pub struct ScanReport {
     pub patterns: Vec<PatternStats>,
     /// False when `MEMORY USAGE` was not allowed, so every byte figure is `None`.
     pub sizes_available: bool,
+    /// Up to 50 keys with the highest `OBJECT FREQ`, hottest first (ties by key). Empty when
+    /// LFU counters were unavailable. Missing in snapshots written before v0.2.
+    #[serde(default)]
+    pub hot_keys: Vec<KeySample>,
+    /// Every key in the database was looked at: the `SCAN` cursor returned to 0, no
+    /// sample limit cut the walk short and no `MATCH` glob narrowed it. `false` in
+    /// snapshots written before this field existed.
+    #[serde(default)]
+    pub complete: bool,
+    /// The `SCAN MATCH` glob the scan used, if any.
+    #[serde(default)]
+    pub match_glob: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

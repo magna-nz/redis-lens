@@ -2,6 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Block;
 
@@ -144,6 +145,35 @@ pub fn bar(ratio: f64, w: usize) -> (String, String) {
     (fill, "░".repeat(w.saturating_sub(len)))
 }
 
+/// One block character for `v` out of `max`: `▁` for the smallest non-zero share up to
+/// `█` for the largest.
+pub fn level(v: u64, max: u64) -> char {
+    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if max == 0 {
+        return LEVELS[0];
+    }
+    let i = ((v as f64 / max as f64) * 8.0).ceil() as usize;
+    LEVELS[i.clamp(1, 8) - 1]
+}
+
+/// A TTL histogram: one 5-cell column per bucket, a 3-character block bar scaled to
+/// the largest bucket, or `·` when empty. The "none" bucket uses `none_style`, the
+/// others teal.
+pub fn ttl_hist_spans(hist: &[u64; 7], none_style: Style) -> Vec<Span<'static>> {
+    let max = hist.iter().copied().max().unwrap_or(0);
+    hist.iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            if v == 0 {
+                Span::styled(pad_r("·", 5), style::track())
+            } else {
+                let st = if i == 0 { none_style } else { style::ok() };
+                Span::styled(pad_r(&level(v, max).to_string().repeat(3), 5), st)
+            }
+        })
+        .collect()
+}
+
 /// A bordered panel with `─ Title ` on the left and ` right ─` on the right of the
 /// top border. Returns the inner area.
 pub fn panel(frame: &mut Frame, area: Rect, title: &str, right: &str) -> Rect {
@@ -231,6 +261,16 @@ mod tests {
         assert_eq!(bar(0.5, 4).0, "██");
         assert_eq!(bar(0.001, 4).0, "▏");
         assert_eq!(bar(f64::NAN, 2).1, "░░");
+    }
+
+    #[test]
+    fn levels_and_histograms() {
+        assert_eq!(level(1, 100), '▁');
+        assert_eq!(level(100, 100), '█');
+        assert_eq!(level(0, 0), '▁');
+        let spans = ttl_hist_spans(&[0, 10, 0, 0, 0, 0, 5], style::warn());
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "·    ███  ·    ·    ·    ·    ▄▄▄  ");
     }
 
     #[test]

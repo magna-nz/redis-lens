@@ -23,9 +23,10 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::conn;
-use crate::model::{Credentials, Profile};
+use crate::model::{Credentials, Profile, ScanReport};
 use crate::scan::{self, ScanOptions, ScanProgress};
 use crate::secrets::{KeyringStore, MemoryStore, SecretStore};
+use crate::{diff, snapshot};
 
 pub mod app;
 pub mod tree;
@@ -124,10 +125,10 @@ async fn event_loop(
                 Some(Incoming::Input(Event::Paste(s))) => app.handle_paste(s),
                 Some(Incoming::Input(_)) => {}
                 Some(Incoming::InputFailed(e)) => bail!("could not read terminal input: {e}"),
-                Some(Incoming::Msg(m)) => app.apply(m),
+                Some(Incoming::Msg(m)) => pending = app.apply(m),
                 None => return Ok(()),
             },
-            _ = tick.tick() => app.apply(Msg::Tick),
+            _ = tick.tick() => pending = app.apply(Msg::Tick),
         }
     }
 }
@@ -191,9 +192,45 @@ impl Runner {
                     send(&tx, msg);
                 });
             }
+            Effect::LoadHistory { id, report } => {
+                tokio::task::spawn_blocking(move || {
+                    let taken_at_unix = report.taken_at_unix;
+                    let result = load_history(&report).map_err(|e| e.to_string());
+                    send(
+                        &tx,
+                        Msg::History {
+                            id,
+                            taken_at_unix,
+                            result,
+                        },
+                    );
+                });
+            }
+            Effect::SaveSnapshot(report) => {
+                tokio::task::spawn_blocking(move || {
+                    let msg =
+                        match snapshot::default_dir().and_then(|d| snapshot::save(&d, &report)) {
+                            Ok(path) => Msg::SnapshotSaved(path),
+                            Err(e) => Msg::SnapshotFailed(e.to_string()),
+                        };
+                    send(&tx, msg);
+                });
+            }
         }
         false
     }
+}
+
+/// The diff between the newest snapshot older than `report` and `report`.
+fn load_history(report: &ScanReport) -> Result<Option<diff::ReportDiff>, snapshot::SnapshotError> {
+    let dir = snapshot::default_dir()?;
+    let prev = snapshot::latest_before(
+        &dir,
+        &report.profile,
+        report.taken_at_unix,
+        report.match_glob.as_deref(),
+    )?;
+    Ok(prev.map(|p| diff::diff(&p, report)))
 }
 
 /// Save a new profile the way `conn add` does: credentials to the keychain first, so
@@ -229,7 +266,21 @@ fn scrub(text: String, secret: Option<&str>) -> String {
     }
 }
 
+/// Prefix of the report (and so snapshot) name of a Docker container, so a container
+/// called `cache` never shares history with a saved profile called `cache`.
+const DOCKER_PREFIX: &str = "docker:";
+
+/// The name a scan of `profile` is reported and snapshotted under: the profile name for
+/// saved profiles, `docker:<container>` for containers found in Docker.
+fn report_name(profile: &Profile, secrets: &SecretSource) -> String {
+    match secrets {
+        SecretSource::Keychain => profile.name.clone(),
+        SecretSource::Container(_) => format!("{DOCKER_PREFIX}{}", profile.name),
+    }
+}
+
 async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, tx: Tx) {
+    let name = report_name(&profile, &secrets);
     let (store, secret): (Box<dyn SecretStore>, Option<String>) = match secrets {
         SecretSource::Keychain => (Box::new(KeyringStore), None),
         SecretSource::Container(creds) => {
@@ -283,9 +334,9 @@ async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, t
         }
     });
     let result = scan::scan(
-        &profile.name,
+        &name,
         &mut c,
-        &ScanOptions::default(),
+        &ScanOptions::for_profile(&profile),
         &perms,
         Some(&ptx),
     )
@@ -399,6 +450,24 @@ mod tests {
         assert_eq!(got.password.expose_secret(), "leftover");
         assert!(Config::load(&path).unwrap().profiles.is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn docker_scans_are_filed_apart_from_saved_profiles() {
+        let p = profile("cache");
+        assert_eq!(report_name(&p, &SecretSource::Keychain), "cache");
+        assert_eq!(
+            report_name(&p, &SecretSource::Container(None)),
+            "docker:cache"
+        );
+        let creds = Credentials {
+            username: None,
+            password: SecretString::from("pw"),
+        };
+        assert_eq!(
+            report_name(&p, &SecretSource::Container(Some(creds))),
+            "docker:cache"
+        );
     }
 
     #[test]

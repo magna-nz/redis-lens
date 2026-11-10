@@ -49,6 +49,8 @@ fn args() -> ScanArgs {
         sample: 10_000,
         match_glob: None,
         json: false,
+        max_rate: None,
+        save: false,
     }
 }
 
@@ -103,6 +105,8 @@ async fn scan_redis_and_valkey() {
             .unwrap();
         check_report(&r);
         assert!(r.sizes_available);
+        assert!(r.complete, "a 300-key database fits in one walk");
+        assert_eq!(r.match_glob, None);
         let table = render_table(&r, &perms, 100);
         println!("{table}");
         for name in ["user:{id}:profile", "session:{id}", "order:{id}"] {
@@ -117,16 +121,35 @@ async fn scan_redis_and_valkey() {
 
 #[tokio::test]
 async fn match_glob_limits_the_scan() {
-    let server = common::redis().await;
-    seed(&server).await;
-    let path = temp_config(&profile(server.port, Auth::None));
-    let mut a = args();
-    a.match_glob = Some("session:*".to_string());
-    let (r, _) = report(&path, &MemoryStore::default(), &a, None)
-        .await
-        .unwrap();
-    assert_eq!(r.patterns.len(), 1);
-    assert_eq!(r.patterns[0].pattern, "session:{id}");
+    for server in [common::redis().await, common::valkey().await] {
+        seed(&server).await;
+        let path = temp_config(&profile(server.port, Auth::None));
+        let mut a = args();
+        a.match_glob = Some("session:*".to_string());
+        let (r, _) = report(&path, &MemoryStore::default(), &a, None)
+            .await
+            .unwrap();
+        assert_eq!(r.patterns.len(), 1);
+        assert_eq!(r.patterns[0].pattern, "session:{id}");
+        // A MATCH scan never saw the whole database, and says which glob it used.
+        assert!(!r.complete);
+        assert_eq!(r.match_glob.as_deref(), Some("session:*"));
+    }
+}
+
+#[tokio::test]
+async fn sample_limit_is_not_complete() {
+    for server in [common::redis().await, common::valkey().await] {
+        seed(&server).await;
+        let path = temp_config(&profile(server.port, Auth::None));
+        let mut a = args();
+        a.sample = 50;
+        let (r, _) = report(&path, &MemoryStore::default(), &a, None)
+            .await
+            .unwrap();
+        assert!(!r.complete);
+        assert_eq!(r.match_glob, None);
+    }
 }
 
 #[tokio::test]

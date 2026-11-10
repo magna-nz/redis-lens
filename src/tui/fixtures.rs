@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::conn::docker::DiscoveredInstance;
+use crate::diff::{self, ReportDiff};
 use crate::model::{
     Auth, Endpoint, Env, KeySample, KeyType, PERM_FREQ, PERM_INFO, PERM_MEMORY, PERM_SCAN,
     PERM_TYPE_TTL, PatternStats, PermCheck, PermStatus, PermissionReport, Profile, ScanReport,
@@ -435,5 +436,134 @@ pub fn report(sizes: bool) -> ScanReport {
         sampled_keys: SAMPLED,
         patterns,
         sizes_available: sizes,
+        hot_keys: Vec::new(),
+        complete: false,
+        match_glob: None,
     }
+}
+
+/// The scan a day before [`report`]: `cache:search` and `session` grew by more keys,
+/// `queue:emails` by bigger values, `user:{id}:profile` (no TTL) grew, `rl` shrank,
+/// `tmp:import` is new, and `job:legacy:{id}` has gone. The rest are unchanged.
+pub fn previous_report(sizes: bool) -> ScanReport {
+    let mut r = report(sizes);
+    r.taken_at_unix -= 86_400;
+    r.server.used_memory = (12.9 * GIB) as u64;
+    let changes: [(&str, u64, f64); 5] = [
+        ("session:{uuid}", 1_790_000, 5.89 * GIB),
+        ("cache:search:{hash}", 860_000, 1.56 * GIB),
+        ("user:{id}:profile", 380_000, 0.48 * GIB),
+        ("queue:emails", 1, 380.0 * MIB),
+        ("rl:{ip}:{id}", 2_600_000, 0.47 * GIB),
+    ];
+    for (name, keys, bytes) in changes {
+        let p = r
+            .patterns
+            .iter_mut()
+            .find(|p| p.pattern == name)
+            .unwrap_or_else(|| panic!("no pattern {name}"));
+        p.est_keys = keys;
+        if sizes {
+            p.est_bytes = Some(bytes as u64);
+        }
+    }
+    let mut gone = r
+        .patterns
+        .iter()
+        .find(|p| p.pattern == "lock:{var}")
+        .cloned()
+        .unwrap();
+    gone.pattern = "job:legacy:{id}".into();
+    gone.est_keys = 20_000;
+    gone.est_bytes = sizes.then_some((0.1 * GIB) as u64);
+    r.patterns.retain(|p| p.pattern != "tmp:import:{ulid}");
+    r.patterns.push(gone);
+    r
+}
+
+/// [`previous_report`] compared with [`report`].
+pub fn history(sizes: bool) -> ReportDiff {
+    diff::diff(&previous_report(sizes), &report(sizes))
+}
+
+fn hot(key: &str, key_type: KeyType, bytes: f64, t: &str, freq: u8) -> KeySample {
+    KeySample {
+        key: key.into(),
+        key_type,
+        bytes: Some(bytes as u64),
+        ttl: ttl(t),
+        lfu_freq: Some(freq),
+    }
+}
+
+/// Hottest first, as the scanner returns them. `queue:emails` is hot and big.
+pub fn hot_keys() -> Vec<KeySample> {
+    vec![
+        hot(
+            "cache:product:31337",
+            KeyType::String,
+            6.2 * KIB,
+            "9h 41m",
+            251,
+        ),
+        hot("queue:emails", KeyType::List, 612.0 * MIB, "none", 243),
+        hot(
+            "session:9f1c2a7e-4b3d-4e0a-9c61-2f8d7b1e5a43",
+            KeyType::String,
+            3.2 * KIB,
+            "11h 04m",
+            238,
+        ),
+        hot("feature:checkout-v2", KeyType::String, 48.0, "none", 231),
+        hot(
+            "cache:product:1024",
+            KeyType::String,
+            5.8 * KIB,
+            "22h 03m",
+            226,
+        ),
+        hot("rl:10.0.4.12:29187460", KeyType::String, 162.0, "38s", 219),
+        hot("user:88213:cart", KeyType::Hash, 3.1 * KIB, "6d 23h", 204),
+        hot("lock:billing-run", KeyType::String, 150.0, "24m 10s", 197),
+    ]
+}
+
+/// An LRU server: no LFU counters, so no hot keys.
+pub fn server_lru() -> ServerInfo {
+    ServerInfo {
+        maxmemory_policy: "allkeys-lru".into(),
+        ..server()
+    }
+}
+
+pub fn report_lru() -> ScanReport {
+    ScanReport {
+        server: server_lru(),
+        ..report(true)
+    }
+}
+
+/// Everything allowed except `OBJECT FREQ`, which was skipped for the policy.
+pub fn perms_freq_skipped() -> PermissionReport {
+    let mut p = perms_ok();
+    for c in &mut p.checks {
+        if c.label == PERM_FREQ {
+            c.status = PermStatus::Skipped("eviction policy is not LFU".into());
+        }
+    }
+    p
+}
+
+/// Everything allowed except `OBJECT FREQ`, which the ACL refused.
+pub fn perms_freq_denied() -> PermissionReport {
+    let mut p = perms_ok();
+    for c in &mut p.checks {
+        if c.label == PERM_FREQ {
+            c.status = PermStatus::Denied(
+                "NOPERM User lens-limited has no permissions to run the 'object|freq' command"
+                    .into(),
+            );
+        }
+    }
+    p
 }

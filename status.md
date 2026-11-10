@@ -19,9 +19,9 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 | Wave | Content | Agents | Branch → PR | State |
 |---|---|---|---|---|
 | 2 | Scanner and connections | implementer ×2 [sonnet] | `wave2/*` → `v0.1-core` | **done**, merged into `v0.1-core` |
-| 3 | TUI (Connections and Patterns views), `scan` command | implementer [opus] (TUI), implementer [sonnet] (`scan`), verifier [opus] | `wave3/tui`, `wave3/scan-cli` → `v0.1-core` → PR #6 | merged into `v0.1-core`; waiting on the verifier and CI |
-| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | implementer [sonnet] (engine), implementer [opus] (views), verifier [opus] | `v0.2-views` → next PR | pending |
-| 5 | Replica preference; README modelled on redis-near-cache (logo, badges, `vhs` GIF), CHANGELOG, demo polish | implementer [sonnet] ×2, verifier [opus] | `v0.2-polish` → next PR | pending |
+| 3 | TUI (Connections and Patterns views), `scan` command, verifier fixes | | `v0.1-core` → PR #6 | **done**: verified, CI green, merged into main (6dc45c6) |
+| 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | | `v0.2-views` → PR #7 | **verifier PASS** after fixes; PR #7 open; merge once CI is green |
+| 5 | README, logo, CHANGELOG, Dependabot ignore, GIF (`wave5/docs`, done: GIF recorded and checked against the demo); replica preference, keychain-wait hint, verifier follow-ups (`wave5/polish`, implementer [sonnet] running) | | `v0.2-polish` → PR after #7 | in progress |
 
 ### How to resume after a restart or compaction
 
@@ -67,10 +67,16 @@ See the overnight table above.
 
 ## Needs a decision or action from the owner
 
+- **Dependabot PRs #2 to #5** are left for review. Don't merge #2: it bumps the MSRV job's pinned `dtolnay/rust-toolchain@1.89` to 1.120. Wave 5 adds a Dependabot ignore rule for that pin.
+
 - Add a `CARGO_REGISTRY_TOKEN` repository secret before the first release.
 - Decide whether to publish a placeholder 0.0.1 to reserve the crate name early.
 
 ## Known issues and notes
+
+- **macOS keychain prompt after rebuilds.** Keychain entries are tied to the binary that wrote them. A rebuilt or upgraded binary has to ask macOS for access, and until someone answers the dialog, connecting hangs. Wave 5: add a README note (click "Always Allow") and a TUI hint when a keychain read takes more than 2 s.
+
+- **Lesson:** never switch the main checkout's branch while an agent is reading it. Do all work in worktrees.
 
 - **`vhs` doesn't work here.** It drives headless Chromium, which produces no output, and turning off its browser sandbox was refused. Use `demo/record.py` with `agg` for GIFs instead.
 - **The Patterns view stays empty while a scan runs.** Showing partial results is a follow-up.

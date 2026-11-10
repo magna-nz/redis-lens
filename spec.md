@@ -41,13 +41,13 @@ The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move,
 - Each row shows a TTL histogram over the buckets none, <1m, <1h, <1d, <7d, <30d and >30d.
 
 ### 3 Diff
-- Compares the current scan with a saved snapshot. For each pattern it shows before, after, the change, and the change as a percentage.
-- It also says whether the growth came from more keys or from bigger values.
-- New patterns are flagged.
+- Compares the current scan with the newest earlier snapshot of the same profile taken with the same `MATCH` glob. Comparing with a chosen snapshot is CLI-only, through `redis-lens diff --against`. For each pattern it shows before, after, the change, and the change as a percentage.
+- It also says whether the change came from the key count or the average size: more keys, fewer keys, bigger values or smaller values. Memory is keys × average size, so the cause is whichever of `ln(keys after / keys before)` and `ln(average after / average before)` is larger in magnitude, and its direction always follows the change in memory. A change under 1% or under 64 KiB is "unchanged".
+- New and gone patterns are flagged when both scans saw the whole keyspace or used the same `MATCH` glob. Otherwise a pattern found in only one scan is shown as "not in the other scan", and it never counts as growth in the TTL view.
 
 ### 4 Hot keys
-- Keys ranked by LFU counter (`OBJECT FREQ`), showing pattern, type, size and node.
-- Keys that are both hot and big are flagged.
+- Up to 50 sampled keys with an LFU counter (`OBJECT FREQ`) above 0, ranked by that counter, showing the key, pattern, type, counter and size. A node column comes with cluster support (v0.3).
+- Keys with a counter of at least 100 and a size of at least 10 MiB are flagged as hot and big.
 - Needs an LFU eviction policy. Without one, the view says so and offers an opt-in, time-limited `MONITOR` sample (planned for v0.2).
 
 ## Scanning
@@ -56,7 +56,7 @@ The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move,
 2. Walk the keyspace with `SCAN cursor COUNT n [MATCH glob]`. **Never `KEYS`.** Deduplicate the keys SCAN returns.
 3. For each batch, pipeline `TYPE`, `PTTL`, `MEMORY USAGE key SAMPLES 5` (when allowed) and `OBJECT FREQ` (when allowed and the policy is LFU).
 4. Stop at the sample limit (default 100,000) or when the cursor returns to 0.
-5. Stay under a command budget (default 5,000 commands per second).
+5. Stay under a command budget: 5,000 commands per second by default, none for `local` profiles. `--max-rate N` overrides it (`0` means no limit).
 6. Scale sampled counts to estimates with `DBSIZE / keys seen`, where keys seen counts every distinct key SCAN returned, including keys that vanished or could not be read (for example `NOPERM` from a key ACL). The scale is never below 1, and it is 1 when the SCAN cursor returned to 0 (the whole keyspace was seen) or when `MATCH` is used.
 
 A per-key error such as `NOPERM` drops that field (sizes, frequency) and never aborts the scan.
@@ -129,7 +129,8 @@ Lists running containers whose image is redis, valkey, redis-stack or bitnami/re
 redis-lens                         open the TUI
 redis-lens conn add <name> --url <url> [--env prod|stage|local|other] [--password-stdin | --ask-password] [--entra] [--force]
 redis-lens conn list | remove <name> | test <name>
-redis-lens scan <name> [--sample N] [--match GLOB] [--json]
+redis-lens scan <name> [--sample N] [--match GLOB] [--max-rate N] [--save] [--json]
+redis-lens diff <name> [--against FILE] [--max-rate N] [--json]
 redis-lens discover
 ```
 
@@ -137,7 +138,14 @@ redis-lens discover
 
 ## Snapshots (v0.2)
 
-`s` writes the current `ScanReport` as JSON to the platform data directory, named `<profile>-<timestamp>.json`. The Diff view compares against the latest snapshot or a chosen one. A snapshot holds patterns and example key names, never values or credentials.
+`s` (or `redis-lens scan --save`) writes the current `ScanReport` as JSON to `<data dir>/redis-lens/snapshots/<profile dir>/<YYYYMMDDTHHMMSSZ>.json`. A snapshot holds patterns and example key names, never values or credentials. It also records whether the scan saw the whole keyspace (`complete`: the cursor returned to 0 with no sample limit reached and no `MATCH`) and the `MATCH` glob it used; snapshots written before these fields existed read as incomplete with no glob.
+
+- **Profile directory:** `<name>-<hash>`, where `<name>` is the profile name lower-cased with anything other than `[a-z0-9._-]` replaced by `_` (spaces included), trailing dots removed, and `_` added after Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`). `<hash>` is the first 12 hex digits of the 64-bit FNV-1a hash of the exact profile name, so names that only differ in case, punctuation or non-ASCII characters get their own directories.
+- **Docker containers** are snapshotted under `docker:<container>`, so they never share history with a saved profile of the same name.
+- **Reading:** a snapshot whose stored `profile` is not exactly the requested one is ignored, and so are files that can't be parsed. The baseline is the newest remaining snapshot taken strictly before the new scan with the same `MATCH` glob.
+- **Writing** goes to a uniquely named temp file that is flushed to disk and then renamed into place.
+
+`redis-lens diff <profile>` scans, compares with that baseline (or with `--against <file>`), then saves the new scan. The Diff view uses the same baseline.
 
 ## Quality bar
 

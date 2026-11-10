@@ -2,16 +2,19 @@
 //! messages change the state and return [`Effect`]s for the runtime to carry out.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::conn::docker::DiscoveredInstance;
 use crate::conn::parse::{ParsedConnection, mask, parse_connection_string};
+use crate::diff::ReportDiff;
 use crate::model::{
-    Auth, Credentials, PermStatus, PermissionReport, Profile, ScanReport, ServerInfo,
+    Auth, Credentials, PERM_FREQ, PermStatus, PermissionReport, Profile, ScanReport, ServerInfo,
 };
 use crate::scan::ScanProgress;
+use crate::verdict::ttl_verdict;
 
 use super::tree::{PatternTree, Root, Row};
 
@@ -120,7 +123,7 @@ pub enum SecretSource {
 /// Work for the runtime. Effects are the only way the app reaches the outside world.
 #[derive(Debug)]
 pub enum Effect {
-    /// Connect, check permissions, then scan with default options.
+    /// Connect, check permissions, then scan with the profile's default options.
     Connect {
         id: ConnId,
         profile: Profile,
@@ -132,6 +135,13 @@ pub enum Effect {
         profile: Profile,
         credentials: Option<Credentials>,
     },
+    /// Find the newest snapshot taken before `report` and diff it against `report`.
+    LoadHistory {
+        id: ConnId,
+        report: Box<ScanReport>,
+    },
+    /// Write `report` to the snapshot directory.
+    SaveSnapshot(Box<ScanReport>),
     Quit,
 }
 
@@ -164,6 +174,15 @@ pub enum Msg {
     },
     Saved(Profile),
     SaveFailed(String),
+    /// The diff against the previous snapshot of the scan taken at `taken_at_unix`:
+    /// `Ok(None)` when there is no earlier snapshot.
+    History {
+        id: ConnId,
+        taken_at_unix: i64,
+        result: Result<Option<ReportDiff>, String>,
+    },
+    SnapshotSaved(PathBuf),
+    SnapshotFailed(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -174,7 +193,19 @@ pub enum Phase {
     Failed(String),
 }
 
-/// The connection that Patterns shows.
+/// The comparison of the current scan with the previous snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub enum History {
+    /// No finished scan yet, or the snapshot lookup is still running.
+    Pending,
+    /// No snapshot of this profile is older than the current scan.
+    NoSnapshot,
+    /// The snapshot directory could not be read.
+    Failed(String),
+    Diff(ReportDiff),
+}
+
+/// The connection that the report views show.
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: ConnId,
@@ -183,6 +214,17 @@ pub struct Session {
     pub progress: Option<ScanProgress>,
     pub phase: Phase,
     pub report: Option<ScanReport>,
+    pub history: History,
+}
+
+impl Session {
+    /// The diff against the previous snapshot, when there is one.
+    pub fn diff(&self) -> Option<&ReportDiff> {
+        match &self.history {
+            History::Diff(d) => Some(d),
+            _ => None,
+        }
+    }
 }
 
 /// The add-connection input. Holds what the user typed, which may include a
@@ -217,6 +259,14 @@ pub struct PatternsState {
     pub filtering: bool,
 }
 
+/// The selected row of the TTL, Diff and Hot keys views. Each view keeps its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ViewSel {
+    pub ttl: usize,
+    pub diff: usize,
+    pub hot: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub text: String,
@@ -234,6 +284,7 @@ pub struct App {
     pub add: Option<AddState>,
     pub session: Option<Session>,
     pub patterns: PatternsState,
+    pub sel: ViewSel,
     pub notice: Option<Notice>,
     pub tick: u64,
     next_id: ConnId,
@@ -270,6 +321,7 @@ impl App {
             add: None,
             session: None,
             patterns: PatternsState::default(),
+            sel: ViewSel::default(),
             notice: None,
             tick: 0,
             next_id: 1,
@@ -364,6 +416,75 @@ impl App {
         }
     }
 
+    pub fn report(&self) -> Option<&ScanReport> {
+        self.session.as_ref().and_then(|s| s.report.as_ref())
+    }
+
+    pub fn diff(&self) -> Option<&ReportDiff> {
+        self.session.as_ref().and_then(|s| s.diff())
+    }
+
+    /// Rows of the TTL view: indices into the report's patterns, most worrying verdict
+    /// first, then by estimated memory (keys without sizes), then by name.
+    pub fn ttl_rows(&self) -> Vec<usize> {
+        let Some(r) = self.report() else {
+            return Vec::new();
+        };
+        let diff = self.diff();
+        let mut rows: Vec<usize> = (0..r.patterns.len()).collect();
+        rows.sort_by_cached_key(|&i| {
+            let p = &r.patterns[i];
+            let verdict = ttl_verdict(p, diff.and_then(|d| d.pattern(&p.pattern)));
+            let weight = if r.sizes_available {
+                p.est_bytes.unwrap_or(0)
+            } else {
+                p.est_keys
+            };
+            (verdict, std::cmp::Reverse(weight), p.pattern.clone())
+        });
+        rows
+    }
+
+    /// Why the Hot keys view is empty, or `None` when it has keys (or no report yet).
+    pub fn hot_keys_reason(&self) -> Option<String> {
+        let s = self.session.as_ref()?;
+        let r = s.report.as_ref()?;
+        if !r.hot_keys.is_empty() {
+            return None;
+        }
+        let denied = self
+            .entry(s.id)
+            .and_then(|e| e.perms.as_ref())
+            .is_some_and(|p| {
+                p.checks
+                    .iter()
+                    .any(|c| c.label == PERM_FREQ && matches!(c.status, PermStatus::Denied(_)))
+            });
+        Some(if denied {
+            "OBJECT FREQ was denied for this user.".to_string()
+        } else if !r.server.lfu_enabled() {
+            format!(
+                "The eviction policy is {}, so Redis keeps no LFU counters. Set \
+                 maxmemory-policy to allkeys-lfu or volatile-lfu to see hot keys.",
+                r.server.maxmemory_policy
+            )
+        } else if r.sampled_keys == 0 {
+            "The scan sampled no keys.".to_string()
+        } else {
+            "No sampled key has an LFU counter above 0 yet.".to_string()
+        })
+    }
+
+    /// The number of rows in a list view.
+    fn view_len(&self, view: View) -> usize {
+        match view {
+            View::Ttl => self.report().map_or(0, |r| r.patterns.len()),
+            View::Diff => self.diff().map_or(0, |d| d.patterns.len()),
+            View::HotKeys => self.report().map_or(0, |r| r.hot_keys.len()),
+            View::Connections | View::Patterns => 0,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Input
     // -----------------------------------------------------------------------
@@ -395,10 +516,7 @@ impl App {
                 self.start_add();
                 return Vec::new();
             }
-            Some('s') if self.view != View::Connections => {
-                self.set_info("Snapshots come in v0.2");
-                return Vec::new();
-            }
+            Some('s') if self.view != View::Connections => return self.save_snapshot(),
             _ => {}
         }
         match self.view {
@@ -407,7 +525,40 @@ impl App {
                 self.patterns_key(key);
                 Vec::new()
             }
-            _ => Vec::new(),
+            View::Ttl | View::Diff | View::HotKeys => {
+                self.list_key(key);
+                Vec::new()
+            }
+        }
+    }
+
+    fn save_snapshot(&mut self) -> Vec<Effect> {
+        match self.report() {
+            Some(r) => vec![Effect::SaveSnapshot(Box::new(r.clone()))],
+            None => {
+                self.set_info("Nothing to save yet: connect and wait for the scan to finish.");
+                Vec::new()
+            }
+        }
+    }
+
+    /// ↑↓ on the TTL, Diff and Hot keys views.
+    fn list_key(&mut self, key: KeyEvent) {
+        let len = self.view_len(self.view);
+        let sel = match self.view {
+            View::Ttl => &mut self.sel.ttl,
+            View::Diff => &mut self.sel.diff,
+            View::HotKeys => &mut self.sel.hot,
+            View::Connections | View::Patterns => return,
+        };
+        let last = len.saturating_sub(1);
+        let cur = (*sel).min(last);
+        match (key.code, plain_char(&key)) {
+            (KeyCode::Up, _) | (_, Some('k')) => *sel = cur.saturating_sub(1),
+            (KeyCode::Down, _) | (_, Some('j')) => *sel = (cur + 1).min(last),
+            (KeyCode::Home, _) | (_, Some('g')) => *sel = 0,
+            (KeyCode::End, _) | (_, Some('G')) => *sel = last,
+            _ => {}
         }
     }
 
@@ -612,8 +763,10 @@ impl App {
             progress: None,
             phase: Phase::Connecting,
             report: None,
+            history: History::Pending,
         });
         self.patterns = PatternsState::default();
+        self.sel = ViewSel::default();
         self.view = View::Patterns;
         vec![Effect::Connect {
             id,
@@ -723,7 +876,8 @@ impl App {
         self.session.as_ref().is_some_and(|s| s.id == id)
     }
 
-    pub fn apply(&mut self, msg: Msg) {
+    /// Apply a message. Returns follow-up work, e.g. loading history after a scan.
+    pub fn apply(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
             Msg::Tick => {
                 self.tick += 1;
@@ -743,7 +897,7 @@ impl App {
             }
             Msg::Connected { id, server, perms } => {
                 if !self.is_session(id) {
-                    return;
+                    return Vec::new();
                 }
                 let limited = perms
                     .checks
@@ -765,7 +919,7 @@ impl App {
             }
             Msg::ConnectFailed { id, error } => {
                 if !self.is_session(id) {
-                    return;
+                    return Vec::new();
                 }
                 if let Some(e) = self.entry_mut(id) {
                     e.status = ConnStatus::Failed;
@@ -786,22 +940,58 @@ impl App {
             }
             Msg::ScanDone { id, report } => {
                 if !self.is_session(id) {
-                    return;
+                    return Vec::new();
                 }
                 if let Some(e) = self.entry_mut(id) {
                     e.server = Some(report.server.clone());
                 }
                 self.patterns.tree = PatternTree::build(&report.patterns, report.sizes_available);
                 self.patterns.sel = 0;
+                self.sel = ViewSel::default();
+                let effect = Effect::LoadHistory {
+                    id,
+                    report: Box::new(report.clone()),
+                };
                 if let Some(s) = self.session.as_mut() {
                     s.server = Some(report.server.clone());
                     s.phase = Phase::Done;
                     s.report = Some(report);
+                    s.history = History::Pending;
                 }
+                return vec![effect];
             }
+            Msg::History {
+                id,
+                taken_at_unix,
+                result,
+            } => {
+                let Some(s) = self.session.as_mut() else {
+                    return Vec::new();
+                };
+                if s.id != id || s.report.as_ref().map(|r| r.taken_at_unix) != Some(taken_at_unix) {
+                    return Vec::new();
+                }
+                match result {
+                    Ok(Some(d)) => s.history = History::Diff(d),
+                    Ok(None) => s.history = History::NoSnapshot,
+                    Err(e) => {
+                        s.history = History::Failed(e.clone());
+                        self.set_error(format!("Could not load snapshots: {e}"));
+                    }
+                }
+                self.sel.diff = 0;
+            }
+            Msg::SnapshotSaved(path) => {
+                let name = path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into(),
+                );
+                self.set_info(format!("Saved snapshot {name}"));
+            }
+            Msg::SnapshotFailed(e) => self.set_error(format!("Could not save snapshot: {e}")),
             Msg::ScanFailed { id, error } => {
                 if !self.is_session(id) {
-                    return;
+                    return Vec::new();
                 }
                 if let Some(s) = self.session.as_mut() {
                     s.phase = Phase::Failed(error.clone());
@@ -850,6 +1040,7 @@ impl App {
                 }
             }
         }
+        Vec::new()
     }
 
     /// Replace the Docker rows, keeping the state of containers seen before.
@@ -1172,16 +1363,282 @@ mod tests {
         assert_eq!(app.patterns.filter, "");
     }
 
+    /// Connected to prod-cache-01 with `perms`, and `report` finished scanning.
+    fn scanned_with(report: ScanReport, perms: PermissionReport) -> (App, ConnId) {
+        let mut app = App::new(fixtures::profiles());
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let Effect::Connect { id, .. } = effects[0] else {
+            panic!()
+        };
+        app.apply(Msg::Connected {
+            id,
+            server: Some(report.server.clone()),
+            perms,
+        });
+        app.apply(Msg::ScanDone { id, report });
+        (app, id)
+    }
+
+    fn with_history(app: &mut App, id: ConnId) {
+        let taken_at_unix = app.report().unwrap().taken_at_unix;
+        app.apply(Msg::History {
+            id,
+            taken_at_unix,
+            result: Ok(Some(fixtures::history(true))),
+        });
+    }
+
     #[test]
-    fn snapshot_key_shows_toast() {
+    fn snapshot_key_saves_the_report() {
         let mut app = scanned_app(true);
-        app.handle_key(ch('s'));
+        let effects = app.handle_key(ch('s'));
+        let [Effect::SaveSnapshot(r)] = &effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        assert_eq!(r.profile, "prod-cache-01");
+        assert_eq!(r.taken_at_unix, app.report().unwrap().taken_at_unix);
+        // Works from the other report views too, but not on Connections.
+        for v in ['2', '3', '4'] {
+            app.handle_key(ch(v));
+            assert!(matches!(
+                app.handle_key(ch('s'))[..],
+                [Effect::SaveSnapshot(_)]
+            ));
+        }
+        app.handle_key(ch('0'));
+        assert!(app.handle_key(ch('s')).is_empty());
+
+        app.apply(Msg::SnapshotSaved(PathBuf::from(
+            "/data/redis-lens/snapshots/prod-cache-01/20261110T140211Z.json",
+        )));
         let n = app.notice.clone().unwrap();
-        assert_eq!(n.text, "Snapshots come in v0.2");
+        assert_eq!(n.text, "Saved snapshot 20261110T140211Z.json");
+        assert!(!n.error);
         for _ in 0..NOTICE_TICKS {
             app.apply(Msg::Tick);
         }
         assert!(app.notice.is_none());
+
+        app.apply(Msg::SnapshotFailed(
+            "could not find a data directory for this user".into(),
+        ));
+        let n = app.notice.clone().unwrap();
+        assert!(n.error);
+        assert_eq!(
+            n.text,
+            "Could not save snapshot: could not find a data directory for this user"
+        );
+    }
+
+    #[test]
+    fn snapshot_key_without_report_explains() {
+        let mut app = App::new(fixtures::profiles());
+        app.handle_key(ch('1'));
+        assert!(app.handle_key(ch('s')).is_empty());
+        assert!(!app.notice.as_ref().unwrap().error);
+    }
+
+    #[test]
+    fn scan_done_loads_history_and_stores_the_diff() {
+        let mut app = App::new(fixtures::profiles());
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let Effect::Connect { id, .. } = effects[0] else {
+            panic!()
+        };
+        let report = fixtures::report(true);
+        let effects = app.apply(Msg::ScanDone {
+            id,
+            report: report.clone(),
+        });
+        let [Effect::LoadHistory { id: got, report: r }] = &effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        assert_eq!(*got, id);
+        assert_eq!(**r, report);
+        assert_eq!(app.session.as_ref().unwrap().history, History::Pending);
+        assert!(app.diff().is_none());
+
+        // A reply for another scan is ignored.
+        app.apply(Msg::History {
+            id,
+            taken_at_unix: report.taken_at_unix - 1,
+            result: Ok(Some(fixtures::history(true))),
+        });
+        assert!(app.diff().is_none());
+        app.apply(Msg::History {
+            id: id + 100,
+            taken_at_unix: report.taken_at_unix,
+            result: Ok(Some(fixtures::history(true))),
+        });
+        assert!(app.diff().is_none());
+
+        app.apply(Msg::History {
+            id,
+            taken_at_unix: report.taken_at_unix,
+            result: Ok(Some(fixtures::history(true))),
+        });
+        assert_eq!(app.diff(), Some(&fixtures::history(true)));
+
+        app.apply(Msg::History {
+            id,
+            taken_at_unix: report.taken_at_unix,
+            result: Ok(None),
+        });
+        assert_eq!(app.session.as_ref().unwrap().history, History::NoSnapshot);
+        assert!(app.notice.is_none());
+
+        // A missing data directory is reported and the app carries on.
+        app.apply(Msg::History {
+            id,
+            taken_at_unix: report.taken_at_unix,
+            result: Err("could not find a data directory for this user".into()),
+        });
+        assert!(matches!(
+            app.session.as_ref().unwrap().history,
+            History::Failed(_)
+        ));
+        let n = app.notice.as_ref().unwrap();
+        assert!(n.error);
+        assert!(n.text.contains("could not find a data directory"));
+        assert!(!app.pattern_rows().is_empty());
+    }
+
+    #[test]
+    fn list_views_keep_their_own_selection() {
+        let mut report = fixtures::report(true);
+        report.hot_keys = fixtures::hot_keys();
+        let (mut app, id) = scanned_with(report, fixtures::perms_ok());
+
+        app.handle_key(ch('2'));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(ch('j'));
+        assert_eq!(app.sel.ttl, 2);
+
+        // No diff yet: nothing to move through.
+        app.handle_key(ch('3'));
+        app.handle_key(ch('j'));
+        assert_eq!(app.sel.diff, 0);
+        with_history(&mut app, id);
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.sel.diff, 3);
+
+        app.handle_key(ch('4'));
+        app.handle_key(ch('j'));
+        assert_eq!(app.sel.hot, 1);
+
+        // Patterns has its own selection too.
+        app.handle_key(ch('1'));
+        assert_eq!(app.patterns.sel, 0);
+
+        app.handle_key(ch('2'));
+        assert_eq!(app.sel.ttl, 2);
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.sel.ttl, 1);
+        for _ in 0..50 {
+            app.handle_key(ch('k'));
+        }
+        assert_eq!(app.sel.ttl, 0);
+        for _ in 0..50 {
+            app.handle_key(ch('j'));
+        }
+        assert_eq!(app.sel.ttl, app.ttl_rows().len() - 1);
+        app.handle_key(ch('g'));
+        assert_eq!(app.sel.ttl, 0);
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.sel.ttl, app.ttl_rows().len() - 1);
+
+        app.handle_key(ch('3'));
+        assert_eq!(app.sel.diff, 3);
+        app.handle_key(ch('G'));
+        assert_eq!(app.sel.diff, fixtures::history(true).patterns.len() - 1);
+        app.handle_key(ch('4'));
+        assert_eq!(app.sel.hot, 1);
+        for _ in 0..50 {
+            app.handle_key(ch('j'));
+        }
+        assert_eq!(app.sel.hot, fixtures::hot_keys().len() - 1);
+
+        // A new scan starts every list at the top.
+        app.apply(Msg::ScanDone {
+            id,
+            report: fixtures::report(true),
+        });
+        assert_eq!(app.sel, ViewSel::default());
+    }
+
+    #[test]
+    fn ttl_rows_rank_by_verdict_then_memory() {
+        let (mut app, id) = scanned_with(fixtures::report(true), fixtures::perms_ok());
+        let names = |app: &App| -> Vec<String> {
+            let r = app.report().unwrap();
+            app.ttl_rows()
+                .iter()
+                .map(|&i| r.patterns[i].pattern.clone())
+                .collect()
+        };
+        // Without history nothing counts as growing.
+        assert_eq!(
+            names(&app)[..4],
+            [
+                "cache:search:{hash}",
+                "user:{id}:cart",
+                "tmp:import:{ulid}",
+                "queue:emails"
+            ]
+        );
+        with_history(&mut app, id);
+        assert_eq!(
+            names(&app)[..4],
+            [
+                "tmp:import:{ulid}",
+                "queue:emails",
+                "user:{id}:profile",
+                "cache:search:{hash}"
+            ]
+        );
+    }
+
+    #[test]
+    fn hot_keys_reasons() {
+        let mut report = fixtures::report(true);
+        report.hot_keys = fixtures::hot_keys();
+        let (app, _) = scanned_with(report, fixtures::perms_ok());
+        assert_eq!(app.hot_keys_reason(), None);
+
+        let (app, _) = scanned_with(fixtures::report(true), fixtures::perms_freq_denied());
+        assert_eq!(
+            app.hot_keys_reason().as_deref(),
+            Some("OBJECT FREQ was denied for this user.")
+        );
+
+        let (app, _) = scanned_with(fixtures::report_lru(), fixtures::perms_freq_skipped());
+        assert_eq!(
+            app.hot_keys_reason().as_deref(),
+            Some(
+                "The eviction policy is allkeys-lru, so Redis keeps no LFU counters. Set \
+                 maxmemory-policy to allkeys-lfu or volatile-lfu to see hot keys."
+            )
+        );
+
+        let (app, _) = scanned_with(fixtures::report(true), fixtures::perms_ok());
+        assert_eq!(
+            app.hot_keys_reason().as_deref(),
+            Some("No sampled key has an LFU counter above 0 yet.")
+        );
+
+        let mut empty = fixtures::report(true);
+        empty.sampled_keys = 0;
+        empty.patterns.clear();
+        let (app, _) = scanned_with(empty, fixtures::perms_ok());
+        assert_eq!(
+            app.hot_keys_reason().as_deref(),
+            Some("The scan sampled no keys.")
+        );
+
+        // Nothing to explain before a scan.
+        assert_eq!(App::new(vec![]).hot_keys_reason(), None);
     }
 
     #[test]
