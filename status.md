@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** v0.1 → v0.2
-**Last updated:** 2026-11-11 (overnight run: final wave in its PR)
+**Current milestone:** v0.2 done on main; next is v0.3 (cluster) or the feature ideas below
+**Last updated:** 2026-11-11 (overnight run complete: waves 2 to 5 merged)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -21,7 +21,7 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 | 2 | Scanner and connections | implementer ×2 [sonnet] | `wave2/*` → `v0.1-core` | **done**, merged into `v0.1-core` |
 | 3 | TUI (Connections and Patterns views), `scan` command, verifier fixes | | `v0.1-core` → PR #6 | **done**: verified, CI green, merged into main (6dc45c6) |
 | 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | | `v0.2-views` → PR #7 | **done**: verified, CI green, merged into main |
-| 5 | Docs, logo, GIF, CHANGELOG, Dependabot ignore; replica preference with verification; keychain-wait hint; v0.2 follow-ups | implementer [sonnet] ×2, implementer [opus], verifier [opus] | `wave5/polish` → PR | verification BLOCKED twice (unverified replica endpoint, then a credential bypass by a fake replica), both fixed with regression tests; **third verification PASS** (16e3596, docs corrected in d46399d); PR open, merge once CI is green |
+| 5 | Docs, logo, GIF, CHANGELOG, Dependabot ignore; replica preference with verification; keychain-wait hint; v0.2 follow-ups | implementer [sonnet] ×2, implementer [opus], verifier [opus] | `wave5/polish` → PR | **done**: verified after three rounds (the first two BLOCKED on replica trust, both fixed), CI green, merged into main as PR #8 (0f981e9) |
 
 ### How to resume after a restart or compaction
 
