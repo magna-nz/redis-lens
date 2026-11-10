@@ -23,9 +23,10 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::conn;
-use crate::model::{Credentials, Profile};
+use crate::model::{Credentials, Profile, ScanReport};
 use crate::scan::{self, ScanOptions, ScanProgress};
 use crate::secrets::{KeyringStore, MemoryStore, SecretStore};
+use crate::{diff, snapshot};
 
 pub mod app;
 pub mod tree;
@@ -124,10 +125,10 @@ async fn event_loop(
                 Some(Incoming::Input(Event::Paste(s))) => app.handle_paste(s),
                 Some(Incoming::Input(_)) => {}
                 Some(Incoming::InputFailed(e)) => bail!("could not read terminal input: {e}"),
-                Some(Incoming::Msg(m)) => app.apply(m),
+                Some(Incoming::Msg(m)) => pending = app.apply(m),
                 None => return Ok(()),
             },
-            _ = tick.tick() => app.apply(Msg::Tick),
+            _ = tick.tick() => pending = app.apply(Msg::Tick),
         }
     }
 }
@@ -191,9 +192,40 @@ impl Runner {
                     send(&tx, msg);
                 });
             }
+            Effect::LoadHistory { id, report } => {
+                tokio::task::spawn_blocking(move || {
+                    let taken_at_unix = report.taken_at_unix;
+                    let result = load_history(&report).map_err(|e| e.to_string());
+                    send(
+                        &tx,
+                        Msg::History {
+                            id,
+                            taken_at_unix,
+                            result,
+                        },
+                    );
+                });
+            }
+            Effect::SaveSnapshot(report) => {
+                tokio::task::spawn_blocking(move || {
+                    let msg =
+                        match snapshot::default_dir().and_then(|d| snapshot::save(&d, &report)) {
+                            Ok(path) => Msg::SnapshotSaved(path),
+                            Err(e) => Msg::SnapshotFailed(e.to_string()),
+                        };
+                    send(&tx, msg);
+                });
+            }
         }
         false
     }
+}
+
+/// The diff between the newest snapshot older than `report` and `report`.
+fn load_history(report: &ScanReport) -> Result<Option<diff::ReportDiff>, snapshot::SnapshotError> {
+    let dir = snapshot::default_dir()?;
+    let prev = snapshot::latest_before(&dir, &report.profile, report.taken_at_unix)?;
+    Ok(prev.map(|p| diff::diff(&p, report)))
 }
 
 /// Save a new profile the way `conn add` does: credentials to the keychain first, so
@@ -281,7 +313,7 @@ async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, t
     let result = scan::scan(
         &profile.name,
         &mut c,
-        &ScanOptions::default(),
+        &ScanOptions::for_profile(&profile),
         &perms,
         Some(&ptx),
     )

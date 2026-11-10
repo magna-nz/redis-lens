@@ -2,42 +2,45 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
+use crate::diff::ReportDiff;
 use crate::format;
 use crate::model::{ScanReport, TTL_BUCKET_LABELS, Ttl};
-use crate::tui::app::{App, Phase, Session};
+use crate::tui::app::App;
 use crate::tui::tree::{Root, Row, Summary, Verdict, summarize, summarize_group};
 
+use super::delta::Change;
 use super::widgets::{
     bar, fit, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset, split_cols, trunc,
+    ttl_hist_spans,
 };
-use super::{spinner, split_body, style};
+use super::{report_or_wait, split_body, style};
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
+    let Some((session, report)) = report_or_wait(frame, area, app, "Patterns") else {
+        return;
+    };
     let (main, detail) = split_body(area);
-    let Some(session) = &app.session else {
-        message(
-            frame,
-            main,
-            detail,
-            Span::styled(
-                " No scan yet. Open 0 Connections, pick a connection and press enter.",
-                style::dim(),
-            ),
-        );
-        return;
-    };
-    let Some(report) = &session.report else {
-        waiting(frame, main, detail, app, session);
-        return;
-    };
     let rows_ = app.pattern_rows();
     let sel = app.patterns.sel.min(rows_.len().saturating_sub(1));
     let summaries: Vec<(Summary, usize, Option<bool>)> =
         rows_.iter().map(|r| row_summary(app, report, *r)).collect();
-    table(frame, main, app, report, &summaries, sel);
+    let changes: Option<Vec<Option<Change>>> = session.diff().map(|d| {
+        rows_
+            .iter()
+            .map(|r| row_change(app, report, d, *r))
+            .collect()
+    });
+    table(
+        frame,
+        main,
+        app,
+        report,
+        &summaries,
+        changes.as_deref(),
+        sel,
+    );
     match summaries.get(sel) {
         Some((s, _, _)) => detail_panel(frame, detail, s, report.sizes_available),
         None => {
@@ -63,68 +66,16 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn message(frame: &mut Frame, main: Rect, detail: Rect, text: Span<'static>) {
-    let inner = panel(frame, main, "Patterns", "");
-    rows(frame, inner, vec![Line::default(), Line::from(text)], None);
-    panel(frame, detail, "Details", "");
-}
-
-fn waiting(frame: &mut Frame, main: Rect, detail: Rect, app: &App, s: &Session) {
-    let spin = spinner(app.tick);
-    let p = &s.profile;
-    let inner = panel(frame, main, "Patterns", &p.name);
-    let mut lines = vec![Line::default()];
-    match &s.phase {
-        Phase::Failed(e) => {
-            lines.push(Line::from(Span::styled(format!(" ✗ {e}"), style::warn())));
-            lines.push(Line::from(Span::styled(
-                " Press 0 to go back to Connections and try again.",
-                style::dim(),
-            )));
-        }
-        Phase::Connecting => lines.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(spin, style::amber()),
-            Span::styled(
-                format!(
-                    " Connecting to {} ({}) and checking permissions…",
-                    p.name, p.endpoint
-                ),
-                style::dim(),
-            ),
-        ])),
-        Phase::Scanning | Phase::Done => {
-            let pr = s.progress.unwrap_or_default();
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(spin, style::amber()),
-                Span::styled(" Sampled ", style::dim()),
-                Span::styled(
-                    format!(
-                        "{} / {}",
-                        format::grouped(pr.sampled),
-                        format::grouped(pr.target)
-                    ),
-                    style::fgb(),
-                ),
-                Span::styled(" keys", style::dim()),
-            ]));
-            let ratio = if pr.target == 0 {
-                0.0
-            } else {
-                pr.sampled as f64 / pr.target as f64
-            };
-            let w = usize::from(inner.width).saturating_sub(4).min(40);
-            let (fill, track) = bar(ratio, w);
-            lines.push(Line::from(vec![
-                Span::raw("   "),
-                Span::styled(fill, style::amber()),
-                Span::styled(track, style::track()),
-            ]));
-        }
+/// The change since the snapshot for a row. Parent rows sum their children.
+fn row_change(app: &App, report: &ScanReport, d: &ReportDiff, row: Row) -> Option<Change> {
+    let of = |i: usize| d.pattern(&report.patterns[i].pattern).map(Change::of);
+    match row {
+        Row::Group { root } => match &app.patterns.tree.roots[root] {
+            Root::Group(g) => Change::sum(g.children.iter().filter_map(|&i| of(i))),
+            Root::Single(i) => of(*i),
+        },
+        Row::Pattern { idx, .. } => of(idx),
     }
-    rows(frame, inner, lines, None);
-    panel(frame, detail, "Details", "");
 }
 
 /// The summary for a row, its depth, and for groups whether they are expanded.
@@ -155,10 +106,15 @@ const TYPE_W: usize = 8;
 const NUM_W: usize = 7;
 const PCT_W: usize = 4;
 const TTL_W: usize = 6;
+/// The Δ column, shown only when there is a snapshot to compare with.
+const DELTA_W: usize = 7;
 
-fn cols(inner: usize) -> Cols {
+fn cols(inner: usize, delta: bool) -> Cols {
     let share = if inner >= 100 { 14 } else { 8 };
-    let fixed = TYPE_W + (NUM_W + 2) * 3 + share + 1 + PCT_W + 2 + TTL_W + 2;
+    let mut fixed = TYPE_W + (NUM_W + 2) * 3 + share + 1 + PCT_W + 2 + TTL_W + 2;
+    if delta {
+        fixed += DELTA_W + 1;
+    }
     Cols {
         name: inner.saturating_sub(fixed).max(12),
         share,
@@ -175,6 +131,7 @@ fn table(
     app: &App,
     report: &ScanReport,
     summaries: &[(Summary, usize, Option<bool>)],
+    changes: Option<&[Option<Change>]>,
     sel: usize,
 ) {
     let sizes = report.sizes_available;
@@ -190,8 +147,8 @@ fn table(
         format!("{} patterns · sorted by memory", report.patterns.len())
     };
     let inner = panel(frame, area, "Patterns", &right);
-    let c = cols(usize::from(inner.width));
-    let head = Line::from(vec![
+    let c = cols(usize::from(inner.width), changes.is_some());
+    let mut head = Line::from(vec![
         Span::styled(pad_r(" PATTERN", c.name), style::hd()),
         Span::styled(pad_r("TYPE", TYPE_W), style::hd()),
         Span::styled(format!("{}  ", pad_l("KEYS", NUM_W)), style::hd()),
@@ -201,6 +158,12 @@ fn table(
         Span::styled(format!("{}  ", pad_l("AVG", NUM_W)), style::hd()),
         Span::styled(format!("{}  ", pad_l("NO TTL", TTL_W)), style::hd()),
     ]);
+    if changes.is_some() {
+        head.push_span(Span::styled(
+            format!("{} ", pad_l("Δ", DELTA_W)),
+            style::hd(),
+        ));
+    }
     let total: u64 = report
         .patterns
         .iter()
@@ -214,7 +177,17 @@ fn table(
         .sum();
     let lines: Vec<Line<'static>> = summaries
         .iter()
-        .map(|(s, depth, open)| pattern_row(s, *depth, *open, total, sizes, &c))
+        .enumerate()
+        .map(|(i, (s, depth, open))| {
+            let mut line = pattern_row(s, *depth, *open, total, sizes, &c);
+            if let Some(ch) = changes {
+                line.push_span(match ch.get(i).copied().flatten() {
+                    Some(d) => Span::styled(format!("{} ", pad_l(&d.text(), DELTA_W)), d.style()),
+                    None => Span::styled(format!("{} ", pad_l("—", DELTA_W)), style::dim()),
+                });
+            }
+            line
+        })
         .collect();
     rows(frame, inner, vec![head], None);
     let body = Rect {
@@ -301,31 +274,13 @@ fn plural(n: u64, one: &'static str, many: &'static str) -> &'static str {
     if n == 1 { one } else { many }
 }
 
-fn level(v: u64, max: u64) -> char {
-    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let i = ((v as f64 / max as f64) * 8.0).ceil() as usize;
-    LEVELS[i.clamp(1, 8) - 1]
-}
-
 fn ttl_bars(s: &Summary) -> Vec<Span<'static>> {
-    let max = s.ttl_hist.iter().copied().max().unwrap_or(0);
-    let mixed = matches!(s.verdict, Verdict::MixedTtl(_));
-    s.ttl_hist
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| {
-            if v == 0 {
-                Span::styled(pad_r("·", 5), style::track())
-            } else {
-                let st: Style = match i {
-                    0 if mixed => style::warn(),
-                    0 => style::amber(),
-                    _ => style::ok(),
-                };
-                Span::styled(pad_r(&level(v, max).to_string().repeat(3), 5), st)
-            }
-        })
-        .collect()
+    let none = if matches!(s.verdict, Verdict::MixedTtl(_)) {
+        style::warn()
+    } else {
+        style::amber()
+    };
+    ttl_hist_spans(&s.ttl_hist, none)
 }
 
 fn verdict_line(s: &Summary) -> Span<'static> {
