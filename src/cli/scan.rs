@@ -16,6 +16,7 @@ use crate::format;
 use crate::model::{PERM_FREQ, PatternStats, PermStatus, PermissionReport, ScanReport};
 use crate::scan::{self, ScanOptions, ScanProgress};
 use crate::secrets::{KeyringStore, SecretStore};
+use crate::snapshot;
 
 const MIN_WIDTH: usize = 60;
 const MAX_ROWS: usize = 40;
@@ -28,25 +29,93 @@ pub async fn report(
     args: &ScanArgs,
     progress: Option<&watch::Sender<ScanProgress>>,
 ) -> anyhow::Result<(ScanReport, PermissionReport)> {
+    scan_profile(
+        config_path,
+        secrets,
+        &args.profile,
+        args.sample,
+        args.match_glob.clone(),
+        args.max_rate,
+        progress,
+    )
+    .await
+}
+
+/// The scan behind both `scan` and `diff`. `max_rate` overrides the profile's default
+/// command budget; `Some(0)` means no limit.
+pub async fn scan_profile(
+    config_path: &Path,
+    secrets: &dyn SecretStore,
+    profile_name: &str,
+    sample: u64,
+    match_glob: Option<String>,
+    max_rate: Option<u32>,
+    progress: Option<&watch::Sender<ScanProgress>>,
+) -> anyhow::Result<(ScanReport, PermissionReport)> {
     let config = Config::load(config_path)?;
-    let profile = config.get(&args.profile).ok_or_else(|| {
+    let profile = config.get(profile_name).ok_or_else(|| {
         anyhow::anyhow!(
             "no saved connection named '{}'; see `redis-lens conn list`",
-            args.profile
+            profile_name
         )
     })?;
     let mut connection = conn::connect(profile, secrets).await?;
     let perms = conn::check_permissions(&mut connection).await;
-    let opts = ScanOptions {
-        sample_limit: args.sample,
-        match_glob: args.match_glob.clone(),
-        ..Default::default()
-    };
+    let mut opts = ScanOptions::for_profile(profile);
+    opts.sample_limit = sample;
+    opts.match_glob = match_glob;
+    if let Some(rate) = max_rate {
+        opts.max_commands_per_sec = (rate > 0).then_some(rate);
+    }
     let report = scan::scan(&profile.name, &mut connection, &opts, &perms, progress).await?;
     Ok((report, perms))
 }
 
-fn truncate(s: &str, max: usize) -> String {
+/// With `--save`, write the report into `dir` and tell the user where on stderr.
+pub fn save_if_requested(
+    dir: &Path,
+    args: &ScanArgs,
+    report: &ScanReport,
+) -> anyhow::Result<Option<PathBuf>> {
+    if !args.save {
+        return Ok(None);
+    }
+    let path = snapshot::save(dir, report)?;
+    eprintln!("Saved snapshot {}", path.display());
+    Ok(Some(path))
+}
+
+/// Run `f` while printing "Sampled n / m" on stderr when it is a terminal.
+pub(super) async fn with_progress<T, F, Fut>(f: F) -> T
+where
+    F: FnOnce(Option<watch::Sender<ScanProgress>>) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let show_progress = std::io::stderr().is_terminal();
+    let (tx, mut rx) = watch::channel(ScanProgress::default());
+    let printer = show_progress.then(|| {
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let p = *rx.borrow_and_update();
+                eprint!(
+                    "\rSampled {} / {}",
+                    format::grouped(p.sampled),
+                    format::grouped(p.target)
+                );
+                let _ = std::io::stderr().flush();
+            }
+        })
+    });
+    let result = f(Some(tx)).await;
+    if let Some(h) = printer {
+        let _ = h.await;
+        eprint!("\r\x1b[2K");
+        let _ = std::io::stderr().flush();
+    }
+    result
+}
+
+pub(super) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
@@ -117,6 +186,21 @@ pub fn render_table(report: &ScanReport, perms: &PermissionReport, width: usize)
         .any(|c| c.label == PERM_FREQ && matches!(c.status, PermStatus::Denied(_)))
     {
         degraded.push("hot keys unavailable: OBJECT FREQ denied".to_string());
+    }
+    if !report.hot_keys.is_empty() {
+        let top: Vec<String> = report
+            .hot_keys
+            .iter()
+            .take(3)
+            .map(|k| {
+                format!(
+                    "{} (freq {})",
+                    truncate(&k.key, 40),
+                    k.lfu_freq.unwrap_or(0)
+                )
+            })
+            .collect();
+        lines.push(format!("Hot:     {}", top.join(", ")));
     }
     for d in &degraded {
         lines.push(format!("Note:    {d}"));
@@ -209,31 +293,13 @@ pub async fn run(config: Option<PathBuf>, args: ScanArgs) -> anyhow::Result<()> 
         None => Config::default_path()?,
     };
     let secrets = KeyringStore;
-    let show_progress = std::io::stderr().is_terminal();
-
-    let (tx, mut rx) = watch::channel(ScanProgress::default());
-    let printer = show_progress.then(|| {
-        tokio::spawn(async move {
-            while rx.changed().await.is_ok() {
-                let p = *rx.borrow_and_update();
-                eprint!(
-                    "\rSampled {} / {}",
-                    format::grouped(p.sampled),
-                    format::grouped(p.target)
-                );
-                let _ = std::io::stderr().flush();
-            }
-        })
-    });
-
-    let result = report(&path, &secrets, &args, Some(&tx)).await;
-    drop(tx);
-    if let Some(h) = printer {
-        let _ = h.await;
-        eprint!("\r\x1b[2K");
-        let _ = std::io::stderr().flush();
-    }
+    let result = with_progress(|tx| {
+        let (path, secrets, args) = (&path, &secrets, &args);
+        async move { report(path, secrets, args, tx.as_ref()).await }
+    })
+    .await;
     let (report, perms) = result?;
+    save_if_requested(&snapshot::default_dir()?, &args, &report)?;
 
     if args.json {
         println!(
@@ -336,6 +402,24 @@ mod tests {
         let row = t.lines().find(|l| l.starts_with("a:{id}")).unwrap();
         assert!(row.contains('—'));
         assert!(row.contains("100%"));
+    }
+
+    #[test]
+    fn hot_line_lists_top_three() {
+        let mut r = report(vec![pattern("a", 1, Some(1))], true, "allkeys-lfu");
+        assert!(!render_table(&r, &perms(), 100).contains("Hot:"));
+        r.hot_keys = (0..5)
+            .map(|i| crate::model::KeySample {
+                key: format!("k{i}"),
+                key_type: KeyType::String,
+                bytes: None,
+                ttl: crate::model::Ttl::Persistent,
+                lfu_freq: Some(200 - i),
+            })
+            .collect();
+        let t = render_table(&r, &perms(), 100);
+        let line = t.lines().find(|l| l.starts_with("Hot:")).unwrap();
+        assert_eq!(line, "Hot:     k0 (freq 200), k1 (freq 199), k2 (freq 198)");
     }
 
     #[test]

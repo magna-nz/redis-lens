@@ -1,0 +1,209 @@
+//! Snapshots, `diff` and hot keys against real servers.
+#![cfg(feature = "integration-tests")]
+
+mod common;
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+
+use redis_lens::cli::diff::{diff_profile, render_diff};
+use redis_lens::cli::scan::{render_table, report, save_if_requested};
+use redis_lens::cli::{DiffArgs, ScanArgs};
+use redis_lens::config::Config;
+use redis_lens::diff::Cause;
+use redis_lens::model::{Auth, Endpoint, Env, Profile};
+use redis_lens::secrets::MemoryStore;
+use redis_lens::snapshot;
+
+static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+fn temp_dir(tag: &str) -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("redis-lens-{tag}-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn temp_config(port: u16) -> PathBuf {
+    let profile = Profile {
+        name: "it".to_string(),
+        env: Env::Local,
+        endpoint: Endpoint {
+            host: "127.0.0.1".to_string(),
+            port,
+            tls: false,
+        },
+        db: 0,
+        auth: Auth::None,
+        read_only: None,
+    };
+    let path = temp_dir("diff-it-config").join("config.toml");
+    Config {
+        profiles: vec![profile],
+    }
+    .save(&path)
+    .unwrap();
+    path
+}
+
+fn scan_args(save: bool) -> ScanArgs {
+    ScanArgs {
+        profile: "it".to_string(),
+        sample: 10_000,
+        match_glob: None,
+        json: false,
+        max_rate: Some(0),
+        save,
+    }
+}
+
+fn diff_args() -> DiffArgs {
+    DiffArgs {
+        profile: "it".to_string(),
+        against: None,
+        max_rate: Some(0),
+        json: false,
+    }
+}
+
+async fn set(conn: &mut redis::aio::MultiplexedConnection, key: String, value: String) {
+    let _: () = redis::cmd("SET")
+        .arg(key)
+        .arg(value)
+        .query_async(conn)
+        .await
+        .unwrap();
+}
+
+async fn hset(conn: &mut redis::aio::MultiplexedConnection, key: String, value: String) {
+    let _: () = redis::cmd("HSET")
+        .arg(key)
+        .arg("f")
+        .arg(value)
+        .query_async(conn)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn diff_finds_causes_on_redis_and_valkey() {
+    for server in [common::redis().await, common::valkey().await] {
+        let mut admin = server.admin().await;
+        for i in 0..100 {
+            set(
+                &mut admin,
+                format!("user:{}:profile", 1000 + i),
+                "x".repeat(2000),
+            )
+            .await;
+            hset(&mut admin, format!("order:{}", 9000 + i), "v".repeat(100)).await;
+            set(&mut admin, format!("flag:{}", 100 + i), "1".to_string()).await;
+        }
+        let config = temp_config(server.port);
+        let dir = temp_dir("diff-it-snaps");
+        let secrets = MemoryStore::default();
+
+        // No snapshot yet: a clear error, and nothing saved.
+        let err = diff_profile(&config, &secrets, &diff_args(), &dir, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no snapshot for it; run `redis-lens scan it --save` first"
+        );
+        assert!(snapshot::list(&dir, "it").unwrap().is_empty());
+
+        let args = scan_args(true);
+        let (first, _) = report(&config, &secrets, &args, None).await.unwrap();
+        let saved = save_if_requested(&dir, &args, &first).unwrap().unwrap();
+        assert!(saved.starts_with(&dir));
+        assert!(
+            !std::fs::read_to_string(&saved)
+                .unwrap()
+                .contains("password")
+        );
+
+        // Snapshots are named by the second, and the baseline must be strictly older.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        for i in 100..300 {
+            set(
+                &mut admin,
+                format!("user:{}:profile", 1000 + i),
+                "x".repeat(2000),
+            )
+            .await;
+        }
+        for i in 0..100 {
+            hset(&mut admin, format!("order:{}", 9000 + i), "v".repeat(4000)).await;
+        }
+        for i in 0..50 {
+            set(&mut admin, format!("audit:{}", 1 + i), "a".repeat(2000)).await;
+        }
+
+        let (d, second) = diff_profile(&config, &secrets, &diff_args(), &dir, None)
+            .await
+            .unwrap();
+        let text = render_diff(&d, 60);
+        println!("{text}");
+        assert_eq!(
+            d.pattern("user:{id}:profile").unwrap().cause,
+            Cause::MoreKeys
+        );
+        assert_eq!(d.pattern("order:{id}").unwrap().cause, Cause::BiggerValues);
+        assert_eq!(d.pattern("audit:{id}").unwrap().cause, Cause::New);
+        assert_eq!(d.pattern("flag:{id}").unwrap().cause, Cause::Unchanged);
+        assert_eq!(d.before_taken_at_unix, first.taken_at_unix);
+        assert_eq!(d.after_taken_at_unix, second.taken_at_unix);
+        for l in text.lines() {
+            assert!(l.chars().count() <= 60, "{l:?}");
+        }
+        // The diff saved the new scan, so it is now the newest snapshot.
+        assert_eq!(snapshot::list(&dir, "it").unwrap().len(), 2);
+
+        // --against compares with a chosen file.
+        let mut against = diff_args();
+        against.against = Some(saved);
+        let (d2, _) = diff_profile(&config, &secrets, &against, &dir, None)
+            .await
+            .unwrap();
+        assert_eq!(d2.before_taken_at_unix, first.taken_at_unix);
+        assert_eq!(d2.pattern("audit:{id}").unwrap().cause, Cause::New);
+    }
+}
+
+#[tokio::test]
+async fn hot_keys_with_lfu() {
+    let server = common::redis_with(&["--maxmemory-policy", "allkeys-lfu"]).await;
+    let mut admin = server.admin().await;
+    for i in 0..50 {
+        set(&mut admin, format!("item:{i}"), "x".to_string()).await;
+    }
+    for _ in 0..300 {
+        for i in 0..3 {
+            let _: Option<String> = redis::cmd("GET")
+                .arg(format!("item:{i}"))
+                .query_async(&mut admin)
+                .await
+                .unwrap();
+        }
+    }
+    let config = temp_config(server.port);
+    let (r, perms) = report(&config, &MemoryStore::default(), &scan_args(false), None)
+        .await
+        .unwrap();
+    assert!(!r.hot_keys.is_empty());
+    assert!(r.hot_keys.len() <= 50);
+    assert!(r.hot_keys.iter().all(|k| k.lfu_freq.is_some()));
+    for w in r.hot_keys.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        assert!(
+            a.lfu_freq > b.lfu_freq || (a.lfu_freq == b.lfu_freq && a.key < b.key),
+            "{a:?} before {b:?}"
+        );
+    }
+    assert!(["item:0", "item:1", "item:2"].contains(&r.hot_keys[0].key.as_str()));
+    let table = render_table(&r, &perms, 100);
+    println!("{table}");
+    assert!(table.contains("Hot:     item:"), "{table}");
+}

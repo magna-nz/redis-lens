@@ -42,9 +42,16 @@ impl Default for ScanOptions {
 
 impl ScanOptions {
     /// Defaults for a profile: no command budget for `Local` profiles, 5,000 commands per
-    /// second for everything else. Owner: engine (wave 4); stub.
-    pub fn for_profile(_profile: &crate::model::Profile) -> Self {
-        todo!("ScanOptions::for_profile")
+    /// second for everything else.
+    pub fn for_profile(profile: &crate::model::Profile) -> Self {
+        Self {
+            max_commands_per_sec: if profile.env == crate::model::Env::Local {
+                None
+            } else {
+                Some(5_000)
+            },
+            ..Self::default()
+        }
     }
 }
 
@@ -306,6 +313,21 @@ async fn fetch_batch<C: ConnectionLike + Send>(
     Ok((keys.len() * stride) as u64)
 }
 
+/// How many hot keys a report keeps.
+const HOT_KEY_LIMIT: usize = 50;
+
+/// The sampled keys that have an LFU counter: highest first, ties by key, top 50.
+pub fn hot_keys(samples: &[KeySample]) -> Vec<KeySample> {
+    let mut hot: Vec<KeySample> = samples
+        .iter()
+        .filter(|s| s.lfu_freq.is_some())
+        .cloned()
+        .collect();
+    hot.sort_by(|a, b| b.lfu_freq.cmp(&a.lfu_freq).then_with(|| a.key.cmp(&b.key)));
+    hot.truncate(HOT_KEY_LIMIT);
+    hot
+}
+
 /// Run a full scan: server info, sampling, then [`crate::pattern::aggregate`].
 ///
 /// Uses `perms` to decide whether to ask for sizes and LFU counters.
@@ -350,13 +372,75 @@ pub async fn scan<C: ConnectionLike + Send>(
         sampled_keys: samples.len() as u64,
         patterns: crate::pattern::aggregate(&samples, scale),
         sizes_available: with_sizes,
-        hot_keys: Vec::new(),
+        hot_keys: hot_keys(&samples),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample(key: &str, freq: Option<u8>) -> KeySample {
+        KeySample {
+            key: key.into(),
+            key_type: KeyType::String,
+            bytes: None,
+            ttl: Ttl::Persistent,
+            lfu_freq: freq,
+        }
+    }
+
+    #[test]
+    fn hot_keys_sorted_and_filtered() {
+        let samples = vec![
+            sample("b", Some(5)),
+            sample("none", None),
+            sample("a", Some(5)),
+            sample("z", Some(200)),
+            sample("zero", Some(0)),
+        ];
+        let keys: Vec<_> = hot_keys(&samples).into_iter().map(|s| s.key).collect();
+        assert_eq!(keys, ["z", "a", "b", "zero"]);
+    }
+
+    #[test]
+    fn hot_keys_capped_at_fifty() {
+        let samples: Vec<_> = (0..80)
+            .map(|i| sample(&format!("k{i:02}"), Some(i as u8)))
+            .collect();
+        let hot = hot_keys(&samples);
+        assert_eq!(hot.len(), 50);
+        assert_eq!(hot[0].key, "k79");
+        assert_eq!(hot[49].key, "k30");
+    }
+
+    #[test]
+    fn for_profile_budget() {
+        use crate::model::{Auth, Endpoint, Env, Profile};
+        let mut p = Profile {
+            name: "p".into(),
+            env: Env::Local,
+            endpoint: Endpoint {
+                host: "h".into(),
+                port: 1,
+                tls: false,
+            },
+            db: 0,
+            auth: Auth::None,
+            read_only: None,
+        };
+        assert_eq!(ScanOptions::for_profile(&p).max_commands_per_sec, None);
+        p.env = Env::Prod;
+        assert_eq!(
+            ScanOptions::for_profile(&p).max_commands_per_sec,
+            Some(5_000)
+        );
+        p.env = Env::Other;
+        assert_eq!(
+            ScanOptions::for_profile(&p).max_commands_per_sec,
+            Some(5_000)
+        );
+    }
 
     const REDIS_SERVER: &str = "# Server\r\nredis_version:7.4.2\r\nredis_git_sha1:00000000\r\nredis_mode:standalone\r\nos:Linux 6.6 x86_64\r\nprocess_id:1\r\ntcp_port:6379\r\n";
     const REDIS_MEMORY: &str = "# Memory\r\nused_memory:1084912\r\nused_memory_human:1.03M\r\nmaxmemory:268435456\r\nmaxmemory_human:256.00M\r\nmaxmemory_policy:allkeys-lfu\r\nmem_fragmentation_ratio:9.1\r\n";
