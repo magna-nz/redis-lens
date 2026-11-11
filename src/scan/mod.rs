@@ -155,12 +155,22 @@ impl Limiter {
     /// Record `n` commands just sent and sleep until the average rate is within the limit.
     async fn spent(&mut self, n: u64) {
         self.sent += n;
-        if let Some(rate) = self.per_sec {
-            let due = Duration::from_secs_f64(self.sent as f64 / f64::from(rate));
-            let elapsed = self.start.elapsed();
-            if due > elapsed {
-                tokio::time::sleep(due - elapsed).await;
+        if self.per_sec.is_some() {
+            let wait = self.wait(self.start.elapsed());
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
             }
+        }
+    }
+
+    /// How long to sleep, `elapsed` after the start, so that the commands sent so far
+    /// stay within the budget. Zero when there is no limit.
+    fn wait(&self, elapsed: Duration) -> Duration {
+        match self.per_sec {
+            Some(rate) => {
+                Duration::from_secs_f64(self.sent as f64 / f64::from(rate)).saturating_sub(elapsed)
+            }
+            None => Duration::ZERO,
         }
     }
 }
@@ -753,6 +763,11 @@ mod tests {
             PttlDenied,
         }
 
+        fn type_fate(server: &mut Server, key: &[u8]) -> Option<Fate> {
+            *server.type_calls.entry(key.to_vec()).or_default() += 1;
+            server.fates.get(key).copied()
+        }
+
         pub struct Server {
             pub keys: Vec<(Vec<u8>, Fate)>,
             fates: HashMap<Vec<u8>, Fate>,
@@ -767,6 +782,11 @@ mod tests {
             pub seen_partials: Vec<Option<(u64, u64)>>,
             /// Fail this SCAN call (0-based) with an I/O error.
             pub fail_scan: Option<usize>,
+            /// Make SCAN repeat keys: the first key of each page twice within the page,
+            /// and the last key of the previous page again at the end of each page.
+            pub duplicates: bool,
+            /// How many times each key was sent `TYPE`.
+            pub type_calls: HashMap<Vec<u8>, usize>,
             scans: usize,
         }
 
@@ -782,6 +802,8 @@ mod tests {
                     observer: None,
                     seen_partials: Vec::new(),
                     fail_scan: None,
+                    duplicates: false,
+                    type_calls: HashMap::new(),
                     scans: 0,
                 }
             }
@@ -831,16 +853,24 @@ mod tests {
                         let start: usize = String::from_utf8_lossy(&args[1]).parse().unwrap();
                         let end = (start + self.page).min(self.keys.len());
                         let next = if end >= self.keys.len() { 0 } else { end };
-                        let keys = self.keys[start..end]
-                            .iter()
-                            .map(|(k, _)| Value::BulkString(k.clone()))
+                        let mut page: Vec<&Vec<u8>> =
+                            self.keys[start..end].iter().map(|(k, _)| k).collect();
+                        if self.duplicates && !page.is_empty() {
+                            page.push(page[0]);
+                            if start > 0 {
+                                page.push(&self.keys[start - 1].0);
+                            }
+                        }
+                        let keys = page
+                            .into_iter()
+                            .map(|k| Value::BulkString(k.clone()))
                             .collect();
                         Value::Array(vec![
                             Value::BulkString(next.to_string().into_bytes()),
                             Value::Array(keys),
                         ])
                     }
-                    "TYPE" => match fate() {
+                    "TYPE" => match type_fate(self, &args[1]) {
                         Some(Fate::Present | Fate::Expired | Fate::PttlDenied) => {
                             Value::SimpleString("string".into())
                         }
@@ -935,6 +965,118 @@ mod tests {
                 (format!("{prefix}:{i}").into_bytes(), fate(i))
             })
             .collect()
+    }
+
+    /// A runtime with timers, for the tests that really sleep.
+    fn run_timed<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn limiter_wait_keeps_the_average_rate_within_budget() {
+        // Virtual clock: each command costs nothing, so the limiter sets the pace.
+        for (rate, n) in [(100u32, 1_000u64), (5_000, 20_000), (7, 50)] {
+            let mut l = Limiter::new(Some(rate));
+            let mut now = Duration::ZERO;
+            for _ in 0..n {
+                l.sent += 1;
+                now += l.wait(now);
+            }
+            let min = Duration::from_secs_f64(n as f64 / f64::from(rate));
+            assert!(now >= min, "rate {rate}: {now:?} < {min:?}");
+            // And it does not sleep far longer than needed.
+            assert!(now <= min + Duration::from_millis(1), "{now:?}");
+        }
+        // Batches of commands count in full.
+        let mut l = Limiter::new(Some(10));
+        l.sent += 25;
+        assert_eq!(l.wait(Duration::from_secs(1)), Duration::from_millis(1_500));
+        // Time already spent is not slept again.
+        assert_eq!(l.wait(Duration::from_secs(3)), Duration::ZERO);
+    }
+
+    #[test]
+    fn limiter_without_a_limit_never_waits() {
+        for rate in [None, Some(0)] {
+            let mut l = Limiter::new(rate);
+            l.sent += 1_000_000;
+            assert_eq!(l.wait(Duration::ZERO), Duration::ZERO);
+        }
+        run_timed(async {
+            let mut l = Limiter::new(Some(0));
+            let t0 = Instant::now();
+            for _ in 0..1_000 {
+                l.spent(1_000).await;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(1));
+        });
+    }
+
+    #[test]
+    fn scan_with_a_rate_takes_at_least_commands_over_rate() {
+        let keys = keyspace(120, |_| Fate::Present);
+        let mut server = fake::Server::new(keys, 40);
+        let mut o = opts(1_000, 20);
+        o.max_commands_per_sec = Some(200);
+        let t0 = Instant::now();
+        run_timed(sample_keys_detailed(&mut server, &o, true, false, None)).unwrap();
+        let took = t0.elapsed();
+        let sent = server.log.len() as u64;
+        assert!(sent > 12, "too few commands to mean anything: {sent}");
+        let min = Duration::from_secs_f64(sent as f64 / 200.0);
+        assert!(took >= min, "{sent} commands in {took:?}, budget {min:?}");
+        assert!(!server.log.iter().any(|c| c == "KEYS"));
+    }
+
+    #[test]
+    fn repeated_scan_keys_are_looked_up_once() {
+        let keys = keyspace(300, |_| Fate::Present);
+        let mut server = fake::Server::new(keys.clone(), 50);
+        server.duplicates = true;
+        let o = opts(1_000, 25);
+        let outcome = run(sample_keys_detailed(&mut server, &o, true, false, None)).unwrap();
+        assert!(outcome.complete);
+        assert_eq!(outcome.keys_seen, 300);
+        assert_eq!(outcome.samples.len(), 300);
+        assert_eq!(outcome.keys_present(), 300);
+        assert_eq!(server.type_calls.len(), 300);
+        assert!(server.type_calls.values().all(|n| *n == 1));
+        let mut got: Vec<_> = outcome.samples.iter().map(|s| s.key.clone()).collect();
+        got.sort();
+        got.dedup();
+        assert_eq!(got.len(), 300);
+
+        // Counts are not inflated.
+        let mut server = fake::Server::new(keys, 50);
+        server.duplicates = true;
+        let report = run(scan("t", &mut server, &o, &perms_all(), None)).unwrap();
+        assert_eq!(report.sampled_keys, 300);
+        assert_eq!(est_total(&report), 300);
+    }
+
+    #[test]
+    fn repeated_scan_keys_do_not_skew_the_scale_estimate() {
+        // 1,000 keys, 100 distinct keys sampled: the denominator is 100, not the
+        // number of keys SCAN returned, so the estimate is the whole keyspace.
+        let keys = keyspace(1_000, |_| Fate::Present);
+        let mut server = fake::Server::new(keys, 30);
+        server.duplicates = true;
+        let o = opts(100, 10);
+        let outcome = run(sample_keys_detailed(&mut server, &o, true, false, None)).unwrap();
+        assert_eq!(outcome.keys_seen, 100);
+        assert_eq!(outcome.samples.len(), 100);
+        assert!(server.type_calls.values().all(|n| *n == 1));
+
+        let mut server = fake::Server::new(server.keys, 30);
+        server.duplicates = true;
+        let report = run(scan("t", &mut server, &o, &perms_all(), None)).unwrap();
+        assert_eq!(report.sampled_keys, 100);
+        let est = est_total(&report);
+        assert!(est.abs_diff(1_000) <= 2, "est {est}");
     }
 
     #[test]

@@ -437,6 +437,27 @@ mod tests {
     }
 
     #[test]
+    fn diff_max_rate_flag_reaches_the_scan_options() {
+        use crate::cli::scan::{profile_in, scan_options};
+        use crate::model::Env;
+        use clap::Parser;
+        let rate = |env, extra: &[&str]| {
+            let mut argv = vec!["redis-lens", "diff", "p"];
+            argv.extend_from_slice(extra);
+            let args = match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+                Some(crate::cli::Command::Diff(a)) => a,
+                other => panic!("not diff: {other:?}"),
+            };
+            // The same call `diff_profile` makes for its scan.
+            scan_options(&profile_in(env), 100_000, None, args.max_rate).max_commands_per_sec
+        };
+        assert_eq!(rate(Env::Prod, &["--max-rate", "250"]), Some(250));
+        assert_eq!(rate(Env::Prod, &["--max-rate", "0"]), None);
+        assert_eq!(rate(Env::Prod, &[]), Some(5_000));
+        assert_eq!(rate(Env::Local, &[]), None);
+    }
+
+    #[test]
     fn missing_snapshot_message() {
         assert_eq!(
             no_snapshot("prod").to_string(),
