@@ -936,7 +936,7 @@ mod tests {
                 "keep {keep}: the snapshot just saved is gone"
             );
             assert!(left.contains(&(now + 300 * DAY)) && left.contains(&(now + 200 * DAY)));
-            assert_eq!(left.len(), 2 + keep as usize, "keep {keep}");
+            assert_eq!(left.len(), 2 + keep, "keep {keep}");
             // `snapshots prune` uses the same plan.
             assert!(retention_plan(&dir, "p", r, now).unwrap().is_empty());
             let _ = std::fs::remove_dir_all(&dir);
