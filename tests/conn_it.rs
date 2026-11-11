@@ -327,7 +327,13 @@ async fn conn_add_keeps_credentials_out_of_the_config_file() {
 // Auth probe used by `discover`
 // ---------------------------------------------------------------------------
 
-use redis_lens::conn::docker::{DiscoveredAuth, probe_auth};
+use redis_lens::conn::docker::{DiscoveredAuth, probe_auth_within};
+
+/// The probe with a timeout that a busy machine running many containers still meets
+/// (discovery itself uses 1 s).
+async fn probe_auth(ep: &Endpoint) -> DiscoveredAuth {
+    probe_auth_within(ep, std::time::Duration::from_secs(5)).await
+}
 
 fn endpoint(port: u16) -> Endpoint {
     Endpoint {
@@ -390,6 +396,51 @@ async fn probe_needs_only_ping() {
             probe_auth(&endpoint(server.port)).await,
             DiscoveredAuth::None,
             "valkey={valkey}"
+        );
+    }
+}
+
+/// The probe sends `PING` and nothing else: no `AUTH`, `HELLO`, `CLIENT SETINFO` or
+/// `SELECT`. Counted by the server itself after `CONFIG RESETSTAT` (test setup).
+#[tokio::test]
+async fn probe_sends_only_ping() {
+    for valkey in [false, true] {
+        let server = common::server_with(valkey, &[]).await;
+        let mut admin = server.admin().await;
+        let _: () = redis::cmd("CONFIG")
+            .arg("RESETSTAT")
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        assert_eq!(
+            probe_auth(&endpoint(server.port)).await,
+            DiscoveredAuth::None,
+            "valkey={valkey}"
+        );
+        let stats: String = redis::cmd("INFO")
+            .arg("commandstats")
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        let names: Vec<(&str, &str)> = stats
+            .lines()
+            .filter_map(|l| l.strip_prefix("cmdstat_"))
+            .filter_map(|l| l.split_once(':'))
+            .collect();
+        for (name, _) in &names {
+            assert!(
+                ["ping", "info", "config|resetstat", "config"].contains(name),
+                "valkey={valkey}: the probe (or something) sent {name}: {stats}"
+            );
+        }
+        let ping = names
+            .iter()
+            .find(|(n, _)| *n == "ping")
+            .unwrap_or_else(|| panic!("valkey={valkey}: no PING counted: {stats}"));
+        assert!(
+            ping.1.starts_with("calls=1,"),
+            "valkey={valkey}: {}",
+            ping.1
         );
     }
 }
@@ -477,19 +528,27 @@ async fn conn_test_reports_success_and_permissions() {
 
 #[tokio::test]
 async fn conn_test_reports_denied_commands() {
-    let server = common::redis_with(&lens_args(Some("+memory|usage"), &[])).await;
-    seed(&server).await;
-    let secrets = MemoryStore::default();
-    let p = profile("limited", server.port, Auth::Keychain);
-    secrets
-        .set(&p.secret_ref(), &creds(Some("lens"), "lens-pw"))
-        .unwrap();
-    let path = temp_config("test-denied");
-    save_profile(&path, &p);
-    let out = cli_conn::test(&path, &secrets, "limited").await.unwrap();
-    assert!(out.contains(&format!("✗ {PERM_MEMORY}")), "{out}");
-    assert!(out.contains(&format!("✓ {PERM_SCAN}")), "{out}");
-    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    for valkey in [false, true] {
+        let server = common::server_with(valkey, &lens_args(Some("+memory|usage"), &[])).await;
+        seed(&server).await;
+        let secrets = MemoryStore::default();
+        let p = profile("limited", server.port, Auth::Keychain);
+        secrets
+            .set(&p.secret_ref(), &creds(Some("lens"), "lens-pw"))
+            .unwrap();
+        let path = temp_config(&format!("test-denied-{valkey}"));
+        save_profile(&path, &p);
+        let out = cli_conn::test(&path, &secrets, "limited").await.unwrap();
+        assert!(
+            out.contains(&format!("✗ {PERM_MEMORY}")),
+            "valkey={valkey}: {out}"
+        );
+        assert!(
+            out.contains(&format!("✓ {PERM_SCAN}")),
+            "valkey={valkey}: {out}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }
 
 #[tokio::test]

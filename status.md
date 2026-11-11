@@ -47,7 +47,16 @@ Integration branch `wave7/fixes` (worktree `.claude/worktrees/wave7`, from main 
 | C | Bundled roots as an explicit store from `webpki-root-certs` 1.0.9; Windows trusts the OS store plus the bundle (N4); D2 (exact store sizes, Cargo.lock pin on redis 1.8.1), D3 (bundle non-empty, holds ISRG Root X1), D4 reduced to one fallback; `tests/os_trust.rs` plus a CI step that installs a throwaway CA in the OS store on macOS, Windows and Ubuntu | implementer [opus] | `wave7/tls` | **done** (2a4196c), merged. The CI trust-store step runs for the first time on the PR |
 | D | Limiter pacing (virtual clock, plus a rate lower bound over the fake), `--max-rate` into `ScanOptions` for `scan` and `diff`, SCAN deduplication | implementer [sonnet] | `wave7/scan` | **done** (21e8dbb), merged |
 | M | Selected row's overflowing text scrolls across (`ui::widgets::marquee`), restarted on selection change; narrow-width test. Owner-approved after the horizontal-scroll finding | implementer [sonnet] | `wave7/marquee` | **done** (fd51556), merged; 301 unit tests |
-| V | Verifier on the merged `wave7/fixes` | verifier [opus] | pinned detached worktree | pending |
+| V | Verifier on the merged `wave7/fixes` | verifier [opus] | pinned detached worktree at 208156d | **BLOCKED** on B1, fixed in round 1 (below); round 2 pending |
+
+**Verifier round 1 (BLOCKED, report `.claude/worktrees/w7-verify-report.md`), and the fixes:**
+- B1: `webpki-root-certs` loses Mozilla's name constraints, so the TUBITAK root (limited to `.tr` in `webpki-roots`) would have vouched for any host name: on every Windows machine, and elsewhere when the OS store is empty. Fixed: the bundle is the certificates whose anchor is in `webpki-roots` with no name constraint (`webpki-roots` is now a direct dependency); `conn::tls::tests::the_bundle_is_webpki_roots_without_the_name_constrained_roots`, `unlisted_certificates_are_not_bundled`.
+- CI: on Linux cargo sets `SSL_CERT_FILE` for the processes it starts (openssl-probe), so `tests/os_trust.rs` refused to run in `unit tests (ubuntu-latest)`. Each test now re-runs itself in a child without `SSL_CERT_FILE`/`SSL_CERT_DIR`. macOS (System keychain) and Windows (Root store) installed the CA and passed on the first CI run.
+- `--max-rate` was only tested by rebuilding the options: `diff_it::max_rate_paces_scan_and_diff` now runs `scan` and `diff` through the CLI entry points on a `local` profile and checks they take at least commands / N (Redis and Valkey); dropping the flag at the call site fails it.
+- "Only `PING`" rested on reading the code: `conn_it::probe_sends_only_ping` counts commands on the server after `CONFIG RESETSTAT`; making the probe send `CLIENT SETINFO` fails it.
+- The probe ITs use a 5 s timeout (`probe_auth_within`), after one `Unknown` in 17 runs on a loaded machine; discovery keeps 1 s.
+- `conn_test_reports_denied_commands` now runs on Valkey too.
+- Not changed (noted): the keychain worker's panic message would print to stderr under the TUI; probes run one container at a time (an unreachable one adds up to 1 s); `replica_it` failed once on container start-up timeouts (unchanged code, passed on re-runs).
 
 **Test gaps from wave 6, and where each is covered now:**
 - D1 partial denominator: `scan::tests::partial_denominator_leaves_out_pending_and_vanished_keys` (wave 6).

@@ -54,8 +54,10 @@ rustls = { version = "0.23.46", default-features = false, features = ["std"] }
 rustls-native-certs = "0.8.5"
 # The bundled roots as full certificates (webpki-roots only has trust anchors, and
 # redis-rs takes custom roots only as PEM). Same CCADB data and version as the
-# webpki-roots that redis-rs pulls in.
+# webpki-roots that redis-rs pulls in. webpki-roots is used to leave out the roots it
+# limits with name constraints, which a certificate cannot carry (src/conn/tls.rs).
 webpki-root-certs = "1.0.9"
+webpki-roots = "1.0.9"
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"

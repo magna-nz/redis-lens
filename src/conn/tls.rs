@@ -5,9 +5,12 @@
 //! replace it when set). Certificates or files that fail to load are skipped rather
 //! than failing the connection.
 //!
-//! The bundled roots are Mozilla's, through the CCADB (`webpki-root-certs`, the same
-//! data as the webpki-roots that redis-rs ships). How they combine with the OS store
-//! depends on the platform ([`Platform`]):
+//! The bundled roots are Mozilla's, through the CCADB: the certificates in
+//! `webpki-root-certs` whose trust anchor is in `webpki-roots` (the set redis-rs ships)
+//! with no name constraint. A certificate cannot carry Mozilla's name constraints (they
+//! are metadata in `webpki-roots`), so a constrained root, such as one limited to `.tr`
+//! names, would trust any host name as a plain certificate and is left out. How the
+//! bundled roots combine with the OS store depends on the platform ([`Platform`]):
 //!
 //! - **macOS and Linux:** the OS store on its own. Only when it yields no usable
 //!   certificate at all (a slim container without `ca-certificates`, say) are the
@@ -30,9 +33,36 @@ use redis::{ConnectionAddr, TlsCertificates};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 
-/// The bundled roots, as certificates.
+/// The bundled roots, as certificates: those of `webpki-root-certs` whose trust anchor
+/// is in `webpki-roots` without a name constraint (see the module docs).
 fn bundled_certs() -> &'static [CertificateDer<'static>] {
-    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+    static BUNDLED: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
+    BUNDLED.get_or_init(|| unconstrained(webpki_root_certs::TLS_SERVER_ROOT_CERTS))
+}
+
+/// The certificates of `certs` whose trust anchor (subject and key) is in
+/// `webpki_roots::TLS_SERVER_ROOTS` with no name constraint. Certificates rustls refuses,
+/// or that `webpki-roots` does not list, are left out too.
+fn unconstrained(certs: &[CertificateDer<'static>]) -> Vec<CertificateDer<'static>> {
+    certs
+        .iter()
+        .filter(|cert| {
+            let mut one = RootCertStore::empty();
+            if one.add((*cert).clone()).is_err() {
+                return false;
+            }
+            let Some(anchor) = one.roots.first() else {
+                return false;
+            };
+            webpki_roots::TLS_SERVER_ROOTS.iter().any(|known| {
+                known.subject.as_ref() == anchor.subject.as_ref()
+                    && known.subject_public_key_info.as_ref()
+                        == anchor.subject_public_key_info.as_ref()
+                    && known.name_constraints.is_none()
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 /// How the OS store and the bundled roots combine.
@@ -492,7 +522,6 @@ mod tests {
     fn the_bundle_is_the_crate_set_and_holds_isrg_root_x1() {
         let certs = bundled_certs();
         assert!(certs.len() > 100, "only {} bundled roots", certs.len());
-        assert_eq!(certs, webpki_root_certs::TLS_SERVER_ROOT_CERTS);
         let mut store = RootCertStore::empty();
         for cert in certs {
             store
@@ -510,6 +539,58 @@ mod tests {
             isrg.is_some(),
             "ISRG Root X1 is not among the bundled roots"
         );
+    }
+
+    /// The bundle is exactly the unconstrained part of webpki-roots: every bundled anchor
+    /// is listed there without a name constraint, every unconstrained webpki-roots anchor
+    /// is bundled, and no constrained one is (a certificate would drop the constraint).
+    #[test]
+    fn the_bundle_is_webpki_roots_without_the_name_constrained_roots() {
+        let mut store = RootCertStore::empty();
+        for cert in bundled_certs() {
+            store.add(cert.clone()).unwrap();
+        }
+        let key = |subject: &[u8], spki: &[u8]| (subject.to_vec(), spki.to_vec());
+        let bundled: HashSet<_> = store
+            .roots
+            .iter()
+            .map(|a| key(a.subject.as_ref(), a.subject_public_key_info.as_ref()))
+            .collect();
+        let (constrained, free): (Vec<_>, Vec<_>) = webpki_roots::TLS_SERVER_ROOTS
+            .iter()
+            .partition(|a| a.name_constraints.is_some());
+        let free: HashSet<_> = free
+            .iter()
+            .map(|a| key(a.subject.as_ref(), a.subject_public_key_info.as_ref()))
+            .collect();
+        assert_eq!(bundled, free);
+        assert!(
+            !constrained.is_empty(),
+            "webpki-roots has no constrained root to check"
+        );
+        for a in &constrained {
+            let k = key(a.subject.as_ref(), a.subject_public_key_info.as_ref());
+            assert!(!bundled.contains(&k), "a name-constrained root is bundled");
+        }
+        let tubitak = |subject: &[u8]| {
+            subject
+                .windows(b"TUBITAK Kamu SM SSL Kok".len())
+                .any(|w| w == b"TUBITAK Kamu SM SSL Kok")
+        };
+        assert!(constrained.iter().any(|a| tubitak(a.subject.as_ref())));
+        assert!(!bundled.iter().any(|(subject, _)| tubitak(subject)));
+        // Fewer certificates than the crate ships: the constrained ones are out.
+        assert_eq!(
+            bundled_certs().len(),
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS.len() - constrained.len()
+        );
+    }
+
+    /// A certificate that webpki-roots does not list, or lists with a name constraint,
+    /// is not bundled.
+    #[test]
+    fn unlisted_certificates_are_not_bundled() {
+        assert!(unconstrained(&[ca_cert("not-in-webpki-roots")]).is_empty());
     }
 
     /// redis-rs replaces its default store with the one in `tls_params` in 1.8.1. The

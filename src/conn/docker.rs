@@ -34,7 +34,13 @@ pub fn classify_probe(r: &Result<String, ConnError>) -> DiscoveredAuth {
 
 /// Probe `ep` with `PING` and no credentials, and classify the result.
 pub async fn probe_auth(ep: &Endpoint) -> DiscoveredAuth {
-    classify_probe(&super::ping_without_credentials(ep, PROBE_TIMEOUT).await)
+    probe_auth_within(ep, PROBE_TIMEOUT).await
+}
+
+/// [`probe_auth`] with its own timeout (tests use a longer one, so a loaded machine
+/// doesn't turn an answer into `Unknown`).
+pub async fn probe_auth_within(ep: &Endpoint, timeout: std::time::Duration) -> DiscoveredAuth {
+    classify_probe(&super::ping_without_credentials(ep, timeout).await)
 }
 
 /// What discovery could tell about a container's authentication.

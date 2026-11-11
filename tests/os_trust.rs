@@ -10,9 +10,10 @@
 //!
 //! Without `REDIS_LENS_OS_TRUST_CA` the tests return early with a note, so a plain
 //! `cargo test` never needs the OS store changed. `SSL_CERT_FILE` / `SSL_CERT_DIR`
-//! replace the OS store, so they must not be set; to check the test body itself without
-//! touching the OS store, point `SSL_CERT_FILE` at the CA and set
-//! `REDIS_LENS_OS_TRUST_VIA_CERT_FILE=1`.
+//! replace the OS store, and on Linux cargo sets them for every process it starts
+//! (through openssl-probe), so each test re-runs itself in a child process without them.
+//! To check the test body itself without touching the OS store, point `SSL_CERT_FILE` at
+//! the CA and set `REDIS_LENS_OS_TRUST_VIA_CERT_FILE=1`.
 //!
 //! Not Docker-gated: it runs in the unit test job on every OS.
 
@@ -30,6 +31,42 @@ use tokio::net::TcpListener;
 const CA_ENV: &str = "REDIS_LENS_OS_TRUST_CA";
 const KEY_ENV: &str = "REDIS_LENS_OS_TRUST_CA_KEY";
 const VIA_CERT_FILE_ENV: &str = "REDIS_LENS_OS_TRUST_VIA_CERT_FILE";
+/// Set in the child process that [`rerun_without_cert_env`] starts.
+const CHILD_ENV: &str = "REDIS_LENS_OS_TRUST_CHILD";
+
+/// Re-run test `name` in a child process without `SSL_CERT_FILE` and `SSL_CERT_DIR`, when
+/// either is set and the test would run (cargo sets them on Linux, and they would replace
+/// the OS store under test). Returns true when the child ran it and passed, so the caller
+/// returns; false when the test should run here.
+fn rerun_without_cert_env(name: &str) -> bool {
+    let set = ["SSL_CERT_FILE", "SSL_CERT_DIR"]
+        .iter()
+        .any(|v| std::env::var_os(v).is_some());
+    if !set
+        || std::env::var_os(CA_ENV).is_none()
+        || std::env::var_os(VIA_CERT_FILE_ENV).is_some()
+        || std::env::var_os(CHILD_ENV).is_some()
+    {
+        return false;
+    }
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([name, "--exact", "--nocapture", "--test-threads", "1"])
+        .env(CHILD_ENV, "1")
+        .env_remove("SSL_CERT_FILE")
+        .env_remove("SSL_CERT_DIR")
+        .output()
+        .expect("run the test in a child process");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    print!("{stdout}");
+    eprint!("{stderr}");
+    assert!(out.status.success(), "child process failed: {}", out.status);
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "the child did not run `{name}`"
+    );
+    true
+}
 
 /// The installed CA, as an issuer, or `None` (after printing why) when the test is not
 /// set up.
@@ -178,6 +215,9 @@ fn profile(port: u16) -> Profile {
 
 #[tokio::test]
 async fn a_server_signed_by_the_installed_ca_is_trusted() {
+    if rerun_without_cert_env("a_server_signed_by_the_installed_ca_is_trusted") {
+        return;
+    }
     let Some(ca) = installed_ca() else { return };
     let (cert, key) = leaf(&ca);
     let port = serve(cert, key).await;
@@ -192,6 +232,9 @@ async fn a_server_signed_by_the_installed_ca_is_trusted() {
 
 #[tokio::test]
 async fn a_server_signed_by_a_ca_not_installed_is_refused() {
+    if rerun_without_cert_env("a_server_signed_by_a_ca_not_installed_is_refused") {
+        return;
+    }
     if installed_ca().is_none() {
         return;
     }
