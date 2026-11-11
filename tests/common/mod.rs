@@ -1,6 +1,9 @@
 //! Helpers for integration tests: start throwaway Redis and Valkey containers.
 #![allow(dead_code)]
 
+pub mod cluster;
+pub mod ssh;
+
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, CopyTargetOptions, GenericImage, ImageExt};

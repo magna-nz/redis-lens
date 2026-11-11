@@ -196,6 +196,7 @@ mod tests {
             bytes: Some(bytes),
             ttl: Ttl::Persistent,
             lfu_freq: Some(freq),
+            node: None,
         }
     }
 

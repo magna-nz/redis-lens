@@ -292,6 +292,7 @@ pub async fn add_confirmed(
         prefer_replica: args.prefer_replica,
         provider,
         token_command,
+        ssh: None,
     };
 
     let r = profile.secret_ref();
@@ -506,6 +507,9 @@ mod tests {
             provider: None,
             token_command: Vec::new(),
             yes: false,
+            ssh: None,
+            ssh_identity: None,
+            ssh_known_hosts: None,
         }
     }
 
@@ -1172,6 +1176,7 @@ mod tests {
                 prefer_replica: false,
                 provider: None,
                 token_command: None,
+                ssh: None,
             },
             credentials: Some(Credentials {
                 username: None,

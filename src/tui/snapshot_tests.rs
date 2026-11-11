@@ -64,7 +64,7 @@ fn scanned_with(report: ScanReport, perms: PermissionReport) -> (App, ConnId) {
     app.apply(Msg::ScanDone {
         id,
         scan: scan_of(&app),
-        report,
+        report: Box::new(report),
     });
     (app, id)
 }

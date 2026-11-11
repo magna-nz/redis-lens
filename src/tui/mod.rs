@@ -436,7 +436,11 @@ where
     send(
         &tx,
         match result {
-            Ok(report) => Msg::ScanDone { id, scan, report },
+            Ok(report) => Msg::ScanDone {
+                id,
+                scan,
+                report: Box::new(report),
+            },
             Err(error) => Msg::ScanFailed { id, scan, error },
         },
     );
@@ -571,6 +575,7 @@ mod tests {
             prefer_replica: false,
             provider: None,
             token_command: None,
+            ssh: None,
         }
     }
 
@@ -772,7 +777,7 @@ mod tests {
             panic!("expected ScanDone last, got {last:?}");
         };
         assert_eq!((id, scan), (3, 30));
-        assert_eq!(r, report);
+        assert_eq!(*r, report);
     }
 
     #[tokio::test]

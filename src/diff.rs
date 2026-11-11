@@ -514,6 +514,7 @@ mod tests {
             complete: false,
             match_glob: None,
             server_context: None,
+            nodes: None,
         }
     }
 

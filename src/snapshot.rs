@@ -611,6 +611,7 @@ mod tests {
             complete: true,
             match_glob: None,
             server_context: None,
+            nodes: None,
         }
     }
 

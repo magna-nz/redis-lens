@@ -202,6 +202,18 @@ pub struct ConnAddArgs {
     /// Save a token command without asking first.
     #[arg(long)]
     pub yes: bool,
+    /// Reach the server, and its cluster nodes and replicas, through an SSH bastion:
+    /// `[USER@]HOST[:PORT]`, or a `Host` alias from ~/.ssh/config. Uses the system ssh
+    /// with strict host-key checking; the username goes to the OS keychain.
+    #[arg(long, value_name = "[USER@]HOST[:PORT]")]
+    pub ssh: Option<String>,
+    /// A private key file for the SSH bastion (ssh -i). An encrypted key must be loaded
+    /// in the SSH agent: redis-lens never asks for a passphrase.
+    #[arg(long, requires = "ssh", value_name = "FILE")]
+    pub ssh_identity: Option<std::path::PathBuf>,
+    /// A known_hosts file to check the bastion's host key against, instead of ssh's own.
+    #[arg(long, requires = "ssh", value_name = "FILE")]
+    pub ssh_known_hosts: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

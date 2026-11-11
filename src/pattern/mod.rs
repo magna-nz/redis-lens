@@ -332,6 +332,7 @@ mod tests {
             bytes,
             ttl,
             lfu_freq: None,
+            node: None,
         }
     }
 

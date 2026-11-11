@@ -217,6 +217,7 @@ pub(crate) mod fixtures {
                     bytes,
                     ttl: Ttl::Persistent,
                     lfu_freq: None,
+                    node: None,
                 })
                 .collect(),
         }
@@ -242,6 +243,7 @@ pub(crate) mod fixtures {
             complete: true,
             match_glob: None,
             server_context: None,
+            nodes: None,
         }
     }
 

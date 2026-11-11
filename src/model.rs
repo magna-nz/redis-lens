@@ -107,6 +107,10 @@ pub struct KeySample {
     pub ttl: Ttl,
     /// `OBJECT FREQ` (LFU log counter, 0-255). `None` unless the eviction policy is LFU.
     pub lfu_freq: Option<u8>,
+    /// On a cluster scan, the index into [`ScanReport::nodes`] of the node the key was
+    /// sampled on. `None` on a standalone scan, and in snapshots written before v0.3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<u16>,
 }
 
 /// Statistics for one inferred key pattern.
@@ -218,6 +222,66 @@ pub struct ScanReport {
     /// set beside the sampled estimates. `None` in snapshots written before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_context: Option<ServerContext>,
+    /// On a cluster scan, one entry per shard, in slot order: the node that was
+    /// scanned for it and that node's own results. `None` on a standalone scan and in
+    /// snapshots written before v0.3. On a cluster scan the report's other fields hold
+    /// the merged results: `server` is the seed node's flavor, version and policy with
+    /// `used_memory`, `maxmemory` and `total_keys` summed over the shards, `patterns`
+    /// are merged over the shards (estimates summed), and `complete` is true only when
+    /// every shard was seen completely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nodes: Option<Vec<NodeReport>>,
+}
+
+/// What was scanned for one shard of a cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeRole {
+    Primary,
+    Replica,
+}
+
+/// How far a shard's scan got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeStatus {
+    /// Scanned to the end (the sample limit or the end of the keyspace).
+    Scanned,
+    /// Some results, but the scan of this node stopped early (an error mid-scan).
+    Partial,
+    /// No results for this shard: unreachable, refused, or failed before sampling.
+    Failed,
+}
+
+/// One shard of a cluster scan: the node scanned for it and its own results.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeReport {
+    /// The cluster node ID (`CLUSTER SHARDS` / `CLUSTER SLOTS`) of the node scanned.
+    pub id: String,
+    /// The address the node was scanned at, as the cluster announced it (behind an SSH
+    /// tunnel, the announced address, never the local forward). Never holds credentials.
+    pub endpoint: Endpoint,
+    /// Whether the shard's primary or one of its replicas was scanned.
+    pub role: NodeRole,
+    /// The node ID of the shard's primary; equal to `id` when `role` is `Primary`.
+    pub primary_id: String,
+    /// The slot ranges the shard serves, inclusive, in ascending order.
+    pub slots: Vec<(u16, u16)>,
+    /// `INFO` and `DBSIZE` of the node scanned. `None` when it could not be read.
+    pub server: Option<ServerInfo>,
+    pub status: NodeStatus,
+    /// Why the status is not `Scanned`, or why a replica was wanted but the primary was
+    /// scanned. Fixed text written by redis-lens, never a server's error text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub sampled_keys: u64,
+    /// The same as [`ScanReport::complete`], for this node alone.
+    pub complete: bool,
+    /// The same as [`ScanReport::sizes_available`], for this node alone.
+    pub sizes_available: bool,
+    /// This node's patterns, estimated for this node alone and sorted like
+    /// [`ScanReport::patterns`]. `examples` is left empty (the merged rows hold them).
+    pub patterns: Vec<PatternStats>,
 }
 
 /// Exact figures the server reports about itself: a [`ServerContextParts`], boxed so a
@@ -444,6 +508,30 @@ pub struct Profile {
     /// whose standard output is the token. Not a secret; the token it prints is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_command: Option<Vec<String>>,
+    /// Reach the server (and its cluster nodes and replicas) through an SSH bastion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshTunnel>,
+}
+
+/// An SSH bastion that a profile's connections go through, with the system `ssh`
+/// (`ssh -N -L`, `BatchMode=yes`, `StrictHostKeyChecking=yes`). Nothing secret lives
+/// here: the SSH username, when given, is in the OS keychain under
+/// [`Profile::ssh_secret_ref`], and key passphrases are never handled (an encrypted key
+/// must be loaded in the SSH agent).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshTunnel {
+    /// The bastion's host name or address, or a `Host` alias from `~/.ssh/config`.
+    pub host: String,
+    /// The bastion's SSH port. `None` leaves it to ssh (its config, else 22).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// A private key file for `ssh -i`. `None` leaves it to ssh (its config, the agent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<std::path::PathBuf>,
+    /// A known_hosts file to check the bastion's host key against, instead of ssh's
+    /// own (`UserKnownHostsFile`). Host keys are always checked strictly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_hosts_file: Option<std::path::PathBuf>,
 }
 
 /// Service name for every keychain entry this tool creates.
@@ -455,6 +543,16 @@ impl Profile {
         SecretRef {
             service: SECRET_SERVICE.to_string(),
             account: format!("profile:{}", self.name),
+        }
+    }
+
+    /// Where this profile's SSH username lives in the OS keychain (as the `username`
+    /// of a [`Credentials`] with an empty password). A different prefix from
+    /// [`Self::secret_ref`], so no profile name can make the two collide.
+    pub fn ssh_secret_ref(&self) -> SecretRef {
+        SecretRef {
+            service: SECRET_SERVICE.to_string(),
+            account: format!("ssh:profile:{}", self.name),
         }
     }
 
@@ -600,6 +698,7 @@ mod tests {
             prefer_replica: false,
             provider: None,
             token_command: None,
+            ssh: None,
         };
         assert!(p.is_read_only());
         p.env = Env::Local;
@@ -644,10 +743,118 @@ mod tests {
             prefer_replica: false,
             provider: None,
             token_command: None,
+            ssh: None,
         };
         let text = toml::to_string(&p).unwrap();
         for word in ["password", "username", "user", "secret", "token"] {
             assert!(!text.contains(word), "{word} in {text}");
         }
+    }
+
+    #[test]
+    fn ssh_secret_ref_never_collides_with_a_profile_entry() {
+        let mut p = Profile {
+            name: "a".into(),
+            env: Env::Other,
+            endpoint: Endpoint {
+                host: "h".into(),
+                port: 6379,
+                tls: false,
+            },
+            db: 0,
+            auth: Auth::None,
+            read_only: None,
+            prefer_replica: false,
+            provider: None,
+            token_command: None,
+            ssh: None,
+        };
+        let ssh = p.ssh_secret_ref();
+        assert_eq!(ssh.service, SECRET_SERVICE);
+        assert_eq!(ssh.account, "ssh:profile:a");
+        // No profile name gives a `profile:` entry equal to another's `ssh:` entry.
+        p.name = "ssh:profile:a".into();
+        assert!(!p.secret_ref().account.starts_with("ssh:"));
+    }
+
+    #[test]
+    fn ssh_tunnel_is_absent_from_toml_unless_set_and_holds_no_user() {
+        let mut p = Profile {
+            name: "bastioned".into(),
+            env: Env::Prod,
+            endpoint: Endpoint {
+                host: "10.0.0.5".into(),
+                port: 6379,
+                tls: false,
+            },
+            db: 0,
+            auth: Auth::None,
+            read_only: None,
+            prefer_replica: false,
+            provider: None,
+            token_command: None,
+            ssh: None,
+        };
+        assert!(!toml::to_string(&p).unwrap().contains("ssh"));
+        p.ssh = Some(SshTunnel {
+            host: "bastion.example.com".into(),
+            port: Some(2222),
+            identity_file: None,
+            known_hosts_file: Some("/tmp/kh".into()),
+        });
+        let text = toml::to_string(&p).unwrap();
+        assert!(text.contains("bastion.example.com"), "{text}");
+        assert!(!text.contains("identity_file"), "{text}");
+        for word in ["password", "username", "user", "secret", "passphrase"] {
+            assert!(!text.contains(word), "{word} in {text}");
+        }
+        let back: Profile = toml::from_str(&text).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn reports_without_nodes_still_load_and_nodes_round_trip() {
+        let sample = KeySample {
+            key: "k".into(),
+            key_type: KeyType::String,
+            bytes: Some(10),
+            ttl: Ttl::Persistent,
+            lfu_freq: Some(3),
+            node: None,
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert!(!json.contains("node"), "{json}");
+        let old: KeySample = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.node, None);
+        let on_node = KeySample {
+            node: Some(2),
+            ..sample
+        };
+        let back: KeySample =
+            serde_json::from_str(&serde_json::to_string(&on_node).unwrap()).unwrap();
+        assert_eq!(back.node, Some(2));
+
+        let node = NodeReport {
+            id: "a".repeat(40),
+            endpoint: Endpoint {
+                host: "10.0.0.7".into(),
+                port: 7000,
+                tls: false,
+            },
+            role: NodeRole::Replica,
+            primary_id: "b".repeat(40),
+            slots: vec![(0, 5460)],
+            server: None,
+            status: NodeStatus::Failed,
+            note: Some("unreachable".into()),
+            sampled_keys: 0,
+            complete: false,
+            sizes_available: false,
+            patterns: Vec::new(),
+        };
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains(r#""role":"replica""#), "{json}");
+        assert!(json.contains(r#""status":"failed""#), "{json}");
+        assert_eq!(serde_json::from_str::<NodeReport>(&json).unwrap(), node);
     }
 }

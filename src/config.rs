@@ -160,6 +160,7 @@ mod tests {
             prefer_replica: false,
             provider: None,
             token_command: None,
+            ssh: None,
         }
     }
 

@@ -2,6 +2,7 @@
 //!
 //! Owner: scanner.
 
+pub mod cluster;
 pub mod context;
 
 use std::collections::HashSet;
@@ -438,6 +439,7 @@ async fn fetch_batch<C: ConnectionLike + Send>(
             bytes,
             ttl,
             lfu_freq,
+            node: None,
         });
     }
     Ok(BatchOutcome {
@@ -658,6 +660,7 @@ pub async fn scan_with_partial<C: ConnectionLike + Send>(
         complete,
         match_glob: opts.match_glob.clone(),
         server_context: Some(server_context),
+        nodes: None,
     })
 }
 
@@ -672,6 +675,7 @@ mod tests {
             bytes: None,
             ttl: Ttl::Persistent,
             lfu_freq: freq,
+            node: None,
         }
     }
 
@@ -717,6 +721,7 @@ mod tests {
             prefer_replica: false,
             provider: None,
             token_command: None,
+            ssh: None,
         };
         assert_eq!(ScanOptions::for_profile(&p).max_commands_per_sec, None);
         p.env = Env::Prod;
@@ -751,6 +756,7 @@ mod tests {
             prefer_replica: false,
             provider: Some(Provider::ElasticacheServerless),
             token_command: None,
+            ssh: None,
         };
         for env in [Env::Prod, Env::Stage, Env::Other, Env::Local] {
             p.env = env;

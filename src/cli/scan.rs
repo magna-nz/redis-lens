@@ -139,6 +139,7 @@ pub(crate) fn profile_in(env: crate::model::Env) -> Profile {
         prefer_replica: false,
         provider: None,
         token_command: None,
+        ssh: None,
     }
 }
 
@@ -610,6 +611,7 @@ mod tests {
             complete: false,
             match_glob: None,
             server_context: None,
+            nodes: None,
         }
     }
 
@@ -770,6 +772,7 @@ mod tests {
                 bytes: None,
                 ttl: crate::model::Ttl::Persistent,
                 lfu_freq: Some(200 - i),
+                node: None,
             })
             .collect();
         let t = render_table(&r, &perms(), 100);

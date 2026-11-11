@@ -206,7 +206,7 @@ pub enum Msg {
     ScanDone {
         id: ConnId,
         scan: ScanId,
-        report: ScanReport,
+        report: Box<ScanReport>,
     },
     ScanFailed {
         id: ConnId,
@@ -1164,6 +1164,7 @@ impl App {
             prefer_replica: false,
             provider: None,
             token_command: None,
+            ssh: None,
         };
         if let Some(add) = self.add.as_mut() {
             add.saving = true;
@@ -1524,6 +1525,7 @@ impl App {
                 if !self.is_session(id, scan) {
                     return Vec::new();
                 }
+                let report = *report;
                 if let Some(e) = self.entry_mut(id) {
                     e.server = Some(report.server.clone());
                 }
@@ -1833,7 +1835,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan: scan_of(&app),
-            report: report.clone(),
+            report: Box::new(report.clone()),
         });
         let s = app.session.as_ref().unwrap();
         assert!(s.partial.is_none());
@@ -2130,7 +2132,7 @@ mod tests {
             Msg::ScanDone {
                 id,
                 scan: s1,
-                report: fixtures::report(true),
+                report: Box::new(fixtures::report(true)),
             },
             Msg::History {
                 id,
@@ -2210,7 +2212,7 @@ mod tests {
         let effects = app.apply(Msg::ScanDone {
             id,
             scan: s2,
-            report: report.clone(),
+            report: Box::new(report.clone()),
         });
         let [Effect::LoadHistory { id: got, scan, .. }] = &effects[..] else {
             panic!("unexpected effects {effects:?}");
@@ -2264,7 +2266,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan: s1,
-            report: fixtures::report(true),
+            report: Box::new(fixtures::report(true)),
         });
         app.apply(Msg::ScanFailed {
             id,
@@ -2482,7 +2484,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id: *id,
             scan: scan_of(&app),
-            report: fixtures::report(true),
+            report: Box::new(fixtures::report(true)),
         });
         assert_eq!(app.session.as_ref().unwrap().phase, Phase::Done);
         assert!(!app.pattern_rows().is_empty());
@@ -2531,7 +2533,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id: 999,
             scan: scan_of(&app),
-            report: fixtures::report(true),
+            report: Box::new(fixtures::report(true)),
         });
         assert!(app.session.as_ref().unwrap().report.is_none());
         // Any key clears the error.
@@ -2555,7 +2557,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan: scan_of(&app),
-            report: fixtures::report(sizes),
+            report: Box::new(fixtures::report(sizes)),
         });
         app
     }
@@ -2717,7 +2719,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan: scan_of(&app),
-            report: fixtures::report(true),
+            report: Box::new(fixtures::report(true)),
         });
         assert_eq!(app.selected_row_id(), Some(pat("tmp:import:{ulid}")));
         assert_eq!(app.patterns.sel, before + 2);
@@ -2729,7 +2731,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan: scan_of(&app),
-            report: fixtures::report(true),
+            report: Box::new(fixtures::report(true)),
         });
         assert_eq!(app.selected_row_id(), Some(grp("user")));
     }
@@ -2856,7 +2858,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan: scan_of(&app),
-            report: fixtures::report(true),
+            report: Box::new(fixtures::report(true)),
         });
         assert!(app.patterns.collapsed.contains("cache"));
         assert_eq!(app.selected_row_id(), Some(grp("cache")));
@@ -2966,7 +2968,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan: scan_of(&app),
-            report: report.clone(),
+            report: Box::new(report.clone()),
         });
         assert_eq!(app.patterns.sort, SortBy::Keys);
         assert_eq!(
@@ -3007,7 +3009,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan: scan_of(&app),
-            report,
+            report: Box::new(report),
         });
         (app, id)
     }
@@ -3083,7 +3085,7 @@ mod tests {
         let effects = app.apply(Msg::ScanDone {
             id,
             scan: scan_of(&app),
-            report: report.clone(),
+            report: Box::new(report.clone()),
         });
         let [
             Effect::LoadHistory {
@@ -3220,7 +3222,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan: scan_of(&app),
-            report: fixtures::report(true),
+            report: Box::new(fixtures::report(true)),
         });
         assert_eq!(app.sel, ViewSel::default());
     }
@@ -3541,7 +3543,7 @@ mod tests {
         let effects = app.apply(Msg::ScanDone {
             id,
             scan: s2,
-            report: report.clone(),
+            report: Box::new(report.clone()),
         });
         assert!(matches!(effects[..], [Effect::LoadHistory { scan, .. }] if scan == s2));
         assert_eq!(app.selected_row_id(), Some(pat("user:{id}:cart")));
@@ -3585,7 +3587,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan: s2,
-            report: report.clone(),
+            report: Box::new(report.clone()),
         });
         let s = app.session.as_ref().unwrap();
         assert_eq!(s.previous, None);
@@ -3785,7 +3787,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan: s2,
-            report: fixtures::report(true),
+            report: Box::new(fixtures::report(true)),
         });
         // A late trend of s1 for the same scan time stays out; s2's gets in.
         app.apply(trend_msg(id, s1, at));
@@ -3821,7 +3823,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan: s2,
-            report: report.clone(),
+            report: Box::new(report.clone()),
         });
         assert!(app.session.as_ref().unwrap().trend.is_none());
         app.apply(trend_msg(id, s2, report.taken_at_unix));
@@ -3840,7 +3842,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan: s2,
-            report: newer.clone(),
+            report: Box::new(newer.clone()),
         });
         assert!(app.session.as_ref().unwrap().trend.is_none());
         // s1's trend was for the old report's time.
@@ -3934,7 +3936,7 @@ mod tests {
             app.apply(Msg::ScanDone {
                 id,
                 scan: s,
-                report: fixtures::report(true),
+                report: Box::new(fixtures::report(true)),
             });
         }
         // On Connections `r` still looks for Docker containers.
@@ -3997,7 +3999,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan,
-            report: fixtures::report(true),
+            report: Box::new(fixtures::report(true)),
         });
         app.apply(Msg::DockerFound(Vec::new()));
         assert!(app.handle_key(ch('r')).is_empty());
@@ -4038,7 +4040,7 @@ mod tests {
         app.apply(Msg::ScanDone {
             id,
             scan: s2,
-            report: new.clone(),
+            report: Box::new(new.clone()),
         });
         let effects = app.handle_key(ch('s'));
         let [Effect::SaveSnapshot(r)] = &effects[..] else {
@@ -4375,7 +4377,7 @@ mod tests {
             app.apply(Msg::ScanDone {
                 id,
                 scan,
-                report: report.clone(),
+                report: Box::new(report.clone()),
             });
             with_history(&mut app, id);
             for view in View::ALL {

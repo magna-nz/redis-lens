@@ -33,6 +33,7 @@ fn profile(name: &str, env: Env, host: &str, port: u16, tls: bool, auth: Auth) -
         prefer_replica: false,
         provider: None,
         token_command: None,
+        ssh: None,
     }
 }
 
@@ -197,6 +198,7 @@ fn build(p: &Pat, sizes: bool) -> PatternStats {
             bytes: opt(*b),
             ttl: ttl(t),
             lfu_freq: None,
+            node: None,
         })
         .collect();
     examples.sort_by_key(|e| std::cmp::Reverse(e.bytes));
@@ -465,6 +467,7 @@ pub fn report(sizes: bool) -> ScanReport {
         complete: false,
         match_glob: None,
         server_context: None,
+        nodes: None,
     }
 }
 
@@ -581,6 +584,7 @@ fn hot(key: &str, key_type: KeyType, bytes: f64, t: &str, freq: u8) -> KeySample
         bytes: Some(bytes as u64),
         ttl: ttl(t),
         lfu_freq: Some(freq),
+        node: None,
     }
 }
 

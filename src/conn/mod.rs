@@ -3,6 +3,7 @@
 //! Owner: connections.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use redis::aio::{ConnectionLike, MultiplexedConnection};
@@ -17,9 +18,11 @@ use crate::model::{
 };
 use crate::secrets::{SecretError, SecretStore};
 
+pub mod cluster;
 pub mod docker;
 pub mod parse;
 pub mod provider;
+pub mod ssh;
 mod tls;
 pub mod token;
 
@@ -42,6 +45,9 @@ pub enum ConnError {
     Redis(#[from] redis::RedisError),
     #[error("Docker: {0}")]
     Docker(String),
+    /// The SSH tunnel could not be opened. Never holds ssh's own output.
+    #[error(transparent)]
+    Ssh(#[from] ssh::SshError),
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -58,9 +64,114 @@ const PROBE_KEY: &str = "redis-lens:probe";
 pub async fn connect(
     profile: &Profile,
     secrets: &dyn SecretStore,
-) -> Result<MultiplexedConnection, ConnError> {
+) -> Result<Connection, ConnError> {
+    let route = Route::for_profile(profile, secrets).await?;
     let auth = ResolvedAuth::new(profile, secrets).await?;
-    auth.open(&profile.endpoint).await
+    auth.open(&route, &profile.endpoint).await
+}
+
+/// How connections reach servers: directly, or through the profile's SSH bastion.
+pub enum Route {
+    Direct,
+    /// Every endpoint, the profile's own and every announced node or replica, is reached
+    /// through a local forward over this bastion (see [`ssh`]).
+    Ssh(ssh::Bastion),
+}
+
+impl Route {
+    /// The route for `profile`: through its SSH bastion when it has one (reading the SSH
+    /// username from the keychain), otherwise direct. Starts no forward yet.
+    pub async fn for_profile(
+        profile: &Profile,
+        secrets: &dyn SecretStore,
+    ) -> Result<Arc<Self>, ConnError> {
+        Ok(Arc::new(match &profile.ssh {
+            None => Self::Direct,
+            Some(tunnel) => Self::Ssh(ssh::Bastion::new(profile, tunnel, secrets)?),
+        }))
+    }
+
+    /// The addresses to connect to for `ep`, fixed once, and whether `ep` counts as on
+    /// the same machine as whatever reaches it. Direct: `ep`'s host resolved here
+    /// ([`resolve`]). Through SSH: the local end of a forward to `ep` (started when
+    /// first needed), with `local` judged from the bastion's side.
+    async fn reach(&self, ep: &Endpoint) -> Result<Resolved, Unusable> {
+        match self {
+            Self::Direct => resolve(&ep.host, ep.port).await.map_err(Unusable::Resolve),
+            Self::Ssh(bastion) => bastion.reach(ep).await,
+        }
+    }
+}
+
+/// A connection to one server, holding on to its [`Route`] so an SSH forward it goes
+/// through stays open while the connection is in use. Use it as a
+/// [`MultiplexedConnection`] (it derefs to one and implements [`ConnectionLike`]).
+#[derive(Clone)]
+pub struct Connection {
+    conn: MultiplexedConnection,
+    _route: Arc<Route>,
+}
+
+impl Connection {
+    fn new(conn: MultiplexedConnection, route: &Arc<Route>) -> Self {
+        Self {
+            conn,
+            _route: Arc::clone(route),
+        }
+    }
+
+    /// The bare connection. Only for direct routes: through SSH the forward closes once
+    /// every [`Connection`] that uses it is dropped.
+    pub fn into_inner(self) -> MultiplexedConnection {
+        self.conn
+    }
+}
+
+/// Says only which kind of route the connection uses: nothing about the server, the
+/// credentials or the forward.
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let route = match self._route.as_ref() {
+            Route::Direct => "direct",
+            Route::Ssh(_) => "ssh",
+        };
+        f.debug_struct("Connection").field("route", &route).finish()
+    }
+}
+
+impl std::ops::Deref for Connection {
+    type Target = MultiplexedConnection;
+    fn deref(&self) -> &MultiplexedConnection {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for Connection {
+    fn deref_mut(&mut self) -> &mut MultiplexedConnection {
+        &mut self.conn
+    }
+}
+
+impl ConnectionLike for Connection {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        cmd: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        self.conn.req_packed_command(cmd)
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        cmd: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        self.conn.req_packed_commands(cmd, offset, count)
+    }
+
+    fn get_db(&self) -> i64 {
+        self.conn.get_db()
+    }
 }
 
 /// Run the profile's token command (see [`token`]) on a blocking thread and return the
@@ -138,9 +249,19 @@ impl ResolvedAuth {
         })
     }
 
-    /// Connect to `ep` with these credentials, the endpoint's TLS setting and the database.
-    async fn open(&self, ep: &Endpoint) -> Result<MultiplexedConnection, ConnError> {
-        open(ep, self.settings.clone(), &self.config).await
+    /// Connect to `ep` over `route` with these credentials, the endpoint's TLS setting
+    /// and the database. Direct, redis-rs resolves the host; through SSH the connection
+    /// goes to the forward's local end, and TLS still checks `ep`'s host name.
+    async fn open(&self, route: &Arc<Route>, ep: &Endpoint) -> Result<Connection, ConnError> {
+        let c = match route.as_ref() {
+            Route::Direct => open(ep, self.settings.clone(), &self.config).await?,
+            Route::Ssh(_) => {
+                let reached = route.reach(ep).await.map_err(Unusable::into_conn_error)?;
+                let config = self.config.clone().set_dns_resolver(Pinned(reached.addrs));
+                open(ep, self.settings.clone(), &config).await?
+            }
+        };
+        Ok(Connection::new(c, route))
     }
 }
 
@@ -368,6 +489,23 @@ enum Unusable {
     Conn(ConnError),
 }
 
+impl Unusable {
+    /// For callers that need a [`ConnError`]: only [`Route::reach`]'s failures
+    /// (`Resolve`, `Conn`) are expected here; the others get a fixed text.
+    fn into_conn_error(self) -> ConnError {
+        match self {
+            Self::Conn(e) => e,
+            Self::Resolve(e) => ConnError::Redis(redis::RedisError::from(e)),
+            Self::NotAReplica => ConnError::Redis(redis::RedisError::from(std::io::Error::other(
+                "not a replica of this primary",
+            ))),
+            Self::WontSendCredentials => ConnError::Redis(redis::RedisError::from(
+                std::io::Error::other("credentials may not be sent to this address"),
+            )),
+        }
+    }
+}
+
 impl From<ConnError> for Unusable {
     fn from(e: ConnError) -> Self {
         Self::Conn(e)
@@ -396,14 +534,13 @@ async fn info_replication(c: &mut MultiplexedConnection) -> Result<String, redis
 /// connection, which is the one returned.
 async fn verified_replica(
     auth: &ResolvedAuth,
+    route: &Arc<Route>,
     db: u32,
     primary: &Endpoint,
     primary_replid: &str,
     ep: &Endpoint,
-) -> Result<MultiplexedConnection, Unusable> {
-    let candidate = resolve(&ep.host, ep.port)
-        .await
-        .map_err(Unusable::Resolve)?;
+) -> Result<Connection, Unusable> {
+    let candidate = route.reach(ep).await?;
     let pinned =
         |config: AsyncConnectionConfig| config.set_dns_resolver(Pinned(candidate.addrs.clone()));
 
@@ -417,7 +554,7 @@ async fn verified_replica(
                     .query_async::<()>(&mut probe)
                     .await?;
             }
-            return Ok(probe);
+            return Ok(Connection::new(probe, route));
         }
         Ok(_) => return Err(Unusable::NotAReplica),
         Err(e) if auth.sends_credentials && e.code() == Some("NOAUTH") => {}
@@ -426,7 +563,7 @@ async fn verified_replica(
     drop(probe);
 
     // A primary whose name no longer resolves counts as remote, which only restricts.
-    let primary_local = match resolve(&primary.host, primary.port).await {
+    let primary_local = match route.reach(primary).await {
         Ok(r) => r.local,
         Err(_) => false,
     };
@@ -436,7 +573,7 @@ async fn verified_replica(
     let mut c = open(ep, auth.settings.clone(), &pinned(auth.config.clone())).await?;
     let info = info_replication(&mut c).await?;
     if is_replica_of(&info, primary_replid) {
-        Ok(c)
+        Ok(Connection::new(c, route))
     } else {
         Err(Unusable::NotAReplica)
     }
@@ -462,9 +599,20 @@ pub fn master_replid(info: &str) -> Option<String> {
 pub async fn connect_for_scan(
     profile: &Profile,
     secrets: &dyn SecretStore,
-) -> Result<(MultiplexedConnection, ScanTarget), ConnError> {
+) -> Result<(Connection, ScanTarget), ConnError> {
+    let route = Route::for_profile(profile, secrets).await?;
     let auth = ResolvedAuth::new(profile, secrets).await?;
-    let mut primary = auth.open(&profile.endpoint).await?;
+    connect_for_scan_with(profile, &route, &auth).await
+}
+
+/// [`connect_for_scan`] with the route and credentials already resolved, so a caller
+/// (cluster discovery) can reuse them for further connections.
+async fn connect_for_scan_with(
+    profile: &Profile,
+    route: &Arc<Route>,
+    auth: &ResolvedAuth,
+) -> Result<(Connection, ScanTarget), ConnError> {
+    let mut primary = auth.open(route, &profile.endpoint).await?;
     if !profile.prefer_replica {
         return Ok((primary, ScanTarget::Primary));
     }
@@ -492,7 +640,8 @@ pub async fn connect_for_scan(
                 port,
                 tls: profile.endpoint.tls,
             };
-            let attempt = verified_replica(&auth, profile.db, &profile.endpoint, &replid, &ep);
+            let attempt =
+                verified_replica(auth, route, profile.db, &profile.endpoint, &replid, &ep);
             match tokio::time::timeout(REPLICA_TIMEOUT, attempt).await {
                 Ok(Ok(c)) => Ok((c, ScanTarget::Replica(ep))),
                 Ok(Err(Unusable::NotAReplica)) => fallback(
@@ -846,6 +995,7 @@ mod tests {
             prefer_replica: false,
             provider: None,
             token_command: Some(cmd.iter().map(|s| s.to_string()).collect()),
+            ssh: None,
         }
     }
 
