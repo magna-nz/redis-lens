@@ -601,6 +601,32 @@ pub fn context_summary(report: &ScanReport) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A snapshot is saved as JSON and compared with the scan it came from, so float
+    /// fields must read back bit for bit (serde_json's `float_roundtrip` feature: without
+    /// it, `fragmentation` can come back one unit off in the last place).
+    #[test]
+    fn memory_stats_floats_survive_a_json_round_trip() {
+        for f in [
+            1.530_957_669_598_477_5,
+            1.831_791_926_153_223_4,
+            9.567_604_255_623_749,
+            0.1 + 0.2,
+            0.0,
+        ] {
+            let m = crate::model::MemoryStats {
+                fragmentation: Some(f),
+                ..Default::default()
+            };
+            let back: crate::model::MemoryStats =
+                serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+            assert_eq!(
+                back.fragmentation.map(f64::to_bits),
+                Some(f.to_bits()),
+                "{f}"
+            );
+        }
+    }
+
     use super::*;
     use crate::model::{PatternStats, ServerContextParts, ServerFlavor, ServerInfo, ServerMode};
     use proptest::prelude::*;
