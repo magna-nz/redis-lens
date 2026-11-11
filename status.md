@@ -52,7 +52,12 @@ Integration branch `wave8/usability` (worktree `.claude/worktrees/wave8`, from m
 | B | Key table (`tui/keymap.rs`), `?` help overlay (`tui/ui/help.rs`), OSC 52 clipboard (`tui/clipboard.rs`), standalone | implementer [sonnet] | `wave8/keys` | **done** (d34d3fa), merged |
 | D | Keychain panic text, parallel discovery probes, `os_trust` skipped | implementer [sonnet] | `wave8/extras` | **done** (693d575), merged |
 | C | Rescan, `?` and clipboard wired in, footer from the key table, Page Up/Down and Home/End in every list view | implementer [opus] | `wave8/wire`, after A, B and D | **done** (75804f2), merged |
-| V | Verifier on the merged `wave8/usability` | verifier [opus] | pinned detached worktree | in progress |
+| V | Verifier on the merged `wave8/usability` | verifier [opus] | pinned detached worktree (3de2853, then the fix commit) | round 1 **BLOCKED** on B1 and B2, both fixed (below); round 2 in progress |
+
+**Verifier round 1 (BLOCKED, report `w8-verify-report.md` in the session notes), and the fixes:**
+- B1: the suggested command (`Y` and the detail panel's `$` line) put the glob in single quotes without escaping `'`, so a key named ``evil:x'$(touch pwned)'`` gave a command that ran `touch` when pasted into a shell. Fixed in `tui::clipboard::suggested_command`: `'` is written as `'\''`, and control characters and `\` (fish's escape inside single quotes) become `?`. Tests: `a_key_name_cannot_break_out_of_the_command` (exact text) and the proptest `the_pattern_is_always_one_quoted_word` (the text after `--pattern` is exactly one quoted word holding the glob, and has no control characters). Checked in bash with a stub `redis-cli`: one argument, nothing run.
+- B2: the panic-hook test passed with the silencing removed, and nothing checked the hook is installed. The test now records keychain-thread panics too, and `keychain_calls_install_the_silencing_hook` checks the install; both fail under those mutations.
+- Not changed (noted): `copy_never_carries_credentials` checks held credentials only through the Docker entry, since the app never holds a saved profile's credentials; `CopyText` constructors take any `&str`, so "only a pattern, key or command" rests on `App::copy`'s call sites; the discovery concurrency test is timing-based (1.2 s limit for about 0.4 s of work).
 
 **How each item is covered** (agents' change → test maps are in their reports; the verifier audits them):
 - Selection follows the pattern: `tui::app::tests::selection_follows_the_pattern_across_partials`, `selection_follows_the_pattern_into_the_finished_scan` and the collapsed-group, `{var}` and gone-row cases. Restart by a message: `a_message_that_changes_the_selected_row_restarts_the_marquee` (fails with `track_selection()` removed from `apply`).
@@ -69,6 +74,10 @@ Integration branch `wave8/usability` (worktree `.claude/worktrees/wave8`, from m
 - Parallel discovery: `conn::docker::tests::discovery_probes_run_concurrently_and_keep_order`; `conn_it` on Redis, Valkey and 6.2.
 - `os_trust`: `#[ignore]`d locally; CI runs `cargo test --test os_trust -- --ignored` after installing the CA, and the tests fail without it.
 
+**Checks at 3de2853:** fmt, clippy `-D warnings`, 400 unit tests; every integration test on Redis 7.4, Valkey 8.1 and Redis 6.2 (cli_config 4, conn 26, diff 5, replica 11, scan_cli 5, scan 15, smoke 3, tls 6; os_trust 2 ignored locally). Two failures on the first run, both passing on re-run with code unchanged in this wave: `replica_it` on 6.2 (container start-up, as in wave 7) and `conn_it::connect_with_keychain_credentials` under coverage (a reply that wasn't RESP, likely another process on the mapped port).
+
+**Coverage (`make coverage`, unit + integration, at 3de2853):** 94.46% of lines (wave 7: 93.48%). New modules: `tui/clipboard.rs` 100%, `tui/ui/help.rs` 100%, `tui/tree.rs` 98.8%, `tui/app.rs` 97.8%, `tui/keymap.rs` 86.5%. Lowest: `tui/mod.rs` 67% (terminal event loop), `secrets.rs` 76% (the real keychain, an ignored test), `tui/ui/connections.rs` 82%.
+
 **Decisions taken in the wave (owner may revisit):**
 - The Patterns key bar has no `r Rescan`: with `? Help` and `o Sort` it is 79 columns, and rescan would make it 90. Rescan is in the `?` overlay.
 - After a failed rescan, `s` saves the previous report that is still shown. It has the same snapshot file name as that report's own snapshot, so nothing is duplicated.
@@ -77,6 +86,7 @@ Integration branch `wave8/usability` (worktree `.claude/worktrees/wave8`, from m
 
 **Follow-ups found in the wave (not done):**
 - Rule 1: a server's `NOPERM` reply names the ACL user (`NOPERM User <name> has no permissions …`), and the Connections detail panel shows it (fixture: `connections_view` snapshot). It never reaches the scan report or snapshot files. The username should be masked in permission results before they are shown (TUI and `conn test`).
+- spec.md "4 Hot keys" promises an opt-in `MONITOR` sample "planned for v0.2"; it was never built (from before this wave).
 - The failed-scan waiting panel says "Press 0 to go back to Connections and try again" and doesn't mention `r`.
 
 ## Wave 7 (2026-11-11): four bugs and the test gaps

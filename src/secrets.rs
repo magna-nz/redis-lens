@@ -74,8 +74,12 @@ fn install_panic_hook() {
     ONCE.call_once(|| {
         let prev = std::panic::take_hook();
         std::panic::set_hook(silence_keychain_worker(prev));
+        HOOK_INSTALLED.store(true, std::sync::atomic::Ordering::SeqCst);
     });
 }
+
+/// Set once [`install_panic_hook`] has installed the hook, for tests.
+static HOOK_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Run `f` on a worker thread and wait up to `dur` for it. On timeout the worker is left
 /// to finish on its own and [`SecretError::Timeout`] names `account`. A panic in `f`
@@ -254,7 +258,9 @@ mod tests {
         let orig2 = orig.clone();
         let prev: PanicHook = Box::new(move |info| {
             let name = std::thread::current().name().unwrap_or("").to_string();
-            if name.starts_with("hook-test-") {
+            // Keychain-worker panics are recorded too: the silencing hook must stop them
+            // before they get here.
+            if name.starts_with("hook-test-") || name == WORKER_NAME {
                 seen2.lock().unwrap().push(name);
             } else {
                 // Panics from unrelated tests running meanwhile keep their normal output.
@@ -275,6 +281,12 @@ mod tests {
         std::panic::set_hook(Box::new(move |info| orig(info)));
         assert!(matches!(r, Err(SecretError::Store(_))));
         assert_eq!(*seen.lock().unwrap(), vec!["hook-test-other".to_string()]);
+    }
+
+    #[test]
+    fn keychain_calls_install_the_silencing_hook() {
+        with_timeout(Duration::from_secs(5), "acct", || 1).unwrap();
+        assert!(HOOK_INSTALLED.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     fn sref(n: &str) -> SecretRef {

@@ -78,10 +78,33 @@ impl CopyText {
     }
 }
 
-/// The command shown in the detail panel and copied by `Y`. It carries no host or
+/// The command shown in the detail panel and copied by `Y`: `redis-cli --scan
+/// --pattern` with the pattern's glob as one shell word. It carries no host or
 /// credentials.
+///
+/// Key names come from the server, and anyone who can write keys picks them, so pasting
+/// the command must never run anything else. The glob goes in single quotes, where a
+/// POSIX shell treats nothing as special except `'` itself, written as `'\''`. Control
+/// characters (a newline would also break the line on screen) and `\` (an escape inside
+/// single quotes in fish) become the glob wildcard `?`, which still matches them.
 pub fn suggested_command(label: &str) -> String {
-    format!("redis-cli --scan --pattern '{}'", format::glob(label))
+    format!(
+        "redis-cli --scan --pattern {}",
+        shell_quote(&safe_glob(label))
+    )
+}
+
+/// [`format::glob`] with control characters and `\` replaced by `?`.
+fn safe_glob(label: &str) -> String {
+    format::glob(label)
+        .chars()
+        .map(|c| if c.is_control() || c == '\\' { '?' } else { c })
+        .collect()
+}
+
+/// `s` as one single-quoted POSIX shell word.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// The OSC 52 "set clipboard" sequence for `t`, or `None` when it would be longer
@@ -184,6 +207,64 @@ mod tests {
         assert_eq!(t.what(), "command");
         for bad in [" -a ", "--user", "--pass", " -u ", "redis://"] {
             assert!(!t.as_str().contains(bad), "{bad}");
+        }
+    }
+
+    /// Reads one POSIX shell word made of single-quoted runs and `\'`, as
+    /// [`shell_quote`] writes it. `None` for anything else, e.g. an unquoted character
+    /// or an unterminated quote. Also `None` when a `\` appears inside quotes, since
+    /// fish would read it as an escape.
+    fn unquote(word: &str) -> Option<String> {
+        let mut out = String::new();
+        let mut it = word.chars();
+        while let Some(c) = it.next() {
+            match c {
+                '\'' => loop {
+                    match it.next()? {
+                        '\'' => break,
+                        '\\' => return None,
+                        c => out.push(c),
+                    }
+                },
+                '\\' => out.push(it.next().filter(|c| *c == '\'')?),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    fn quoted_glob(cmd: &str) -> Option<String> {
+        unquote(cmd.strip_prefix("redis-cli --scan --pattern ")?)
+    }
+
+    #[test]
+    fn a_key_name_cannot_break_out_of_the_command() {
+        let cmd = suggested_command("evil:x'$(touch pwned)'");
+        assert_eq!(
+            cmd,
+            r"redis-cli --scan --pattern 'evil:x'\''$(touch pwned)'\'''"
+        );
+        assert_eq!(quoted_glob(&cmd).unwrap(), "evil:x'$(touch pwned)'");
+        // A newline and fish's escape character become `?`.
+        assert_eq!(
+            suggested_command("a\nb\\'c\x1b"),
+            r"redis-cli --scan --pattern 'a?b?'\''c?'"
+        );
+    }
+
+    proptest::proptest! {
+        /// Whatever the label, the command is `redis-cli --scan --pattern` plus exactly
+        /// one shell word, and that word is the label's glob (control characters and
+        /// `\` as `?`).
+        #[test]
+        fn the_pattern_is_always_one_quoted_word(label in "\\PC*|[\\x00-\\x7f]*") {
+            let cmd = suggested_command(&label);
+            let want: String = format::glob(&label)
+                .chars()
+                .map(|c| if c.is_control() || c == '\\' { '?' } else { c })
+                .collect();
+            proptest::prop_assert_eq!(quoted_glob(&cmd), Some(want));
+            proptest::prop_assert!(!cmd.chars().any(char::is_control));
         }
     }
 
