@@ -55,6 +55,10 @@ Integration branch `quickwins/integration` (worktree `.claude/worktrees/qw`, fro
 | C | 3 provider detection and notices; 4 server context (`INFO keysizes`, `INFO keyspace`, `MEMORY STATS`); 5 token-command auth | implementer [opus] | `quickwins/c` | **done** (7cfbd00, 0e8d584), merged |
 | V | Verifier on the merged branch | verifier [opus] | pinned detached worktree | not started |
 
+**Checks at 5d11791:** fmt, clippy `-D warnings`, 560 unit tests; every integration test on Redis 7.4, Valkey 8.1 and Redis 6.2 (cli_config 4, compare 3, conn 29, diff 6, replica 11, scan_cli 11, scan 21, smoke 3, tls 6; os_trust 2 ignored locally). With the default thread count, test containers sometimes failed to start while another build ran on the machine; with `--test-threads=4` and `--no-fail-fast` everything passed on both images. The first full run also found a real bug, fixed in 5d11791: `MEMORY STATS` floats didn't always read back exactly from a snapshot, so serde_json's `float_roundtrip` feature is on, with a test using floats that fail without it.
+
+**Coverage (`make coverage`, unit + integration, at 5d11791):** 94.91% of lines (wave 8: 94.46%). New code: `conn/provider.rs` 100%, `format.rs` 100%, `diff.rs` 99.9%, `snapshot.rs` 98.8%, `check.rs` 97.6%, `scan/context.rs` 97.1%, `report/` 93-99%, `cli/compare.rs` 93.3%, `cli/trend.rs` 94.2%, `cli/snapshots.rs` 91.1%, `conn/token.rs` 88.8% (the Windows branch and the interactive prompt). Lowest: `tui/mod.rs` 68%, `secrets.rs` 77%, `cli/mod.rs` 78%.
+
 **How each item is covered** (the agents' change → test maps are in their reports; the verifier audits them):
 - `--check`: `check::tests` (every metric and op, the min-keys floor, not judged and `--strict`, growth with and without a baseline, the TOML file, parser errors, a parser proptest); `cli::tests::exit_codes`; `scan_cli_it` passing and failing gates, a growth rule against a saved baseline (Redis and Valkey).
 - Reports: `report::{md,html,csv}::tests` snapshots of each format and hostile names (`<script>`, `|`, `=cmd()`, newlines, backticks); `scan_cli_it` writing `--report md -o`.
