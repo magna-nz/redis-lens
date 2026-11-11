@@ -532,6 +532,48 @@ pub fn history(sizes: bool) -> ReportDiff {
     diff::diff(&previous_report(sizes), &report(sizes))
 }
 
+/// A week of daily snapshots before [`report`], oldest first, ending with
+/// [`previous_report`]: `session` and `cache:search` grow steadily, `rl` shrinks,
+/// `queue:emails` is missing from one (a gap). Like [`report`], every scan is sampled.
+pub fn earlier_reports(sizes: bool) -> Vec<ScanReport> {
+    let mut out: Vec<ScanReport> = (1..=6)
+        .rev()
+        .map(|back: u32| {
+            let mut r = previous_report(sizes);
+            r.taken_at_unix -= i64::from(back) * 86_400;
+            let k = f64::from(back);
+            for p in &mut r.patterns {
+                let factor = match p.pattern.as_str() {
+                    "session:{uuid}" => 1.0 - 0.01 * k,
+                    "cache:search:{hash}" => 1.0 - 0.05 * k,
+                    "rl:{ip}:{id}" => 1.0 + 0.03 * k,
+                    _ => 1.0,
+                };
+                p.est_keys = (p.est_keys as f64 * factor) as u64;
+                p.est_bytes = p.est_bytes.map(|b| (b as f64 * factor) as u64);
+            }
+            if back == 4 {
+                r.patterns.retain(|p| p.pattern != "queue:emails");
+            }
+            r
+        })
+        .collect();
+    out.push(previous_report(sizes));
+    out
+}
+
+/// The trend the Diff view loads: [`earlier_reports`] with [`report`] as the last point.
+pub fn trend(sizes: bool) -> crate::snapshot::Trend {
+    let mut reports = earlier_reports(sizes);
+    reports.push(report(sizes));
+    crate::snapshot::trend(&reports)
+}
+
+/// The trend with a single earlier snapshot: too short for the trend column.
+pub fn short_trend(sizes: bool) -> crate::snapshot::Trend {
+    crate::snapshot::trend(&[previous_report(sizes), report(sizes)])
+}
+
 fn hot(key: &str, key_type: KeyType, bytes: f64, t: &str, freq: u8) -> KeySample {
     KeySample {
         key: key.into(),
