@@ -17,7 +17,6 @@ use std::time::Duration;
 use anyhow::bail;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event};
 use crossterm::execute;
-use futures::future::{AbortHandle, Abortable};
 use ratatui::DefaultTerminal;
 use secrecy::ExposeSecret;
 use tokio::sync::{mpsc, watch};
@@ -157,38 +156,8 @@ async fn event_loop(
 struct Runner {
     tx: Tx,
     path: PathBuf,
-    scan_task: Option<ScanTask>,
+    scan_task: Option<JoinHandle<()>>,
 }
-
-/// The running connect-and-scan, stopped with [`ScanTask::abort`] when a new connect
-/// replaces it or the TUI quits.
-///
-/// The cluster connect and scan futures (`conn::cluster::connect_targets`,
-/// `scan::cluster::scan_targets`) are not `Send` as rustc sees them (a higher-ranked
-/// lifetime limitation with their `buffered` streams), so `tokio::spawn` can't take
-/// them. The run is driven by `Handle::block_on` on a blocking-pool thread instead,
-/// inside an [`Abortable`]: aborting wakes it, and the run's future (its connections
-/// and the progress forwarder) is dropped at once, as an aborted task's would be.
-struct ScanTask(AbortHandle);
-
-impl ScanTask {
-    fn spawn(fut: impl FnOnce() -> BoxedRun + Send + 'static) -> Self {
-        let (abort, reg) = AbortHandle::new_pair();
-        let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            // `Err(Aborted)` when replaced: nothing more to report.
-            let _ = handle.block_on(Abortable::new(fut(), reg));
-        });
-        Self(abort)
-    }
-
-    fn abort(&self) {
-        self.0.abort();
-    }
-}
-
-/// A connect-and-scan run, built on the thread that drives it.
-type BoxedRun = std::pin::Pin<Box<dyn Future<Output = ()>>>;
 
 impl Drop for Runner {
     fn drop(&mut self) {
@@ -247,9 +216,9 @@ impl Runner {
                 if let Some(t) = self.scan_task.take() {
                     t.abort();
                 }
-                self.scan_task = Some(ScanTask::spawn(move || {
-                    Box::pin(connect_and_scan(id, scan, profile, secrets, tx))
-                }));
+                self.scan_task = Some(tokio::spawn(connect_and_scan(
+                    id, scan, profile, secrets, tx,
+                )));
             }
             Effect::SaveConnection {
                 profile,
@@ -998,62 +967,24 @@ mod tests {
         assert_eq!(m.mode, ServerMode::Cluster);
     }
 
-    /// Sets its flag when dropped.
-    struct Dropped(Arc<std::sync::atomic::AtomicBool>);
-
-    impl Drop for Dropped {
-        fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_aborted_scan_task_drops_its_run_at_once() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let dropped = Arc::new(AtomicBool::new(false));
-        let started = Arc::new(tokio::sync::Notify::new());
-        let (flag, go) = (dropped.clone(), started.clone());
-        let task = ScanTask::spawn(move || {
-            Box::pin(async move {
-                let _guard = Dropped(flag);
-                // The run uses the runtime: timers and tasks work from its thread.
-                tokio::spawn(async {}).await.unwrap();
-                go.notify_one();
-                std::future::pending::<()>().await;
-            })
-        });
-        tokio::time::timeout(Duration::from_secs(5), started.notified())
-            .await
-            .expect("the run started");
-        assert!(!dropped.load(Ordering::SeqCst));
-        task.abort();
-        let t0 = std::time::Instant::now();
-        while !dropped.load(Ordering::SeqCst) {
-            assert!(t0.elapsed() < Duration::from_secs(5), "never dropped");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_scan_task_reports_like_a_spawned_one() {
+    async fn a_spawned_scan_reports_the_whole_cluster_report() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let report = crate::tui::fixtures::cluster_report();
         let sent = report.clone();
-        let _task = ScanTask::spawn(move || {
-            Box::pin(scan_and_report(
-                3,
-                30,
-                tx,
-                move |ptx, _partial| async move {
-                    ptx.send_replace(ScanProgress {
-                        sampled: 1,
-                        target: 2,
-                        done: false,
-                    });
-                    Ok(sent)
-                },
-            ))
-        });
+        let _task = tokio::spawn(scan_and_report(
+            3,
+            30,
+            tx,
+            move |ptx, _partial| async move {
+                ptx.send_replace(ScanProgress {
+                    sampled: 1,
+                    target: 2,
+                    done: false,
+                });
+                Ok(sent)
+            },
+        ));
         let mut done = None;
         while let Some(incoming) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await

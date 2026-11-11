@@ -19,6 +19,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt};
 use redis::Value;
 use redis::aio::ConnectionLike;
@@ -129,23 +131,30 @@ impl ClusterTargets {
     /// report in [`NodeTarget::perms`], and return the merged report: a command counts
     /// as allowed only when every connected node allows it.
     pub async fn check_permissions(&mut self) -> PermissionReport {
-        let mut reports: Vec<(usize, PermissionReport)> = stream::iter(
-            self.nodes
-                .iter_mut()
-                .enumerate()
-                .filter(|(_, t)| t.conn.is_some()),
-        )
-        .map(|(i, t)| async move {
-            let Some(c) = t.conn.as_mut() else {
-                return (i, PermissionReport::default());
-            };
-            let r = super::check_permissions(c).await;
-            t.perms = Some(r.clone());
-            (i, r)
-        })
-        .buffer_unordered(crate::scan::cluster::MAX_CONCURRENT_NODES)
-        .collect()
-        .await;
+        // Collected first, boxed as `Send`: a stream that holds these iterator closures
+        // trips rustc's higher-ranked `Send` check when the caller is spawned (see
+        // `scan::cluster::tests::futures_are_send`).
+        let checks: Vec<BoxFuture<'_, (usize, PermissionReport)>> = self
+            .nodes
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, t)| t.conn.is_some())
+            .map(|(i, t)| {
+                async move {
+                    let Some(c) = t.conn.as_mut() else {
+                        return (i, PermissionReport::default());
+                    };
+                    let r = super::check_permissions(c).await;
+                    t.perms = Some(r.clone());
+                    (i, r)
+                }
+                .boxed()
+            })
+            .collect();
+        let mut reports: Vec<(usize, PermissionReport)> = stream::iter(checks)
+            .buffer_unordered(crate::scan::cluster::MAX_CONCURRENT_NODES)
+            .collect()
+            .await;
         reports.sort_by_key(|(i, _)| *i);
         let reports: Vec<PermissionReport> = reports.into_iter().map(|(_, r)| r).collect();
         merge_permissions(&reports)
@@ -859,7 +868,11 @@ async fn discover(
         seed_id: seed_id.as_deref(),
         seed_local,
     };
-    let nodes = stream::iter(shards.into_iter().map(|s| connect_shard(&ctx, s)))
+    let connects: Vec<BoxFuture<'_, NodeTarget>> = shards
+        .into_iter()
+        .map(|s| connect_shard(&ctx, s).boxed())
+        .collect();
+    let nodes = stream::iter(connects)
         .buffered(crate::scan::cluster::MAX_CONCURRENT_NODES)
         .collect()
         .await;

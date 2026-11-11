@@ -20,6 +20,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt};
 use redis::aio::ConnectionLike;
 use tokio::sync::watch;
@@ -293,13 +295,22 @@ pub(crate) async fn scan_nodes<C: ConnectionLike + Send>(
     let has_match = opts.match_glob.is_some();
 
     // Phase 1: INFO and DBSIZE of every connected node.
-    let infos: Vec<Option<ServerInfo>> = stream::iter(nodes.iter_mut())
-        .map(|n| async move {
-            match n.conn.as_deref_mut() {
-                Some(c) => server_info(c).await.ok(),
-                None => None,
+    // The per-node futures are boxed as `Send` and collected before they are streamed:
+    // a stream that holds iterator closures trips rustc's higher-ranked `Send` check when
+    // the caller is spawned (see `tests::futures_are_send`).
+    let reads: Vec<BoxFuture<'_, Option<ServerInfo>>> = nodes
+        .iter_mut()
+        .map(|n| {
+            async move {
+                match n.conn.as_deref_mut() {
+                    Some(c) => server_info(c).await.ok(),
+                    None => None,
+                }
             }
+            .boxed()
         })
+        .collect();
+    let infos: Vec<Option<ServerInfo>> = stream::iter(reads)
         .buffered(MAX_CONCURRENT_NODES)
         .collect()
         .await;
@@ -378,7 +389,9 @@ pub(crate) async fn scan_nodes<C: ConnectionLike + Send>(
                 .await;
                 (i, sample)
             }
-        });
+            .boxed()
+        })
+        .collect::<Vec<BoxFuture<'_, (usize, ServerSample)>>>();
     let mut samples: Vec<Option<ServerSample>> = (0..infos.len()).map(|_| None).collect();
     let done: Vec<(usize, ServerSample)> = stream::iter(jobs)
         .buffer_unordered(MAX_CONCURRENT_NODES)
@@ -673,6 +686,37 @@ mod tests {
         Ttl,
     };
     use proptest::prelude::*;
+
+    /// Compile-time check, never run: connecting to, checking and scanning whatever
+    /// `connect_targets` returns can go in `tokio::spawn`, the way the TUI runs it. Fails
+    /// to build (rustc's "implementation of `Send` is not general enough") when a
+    /// per-node future in a `buffered`/`buffer_unordered` stream is left unboxed.
+    #[allow(dead_code)]
+    fn futures_are_send(
+        profile: crate::model::Profile,
+        store: Box<dyn crate::secrets::SecretStore>,
+        opts: ScanOptions,
+        progress: watch::Sender<ScanProgress>,
+        partial: PartialSender,
+    ) {
+        drop(tokio::spawn(async move {
+            let Ok(mut targets) =
+                crate::conn::cluster::connect_targets(&profile, store.as_ref()).await
+            else {
+                return;
+            };
+            let perms = targets.check_permissions().await;
+            let _ = scan_targets(
+                &profile.name,
+                &mut targets,
+                &opts,
+                &perms,
+                Some(&progress),
+                Some(&partial),
+            )
+            .await;
+        }));
+    }
 
     fn perms_all() -> PermissionReport {
         PermissionReport {
