@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** v0.2 done on main; waves 6-8 merged (PRs #10-#12); the quick wins (feature ideas 1-7) in progress; then v0.3 (cluster) or the bigger bets below
-**Last updated:** 2026-11-11 (quick-wins wave started)
+**Last updated:** 2026-11-11 (quick wins verified; PR #13)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -53,7 +53,7 @@ Integration branch `quickwins/integration` (worktree `.claude/worktrees/qw`, fro
 | R | 1 `--check` rules with exit codes; 2 Markdown, HTML and CSV reports | implementer [sonnet] | `quickwins/r` | **done** (850cefa; Markdown names as code spans in 8d0a175), merged |
 | S | 6 snapshot retention, `snapshots list/prune`, `trend` and a trend column in the Diff view; 7 `compare` | implementer [opus] | `quickwins/s` | **done** (827ba4c, 9e5d008, 98318f3), merged; `prune` needs `--keep` or `--keep-days` (clap, f0cbbe0) |
 | C | 3 provider detection and notices; 4 server context (`INFO keysizes`, `INFO keyspace`, `MEMORY STATS`); 5 token-command auth | implementer [opus] | `quickwins/c` | **done** (7cfbd00, 0e8d584), merged |
-| V | Verifier on the merged branch | verifier [opus] | pinned detached worktree (5d11791) | round 1 **BLOCKED** on B1, fixed (below); round 2 in progress |
+| V | Verifier on the merged branch | verifier [opus] | pinned detached worktree (5d11791) | round 1 **BLOCKED** on B1, fixed (below); round 2 at 6cd0d4a **APPROVE**, no blockers |
 
 **Verifier round 1 (BLOCKED, report `qw-verify-report.md` in the session notes), and the fixes (63e4801, 717b306):**
 - B1: with snapshots dated in the future (clock skew), `scan --save --keep N` ranked them newest and deleted the snapshot it had just written. Now snapshots dated after now are never deleted and take no keep slot. Test: `snapshot::tests::future_dated_snapshots_never_cost_the_newest_real_one` (keep 1 and 2, and the prune plan); it fails without the fix.
@@ -73,6 +73,10 @@ Integration branch `quickwins/integration` (worktree `.claude/worktrees/qw`, fro
   - N7: `trend` and `compare` print pattern names raw, like `scan` and `diff` already did;
   - N8: the HTML CSP allows inline scripts (the sort script is inline);
   - N11: a token command's arguments are in clear in the config, so don't put secrets in them.
+- Round 2 (APPROVE) notes, and what was done:
+  - R2-1, fixed: output one byte over the 64 KiB cap could be accepted in a race with a background writer during the grace period; the cap is checked again on the output taken.
+  - A3, fixed: `replacing_a_token_profile_with_a_username_deletes_the_old_username`; it fails if `Auth::Command` is dropped from the delete-old-entry check.
+  - Not changed: R2-2 (the wait-for-close half of the exit condition has no deterministic test), R2-3 (the stdin half of `stdin_and_stderr_are_dev_null` can't fail when the test runner's own stdin is already `/dev/null`), and the read-error path has no test. A background process started by a token command is not killed (no process group); the reader thread lives until it closes stdout.
 
 **Checks at 5d11791:** fmt, clippy `-D warnings`, 560 unit tests; every integration test on Redis 7.4, Valkey 8.1 and Redis 6.2 (cli_config 4, compare 3, conn 29, diff 6, replica 11, scan_cli 11, scan 21, smoke 3, tls 6; os_trust 2 ignored locally). With the default thread count, test containers sometimes failed to start while another build ran on the machine; with `--test-threads=4` and `--no-fail-fast` everything passed on both images. The first full run also found a real bug, fixed in 5d11791: `MEMORY STATS` floats didn't always read back exactly from a snapshot, so serde_json's `float_roundtrip` feature is on, with a test using floats that fail without it.
 

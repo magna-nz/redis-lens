@@ -910,6 +910,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// The same from a token-command profile with a username: replacing it with one
+    /// without a username removes the old username from the keychain too.
+    #[tokio::test]
+    async fn replacing_a_token_profile_with_a_username_deletes_the_old_username() {
+        let path = temp_path("token-replace-user");
+        let store = MemoryStore::default();
+        let mut first = token_args("c", "rediss://old-oid-77@h:6380", &["printf", "tok"]);
+        first.yes = true;
+        add_token(&path, &store, &first, &never).await.unwrap();
+        assert!(
+            entry(&store, "c").is_some(),
+            "the username is in the keychain"
+        );
+        let mut second = token_args("c", "rediss://h:6380", &["printf", "tok2"]);
+        second.force = true;
+        second.yes = true;
+        add_token(&path, &store, &second, &never).await.unwrap();
+        assert_eq!(entry(&store, "c"), None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[tokio::test]
     async fn token_command_goes_to_the_config_and_the_username_to_the_keychain() {
         let path = temp_path("token-user");

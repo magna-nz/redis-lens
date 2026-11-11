@@ -176,6 +176,12 @@ fn run_with(argv: &[String], timeout: Duration, max: usize) -> Result<SecretStri
         }
         std::thread::sleep(POLL);
     };
+    // The reader may have appended after the size check above (a background process
+    // still writing during the grace period), so check the cap again on what was taken.
+    if out.len() > max {
+        stop(&mut child);
+        return Err(TokenError::TooLong { program: name() });
+    }
     let (status, _) = exited.expect("the loop only ends after the command exited");
     if !status.success() {
         return Err(TokenError::Failed {
