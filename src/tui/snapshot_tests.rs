@@ -5,7 +5,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
-use super::app::{App, ConnId, Effect, Msg};
+use super::app::{App, ConnId, Effect, Msg, ScanId};
 use super::fixtures;
 use super::tree::{Root, Row};
 use super::ui;
@@ -43,6 +43,11 @@ fn connect_selected(app: &mut App) -> u64 {
     }
 }
 
+/// The current session's run, for messages that should be accepted.
+fn scan_of(app: &App) -> ScanId {
+    app.session.as_ref().unwrap().scan
+}
+
 /// Connected to prod-cache-01 with `perms`, and `report` finished scanning.
 fn scanned_with(report: ScanReport, perms: PermissionReport) -> (App, ConnId) {
     let mut app = App::new(fixtures::profiles());
@@ -50,11 +55,16 @@ fn scanned_with(report: ScanReport, perms: PermissionReport) -> (App, ConnId) {
     let id = connect_selected(&mut app);
     app.apply(Msg::Connected {
         id,
+        scan: scan_of(&app),
         server: Some(report.server.clone()),
         perms,
         target: ScanTarget::Primary,
     });
-    app.apply(Msg::ScanDone { id, report });
+    app.apply(Msg::ScanDone {
+        id,
+        scan: scan_of(&app),
+        report,
+    });
     (app, id)
 }
 
@@ -80,6 +90,7 @@ fn set_history(app: &mut App, id: ConnId, diff: Option<crate::diff::ReportDiff>)
         .taken_at_unix;
     app.apply(Msg::History {
         id,
+        scan: scan_of(app),
         taken_at_unix,
         result: Ok(diff),
     });
@@ -132,6 +143,7 @@ fn connections_view() {
     let id = connect_selected(&mut app);
     app.apply(Msg::Connected {
         id,
+        scan: scan_of(&app),
         server: Some(crate::model::ServerInfo {
             version: "7.2.5".into(),
             used_memory: 2_254_857_830,
@@ -144,6 +156,7 @@ fn connections_view() {
     });
     app.apply(Msg::ScanProgress {
         id,
+        scan: scan_of(&app),
         progress: ScanProgress {
             sampled: 12_400,
             target: 85_964,
@@ -161,12 +174,14 @@ fn scanning_progress_header() {
     let id = connect_selected(&mut app);
     app.apply(Msg::Connected {
         id,
+        scan: scan_of(&app),
         server: Some(fixtures::server()),
         perms: fixtures::perms_ok(),
         target: ScanTarget::Primary,
     });
     app.apply(Msg::ScanProgress {
         id,
+        scan: scan_of(&app),
         progress: ScanProgress {
             sampled: 12_400,
             target: 85_964,
@@ -234,6 +249,7 @@ fn partial_after_previous_profile() -> App {
     let id = connect_selected(&mut app);
     app.apply(Msg::Connected {
         id,
+        scan: scan_of(&app),
         server: Some(fixtures::server()),
         perms: fixtures::perms_ok(),
         target: ScanTarget::Primary,
@@ -241,13 +257,18 @@ fn partial_after_previous_profile() -> App {
     let partial = fixtures::partial(true);
     app.apply(Msg::ScanProgress {
         id,
+        scan: scan_of(&app),
         progress: ScanProgress {
             sampled: partial.sampled,
             target: partial.target,
             done: false,
         },
     });
-    app.apply(Msg::ScanPartial { id, partial });
+    app.apply(Msg::ScanPartial {
+        id,
+        scan: scan_of(&app),
+        partial,
+    });
     app
 }
 
@@ -303,6 +324,7 @@ fn failed_scan_drops_partial_results_from_the_screen() {
     let id = app.session.as_ref().unwrap().id;
     app.apply(Msg::ScanFailed {
         id,
+        scan: scan_of(&app),
         error: "connection reset by peer".into(),
     });
     app.handle_key(ch('x')); // clear the error notice
@@ -324,6 +346,7 @@ fn empty_partial_says_nothing_sampled_yet() {
     let id = connect_selected(&mut app);
     app.apply(Msg::Connected {
         id,
+        scan: scan_of(&app),
         server: Some(fixtures::server()),
         perms: fixtures::perms_ok(),
         target: ScanTarget::Primary,
@@ -333,6 +356,7 @@ fn empty_partial_says_nothing_sampled_yet() {
     partial.sampled = 0;
     app.apply(Msg::ScanPartial {
         id,
+        scan: scan_of(&app),
         partial: std::sync::Arc::new(partial),
     });
     let lines = buffer_lines(&render(&app, 120, 36));
@@ -497,6 +521,7 @@ fn every_tab_at_60x20_and_200x60() {
     let taken_at_unix = failed.report().unwrap().taken_at_unix;
     failed.apply(Msg::History {
         id,
+        scan: scan_of(&failed),
         taken_at_unix,
         result: Err("could not find a data directory for this user".into()),
     });
@@ -605,6 +630,7 @@ fn keychain_hint_and_scan_target_are_drawn() {
     };
     app.apply(Msg::Connected {
         id,
+        scan: scan_of(&app),
         server: Some(fixtures::server()),
         perms: fixtures::perms_ok(),
         target: ScanTarget::Replica(ep),
