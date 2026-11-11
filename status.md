@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** v0.2 done on main; waves 6 and 7 merged (PRs #10, #11); wave 8 (usability) in progress; then v0.3 (cluster) or the feature ideas below
-**Last updated:** 2026-11-11 (wave 8 verified; PR #12)
+**Current milestone:** v0.2 done on main; waves 6-8 merged (PRs #10-#12); the quick wins (feature ideas 1-7) in progress; then v0.3 (cluster) or the bigger bets below
+**Last updated:** 2026-11-11 (quick wins verified; PR #13)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -33,6 +33,80 @@ Approved by the owner: "Approve, merge when green". Same merge rules as the over
 | B | Redis 6.2 in the integration job, as a new CI job (existing required check names unchanged) | implementer [sonnet] | `wave6/tests` (worktree `.claude/worktrees/w6-tests`) | **done** (89f0274): all integration tests pass on 6.2 with no test changes; merged into `wave6/fixes` |
 | C | OS trust store for TLS (load native certs, skip ones that fail to load, fall back to bundled roots when the store is empty); TLS replica test on Redis and Valkey via a throwaway CA and `SSL_CERT_FILE` | implementer [opus] | `wave6/tls` from `wave6/fixes` after B | **done** (9291fba, 3a54fdc): `src/conn/tls.rs`; `tests/tls_it.rs` (6 tests, Redis + Valkey, also on 6.2); merged into `wave6/fixes` |
 | V | Verifier on the merged `wave6/fixes` | verifier [opus] | pinned detached worktree at 09343e2 | **APPROVE**, no blockers. Its ready-made test for the partial denominator (D1) is added. Follow-ups below |
+
+## Quick wins (2026-11-11): feature ideas 1-7
+
+Approved by the owner ("Approve as proposed"). Defaults agreed:
+- The token command's username stays in the OS keychain (rule 1); only the argv goes in the config file. `conn add` asks first (`--yes` skips).
+- Reports leave example key names out unless `--examples`.
+- `compare` comes forward from v0.3 for standalone servers.
+- The provider is a host-name hint; ElastiCache Serverless gets a lower default rate.
+- `snapshots prune` needs `--yes` and only touches redis-lens's own snapshot directory.
+- No tag, release or publish. The owner merges the PR (auto mode blocks the admin merge).
+
+Integration branch `quickwins/integration` (worktree `.claude/worktrees/qw`, from main ebe9f17). Contract commits 95c099f and 1c28218:
+- in `model.rs`: `Auth::Command`, `Provider`, `Profile.provider`, `Profile.token_command`, `ScanReport.server_context`;
+- every new CLI flag and subcommand, plus exit codes (`ChecksFailed` 1, `GateError` 2), with stubs.
+
+| Part | Content | Agent | Branch | State |
+|---|---|---|---|---|
+| R | 1 `--check` rules with exit codes; 2 Markdown, HTML and CSV reports | implementer [sonnet] | `quickwins/r` | **done** (850cefa; Markdown names as code spans in 8d0a175), merged |
+| S | 6 snapshot retention, `snapshots list/prune`, `trend` and a trend column in the Diff view; 7 `compare` | implementer [opus] | `quickwins/s` | **done** (827ba4c, 9e5d008, 98318f3), merged; `prune` needs `--keep` or `--keep-days` (clap, f0cbbe0) |
+| C | 3 provider detection and notices; 4 server context (`INFO keysizes`, `INFO keyspace`, `MEMORY STATS`); 5 token-command auth | implementer [opus] | `quickwins/c` | **done** (7cfbd00, 0e8d584), merged |
+| V | Verifier on the merged branch | verifier [opus] | pinned detached worktree (5d11791) | round 1 **BLOCKED** on B1, fixed (below); round 2 at 6cd0d4a **APPROVE**, no blockers |
+
+**Verifier round 1 (BLOCKED, report `qw-verify-report.md` in the session notes), and the fixes (63e4801, 717b306):**
+- B1: with snapshots dated in the future (clock skew), `scan --save --keep N` ranked them newest and deleted the snapshot it had just written. Now snapshots dated after now are never deleted and take no keep slot. Test: `snapshot::tests::future_dated_snapshots_never_cost_the_newest_real_one` (keep 1 and 2, and the prune plan); it fails without the fix.
+- Test gaps filled:
+  - stdin and stderr are `/dev/null` (`conn::token::tests::stdin_and_stderr_are_dev_null`); a timed-out command is really killed (`a_timed_out_command_is_killed`); both checked by mutation;
+  - the `--check` baseline shares the scan's `MATCH` glob (`cli::scan::tests::the_baseline_shares_the_scans_match_glob`); which rules need a baseline (`check::tests::which_rules_need_a_baseline`);
+  - the context commands count against the budget, and a denied `MEMORY STATS` is not sent (`scan::tests::context_commands_count_against_the_budget`);
+  - replacing a password profile with a token command without a username deletes the old keychain entry (`cli::conn::tests::replacing_with_a_token_command_without_a_username_deletes_the_old_entry`).
+- Also fixed:
+  - N1: a token command that exits but leaves a background process holding stdout no longer times out; its output gets 250 ms to close after it exits (`a_background_child_holding_stdout_does_not_cost_the_token`);
+  - N3: `verdict=persistent-stable` needs a baseline, like `persistent-growing`;
+  - N9: `--keep 0` is a usage error (`cli::tests::keep_must_be_at_least_one`).
+- Not changed (noted):
+  - N2: token buffers are not zeroized;
+  - N4, N5: the big-strings bias warning ignores the sample fraction, and the server-wide `dataset.bytes` is compared with a one-database sample;
+  - N6: `compare`'s TTL mismatch has no min-keys floor;
+  - N7: `trend` and `compare` print pattern names raw, like `scan` and `diff` already did;
+  - N8: the HTML CSP allows inline scripts (the sort script is inline);
+  - N11: a token command's arguments are in clear in the config, so don't put secrets in them.
+- Round 2 (APPROVE) notes, and what was done:
+  - R2-1, fixed: output one byte over the 64 KiB cap could be accepted in a race with a background writer during the grace period; the cap is checked again on the output taken.
+  - A3, fixed: `replacing_a_token_profile_with_a_username_deletes_the_old_username`; it fails if `Auth::Command` is dropped from the delete-old-entry check.
+  - Not changed: R2-2 (the wait-for-close half of the exit condition has no deterministic test), R2-3 (the stdin half of `stdin_and_stderr_are_dev_null` can't fail when the test runner's own stdin is already `/dev/null`), and the read-error path has no test. A background process started by a token command is not killed (no process group); the reader thread lives until it closes stdout.
+
+**Checks at 5d11791:** fmt, clippy `-D warnings`, 560 unit tests; every integration test on Redis 7.4, Valkey 8.1 and Redis 6.2 (cli_config 4, compare 3, conn 29, diff 6, replica 11, scan_cli 11, scan 21, smoke 3, tls 6; os_trust 2 ignored locally). With the default thread count, test containers sometimes failed to start while another build ran on the machine; with `--test-threads=4` and `--no-fail-fast` everything passed on both images. The first full run also found a real bug, fixed in 5d11791: `MEMORY STATS` floats didn't always read back exactly from a snapshot, so serde_json's `float_roundtrip` feature is on, with a test using floats that fail without it.
+
+**Coverage (`make coverage`, unit + integration, at 5d11791):** 94.91% of lines (wave 8: 94.46%). New code: `conn/provider.rs` 100%, `format.rs` 100%, `diff.rs` 99.9%, `snapshot.rs` 98.8%, `check.rs` 97.6%, `scan/context.rs` 97.1%, `report/` 93-99%, `cli/compare.rs` 93.3%, `cli/trend.rs` 94.2%, `cli/snapshots.rs` 91.1%, `conn/token.rs` 88.8% (the Windows branch and the interactive prompt). Lowest: `tui/mod.rs` 68%, `secrets.rs` 77%, `cli/mod.rs` 78%.
+
+**How each item is covered** (the agents' change → test maps are in their reports; the verifier audits them):
+- `--check`: `check::tests` (every metric and op, the min-keys floor, not judged and `--strict`, growth with and without a baseline, the TOML file, parser errors, a parser proptest); `cli::tests::exit_codes`; `scan_cli_it` passing and failing gates, a growth rule against a saved baseline (Redis and Valkey).
+- Reports: `report::{md,html,csv}::tests` snapshots of each format and hostile names (`<script>`, `|`, `=cmd()`, newlines, backticks); `scan_cli_it` writing `--report md -o`.
+- Providers: `conn::provider::tests` (each provider and negatives, notices); the serverless rate in `scan::tests`; TUI notice snapshots in `tui::snapshot_tests_server`.
+- Server context: parser tests for `INFO keysizes`, `INFO keyspace` and `MEMORY STATS` with documented formats, plus proptests; `context_summary` lines and sampling-bias warnings; `scan_it` on real servers (also `redis:8` for `INFO keysizes`) and with `MEMORY STATS` denied by ACL; the Patterns strip snapshots.
+- Token command: `conn::token::tests` (success, timeout, non-zero exit, empty, too long, not UTF-8; Unix only); `conn add` with a token command (argv in the config, username only in the keychain, URL password refused, confirmation and `--yes`); `conn_it` connecting with a token command to a `requirepass` server and with an ACL user.
+- Retention and snapshots: `snapshot::tests` (keep only, days only, both, newest kept, other profiles' and foreign files and symlinks untouched); `cli::tests::prune_needs_a_retention_rule`; `diff_it` `scan --save --keep 2` over three scans.
+- Trend: sparkline and least-squares tests (empty, one point, flat, rising, gaps); Diff view snapshots with and without a trend column; stale-run tests unchanged.
+- Compare: `diff::tests` for the classification and ratios with zeros; `compare_it` on two seeded servers, checking neither was written to (Redis and Valkey).
+
+**Decisions taken in the wave (owner may revisit):**
+- `ServerContext` is a boxed newtype (`Deref` to its parts), so `ScanReport` doesn't grow by 176 bytes and trip clippy's `large_enum_variant` on the TUI messages. The JSON is unchanged.
+- The ElastiCache Serverless default budget is 1,000 commands/s. AWS publishes no figure; it is chosen from AWS's warning that frequent or large `SCAN`s raise latency there, and ECPU billing.
+- The trend reaches the TUI as its own `Msg::Trend` after `Msg::History`, through the same stale-run guard.
+- `scan --save --keep` into a profile directory that is a symlink saves the snapshot, then exits 1 with an "unsafe directory" error and deletes nothing.
+- `compare` compares the share of keys without a TTL on each side, not the full TTL histogram.
+- Markdown reports put pattern and key names in code spans, so a hostile name can't make a link or emphasis.
+
+**Follow-ups found in the wave (not done):**
+- Terminal escape sequences in key names reach the terminal in `scan`, `diff`, `trend` and `compare` output (verifier N7; from before this wave for `scan` and `diff`).
+- `compare` flags a TTL mismatch on patterns of any size (N6); the context strip's sampling-bias and `dataset.bytes` coverage figures are rough on large or multi-database servers (N4, N5).
+- Rule 1 (from wave 8): permission-check rows and `conn test` show the server's `NOPERM` text, which names the ACL user.
+- The provider table's starred cells (MemoryDB, Memorystore, node-based ElastiCache command lists, Azure Enterprise, China and US Government suffixes) and the AWS token tool's exact name were not checked against the services (no web access in the agent).
+- The token runner's unit tests are Unix-only; the interactive confirmation in `conn add` has no unit test (`--yes` and the no-terminal refusal do).
+- The GitHub Actions example has not been run on a real runner (the OS keychain may be missing there).
 
 ## Wave 8 (2026-11-11): usability
 
@@ -226,7 +300,7 @@ See the overnight table above.
 - Agent worktrees made by the harness branch from `main`, not the current branch, so create them by hand.
 - **Entra ID** is implemented behind `--features entra-id`, using redis-rs's `EntraIdCredentialsProvider::new_developer_tools()` (az login and other developer tools). It is untested against real Azure, and managed identity isn't covered yet.
 - `discover` shows the demo Redis as auth "required" (since wave 7; it was "none"), because its passwords live in an ACL file discovery can't see. Save it as a profile instead (`make demo-profiles`).
-- Narrow terminals: rows are drawn at fixed column widths and cut off at the right edge (the spec said "scroll horizontally" until wave 7; the owner chose truncation plus scrolling text on the selected row). Hiding low-priority columns at narrow widths is a candidate for the usability wave.
+- Narrow terminals: the Patterns view hides the share bar, then Δ, then avg size before cutting a row (wave 8); other views cut a row too wide at the right edge, and the selected row's overflowing text scrolls across.
 - For Redis ACL rules passed as server arguments, use one argument per word (`tests/common/mod.rs`).
 - `ParsedConnection.credentials` is `Some` with an empty password when a URL has a username but no password, so `conn add` can ask for `--password-stdin` or `--ask-password`.
 

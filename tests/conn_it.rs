@@ -8,8 +8,8 @@ use redis_lens::cli::conn as cli_conn;
 use redis_lens::config::Config;
 use redis_lens::conn::{self, check_permissions};
 use redis_lens::model::{
-    Auth, Credentials, Endpoint, Env, PERM_FREQ, PERM_INFO, PERM_LABELS, PERM_MEMORY, PERM_SCAN,
-    PERM_TYPE_TTL, PermStatus, PermissionReport, Profile,
+    Auth, ContextGap, Credentials, Endpoint, Env, PERM_FREQ, PERM_INFO, PERM_LABELS, PERM_MEMORY,
+    PERM_MEMORY_STATS, PERM_SCAN, PERM_TYPE_TTL, PermStatus, PermissionReport, Profile,
 };
 use redis_lens::secrets::{MemoryStore, SecretStore};
 use secrecy::{ExposeSecret, SecretString};
@@ -27,6 +27,8 @@ fn profile(name: &str, port: u16, auth: Auth) -> Profile {
         auth,
         read_only: None,
         prefer_replica: false,
+        provider: None,
+        token_command: None,
     }
 }
 
@@ -51,7 +53,7 @@ fn assert_labels_in_order(r: &PermissionReport) {
     assert_eq!(labels, PERM_LABELS);
 }
 
-const LENS_RULES: [&str; 20] = [
+const LENS_RULES: [&str; 21] = [
     "--user",
     "lens",
     "on",
@@ -71,6 +73,7 @@ const LENS_RULES: [&str; 20] = [
     "+pttl",
     "+memory|usage",
     "+object|freq",
+    "+memory|stats",
     "+auth",
 ];
 
@@ -179,7 +182,13 @@ async fn permissions_full_user_on_redis() {
     let mut conn = conn::connect(&p, &secrets).await.unwrap();
     let r = check_permissions(&mut conn).await;
     assert_labels_in_order(&r);
-    for l in [PERM_SCAN, PERM_TYPE_TTL, PERM_MEMORY, PERM_INFO] {
+    for l in [
+        PERM_SCAN,
+        PERM_TYPE_TTL,
+        PERM_MEMORY,
+        PERM_INFO,
+        PERM_MEMORY_STATS,
+    ] {
         assert_eq!(status(&r, l), &PermStatus::Allowed, "{l}");
     }
     assert!(
@@ -303,6 +312,9 @@ async fn conn_add_keeps_credentials_out_of_the_config_file() {
         entra: false,
         force: false,
         prefer_replica: false,
+        provider: None,
+        token_command: Vec::new(),
+        yes: false,
     };
     let msg = cli_conn::add(&path, &secrets, &args, Some("uniq-pw-4242\n".into()))
         .await
@@ -583,7 +595,7 @@ async fn conn_test_unknown_profile_is_an_error() {
 // ---------------------------------------------------------------------------
 
 /// The spec's line, word by word, with the password where it has `…`.
-const SPEC_RO_RULES: &str = "on >{PW} ~* resetchannels -@all +ping +hello +client|setinfo +client|setname +select +info +dbsize +scan +type +ttl +pttl +memory|usage +object|freq";
+const SPEC_RO_RULES: &str = "on >{PW} ~* resetchannels -@all +ping +hello +client|setinfo +client|setname +select +info +dbsize +scan +type +ttl +pttl +memory|usage +object|freq +memory|stats";
 
 #[tokio::test]
 async fn spec_minimal_read_only_user_can_connect_check_and_scan() {
@@ -632,5 +644,214 @@ async fn spec_minimal_read_only_user_can_connect_check_and_scan() {
             .unwrap_or_else(|e| panic!("valkey={valkey}: scan as lens-ro: {e}"));
         assert_eq!(report.sampled_keys, 20, "valkey={valkey}");
         assert!(report.sizes_available);
+        let ctx = report.server_context.expect("a server context");
+        assert!(
+            ctx.memory.and_then(|m| m.dataset_bytes).is_some(),
+            "valkey={valkey}"
+        );
+        assert_eq!(ctx.keyspace.map(|k| k.keys), Some(20), "valkey={valkey}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MEMORY STATS in the permission check
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn memory_stats_denied_by_acl_degrades_only_the_context() {
+    use redis_lens::scan::{ScanOptions, scan};
+    for valkey in [false, true] {
+        let server = common::server_with(valkey, &lens_args(Some("+memory|stats"), &[])).await;
+        seed(&server).await;
+        let secrets = MemoryStore::default();
+        let p = profile("nostats", server.port, Auth::Keychain);
+        secrets
+            .set(&p.secret_ref(), &creds(Some("lens"), "lens-pw"))
+            .unwrap();
+        let mut conn = conn::connect(&p, &secrets).await.unwrap();
+        let perms = check_permissions(&mut conn).await;
+        assert_labels_in_order(&perms);
+        assert!(
+            matches!(status(&perms, PERM_MEMORY_STATS), PermStatus::Denied(m) if m.starts_with("NOPERM")),
+            "valkey={valkey}: {:?}",
+            status(&perms, PERM_MEMORY_STATS)
+        );
+        for l in [PERM_SCAN, PERM_TYPE_TTL, PERM_MEMORY, PERM_INFO] {
+            assert_eq!(
+                status(&perms, l),
+                &PermStatus::Allowed,
+                "valkey={valkey}: {l}"
+            );
+        }
+        let report = scan(
+            "nostats",
+            &mut conn,
+            &ScanOptions::for_profile(&p),
+            &perms,
+            None,
+        )
+        .await
+        .expect("a denied MEMORY STATS must not fail the scan");
+        assert_eq!(report.sampled_keys, 1, "valkey={valkey}");
+        assert!(report.sizes_available);
+        let ctx = report.server_context.clone().unwrap();
+        assert_eq!(ctx.memory, None);
+        assert!(
+            ctx.missing.contains(&ContextGap::MemoryStatsDenied),
+            "{:?}",
+            ctx.missing
+        );
+        assert_eq!(ctx.keyspace.map(|k| k.keys), Some(1));
+        let summary = redis_lens::scan::context::context_summary(&report).join("\n");
+        assert!(summary.contains("MEMORY STATS is denied"), "{summary}");
+        // The snapshot keeps the fixed reason, never the server's text with the user.
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            !json.contains("NOPERM") && !json.contains("\"lens\""),
+            "{json}"
+        );
+
+        let path = temp_config(&format!("nostats-{valkey}"));
+        save_profile(&path, &p);
+        let out = cli_conn::test(&path, &secrets, "nostats").await.unwrap();
+        assert!(out.contains(&format!("✗ {PERM_MEMORY_STATS}")), "{out}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Token command (`auth = "command"`)
+// ---------------------------------------------------------------------------
+
+fn token_profile(name: &str, port: u16, argv: &[&str]) -> Profile {
+    let mut p = profile(name, port, Auth::Command);
+    p.token_command = Some(argv.iter().map(|s| s.to_string()).collect());
+    p
+}
+
+/// A `requirepass` server and a command that prints the password: connect, `conn test`
+/// and a scan work, and the token appears in no error, `Debug` text, config file or
+/// snapshot JSON.
+#[tokio::test]
+async fn token_command_authenticates_against_requirepass() {
+    use redis_lens::scan::{ScanOptions, scan};
+    let token = "tok-requirepass-48213";
+    for valkey in [false, true] {
+        let server = common::server_with(valkey, &["--requirepass", token]).await;
+        let mut admin = server.admin_as("default", token).await;
+        let _: () = redis::cmd("SET")
+            .arg("seed:1")
+            .arg("v")
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        let secrets = MemoryStore::default();
+        let p = token_profile("tok", server.port, &["printf", "%s", token]);
+
+        let mut c = conn::connect(&p, &secrets).await.unwrap();
+        ping(&mut c).await;
+
+        let (mut c, _) = conn::connect_for_scan(&p, &secrets).await.unwrap();
+        let perms = check_permissions(&mut c).await;
+        let report = scan("tok", &mut c, &ScanOptions::for_profile(&p), &perms, None)
+            .await
+            .unwrap();
+        assert_eq!(report.sampled_keys, 1, "valkey={valkey}");
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains(token), "{json}");
+        assert!(!format!("{report:?}").contains(token));
+
+        let path = temp_config(&format!("tok-{valkey}"));
+        save_profile(&path, &p);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#"auth = "command""#), "{text}");
+        assert!(
+            text.matches(token).count() == 1,
+            "only inside the argv the user wrote: {text}"
+        );
+        let out = cli_conn::test(&path, &secrets, "tok").await.unwrap();
+        assert!(out.starts_with("Connected to tok"), "{out}");
+        assert!(!out.contains(token), "{out}");
+
+        // A command that prints the wrong token: the server's error, without the token.
+        let wrong = "tok-wrong-77310";
+        let bad = token_profile("bad", server.port, &["printf", "%s", wrong]);
+        let e = conn::connect(&bad, &secrets).await.unwrap_err();
+        assert!(!e.to_string().contains(wrong), "{e}");
+        assert!(!format!("{e:?}").contains(wrong), "{e:?}");
+
+        // A command that fails: named, with its status, nothing it printed.
+        let failing = token_profile(
+            "fail",
+            server.port,
+            &["sh", "-c", "echo tok-leak-1; echo tok-leak-2 >&2; exit 4"],
+        );
+        let e = conn::connect(&failing, &secrets).await.unwrap_err();
+        let text = format!("{e} {e:?}");
+        assert!(text.contains("exit status 4"), "{text}");
+        assert!(!text.contains("tok-leak"), "{text}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}
+
+/// An ACL user whose username is in the keychain and whose password comes from the
+/// command, saved through `conn add` with `--yes`.
+#[tokio::test]
+async fn token_command_with_an_acl_username_from_the_keychain() {
+    let token = "tok-acl-pw-90127";
+    for valkey in [false, true] {
+        let rules = [
+            "--user",
+            "default",
+            "off",
+            "--user",
+            "iam-user-31",
+            "on",
+            ">tok-acl-pw-90127",
+            "~*",
+            "+@all",
+        ];
+        let server = common::server_with(valkey, &rules).await;
+        let path = temp_config(&format!("tok-acl-{valkey}"));
+        let secrets = MemoryStore::default();
+        let args = ConnAddArgs {
+            name: "iam".into(),
+            url: format!("redis://iam-user-31@127.0.0.1:{}", server.port),
+            env: None,
+            password_stdin: false,
+            ask_password: false,
+            entra: false,
+            force: true,
+            prefer_replica: false,
+            provider: None,
+            token_command: vec!["printf".into(), "%s".into(), token.into()],
+            yes: true,
+        };
+        let msg = cli_conn::add(&path, &secrets, &args, None).await.unwrap();
+        assert!(msg.contains("The username is in the OS keychain"), "{msg}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("iam-user-31"), "{text}");
+        let p = Config::load(&path).unwrap().get("iam").unwrap().clone();
+        assert_eq!(p.auth, Auth::Command);
+        let c = secrets.get(&p.secret_ref()).unwrap().unwrap();
+        assert_eq!(c.username.as_deref(), Some("iam-user-31"));
+        assert_eq!(c.password.expose_secret(), "", "the token is never stored");
+
+        let mut conn = conn::connect(&p, &secrets).await.unwrap();
+        let who: String = redis::cmd("ACL")
+            .arg("WHOAMI")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(who, "iam-user-31", "valkey={valkey}");
+        let out = cli_conn::test(&path, &secrets, "iam").await.unwrap();
+        assert!(out.starts_with("Connected to iam"), "{out}");
+
+        // Without the keychain username the token goes to the default user, which is off.
+        let e = conn::connect(&p, &MemoryStore::default())
+            .await
+            .unwrap_err();
+        assert!(!e.to_string().contains(token), "{e}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

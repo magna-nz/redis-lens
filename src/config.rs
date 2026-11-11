@@ -158,6 +158,8 @@ mod tests {
             auth: Auth::Keychain,
             read_only: Some(true),
             prefer_replica: false,
+            provider: None,
+            token_command: None,
         }
     }
 
@@ -219,6 +221,56 @@ mod tests {
         assert!(c.get("zzz").is_none());
         assert_eq!(c.remove("a").unwrap().name, "a");
         assert!(matches!(c.remove("a"), Err(ConfigError::NotFound(_))));
+    }
+
+    #[test]
+    fn token_command_and_provider_round_trip() {
+        use crate::model::Provider;
+        let dir = temp_dir("token");
+        let path = dir.join("config.toml");
+        let mut p = profile("az", 10000);
+        p.auth = Auth::Command;
+        p.provider = Some(Provider::Azure);
+        p.token_command = Some(vec![
+            "az".into(),
+            "account".into(),
+            "get-access-token".into(),
+            "--query".into(),
+            "accessToken".into(),
+        ]);
+        let mut c = Config::default();
+        c.add(p.clone(), false).unwrap();
+        c.add(profile("plain", 1), false).unwrap();
+        c.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#"auth = "command""#), "{text}");
+        assert!(text.contains(r#"provider = "azure""#), "{text}");
+        assert!(
+            text.contains(r#""az","#) || text.contains(r#""az""#),
+            "the argv is stored as an array: {text}"
+        );
+        // Absent for the profile without them.
+        assert_eq!(text.matches("token_command").count(), 1, "{text}");
+        assert_eq!(text.matches("provider").count(), 1, "{text}");
+        assert_eq!(Config::load(&path).unwrap(), c);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn old_files_without_the_new_fields_load() {
+        let dir = temp_dir("old");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[[profile]]\nname = \"x\"\nauth = \"keychain\"\n[profile.endpoint]\nhost = \"h\"\nport = 6379\n",
+        )
+        .unwrap();
+        let c = Config::load(&path).unwrap();
+        let p = c.get("x").unwrap();
+        assert_eq!(p.provider, None);
+        assert_eq!(p.token_command, None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

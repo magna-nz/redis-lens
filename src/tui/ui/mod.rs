@@ -8,8 +8,8 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Block;
 
-use crate::conn::ScanTarget;
 use crate::conn::parse::mask;
+use crate::conn::{ScanTarget, provider};
 use crate::format;
 use crate::model::{PERM_MEMORY, ScanReport, ServerFlavor, ServerInfo};
 
@@ -154,6 +154,7 @@ fn waiting(frame: &mut Frame, main: Rect, detail: Rect, app: &App, s: &Session, 
             if let Some(hint) = app.keychain_hint() {
                 lines.push(Line::from(Span::styled(format!(" {hint}"), style::amber())));
             }
+            provider_notice(&mut lines, p);
         }
         Phase::Scanning | Phase::Done => {
             let pr = s.progress.unwrap_or_default();
@@ -183,10 +184,19 @@ fn waiting(frame: &mut Frame, main: Rect, detail: Rect, app: &App, s: &Session, 
                 Span::styled(fill, style::amber()),
                 Span::styled(track, style::track()),
             ]));
+            provider_notice(&mut lines, p);
         }
     }
     rows(frame, inner, lines, None);
     panel(frame, detail, "Details", "");
+}
+
+/// A blank line and the profile's provider notice (see [`provider::notice`]), if any.
+fn provider_notice(lines: &mut Vec<Line<'static>>, p: &crate::model::Profile) {
+    if let Some(n) = provider::notice(p.provider) {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(format!(" ▲ {n}"), style::amber())));
+    }
 }
 
 /// A panel holding a few lines of explanation, with an empty detail panel below.

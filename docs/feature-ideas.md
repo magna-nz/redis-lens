@@ -40,7 +40,11 @@ Where redis-lens already leads: live `SCAN` plus `MEMORY USAGE` sampling, patter
 
 # Quick wins
 
+All seven were built in the quick-wins wave (2026-11-11); each item says what shipped and how it differs from the proposal.
+
 ## 1. `--check` thresholds and exit codes for CI and pre-deploy gates
+
+**Built** (quick-wins wave, PR after #12): `scan --check`, `--rules FILE`, `--strict`, exit codes 0/1/2. Differs from the proposal: no `--webhook`; the "any pattern above X bytes" rule is `pattern-bytes`; `growth` uses the saved-snapshot baseline with the same `MATCH` glob, so CI needs snapshots kept between runs; a per-rule `min-keys` floor (default 50) keeps small patterns from flapping; production profiles get a stderr warning and keep the command budget. A GitHub Actions example is in the README.
 
 **Pitch:** `redis-lens scan staging --check 'no-ttl-pct<20' --check 'growth<25%'` exits non-zero when a rule fails, so a pipeline can block a deploy.
 
@@ -64,6 +68,8 @@ Where redis-lens already leads: live `SCAN` plus `MEMORY USAGE` sampling, patter
 
 ## 2. Report export: Markdown, HTML and CSV
 
+**Built** (quick-wins wave): `scan --report md|html|csv [-o FILE] [--examples]`. Differs: example keys are off by default and `--examples` turns them on (owner decision), instead of a `--no-examples` flag; TTL risks and the server context lines are included; HTML has a sortable table and share bars with no external requests (a CSP meta tag); Markdown puts names in code spans so hostile key names can't form links.
+
 **Pitch:** `redis-lens scan prod --report md|html|csv -o report.md` produces a shareable file for a PR comment, ticket or review.
 
 **Why:**
@@ -80,6 +86,8 @@ Where redis-lens already leads: live `SCAN` plus `MEMORY USAGE` sampling, patter
 **Risks:** Example key names can contain user ids or emails. Default to examples off in reports, on in the TUI.
 
 ## 3. Provider detection and honest degradation on managed services
+
+**Built** (quick-wins wave): `conn::provider::classify` (ElastiCache, ElastiCache Serverless, MemoryDB, Azure; Memorystore by `--provider` only), the `provider` profile field set by `conn add` and shown by `conn list`, one-line notices in the TUI, `scan`, `conn add` and `conn test`, and a 1,000 commands/s default budget on ElastiCache Serverless. The permission check stays authoritative. The what-works-where table is in the README; cells not checked against the services are starred.
 
 **Pitch:** Recognise ElastiCache, MemoryDB, Memorystore and Azure by host name, and explain which views will be empty and why before the scan runs.
 
@@ -100,6 +108,8 @@ Where redis-lens already leads: live `SCAN` plus `MEMORY USAGE` sampling, patter
 
 ## 4. Server context strip: `INFO keysizes`, `INFO keyspace`, `MEMORY STATS`
 
+**Built** (quick-wins wave): the scan reads `INFO keyspace`, `INFO keysizes` (by presence) and `MEMORY STATS` (when the probe allows; a new `MEMORY STATS` permission check, and `+memory|stats` in the sample ACL line) into `ScanReport.server_context`. `scan::context::context_summary` and a strip on the Patterns table's bottom border show how much of `dataset.bytes` the sample explains, exact key counts, big keys, and sampling-bias warnings. Checked on a live 7.4 server: `subexpiry` counts keys with field-level TTLs (`HEXPIRE`). Integration tests also run on `redis:8` for real `INFO keysizes`. Not built: the per-db `overhead.hashtable.main` figure.
+
 **Pitch:** Show exact server-side facts next to the sampled estimates, so users can see how much of used memory the sample explains.
 
 **Why:**
@@ -119,6 +129,8 @@ Where redis-lens already leads: live `SCAN` plus `MEMORY USAGE` sampling, patter
 **Risks:** The `keysizes` version boundary is not verified, so feature-detect by section presence, not version. `MEMORY STATS` fields vary by version (some are 7.4+), so parse tolerantly.
 
 ## 5. External token command for passwordless auth (covers GCP, AWS and Azure today)
+
+**Built** (quick-wins wave): `conn add … -- <argv>` saves `auth = "command"` and `token_command`, after a confirmation (`--yes` skips it). Differs from the proposal: the username stays in the OS keychain, not the config file (rule 1). At every connect and rescan the command runs without a shell, with stdin closed, stderr dropped, a 10 s timeout and a 64 KiB cap; the token stays in a `SecretString`, and errors name only the program and its exit status. No mid-session refresh in the TUI: a rescan runs the command again.
 
 **Pitch:** A profile can say `auth = command` with a shell command that prints a short-lived token; redis-lens runs it at connect time and never stores the token.
 
@@ -143,6 +155,8 @@ Where redis-lens already leads: live `SCAN` plus `MEMORY USAGE` sampling, patter
 
 ## 6. Snapshot retention and trend view
 
+**Built** (quick-wins wave): `scan --save --keep/--keep-days`, `snapshots list|prune` (prune needs `--keep` or `--keep-days` and `--yes`, and only touches files redis-lens wrote for that profile), `trend` with a sparkline and least-squares growth, and a trend column in the Diff view. Partial scans are included in trends and marked rather than left out. The cron example is in the README.
+
 **Pitch:** Make "scheduled snapshots" work without a daemon: `scan --save --keep 30`, `snapshots list|prune`, and a trend column in the Diff view.
 
 **Why:**
@@ -161,6 +175,8 @@ Where redis-lens already leads: live `SCAN` plus `MEMORY USAGE` sampling, patter
 **Risks:** Deleting snapshots is the first destructive action in the tool; confine it to the snapshot directory and require `--yes` on `prune`.
 
 ## 7. Compare two instances (staging vs prod)
+
+**Built** (quick-wins wave), standalone: `redis-lens compare <left> <right>` with `--left-file`/`--right-file`. It leads with shares and ratios, shows sample fractions, and flags "no TTL on one side, set on the other". The "TTL distribution difference" is the no-TTL share per side, not the full histogram.
 
 **Pitch:** `redis-lens compare staging prod` diffs patterns across two profiles, so "does staging look like prod?" has an answer.
 

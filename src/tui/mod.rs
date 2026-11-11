@@ -39,6 +39,9 @@ pub mod ui;
 mod fixtures;
 #[cfg(test)]
 mod snapshot_tests;
+/// Snapshots of the provider notices and the server context strip (quick-wins agent C).
+#[cfg(test)]
+mod snapshot_tests_server;
 
 use app::{App, ConnId, Effect, Msg, ScanId, SecretSource};
 use clipboard::CopyText;
@@ -240,6 +243,20 @@ impl Runner {
                             result,
                         },
                     );
+                    // A failure is already reported through the history; without a
+                    // trend the Diff view just has no trend column.
+                    let trend = snapshot::default_dir()
+                        .ok()
+                        .and_then(|dir| load_trend(&dir, &report).ok());
+                    send(
+                        &tx,
+                        Msg::Trend {
+                            id,
+                            scan,
+                            taken_at_unix,
+                            trend,
+                        },
+                    );
                 });
             }
             Effect::SaveSnapshot(report) => {
@@ -267,6 +284,20 @@ fn load_history(report: &ScanReport) -> Result<Option<diff::ReportDiff>, snapsho
         report.match_glob.as_deref(),
     )?;
     Ok(prev.map(|p| diff::diff(&p, report)))
+}
+
+/// The trend over the [`app::TREND_SNAPSHOTS`] newest snapshots in `dir` taken before
+/// `report` with its `MATCH` glob, with `report` itself as the last point.
+fn load_trend(dir: &Path, report: &ScanReport) -> Result<snapshot::Trend, snapshot::SnapshotError> {
+    let mut reports = snapshot::recent_matching(
+        dir,
+        &report.profile,
+        report.taken_at_unix,
+        report.match_glob.as_deref(),
+        app::TREND_SNAPSHOTS,
+    )?;
+    reports.push(report.clone());
+    Ok(snapshot::trend(&reports))
 }
 
 /// Save a new profile the way `conn add` does: credentials to the keychain first, so
@@ -492,6 +523,39 @@ mod tests {
             .join("config.toml")
     }
 
+    #[test]
+    fn trend_uses_the_earlier_snapshots_with_the_same_glob() {
+        let dir = temp_path("trend").parent().unwrap().to_path_buf();
+        let report = fixtures::report(true);
+        let t0 = report.taken_at_unix;
+        // Nine earlier snapshots a day apart, one with another glob, one newer than the scan.
+        for d in 1..=9 {
+            let mut r = report.clone();
+            r.taken_at_unix = t0 - d * 86_400;
+            if d == 2 {
+                r.match_glob = Some("user:*".into());
+            }
+            snapshot::save(&dir, &r).unwrap();
+        }
+        let mut newer = report.clone();
+        newer.taken_at_unix = t0 + 60;
+        snapshot::save(&dir, &newer).unwrap();
+        let t = load_trend(&dir, &report).unwrap();
+        let at: Vec<i64> = t.points.iter().map(|p| p.taken_at_unix).collect();
+        // Seven earlier ones without a glob (day 2 skipped, days 9.. too old), then the scan.
+        let expect: Vec<i64> = [8, 7, 6, 5, 4, 3, 1]
+            .iter()
+            .map(|d| t0 - d * 86_400)
+            .chain([t0])
+            .collect();
+        assert_eq!(at, expect);
+        assert_eq!(t.points.len(), app::TREND_SNAPSHOTS + 1);
+        // Nothing saved yet: the scan alone.
+        let empty = temp_path("trend-empty").parent().unwrap().to_path_buf();
+        assert_eq!(load_trend(&empty, &report).unwrap().points.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn profile(name: &str) -> Profile {
         Profile {
             name: name.into(),
@@ -505,6 +569,8 @@ mod tests {
             auth: Auth::Keychain,
             read_only: None,
             prefer_replica: false,
+            provider: None,
+            token_command: None,
         }
     }
 

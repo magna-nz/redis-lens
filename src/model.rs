@@ -214,6 +214,127 @@ pub struct ScanReport {
     /// The `SCAN MATCH` glob the scan used, if any.
     #[serde(default)]
     pub match_glob: Option<String>,
+    /// Exact server-side figures (`INFO keysizes`, `INFO keyspace`, `MEMORY STATS`) to
+    /// set beside the sampled estimates. `None` in snapshots written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_context: Option<ServerContext>,
+}
+
+/// Exact figures the server reports about itself: a [`ServerContextParts`], boxed so a
+/// [`ScanReport`] stays small (it travels in the TUI's messages). Reads and writes its
+/// fields through `Deref`; serialized as the parts themselves.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ServerContext(pub Box<ServerContextParts>);
+
+impl std::ops::Deref for ServerContext {
+    type Target = ServerContextParts;
+    fn deref(&self) -> &ServerContextParts {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ServerContext {
+    fn deref_mut(&mut self) -> &mut ServerContextParts {
+        &mut self.0
+    }
+}
+
+impl From<ServerContextParts> for ServerContext {
+    fn from(parts: ServerContextParts) -> Self {
+        Self(Box::new(parts))
+    }
+}
+
+/// The parts of a [`ServerContext`]. Each part is optional: a section the server doesn't
+/// have (`INFO keysizes` before Redis 8, Valkey) or a command it refuses (`MEMORY STATS`
+/// on managed services) leaves it out, and [`ServerContextParts::missing`] says why.
+/// Holds counts and sizes only: never key names, server error text or anything else
+/// that could carry a username.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServerContextParts {
+    /// The scanned database's line of `INFO keyspace`. A database with no keys has no
+    /// line, which reads as all zeros. `None` when `INFO keyspace` failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyspace: Option<KeyspaceInfo>,
+    /// `MEMORY STATS`, when the permission check allowed it and the server answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryStats>,
+    /// The scanned database's histograms from `INFO keysizes`, one per type the server
+    /// reports, when the server has the section. Empty when it has the section but the
+    /// database has no keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keysizes: Option<Vec<KeysizeHistogram>>,
+    /// Why a part is missing, in the order the parts are read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<ContextGap>,
+}
+
+/// One `dbN:keys=…,expires=…,avg_ttl=…[,subexpiry=…]` line of `INFO keyspace`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyspaceInfo {
+    pub db: u32,
+    pub keys: u64,
+    /// Keys with a TTL.
+    pub expires: u64,
+    /// Average TTL of the keys with one, in milliseconds (an estimate the server keeps).
+    pub avg_ttl_ms: u64,
+    /// Keys with field-level expiry (hash fields with a TTL). Redis 7.4 and later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subexpiry: Option<u64>,
+}
+
+/// The `MEMORY STATS` fields redis-lens uses. Each one is optional: fields differ
+/// between versions and servers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemoryStats {
+    /// `dataset.bytes`: used memory minus the server's own overhead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_bytes: Option<u64>,
+    /// `overhead.total`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overhead_total: Option<u64>,
+    /// `keys.count`, over every database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys_count: Option<u64>,
+    /// `keys.bytes-per-key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_per_key: Option<u64>,
+    /// `fragmentation`: resident memory over allocated memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragmentation: Option<f64>,
+}
+
+/// One `dbN_distrib_<type>_<unit>` line of `INFO keysizes`: a base-2 histogram that
+/// the server keeps exactly, not a sample.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeysizeHistogram {
+    /// The type as the server names it: `strings`, `lists`, `sets`, `zsets`, `hashes`.
+    pub key_type: String,
+    /// `sizes` (string length in bytes) or `items` (elements in a collection).
+    pub unit: String,
+    /// `(lower bound, keys)`, ascending. A bin holds sizes from its bound up to, not
+    /// including, twice the bound (the `0` bin holds only 0).
+    pub bins: Vec<(u64, u64)>,
+}
+
+/// Why part of [`ServerContext`] is missing. Fixed reasons, never the server's error
+/// text, which can name the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContextGap {
+    /// `INFO keyspace` failed.
+    KeyspaceUnavailable,
+    /// The permission check did not allow `MEMORY STATS` (`NOPERM`).
+    MemoryStatsDenied,
+    /// The server does not have `MEMORY STATS` or refused it with something other
+    /// than `NOPERM` (managed services), or its reply could not be read.
+    MemoryStatsUnavailable,
+    /// The server has no `INFO keysizes` section (Redis before 8, Valkey).
+    NoKeysizes,
+    /// A reason written by a newer version.
+    #[serde(other)]
+    Other,
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +394,27 @@ pub enum Auth {
     Keychain,
     /// Microsoft Entra ID through the redis-rs developer-tools credential chain (az login and similar). Needs the `entra-id` feature.
     EntraId,
+    /// A short-lived token printed by [`Profile::token_command`], run at every connect
+    /// and sent as the password. The username, if any, is in the OS keychain under
+    /// [`Profile::secret_ref`] (rule 1); the token is never stored anywhere.
+    Command,
+}
+
+/// A managed service recognised from the host name, or set by hand. A hint only: the
+/// permission check stays authoritative for what works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Provider {
+    /// Amazon ElastiCache (node-based).
+    Elasticache,
+    /// Amazon ElastiCache Serverless: `MEMORY USAGE` and `OBJECT FREQ` are restricted.
+    ElasticacheServerless,
+    /// Amazon MemoryDB.
+    Memorydb,
+    /// Azure Cache for Redis or Azure Managed Redis.
+    Azure,
+    /// Google Cloud Memorystore (private IPs, so only ever set by hand).
+    Memorystore,
 }
 
 /// A saved connection, as written to the config file.
@@ -295,6 +437,13 @@ pub struct Profile {
     /// Scan a replica of this server instead of the primary, when one is reachable.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prefer_replica: bool,
+    /// The managed service this profile is on, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Provider>,
+    /// For [`Auth::Command`]: the program and its arguments (never a shell string),
+    /// whose standard output is the token. Not a secret; the token it prints is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_command: Option<Vec<String>>,
 }
 
 /// Service name for every keychain entry this tool creates.
@@ -348,7 +497,17 @@ pub const PERM_TYPE_TTL: &str = "TYPE · TTL";
 pub const PERM_MEMORY: &str = "MEMORY USAGE";
 pub const PERM_FREQ: &str = "OBJECT FREQ";
 pub const PERM_INFO: &str = "INFO";
-pub const PERM_LABELS: [&str; 5] = [PERM_SCAN, PERM_TYPE_TTL, PERM_MEMORY, PERM_FREQ, PERM_INFO];
+/// `MEMORY STATS`, for the server context. Optional: without it only the dataset
+/// figures are missing.
+pub const PERM_MEMORY_STATS: &str = "MEMORY STATS";
+pub const PERM_LABELS: [&str; 6] = [
+    PERM_SCAN,
+    PERM_TYPE_TTL,
+    PERM_MEMORY,
+    PERM_FREQ,
+    PERM_INFO,
+    PERM_MEMORY_STATS,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermStatus {
@@ -439,12 +598,23 @@ mod tests {
             auth: Auth::None,
             read_only: None,
             prefer_replica: false,
+            provider: None,
+            token_command: None,
         };
         assert!(p.is_read_only());
         p.env = Env::Local;
         assert!(!p.is_read_only());
         p.read_only = Some(true);
         assert!(p.is_read_only());
+    }
+
+    /// A report travels in the TUI's messages; a context adds one pointer to it.
+    #[test]
+    fn server_context_is_a_pointer() {
+        assert_eq!(
+            std::mem::size_of::<Option<ServerContext>>(),
+            std::mem::size_of::<usize>()
+        );
     }
 
     #[test]
@@ -472,6 +642,8 @@ mod tests {
             auth: Auth::Keychain,
             read_only: None,
             prefer_replica: false,
+            provider: None,
+            token_command: None,
         };
         let text = toml::to_string(&p).unwrap();
         for word in ["password", "username", "user", "secret", "token"] {

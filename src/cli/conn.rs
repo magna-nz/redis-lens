@@ -4,7 +4,7 @@
 //! [`SecretStore`] so tests can run them against a temp dir and a `MemoryStore`;
 //! `run` and `discover` wire them to the real keychain.
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -13,7 +13,8 @@ use secrecy::{ExposeSecret, SecretString};
 use super::{ConnAddArgs, ConnCommand};
 use crate::config::Config;
 use crate::conn::docker::DiscoveredInstance;
-use crate::conn::{self, parse_connection_string};
+use crate::conn::token::display_command;
+use crate::conn::{self, parse_connection_string, provider};
 use crate::model::{Auth, Credentials, PermStatus, Profile, SecretRef};
 use crate::secrets::{KeyringStore, SecretError, SecretStore};
 
@@ -145,6 +146,52 @@ pub async fn add_with(
     warn: &mut dyn std::io::Write,
     prompt: &dyn Fn() -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
+    add_confirmed(
+        path,
+        secrets,
+        args,
+        stdin_password,
+        warn,
+        prompt,
+        &confirm_on_terminal,
+    )
+    .await
+}
+
+/// Ask on the terminal whether to save `command` as the profile's token command. Without
+/// a terminal there is no one to ask, so it refuses: pass `--yes` in scripts.
+fn confirm_on_terminal(command: &str) -> anyhow::Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "saving a token command needs confirmation, and standard input is not a terminal; \
+             pass --yes to save it without asking"
+        );
+    }
+    eprintln!(
+        "This profile will run this command at every connect and send what it prints as \
+         the password:\n  {command}\nIt is run directly, not through a shell. Save it? [y/N] "
+    );
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("could not read the answer")?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// [`add_with`] with the token-command confirmation injected too. `confirm` gets the
+/// command as it would be typed and is only called for a token command without `--yes`.
+pub async fn add_confirmed(
+    path: &Path,
+    secrets: &dyn SecretStore,
+    args: &ConnAddArgs,
+    stdin_password: Option<String>,
+    warn: &mut dyn std::io::Write,
+    prompt: &dyn Fn() -> anyhow::Result<String>,
+    confirm: &dyn Fn(&str) -> anyhow::Result<bool>,
+) -> anyhow::Result<String> {
     if has_docker_prefix(&args.name) {
         bail!("names starting with {DOCKER_PREFIX} are reserved for discovered containers");
     }
@@ -166,7 +213,39 @@ pub async fn add_with(
         None => (None, None),
     };
 
-    let (auth, creds) = if args.entra {
+    let token_command = (!args.token_command.is_empty()).then(|| args.token_command.clone());
+    let (auth, creds) = if let Some(cmd) = &token_command {
+        if args.entra {
+            bail!("--entra and a token command are two ways to sign in; give one of them");
+        }
+        if args.password_stdin || args.ask_password {
+            bail!(
+                "a token command replaces the password; leave out --password-stdin and --ask-password"
+            );
+        }
+        if url_password.is_some() {
+            bail!(
+                "the URL has a password and there is a token command; the token is sent as the password, \
+                 so take the password out of the URL"
+            );
+        }
+        if cmd[0].trim().is_empty() {
+            bail!("the token command after -- must start with a program");
+        }
+        let shown = display_command(cmd);
+        if !args.yes && !confirm(&shown)? {
+            bail!("not saved: the token command was not confirmed");
+        }
+        // Only a username from the URL goes to the keychain; without one there is no
+        // entry at all.
+        (
+            Auth::Command,
+            url_user.map(|u| Credentials {
+                username: Some(u),
+                password: SecretString::from(String::new()),
+            }),
+        )
+    } else if args.entra {
         (Auth::EntraId, None)
     } else {
         let password: Option<SecretString> = if let Some(p) = url_password {
@@ -199,6 +278,10 @@ pub async fn add_with(
         }
     };
 
+    let provider = args
+        .provider
+        .map(Into::into)
+        .or_else(|| provider::classify(&parsed.endpoint.host));
     let profile = Profile {
         name: args.name.clone(),
         env: args.env.map(Into::into).unwrap_or(parsed.env_guess),
@@ -207,6 +290,8 @@ pub async fn add_with(
         auth,
         read_only: None,
         prefer_replica: args.prefer_replica,
+        provider,
+        token_command,
     };
 
     let r = profile.secret_ref();
@@ -222,7 +307,7 @@ pub async fn add_with(
             // Switching to no stored credentials: the old entry goes only once the
             // config no longer points at it.
             save()?;
-            if existing.is_some_and(|e| e.auth == Auth::Keychain) {
+            if existing.is_some_and(|e| matches!(e.auth, Auth::Keychain | Auth::Command)) {
                 secrets.delete(&r).context(
                     "the profile was saved, but its old keychain entry could not be deleted",
                 )?;
@@ -236,8 +321,24 @@ pub async fn add_with(
         profile.endpoint,
         profile.env.label()
     );
-    if creds.is_some() {
-        msg.push_str(" Credentials are in the OS keychain.");
+    match (&profile.token_command, &creds) {
+        (Some(cmd), c) => {
+            msg.push_str(&format!(
+                " Token command: {}. It runs at every connect.",
+                display_command(cmd)
+            ));
+            if c.is_some() {
+                msg.push_str(" The username is in the OS keychain.");
+            }
+        }
+        (None, Some(_)) => msg.push_str(" Credentials are in the OS keychain."),
+        (None, None) => {}
+    }
+    if let Some(p) = profile.provider {
+        msg.push_str(&format!(" Provider: {}.", provider::label(p)));
+        if let Some(n) = provider::notice(Some(p)) {
+            msg.push_str(&format!("\n{n}"));
+        }
     }
     Ok(msg)
 }
@@ -278,6 +379,7 @@ fn auth_label(a: Auth) -> &'static str {
         Auth::None => "none",
         Auth::Keychain => "keychain",
         Auth::EntraId => "entra-id",
+        Auth::Command => "command",
     }
 }
 
@@ -297,10 +399,14 @@ pub fn list(path: &Path) -> anyhow::Result<String> {
                 p.endpoint.to_string(),
                 if p.endpoint.tls { "tls" } else { "plain" }.to_string(),
                 auth_label(p.auth).to_string(),
+                p.provider.map_or("", provider::label).to_string(),
             ]
         })
         .collect();
-    Ok(table(&["NAME", "ENV", "ENDPOINT", "TLS", "AUTH"], &rows))
+    Ok(table(
+        &["NAME", "ENV", "ENDPOINT", "TLS", "AUTH", "PROVIDER"],
+        &rows,
+    ))
 }
 
 /// Remove a profile from the config, then its keychain entry. The entry is deleted
@@ -329,6 +435,14 @@ pub async fn test(path: &Path, secrets: &dyn SecretStore, name: &str) -> anyhow:
         profile.endpoint,
         profile.env.label()
     )];
+    if let Some(p) = profile.provider {
+        let mut line = format!("Provider: {}.", provider::label(p));
+        if let Some(n) = provider::notice(Some(p)) {
+            line.push(' ');
+            line.push_str(n);
+        }
+        lines.push(line);
+    }
     for c in &report.checks {
         lines.push(match &c.status {
             PermStatus::Allowed => format!("  ✓ {}", c.label),
@@ -389,6 +503,9 @@ mod tests {
             entra: false,
             force: false,
             prefer_replica: false,
+            provider: None,
+            token_command: Vec::new(),
+            yes: false,
         }
     }
 
@@ -740,6 +857,302 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    fn token_args(name: &str, url: &str, cmd: &[&str]) -> ConnAddArgs {
+        let mut a = args(name, url);
+        a.token_command = cmd.iter().map(|s| s.to_string()).collect();
+        a
+    }
+
+    const AZ: [&str; 9] = [
+        "az",
+        "account",
+        "get-access-token",
+        "--resource",
+        "https://redis.azure.com",
+        "--query",
+        "accessToken",
+        "-o",
+        "tsv",
+    ];
+
+    async fn add_token(
+        path: &Path,
+        store: &MemoryStore,
+        a: &ConnAddArgs,
+        confirm: &dyn Fn(&str) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<String> {
+        let no_prompt = || -> anyhow::Result<String> { panic!("no password prompt expected") };
+        add_confirmed(path, store, a, None, &mut Vec::new(), &no_prompt, confirm).await
+    }
+
+    fn never(_: &str) -> anyhow::Result<bool> {
+        panic!("no confirmation expected")
+    }
+
+    /// Replacing a password profile with a token command that has no username leaves
+    /// no keychain entry behind: the old username and password are deleted.
+    #[tokio::test]
+    async fn replacing_with_a_token_command_without_a_username_deletes_the_old_entry() {
+        let path = temp_path("token-replace");
+        let store = MemoryStore::default();
+        add(&path, &store, &args("c", "redis://u:old-pw@h"), None)
+            .await
+            .unwrap();
+        assert!(entry(&store, "c").is_some());
+        let mut a = token_args("c", "rediss://h2:6380", &["printf", "tok"]);
+        a.force = true;
+        a.yes = true;
+        add_token(&path, &store, &a, &never).await.unwrap();
+        assert_eq!(entry(&store, "c"), None);
+        let p = Config::load(&path).unwrap().get("c").unwrap().clone();
+        assert_eq!(p.auth, Auth::Command);
+        assert_eq!(p.token_command, Some(vec!["printf".into(), "tok".into()]));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The same from a token-command profile with a username: replacing it with one
+    /// without a username removes the old username from the keychain too.
+    #[tokio::test]
+    async fn replacing_a_token_profile_with_a_username_deletes_the_old_username() {
+        let path = temp_path("token-replace-user");
+        let store = MemoryStore::default();
+        let mut first = token_args("c", "rediss://old-oid-77@h:6380", &["printf", "tok"]);
+        first.yes = true;
+        add_token(&path, &store, &first, &never).await.unwrap();
+        assert!(
+            entry(&store, "c").is_some(),
+            "the username is in the keychain"
+        );
+        let mut second = token_args("c", "rediss://h:6380", &["printf", "tok2"]);
+        second.force = true;
+        second.yes = true;
+        add_token(&path, &store, &second, &never).await.unwrap();
+        assert_eq!(entry(&store, "c"), None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn token_command_goes_to_the_config_and_the_username_to_the_keychain() {
+        let path = temp_path("token-user");
+        let store = MemoryStore::default();
+        let a = token_args(
+            "az",
+            "rediss://3f1c0a2e-uniq-oid@contoso.eastus.redis.azure.net:10000",
+            &AZ,
+        );
+        let asked = std::cell::RefCell::new(Vec::new());
+        let confirm = |cmd: &str| -> anyhow::Result<bool> {
+            asked.borrow_mut().push(cmd.to_string());
+            Ok(true)
+        };
+        let msg = add_token(&path, &store, &a, &confirm).await.unwrap();
+        assert_eq!(
+            asked.borrow().as_slice(),
+            [
+                "az account get-access-token --resource https://redis.azure.com --query accessToken -o tsv"
+            ]
+        );
+        assert!(
+            msg.contains("Token command: az account get-access-token"),
+            "{msg}"
+        );
+        assert!(msg.contains("The username is in the OS keychain."), "{msg}");
+        assert!(msg.contains("Provider: Azure."), "{msg}");
+        assert!(!msg.contains("3f1c0a2e-uniq-oid"), "{msg}");
+
+        let p = Config::load(&path).unwrap().get("az").unwrap().clone();
+        assert_eq!(p.auth, Auth::Command);
+        assert_eq!(
+            p.token_command,
+            Some(AZ.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        );
+        assert_eq!(p.provider, Some(crate::model::Provider::Azure));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#"auth = "command""#), "{text}");
+        assert!(text.contains("token_command = ["), "{text}");
+        assert!(!text.contains("3f1c0a2e-uniq-oid"), "{text}");
+        assert!(
+            !text.contains("password") && !text.contains("username"),
+            "{text}"
+        );
+        let c = store.get(&p.secret_ref()).unwrap().unwrap();
+        assert_eq!(c.username.as_deref(), Some("3f1c0a2e-uniq-oid"));
+        assert_eq!(c.password.expose_secret(), "");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn token_command_without_a_username_makes_no_keychain_entry() {
+        let path = temp_path("token-nouser");
+        let store = MemoryStore::default();
+        // A keychain profile first: switching it to a token command deletes its entry.
+        add(
+            &path,
+            &store,
+            &args("gcp", "redis://u:old-pw@10.0.0.5:6379"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(entry(&store, "gcp").is_some());
+        let mut a = token_args(
+            "gcp",
+            "redis://10.0.0.5:6379",
+            &["gcloud", "auth", "print-access-token"],
+        );
+        a.yes = true;
+        a.force = true;
+        a.provider = Some(crate::cli::ProviderArg::Memorystore);
+        let msg = add_token(&path, &store, &a, &never).await.unwrap();
+        assert!(!msg.contains("keychain"), "{msg}");
+        assert!(msg.contains("Provider: Memorystore."), "{msg}");
+        assert_eq!(entry(&store, "gcp"), None);
+        let p = Config::load(&path).unwrap().get("gcp").unwrap().clone();
+        assert_eq!(p.auth, Auth::Command);
+        assert_eq!(p.provider, Some(crate::model::Provider::Memorystore));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("old-pw"), "{text}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn token_command_must_be_confirmed() {
+        let path = temp_path("token-confirm");
+        let store = MemoryStore::default();
+        let a = token_args("t", "redis://svc@h", &["printf", "x"]);
+        let no = |_: &str| -> anyhow::Result<bool> { Ok(false) };
+        let e = add_token(&path, &store, &a, &no).await.unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "not saved: the token command was not confirmed"
+        );
+        assert!(!path.exists());
+        assert_eq!(entry(&store, "t"), None);
+        // No terminal: the prompt refuses, and nothing is saved.
+        let refuse = |_: &str| -> anyhow::Result<bool> {
+            bail!("standard input is not a terminal; pass --yes")
+        };
+        assert!(add_token(&path, &store, &a, &refuse).await.is_err());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn token_command_conflicts() {
+        let path = temp_path("token-conflict");
+        let store = MemoryStore::default();
+        let cmd = ["printf", "x"];
+        // A password in the URL: an error that does not repeat it.
+        let mut a = token_args("t", "redis://u:url-pw-777@h", &cmd);
+        a.yes = true;
+        let e = add_token(&path, &store, &a, &never)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("password"), "{e}");
+        assert!(!e.contains("url-pw-777"), "{e}");
+        let mut a = token_args("t", "redis://h", &cmd);
+        a.yes = true;
+        a.password_stdin = true;
+        assert!(add_token(&path, &store, &a, &never).await.is_err());
+        a.password_stdin = false;
+        a.entra = true;
+        assert!(add_token(&path, &store, &a, &never).await.is_err());
+        let mut a = token_args("t", "redis://h", &["", "x"]);
+        a.yes = true;
+        assert!(add_token(&path, &store, &a, &never).await.is_err());
+        assert!(!path.exists());
+        assert_eq!(entry(&store, "t"), None);
+    }
+
+    #[tokio::test]
+    async fn provider_comes_from_the_host_or_the_flag() {
+        let path = temp_path("provider");
+        let store = MemoryStore::default();
+        let msg = add(
+            &path,
+            &store,
+            &args(
+                "sls",
+                "rediss://c-1a2b3c.serverless.use1.cache.amazonaws.com:6379",
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(msg.contains("Provider: ElastiCache Serverless."), "{msg}");
+        assert!(msg.contains("restricts MEMORY and OBJECT"), "{msg}");
+        add(
+            &path,
+            &store,
+            &args(
+                "ec",
+                "rediss://master.c.abc123.use1.cache.amazonaws.com:6379",
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        // The flag wins over the host name.
+        let mut a = args("gcp", "redis://10.0.0.5:6379");
+        a.provider = Some(crate::cli::ProviderArg::Memorystore);
+        add(&path, &store, &a, None).await.unwrap();
+        let mut a = args(
+            "forced",
+            "rediss://master.c.abc123.use1.cache.amazonaws.com:6379",
+        );
+        a.provider = Some(crate::cli::ProviderArg::ElasticacheServerless);
+        add(&path, &store, &a, None).await.unwrap();
+        add(&path, &store, &args("plain", "redis://localhost"), None)
+            .await
+            .unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        use crate::model::Provider;
+        assert_eq!(
+            cfg.get("sls").unwrap().provider,
+            Some(Provider::ElasticacheServerless)
+        );
+        assert_eq!(cfg.get("ec").unwrap().provider, Some(Provider::Elasticache));
+        assert_eq!(
+            cfg.get("gcp").unwrap().provider,
+            Some(Provider::Memorystore)
+        );
+        assert_eq!(
+            cfg.get("forced").unwrap().provider,
+            Some(Provider::ElasticacheServerless)
+        );
+        assert_eq!(cfg.get("plain").unwrap().provider, None);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(r#"provider = "elasticache-serverless""#),
+            "{text}"
+        );
+        assert_eq!(text.matches("provider =").count(), 4, "{text}");
+
+        let out = list(&path).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].ends_with("PROVIDER"), "{out}");
+        let col = lines[0].find("PROVIDER").unwrap();
+        let row = |name: &str| *lines.iter().find(|l| l.starts_with(name)).unwrap();
+        assert_eq!(&row("sls ")[col..], "ElastiCache Serverless");
+        assert_eq!(&row("ec ")[col..], "ElastiCache");
+        assert_eq!(&row("gcp ")[col..], "Memorystore");
+        assert!(row("plain").len() <= col, "{out}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_shows_command_auth() {
+        let path = temp_path("list-cmd");
+        let store = MemoryStore::default();
+        let mut a = token_args("t", "redis://h", &["printf", "x"]);
+        a.yes = true;
+        add_token(&path, &store, &a, &never).await.unwrap();
+        let out = list(&path).unwrap();
+        assert!(out.lines().nth(1).unwrap().contains("command"), "{out}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn discovered_output_hides_passwords() {
         let d = DiscoveredInstance {
@@ -757,6 +1170,8 @@ mod tests {
                 auth: Auth::Keychain,
                 read_only: None,
                 prefer_replica: false,
+                provider: None,
+                token_command: None,
             },
             credentials: Some(Credentials {
                 username: None,

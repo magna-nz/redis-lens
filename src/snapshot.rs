@@ -1,4 +1,5 @@
-//! Saving scan reports to disk and loading them back for the Diff view.
+//! Saving scan reports to disk, loading them back for the Diff view and `trend`, and
+//! deleting old ones (retention).
 //!
 //! Files are `<dir>/<profile dir>/<YYYYMMDDTHHMMSSZ>.json`, holding a serialized
 //! [`ScanReport`]: patterns and example key names, never values or credentials. The
@@ -22,6 +23,8 @@ pub enum SnapshotError {
     Parse { path: PathBuf, message: String },
     #[error("could not find a data directory for this user")]
     NoDataDir,
+    #[error("will not delete snapshots in {path}: {reason}")]
+    Unsafe { path: PathBuf, reason: &'static str },
 }
 
 /// One saved snapshot, newest first when listed.
@@ -150,7 +153,7 @@ pub fn format_utc(unix: i64) -> String {
 }
 
 /// Inverse of [`timestamp_name`]. `None` when `s` is not in that format.
-fn parse_timestamp(s: &str) -> Option<i64> {
+pub fn parse_timestamp(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
         return None;
@@ -290,6 +293,292 @@ pub fn latest_before(
         .find(|r| r.profile == profile && r.match_glob.as_deref() == match_glob))
 }
 
+/// How many of a profile's snapshots to keep (`scan --save --keep N --keep-days D`,
+/// `snapshots prune`). `None` in both means keep everything.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Retention {
+    pub keep: Option<usize>,
+    pub keep_days: Option<u64>,
+}
+
+impl Retention {
+    /// Whether the snapshot at `index` in a newest-first list, taken at `taken_at_unix`,
+    /// is kept at `now_unix`: it is among the newest `keep` (when set) and no older than
+    /// `keep_days` days (when set). The newest (`index` 0) is always kept.
+    pub fn keeps(&self, index: usize, taken_at_unix: i64, now_unix: i64) -> bool {
+        if index == 0 {
+            return true;
+        }
+        let by_count = self.keep.is_none_or(|n| index < n);
+        let by_age = self.keep_days.is_none_or(|d| {
+            let max_age = i64::try_from(d.saturating_mul(86_400)).unwrap_or(i64::MAX);
+            now_unix.saturating_sub(taken_at_unix) <= max_age
+        });
+        by_count && by_age
+    }
+}
+
+/// `profile`'s snapshots that `retention` would delete at `now_unix`, newest first.
+///
+/// Only files `save` wrote for that profile count, and only those can be returned: a
+/// regular file (not a symbolic link) directly in the profile's directory, named exactly
+/// `YYYYMMDDTHHMMSSZ.json` as [`timestamp_name`] writes it, whose stored `profile` is
+/// `profile`. Temp files, other names, corrupt files and other profiles' snapshots are
+/// neither counted nor touched. A profile directory that is a symbolic link is refused,
+/// so nothing outside `dir` is ever deleted through it.
+pub fn retention_plan(
+    dir: &Path,
+    profile: &str,
+    retention: Retention,
+    now_unix: i64,
+) -> Result<Vec<SnapshotInfo>, SnapshotError> {
+    let pdir = profile_dir(dir, profile);
+    match std::fs::symlink_metadata(&pdir) {
+        Ok(m) if m.file_type().is_symlink() || !m.is_dir() => {
+            return Err(SnapshotError::Unsafe {
+                path: pdir,
+                reason: "it is not a plain directory",
+            });
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io(&pdir)(e)),
+    }
+    let owned: Vec<SnapshotInfo> = list(dir, profile)?
+        .into_iter()
+        .filter(|info| written_by_save(&pdir, info))
+        .collect();
+    // Snapshots dated after `now_unix` (a clock that was ahead, or a file copied from
+    // another machine) are never deleted and take no keep slot: otherwise they would
+    // rank as the newest and `scan --save --keep N` would delete the snapshot it just
+    // wrote. Only snapshots up to now are ranked.
+    Ok(owned
+        .into_iter()
+        .filter(|info| info.taken_at_unix <= now_unix)
+        .enumerate()
+        .filter(|(i, info)| !retention.keeps(*i, info.taken_at_unix, now_unix))
+        .map(|(_, info)| info)
+        .collect())
+}
+
+/// `info` is a regular file directly in `pdir` whose name is exactly what [`save`] writes
+/// for its time.
+fn written_by_save(pdir: &Path, info: &SnapshotInfo) -> bool {
+    let expected = format!("{}.json", timestamp_name(info.taken_at_unix));
+    info.path.parent() == Some(pdir)
+        && info.path.file_name().and_then(|n| n.to_str()) == Some(expected.as_str())
+        && std::fs::symlink_metadata(&info.path).is_ok_and(|m| m.file_type().is_file())
+}
+
+/// Delete `profile`'s snapshots in `dir` that `retention` doesn't keep, judged at
+/// `now_unix`, and return the deleted paths, newest first. Only files `save` wrote for
+/// that profile are touched (see [`retention_plan`]); the newest is never deleted.
+pub fn apply_retention(
+    dir: &Path,
+    profile: &str,
+    retention: Retention,
+    now_unix: i64,
+) -> Result<Vec<PathBuf>, SnapshotError> {
+    if retention == Retention::default() {
+        return Ok(Vec::new());
+    }
+    let mut deleted = Vec::new();
+    for info in retention_plan(dir, profile, retention, now_unix)? {
+        std::fs::remove_file(&info.path).map_err(io(&info.path))?;
+        deleted.push(info.path);
+    }
+    Ok(deleted)
+}
+
+/// The directory holding `profile`'s snapshots under `dir`, whether or not it exists.
+pub fn profile_dir_path(dir: &Path, profile: &str) -> PathBuf {
+    profile_dir(dir, profile)
+}
+
+/// Up to `n` of `profile`'s snapshots taken strictly before `before_unix` with the
+/// `SCAN MATCH` glob `match_glob`, newest first. Corrupt files and other profiles'
+/// snapshots are skipped.
+pub fn recent_matching(
+    dir: &Path,
+    profile: &str,
+    before_unix: i64,
+    match_glob: Option<&str>,
+    n: usize,
+) -> Result<Vec<ScanReport>, SnapshotError> {
+    Ok(candidates(dir, profile)?
+        .into_iter()
+        .filter(|s| s.taken_at_unix < before_unix)
+        .filter_map(|s| load(&s.path).ok())
+        .filter(|r| r.profile == profile && r.match_glob.as_deref() == match_glob)
+        .take(n)
+        .collect())
+}
+
+/// What a trend measures: estimated bytes when every snapshot in it had sizes, estimated
+/// keys otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrendMetric {
+    Bytes,
+    Keys,
+}
+
+/// One snapshot in a trend.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TrendPoint {
+    pub taken_at_unix: i64,
+    /// The scan saw the whole keyspace. A partial scan's figures are estimates scaled up
+    /// from a sample, so its point is less certain.
+    pub complete: bool,
+    pub sampled_keys: u64,
+}
+
+/// A least-squares growth rate.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct Growth {
+    /// The slope: bytes (or keys) per day.
+    pub per_day: f64,
+    /// The slope as a fraction of the mean of the points it was fitted to, e.g. 0.02 for
+    /// 2% a day. `None` when the mean is 0.
+    pub ratio_per_day: Option<f64>,
+}
+
+/// One pattern's values over a trend's points.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PatternTrend {
+    pub pattern: String,
+    /// One per [`Trend::points`], oldest first. `None` where the pattern was not in that
+    /// snapshot (a gap, not a zero).
+    pub values: Vec<Option<u64>>,
+    /// `None` with fewer than two values at different times.
+    pub growth: Option<Growth>,
+}
+
+/// Each pattern's memory (or key count) over a run of snapshots of one profile taken
+/// with the same `MATCH` glob.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Trend {
+    pub profile: String,
+    pub match_glob: Option<String>,
+    pub metric: TrendMetric,
+    /// Oldest first.
+    pub points: Vec<TrendPoint>,
+    /// Sorted by growth per day, largest first; patterns without a growth rate last; then
+    /// by name.
+    pub patterns: Vec<PatternTrend>,
+}
+
+impl Trend {
+    pub fn pattern(&self, pattern: &str) -> Option<&PatternTrend> {
+        self.patterns.iter().find(|p| p.pattern == pattern)
+    }
+
+    /// How many of the points were partial scans.
+    pub fn partial_points(&self) -> usize {
+        self.points.iter().filter(|p| !p.complete).count()
+    }
+}
+
+/// Least-squares slope of `y` over `x`, and the mean of `y`. `None` with fewer than two
+/// points or when every `x` is the same.
+pub fn least_squares(points: &[(f64, f64)]) -> Option<(f64, f64)> {
+    if points.len() < 2 {
+        return None;
+    }
+    let n = points.len() as f64;
+    let mx = points.iter().map(|p| p.0).sum::<f64>() / n;
+    let my = points.iter().map(|p| p.1).sum::<f64>() / n;
+    let sxx: f64 = points.iter().map(|p| (p.0 - mx).powi(2)).sum();
+    if sxx == 0.0 || !sxx.is_finite() {
+        return None;
+    }
+    let sxy: f64 = points.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+    let slope = sxy / sxx;
+    slope.is_finite().then_some((slope, my))
+}
+
+/// The growth of `values` taken at `times` (Unix seconds), per day. Gaps are left out of
+/// the fit, not counted as zero.
+pub fn growth(times: &[i64], values: &[Option<u64>]) -> Option<Growth> {
+    let t0 = *times.first()?;
+    let points: Vec<(f64, f64)> = times
+        .iter()
+        .zip(values)
+        .filter_map(|(t, v)| v.map(|v| ((t - t0) as f64 / 86_400.0, v as f64)))
+        .collect();
+    let (slope, mean) = least_squares(&points)?;
+    Some(Growth {
+        per_day: slope,
+        ratio_per_day: (mean > 0.0).then(|| slope / mean),
+    })
+}
+
+/// The trend over `reports`, which should be one profile's snapshots with the same
+/// `MATCH` glob, in any order (they are sorted oldest first).
+pub fn trend(reports: &[ScanReport]) -> Trend {
+    let mut reports: Vec<&ScanReport> = reports.iter().collect();
+    reports.sort_by_key(|r| r.taken_at_unix);
+    let metric = if !reports.is_empty() && reports.iter().all(|r| r.sizes_available) {
+        TrendMetric::Bytes
+    } else {
+        TrendMetric::Keys
+    };
+    let points: Vec<TrendPoint> = reports
+        .iter()
+        .map(|r| TrendPoint {
+            taken_at_unix: r.taken_at_unix,
+            complete: r.complete,
+            sampled_keys: r.sampled_keys,
+        })
+        .collect();
+    let times: Vec<i64> = points.iter().map(|p| p.taken_at_unix).collect();
+    let mut names: Vec<&str> = reports
+        .iter()
+        .flat_map(|r| r.patterns.iter().map(|p| p.pattern.as_str()))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut patterns: Vec<PatternTrend> = names
+        .into_iter()
+        .map(|name| {
+            let values: Vec<Option<u64>> = reports
+                .iter()
+                .map(|r| {
+                    let p = r.patterns.iter().find(|p| p.pattern == name)?;
+                    match metric {
+                        TrendMetric::Bytes => p.est_bytes,
+                        TrendMetric::Keys => Some(p.est_keys),
+                    }
+                })
+                .collect();
+            PatternTrend {
+                pattern: name.to_string(),
+                growth: growth(&times, &values),
+                values,
+            }
+        })
+        .collect();
+    patterns.sort_by(|a, b| {
+        let rate = |p: &PatternTrend| p.growth.map(|g| g.per_day);
+        match (rate(a), rate(b)) {
+            (Some(x), Some(y)) => y.total_cmp(&x),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| a.pattern.cmp(&b.pattern))
+    });
+    Trend {
+        profile: reports
+            .last()
+            .map_or_else(String::new, |r| r.profile.clone()),
+        match_glob: reports.last().and_then(|r| r.match_glob.clone()),
+        metric,
+        points,
+        patterns,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +610,7 @@ mod tests {
             hot_keys: vec![],
             complete: true,
             match_glob: None,
+            server_context: None,
         }
     }
 
@@ -566,5 +856,409 @@ mod tests {
         if let Ok(d) = default_dir() {
             assert!(d.ends_with("snapshots"));
         }
+    }
+    const DAY: i64 = 86_400;
+
+    fn times(paths: &[PathBuf]) -> Vec<i64> {
+        paths
+            .iter()
+            .map(|p| {
+                let stem = p.file_stem().unwrap().to_str().unwrap();
+                parse_timestamp(stem).unwrap()
+            })
+            .collect()
+    }
+
+    fn listed(dir: &Path, profile: &str) -> Vec<i64> {
+        list(dir, profile)
+            .unwrap()
+            .iter()
+            .map(|s| s.taken_at_unix)
+            .collect()
+    }
+
+    /// Five snapshots of `p`, one a day, the newest at `now`.
+    fn five_days(tag: &str, now: i64) -> PathBuf {
+        let dir = temp_dir(tag);
+        for d in 0..5 {
+            save(&dir, &report("p", now - d * DAY)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn retention_keep_only() {
+        let now = 1_800_000_000;
+        let dir = five_days("ret-keep", now);
+        let r = Retention {
+            keep: Some(2),
+            keep_days: None,
+        };
+        let plan: Vec<i64> = retention_plan(&dir, "p", r, now)
+            .unwrap()
+            .iter()
+            .map(|s| s.taken_at_unix)
+            .collect();
+        assert_eq!(plan, [now - 2 * DAY, now - 3 * DAY, now - 4 * DAY]);
+        // Planning deletes nothing.
+        assert_eq!(listed(&dir, "p").len(), 5);
+        let deleted = apply_retention(&dir, "p", r, now).unwrap();
+        assert_eq!(times(&deleted), plan);
+        assert_eq!(listed(&dir, "p"), [now, now - DAY]);
+        // Applying it again finds nothing more.
+        assert!(apply_retention(&dir, "p", r, now).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clock skew: snapshots dated after now must not push out the one just saved.
+    #[test]
+    fn future_dated_snapshots_never_cost_the_newest_real_one() {
+        let now = 1_800_000_000;
+        for keep in [1, 2] {
+            let dir = temp_dir(&format!("ret-future-{keep}"));
+            for ahead in [300 * DAY, 200 * DAY] {
+                save(&dir, &report("p", now + ahead)).unwrap();
+            }
+            for back in [0, DAY, 2 * DAY] {
+                save(&dir, &report("p", now - back)).unwrap();
+            }
+            let r = Retention {
+                keep: Some(keep),
+                keep_days: None,
+            };
+            let deleted = apply_retention(&dir, "p", r, now).unwrap();
+            // The future files and the newest `keep` real ones stay; nothing at or
+            // after `now` is deleted.
+            assert!(times(&deleted).iter().all(|t| *t < now), "keep {keep}");
+            let left = listed(&dir, "p");
+            assert!(
+                left.contains(&now),
+                "keep {keep}: the snapshot just saved is gone"
+            );
+            assert!(left.contains(&(now + 300 * DAY)) && left.contains(&(now + 200 * DAY)));
+            assert_eq!(left.len(), 2 + keep, "keep {keep}");
+            // `snapshots prune` uses the same plan.
+            assert!(retention_plan(&dir, "p", r, now).unwrap().is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn retention_days_only() {
+        let now = 1_800_000_000;
+        let dir = five_days("ret-days", now);
+        let r = Retention {
+            keep: None,
+            keep_days: Some(2),
+        };
+        // Exactly two days old is still kept; older is not.
+        let deleted = apply_retention(&dir, "p", r, now).unwrap();
+        assert_eq!(times(&deleted), [now - 3 * DAY, now - 4 * DAY]);
+        assert_eq!(listed(&dir, "p"), [now, now - DAY, now - 2 * DAY]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_both_limits() {
+        let now = 1_800_000_000;
+        // Count is the tighter limit.
+        let dir = five_days("ret-both-a", now);
+        let r = Retention {
+            keep: Some(2),
+            keep_days: Some(3),
+        };
+        apply_retention(&dir, "p", r, now).unwrap();
+        assert_eq!(listed(&dir, "p"), [now, now - DAY]);
+        let _ = std::fs::remove_dir_all(&dir);
+        // Age is the tighter limit.
+        let dir = five_days("ret-both-b", now);
+        let r = Retention {
+            keep: Some(4),
+            keep_days: Some(1),
+        };
+        apply_retention(&dir, "p", r, now).unwrap();
+        assert_eq!(listed(&dir, "p"), [now, now - DAY]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_never_deletes_the_newest() {
+        let now = 1_800_000_000;
+        let dir = five_days("ret-newest", now);
+        // Every snapshot is older than the limit, and --keep 0.
+        let r = Retention {
+            keep: Some(0),
+            keep_days: Some(1),
+        };
+        apply_retention(&dir, "p", r, now + 30 * DAY).unwrap();
+        assert_eq!(listed(&dir, "p"), [now]);
+        let _ = std::fs::remove_dir_all(&dir);
+        // No limit at all deletes nothing.
+        let dir = five_days("ret-none", now);
+        assert!(
+            apply_retention(&dir, "p", Retention::default(), now)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(listed(&dir, "p").len(), 5);
+        // A missing directory is nothing to delete.
+        assert!(
+            apply_retention(
+                &dir,
+                "absent",
+                Retention {
+                    keep: Some(1),
+                    keep_days: None
+                },
+                now
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        // Huge day counts don't overflow, and future-dated files are kept.
+        assert!(
+            Retention {
+                keep: None,
+                keep_days: Some(u64::MAX)
+            }
+            .keeps(3, i64::MIN, i64::MAX)
+        );
+        assert!(
+            Retention {
+                keep: None,
+                keep_days: Some(0)
+            }
+            .keeps(3, now + DAY, now)
+        );
+    }
+
+    #[test]
+    fn retention_leaves_other_files_alone() {
+        let now = 1_800_000_000;
+        let dir = five_days("ret-foreign", now);
+        // Other profiles' snapshots, in their own directories, are untouched.
+        for d in 0..3 {
+            save(&dir, &report("q", now - d * DAY)).unwrap();
+            save(&dir, &report("P", now - d * DAY)).unwrap();
+        }
+        let pdir = profile_dir(&dir, "p");
+        // Files in p's directory that save did not write for p.
+        let old = timestamp_name(now - 10 * DAY);
+        let foreign = pdir.join(format!("{}.json", timestamp_name(now - 9 * DAY)));
+        std::fs::write(&foreign, serde_json::to_string(&report("q", 1)).unwrap()).unwrap();
+        let corrupt = pdir.join(format!("{}.json", timestamp_name(now - 8 * DAY)));
+        std::fs::write(&corrupt, "not json").unwrap();
+        let junk = [
+            pdir.join("notes.json"),
+            pdir.join("readme.txt"),
+            pdir.join(format!("{old}.json.bak")),
+            pdir.join(format!(".{old}.json.tmp1-2-3")),
+            pdir.join(format!("{}.JSON", timestamp_name(now - 12 * DAY))),
+            // Parses as a time but save never writes it (31 February).
+            pdir.join("20240231T000000Z.json"),
+        ];
+        let body = serde_json::to_string(&report("p", now - 10 * DAY)).unwrap();
+        for f in &junk {
+            std::fs::write(f, &body).unwrap();
+        }
+        // A file outside the snapshot directory, linked in under a snapshot name.
+        let outside = temp_dir("ret-outside").join("keep-me.json");
+        std::fs::write(&outside, &body).unwrap();
+        #[cfg(unix)]
+        let link = {
+            let link = pdir.join(format!("{old}.json"));
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            link
+        };
+        // A sub-directory with a snapshot name.
+        let sub = pdir.join(format!("{}.json", timestamp_name(now - 11 * DAY)));
+        std::fs::create_dir(&sub).unwrap();
+
+        let r = Retention {
+            keep: Some(1),
+            keep_days: None,
+        };
+        let deleted = apply_retention(&dir, "p", r, now).unwrap();
+        assert_eq!(
+            times(&deleted),
+            [now - DAY, now - 2 * DAY, now - 3 * DAY, now - 4 * DAY]
+        );
+        for f in junk.iter().chain([&foreign, &corrupt, &outside, &sub]) {
+            assert!(f.exists(), "{} was deleted", f.display());
+        }
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "the link was deleted"
+        );
+        assert_eq!(listed(&dir, "q").len(), 3);
+        assert_eq!(listed(&dir, "P").len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(outside.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_refuses_a_linked_profile_directory() {
+        let now = 1_800_000_000;
+        let elsewhere = five_days("ret-elsewhere", now);
+        let dir = temp_dir("ret-linked");
+        std::os::unix::fs::symlink(profile_dir(&elsewhere, "p"), profile_dir(&dir, "p")).unwrap();
+        // Reading through it is fine; deleting through it is refused.
+        assert_eq!(listed(&dir, "p").len(), 5);
+        let r = Retention {
+            keep: Some(1),
+            keep_days: None,
+        };
+        let err = apply_retention(&dir, "p", r, now).unwrap_err();
+        assert!(matches!(err, SnapshotError::Unsafe { .. }), "{err}");
+        assert!(err.to_string().starts_with("will not delete snapshots in"));
+        assert_eq!(listed(&elsewhere, "p").len(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn recent_matching_filters_and_limits() {
+        let dir = temp_dir("recent");
+        for t in [100, 200, 300, 400] {
+            save(&dir, &report("p", t)).unwrap();
+        }
+        let mut globbed = report("p", 350);
+        globbed.match_glob = Some("u*".into());
+        save(&dir, &globbed).unwrap();
+        let pdir = profile_dir(&dir, "p");
+        std::fs::write(pdir.join(format!("{}.json", timestamp_name(250))), "{").unwrap();
+        let at = |before, glob, n| -> Vec<i64> {
+            recent_matching(&dir, "p", before, glob, n)
+                .unwrap()
+                .iter()
+                .map(|r| r.taken_at_unix)
+                .collect()
+        };
+        assert_eq!(at(i64::MAX, None, 10), [400, 300, 200, 100]);
+        assert_eq!(at(400, None, 2), [300, 200]);
+        assert_eq!(at(i64::MAX, Some("u*"), 10), [350]);
+        assert!(at(i64::MAX, Some("x*"), 10).is_empty());
+        assert!(at(i64::MAX, None, 0).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn with_patterns(at: i64, sizes: bool, pats: &[(&str, u64)]) -> ScanReport {
+        let mut r = report("p", at);
+        r.sizes_available = sizes;
+        r.patterns = pats
+            .iter()
+            .map(|(name, v)| crate::model::PatternStats {
+                pattern: (*name).into(),
+                key_type: None,
+                sampled_keys: 1,
+                est_keys: *v / 10,
+                sampled_bytes: sizes.then_some(*v),
+                est_bytes: sizes.then_some(*v),
+                no_ttl: 0,
+                ttl_hist: [0; 7],
+                size_p50: None,
+                size_p99: None,
+                size_max: None,
+                examples: vec![],
+            })
+            .collect();
+        r
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9 * b.abs().max(1.0)
+    }
+
+    #[test]
+    fn least_squares_cases() {
+        assert_eq!(least_squares(&[]), None);
+        assert_eq!(least_squares(&[(1.0, 5.0)]), None);
+        // The same time twice has no slope.
+        assert_eq!(least_squares(&[(1.0, 5.0), (1.0, 9.0)]), None);
+        assert_eq!(
+            least_squares(&[(0.0, 3.0), (1.0, 3.0), (2.0, 3.0)]),
+            Some((0.0, 3.0))
+        );
+        let (slope, mean) = least_squares(&[(0.0, 1.0), (1.0, 3.0), (2.0, 5.0)]).unwrap();
+        assert!(close(slope, 2.0) && close(mean, 3.0), "{slope} {mean}");
+        // Noisy: y = 1, 2, 2, 4 at x = 0..4 fits 0.9 a step.
+        let (slope, _) = least_squares(&[(0.0, 1.0), (1.0, 2.0), (2.0, 2.0), (3.0, 4.0)]).unwrap();
+        assert!(close(slope, 0.9), "{slope}");
+    }
+
+    #[test]
+    fn growth_cases() {
+        let days = |n: i64| (0..n).map(|d| 1_000 + d * DAY).collect::<Vec<_>>();
+        // Empty, one point, all gaps.
+        assert_eq!(growth(&[], &[]), None);
+        assert_eq!(growth(&days(1), &[Some(10)]), None);
+        assert_eq!(growth(&days(3), &[None, Some(5), None]), None);
+        // Flat.
+        let g = growth(&days(3), &[Some(7), Some(7), Some(7)]).unwrap();
+        assert_eq!((g.per_day, g.ratio_per_day), (0.0, Some(0.0)));
+        // Rising 2 a day around a mean of 100.
+        let g = growth(&days(3), &[Some(98), Some(100), Some(102)]).unwrap();
+        assert!(
+            close(g.per_day, 2.0) && close(g.ratio_per_day.unwrap(), 0.02),
+            "{g:?}"
+        );
+        // Gaps are left out, not counted as 0: 10 → (gap) → 30 is 10 a day.
+        let g = growth(&days(3), &[Some(10), None, Some(30)]).unwrap();
+        assert!(close(g.per_day, 10.0), "{g:?}");
+        // Half-day spacing is measured in days.
+        let g = growth(&[0, DAY / 2], &[Some(0), Some(50)]).unwrap();
+        assert!(close(g.per_day, 100.0), "{g:?}");
+        // All zero: a slope but no relative rate.
+        let g = growth(&days(2), &[Some(0), Some(0)]).unwrap();
+        assert_eq!(g.ratio_per_day, None);
+    }
+
+    #[test]
+    fn trend_over_snapshots() {
+        let reports = [
+            // Out of order on purpose.
+            with_patterns(2 * DAY, true, &[("a", 120), ("b", 50)]),
+            with_patterns(0, true, &[("a", 100), ("b", 50), ("c", 9)]),
+            with_patterns(DAY, true, &[("a", 110), ("b", 50)]),
+        ];
+        let t = trend(&reports);
+        assert_eq!(t.metric, TrendMetric::Bytes);
+        assert_eq!(t.profile, "p");
+        let at: Vec<i64> = t.points.iter().map(|p| p.taken_at_unix).collect();
+        assert_eq!(at, [0, DAY, 2 * DAY]);
+        let names: Vec<&str> = t.patterns.iter().map(|p| p.pattern.as_str()).collect();
+        // a grows, b is flat, c has one point and so no rate.
+        assert_eq!(names, ["a", "b", "c"]);
+        let a = t.pattern("a").unwrap();
+        assert_eq!(a.values, [Some(100), Some(110), Some(120)]);
+        assert!(close(a.growth.unwrap().per_day, 10.0));
+        assert!(close(
+            a.growth.unwrap().ratio_per_day.unwrap(),
+            10.0 / 110.0
+        ));
+        assert_eq!(t.pattern("c").unwrap().values, [Some(9), None, None]);
+        assert_eq!(t.pattern("c").unwrap().growth, None);
+        assert_eq!(t.partial_points(), 0);
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["metric"], "bytes");
+        assert_eq!(json["patterns"][2]["values"][1], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn trend_uses_keys_without_sizes_and_marks_partial_scans() {
+        let mut partial = with_patterns(DAY, false, &[("a", 200)]);
+        partial.complete = false;
+        let t = trend(&[with_patterns(0, true, &[("a", 100)]), partial]);
+        assert_eq!(t.metric, TrendMetric::Keys);
+        assert_eq!(t.pattern("a").unwrap().values, [Some(10), Some(20)]);
+        assert_eq!(t.partial_points(), 1);
+        assert!(!t.points[1].complete);
+        // No reports at all.
+        let t = trend(&[]);
+        assert!(t.points.is_empty() && t.patterns.is_empty());
+        assert_eq!(t.metric, TrendMetric::Keys);
     }
 }

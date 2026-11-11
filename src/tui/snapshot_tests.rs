@@ -582,6 +582,94 @@ fn diff_view_with_history() {
     insta::assert_snapshot!(t.backend());
 }
 
+/// The trend lookup came back for the current scan.
+fn set_trend(app: &mut App, trend: crate::snapshot::Trend) {
+    let s = app.session.as_ref().unwrap();
+    let (id, scan) = (s.id, s.scan);
+    let taken_at_unix = s.report.as_ref().unwrap().taken_at_unix;
+    app.apply(Msg::Trend {
+        id,
+        scan,
+        taken_at_unix,
+        trend: Some(trend),
+    });
+}
+
+#[test]
+fn diff_view_with_trend() {
+    let mut app = scanned_with_history(true);
+    set_trend(&mut app, fixtures::trend(true));
+    press(&mut app, "3j");
+    let t = render(&app, 120, 36);
+    let text = buffer_lines(&t).join("\n");
+    assert!(text.contains("TREND"), "{text}");
+    // The selected cache:search row grew every day; the detail line gives the rate.
+    let row = buffer_lines(&t)
+        .into_iter()
+        .find(|l| l.contains("cache:search:{hash}") && l.contains("more keys"))
+        .unwrap();
+    let spark =
+        |name: &str| crate::format::sparkline(&fixtures::trend(true).pattern(name).unwrap().values);
+    assert_eq!(spark("cache:search:{hash}"), "▁▁▂▂▃▃▄█");
+    assert!(row.contains(&spark("cache:search:{hash}")), "{row}");
+    assert!(
+        text.contains(&format!(
+            " trend          {}  +8.7% a day (+128M a day)",
+            spark("cache:search:{hash}")
+        )),
+        "{text}"
+    );
+    assert!(text.contains("a day) over 8 scans, all partial"), "{text}");
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn diff_view_with_trend_without_sizes() {
+    let mut app = scanned_with_history(false);
+    set_trend(&mut app, fixtures::trend(false));
+    // queue:emails: missing from one snapshot, so its line has a gap.
+    press(&mut app, "3");
+    let rows = app.diff().unwrap().patterns.clone();
+    let at = rows
+        .iter()
+        .position(|p| p.pattern == "queue:emails")
+        .unwrap();
+    for _ in 0..at {
+        app.handle_key(ch('j'));
+    }
+    let t = render(&app, 120, 36);
+    let text = buffer_lines(&t).join("\n");
+    assert!(text.contains("TREND"), "{text}");
+    let trend = fixtures::trend(false);
+    let values = &trend.pattern("queue:emails").unwrap().values;
+    assert_eq!(values[2], None);
+    let spark = crate::format::sparkline(values);
+    assert!(spark.contains('·'), "{spark}");
+    assert!(
+        text.contains(&format!(
+            " trend          {spark}  flat over 8 scans, all partial"
+        )),
+        "{text}"
+    );
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn diff_view_with_one_earlier_snapshot_has_no_trend() {
+    let mut app = scanned_with_history(true);
+    set_trend(&mut app, fixtures::short_trend(true));
+    press(&mut app, "3j");
+    let t = render(&app, 120, 36);
+    let text = buffer_lines(&t).join("\n");
+    assert!(!text.contains("TREND"), "{text}");
+    assert!(!text.contains(" trend "), "{text}");
+    // Exactly the Diff view without a trend.
+    let mut plain = scanned_with_history(true);
+    press(&mut plain, "3j");
+    assert_eq!(buffer_lines(&render(&plain, 120, 36)), buffer_lines(&t));
+    insta::assert_snapshot!(t.backend());
+}
+
 #[test]
 fn diff_view_without_history() {
     let (mut app, id) = scanned_with(fixtures::report(true), fixtures::perms_ok());
@@ -666,6 +754,10 @@ fn every_tab_at_60x20_and_200x60() {
     });
     let mut connecting = App::new(fixtures::profiles());
     connect_selected(&mut connecting);
+    let mut with_trend = scanned_with_history(true);
+    set_trend(&mut with_trend, fixtures::trend(true));
+    let mut with_trend_keys = scanned_with_history(false);
+    set_trend(&mut with_trend_keys, fixtures::trend(false));
     let mut apps = vec![
         App::new(vec![]),
         connecting,
@@ -675,6 +767,8 @@ fn every_tab_at_60x20_and_200x60() {
         denied,
         no_history,
         failed,
+        with_trend,
+        with_trend_keys,
     ];
     for app in &mut apps {
         for view in ['0', '1', '2', '3', '4'] {
@@ -706,6 +800,9 @@ fn small_terminals_do_not_panic() {
     // History and hot keys, with and without sizes.
     apps.push(scanned_with_history(true));
     apps.push(scanned_with_history(false));
+    let mut with_trend = scanned_with_history(true);
+    set_trend(&mut with_trend, fixtures::trend(true));
+    apps.push(with_trend);
     // No earlier snapshot, and history whose other scan used a different MATCH.
     let (mut no_history, id) = scanned_with(fixtures::report(true), fixtures::perms_ok());
     set_history(&mut no_history, id, None);

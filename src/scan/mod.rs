@@ -2,6 +2,8 @@
 //!
 //! Owner: scanner.
 
+pub mod context;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +29,9 @@ pub struct ScanOptions {
     pub max_commands_per_sec: Option<u32>,
     /// Only scan keys matching this glob (`SCAN ... MATCH`).
     pub match_glob: Option<String>,
+    /// The database the connection has selected, for its `INFO keyspace` and
+    /// `INFO keysizes` lines.
+    pub db: u32,
 }
 
 impl Default for ScanOptions {
@@ -37,20 +42,28 @@ impl Default for ScanOptions {
             batch_size: 500,
             max_commands_per_sec: Some(5_000),
             match_glob: None,
+            db: 0,
         }
     }
 }
 
 impl ScanOptions {
-    /// Defaults for a profile: no command budget for `Local` profiles, 5,000 commands per
-    /// second for everything else.
+    /// Defaults for a profile: 1,000 commands per second on ElastiCache Serverless
+    /// ([`crate::conn::provider::SERVERLESS_MAX_RATE`]), no command budget for `Local`
+    /// profiles, 5,000 commands per second for everything else. The profile's database.
+    /// An explicit `--max-rate` replaces the budget afterwards.
     pub fn for_profile(profile: &crate::model::Profile) -> Self {
-        Self {
-            max_commands_per_sec: if profile.env == crate::model::Env::Local {
+        let max_commands_per_sec =
+            if profile.provider == Some(crate::model::Provider::ElasticacheServerless) {
+                Some(crate::conn::provider::SERVERLESS_MAX_RATE)
+            } else if profile.env == crate::model::Env::Local {
                 None
             } else {
                 Some(5_000)
-            },
+            };
+        Self {
+            max_commands_per_sec,
+            db: profile.db,
             ..Self::default()
         }
     }
@@ -235,7 +248,17 @@ pub async fn sample_keys_detailed<C: ConnectionLike + Send>(
     with_freq: bool,
     progress: Option<&watch::Sender<ScanProgress>>,
 ) -> Result<SampleOutcome, ScanError> {
-    sample_inner(conn, opts, with_sizes, with_freq, progress, None).await
+    let mut limiter = Limiter::new(opts.max_commands_per_sec);
+    sample_inner(
+        conn,
+        opts,
+        with_sizes,
+        with_freq,
+        progress,
+        None,
+        &mut limiter,
+    )
+    .await
 }
 
 /// [`sample_keys_detailed`], also publishing partial pattern stats to `partial` (throttled)
@@ -247,10 +270,10 @@ async fn sample_inner<C: ConnectionLike + Send>(
     with_freq: bool,
     progress: Option<&watch::Sender<ScanProgress>>,
     mut partial: Option<&mut PartialSink<'_>>,
+    limiter: &mut Limiter,
 ) -> Result<SampleOutcome, ScanError> {
     let limit = usize::try_from(opts.sample_limit).unwrap_or(usize::MAX);
     let batch_size = opts.batch_size.max(1);
-    let mut limiter = Limiter::new(opts.max_commands_per_sec);
     let mut seen: HashSet<String> = HashSet::new();
     // Keys that are not valid UTF-8: not sampled, but still part of the keyspace.
     let mut skipped: HashSet<Vec<u8>> = HashSet::new();
@@ -543,10 +566,11 @@ impl PartialSink<'_> {
     }
 }
 
-/// Run a full scan: server info, sampling, then [`crate::pattern::aggregate`].
+/// Run a full scan: server info, the server context (see [`context`]), sampling, then
+/// [`crate::pattern::aggregate`].
 ///
-/// Uses `perms` to decide whether to ask for sizes and LFU counters. The same as
-/// [`scan_with_partial`] without partial results.
+/// Uses `perms` to decide whether to ask for sizes, LFU counters and `MEMORY STATS`. The
+/// same as [`scan_with_partial`] without partial results.
 pub async fn scan<C: ConnectionLike + Send>(
     profile_name: &str,
     conn: &mut C,
@@ -573,6 +597,9 @@ pub async fn scan_with_partial<C: ConnectionLike + Send>(
     partial: Option<&PartialSender>,
 ) -> Result<ScanReport, ScanError> {
     let server = server_info(conn).await?;
+    let mut limiter = Limiter::new(opts.max_commands_per_sec);
+    // A few read-only commands; any part that fails is left out, never the scan.
+    let server_context = context::read(conn, opts.db, perms, &mut limiter).await;
     let with_sizes = perms.allowed(PERM_MEMORY);
     let with_freq = perms.allowed(PERM_FREQ) && server.lfu_enabled();
     let target = opts.sample_limit.min(server.total_keys);
@@ -593,7 +620,16 @@ pub async fn scan_with_partial<C: ConnectionLike + Send>(
         sizes_available: with_sizes,
         throttle: Throttle::default(),
     });
-    let outcome = sample_inner(conn, opts, with_sizes, with_freq, progress, sink.as_mut()).await?;
+    let outcome = sample_inner(
+        conn,
+        opts,
+        with_sizes,
+        with_freq,
+        progress,
+        sink.as_mut(),
+        &mut limiter,
+    )
+    .await?;
     let scale = estimate_scale(
         server.total_keys,
         outcome.keys_present(),
@@ -621,6 +657,7 @@ pub async fn scan_with_partial<C: ConnectionLike + Send>(
         hot_keys: hot_keys(&samples),
         complete,
         match_glob: opts.match_glob.clone(),
+        server_context: Some(server_context),
     })
 }
 
@@ -678,6 +715,8 @@ mod tests {
             auth: Auth::None,
             read_only: None,
             prefer_replica: false,
+            provider: None,
+            token_command: None,
         };
         assert_eq!(ScanOptions::for_profile(&p).max_commands_per_sec, None);
         p.env = Env::Prod;
@@ -690,6 +729,47 @@ mod tests {
             ScanOptions::for_profile(&p).max_commands_per_sec,
             Some(5_000)
         );
+        assert_eq!(ScanOptions::for_profile(&p).db, 0);
+        p.db = 4;
+        assert_eq!(ScanOptions::for_profile(&p).db, 4);
+    }
+
+    #[test]
+    fn serverless_gets_a_lower_default_rate() {
+        use crate::model::{Auth, Endpoint, Env, Profile, Provider};
+        let mut p = Profile {
+            name: "p".into(),
+            env: Env::Prod,
+            endpoint: Endpoint {
+                host: "c-1a2b3c.serverless.use1.cache.amazonaws.com".into(),
+                port: 6379,
+                tls: true,
+            },
+            db: 0,
+            auth: Auth::None,
+            read_only: None,
+            prefer_replica: false,
+            provider: Some(Provider::ElasticacheServerless),
+            token_command: None,
+        };
+        for env in [Env::Prod, Env::Stage, Env::Other, Env::Local] {
+            p.env = env;
+            assert_eq!(
+                ScanOptions::for_profile(&p).max_commands_per_sec,
+                Some(1_000),
+                "{env:?}"
+            );
+        }
+        // Other providers keep the usual budget.
+        p.env = Env::Prod;
+        for other in [Provider::Elasticache, Provider::Memorydb, Provider::Azure] {
+            p.provider = Some(other);
+            assert_eq!(
+                ScanOptions::for_profile(&p).max_commands_per_sec,
+                Some(5_000),
+                "{other:?}"
+            );
+        }
     }
 
     const REDIS_SERVER: &str = "# Server\r\nredis_version:7.4.2\r\nredis_git_sha1:00000000\r\nredis_mode:standalone\r\nos:Linux 6.6 x86_64\r\nprocess_id:1\r\ntcp_port:6379\r\n";
@@ -887,6 +967,12 @@ mod tests {
                         Some(Fate::NoPerm) => noperm(),
                         _ => Value::Nil,
                     },
+                    "MEMORY" if text("STATS") => Value::Array(vec![
+                        Value::BulkString(b"dataset.bytes".to_vec()),
+                        Value::Int(self.dbsize as i64 * 100),
+                        Value::BulkString(b"fragmentation".to_vec()),
+                        Value::BulkString(b"1.5".to_vec()),
+                    ]),
                     other => panic!("the scanner must not send {other}"),
                 }
             }
@@ -997,6 +1083,27 @@ mod tests {
         assert_eq!(l.wait(Duration::from_secs(1)), Duration::from_millis(1_500));
         // Time already spent is not slept again.
         assert_eq!(l.wait(Duration::from_secs(3)), Duration::ZERO);
+    }
+
+    /// The server-context commands (`INFO keyspace`, `INFO keysizes`, `MEMORY STATS`) each
+    /// count against the scan's command budget, so `--max-rate` covers them too.
+    #[test]
+    fn context_commands_count_against_the_budget() {
+        let mut server = fake::Server::new(keyspace(10, |_| Fate::Present), 10);
+        let mut l = Limiter::new(Some(1_000_000));
+        run_timed(context::read(&mut server, 0, &perms_all(), &mut l));
+        assert_eq!(server.log.len(), 3, "{:?}", server.log);
+        assert_eq!(l.sent, server.log.len() as u64);
+        // A denied MEMORY STATS is not sent and not counted.
+        let mut server = fake::Server::new(keyspace(10, |_| Fate::Present), 10);
+        let mut l = Limiter::new(Some(1_000_000));
+        let denied = perms_with(
+            crate::model::PERM_MEMORY_STATS,
+            crate::model::PermStatus::Denied("NOPERM".into()),
+        );
+        run_timed(context::read(&mut server, 0, &denied, &mut l));
+        assert_eq!(l.sent, 2);
+        assert_eq!(server.log.len(), 2, "{:?}", server.log);
     }
 
     #[test]
@@ -1156,6 +1263,73 @@ mod tests {
         let report = run(scan("t", &mut server, &opts(100, 50), &perms_all(), None)).unwrap();
         assert_eq!(report.sampled_keys, 0);
         assert!(report.patterns.is_empty());
+    }
+
+    fn perms_with(label: &'static str, status: crate::model::PermStatus) -> PermissionReport {
+        let mut p = perms_all();
+        p.checks.push(crate::model::PermCheck {
+            label: crate::model::PERM_MEMORY_STATS,
+            status: crate::model::PermStatus::Allowed,
+        });
+        for c in &mut p.checks {
+            if c.label == label {
+                c.status = status.clone();
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn the_server_context_is_read_once_per_scan() {
+        use crate::model::{ContextGap, PERM_MEMORY_STATS, PermStatus};
+        let keys = keyspace(200, |_| Fate::Present);
+        let mut server = fake::Server::new(keys, 100);
+        let perms = perms_with(PERM_MEMORY, PermStatus::Denied("NOPERM".into()));
+        let report = run(scan("t", &mut server, &opts(1_000, 50), &perms, None)).unwrap();
+        let ctx = report.server_context.expect("a context");
+        // INFO server, INFO memory, then INFO keyspace and INFO keysizes; one MEMORY
+        // (STATS: MEMORY USAGE is denied here). Nothing else is new, nothing writes.
+        let count = |name: &str| server.log.iter().filter(|c| *c == name).count();
+        assert_eq!(count("INFO"), 4, "{:?}", server.log);
+        assert_eq!(count("MEMORY"), 1, "{:?}", server.log);
+        assert_eq!(ctx.memory.and_then(|m| m.dataset_bytes), Some(20_000));
+        assert_eq!(ctx.memory.and_then(|m| m.fragmentation), Some(1.5));
+        // The fake has no keysizes section and no db0 line.
+        assert_eq!(ctx.keysizes, None);
+        assert_eq!(ctx.keyspace.map(|k| k.keys), Some(0));
+        assert_eq!(ctx.missing, vec![ContextGap::NoKeysizes]);
+
+        // Denied by the permission check: not sent, and the reason is kept.
+        for (status, gap) in [
+            (
+                PermStatus::Denied("NOPERM User lens-ro has no permissions".into()),
+                ContextGap::MemoryStatsDenied,
+            ),
+            (
+                PermStatus::Denied("ERR unknown command 'MEMORY'".into()),
+                ContextGap::MemoryStatsUnavailable,
+            ),
+        ] {
+            let mut server = fake::Server::new(keyspace(10, |_| Fate::Present), 100);
+            let mut perms = perms_with(PERM_MEMORY_STATS, status);
+            perms.checks.retain(|c| c.label != PERM_MEMORY);
+            let report = run(scan("t", &mut server, &opts(1_000, 50), &perms, None)).unwrap();
+            assert!(
+                !server.log.iter().any(|c| c == "MEMORY"),
+                "{:?}",
+                server.log
+            );
+            let ctx = report.server_context.unwrap();
+            assert_eq!(ctx.memory, None);
+            assert_eq!(ctx.missing, vec![ContextGap::NoKeysizes, gap]);
+            // The snapshot JSON holds the fixed reason, never the server's text (which
+            // names the user).
+            let json = serde_json::to_string(&ctx).unwrap();
+            assert!(
+                !json.contains("lens-ro") && !json.contains("NOPERM"),
+                "{json}"
+            );
+        }
     }
 
     #[test]

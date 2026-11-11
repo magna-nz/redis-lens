@@ -38,6 +38,8 @@ fn config_with(dir: &Path, file: &str, name: &str, port: u16) -> PathBuf {
                 auth: Auth::None,
                 read_only: None,
                 prefer_replica: false,
+                provider: None,
+                token_command: None,
             },
             false,
         )

@@ -5,11 +5,11 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use secrecy::ExposeSecret;
 
-use crate::conn::ScanTarget;
 use crate::conn::docker::DiscoveredAuth;
 use crate::conn::parse::{AzureKind, ConnFormat, ParsedConnection, mask};
+use crate::conn::{ScanTarget, provider};
 use crate::format;
-use crate::model::{Auth, Env, PERM_LABELS, PERM_MEMORY, PermStatus};
+use crate::model::{Auth, Env, PERM_LABELS, PERM_MEMORY, PERM_MEMORY_STATS, PermStatus};
 use crate::tui::app::{AddState, App, ConnEntry, ConnSel, ConnStatus, DockerState, Source};
 
 use super::widgets::{
@@ -70,6 +70,7 @@ fn auth_label(e: &ConnEntry) -> &'static str {
         (_, Auth::None) => "none",
         (_, Auth::Keychain) => "keychain",
         (_, Auth::EntraId) => "Entra ID",
+        (_, Auth::Command) => "command",
     }
 }
 
@@ -187,7 +188,7 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
         } => Some((container, image, *auth)),
         Source::Saved => None,
     };
-    let right = format!(
+    let mut right = format!(
         "{} · {}",
         p.env.label(),
         if docker.is_some() {
@@ -196,6 +197,9 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
             "saved profile"
         }
     );
+    if let Some(pv) = p.provider {
+        right.push_str(&format!(" · {}", provider::label(pv)));
+    }
     let inner = panel(frame, area, &p.name, &right);
     let (lw, rw) = split_cols(usize::from(inner.width));
 
@@ -226,6 +230,10 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
         (Some(DiscoveredAuth::Unknown), _) => ("unknown", "could not tell"),
         (None, Auth::Keychain) => ("password or ACL user", "OS keychain"),
         (None, Auth::EntraId) => ("Entra ID", "developer tools (az login)"),
+        (None, Auth::Command) => (
+            "token command",
+            "token from the command, username in the OS keychain",
+        ),
     };
     let read_only = match (p.is_read_only(), p.env) {
         (true, Env::Prod) => "yes (production profile)",
@@ -316,9 +324,18 @@ fn note(app: &App, e: &ConnEntry, docker: Option<(&String, &String)>) -> Span<'s
         }
         ConnStatus::Limited => {
             let memory = e.perms.as_ref().is_some_and(|p| !p.allowed(PERM_MEMORY));
+            // MEMORY STATS is the only denied check: only the dataset figures go.
+            let only_stats = e.perms.as_ref().is_some_and(|p| {
+                p.checks
+                    .iter()
+                    .filter(|c| matches!(c.status, PermStatus::Denied(_)))
+                    .all(|c| c.label == PERM_MEMORY_STATS)
+            });
             return Span::styled(
                 if memory {
                     " ▲ This user can't run MEMORY USAGE, so Patterns shows counts but no sizes."
+                } else if only_stats {
+                    " ▲ MEMORY STATS is denied, so Patterns can't say how much of dataset.bytes the sample explains."
                 } else {
                     " ▲ Some checks were denied, so the views that need them are turned off."
                 },
@@ -335,6 +352,11 @@ fn note(app: &App, e: &ConnEntry, docker: Option<(&String, &String)>) -> Span<'s
             format!(" Found in Docker: container {container} ({image}). Press enter to connect."),
             style::dim(),
         );
+    }
+    // Before connecting, say what the provider takes away; once connected the
+    // permission check above is what counts.
+    if let Some(n) = provider::notice(e.profile.provider) {
+        return Span::styled(format!(" ▲ {n}"), style::amber());
     }
     let lead = if e.just_saved { " Saved. " } else { " " };
     Span::styled(

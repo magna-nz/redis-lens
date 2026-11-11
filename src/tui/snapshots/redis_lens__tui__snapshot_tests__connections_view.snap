@@ -34,7 +34,7 @@ expression: t.backend()
 "│ Auth        password or ACL user                                       ✗ MEMORY USAGE  NOPERM User lens-limited has …│"
 "│ Credential  OS keychain                                                – OBJECT FREQ   eviction policy is not LFU    │"
 "│ TLS         off                                                        ✓ INFO                                        │"
-"│ Read-only   no                                                                                                       │"
+"│ Read-only   no                                                         – MEMORY STATS                                │"
 "│ ▲ This user can't run MEMORY USAGE, so Patterns shows counts but no sizes.                                           │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 " ↑↓ Move   enter Connect   a Add   r Rescan Docker   0-4 View   ? Help   q Quit                                         "
