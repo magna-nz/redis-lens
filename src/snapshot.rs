@@ -254,6 +254,26 @@ fn candidates(dir: &Path, profile: &str) -> Result<Vec<SnapshotInfo>, SnapshotEr
 /// Snapshots for a profile, newest first. A missing directory is an empty list. Files
 /// that can't be read, aren't valid snapshots, or belong to another profile (a hash
 /// collision or a copied file) are left out.
+/// How many of a profile's snapshots to keep (`scan --save --keep N --keep-days D`,
+/// `snapshots prune`). `None` in both means keep everything.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Retention {
+    pub keep: Option<usize>,
+    pub keep_days: Option<u64>,
+}
+
+/// Delete `profile`'s snapshots in `dir` that `retention` doesn't keep, judged at
+/// `now_unix`, and return the deleted paths. Only files `save` wrote for that profile
+/// are touched. Contract stub for the quick-wins wave: deletes nothing yet.
+pub fn apply_retention(
+    _dir: &Path,
+    _profile: &str,
+    _retention: Retention,
+    _now_unix: i64,
+) -> Result<Vec<PathBuf>, SnapshotError> {
+    Ok(Vec::new())
+}
+
 pub fn list(dir: &Path, profile: &str) -> Result<Vec<SnapshotInfo>, SnapshotError> {
     Ok(candidates(dir, profile)?
         .into_iter()
@@ -321,6 +341,7 @@ mod tests {
             hot_keys: vec![],
             complete: true,
             match_glob: None,
+            server_context: None,
         }
     }
 

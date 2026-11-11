@@ -105,6 +105,8 @@ fn profile(port: u16, prefer_replica: bool) -> Profile {
         auth: Auth::None,
         read_only: None,
         prefer_replica,
+        provider: None,
+        token_command: None,
     }
 }
 

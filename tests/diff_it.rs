@@ -41,6 +41,8 @@ fn temp_config(port: u16) -> PathBuf {
         auth: Auth::None,
         read_only: None,
         prefer_replica: false,
+        provider: None,
+        token_command: None,
     };
     let path = temp_dir("diff-it-config").join("config.toml");
     Config {
@@ -59,6 +61,14 @@ fn scan_args(save: bool) -> ScanArgs {
         json: false,
         max_rate: Some(0),
         save,
+        keep: None,
+        keep_days: None,
+        checks: Vec::new(),
+        rules: None,
+        strict: false,
+        report: None,
+        output: None,
+        examples: false,
     }
 }
 

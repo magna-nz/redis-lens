@@ -207,6 +207,8 @@ pub async fn add_with(
         auth,
         read_only: None,
         prefer_replica: args.prefer_replica,
+        provider: None,
+        token_command: None,
     };
 
     let r = profile.secret_ref();
@@ -278,6 +280,7 @@ fn auth_label(a: Auth) -> &'static str {
         Auth::None => "none",
         Auth::Keychain => "keychain",
         Auth::EntraId => "entra-id",
+        Auth::Command => "command",
     }
 }
 
@@ -389,6 +392,8 @@ mod tests {
             entra: false,
             force: false,
             prefer_replica: false,
+            provider: None,
+            token_command: Vec::new(),
         }
     }
 
@@ -757,6 +762,8 @@ mod tests {
                 auth: Auth::Keychain,
                 read_only: None,
                 prefer_replica: false,
+                provider: None,
+                token_command: None,
             },
             credentials: Some(Credentials {
                 username: None,

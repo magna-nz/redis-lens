@@ -216,6 +216,8 @@ fn profile(port: u16) -> Profile {
         auth: Auth::None,
         read_only: None,
         prefer_replica: false,
+        provider: None,
+        token_command: None,
     }
 }
 

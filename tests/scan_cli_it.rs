@@ -41,6 +41,8 @@ fn profile(port: u16, auth: Auth) -> Profile {
         auth,
         read_only: None,
         prefer_replica: false,
+        provider: None,
+        token_command: None,
     }
 }
 
@@ -52,6 +54,14 @@ fn args() -> ScanArgs {
         json: false,
         max_rate: None,
         save: false,
+        keep: None,
+        keep_days: None,
+        checks: Vec::new(),
+        rules: None,
+        strict: false,
+        report: None,
+        output: None,
+        examples: false,
     }
 }
 

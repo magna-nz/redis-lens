@@ -413,6 +413,7 @@ mod tests {
             hot_keys: vec![],
             complete: false,
             match_glob: Some("user:*".into()),
+            server_context: None,
         };
         snapshot::save(&dir, &report).unwrap();
         let args = DiffArgs {

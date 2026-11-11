@@ -153,6 +153,8 @@ fn profile_for(name: String, port: u16, password: bool) -> Profile {
         auth: if password { Auth::Keychain } else { Auth::None },
         read_only: None,
         prefer_replica: false,
+        provider: None,
+        token_command: None,
     }
 }
 

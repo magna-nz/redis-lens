@@ -70,6 +70,7 @@ fn auth_label(e: &ConnEntry) -> &'static str {
         (_, Auth::None) => "none",
         (_, Auth::Keychain) => "keychain",
         (_, Auth::EntraId) => "Entra ID",
+        (_, Auth::Command) => "command",
     }
 }
 
@@ -226,6 +227,10 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
         (Some(DiscoveredAuth::Unknown), _) => ("unknown", "could not tell"),
         (None, Auth::Keychain) => ("password or ACL user", "OS keychain"),
         (None, Auth::EntraId) => ("Entra ID", "developer tools (az login)"),
+        (None, Auth::Command) => (
+            "token command",
+            "token from the command, username in the OS keychain",
+        ),
     };
     let read_only = match (p.is_read_only(), p.env) {
         (true, Env::Prod) => "yes (production profile)",

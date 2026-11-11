@@ -4,11 +4,35 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::model::Env;
+use crate::model::{Env, Provider};
 
+pub mod compare;
 pub mod conn;
 pub mod diff;
 pub mod scan;
+pub mod snapshots;
+pub mod trend;
+
+/// `scan --check`: one or more rules failed. The failures are already printed. Exit code 1.
+#[derive(Debug, thiserror::Error)]
+#[error("{0} check(s) failed")]
+pub struct ChecksFailed(pub usize);
+
+/// `scan --check`: the scan itself failed, so no rule could be judged. Exit code 2, so a
+/// CI gate can tell a failing rule from a broken scan.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct GateError(pub anyhow::Error);
+
+/// The process exit code for an error from [`run`]: 2 for [`GateError`], 1 otherwise
+/// ([`ChecksFailed`] included).
+pub fn exit_code(err: &anyhow::Error) -> u8 {
+    if err.downcast_ref::<GateError>().is_some() {
+        2
+    } else {
+        1
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "redis-lens", version, about, long_about = None)]
@@ -34,6 +58,78 @@ pub enum Command {
     Discover,
     /// Scan a saved connection and compare it with its previous snapshot.
     Diff(DiffArgs),
+    /// List or prune a profile's saved snapshots.
+    #[command(subcommand)]
+    Snapshots(SnapshotsCommand),
+    /// Show each pattern's memory over a profile's recent snapshots.
+    Trend(TrendArgs),
+    /// Compare the patterns of two connections, e.g. staging and prod.
+    Compare(CompareArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SnapshotsCommand {
+    /// List a profile's snapshots, newest first.
+    List {
+        /// Profile name.
+        profile: String,
+        /// Print as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a profile's old snapshots. Only files in redis-lens's own snapshot
+    /// directory are touched.
+    Prune {
+        /// Profile name.
+        profile: String,
+        /// Keep only the newest N snapshots.
+        #[arg(long)]
+        keep: Option<usize>,
+        /// Delete snapshots older than D days.
+        #[arg(long)]
+        keep_days: Option<u64>,
+        /// Delete without asking. Without it, prune only lists what it would delete.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct TrendArgs {
+    /// Profile name.
+    pub profile: String,
+    /// Only patterns containing this text.
+    #[arg(long)]
+    pub pattern: Option<String>,
+    /// How many of the newest snapshots to use.
+    #[arg(long, default_value_t = 7)]
+    pub last: usize,
+    /// Print as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CompareArgs {
+    /// The left profile (scanned unless --left-file is given).
+    pub left: String,
+    /// The right profile (scanned unless --right-file is given).
+    pub right: String,
+    /// Use this snapshot file for the left side instead of scanning.
+    #[arg(long)]
+    pub left_file: Option<PathBuf>,
+    /// Use this snapshot file for the right side instead of scanning.
+    #[arg(long)]
+    pub right_file: Option<PathBuf>,
+    /// Maximum number of keys to sample on each side.
+    #[arg(long, default_value_t = 100_000)]
+    pub sample: u64,
+    /// Upper bound on commands per second for each scan (0 means no limit).
+    #[arg(long)]
+    pub max_rate: Option<u32>,
+    /// Print as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -83,6 +179,36 @@ pub struct ConnAddArgs {
     /// Scan a replica instead of the primary when one is reachable.
     #[arg(long)]
     pub prefer_replica: bool,
+    /// The managed service, when the host name doesn't show it.
+    #[arg(long, value_enum)]
+    pub provider: Option<ProviderArg>,
+    /// Authenticate with a short-lived token printed by a command, run at every connect,
+    /// e.g. `-- az account get-access-token --resource https://redis.azure.com --query
+    /// accessToken -o tsv`. Give the program and its arguments after `--`; it is not run
+    /// through a shell.
+    #[arg(last = true, value_name = "TOKEN_COMMAND")]
+    pub token_command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ProviderArg {
+    Elasticache,
+    ElasticacheServerless,
+    Memorydb,
+    Azure,
+    Memorystore,
+}
+
+impl From<ProviderArg> for Provider {
+    fn from(p: ProviderArg) -> Self {
+        match p {
+            ProviderArg::Elasticache => Provider::Elasticache,
+            ProviderArg::ElasticacheServerless => Provider::ElasticacheServerless,
+            ProviderArg::Memorydb => Provider::Memorydb,
+            ProviderArg::Azure => Provider::Azure,
+            ProviderArg::Memorystore => Provider::Memorystore,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -124,6 +250,39 @@ pub struct ScanArgs {
     /// Save the report as a snapshot for later comparison.
     #[arg(long)]
     pub save: bool,
+    /// With --save, keep only the newest N snapshots of this profile.
+    #[arg(long, requires = "save")]
+    pub keep: Option<usize>,
+    /// With --save, delete this profile's snapshots older than D days.
+    #[arg(long, requires = "save")]
+    pub keep_days: Option<u64>,
+    /// Fail with exit code 1 when a rule fails, e.g. `no-ttl-pct<20`. Repeatable. A
+    /// broken scan exits with 2.
+    #[arg(long = "check", value_name = "RULE")]
+    pub checks: Vec<String>,
+    /// Read rules from the `[check]` table of a TOML file.
+    #[arg(long, value_name = "FILE")]
+    pub rules: Option<PathBuf>,
+    /// Also fail rules that could not be judged, e.g. a size rule without MEMORY USAGE.
+    #[arg(long)]
+    pub strict: bool,
+    /// Write a report in this format instead of the table.
+    #[arg(long, value_enum, conflicts_with = "json")]
+    pub report: Option<ReportFormat>,
+    /// Where to write the report. Standard output when omitted.
+    #[arg(short = 'o', long, requires = "report")]
+    pub output: Option<PathBuf>,
+    /// Include example key names in the report. Left out by default, since key names
+    /// can hold user ids or emails.
+    #[arg(long, requires = "report")]
+    pub examples: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ReportFormat {
+    Md,
+    Html,
+    Csv,
 }
 
 #[derive(Debug, Args)]
@@ -149,5 +308,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Scan(args) => scan::run(config, args).await,
         Command::Discover => conn::discover(config).await,
         Command::Diff(args) => diff::run(config, args).await,
+        Command::Snapshots(cmd) => snapshots::run(config, cmd).await,
+        Command::Trend(args) => trend::run(config, args).await,
+        Command::Compare(args) => compare::run(config, args).await,
     }
 }

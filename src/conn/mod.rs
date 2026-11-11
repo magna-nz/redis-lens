@@ -92,6 +92,8 @@ impl ResolvedAuth {
                 config = entra_config(config)?;
                 sends_credentials = true;
             }
+            // Contract stub for the quick-wins wave (agent C builds it).
+            Auth::Command => unimplemented!("token command auth"),
         }
         Ok(Self {
             settings,

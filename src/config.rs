@@ -158,6 +158,8 @@ mod tests {
             auth: Auth::Keychain,
             read_only: Some(true),
             prefer_replica: false,
+            provider: None,
+            token_command: None,
         }
     }
 

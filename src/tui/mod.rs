@@ -39,6 +39,9 @@ pub mod ui;
 mod fixtures;
 #[cfg(test)]
 mod snapshot_tests;
+/// Snapshots of the provider notices and the server context strip (quick-wins agent C).
+#[cfg(test)]
+mod snapshot_tests_server;
 
 use app::{App, ConnId, Effect, Msg, ScanId, SecretSource};
 use clipboard::CopyText;
@@ -505,6 +508,8 @@ mod tests {
             auth: Auth::Keychain,
             read_only: None,
             prefer_replica: false,
+            provider: None,
+            token_command: None,
         }
     }
 

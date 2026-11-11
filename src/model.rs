@@ -214,7 +214,18 @@ pub struct ScanReport {
     /// The `SCAN MATCH` glob the scan used, if any.
     #[serde(default)]
     pub match_glob: Option<String>,
+    /// Exact server-side figures (`INFO keysizes`, `INFO keyspace`, `MEMORY STATS`) to
+    /// set beside the sampled estimates. `None` in snapshots written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_context: Option<ServerContext>,
 }
+
+/// Exact figures the server reports about itself. Each part is optional: a section the
+/// server doesn't have (`INFO keysizes` before Redis 8, Valkey) or a command it refuses
+/// (`MEMORY STATS` on managed services) leaves it out. Fields are filled in by the scan
+/// module owner.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServerContext {}
 
 // ---------------------------------------------------------------------------
 // Connections
@@ -273,6 +284,27 @@ pub enum Auth {
     Keychain,
     /// Microsoft Entra ID through the redis-rs developer-tools credential chain (az login and similar). Needs the `entra-id` feature.
     EntraId,
+    /// A short-lived token printed by [`Profile::token_command`], run at every connect
+    /// and sent as the password. The username, if any, is in the OS keychain under
+    /// [`Profile::secret_ref`] (rule 1); the token is never stored anywhere.
+    Command,
+}
+
+/// A managed service recognised from the host name, or set by hand. A hint only: the
+/// permission check stays authoritative for what works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Provider {
+    /// Amazon ElastiCache (node-based).
+    Elasticache,
+    /// Amazon ElastiCache Serverless: `MEMORY USAGE` and `OBJECT FREQ` are restricted.
+    ElasticacheServerless,
+    /// Amazon MemoryDB.
+    Memorydb,
+    /// Azure Cache for Redis or Azure Managed Redis.
+    Azure,
+    /// Google Cloud Memorystore (private IPs, so only ever set by hand).
+    Memorystore,
 }
 
 /// A saved connection, as written to the config file.
@@ -295,6 +327,13 @@ pub struct Profile {
     /// Scan a replica of this server instead of the primary, when one is reachable.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prefer_replica: bool,
+    /// The managed service this profile is on, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Provider>,
+    /// For [`Auth::Command`]: the program and its arguments (never a shell string),
+    /// whose standard output is the token. Not a secret; the token it prints is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_command: Option<Vec<String>>,
 }
 
 /// Service name for every keychain entry this tool creates.
@@ -439,6 +478,8 @@ mod tests {
             auth: Auth::None,
             read_only: None,
             prefer_replica: false,
+            provider: None,
+            token_command: None,
         };
         assert!(p.is_read_only());
         p.env = Env::Local;
@@ -472,6 +513,8 @@ mod tests {
             auth: Auth::Keychain,
             read_only: None,
             prefer_replica: false,
+            provider: None,
+            token_command: None,
         };
         let text = toml::to_string(&p).unwrap();
         for word in ["password", "username", "user", "secret", "token"] {

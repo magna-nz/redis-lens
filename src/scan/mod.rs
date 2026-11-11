@@ -621,6 +621,7 @@ pub async fn scan_with_partial<C: ConnectionLike + Send>(
         hot_keys: hot_keys(&samples),
         complete,
         match_glob: opts.match_glob.clone(),
+        server_context: None,
     })
 }
 
@@ -678,6 +679,8 @@ mod tests {
             auth: Auth::None,
             read_only: None,
             prefer_replica: false,
+            provider: None,
+            token_command: None,
         };
         assert_eq!(ScanOptions::for_profile(&p).max_commands_per_sec, None);
         p.env = Env::Prod;

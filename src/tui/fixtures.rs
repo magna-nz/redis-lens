@@ -31,6 +31,8 @@ fn profile(name: &str, env: Env, host: &str, port: u16, tls: bool, auth: Auth) -
         auth,
         read_only: None,
         prefer_replica: false,
+        provider: None,
+        token_command: None,
     }
 }
 
@@ -462,6 +464,7 @@ pub fn report(sizes: bool) -> ScanReport {
         hot_keys: Vec::new(),
         complete: false,
         match_glob: None,
+        server_context: None,
     }
 }
 

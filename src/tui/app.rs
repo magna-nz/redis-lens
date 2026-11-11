@@ -1129,6 +1129,8 @@ impl App {
             },
             read_only: None,
             prefer_replica: false,
+            provider: None,
+            token_command: None,
         };
         if let Some(add) = self.add.as_mut() {
             add.saving = true;

@@ -278,6 +278,7 @@ mod tests {
             hot_keys: vec![],
             complete: false,
             match_glob: None,
+            server_context: None,
         }
     }
 

@@ -132,6 +132,8 @@ pub(crate) fn profile_in(env: crate::model::Env) -> Profile {
         auth: Auth::None,
         read_only: None,
         prefer_replica: false,
+        provider: None,
+        token_command: None,
     }
 }
 
@@ -154,8 +156,22 @@ fn save_into(
     if !args.save {
         return Ok(None);
     }
-    let path = snapshot::save(&dir()?, report)?;
+    let dir = dir()?;
+    let path = snapshot::save(&dir, report)?;
     eprintln!("Saved snapshot {}", path.display());
+    let retention = snapshot::Retention {
+        keep: args.keep,
+        keep_days: args.keep_days,
+    };
+    if retention != snapshot::Retention::default() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let removed = snapshot::apply_retention(&dir, &report.profile, retention, now)?;
+        if !removed.is_empty() {
+            eprintln!("Removed {} older snapshot(s)", removed.len());
+        }
+    }
     Ok(Some(path))
 }
 
@@ -449,6 +465,7 @@ mod tests {
             hot_keys: Vec::new(),
             complete: false,
             match_glob: None,
+            server_context: None,
         }
     }
 
@@ -472,6 +489,14 @@ mod tests {
             json: false,
             max_rate: None,
             save,
+            keep: None,
+            keep_days: None,
+            checks: Vec::new(),
+            rules: None,
+            strict: false,
+            report: None,
+            output: None,
+            examples: false,
         }
     }
 
