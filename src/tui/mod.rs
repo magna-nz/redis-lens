@@ -38,7 +38,7 @@ mod fixtures;
 #[cfg(test)]
 mod snapshot_tests;
 
-use app::{App, ConnId, Effect, Msg, SecretSource};
+use app::{App, ConnId, Effect, Msg, ScanId, SecretSource};
 
 const TICK: Duration = Duration::from_millis(100);
 
@@ -170,13 +170,16 @@ impl Runner {
             }
             Effect::Connect {
                 id,
+                scan,
                 profile,
                 secrets,
             } => {
                 if let Some(t) = self.scan_task.take() {
                     t.abort();
                 }
-                self.scan_task = Some(tokio::spawn(connect_and_scan(id, profile, secrets, tx)));
+                self.scan_task = Some(tokio::spawn(connect_and_scan(
+                    id, scan, profile, secrets, tx,
+                )));
             }
             Effect::SaveConnection {
                 profile,
@@ -193,7 +196,7 @@ impl Runner {
                     send(&tx, msg);
                 });
             }
-            Effect::LoadHistory { id, report } => {
+            Effect::LoadHistory { id, scan, report } => {
                 tokio::task::spawn_blocking(move || {
                     let taken_at_unix = report.taken_at_unix;
                     let result = load_history(&report).map_err(|e| e.to_string());
@@ -201,6 +204,7 @@ impl Runner {
                         &tx,
                         Msg::History {
                             id,
+                            scan,
                             taken_at_unix,
                             result,
                         },
@@ -292,6 +296,7 @@ fn report_name(profile: &Profile, secrets: &SecretSource) -> String {
 /// Pass progress and partial results on as messages until both senders are dropped.
 async fn forward_progress(
     id: ConnId,
+    scan: ScanId,
     mut progress: watch::Receiver<ScanProgress>,
     mut partial: watch::Receiver<Option<Arc<scan::PartialPatterns>>>,
     tx: Tx,
@@ -302,6 +307,7 @@ async fn forward_progress(
             r = progress.changed(), if progress_open => match r {
                 Ok(()) => Some(Msg::ScanProgress {
                     id,
+                    scan,
                     progress: *progress.borrow_and_update(),
                 }),
                 Err(_) => {
@@ -313,7 +319,7 @@ async fn forward_progress(
                 Ok(()) => partial
                     .borrow_and_update()
                     .clone()
-                    .map(|partial| Msg::ScanPartial { id, partial }),
+                    .map(|partial| Msg::ScanPartial { id, scan, partial }),
                 Err(_) => {
                     partial_open = false;
                     None
@@ -328,7 +334,59 @@ async fn forward_progress(
     }
 }
 
-async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, tx: Tx) {
+/// Aborts the task when dropped, so a forwarder never outlives the scan it serves:
+/// when the scan task is aborted (a new connect replaced it), its forwarder stops too
+/// instead of passing on the replaced scan's last progress and partials.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+type ProgressTx = watch::Sender<ScanProgress>;
+type PartialTx = watch::Sender<Option<Arc<scan::PartialPatterns>>>;
+
+/// Run one scan and report it: start the forwarder, run the scan (`run`) with the
+/// progress and partial senders, then send `ScanDone` or `ScanFailed`. Every progress and partial
+/// message of this scan arrives before that final message, and none after it.
+async fn scan_and_report<F, Fut>(id: ConnId, scan: ScanId, tx: Tx, run: F)
+where
+    F: FnOnce(ProgressTx, PartialTx) -> Fut,
+    Fut: Future<Output = Result<ScanReport, String>>,
+{
+    let (ptx, prx) = watch::channel(ScanProgress::default());
+    let (partial_tx, partial_rx) = watch::channel(None);
+    let mut forward = AbortOnDrop(tokio::spawn(forward_progress(
+        id,
+        scan,
+        prx,
+        partial_rx,
+        tx.clone(),
+    )));
+    // The future `run` returns owns the senders, so they are dropped with it as soon
+    // as this await completes.
+    // That ends the forwarder once it has passed on the last values: awaiting it here
+    // puts every progress and partial message before ScanDone or ScanFailed.
+    let result = run(ptx, partial_tx).await;
+    let _ = (&mut forward.0).await;
+    send(
+        &tx,
+        match result {
+            Ok(report) => Msg::ScanDone { id, scan, report },
+            Err(error) => Msg::ScanFailed { id, scan, error },
+        },
+    );
+}
+
+async fn connect_and_scan(
+    id: ConnId,
+    scan_id: ScanId,
+    profile: Profile,
+    secrets: SecretSource,
+    tx: Tx,
+) {
     let name = report_name(&profile, &secrets);
     let (store, secret): (Box<dyn SecretStore>, Option<String>) = match secrets {
         SecretSource::Keychain => (Box::new(KeyringStore), None),
@@ -353,6 +411,7 @@ async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, t
                 &tx,
                 Msg::ConnectFailed {
                     id,
+                    scan: scan_id,
                     error: clean(e.to_string()),
                 },
             );
@@ -365,6 +424,7 @@ async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, t
         &tx,
         Msg::Connected {
             id,
+            scan: scan_id,
             server,
             perms: perms.clone(),
             target,
@@ -373,33 +433,13 @@ async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, t
         return;
     }
 
-    let (ptx, prx) = watch::channel(ScanProgress::default());
-    let (partial_tx, partial_rx) = watch::channel(None);
-    let forward = tokio::spawn(forward_progress(id, prx, partial_rx, tx.clone()));
-    let result = scan::scan_with_partial(
-        &name,
-        &mut c,
-        &ScanOptions::for_profile(&profile),
-        &perms,
-        Some(&ptx),
-        Some(&partial_tx),
-    )
+    let opts = ScanOptions::for_profile(&profile);
+    scan_and_report(id, scan_id, tx, |ptx, partial_tx| async move {
+        scan::scan_with_partial(&name, &mut c, &opts, &perms, Some(&ptx), Some(&partial_tx))
+            .await
+            .map_err(|e| clean(e.to_string()))
+    })
     .await;
-    // Dropping the senders ends the forwarder once it has passed on the last values, so
-    // every progress and partial message arrives before ScanDone or ScanFailed.
-    drop(ptx);
-    drop(partial_tx);
-    let _ = forward.await;
-    send(
-        &tx,
-        match result {
-            Ok(report) => Msg::ScanDone { id, report },
-            Err(e) => Msg::ScanFailed {
-                id,
-                error: clean(e.to_string()),
-            },
-        },
-    );
 }
 
 #[cfg(test)]
@@ -505,7 +545,7 @@ mod tests {
         let (ptx, prx) = watch::channel(ScanProgress::default());
         let (partial_tx, partial_rx) = watch::channel(None);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let forward = tokio::spawn(forward_progress(7, prx, partial_rx, tx));
+        let forward = tokio::spawn(forward_progress(7, 70, prx, partial_rx, tx));
         let partial = crate::tui::fixtures::partial(true);
         ptx.send_replace(ScanProgress {
             sampled: 3_200,
@@ -521,12 +561,12 @@ mod tests {
         let (mut last_progress, mut last_partial) = (None, None);
         while let Ok(incoming) = rx.try_recv() {
             match incoming {
-                Incoming::Msg(Msg::ScanProgress { id, progress }) => {
-                    assert_eq!(id, 7);
+                Incoming::Msg(Msg::ScanProgress { id, scan, progress }) => {
+                    assert_eq!((id, scan), (7, 70));
                     last_progress = Some(progress);
                 }
-                Incoming::Msg(Msg::ScanPartial { id, partial }) => {
-                    assert_eq!(id, 7);
+                Incoming::Msg(Msg::ScanPartial { id, scan, partial }) => {
+                    assert_eq!((id, scan), (7, 70));
                     last_partial = Some(partial);
                 }
                 _ => panic!("unexpected message"),
@@ -542,7 +582,7 @@ mod tests {
         let (_partial_tx, partial_rx) = watch::channel(None);
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
-        let forward = tokio::spawn(forward_progress(1, prx, partial_rx, tx));
+        let forward = tokio::spawn(forward_progress(1, 10, prx, partial_rx, tx));
         ptx.send_replace(ScanProgress {
             sampled: 1,
             target: 2,
@@ -553,6 +593,147 @@ mod tests {
             .await
             .expect("forwarder kept running")
             .unwrap();
+    }
+
+    /// Run `scan_and_report` with a scan that sends many progress and partial values,
+    /// the last of them right before it returns `result`, then return every message.
+    async fn messages_of_a_scan(result: Result<ScanReport, String>) -> Vec<Msg> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let partial = crate::tui::fixtures::partial(true);
+        scan_and_report(3, 30, tx, |ptx, partial_tx| async move {
+            for i in 1..=50 {
+                ptx.send_replace(ScanProgress {
+                    sampled: i,
+                    target: 50,
+                    done: false,
+                });
+                partial_tx.send_replace(Some(partial.clone()));
+                if i % 7 == 0 {
+                    // Let the forwarder pass some on while the scan runs.
+                    tokio::task::yield_now().await;
+                }
+            }
+            // The last values are set with no chance for the forwarder to run before
+            // the scan returns.
+            ptx.send_replace(ScanProgress {
+                sampled: 50,
+                target: 50,
+                done: true,
+            });
+            partial_tx.send_replace(Some(partial.clone()));
+            result
+        })
+        .await;
+        let mut out = Vec::new();
+        // Every sender is gone once scan_and_report returns: this ends.
+        while let Some(incoming) = rx.recv().await {
+            let Incoming::Msg(msg) = incoming else {
+                panic!("not a message");
+            };
+            out.push(msg);
+        }
+        out
+    }
+
+    /// Checks that `msgs` is progress and partials of run (3, 30), the last progress
+    /// being the scan's final value, then exactly one final message, returned.
+    fn split_final(mut msgs: Vec<Msg>) -> Msg {
+        let last = msgs.pop().expect("no messages");
+        let (mut last_progress, mut partials) = (None, 0);
+        for m in msgs {
+            match m {
+                Msg::ScanProgress { id, scan, progress } => {
+                    assert_eq!((id, scan), (3, 30));
+                    last_progress = Some(progress);
+                }
+                Msg::ScanPartial { id, scan, .. } => {
+                    assert_eq!((id, scan), (3, 30));
+                    partials += 1;
+                }
+                other => panic!("{other:?} before the end of the scan"),
+            }
+        }
+        let p = last_progress.expect("no progress");
+        assert!(
+            p.done && p.sampled == 50,
+            "the final progress came late: {p:?}"
+        );
+        assert!(partials > 0);
+        last
+    }
+
+    #[tokio::test]
+    async fn progress_and_partials_all_arrive_before_scan_done() {
+        let report = crate::tui::fixtures::report(true);
+        let last = split_final(messages_of_a_scan(Ok(report.clone())).await);
+        let Msg::ScanDone {
+            id,
+            scan,
+            report: r,
+        } = last
+        else {
+            panic!("expected ScanDone last, got {last:?}");
+        };
+        assert_eq!((id, scan), (3, 30));
+        assert_eq!(r, report);
+    }
+
+    #[tokio::test]
+    async fn progress_and_partials_all_arrive_before_scan_failed() {
+        let last = split_final(messages_of_a_scan(Err("connection reset".into())).await);
+        let Msg::ScanFailed { id, scan, error } = last else {
+            panic!("expected ScanFailed last, got {last:?}");
+        };
+        assert_eq!((id, scan), (3, 30));
+        assert_eq!(error, "connection reset");
+    }
+
+    #[tokio::test]
+    async fn aborting_the_scan_task_stops_its_forwarder() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (keep_tx, keep_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(scan_and_report(4, 40, tx, |ptx, partial_tx| async move {
+            ptx.send_replace(ScanProgress {
+                sampled: 1,
+                target: 10,
+                done: false,
+            });
+            // Hand the senders out so they outlive the task: a forwarder that kept
+            // running would pass on whatever they get next.
+            let _ = keep_tx.send((ptx, partial_tx));
+            std::future::pending::<Result<ScanReport, String>>().await
+        }));
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no progress")
+            .expect("channel closed");
+        assert!(matches!(
+            first,
+            Incoming::Msg(Msg::ScanProgress {
+                id: 4,
+                scan: 40,
+                ..
+            })
+        ));
+        let (ptx, partial_tx) = keep_rx.await.unwrap();
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        ptx.send_replace(ScanProgress {
+            sampled: 2,
+            target: 10,
+            done: false,
+        });
+        partial_tx.send_replace(Some(crate::tui::fixtures::partial(true)));
+        // The forwarder held the last sender of the channel: it closes with nothing
+        // more in it.
+        let next = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the channel stayed open: the forwarder outlived the aborted scan");
+        assert!(
+            next.is_none(),
+            "a message arrived after the scan was aborted"
+        );
     }
 
     #[test]

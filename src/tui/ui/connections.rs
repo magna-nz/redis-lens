@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 use secrecy::ExposeSecret;
 
 use crate::conn::ScanTarget;
+use crate::conn::docker::DiscoveredAuth;
 use crate::conn::parse::{AzureKind, ConnFormat, ParsedConnection, mask};
 use crate::format;
 use crate::model::{Auth, Env, PERM_LABELS, PERM_MEMORY, PermStatus};
@@ -63,14 +64,8 @@ fn status(e: &ConnEntry) -> (&'static str, ratatui::style::Style) {
 
 fn auth_label(e: &ConnEntry) -> &'static str {
     match (&e.source, e.profile.auth) {
-        (
-            Source::Docker {
-                credentials: Some(_),
-                ..
-            },
-            _,
-        ) => "password",
-        (Source::Docker { .. }, _) | (_, Auth::None) => "none",
+        (Source::Docker { auth, .. }, _) => auth.label(),
+        (_, Auth::None) => "none",
         (_, Auth::Keychain) => "keychain",
         (_, Auth::EntraId) => "Entra ID",
     }
@@ -176,8 +171,9 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
         Source::Docker {
             container,
             image,
-            credentials,
-        } => Some((container, image, credentials.is_some())),
+            auth,
+            ..
+        } => Some((container, image, *auth)),
         Source::Saved => None,
     };
     let right = format!(
@@ -207,9 +203,16 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
         ),
         None => ("not connected yet".to_string(), style::dim()),
     };
-    let (auth, cred) = match (docker, p.auth) {
-        (Some((_, _, true)), _) => ("password (default user)", "from the container, memory only"),
-        (Some(_), _) | (None, Auth::None) => ("none", "none"),
+    let (auth, cred) = match (docker.map(|(_, _, auth)| auth), p.auth) {
+        (Some(DiscoveredAuth::Password), _) => {
+            ("password (default user)", "from the container, memory only")
+        }
+        (Some(DiscoveredAuth::None), _) | (None, Auth::None) => ("none", "none"),
+        (Some(DiscoveredAuth::Required), _) => (
+            "required",
+            "not found: save it as a profile with credentials",
+        ),
+        (Some(DiscoveredAuth::Unknown), _) => ("unknown", "could not tell"),
         (None, Auth::Keychain) => ("password or ACL user", "OS keychain"),
         (None, Auth::EntraId) => ("Entra ID", "developer tools (az login)"),
     };
