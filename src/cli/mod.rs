@@ -317,3 +317,37 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Compare(args) => compare::run(config, args).await,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_needs_a_retention_rule() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv);
+        let e = parse(&["redis-lens", "snapshots", "prune", "p"]).unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(parse(&["redis-lens", "snapshots", "prune", "p", "--keep", "3"]).is_ok());
+        assert!(parse(&["redis-lens", "snapshots", "prune", "p", "--keep-days", "7"]).is_ok());
+        assert!(
+            parse(&[
+                "redis-lens",
+                "snapshots",
+                "prune",
+                "p",
+                "--keep",
+                "3",
+                "--keep-days",
+                "7"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn exit_codes() {
+        assert_eq!(exit_code(&anyhow::Error::from(ChecksFailed(2))), 1);
+        assert_eq!(exit_code(&GateError(anyhow::anyhow!("boom")).into()), 2);
+        assert_eq!(exit_code(&anyhow::anyhow!("other")), 1);
+    }
+}
