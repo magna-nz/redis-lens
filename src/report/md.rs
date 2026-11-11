@@ -3,7 +3,7 @@
 
 use std::fmt::Write;
 
-use super::{Row, TOP_PATTERNS, change_text, changes, facts, risks, rows};
+use super::{NODE_HEADS, Row, TOP_PATTERNS, change_text, changes, facts, node_cells, risks, rows};
 use crate::diff::ReportDiff;
 use crate::format;
 use crate::model::ScanReport;
@@ -73,6 +73,28 @@ pub fn render(report: &ScanReport, diff: Option<&ReportDiff>, examples: bool) ->
     }
     for line in context_summary(report) {
         let _ = writeln!(out, "- {}", esc(&line));
+    }
+
+    if let Some(nodes) = &report.nodes {
+        let _ = writeln!(out, "\n## Nodes\n");
+        let heads: Vec<String> = NODE_HEADS
+            .iter()
+            .map(|h| {
+                let mut c = h.chars();
+                c.next()
+                    .map(|f| f.to_string() + &c.as_str().to_lowercase())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "| {} |\n|---|---|---|---|---:|---:|---:|---|",
+            heads.join(" | ")
+        );
+        for n in nodes {
+            let cells: Vec<String> = node_cells(n).iter().map(|c| esc(c)).collect();
+            let _ = writeln!(out, "| {} |", cells.join(" | "));
+        }
     }
 
     let _ = writeln!(out, "\n## Top patterns\n");
@@ -202,6 +224,29 @@ mod tests {
         assert_eq!(esc("[l](u)"), "\\[l\\](u)");
         assert_eq!(esc("a\nb\r\tc"), "a b  c");
         assert_eq!(esc("\\|"), "\\\\\\|");
+    }
+
+    #[test]
+    fn snapshot_cluster_nodes() {
+        insta::assert_snapshot!(render(&cluster_report(), None, false));
+    }
+
+    #[test]
+    fn nodes_section_only_on_clusters() {
+        let (_, after) = before_after();
+        assert!(!render(&after, None, false).contains("## Nodes"));
+        assert!(render(&cluster_report(), None, false).contains("## Nodes"));
+    }
+
+    #[test]
+    fn hostile_node_endpoint_and_note_are_escaped() {
+        let mut r = cluster_report();
+        let n = &mut r.nodes.as_mut().unwrap()[0];
+        n.endpoint.host = "<b>x|y".into();
+        n.note = Some("a|b\nc".into());
+        let out = render(&r, None, false);
+        assert!(out.contains("\\<b\\>x\\|y:7000"), "{out}");
+        assert!(out.contains("a\\|b c"), "{out}");
     }
 
     #[test]

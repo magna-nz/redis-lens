@@ -9,7 +9,7 @@
 use crate::cli::ReportFormat;
 use crate::diff::{Cause, PatternDiff, ReportDiff};
 use crate::format;
-use crate::model::{PatternStats, ScanReport};
+use crate::model::{NodeReport, NodeRole, NodeStatus, PatternStats, ScanReport};
 use crate::verdict::{TtlVerdict, ttl_verdict};
 
 pub mod csv;
@@ -182,6 +182,78 @@ pub(crate) fn change_text(c: &PatternDiff) -> String {
     }
 }
 
+/// Most slot ranges written out in the Nodes table; the rest are counted.
+const MAX_SLOT_RANGES: usize = 3;
+
+/// Column heads of the Nodes table, shared by the text, Markdown and HTML reports.
+pub(crate) const NODE_HEADS: [&str; 8] = [
+    "SLOTS", "ENDPOINT", "ROLE", "STATUS", "KEYS", "SAMPLED", "MEMORY", "NOTE",
+];
+
+/// Slot ranges as `0-5460`, joined with commas. A single slot is `5`; after
+/// [`MAX_SLOT_RANGES`] ranges the rest are counted (`0-99,200-299,400-499,+2 more`).
+pub(crate) fn slots_text(slots: &[(u16, u16)]) -> String {
+    if slots.is_empty() {
+        return "-".to_string();
+    }
+    let range = |&(a, b): &(u16, u16)| {
+        if a == b {
+            a.to_string()
+        } else {
+            format!("{a}-{b}")
+        }
+    };
+    let mut parts: Vec<String> = slots.iter().take(MAX_SLOT_RANGES).map(range).collect();
+    if slots.len() > MAX_SLOT_RANGES {
+        parts.push(format!("+{} more", slots.len() - MAX_SLOT_RANGES));
+    }
+    parts.join(",")
+}
+
+pub(crate) fn role_word(r: NodeRole) -> &'static str {
+    match r {
+        NodeRole::Primary => "primary",
+        NodeRole::Replica => "replica",
+    }
+}
+
+pub(crate) fn status_word(s: NodeStatus) -> &'static str {
+    match s {
+        NodeStatus::Scanned => "scanned",
+        NodeStatus::Partial => "partial",
+        NodeStatus::Failed => "failed",
+    }
+}
+
+/// The cells of one Nodes table row, in [`NODE_HEADS`] order. Unknown figures are `-`.
+pub(crate) fn node_cells(n: &NodeReport) -> [String; 8] {
+    [
+        slots_text(&n.slots),
+        n.endpoint.to_string(),
+        role_word(n.role).to_string(),
+        status_word(n.status).to_string(),
+        n.server
+            .as_ref()
+            .map_or("-".to_string(), |s| format::count(s.total_keys)),
+        format::count(n.sampled_keys),
+        n.server
+            .as_ref()
+            .map_or("-".to_string(), |s| format::bytes(s.used_memory)),
+        n.note.clone().unwrap_or_default(),
+    ]
+}
+
+/// Nodes that were not scanned to the end, as `endpoint (status)`.
+pub(crate) fn unfinished_nodes(report: &ScanReport) -> Vec<String> {
+    report
+        .nodes
+        .iter()
+        .flatten()
+        .filter(|n| n.status != NodeStatus::Scanned)
+        .map(|n| format!("{} ({})", n.endpoint, status_word(n.status)))
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
@@ -277,6 +349,59 @@ pub(crate) mod fixtures {
         (before, after)
     }
 
+    /// [`before_after`]'s later report as a three-shard cluster scan: two nodes scanned, one
+    /// failed. Made-up addresses.
+    pub fn cluster_report() -> ScanReport {
+        use crate::model::{Endpoint, NodeReport, NodeRole, NodeStatus};
+        let (_, mut r) = before_after();
+        r.server.mode = ServerMode::Cluster;
+        r.complete = false;
+        let base = r.server.clone();
+        let node = |i: u16, slots: Vec<(u16, u16)>, status, note: Option<&str>, keys| {
+            let up = status != NodeStatus::Failed;
+            NodeReport {
+                id: format!("{i:040}"),
+                endpoint: Endpoint {
+                    host: format!("10.0.1.{i}"),
+                    port: 7000,
+                    tls: false,
+                },
+                role: NodeRole::Primary,
+                primary_id: format!("{i:040}"),
+                slots,
+                server: up.then(|| ServerInfo {
+                    total_keys: keys,
+                    used_memory: 10_485_760,
+                    ..base.clone()
+                }),
+                status,
+                note: note.map(str::to_string),
+                sampled_keys: if up { 300 } else { 0 },
+                complete: status == NodeStatus::Scanned,
+                sizes_available: up,
+                patterns: Vec::new(),
+            }
+        };
+        r.nodes = Some(vec![
+            node(1, vec![(0, 5460)], NodeStatus::Scanned, None, 3_400),
+            node(
+                2,
+                vec![(5461, 9000), (9500, 10922)],
+                NodeStatus::Partial,
+                Some("the scan of this node stopped early"),
+                3_300,
+            ),
+            node(
+                3,
+                vec![(10923, 16383)],
+                NodeStatus::Failed,
+                Some("this node could not be connected to"),
+                0,
+            ),
+        ]);
+        r
+    }
+
     /// A pattern name and example keys written by an attacker.
     pub fn hostile() -> ScanReport {
         let evil = [
@@ -300,5 +425,42 @@ pub(crate) mod fixtures {
             ));
         }
         report(patterns, true, 1_709_210_096)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::cluster_report;
+    use super::*;
+
+    #[test]
+    fn slots_compact_and_truncated() {
+        assert_eq!(slots_text(&[(0, 5460)]), "0-5460");
+        assert_eq!(slots_text(&[(5, 5), (7, 9)]), "5,7-9");
+        assert_eq!(slots_text(&[]), "-");
+        let many: Vec<(u16, u16)> = (0..5).map(|i| (i * 100, i * 100 + 99)).collect();
+        assert_eq!(slots_text(&many), "0-99,100-199,200-299,+2 more");
+    }
+
+    #[test]
+    fn node_cells_use_dash_for_unknowns() {
+        let r = cluster_report();
+        let nodes = r.nodes.as_ref().unwrap();
+        let ok = node_cells(&nodes[0]);
+        assert_eq!(ok[..4], ["0-5460", "10.0.1.1:7000", "primary", "scanned"]);
+        assert_eq!(ok[4], format::count(3_400));
+        let failed = node_cells(&nodes[2]);
+        assert_eq!((failed[3].as_str(), failed[4].as_str()), ("failed", "-"));
+        assert_eq!(failed[6], "-");
+    }
+
+    #[test]
+    fn unfinished_lists_partial_and_failed() {
+        let r = cluster_report();
+        assert_eq!(
+            unfinished_nodes(&r),
+            ["10.0.1.2:7000 (partial)", "10.0.1.3:7000 (failed)"]
+        );
+        assert!(unfinished_nodes(&fixtures::report(vec![], true, 0)).is_empty());
     }
 }

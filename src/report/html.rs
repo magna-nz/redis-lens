@@ -4,7 +4,7 @@
 
 use std::fmt::Write;
 
-use super::{Row, TOP_PATTERNS, change_text, changes, facts, risks, rows};
+use super::{NODE_HEADS, Row, TOP_PATTERNS, change_text, changes, facts, node_cells, risks, rows};
 use crate::diff::ReportDiff;
 use crate::format;
 use crate::model::ScanReport;
@@ -65,6 +65,32 @@ pub fn render(report: &ScanReport, diff: Option<&ReportDiff>, examples: bool) ->
         let _ = writeln!(out, "<dt>Server</dt><dd>{}</dd>", esc(&line));
     }
     out.push_str("</dl>\n");
+
+    if let Some(nodes) = &report.nodes {
+        out.push_str("<h2>Nodes</h2>\n<table class=\"sortable\">\n<thead><tr>");
+        for (i, h) in NODE_HEADS.iter().enumerate() {
+            let class = if (4..7).contains(&i) {
+                " class=\"n\""
+            } else {
+                ""
+            };
+            let _ = write!(out, "<th{class}>{}</th>", esc(h));
+        }
+        out.push_str("</tr></thead>\n<tbody>\n");
+        for n in nodes {
+            out.push_str("<tr>");
+            for (i, c) in node_cells(n).iter().enumerate() {
+                let class = match i {
+                    3 if n.status != crate::model::NodeStatus::Scanned => " class=\"warn\"",
+                    4..=6 => " class=\"n\"",
+                    _ => "",
+                };
+                let _ = write!(out, "<td{class}>{}</td>", esc(c));
+            }
+            out.push_str("</tr>\n");
+        }
+        out.push_str("</tbody>\n</table>\n");
+    }
 
     out.push_str("<h2>Top patterns</h2>\n");
     if rows.is_empty() {
@@ -205,6 +231,33 @@ mod tests {
     fn escapes_all_five() {
         assert_eq!(esc("&<>\"'"), "&amp;&lt;&gt;&quot;&#39;");
         assert_eq!(esc("a\nb"), "a b");
+    }
+
+    #[test]
+    fn snapshot_cluster_nodes() {
+        insta::assert_snapshot!(render(&cluster_report(), None, false));
+    }
+
+    #[test]
+    fn nodes_section_only_on_clusters() {
+        let (_, after) = before_after();
+        assert!(!render(&after, None, false).contains("<h2>Nodes</h2>"));
+        assert!(render(&cluster_report(), None, false).contains("<h2>Nodes</h2>"));
+    }
+
+    #[test]
+    fn hostile_node_endpoint_and_note_are_escaped() {
+        let mut r = cluster_report();
+        let n = &mut r.nodes.as_mut().unwrap()[0];
+        n.endpoint.host = "<script>x()</script>".into();
+        n.note = Some("\"><img>".into());
+        let out = render(&r, None, false);
+        assert_eq!(out.matches("<script").count(), 1, "{out}");
+        assert!(!out.contains("<img>"), "{out}");
+        assert!(
+            out.contains("&lt;script&gt;x()&lt;/script&gt;:7000"),
+            "{out}"
+        );
     }
 
     #[test]
