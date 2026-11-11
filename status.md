@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** v0.2 done on main; waves 6 and 7 merged (PRs #10, #11); wave 8 (usability) in progress; then v0.3 (cluster) or the feature ideas below
-**Last updated:** 2026-11-11 (wave 8 merged on the integration branch; verifier next)
+**Last updated:** 2026-11-11 (wave 8 verified; PR #12)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -52,7 +52,7 @@ Integration branch `wave8/usability` (worktree `.claude/worktrees/wave8`, from m
 | B | Key table (`tui/keymap.rs`), `?` help overlay (`tui/ui/help.rs`), OSC 52 clipboard (`tui/clipboard.rs`), standalone | implementer [sonnet] | `wave8/keys` | **done** (d34d3fa), merged |
 | D | Keychain panic text, parallel discovery probes, `os_trust` skipped | implementer [sonnet] | `wave8/extras` | **done** (693d575), merged |
 | C | Rescan, `?` and clipboard wired in, footer from the key table, Page Up/Down and Home/End in every list view | implementer [opus] | `wave8/wire`, after A, B and D | **done** (75804f2), merged |
-| V | Verifier on the merged `wave8/usability` | verifier [opus] | pinned detached worktree (3de2853, then the fix commit) | round 1 **BLOCKED** on B1 and B2, fixed; round 2 **BLOCKED** on B3, fixed; round 3 **BLOCKED** on B4 (test only), fixed (below); round 4 in progress |
+| V | Verifier on the merged `wave8/usability` | verifier [opus] | pinned detached worktree (3de2853, then the fix commit) | round 1 **BLOCKED** on B1 and B2, fixed; round 2 **BLOCKED** on B3, fixed; round 3 **BLOCKED** on B4 (test only), fixed (below); round 4 at 0eaa9e2 **APPROVE**, no blockers |
 
 **Verifier round 1 (BLOCKED, report `w8-verify-report.md` in the session notes), and the fixes:**
 - B1: the suggested command (`Y` and the detail panel's `$` line) put the glob in single quotes without escaping `'`, so a key named ``evil:x'$(touch pwned)'`` gave a command that ran `touch` when pasted into a shell. Fixed in `tui::clipboard::suggested_command`: `'` is written as `'\''`, and control characters and `\` (fish's escape inside single quotes) become `?`. Tests: `a_key_name_cannot_break_out_of_the_command` (exact text) and the proptest `the_pattern_is_always_one_quoted_word` (the text after `--pattern` is exactly one quoted word holding the glob, and has no control characters). Checked in bash with a stub `redis-cli`: one argument, nothing run.
