@@ -38,6 +38,8 @@ Approved by the owner: "Approve, merge when green". Same merge rules as the over
 
 **Owner instruction (2026-11-11): "make sure we have tests for everything".** Every behaviour change in this wave needs a test. Each agent reports a test map (change → test), and the verifier audits it, plus a repo-wide check that each behaviour in `spec.md` has a test.
 
+**Coverage (`make coverage`, unit + integration, 2026-11-11 at 09343e2):** 92.6% of lines. All tests pass: 260 unit, conn 14, diff 4, replica 11, scan_cli 5, scan 15, smoke 3, tls 6. Lowest: `main.rs` 0% (entry point only), `cli/mod.rs` 24% (clap dispatch), `tui/mod.rs` 52% (terminal event loop), `secrets.rs` 70% (the real keychain, an ignored test), `tui/ui/connections.rs` 77%.
+
 Integration branch: `wave6/fixes` (worktree `.claude/worktrees/wave6`). Out of scope: Entra ID against real Azure and managed identity (needs Azure; feature idea 10), and the `--prefer-replica` trust boundary (a documented design trade-off).
 
 ### How to resume after a restart or compaction
