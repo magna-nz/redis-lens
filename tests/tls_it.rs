@@ -377,6 +377,9 @@ tls_test!(
         for valkey in [false, true] {
             // The OS store is empty, so the bundled public roots are used, and the test
             // CA is not among them: the same server the other tests reach is refused.
+            // That the bundled store is not empty (and holds exactly the bundled roots)
+            // is checked by the unit tests in src/conn/tls.rs; the trust roots are not
+            // reachable from here.
             let server = common::tls_server(valkey, &fx.good).await;
             let err = conn::connect(&profile(server.port, false), &MemoryStore::default())
                 .await

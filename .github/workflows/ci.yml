@@ -41,6 +41,52 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # For tests/os_trust.rs: a CA in the real OS trust store (System keychain, Windows
+      # Root store, update-ca-certificates). Fails rather than skips if it can't be
+      # installed, since the test only skips when REDIS_LENS_OS_TRUST_CA is unset.
+      - name: Install a throwaway CA in the OS trust store
+        shell: bash
+        env:
+          # Keep Git Bash on Windows from turning "/CN=..." into a path.
+          MSYS_NO_PATHCONV: "1"
+          MSYS2_ARG_CONV_EXCL: "*"
+        run: |
+          set -euo pipefail
+          if [ -n "${SSL_CERT_FILE:-}" ] || [ -n "${SSL_CERT_DIR:-}" ]; then
+            echo "::error::SSL_CERT_FILE or SSL_CERT_DIR is set: it would replace the OS store under test"
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/os-trust"
+          if [ "$RUNNER_OS" = Windows ]; then dir="$(cygpath -m "$RUNNER_TEMP")/os-trust"; fi
+          mkdir -p "$dir"
+          name="redis-lens CI OS trust CA"
+          openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 2 \
+            -subj "/CN=$name" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign" \
+            -keyout "$dir/ca.key" -out "$dir/ca.pem"
+          case "$RUNNER_OS" in
+            macOS)
+              sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$dir/ca.pem"
+              security dump-trust-settings -d | grep -F "$name"
+              ;;
+            Windows)
+              openssl x509 -in "$dir/ca.pem" -outform der -out "$dir/ca.cer"
+              certutil -addstore -f Root "$dir/ca.cer"
+              certutil -store Root "$name"
+              ;;
+            Linux)
+              sudo cp "$dir/ca.pem" /usr/local/share/ca-certificates/redis-lens-os-trust-ci.crt
+              sudo update-ca-certificates
+              grep -qF "$(sed -n 2p "$dir/ca.pem")" /etc/ssl/certs/ca-certificates.crt
+              ;;
+            *)
+              echo "::error::no OS trust store install step for $RUNNER_OS"
+              exit 1
+              ;;
+          esac
+          echo "REDIS_LENS_OS_TRUST_CA=$dir/ca.pem" >> "$GITHUB_ENV"
+          echo "REDIS_LENS_OS_TRUST_CA_KEY=$dir/ca.key" >> "$GITHUB_ENV"
       - run: cargo test --locked
 
   integration:

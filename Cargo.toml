@@ -28,15 +28,22 @@ directories = "6.0.0"
 futures = "0.3.34"
 keyring = "4.2.0"
 ratatui = "0.30.2"
+# Pinned on purpose: src/conn/tls.rs relies on redis-rs 1.8.1 *replacing* its default
+# trust store with the one in `tls_params` (`root_cert_store.unwrap_or(root_store)` in
+# connection.rs `create_rustls_config`), not merging the two. A unit test there
+# (`redis_is_still_the_version_whose_store_handling_was_checked`) fails when Cargo.lock
+# moves off 1.8.1: re-check that function, then update the pin in the test.
 redis = { version = "1.8.1", default-features = false, features = [
     "acl",
     "aio",
     "tokio-comp",
     "tokio-rustls-comp",
-    # Keep: without it redis-rs loads the OS store itself on every TLS connection and
-    # fails if any one certificate is unreadable. With it, redis-rs's default store is
-    # the bundled webpki roots, which src/conn/tls.rs uses only when the OS store
-    # (loaded there, once) has no usable certificate.
+    # Keep: redis-rs builds its default store on every TLS connection, even when
+    # `tls_params` replace it. Without this feature that default is the OS store, loaded
+    # again per connection and failing if any one certificate is unreadable. With it, the
+    # default is the bundled webpki roots, which costs nothing. src/conn/tls.rs always
+    # passes its own store (OS certificates, or webpki-root-certs below), so the default
+    # is only a fallback that is not expected to be reached.
     "tls-rustls-webpki-roots",
     "cluster-async",
     "connection-manager",
@@ -45,6 +52,10 @@ redis = { version = "1.8.1", default-features = false, features = [
 rpassword = "7.5.4"
 rustls = { version = "0.23.46", default-features = false, features = ["std"] }
 rustls-native-certs = "0.8.5"
+# The bundled roots as full certificates (webpki-roots only has trust anchors, and
+# redis-rs takes custom roots only as PEM). Same CCADB data and version as the
+# webpki-roots that redis-rs pulls in.
+webpki-root-certs = "1.0.9"
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
@@ -56,9 +67,11 @@ url = "2.5.8"
 [dev-dependencies]
 insta = "1.49.0"
 proptest = "1.12.0"
-rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
 testcontainers = "0.28.0"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "io-util"] }
+# The in-process TLS server in tests/os_trust.rs. Same version redis-rs uses.
+tokio-rustls = { version = "0.26.6", default-features = false }
 
 [lints.rust]
 unsafe_code = "forbid"
