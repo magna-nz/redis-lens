@@ -385,8 +385,9 @@ impl Bastion {
         })
     }
 
-    /// Run `launcher` (a program and its first arguments) instead of `ssh`.
-    #[cfg(test)]
+    /// Run `launcher` (a program and its first arguments) instead of `ssh`. Only the
+    /// Unix tests use it: they launch shell and perl stand-ins.
+    #[cfg(all(test, unix))]
     pub(crate) fn with_launcher(mut self, launcher: Vec<OsString>, ready: Duration) -> Self {
         self.launcher = launcher;
         self.ready_timeout = ready;
