@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** v0.2 done on main; waves 6 and 7 merged (PRs #10, #11); wave 8 (usability) in progress; then v0.3 (cluster) or the feature ideas below
-**Last updated:** 2026-11-11 (wave 8 verified; PR #12)
+**Current milestone:** v0.2 done on main; waves 6-8 merged (PRs #10-#12); the quick wins (feature ideas 1-7) in progress; then v0.3 (cluster) or the bigger bets below
+**Last updated:** 2026-11-11 (quick-wins wave started)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -33,6 +33,27 @@ Approved by the owner: "Approve, merge when green". Same merge rules as the over
 | B | Redis 6.2 in the integration job, as a new CI job (existing required check names unchanged) | implementer [sonnet] | `wave6/tests` (worktree `.claude/worktrees/w6-tests`) | **done** (89f0274): all integration tests pass on 6.2 with no test changes; merged into `wave6/fixes` |
 | C | OS trust store for TLS (load native certs, skip ones that fail to load, fall back to bundled roots when the store is empty); TLS replica test on Redis and Valkey via a throwaway CA and `SSL_CERT_FILE` | implementer [opus] | `wave6/tls` from `wave6/fixes` after B | **done** (9291fba, 3a54fdc): `src/conn/tls.rs`; `tests/tls_it.rs` (6 tests, Redis + Valkey, also on 6.2); merged into `wave6/fixes` |
 | V | Verifier on the merged `wave6/fixes` | verifier [opus] | pinned detached worktree at 09343e2 | **APPROVE**, no blockers. Its ready-made test for the partial denominator (D1) is added. Follow-ups below |
+
+## Quick wins (2026-11-11): feature ideas 1-7
+
+Approved by the owner ("Approve as proposed"). Defaults agreed:
+- The token command's username stays in the OS keychain (rule 1); only the argv goes in the config file. `conn add` asks first (`--yes` skips).
+- Reports leave example key names out unless `--examples`.
+- `compare` comes forward from v0.3 for standalone servers.
+- The provider is a host-name hint; ElastiCache Serverless gets a lower default rate.
+- `snapshots prune` needs `--yes` and only touches redis-lens's own snapshot directory.
+- No tag, release or publish. The owner merges the PR (auto mode blocks the admin merge).
+
+Integration branch `quickwins/integration` (worktree `.claude/worktrees/qw`, from main ebe9f17). Contract commits 95c099f and 1c28218:
+- in `model.rs`: `Auth::Command`, `Provider`, `Profile.provider`, `Profile.token_command`, `ScanReport.server_context`;
+- every new CLI flag and subcommand, plus exit codes (`ChecksFailed` 1, `GateError` 2), with stubs.
+
+| Part | Content | Agent | Branch | State |
+|---|---|---|---|---|
+| R | 1 `--check` rules with exit codes; 2 Markdown, HTML and CSV reports | implementer [sonnet] | `quickwins/r` | in progress |
+| S | 6 snapshot retention, `snapshots list/prune`, `trend` and a trend column in the Diff view; 7 `compare` | implementer [opus] | `quickwins/s` | in progress |
+| C | 3 provider detection and notices; 4 server context (`INFO keysizes`, `INFO keyspace`, `MEMORY STATS`); 5 token-command auth | implementer [opus] | `quickwins/c` | in progress |
+| V | Verifier on the merged branch | verifier [opus] | pinned detached worktree | not started |
 
 ## Wave 8 (2026-11-11): usability
 
@@ -226,7 +247,7 @@ See the overnight table above.
 - Agent worktrees made by the harness branch from `main`, not the current branch, so create them by hand.
 - **Entra ID** is implemented behind `--features entra-id`, using redis-rs's `EntraIdCredentialsProvider::new_developer_tools()` (az login and other developer tools). It is untested against real Azure, and managed identity isn't covered yet.
 - `discover` shows the demo Redis as auth "required" (since wave 7; it was "none"), because its passwords live in an ACL file discovery can't see. Save it as a profile instead (`make demo-profiles`).
-- Narrow terminals: rows are drawn at fixed column widths and cut off at the right edge (the spec said "scroll horizontally" until wave 7; the owner chose truncation plus scrolling text on the selected row). Hiding low-priority columns at narrow widths is a candidate for the usability wave.
+- Narrow terminals: the Patterns view hides the share bar, then Δ, then avg size before cutting a row (wave 8); other views cut a row too wide at the right edge, and the selected row's overflowing text scrolls across.
 - For Redis ACL rules passed as server arguments, use one argument per word (`tests/common/mod.rs`).
 - `ParsedConnection.credentials` is `Some` with an empty password when a URL has a username but no password, so `conn add` can ask for `--password-stdin` or `--ask-password`.
 
