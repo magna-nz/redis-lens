@@ -79,6 +79,7 @@ pub enum SnapshotsCommand {
     },
     /// Delete a profile's old snapshots. Only files in redis-lens's own snapshot
     /// directory are touched.
+    #[command(group(clap::ArgGroup::new("retention").required(true).multiple(true).args(["keep", "keep_days"])))]
     Prune {
         /// Profile name.
         profile: String,
