@@ -4,7 +4,7 @@ expression: "render(View::Patterns, 40, 12).backend()"
 ---
 "┌─ Keys · Patterns ────────────────────┐"
 "│Everywhere                            │"
-"│0-4            Switch view, 0 Connect…│"
+"│0-5            Switch view, 0 Connect…│"
 "│?              Show or hide this key …│"
 "│a              Add a connection       │"
 "│q ctrl-c       Quit                   │"

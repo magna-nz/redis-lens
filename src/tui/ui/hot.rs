@@ -5,12 +5,12 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use crate::format;
-use crate::model::{KeySample, ScanReport, Ttl};
+use crate::model::{KeySample, NodeReport, ScanReport, Ttl};
 use crate::pattern::pattern_for_key;
 use crate::tui::app::App;
 
 use super::widgets::{
-    bar, fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset,
+    bar, fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset, trunc,
 };
 use super::{mark_previous, notice_panels, report_or_wait, split_body, style};
 
@@ -25,10 +25,27 @@ const FREQ_W: usize = 4;
 const HEAT_W: usize = 10;
 const SIZE_W: usize = 6;
 const FLAG_W: usize = 10;
+/// The node column of a cluster report: `10.0.1.11:6379` and a gap.
+const NODE_W: usize = 16;
 
-fn key_width(inner: usize) -> usize {
-    let fixed = PATTERN_W + TYPE_W + FREQ_W + 2 + HEAT_W + 2 + SIZE_W + 2 + FLAG_W;
+/// The key column; `cluster` makes room for the node column.
+fn key_width(inner: usize, cluster: bool) -> usize {
+    let mut fixed = PATTERN_W + TYPE_W + FREQ_W + 2 + HEAT_W + 2 + SIZE_W + 2 + FLAG_W;
+    if cluster {
+        fixed += NODE_W;
+    }
     inner.saturating_sub(fixed).max(12)
+}
+
+/// The address of the node `k` was sampled on, from [`KeySample::node`]: `None` on a
+/// standalone report, `—` when the index is not in the report's nodes.
+fn node_of(k: &KeySample, nodes: Option<&[NodeReport]>) -> Option<String> {
+    let nodes = nodes?;
+    Some(
+        k.node
+            .and_then(|i| nodes.get(usize::from(i)))
+            .map_or_else(|| "—".to_string(), |n| n.endpoint.to_string()),
+    )
 }
 
 fn is_hot_big(k: &KeySample) -> bool {
@@ -68,16 +85,20 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         ),
     );
     let inner = panel(frame, main, "Hot keys", &right);
-    let kw = key_width(usize::from(inner.width));
-    let head = Line::from(vec![
-        Span::styled(pad_r(" KEY", kw), style::hd()),
+    let nodes = report.nodes.as_deref();
+    let kw = key_width(usize::from(inner.width), nodes.is_some());
+    let mut head = vec![Span::styled(pad_r(" KEY", kw), style::hd())];
+    if nodes.is_some() {
+        head.push(Span::styled(pad_r("NODE", NODE_W), style::hd()));
+    }
+    head.extend([
         Span::styled(pad_r("PATTERN", PATTERN_W), style::hd()),
         Span::styled(pad_r("TYPE", TYPE_W), style::hd()),
         Span::styled(format!("{}  ", pad_l("FREQ", FREQ_W)), style::hd()),
         Span::styled(pad_r("HEAT", HEAT_W + 2), style::hd()),
         Span::styled(format!("{}  ", pad_l("SIZE", SIZE_W)), style::hd()),
     ]);
-    rows(frame, inner, vec![head], None);
+    rows(frame, inner, vec![Line::from(head)], None);
     let body = Rect {
         y: inner.y + 1,
         height: inner.height.saturating_sub(1),
@@ -89,15 +110,18 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         .skip(off)
         .take(usize::from(body.height))
         .enumerate()
-        .map(|(i, k)| hot_row(k, kw, (off + i == sel).then(|| app.sel_ticks())))
+        .map(|(i, k)| {
+            let node = node_of(k, nodes);
+            hot_row(k, kw, node, (off + i == sel).then(|| app.sel_ticks()))
+        })
         .collect();
     rows(frame, body, lines, Some(sel - off));
     if let Some(k) = keys.get(sel) {
-        detail_panel(frame, detail, k);
+        detail_panel(frame, detail, k, node_of(k, nodes));
     }
 }
 
-fn hot_row(k: &KeySample, kw: usize, scroll: Option<u64>) -> Line<'static> {
+fn hot_row(k: &KeySample, kw: usize, node: Option<String>, scroll: Option<u64>) -> Line<'static> {
     let dash = || "—".to_string();
     let freq = k.lfu_freq.unwrap_or(0);
     let big = is_hot_big(k);
@@ -107,6 +131,13 @@ fn hot_row(k: &KeySample, kw: usize, scroll: Option<u64>) -> Line<'static> {
         None => fit(key, kw.saturating_sub(1)),
     };
     spans.push(Span::raw(" "));
+    if let Some(node) = node {
+        // One cell stays free before the pattern, also when the address is cut.
+        spans.push(Span::styled(
+            pad_r(&trunc(&node, NODE_W - 1), NODE_W),
+            style::dim(),
+        ));
+    }
     spans.extend(fit(
         pattern_spans(&pattern_for_key(&k.key), style::dim(), style::ph()),
         PATTERN_W - 1,
@@ -133,7 +164,7 @@ fn hot_row(k: &KeySample, kw: usize, scroll: Option<u64>) -> Line<'static> {
     Line::from(spans)
 }
 
-fn detail_panel(frame: &mut Frame, area: Rect, k: &KeySample) {
+fn detail_panel(frame: &mut Frame, area: Rect, k: &KeySample, node: Option<String>) {
     let pattern = pattern_for_key(&k.key);
     let right = format!("{} · {pattern}", k.key_type.as_str());
     let inner = panel(frame, area, &k.key, &right);
@@ -166,8 +197,14 @@ fn detail_panel(frame: &mut Frame, area: Rect, k: &KeySample) {
             ),
         ]),
         Line::from(vec![label("TTL"), Span::styled(ttl, ttl_style)]),
-        Line::default(),
     ];
+    if let Some(node) = node {
+        lines.push(Line::from(vec![
+            label("NODE"),
+            Span::styled(node, style::fgb()),
+        ]));
+    }
+    lines.push(Line::default());
     if is_hot_big(k) {
         let note = format!(
             " ▲ {} is both hot and {}. Every read moves a lot of data; trim it or split it.",

@@ -1,0 +1,28 @@
+---
+source: src/tui/snapshot_tests_cluster.rs
+expression: t.backend()
+---
+" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
+" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
+"  0 Connections   1 Patterns   2 TTL   3 Diff   4 Hot keys   5 Nodes            "
+"┌─ Nodes ───────────────────────────────────────────────────────── standalone ─┐"
+"│                                                                              │"
+"│ Not a cluster: this scan read one standalone server.                         │"
+"│ On a cluster this view lists each shard and the node scanned for it.         │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"┌─ Details ────────────────────────────────────────────────────────────────────┐"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" ↑↓ Move   enter Patterns   r Rescan   s Snapshot   0-5 View   ? Help   q Quit  "

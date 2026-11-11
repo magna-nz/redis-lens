@@ -13,8 +13,8 @@ use crate::conn::docker::{DiscoveredAuth, DiscoveredInstance};
 use crate::conn::parse::{ParsedConnection, mask, parse_connection_string};
 use crate::diff::ReportDiff;
 use crate::model::{
-    Auth, Credentials, PERM_FREQ, PatternStats, PermStatus, PermissionReport, Profile, ScanReport,
-    ServerInfo,
+    Auth, Credentials, Endpoint, NodeReport, NodeStatus, PERM_FREQ, PatternStats, PermStatus,
+    PermissionReport, Profile, ScanReport, ServerInfo,
 };
 use crate::pattern::pattern_for_key;
 use crate::scan::{PartialPatterns, ScanProgress};
@@ -41,15 +41,18 @@ pub enum View {
     Ttl,
     Diff,
     HotKeys,
+    /// The shards of a cluster scan (empty on a standalone one).
+    Nodes,
 }
 
 impl View {
-    pub const ALL: [View; 5] = [
+    pub const ALL: [View; 6] = [
         View::Connections,
         View::Patterns,
         View::Ttl,
         View::Diff,
         View::HotKeys,
+        View::Nodes,
     ];
 
     pub fn title(self) -> &'static str {
@@ -59,6 +62,7 @@ impl View {
             Self::Ttl => "TTL",
             Self::Diff => "Diff",
             Self::HotKeys => "Hot keys",
+            Self::Nodes => "Nodes",
         }
     }
 }
@@ -313,6 +317,33 @@ pub const TREND_SNAPSHOTS: usize = 7;
 /// The fewest points (the scan included) the Diff view shows a trend for.
 pub const TREND_MIN_POINTS: usize = 3;
 
+/// Which node of a cluster report the Patterns view is narrowed to: its node ID and
+/// the address it was scanned at, both from [`NodeReport`]. Found again by both in each
+/// new report, so a rescan's report narrows to the same node, or not at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeKey {
+    pub id: String,
+    pub endpoint: Endpoint,
+}
+
+impl NodeKey {
+    fn of(n: &NodeReport) -> Self {
+        Self {
+            id: n.id.clone(),
+            endpoint: n.endpoint.clone(),
+        }
+    }
+
+    /// The index of this node in `report`'s nodes.
+    fn find(&self, report: &ScanReport) -> Option<usize> {
+        report
+            .nodes
+            .as_ref()?
+            .iter()
+            .position(|n| n.id == self.id && n.endpoint == self.endpoint)
+    }
+}
+
 /// The patterns the Patterns view shows.
 #[derive(Debug, Clone, Copy)]
 pub struct PatternData<'a> {
@@ -358,14 +389,19 @@ pub struct PatternsState {
     pub filter: String,
     /// The filter input is open.
     pub filtering: bool,
+    /// `Some` while the view shows one cluster node's patterns (`enter` on 5 Nodes)
+    /// instead of the merged ones; `esc` goes back. Cleared when the node is not in the
+    /// report shown, or partial results (always merged) replace that report.
+    pub node: Option<NodeKey>,
 }
 
-/// The selected row of the TTL, Diff and Hot keys views. Each view keeps its own.
+/// The selected row of the TTL, Diff, Hot keys and Nodes views. Each view keeps its own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ViewSel {
     pub ttl: usize,
     pub diff: usize,
     pub hot: usize,
+    pub nodes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -431,9 +467,20 @@ impl Default for SelId {
     }
 }
 
-/// What the Patterns view shows for `s`: see [`App::pattern_data`].
-fn pattern_data_of(s: &Session) -> Option<PatternData<'_>> {
+/// What the Patterns view shows for `s`, narrowed to `node` when it is set and in the
+/// report: see [`App::pattern_data`].
+fn pattern_data_of<'a>(s: &'a Session, node: Option<&NodeKey>) -> Option<PatternData<'a>> {
     if let Some(r) = &s.report {
+        if let Some(n) = node
+            .and_then(|k| k.find(r))
+            .and_then(|i| r.nodes.as_ref()?.get(i))
+        {
+            return Some(PatternData {
+                patterns: &n.patterns,
+                sizes_available: n.sizes_available,
+                partial: None,
+            });
+        }
         return Some(PatternData {
             patterns: &r.patterns,
             sizes_available: r.sizes_available,
@@ -614,11 +661,24 @@ impl App {
         }
     }
 
-    /// What the Patterns view shows: the finished report's patterns, or the partial
-    /// results while the scan runs, or `None`. `self.patterns.tree` is always built
-    /// from these.
+    /// What the Patterns view shows: the finished report's patterns (one node's, when
+    /// narrowed to it), or the partial results while the scan runs, or `None`.
+    /// `self.patterns.tree` is always built from these.
     pub fn pattern_data(&self) -> Option<PatternData<'_>> {
-        pattern_data_of(self.session.as_ref()?)
+        pattern_data_of(self.session.as_ref()?, self.patterns.node.as_ref())
+    }
+
+    /// The node the Patterns view is narrowed to, with its index in the report's nodes:
+    /// `None` when it shows the merged patterns.
+    pub fn narrowed_node(&self) -> Option<(usize, &NodeReport)> {
+        let r = self.report()?;
+        let i = self.patterns.node.as_ref()?.find(r)?;
+        Some((i, r.nodes.as_ref()?.get(i)?))
+    }
+
+    /// The nodes of a cluster report; `None` on a standalone report or before one.
+    pub fn nodes(&self) -> Option<&[NodeReport]> {
+        self.report()?.nodes.as_deref()
     }
 
     /// Rows currently visible on the Patterns view.
@@ -664,7 +724,12 @@ impl App {
     /// (see [`PatternTree::find`]). When that row is gone the index stays, clamped to
     /// the rows.
     fn rebuild_patterns(&mut self, anchor: Option<(RowId, Vec<String>)>) {
-        let Some(d) = self.session.as_ref().and_then(pattern_data_of) else {
+        let node = self.patterns.node.clone();
+        let Some(d) = self
+            .session
+            .as_ref()
+            .and_then(|s| pattern_data_of(s, node.as_ref()))
+        else {
             self.patterns.tree = PatternTree::default();
             self.patterns.sel = 0;
             return;
@@ -795,6 +860,7 @@ impl App {
             View::Ttl => self.report().map_or(0, |r| r.patterns.len()),
             View::Diff => self.diff().map_or(0, |d| d.patterns.len()),
             View::HotKeys => self.report().map_or(0, |r| r.hot_keys.len()),
+            View::Nodes => self.nodes().map_or(0, <[NodeReport]>::len),
             View::Connections | View::Patterns => 0,
         }
     }
@@ -862,7 +928,7 @@ impl App {
         }
         match plain_char(&key) {
             Some('q') => return vec![Effect::Quit],
-            Some(c @ '0'..='4') => {
+            Some(c @ '0'..='5') => {
                 self.view = View::ALL[c as usize - '0' as usize];
                 return Vec::new();
             }
@@ -876,8 +942,8 @@ impl App {
             }
             Some('s') if self.view != View::Connections => return self.save_snapshot(),
             Some('r') if self.view != View::Connections => return self.rescan(),
-            Some('y') if self.view != View::Connections => return self.copy(false),
-            Some('Y') if self.view != View::Connections => return self.copy(true),
+            Some('y') if self.copies() => return self.copy(false),
+            Some('Y') if self.copies() => return self.copy(true),
             _ => {}
         }
         match self.view {
@@ -890,7 +956,16 @@ impl App {
                 self.list_key(key);
                 Vec::new()
             }
+            View::Nodes => {
+                self.nodes_key(key);
+                Vec::new()
+            }
         }
+    }
+
+    /// `y` and `Y` copy on Patterns, TTL, Diff and Hot keys.
+    fn copies(&self) -> bool {
+        !matches!(self.view, View::Connections | View::Nodes)
     }
 
     /// Only a finished report is ever saved, never partial results, and not the
@@ -920,7 +995,7 @@ impl App {
         }
     }
 
-    /// `r` on views 1-4: scan the session's entry again as a new run, keeping the
+    /// `r` on views 1-5: scan the session's entry again as a new run, keeping the
     /// Patterns state, the list selections, the view and, until the new run's first
     /// results, the old report.
     fn rescan(&mut self) -> Vec<Effect> {
@@ -968,7 +1043,7 @@ impl App {
             }
         };
         let text = match self.view {
-            View::Connections => return Vec::new(),
+            View::Connections | View::Nodes => return Vec::new(),
             View::Patterns => self.selected_pattern_label().map(of_pattern),
             View::Ttl => self.selected_ttl_pattern().map(of_pattern),
             View::Diff => self.selected_diff_pattern().map(of_pattern),
@@ -1009,19 +1084,67 @@ impl App {
         vec![Effect::Copy(text)]
     }
 
-    /// Moving through the TTL, Diff and Hot keys views.
-    fn list_key(&mut self, key: KeyEvent) {
+    /// Moving through the TTL, Diff, Hot keys and Nodes views. Returns whether `key` was
+    /// a move key.
+    fn list_key(&mut self, key: KeyEvent) -> bool {
         let len = self.view_len(self.view);
         let page = self.page();
         let sel = match self.view {
             View::Ttl => &mut self.sel.ttl,
             View::Diff => &mut self.sel.diff,
             View::HotKeys => &mut self.sel.hot,
-            View::Connections | View::Patterns => return,
+            View::Nodes => &mut self.sel.nodes,
+            View::Connections | View::Patterns => return false,
         };
-        if let Some(to) = list_move(&key, (*sel).min(len.saturating_sub(1)), len, page) {
-            *sel = to;
+        match list_move(&key, (*sel).min(len.saturating_sub(1)), len, page) {
+            Some(to) => {
+                *sel = to;
+                true
+            }
+            None => false,
         }
+    }
+
+    /// The Nodes view: move, or `enter` to narrow Patterns to the selected node.
+    fn nodes_key(&mut self, key: KeyEvent) {
+        if self.list_key(key) {
+            return;
+        }
+        if key.code == KeyCode::Enter {
+            self.narrow_to_selected_node();
+        }
+    }
+
+    /// Shows the selected node's own patterns on the Patterns view. A node with no
+    /// results (`failed`) is not narrowed to; a notice says why.
+    fn narrow_to_selected_node(&mut self) {
+        let Some(nodes) = self.nodes() else {
+            return;
+        };
+        let Some(n) = nodes.get(self.sel.nodes.min(nodes.len().saturating_sub(1))) else {
+            return;
+        };
+        if n.status == NodeStatus::Failed {
+            let text = format!(
+                "{} was not scanned, so it has no patterns to show.",
+                n.endpoint
+            );
+            self.set_info(text);
+            return;
+        }
+        self.patterns.node = Some(NodeKey::of(n));
+        self.patterns.sel = 0;
+        self.view = View::Patterns;
+        self.rebuild_patterns(None);
+    }
+
+    /// `esc` on a narrowed Patterns view: back to the merged patterns, with the selected
+    /// pattern still selected, and back to the Nodes view.
+    fn leave_node(&mut self) {
+        let anchor = self.selection_anchor();
+        self.patterns.node = None;
+        self.rebuild_patterns(anchor);
+        self.view = View::Nodes;
     }
 
     pub fn handle_paste(&mut self, text: String) {
@@ -1314,6 +1437,7 @@ impl App {
                 self.patterns.filter.clear();
                 self.patterns.sel = 0;
             }
+            (KeyCode::Esc, _) if self.patterns.node.is_some() => self.leave_node(),
             (_, Some('o')) => self.cycle_sort(),
             _ => {}
         }
@@ -1338,7 +1462,8 @@ impl App {
 
     /// Collapses `g`, remembering its patterns (see [`Collapsed`]).
     fn collapse_group(&mut self, g: &Group) {
-        if let Some(d) = self.session.as_ref().and_then(pattern_data_of) {
+        let node = self.patterns.node.as_ref();
+        if let Some(d) = self.session.as_ref().and_then(|s| pattern_data_of(s, node)) {
             self.patterns.collapsed.collapse(g, d.patterns);
         }
     }
@@ -1519,6 +1644,8 @@ impl App {
                     }
                     s.partial = Some(partial);
                 }
+                // Partial results are merged over the cluster: no node to narrow to.
+                self.patterns.node = None;
                 self.rebuild_patterns(anchor);
             }
             Msg::ScanDone { id, scan, report } => {
@@ -1550,6 +1677,15 @@ impl App {
                     s.trend = None;
                     s.previous = None;
                 }
+                // Narrowed to a node this report doesn't have: back to the merged rows.
+                if self
+                    .patterns
+                    .node
+                    .as_ref()
+                    .is_some_and(|k| self.report().and_then(|r| k.find(r)).is_none())
+                {
+                    self.patterns.node = None;
+                }
                 self.rebuild_patterns(anchor);
                 if rescan {
                     self.sel.ttl = self.sel.ttl.min(self.view_len(View::Ttl).saturating_sub(1));
@@ -1557,6 +1693,10 @@ impl App {
                         .sel
                         .hot
                         .min(self.view_len(View::HotKeys).saturating_sub(1));
+                    self.sel.nodes = self
+                        .sel
+                        .nodes
+                        .min(self.view_len(View::Nodes).saturating_sub(1));
                 }
                 return vec![effect];
             }
@@ -1876,7 +2016,7 @@ mod tests {
             partial: fixtures::partial(true),
         });
         // `s` does not save partial results, on any report view; it says why.
-        for view in ['1', '2', '3', '4'] {
+        for view in ['1', '2', '3', '4', '5'] {
             app.handle_key(ch(view));
             assert!(app.handle_key(ch('s')).is_empty(), "view {view}");
             let notice = app.notice.clone().unwrap();
@@ -3034,7 +3174,7 @@ mod tests {
         assert_eq!(r.profile, "prod-cache-01");
         assert_eq!(r.taken_at_unix, app.report().unwrap().taken_at_unix);
         // Works from the other report views too, but not on Connections.
-        for v in ['2', '3', '4'] {
+        for v in ['2', '3', '4', '5'] {
             app.handle_key(ch(v));
             assert!(matches!(
                 app.handle_key(ch('s'))[..],
@@ -3498,6 +3638,7 @@ mod tests {
             ttl: 2,
             diff: 3,
             hot: 1,
+            nodes: 0,
         };
         assert_eq!(app.sel, sel);
         app.handle_key(ch('1'));
@@ -3896,7 +4037,7 @@ mod tests {
     fn r_needs_a_finished_or_failed_scan() {
         // No session: connect first.
         let mut app = App::new(fixtures::profiles());
-        for view in ['1', '2', '3', '4'] {
+        for view in ['1', '2', '3', '4', '5'] {
             app.handle_key(ch(view));
             assert!(app.handle_key(ch('r')).is_empty());
             let n = app.notice.clone().unwrap();
@@ -3907,7 +4048,7 @@ mod tests {
         let mut app = App::new(fixtures::profiles());
         app.handle_key(key(KeyCode::Enter));
         let scan = scan_of(&app);
-        for view in ['1', '2', '3', '4'] {
+        for view in ['1', '2', '3', '4', '5'] {
             app.handle_key(ch(view));
             assert!(app.handle_key(ch('r')).is_empty());
             assert_eq!(
@@ -3929,7 +4070,7 @@ mod tests {
         assert_eq!(scan_of(&app), s2);
         // Finished: works on every report view.
         let (mut app, id, _) = finished_with_history();
-        for view in ['1', '2', '3', '4'] {
+        for view in ['1', '2', '3', '4', '5'] {
             app.handle_key(ch(view));
             let s = press_rescan(&mut app, id);
             connected(&mut app, id, s);
@@ -4018,7 +4159,7 @@ mod tests {
         let (mut app, id, report) = finished_with_history();
         let s2 = press_rescan(&mut app, id);
         let wait = "A scan is running. Press s again when it finishes to save it.";
-        for view in ['1', '2', '3', '4'] {
+        for view in ['1', '2', '3', '4', '5'] {
             app.handle_key(ch(view));
             assert!(app.handle_key(ch('s')).is_empty(), "view {view}");
             assert_eq!(app.notice.clone().unwrap().text, wait);
@@ -4071,7 +4212,7 @@ mod tests {
     #[test]
     fn help_opens_on_every_view_and_takes_every_key() {
         let (mut app, _, _) = finished_with_history();
-        for view in ['0', '1', '2', '3', '4'] {
+        for view in ['0', '1', '2', '3', '4', '5'] {
             app.handle_key(ch(view));
             let shown = app.view;
             assert!(app.handle_key(ch('?')).is_empty());
@@ -4441,6 +4582,7 @@ mod tests {
             View::Ttl => app.sel.ttl,
             View::Diff => app.sel.diff,
             View::HotKeys => app.sel.hot,
+            View::Nodes => app.sel.nodes,
         }
     }
 
@@ -4451,7 +4593,19 @@ mod tests {
             View::Ttl => app.ttl_rows().len(),
             View::Diff => app.diff().map_or(0, |d| d.patterns.len()),
             View::HotKeys => app.report().map_or(0, |r| r.hot_keys.len()),
+            View::Nodes => app.nodes().map_or(0, <[NodeReport]>::len),
         }
+    }
+
+    /// prod-cache-01 scanned with hot keys and history, a Docker container listed. For
+    /// the Nodes view, a scan of a 6-shard cluster instead (a standalone one has no rows).
+    fn paging_app_for(view: View) -> App {
+        if view == View::Nodes {
+            let (mut app, _) = cluster_scanned(fixtures::cluster_report_with(&[1.0 / 6.0; 6]));
+            app.apply(Msg::DockerFound(vec![fixtures::docker_instance()]));
+            return app;
+        }
+        paging_app()
     }
 
     /// prod-cache-01 scanned with hot keys and history, a Docker container listed.
@@ -4465,7 +4619,7 @@ mod tests {
     fn page_keys_move_by_the_visible_rows_on_every_list_view() {
         for view in View::ALL {
             for rows in [0, 1, 3, 1000] {
-                let mut app = paging_app();
+                let mut app = paging_app_for(view);
                 app.handle_key(ch(char::from(b'0' + view as u8)));
                 app.set_list_rows(rows);
                 let len = list_len(&app);
@@ -4506,7 +4660,7 @@ mod tests {
     fn page_keys_on_empty_lists_stay_at_the_top() {
         let mut app = App::new(fixtures::profiles());
         app.set_list_rows(5);
-        for view in ['1', '2', '3', '4'] {
+        for view in ['1', '2', '3', '4', '5'] {
             app.handle_key(ch(view));
             for k in [
                 KeyCode::PageDown,
@@ -4593,7 +4747,7 @@ mod tests {
             "enter" => vec![key(KeyCode::Enter)],
             "esc" => vec![key(KeyCode::Esc)],
             "ctrl-c" => vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
-            "0-4" => ('0'..='4').map(ch).collect(),
+            "0-5" => ('0'..='5').map(ch).collect(),
             t if t.chars().count() == 1 => vec![ch(t.chars().next().unwrap())],
             t => panic!("no key events for token {t:?}"),
         }
@@ -4612,7 +4766,7 @@ mod tests {
             KeyCode::Enter => "enter".into(),
             KeyCode::Esc => "esc".into(),
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-c".into(),
-            KeyCode::Char('0'..='4') => "0-4".into(),
+            KeyCode::Char('0'..='5') => "0-5".into(),
             KeyCode::Char(c) => c.to_string(),
             other => format!("{other:?}"),
         }
@@ -4628,9 +4782,9 @@ mod tests {
 
     /// A state where every key of `view` has something to do: a finished scan with hot
     /// keys and history, Docker listed, the selection on the second row (on Patterns
-    /// the expanded `cache:*` group), a page of 3 rows.
+    /// the expanded `cache:*` group), a page of 3 rows. On Nodes, a 6-shard cluster scan.
     fn busy_app(view: View) -> App {
-        let mut app = paging_app();
+        let mut app = paging_app_for(view);
         app.set_list_rows(3);
         app.handle_key(ch(char::from(b'0' + view as u8)));
         app.handle_key(ch('j'));
@@ -4659,7 +4813,7 @@ mod tests {
                     let before = fingerprint(&app);
                     let effects = app.handle_key(k);
                     let ctx = format!("{token:?} ({k:?}) on {view:?}");
-                    if token == "0-4" {
+                    if token == "0-5" {
                         let KeyCode::Char(c) = k.code else {
                             unreachable!()
                         };
@@ -4716,5 +4870,296 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Clusters: the Nodes view and narrowing Patterns to a node
+    // -----------------------------------------------------------------------
+
+    fn summary_of(report: &ScanReport) -> String {
+        let n = report.nodes.as_ref().map_or(0, Vec::len);
+        format!("cluster · {n} shards")
+    }
+
+    /// prod-cache-01 connected as a cluster and `report` finished scanning.
+    fn cluster_scanned(report: ScanReport) -> (App, ConnId) {
+        let mut app = App::new(fixtures::profiles());
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let Effect::Connect { id, .. } = effects[0] else {
+            panic!()
+        };
+        app.apply(Msg::Connected {
+            id,
+            scan: scan_of(&app),
+            server: Some(report.server.clone()),
+            perms: fixtures::perms_ok(),
+            target: ScanTarget::Cluster(summary_of(&report)),
+        });
+        app.apply(Msg::ScanDone {
+            id,
+            scan: scan_of(&app),
+            report: Box::new(report),
+        });
+        (app, id)
+    }
+
+    fn shown_patterns(app: &App) -> Vec<PatternStats> {
+        app.pattern_data().unwrap().patterns.to_vec()
+    }
+
+    fn node_patterns(app: &App, i: usize) -> Vec<PatternStats> {
+        app.nodes().unwrap()[i].patterns.clone()
+    }
+
+    #[test]
+    fn enter_on_a_node_narrows_patterns_and_esc_goes_back() {
+        let report = fixtures::cluster_report();
+        let (mut app, _) = cluster_scanned(report.clone());
+        app.handle_key(ch('5'));
+        assert_eq!(app.view, View::Nodes);
+        app.handle_key(ch('j'));
+        assert_eq!(app.sel.nodes, 1);
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
+        // Patterns, narrowed to the second node, from the top.
+        assert_eq!(app.view, View::Patterns);
+        let (i, n) = app.narrowed_node().unwrap();
+        assert_eq!(
+            (i, n.endpoint.to_string()),
+            (1, "10.0.1.12:6379".to_string())
+        );
+        assert_eq!(shown_patterns(&app), node_patterns(&app, 1));
+        assert_ne!(shown_patterns(&app), report.patterns);
+        assert_eq!(app.patterns.sel, 0);
+        // The tree is built from the node's rows.
+        let rows = app.pattern_rows();
+        assert!(!rows.is_empty());
+        let node = node_patterns(&app, 1);
+        assert!(rows.iter().all(|r| match *r {
+            Row::Pattern { idx, .. } => idx < node.len(),
+            Row::Group { .. } => true,
+        }));
+        // Moving and the other views keep the narrowing.
+        app.handle_key(ch('j'));
+        app.handle_key(ch('2'));
+        app.handle_key(ch('1'));
+        assert!(app.narrowed_node().is_some());
+        // The selected pattern stays selected when esc goes back to the merged rows.
+        let picked = selected_label(&app);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.view, View::Nodes);
+        assert!(app.narrowed_node().is_none());
+        assert_eq!(app.patterns.node, None);
+        assert_eq!(shown_patterns(&app), report.patterns);
+        assert_eq!(app.sel.nodes, 1, "the Nodes selection is kept");
+        app.handle_key(ch('1'));
+        assert_eq!(selected_label(&app), picked);
+        // esc on the merged rows, with no filter, does nothing.
+        let before = fingerprint(&app);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(fingerprint(&app), before);
+    }
+
+    #[test]
+    fn esc_clears_the_filter_before_it_leaves_the_node() {
+        let (mut app, _) = cluster_scanned(fixtures::cluster_report());
+        type_str(&mut app, "5");
+        app.handle_key(key(KeyCode::Enter));
+        type_str(&mut app, "/user");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.patterns.filter, "user");
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.patterns.filter, "");
+        assert_eq!(app.view, View::Patterns);
+        assert!(app.narrowed_node().is_some());
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.view, View::Nodes);
+        assert!(app.narrowed_node().is_none());
+    }
+
+    #[test]
+    fn a_failed_node_is_not_narrowed_to() {
+        let (mut app, _) = cluster_scanned(fixtures::cluster_report_degraded());
+        type_str(&mut app, "5G");
+        assert_eq!(app.sel.nodes, 2);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.view, View::Nodes);
+        assert_eq!(app.patterns.node, None);
+        let n = app.notice.clone().unwrap();
+        assert!(!n.error);
+        assert_eq!(
+            n.text,
+            "10.0.1.13:6379 was not scanned, so it has no patterns to show."
+        );
+        // A partial node can be narrowed to: it has results.
+        app.handle_key(ch('k'));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.narrowed_node().map(|(i, _)| i), Some(1));
+    }
+
+    #[test]
+    fn nodes_keys_on_a_standalone_report_change_nothing() {
+        let (mut app, _, _) = finished_with_history();
+        app.handle_key(ch('5'));
+        assert_eq!(app.view, View::Nodes);
+        assert_eq!(app.nodes(), None);
+        let before = fingerprint(&app);
+        for k in [
+            key(KeyCode::Enter),
+            key(KeyCode::Down),
+            key(KeyCode::End),
+            key(KeyCode::Esc),
+            ch('j'),
+            ch('y'),
+            ch('Y'),
+        ] {
+            assert!(app.handle_key(k).is_empty(), "{k:?}");
+            assert_eq!(fingerprint(&app), before, "{k:?}");
+        }
+        // Rescan and snapshot still work from view 5.
+        assert!(matches!(
+            app.handle_key(ch('s'))[..],
+            [Effect::SaveSnapshot(_)]
+        ));
+        assert!(matches!(
+            app.handle_key(ch('r'))[..],
+            [Effect::Connect { .. }]
+        ));
+    }
+
+    #[test]
+    fn s_saves_a_cluster_report_with_its_nodes() {
+        let report = fixtures::cluster_report();
+        let (mut app, _) = cluster_scanned(report.clone());
+        for view in ['1', '4', '5'] {
+            app.handle_key(ch(view));
+            let effects = app.handle_key(ch('s'));
+            let [Effect::SaveSnapshot(r)] = &effects[..] else {
+                panic!("unexpected effects {effects:?}");
+            };
+            assert_eq!(**r, report, "view {view}");
+        }
+        // Narrowed, `s` still saves the whole report, not the node's rows.
+        app.handle_key(ch('5'));
+        app.handle_key(key(KeyCode::Enter));
+        let effects = app.handle_key(ch('s'));
+        let [Effect::SaveSnapshot(r)] = &effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        assert_eq!(**r, report);
+    }
+
+    #[test]
+    fn y_copies_nothing_on_nodes() {
+        let (mut app, _) = cluster_scanned(fixtures::cluster_report());
+        app.handle_key(ch('5'));
+        for k in ['y', 'Y'] {
+            assert!(app.handle_key(ch(k)).is_empty());
+            assert_eq!(app.notice, None);
+        }
+    }
+
+    /// The report a rescan of the cluster finishes with.
+    fn rescan_to(app: &mut App, id: ConnId, report: ScanReport, partial: bool) {
+        let s = press_rescan(app, id);
+        connected(app, id, s);
+        if partial {
+            send_partial(app, id, fixtures::partial(true));
+        }
+        app.apply(Msg::ScanDone {
+            id,
+            scan: s,
+            report: Box::new(report),
+        });
+    }
+
+    #[test]
+    fn a_rescan_keeps_the_node_until_partial_results_or_a_report_without_it() {
+        let report = fixtures::cluster_report();
+        let (mut app, id) = cluster_scanned(report.clone());
+        type_str(&mut app, "5j");
+        app.handle_key(key(KeyCode::Enter));
+        // While the rescan runs, the previous report stays narrowed.
+        let s = press_rescan(&mut app, id);
+        connected(&mut app, id, s);
+        assert_eq!(app.narrowed_node().map(|(i, _)| i), Some(1));
+        assert_eq!(shown_patterns(&app), node_patterns(&app, 1));
+        // A new report with the same node: still narrowed to it.
+        app.apply(Msg::ScanDone {
+            id,
+            scan: s,
+            report: Box::new(report.clone()),
+        });
+        assert_eq!(app.narrowed_node().map(|(i, _)| i), Some(1));
+        // Partial results are merged: the narrowing ends and stays ended.
+        let s = press_rescan(&mut app, id);
+        connected(&mut app, id, s);
+        send_partial(&mut app, id, fixtures::partial(true));
+        assert_eq!(app.patterns.node, None);
+        assert_eq!(
+            shown_patterns(&app),
+            fixtures::partial(true).patterns.clone()
+        );
+        app.apply(Msg::ScanDone {
+            id,
+            scan: s,
+            report: Box::new(report.clone()),
+        });
+        assert!(app.narrowed_node().is_none());
+        assert_eq!(shown_patterns(&app), report.patterns);
+        // A report whose node set changed: the node is gone, so are the narrowing and
+        // the stale key.
+        app.handle_key(ch('5'));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.narrowed_node().map(|(i, _)| i), Some(1));
+        let mut moved = report.clone();
+        moved.nodes.as_mut().unwrap()[1].endpoint.host = "10.0.1.32".into();
+        rescan_to(&mut app, id, moved.clone(), false);
+        assert_eq!(app.patterns.node, None);
+        assert_eq!(shown_patterns(&app), moved.patterns);
+    }
+
+    #[test]
+    fn a_rescan_clamps_the_nodes_selection_and_a_new_connect_resets_it() {
+        let (mut app, id) = cluster_scanned(fixtures::cluster_report_with(&[0.25; 4]));
+        type_str(&mut app, "5G");
+        assert_eq!(app.sel.nodes, 3);
+        rescan_to(&mut app, id, fixtures::cluster_report(), false);
+        assert_eq!(app.sel.nodes, 2);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.narrowed_node().is_some());
+        // Connecting again starts afresh: no narrowing, the first node.
+        app.handle_key(ch('0'));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.patterns.node, None);
+        assert_eq!(app.sel.nodes, 0);
+    }
+
+    #[test]
+    fn a_narrowed_view_folds_and_sorts_the_nodes_rows() {
+        let (mut app, _) = cluster_scanned(fixtures::cluster_report());
+        type_str(&mut app, "5");
+        app.handle_key(key(KeyCode::Enter));
+        let node = node_patterns(&app, 0);
+        // Sorted by keys, the node's own biggest pattern by keys comes first.
+        app.handle_key(ch('o'));
+        let top = node.iter().max_by_key(|p| p.est_keys).unwrap();
+        let first = app.pattern_rows()[0];
+        let label = match first {
+            Row::Pattern { idx, .. } => node[idx].pattern.clone(),
+            Row::Group { .. } => selected_label(&app),
+        };
+        assert!(
+            label == top.pattern || label.ends_with(":*"),
+            "{label} vs {}",
+            top.pattern
+        );
+        // Collapsing a group of the node's rows works like on the merged ones.
+        select(&mut app, &grp("cache"));
+        app.handle_key(key(KeyCode::Left));
+        assert!(
+            app.pattern_rows()
+                .iter()
+                .all(|r| !matches!(r, Row::Pattern { parent: Some(_), idx } if node[*idx].pattern.starts_with("cache:")))
+        );
     }
 }
