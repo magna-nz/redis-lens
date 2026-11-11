@@ -1095,8 +1095,11 @@ mod tests {
             label: PERM_MEMORY,
             status: PermStatus::Denied("NOPERM".into()),
         });
-        let r = run(scan_nodes("c", nodes, &opts(1_000, 50), None, None)).unwrap();
+        let (tx, rx) = watch::channel(None);
+        let r = run(scan_nodes("c", nodes, &opts(1_000, 50), None, Some(&tx))).unwrap();
         assert!(!r.sizes_available);
+        // The live partials say so too.
+        assert!(!rx.borrow().clone().unwrap().sizes_available);
         let rows = r.nodes.unwrap();
         let sizes: Vec<bool> = rows.iter().map(|n| n.sizes_available).collect();
         assert_eq!(sizes, [true, false, true]);

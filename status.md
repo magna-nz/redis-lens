@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** v0.3 (cluster and SSH tunnels) built on `v03/integration`; verifier and PR next
-**Last updated:** 2026-11-12 (v0.3: verifier blockers fixed on `v03/integration`, re-verification next)
+**Last updated:** 2026-11-12 (v0.3: blockers fixed and re-verified on `v03/integration`; PR next)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -254,11 +254,18 @@ Integration branch `v03/integration` (worktree `.claude/worktrees/v03`). Agent w
 | fix | The cluster futures were not `Send` (rustc's higher-ranked limitation with iterator closures held in streams); boxed and collected first, guarded by `scan::cluster::tests::futures_are_send`; the TUI's blocking-thread workaround removed | me | 621502c | **done** |
 | V | Verifier on the merged branch (8c02a1a): BLOCK on two findings, 41 mutations run | verifier [opus] | | **done** |
 | fix V | B1: an empty shard that doesn't own `redis-lens:probe`'s slot answered `MOVED`, counted as a denial, which turned sizes off for the whole cluster; a redirect on the missing probe key now counts as allowed (`tests/cluster_it.rs` `*_empty_shards`). B2: behind SSH, an announced `127.1` (or `0`, `2130706433`, `0x7f000001`) got credentials on the bastion's loopback; announced hosts whose last label is numeric are now refused (`tests/ssh_it.rs` `a_shorthand_loopback_*`). Tests added for the surviving mutations on sizes merging, case and IPv4-mapped loopback; spec.md states the forward-port race, `conn add --ssh USER@` on the command line and `conn test` on a cluster | me | | **done** |
-| V2 | Verifier on the fix diff | verifier [opus] | | next |
+| V2 | Verifier on the fix diff (56d0420): APPROVE, 17 mutations; its two test gaps (upper-case `0X`, the partials' sizes flag) closed after | verifier [opus] | | **done** |
+| PR | One PR from `v03/integration` to `main`; the owner merges | me | | next |
 
 Checks on the merged branch (621502c plus the spec, status and note edits): fmt and clippy clean; 704 unit tests pass. Integration on Redis 7.4 + Valkey 8.1: 134 of 135 passed, and on `redis:6.2-alpine` 133 of 135; os_trust's 2 are ignored as usual. The three failures were Docker Desktop errors in the container helper (a host-port bind race and `PortNotExposed`), not assertions, and each passed when rerun alone: `replica_it::an_open_replica_is_scanned_without_credentials`, `conn_it::probe_server_with_default_user_off_is_required`, `scan_cli_it::sample_limit_is_not_complete`. CI on Linux is the real check. `make coverage` (unit and integration, default images, no failures): 95.54% of lines, 95.62% of regions; `conn/cluster.rs` 94.8%, `scan/cluster.rs` 97.7%, `conn/ssh.rs` 98.6%, `tui/ui/nodes.rs` 98.1% of lines.
 
+Checks after the fixes (56d0420 plus the two test cases): fmt and clippy clean; 710 unit tests pass. Integration: 139 passed on Redis 7.4 + Valkey 8.1 and 139 on `redis:6.2-alpine` (os_trust's 2 ignored), the 6.2 run after one Docker port-bind error in the container helper on the first try.
+
 Open points:
+- With a key-pattern ACL that doesn't match `redis-lens:probe` (`~app:*`), an empty shard gets `NOPERM` on the probe and still turns sizes off for the whole cluster. Leaving `DBSIZE` 0 nodes out of the sizes rule would fix it; not done, as it changes what the permission check reports.
+- An online replica whose announced address is refused gives `PrimaryFallback("no online replica")`; "address refused" would say more.
+- Behind SSH, a profile's own host written as `127.1` counts as remote on the bastion. It only restricts (loopback replicas or nodes get no credentials).
+- The ACL-before-redirect order that makes a `MOVED` probe count as allowed holds for Redis 6.2/7.x and Valkey 8; not checked on ElastiCache or MemoryDB.
 - With `-l <user>`, the SSH username is visible in the process list while a tunnel runs (documented in spec.md; `User` in `~/.ssh/config` avoids it).
 - The ssh child uses `std::process` with a kill on drop, not tokio's `process` feature. Windows is not compiled locally; CI's Windows unit tests are the check.
 - The kept `INFO server` reply can be up to 10 s old when the scan reads it (version and mode are what the scan uses from it).
