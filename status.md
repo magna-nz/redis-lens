@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** v0.2 done on main; wave 6 merged (PR #10); wave 7 (four bugs and the test gaps) in progress; then usability, then v0.3 (cluster) or the feature ideas below
-**Last updated:** 2026-11-11 (wave 7 verified; PR #11)
+**Current milestone:** v0.2 done on main; waves 6 and 7 merged (PRs #10, #11); wave 8 (usability) in progress; then v0.3 (cluster) or the feature ideas below
+**Last updated:** 2026-11-11 (wave 8 started)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -33,6 +33,26 @@ Approved by the owner: "Approve, merge when green". Same merge rules as the over
 | B | Redis 6.2 in the integration job, as a new CI job (existing required check names unchanged) | implementer [sonnet] | `wave6/tests` (worktree `.claude/worktrees/w6-tests`) | **done** (89f0274): all integration tests pass on 6.2 with no test changes; merged into `wave6/fixes` |
 | C | OS trust store for TLS (load native certs, skip ones that fail to load, fall back to bundled roots when the store is empty); TLS replica test on Redis and Valkey via a throwaway CA and `SSL_CERT_FILE` | implementer [opus] | `wave6/tls` from `wave6/fixes` after B | **done** (9291fba, 3a54fdc): `src/conn/tls.rs`; `tests/tls_it.rs` (6 tests, Redis + Valkey, also on 6.2); merged into `wave6/fixes` |
 | V | Verifier on the merged `wave6/fixes` | verifier [opus] | pinned detached worktree at 09343e2 | **APPROVE**, no blockers. Its ready-made test for the partial denominator (D1) is added. Follow-ups below |
+
+## Wave 8 (2026-11-11): usability
+
+Approved by the owner ("go do all then merge in when green"): the split below; merge with `gh pr merge --merge --admin` when all checks are green and the verifier approves. No tag, release or publish. Not in this wave: `--check`, report export, v0.3 cluster.
+
+Owner decisions:
+- Rescan: `r` in views 1-4 (Connections keeps `r` = Rescan Docker). The old results stay until the first partial arrives; filter, collapse, sort and the selected pattern are kept.
+- Clipboard: OSC 52, no new dependency. `y` copies the selected pattern (Hot keys: the key), `Y` the suggested command. Nothing is copied on the Connections view or in the add flow (rule 1).
+- Sorting: Patterns only. `o` cycles memory, keys, avg size, no-TTL %, name.
+- Also in: hiding the share bar, Δ and avg size on narrow terminals before cutting rows; keychain worker panics stay off the TUI; Docker probes run in parallel; `os_trust` shows as skipped locally.
+
+Integration branch `wave8/usability` (worktree `.claude/worktrees/wave8`, from main 3e347df).
+
+| Part | Content | Agent | Branch | State |
+|---|---|---|---|---|
+| A | Selection follows the pattern (N2), collapse kept when a group's key changes (N3), sorting, marquee follow-ups, narrow columns | implementer [opus] | `wave8/tree` | in progress |
+| B | Key table (`tui/keymap.rs`), `?` help overlay (`tui/ui/help.rs`), OSC 52 clipboard (`tui/clipboard.rs`), standalone | implementer [sonnet] | `wave8/keys` | in progress |
+| D | Keychain panic text, parallel discovery probes, `os_trust` skipped | implementer [sonnet] | `wave8/extras` | in progress |
+| C | Rescan, `?` and clipboard wired in, footer from the key table, Page Up/Down and Home/End in every list view | implementer [opus] | `wave8/wire`, after A, B and D | not started |
+| V | Verifier on the merged `wave8/usability` | verifier [opus] | pinned detached worktree | not started |
 
 ## Wave 7 (2026-11-11): four bugs and the test gaps
 
