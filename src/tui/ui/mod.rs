@@ -11,7 +11,7 @@ use ratatui::widgets::Block;
 use crate::conn::parse::mask;
 use crate::conn::{ScanTarget, provider};
 use crate::format;
-use crate::model::{PERM_MEMORY, ScanReport, ServerFlavor, ServerInfo};
+use crate::model::{NodeReport, NodeStatus, PERM_MEMORY, ScanReport, ServerFlavor, ServerInfo};
 
 use super::app::{App, Phase, Session, View};
 use super::keymap;
@@ -21,6 +21,7 @@ mod delta;
 mod diff;
 pub mod help;
 mod hot;
+mod nodes;
 mod patterns;
 pub mod style;
 mod ttl;
@@ -48,7 +49,7 @@ fn screen(area: Rect) -> [Rect; 3] {
 }
 
 /// List rows a view shows on a screen of `area`: what PgUp and PgDn move by. Every list
-/// view (Connections, Patterns, TTL, Diff, Hot keys) has the same layout: the main panel
+/// view (Connections, Patterns, TTL, Diff, Hot keys, Nodes) has the same layout: the main panel
 /// above the detail panel, its border, one header row, then the rows.
 pub fn list_rows(area: Rect) -> usize {
     let [_, body, _] = screen(area);
@@ -65,6 +66,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         View::Ttl => ttl::draw(frame, body, app),
         View::Diff => diff::draw(frame, body, app),
         View::HotKeys => hot::draw(frame, body, app),
+        View::Nodes => nodes::draw(frame, body, app),
     }
     footer(frame, foot, app);
     if app.help {
@@ -227,6 +229,31 @@ pub fn server_label(s: &ServerInfo) -> String {
     format!("{} {}", flavor(s.flavor), s.version)
 }
 
+/// The cluster summary cut to the header's room: whole when the status on the right
+/// still fits beside it, else cut to leave room for the status (when at least 18 cells
+/// are left for it), else cut to the line (the status gives way, as on any narrow
+/// header). `taken` is the rest of the left part, `right` the status's width.
+fn cluster_summary_fit(summary: &str, w: usize, taken: usize, right: usize) -> String {
+    // Two cells before the summary, two between the parts (see `justify`).
+    let beside = w.saturating_sub(taken + 2 + right + 2);
+    if width(summary) <= beside {
+        return summary.to_string();
+    }
+    if beside >= 18 {
+        return trunc(summary, beside);
+    }
+    trunc(summary, w.saturating_sub(taken + 3).max(8))
+}
+
+/// Whether a cluster scan lost a shard, to draw its summary in amber: the connect
+/// summary ([`ScanTarget::Cluster`]) says a node was unreachable or only the seed could
+/// be read, or the finished report has a node that is not `scanned`.
+pub fn cluster_degraded(summary: &str, nodes: Option<&[NodeReport]>) -> bool {
+    summary.contains("unreachable")
+        || summary.contains("seed node only")
+        || nodes.is_some_and(|n| n.iter().any(|n| n.status != NodeStatus::Scanned))
+}
+
 fn spans_width(spans: &[Span<'_>]) -> usize {
     spans.iter().map(|s| width(&s.content)).sum()
 }
@@ -274,33 +301,6 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Some(s) => {
             let p = &s.profile;
-            let mut left = vec![
-                brand,
-                Span::raw("  "),
-                Span::styled(format!(" {} ", p.env.label()), style::env_badge(p.env)),
-                Span::styled(format!("  {}", p.name), style::fgb()),
-                Span::styled(
-                    format!(
-                        "  {}",
-                        trunc(&p.endpoint.to_string(), if w >= 100 { 30 } else { 18 })
-                    ),
-                    style::dim(),
-                ),
-            ];
-            match &s.target {
-                Some(ScanTarget::Replica(ep)) => left.push(Span::styled(
-                    format!("  replica {}", trunc(&ep.to_string(), 24)),
-                    style::dim(),
-                )),
-                Some(ScanTarget::PrimaryFallback(_)) => left.push(Span::styled(
-                    "  primary (replica unreachable)",
-                    style::amber(),
-                )),
-                _ => {}
-            }
-            if p.is_read_only() {
-                left.push(Span::styled("  read-only", style::amber()));
-            }
             let right = match &s.phase {
                 Phase::Connecting => {
                     vec![Span::styled(format!("{spin} connecting…"), style::amber())]
@@ -321,6 +321,63 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
                 ],
                 Phase::Failed(_) => vec![Span::styled("✗ failed", style::warn())],
             };
+            let cluster = match &s.target {
+                Some(ScanTarget::Cluster(summary)) => Some(summary),
+                _ => None,
+            };
+            let mut left = vec![
+                brand,
+                Span::raw("  "),
+                Span::styled(format!(" {} ", p.env.label()), style::env_badge(p.env)),
+                Span::styled(format!("  {}", p.name), style::fgb()),
+            ];
+            let endpoint = Span::styled(
+                format!(
+                    "  {}",
+                    trunc(&p.endpoint.to_string(), if w >= 100 { 30 } else { 18 })
+                ),
+                style::dim(),
+            );
+            let read_only = p
+                .is_read_only()
+                .then(|| Span::styled("  read-only", style::amber()));
+            let read_only_w = read_only.as_ref().map_or(0, |r| width(&r.content));
+            // On a cluster the summary says more than the seed's address: the address
+            // shows only when the whole summary and the status still fit beside it.
+            let show_endpoint = cluster.is_none_or(|summary| {
+                let taken = spans_width(&left) + width(&endpoint.content) + read_only_w;
+                taken + 2 + width(summary) + 2 + spans_width(&right) <= w
+            });
+            if show_endpoint {
+                left.push(endpoint);
+            }
+            match &s.target {
+                Some(ScanTarget::Replica(ep)) => left.push(Span::styled(
+                    format!("  replica {}", trunc(&ep.to_string(), 24)),
+                    style::dim(),
+                )),
+                Some(ScanTarget::PrimaryFallback(_)) => left.push(Span::styled(
+                    "  primary (replica unreachable)",
+                    style::amber(),
+                )),
+                _ => {}
+            }
+            if let Some(summary) = cluster {
+                let nodes = s.report.as_ref().and_then(|r| r.nodes.as_deref());
+                let taken = spans_width(&left) + read_only_w;
+                left.push(Span::styled(
+                    format!(
+                        "  {}",
+                        cluster_summary_fit(summary, w, taken, spans_width(&right))
+                    ),
+                    if cluster_degraded(summary, nodes) {
+                        style::amber()
+                    } else {
+                        style::dim()
+                    },
+                ));
+            }
+            left.extend(read_only);
             (justify(left, right, w), server_line(app, s, w))
         }
     };
