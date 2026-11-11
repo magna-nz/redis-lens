@@ -1,4 +1,5 @@
-//! Comparing two scan reports of the same server.
+//! Comparing two scan reports: of the same server over time ([`diff`]), or of two
+//! instances such as staging and prod ([`compare`]).
 
 use crate::model::{PatternStats, ScanReport};
 
@@ -231,6 +232,240 @@ fn classify(kb: u64, ka: u64, bytes: Option<(u64, u64)>) -> Cause {
         keys_cause
     } else {
         size_cause
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Comparing two instances (`redis-lens compare`)
+// ---------------------------------------------------------------------------
+
+/// What the shares in a [`Comparison`] are shares of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShareBasis {
+    /// Estimated memory: both sides had sizes.
+    Bytes,
+    /// Estimated keys: at least one side could not run `MEMORY USAGE`.
+    Keys,
+}
+
+/// Which sides a pattern was sampled on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Presence {
+    Both,
+    LeftOnly,
+    RightOnly,
+}
+
+/// Most of a pattern's keys have no TTL on one side, while most have one on the other:
+/// the likely bug class (an expiry set in one environment and forgotten in the other).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TtlMismatch {
+    NoTtlOnLeft,
+    NoTtlOnRight,
+}
+
+/// One side of one pattern.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CompareSide {
+    pub est_keys: u64,
+    pub est_bytes: Option<u64>,
+    pub sampled_keys: u64,
+    /// This pattern's share of its side's total, by [`Comparison::share_basis`], 0.0 to 1.0.
+    pub share: f64,
+    /// Estimated bytes per key. `None` without sizes or keys.
+    pub avg_bytes: Option<f64>,
+    /// Share of sampled keys with no TTL, 0.0 to 1.0.
+    pub no_ttl: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PatternCompare {
+    pub pattern: String,
+    pub presence: Presence,
+    pub left: Option<CompareSide>,
+    pub right: Option<CompareSide>,
+    /// Right estimated keys / left estimated keys. `None` unless both sides have keys.
+    pub key_ratio: Option<f64>,
+    /// Right average size / left average size. `None` unless both sides have a non-zero
+    /// average size.
+    pub avg_size_ratio: Option<f64>,
+    pub ttl_mismatch: Option<TtlMismatch>,
+}
+
+/// What one side of a comparison looked at.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CompareSummary {
+    pub profile: String,
+    pub taken_at_unix: i64,
+    pub used_memory: u64,
+    pub total_keys: u64,
+    pub sampled_keys: u64,
+    /// `sampled_keys / total_keys`, at most 1. `None` for an empty database.
+    pub sample_fraction: Option<f64>,
+    pub sizes_available: bool,
+    pub complete: bool,
+    pub match_glob: Option<String>,
+}
+
+impl CompareSummary {
+    fn of(r: &ScanReport) -> Self {
+        Self {
+            profile: r.profile.clone(),
+            taken_at_unix: r.taken_at_unix,
+            used_memory: r.server.used_memory,
+            total_keys: r.server.total_keys,
+            sampled_keys: r.sampled_keys,
+            sample_fraction: (r.server.total_keys > 0)
+                .then(|| (r.sampled_keys as f64 / r.server.total_keys as f64).min(1.0)),
+            sizes_available: r.sizes_available,
+            complete: r.complete,
+            match_glob: r.match_glob.clone(),
+        }
+    }
+}
+
+/// Two instances' patterns side by side.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Comparison {
+    pub left: CompareSummary,
+    pub right: CompareSummary,
+    pub share_basis: ShareBasis,
+    /// Both sides used the same `MATCH` glob (or none), so a pattern on one side only was
+    /// at least within reach of the other side's scan.
+    pub same_keyspace: bool,
+    /// Patterns with a [`TtlMismatch`] first, then by the larger of the two shares,
+    /// largest first, then by name.
+    pub patterns: Vec<PatternCompare>,
+}
+
+impl Comparison {
+    pub fn pattern(&self, pattern: &str) -> Option<&PatternCompare> {
+        self.patterns.iter().find(|p| p.pattern == pattern)
+    }
+}
+
+/// `a / b`, or `None` when it isn't a finite, meaningful number.
+fn ratio(a: f64, b: f64) -> Option<f64> {
+    (b > 0.0 && a.is_finite())
+        .then(|| a / b)
+        .filter(|r| r.is_finite())
+}
+
+fn compare_side(p: &PatternStats, basis: ShareBasis, total: u64) -> CompareSide {
+    let amount = match basis {
+        ShareBasis::Bytes => p.est_bytes.unwrap_or(0),
+        ShareBasis::Keys => p.est_keys,
+    };
+    CompareSide {
+        est_keys: p.est_keys,
+        est_bytes: p.est_bytes,
+        sampled_keys: p.sampled_keys,
+        share: ratio(amount as f64, total as f64).unwrap_or(0.0),
+        avg_bytes: p.est_bytes.and_then(|b| ratio(b as f64, p.est_keys as f64)),
+        no_ttl: p.no_ttl_ratio(),
+    }
+}
+
+/// Which side, if any, keeps most of the pattern's keys without a TTL while the other
+/// gives most of them one. "Most" is more than half of the sampled keys.
+fn ttl_mismatch(l: &CompareSide, r: &CompareSide) -> Option<TtlMismatch> {
+    if l.sampled_keys == 0 || r.sampled_keys == 0 {
+        return None;
+    }
+    if l.no_ttl > 0.5 && r.no_ttl < 0.5 {
+        Some(TtlMismatch::NoTtlOnLeft)
+    } else if r.no_ttl > 0.5 && l.no_ttl < 0.5 {
+        Some(TtlMismatch::NoTtlOnRight)
+    } else {
+        None
+    }
+}
+
+/// Compare the patterns of two instances, e.g. staging (`left`) and prod (`right`).
+///
+/// Datasets rarely match in size, so this works in shares of each side's total and in
+/// ratios rather than absolute differences. Shares are of estimated memory when both
+/// sides have sizes, of estimated keys otherwise.
+pub fn compare(left: &ScanReport, right: &ScanReport) -> Comparison {
+    let basis = if left.sizes_available && right.sizes_available {
+        ShareBasis::Bytes
+    } else {
+        ShareBasis::Keys
+    };
+    let total = |r: &ScanReport| -> u64 {
+        r.patterns
+            .iter()
+            .map(|p| match basis {
+                ShareBasis::Bytes => p.est_bytes.unwrap_or(0),
+                ShareBasis::Keys => p.est_keys,
+            })
+            .fold(0u64, u64::saturating_add)
+    };
+    let (lt, rt) = (total(left), total(right));
+    let mut names: Vec<&str> = left
+        .patterns
+        .iter()
+        .chain(&right.patterns)
+        .map(|p| p.pattern.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut patterns: Vec<PatternCompare> = names
+        .into_iter()
+        .map(|name| {
+            let side = |r: &ScanReport, t: u64| {
+                r.patterns
+                    .iter()
+                    .find(|p| p.pattern == name)
+                    .map(|p| compare_side(p, basis, t))
+            };
+            let (l, r) = (side(left, lt), side(right, rt));
+            let presence = match (&l, &r) {
+                (Some(_), Some(_)) => Presence::Both,
+                (Some(_), None) => Presence::LeftOnly,
+                _ => Presence::RightOnly,
+            };
+            let (key_ratio, avg_size_ratio, ttl) = match (&l, &r) {
+                (Some(l), Some(r)) => (
+                    ratio(r.est_keys as f64, l.est_keys as f64),
+                    l.avg_bytes
+                        .zip(r.avg_bytes)
+                        .and_then(|(la, ra)| ratio(ra, la)),
+                    ttl_mismatch(l, r),
+                ),
+                _ => (None, None, None),
+            };
+            PatternCompare {
+                pattern: name.to_string(),
+                presence,
+                left: l,
+                right: r,
+                key_ratio,
+                avg_size_ratio,
+                ttl_mismatch: ttl,
+            }
+        })
+        .collect();
+    let biggest = |p: &PatternCompare| {
+        let s = |side: &Option<CompareSide>| side.as_ref().map_or(0.0, |s| s.share);
+        s(&p.left).max(s(&p.right))
+    };
+    patterns.sort_by(|a, b| {
+        b.ttl_mismatch
+            .is_some()
+            .cmp(&a.ttl_mismatch.is_some())
+            .then_with(|| biggest(b).total_cmp(&biggest(a)))
+            .then_with(|| a.pattern.cmp(&b.pattern))
+    });
+    Comparison {
+        left: CompareSummary::of(left),
+        right: CompareSummary::of(right),
+        share_basis: basis,
+        same_keyspace: left.match_glob == right.match_glob,
+        patterns,
     }
 }
 
@@ -605,5 +840,223 @@ mod tests {
             &report(vec![stats("a", 150, None), stats("b", 20, None)], false),
         );
         assert_eq!(d.patterns[0].pattern, "b");
+    }
+    fn with_ttl(name: &str, keys: u64, bytes: Option<u64>, no_ttl: u64) -> PatternStats {
+        let mut p = stats(name, keys, bytes);
+        p.no_ttl = no_ttl;
+        p
+    }
+
+    fn side_report(
+        patterns: Vec<PatternStats>,
+        sizes: bool,
+        total: u64,
+        sampled: u64,
+    ) -> ScanReport {
+        let mut r = report(patterns, sizes);
+        r.server.total_keys = total;
+        r.sampled_keys = sampled;
+        r
+    }
+
+    #[test]
+    fn compare_shares_ratios_and_presence() {
+        // Staging is a tenth of prod: equal shares and a key ratio of 10.
+        let left = side_report(
+            vec![
+                with_ttl("session:{id}", 100, Some(100 * KB), 0),
+                with_ttl("cart:{id}", 300, Some(300 * KB), 0),
+                with_ttl("debug:{id}", 10, Some(10 * KB), 10),
+            ],
+            true,
+            410,
+            410,
+        );
+        let right = side_report(
+            vec![
+                with_ttl("session:{id}", 1000, Some(2000 * KB), 0),
+                with_ttl("cart:{id}", 3000, Some(3000 * KB), 0),
+                with_ttl("audit:{id}", 500, Some(5000 * KB), 500),
+            ],
+            true,
+            100_000,
+            4_500,
+        );
+        let c = compare(&left, &right);
+        assert_eq!(c.share_basis, ShareBasis::Bytes);
+        assert!(c.same_keyspace);
+        let s = c.pattern("session:{id}").unwrap();
+        assert_eq!(s.presence, Presence::Both);
+        let (l, r) = (s.left.as_ref().unwrap(), s.right.as_ref().unwrap());
+        assert!((l.share - 100.0 / 410.0).abs() < 1e-12);
+        assert!((r.share - 0.2).abs() < 1e-12);
+        assert_eq!(s.key_ratio, Some(10.0));
+        // 2 KiB a key against 1 KiB.
+        assert_eq!(s.avg_size_ratio, Some(2.0));
+        assert_eq!(
+            c.pattern("debug:{id}").unwrap().presence,
+            Presence::LeftOnly
+        );
+        let audit = c.pattern("audit:{id}").unwrap();
+        assert_eq!(audit.presence, Presence::RightOnly);
+        assert!(audit.left.is_none() && audit.key_ratio.is_none());
+        assert!(audit.avg_size_ratio.is_none() && audit.ttl_mismatch.is_none());
+        // Sample fractions.
+        assert_eq!(c.left.sample_fraction, Some(1.0));
+        assert_eq!(c.right.sample_fraction, Some(0.045));
+        // Sorted by the larger share: cart (73% of staging), audit (50% of prod),
+        // session, debug.
+        let order: Vec<_> = c.patterns.iter().map(|p| p.pattern.as_str()).collect();
+        assert_eq!(
+            order,
+            ["cart:{id}", "audit:{id}", "session:{id}", "debug:{id}"]
+        );
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["share_basis"], "bytes");
+        assert_eq!(json["patterns"][1]["presence"], "right-only");
+    }
+
+    #[test]
+    fn compare_flags_ttl_missing_on_one_side() {
+        let left = side_report(
+            vec![
+                // Expires on staging, not on prod: the bug class.
+                with_ttl("cart:{id}", 100, Some(MB), 0),
+                // The mirror image.
+                with_ttl("lock:{id}", 10, Some(KB), 9),
+                // Persistent on both: intentional.
+                with_ttl("config:{var}", 5, Some(KB), 5),
+                // Exactly half is not "most".
+                with_ttl("mixed:{id}", 10, Some(KB), 5),
+                with_ttl("big:{id}", 10, Some(100 * MB), 0),
+            ],
+            true,
+            0,
+            0,
+        );
+        let right = side_report(
+            vec![
+                with_ttl("cart:{id}", 100, Some(MB), 80),
+                with_ttl("lock:{id}", 10, Some(KB), 0),
+                with_ttl("config:{var}", 5, Some(KB), 5),
+                with_ttl("mixed:{id}", 10, Some(KB), 10),
+                with_ttl("big:{id}", 10, Some(100 * MB), 0),
+            ],
+            true,
+            0,
+            0,
+        );
+        let c = compare(&left, &right);
+        let flag = |n: &str| c.pattern(n).unwrap().ttl_mismatch;
+        assert_eq!(flag("cart:{id}"), Some(TtlMismatch::NoTtlOnRight));
+        assert_eq!(flag("lock:{id}"), Some(TtlMismatch::NoTtlOnLeft));
+        assert_eq!(flag("config:{var}"), None);
+        assert_eq!(flag("mixed:{id}"), None);
+        assert_eq!(flag("big:{id}"), None);
+        // Flagged patterns lead, ahead of the much bigger big:{id}.
+        let order: Vec<_> = c.patterns.iter().map(|p| p.pattern.as_str()).collect();
+        assert_eq!(order[..3], ["cart:{id}", "lock:{id}", "big:{id}"]);
+        // An empty database has no sample fraction.
+        assert_eq!(c.left.sample_fraction, None);
+        assert_eq!(
+            serde_json::to_value(TtlMismatch::NoTtlOnRight).unwrap(),
+            "no-ttl-on-right"
+        );
+    }
+
+    #[test]
+    fn compare_without_sizes_uses_key_shares() {
+        let left = side_report(
+            vec![stats("a", 30, Some(MB)), stats("b", 10, Some(MB))],
+            true,
+            40,
+            40,
+        );
+        let right = side_report(
+            vec![stats("a", 50, None), stats("b", 50, None)],
+            false,
+            100,
+            100,
+        );
+        let c = compare(&left, &right);
+        assert_eq!(c.share_basis, ShareBasis::Keys);
+        let a = c.pattern("a").unwrap();
+        assert_eq!(a.left.as_ref().unwrap().share, 0.75);
+        assert_eq!(a.right.as_ref().unwrap().share, 0.5);
+        assert_eq!(a.avg_size_ratio, None);
+        assert!((a.key_ratio.unwrap() - 50.0 / 30.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn compare_ratios_with_zeros() {
+        let left = side_report(
+            vec![
+                stats("zero-keys", 0, Some(0)),
+                stats("zero-bytes", 10, Some(0)),
+                stats("empty-right", 10, Some(MB)),
+            ],
+            true,
+            0,
+            0,
+        );
+        let right = side_report(
+            vec![
+                stats("zero-keys", 5, Some(MB)),
+                stats("zero-bytes", 10, Some(MB)),
+                stats("empty-right", 0, Some(0)),
+            ],
+            true,
+            0,
+            0,
+        );
+        let c = compare(&left, &right);
+        let p = |n: &str| c.pattern(n).unwrap().clone();
+        // No keys on the left: no key ratio, no average size.
+        assert_eq!(p("zero-keys").key_ratio, None);
+        assert_eq!(p("zero-keys").left.unwrap().avg_bytes, None);
+        assert_eq!(p("zero-keys").avg_size_ratio, None);
+        // A zero average on the left can't be divided by.
+        assert_eq!(p("zero-bytes").key_ratio, Some(1.0));
+        assert_eq!(p("zero-bytes").avg_size_ratio, None);
+        // Zero on the right is a ratio of 0, not missing.
+        assert_eq!(p("empty-right").key_ratio, Some(0.0));
+        assert_eq!(p("empty-right").avg_size_ratio, None);
+        // Nothing is NaN or infinite, so the JSON has no surprises.
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("NaN") && !json.contains("inf"), "{json}");
+        // An empty side: every share is 0.
+        let c = compare(&report(vec![], true), &right);
+        assert!(c.patterns.iter().all(|p| p.presence == Presence::RightOnly));
+        let c = compare(&left, &report(vec![stats("x", 0, Some(0))], true));
+        assert_eq!(c.pattern("x").unwrap().right.as_ref().unwrap().share, 0.0);
+    }
+
+    #[test]
+    fn compare_with_itself_is_unchanged() {
+        let r = side_report(
+            vec![
+                with_ttl("a", 100, Some(MB), 100),
+                with_ttl("b", 10, Some(KB), 0),
+            ],
+            true,
+            110,
+            110,
+        );
+        let c = compare(&r, &r);
+        for p in &c.patterns {
+            assert_eq!(p.presence, Presence::Both, "{}", p.pattern);
+            assert_eq!(p.key_ratio, Some(1.0));
+            assert_eq!(p.avg_size_ratio, Some(1.0));
+            assert_eq!(p.ttl_mismatch, None);
+            assert_eq!(p.left, p.right);
+        }
+    }
+
+    #[test]
+    fn compare_notes_different_globs() {
+        let mut left = report(vec![stats("user:{id}", 1, Some(1))], true);
+        left.match_glob = Some("user:*".into());
+        let right = report(vec![stats("order:{id}", 1, Some(1))], true);
+        assert!(!compare(&left, &right).same_keyspace);
     }
 }
