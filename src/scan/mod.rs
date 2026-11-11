@@ -1190,6 +1190,43 @@ mod tests {
         assert!(rx.borrow().as_ref().unwrap().sampled < 500);
     }
 
+    #[test]
+    fn partial_denominator_leaves_out_pending_and_vanished_keys() {
+        // 10,000 UTF-8 keys + 10 non-UTF-8 keys in the first page. Page 1,000, batch 100.
+        // First batch (UTF-8 keys 0..99): 20 Gone, 10 NoPerm, 70 Present.
+        let mut keys = keyspace(10_000, |i| {
+            if i < 100 {
+                match i % 10 {
+                    0 | 1 => Fate::Gone,
+                    2 => Fate::NoPerm,
+                    _ => Fate::Present,
+                }
+            } else {
+                Fate::Present
+            }
+        });
+        for j in 0..10u8 {
+            keys.insert(500 + usize::from(j), (vec![0xff, b':', j], Fate::Present));
+        }
+        let mut server = fake::Server::new(keys, 1_000);
+        let (tx, rx) = watch::channel(None);
+        server.observer = Some(rx.clone());
+        run(scan_with_partial(
+            "t",
+            &mut server,
+            &opts(5_000, 100),
+            &perms_all(),
+            None,
+            Some(&tx),
+        ))
+        .unwrap();
+        // Present after batch 1 = (990 seen - 890 pending) + 10 non-UTF-8 - 20 vanished = 90,
+        // so 70 samples stand for 70 * 10,010 / 90 = 7,785.6 keys.
+        let (sampled, est) = server.seen_partials[1].unwrap();
+        assert_eq!(sampled, 70);
+        assert!(est.abs_diff(7_786) <= 2, "est {est}");
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
 

@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** v0.2 done on main; wave 6 (bug fixes and rough edges) in progress; then v0.3 (cluster) or the feature ideas below
-**Last updated:** 2026-11-11 (wave 6 started)
+**Last updated:** 2026-11-11 (wave 6 verified; PR next)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -32,7 +32,27 @@ Approved by the owner: "Approve, merge when green". Same merge rules as the over
 | A | Scale estimate ignores keys that vanish between `SCAN` and the per-key lookups (counts come out low); live partial results in the Patterns view | implementer [opus] | `wave6/scan` (worktree `.claude/worktrees/w6-scan`) | **done** (5eea369, 008d6a8): denominator is keys present (seen minus vanished; unreadable keys stay in); partials on a second channel via `scan_with_partial`; 247 unit tests; merged into `wave6/fixes` |
 | B | Redis 6.2 in the integration job, as a new CI job (existing required check names unchanged) | implementer [sonnet] | `wave6/tests` (worktree `.claude/worktrees/w6-tests`) | **done** (89f0274): all integration tests pass on 6.2 with no test changes; merged into `wave6/fixes` |
 | C | OS trust store for TLS (load native certs, skip ones that fail to load, fall back to bundled roots when the store is empty); TLS replica test on Redis and Valkey via a throwaway CA and `SSL_CERT_FILE` | implementer [opus] | `wave6/tls` from `wave6/fixes` after B | **done** (9291fba, 3a54fdc): `src/conn/tls.rs`; `tests/tls_it.rs` (6 tests, Redis + Valkey, also on 6.2); merged into `wave6/fixes` |
-| V | Verifier on the merged `wave6/fixes` | verifier [opus] | pinned detached worktree | pending |
+| V | Verifier on the merged `wave6/fixes` | verifier [opus] | pinned detached worktree at 09343e2 | **APPROVE**, no blockers. Its ready-made test for the partial denominator (D1) is added. Follow-ups below |
+
+**Wave 6 follow-ups (from the verifier; not fixed in this wave):**
+- N1: after reconnecting the same entry, a stale partial (or `ScanDone`) from the aborted scan can show for up to about 250 ms. The forwarder outlives the aborted scan and sends with the same `ConnId`. Fix: a per-scan id, or abort the forwarder from a drop guard (`tui/app.rs` ~1065, `tui/mod.rs` ~177/378).
+- N2 and N3 (UX): the Patterns selection is a row index, so it moves as partials re-sort and resets to 0 on `ScanDone`. A collapse is lost when a group's key changes.
+- N4 (Windows): the Windows store fills public roots lazily, so a root that hasn't been fetched yet now gives `UnknownIssuer` where bundled-only used to connect.
+- Test gaps in the diff:
+  - D2: nothing catches a redis-rs upgrade that merges stores.
+  - D3: the empty-store TLS test would also pass with zero roots.
+  - D5: the ordering inside `connect_and_scan`.
+  - D6: the N1 window.
+- Spec behaviours with no test:
+  - limiter pacing and `--max-rate`
+  - SCAN deduplication
+  - the shell-history warning for a URL password
+  - `--ask-password` and `REDIS_LENS_CONFIG`
+  - `conn test`
+  - horizontal scrolling
+  - the spec's `lens-ro` ACL line
+  - per-OS trust-store connections
+  - the real keychain (an ignored test)
 
 **TLS replica test (resolved: the owner chose the OS trust store, done in part C).** Original blocker: `src/conn/mod.rs:119` builds TLS connections with `tls_params: None` on redis-rs's `tls-rustls-webpki-roots`, so only public CAs are trusted and a test with a throwaway CA can't connect. This is also a product gap: a server behind a private or corporate CA can't be reached. It needs a decision (OS trust store, or a per-profile CA file) before a test can be written.
 
