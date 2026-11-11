@@ -8,14 +8,15 @@
 //! roots it loads from the OS store. A certificate from a CA that is not installed must
 //! be refused.
 //!
-//! Without `REDIS_LENS_OS_TRUST_CA` the tests return early with a note, so a plain
-//! `cargo test` never needs the OS store changed. `SSL_CERT_FILE` / `SSL_CERT_DIR`
+//! The tests are `#[ignore]`d, so a plain `cargo test` reports them as ignored and never
+//! needs the OS store changed. CI runs them with `cargo test --test os_trust -- --ignored`
+//! and they fail, not skip, when `REDIS_LENS_OS_TRUST_CA` is unset. `SSL_CERT_FILE` / `SSL_CERT_DIR`
 //! replace the OS store, and on Linux cargo sets them for every process it starts
 //! (through openssl-probe), so each test re-runs itself in a child process without them.
 //! To check the test body itself without touching the OS store, point `SSL_CERT_FILE` at
 //! the CA and set `REDIS_LENS_OS_TRUST_VIA_CERT_FILE=1`.
 //!
-//! Not Docker-gated: it runs in the unit test job on every OS.
+//! Not Docker-gated: it runs (with `--ignored`) in the unit test job on every OS.
 
 use std::io;
 use std::sync::Arc;
@@ -50,7 +51,14 @@ fn rerun_without_cert_env(name: &str) -> bool {
         return false;
     }
     let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args([name, "--exact", "--nocapture", "--test-threads", "1"])
+        .args([
+            name,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
         .env(CHILD_ENV, "1")
         .env_remove("SSL_CERT_FILE")
         .env_remove("SSL_CERT_DIR")
@@ -68,13 +76,11 @@ fn rerun_without_cert_env(name: &str) -> bool {
     true
 }
 
-/// The installed CA, as an issuer, or `None` (after printing why) when the test is not
-/// set up.
-fn installed_ca() -> Option<rcgen::Issuer<'static, rcgen::KeyPair>> {
-    let Some(ca_path) = std::env::var_os(CA_ENV) else {
-        eprintln!("skipped: {CA_ENV} is not set, so no CA was installed in the OS store");
-        return None;
-    };
+/// The installed CA, as an issuer. Panics when the test is not set up.
+fn installed_ca() -> rcgen::Issuer<'static, rcgen::KeyPair> {
+    let ca_path = std::env::var_os(CA_ENV).unwrap_or_else(|| {
+        panic!("{CA_ENV} is not set: no CA was installed in the OS store (CI sets it)")
+    });
     let key_path =
         std::env::var_os(KEY_ENV).unwrap_or_else(|| panic!("{CA_ENV} is set but {KEY_ENV} is not"));
     if std::env::var_os(VIA_CERT_FILE_ENV).is_none() {
@@ -91,7 +97,7 @@ fn installed_ca() -> Option<rcgen::Issuer<'static, rcgen::KeyPair>> {
     let key_pem = std::fs::read_to_string(&key_path)
         .unwrap_or_else(|e| panic!("read {KEY_ENV} ({}): {e}", key_path.display()));
     let key = rcgen::KeyPair::from_pem(&key_pem).expect("the CA key (PKCS#8 PEM)");
-    Some(rcgen::Issuer::from_ca_cert_pem(&ca_pem, key).expect("the CA certificate (PEM)"))
+    rcgen::Issuer::from_ca_cert_pem(&ca_pem, key).expect("the CA certificate (PEM)")
 }
 
 /// A CA that is installed nowhere.
@@ -214,11 +220,12 @@ fn profile(port: u16) -> Profile {
 }
 
 #[tokio::test]
+#[ignore = "needs REDIS_LENS_OS_TRUST_CA (a CA in the OS trust store); CI runs it with --ignored"]
 async fn a_server_signed_by_the_installed_ca_is_trusted() {
     if rerun_without_cert_env("a_server_signed_by_the_installed_ca_is_trusted") {
         return;
     }
-    let Some(ca) = installed_ca() else { return };
+    let ca = installed_ca();
     let (cert, key) = leaf(&ca);
     let port = serve(cert, key).await;
     let mut c = conn::connect(&profile(port), &MemoryStore::default())
@@ -231,13 +238,12 @@ async fn a_server_signed_by_the_installed_ca_is_trusted() {
 }
 
 #[tokio::test]
+#[ignore = "needs REDIS_LENS_OS_TRUST_CA (a CA in the OS trust store); CI runs it with --ignored"]
 async fn a_server_signed_by_a_ca_not_installed_is_refused() {
     if rerun_without_cert_env("a_server_signed_by_a_ca_not_installed_is_refused") {
         return;
     }
-    if installed_ca().is_none() {
-        return;
-    }
+    installed_ca();
     let other = other_ca();
     let (cert, key) = leaf(&other);
     let port = serve(cert, key).await;
