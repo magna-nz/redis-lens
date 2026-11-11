@@ -9,11 +9,16 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use tokio::sync::watch;
 
-use super::ScanArgs;
+use super::{ChecksFailed, GateError, ScanArgs};
+use crate::check;
 use crate::config::Config;
-use crate::conn::{self, ScanTarget};
+use crate::conn::{self, ScanTarget, provider};
+use crate::diff::{self, ReportDiff};
 use crate::format;
-use crate::model::{PERM_FREQ, PatternStats, PermStatus, PermissionReport, Profile, ScanReport};
+use crate::model::{
+    Env, PERM_FREQ, PatternStats, PermStatus, PermissionReport, Profile, ScanReport,
+};
+use crate::scan::context::context_summary;
 use crate::scan::{self, ScanOptions, ScanProgress};
 use crate::secrets::{KeyringStore, SecretStore};
 use crate::snapshot;
@@ -398,30 +403,169 @@ pub fn render_table_for(
 
 pub async fn run(config: Option<PathBuf>, args: ScanArgs) -> anyhow::Result<()> {
     let path = match config {
-        Some(p) => p,
-        None => Config::default_path()?,
+        Some(p) => Ok(p),
+        None => Config::default_path().map_err(anyhow::Error::from),
     };
-    let secrets = KeyringStore;
-    let result = with_progress(|tx| {
-        let (path, secrets, args) = (&path, &secrets, &args);
-        async move { report_with_target(path, secrets, args, tx.as_ref()).await }
+    let path = match path {
+        Ok(p) => p,
+        Err(e) if is_gate(&args) => return Err(GateError(e).into()),
+        Err(e) => return Err(e),
+    };
+    execute(
+        &path,
+        &KeyringStore,
+        &args,
+        snapshot::default_dir,
+        &mut std::io::stdout(),
+    )
+    .await
+}
+
+/// True for `scan --check` / `--rules`: errors then exit with code 2 and rule failures with 1.
+fn is_gate(args: &ScanArgs) -> bool {
+    !args.checks.is_empty() || args.rules.is_some()
+}
+
+/// Everything `scan` does after parsing arguments, against a given config, secret store,
+/// snapshot directory and standard output, so tests can run it end to end.
+///
+/// Without `--check` it behaves like a plain scan. With it, rule failures come back as
+/// [`ChecksFailed`] and every other error as [`GateError`].
+pub async fn execute(
+    config_path: &Path,
+    secrets: &dyn SecretStore,
+    args: &ScanArgs,
+    snapshot_dir: impl Fn() -> Result<PathBuf, snapshot::SnapshotError>,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    if !is_gate(args) {
+        scan_and_print(config_path, secrets, args, &snapshot_dir, out, &[]).await?;
+        return Ok(());
+    }
+    let rules = check::load_rules(&args.checks, args.rules.as_deref()).map_err(GateError)?;
+    if let Some(profile) = profile_named(config_path, &args.profile)
+        && profile.is_read_only()
+        && profile.env == Env::Prod
+    {
+        eprintln!(
+            "Warning: '{}' is a production profile. --check runs a real scan against it, \
+             with the normal command budget.",
+            profile.name
+        );
+    }
+    let evals = scan_and_print(config_path, secrets, args, &snapshot_dir, out, &rules)
+        .await
+        .map_err(GateError)?;
+    let failed = check::failure_count(&evals, args.strict);
+    if failed > 0 {
+        return Err(ChecksFailed(failed).into());
+    }
+    Ok(())
+}
+
+fn profile_named(config_path: &Path, name: &str) -> Option<Profile> {
+    Config::load(config_path).ok()?.get(name).cloned()
+}
+
+/// Scan, print what was asked for, judge `rules` (may be empty) and return the verdicts.
+async fn scan_and_print(
+    config_path: &Path,
+    secrets: &dyn SecretStore,
+    args: &ScanArgs,
+    snapshot_dir: &dyn Fn() -> Result<PathBuf, snapshot::SnapshotError>,
+    out: &mut dyn Write,
+    rules: &[check::Rule],
+) -> anyhow::Result<Vec<check::Evaluation>> {
+    if let Some(profile) = profile_named(config_path, &args.profile)
+        && let Some(notice) = provider::notice(profile.provider)
+    {
+        eprintln!("{notice}");
+    }
+    let result = with_progress(|tx| async move {
+        report_with_target(config_path, secrets, args, tx.as_ref()).await
     })
     .await;
     let (report, perms, target) = result?;
-    save_into(snapshot::default_dir, &args, &report)?;
 
+    // The baseline is the newest earlier snapshot with the same MATCH glob. Look it up
+    // before saving, and only when something will use it.
+    let wants_baseline = args.report.is_some() || rules.iter().any(check::Rule::needs_baseline);
+    let baseline = if wants_baseline {
+        baseline_diff(snapshot_dir, &report)
+    } else {
+        None
+    };
+    save_into(snapshot_dir, args, &report)?;
+
+    // Rule results go to standard error when standard output carries the JSON or the report.
+    let stdout_taken = args.json || (args.report.is_some() && args.output.is_none());
     if args.json {
-        println!(
+        writeln!(
+            out,
             "{}",
             serde_json::to_string_pretty(&report).context("could not serialize the report")?
-        );
+        )?;
+    } else if let Some(format) = args.report {
+        let text = crate::report::render(format, &report, baseline.as_ref(), args.examples);
+        match &args.output {
+            Some(path) => {
+                std::fs::write(path, text)
+                    .with_context(|| format!("could not write {}", path.display()))?;
+                eprintln!("Wrote report {}", path.display());
+            }
+            None => write!(out, "{text}")?,
+        }
     } else {
         let width = crossterm::terminal::size()
             .map(|(c, _)| c as usize)
             .unwrap_or(DEFAULT_WIDTH);
-        println!("{}", render_table_for(&report, &perms, &target, width));
+        writeln!(out, "{}", render_table_for(&report, &perms, &target, width))?;
+        for line in context_summary(&report) {
+            writeln!(out, "{line}")?;
+        }
     }
-    Ok(())
+
+    let evals = check::evaluate_all(rules, &report, baseline.as_ref());
+    if !rules.is_empty() {
+        let lines = check::render_lines(&evals, args.strict);
+        if stdout_taken {
+            for l in lines {
+                eprintln!("{l}");
+            }
+        } else {
+            writeln!(out)?;
+            for l in lines {
+                writeln!(out, "{l}")?;
+            }
+        }
+    }
+    if args.strict && rules.is_empty() {
+        eprintln!("Note: --strict has no effect without --check or --rules.");
+    }
+    Ok(evals)
+}
+
+/// The diff of the newest earlier snapshot (same profile, same MATCH glob) against `report`.
+/// A snapshot directory that can't be read means no baseline, with a note on stderr.
+fn baseline_diff(
+    snapshot_dir: &dyn Fn() -> Result<PathBuf, snapshot::SnapshotError>,
+    report: &ScanReport,
+) -> Option<ReportDiff> {
+    let found = snapshot_dir().and_then(|dir| {
+        snapshot::latest_before(
+            &dir,
+            &report.profile,
+            report.taken_at_unix,
+            report.match_glob.as_deref(),
+        )
+    });
+    match found {
+        Ok(before) => before.map(|b| diff::diff(&b, report)),
+        Err(e) => {
+            eprintln!("Note: no baseline snapshot: {e}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
