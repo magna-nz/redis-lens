@@ -83,24 +83,28 @@ the host if you leave it out. `--force` replaces a profile with the same name.
 redis-lens
 ```
 
+Press `?` on any view for its keys. The main ones:
+
 | Key | Where | Action |
 |---|---|---|
 | `0` to `4` | Every view | Switch view: Connections, Patterns, TTL, Diff, Hot keys |
+| `?` | Every view | Show or hide the key list |
 | `a` | Every view | Add a connection: opens the Connections view with a box to paste a connection string into. The password is masked in the preview. |
-| `↑` `↓` or `k` `j` | Every view | Move |
+| `↑` `↓` or `k` `j`, `PgUp` `PgDn`, `Home` `End` or `g` `G` | Every list | Move, by a page, to the first or last row |
 | `enter` | Connections | Connect to the selected profile |
 | `r` | Connections | Look for Docker containers again |
-| `→` `←` or `l` `h` | Patterns | Expand and collapse a pattern group |
-| `enter` | Patterns | Expand or collapse the selected group |
-| `/` | Patterns | Filter patterns. Type the filter, `enter` keeps it, `esc` clears it. |
-| `esc` | Patterns | Clear the filter |
-| `g` `G` (or `Home` `End`) | TTL, Diff, Hot keys | Jump to the first or last row |
+| `r` | Patterns, TTL, Diff, Hot keys | Scan again; the previous results stay until new ones arrive |
+| `→` `←` or `l` `h`, `enter` | Patterns | Expand and collapse a pattern group |
+| `/`, `esc` | Patterns | Filter patterns, clear the filter |
+| `o` | Patterns | Sort by memory, keys, average size, no-TTL % or name |
+| `y`, `Y` | Patterns, TTL, Diff, Hot keys | Copy the pattern (Hot keys: the key), or a `redis-cli --scan` command for it, through your terminal (OSC 52) |
 | `s` | Every view but Connections | Save a snapshot of the current scan |
 | `q` | Every view | Quit |
 
 In the add box, `enter` saves, `esc` cancels and `ctrl-u` clears the field. `ctrl-c` quits from anywhere.
 
-Narrow terminals scroll sideways instead of wrapping.
+Narrow terminals never wrap: the Patterns view hides the share bar, then Δ, then the average size, and the selected
+row's text that doesn't fit scrolls across.
 
 ### Scan from the command line
 
@@ -118,6 +122,65 @@ redis-lens scan prod-cache --max-rate 1000 --save
 | `--json` | Print the report as JSON instead of a table. |
 | `--max-rate N` | At most N commands per second. `0` means no limit. |
 | `--save` | Save the report as a snapshot. |
+| `--keep N`, `--keep-days D` | With `--save`, keep only the newest N snapshots, or those from the last D days. |
+| `--check RULE` | Fail with exit code 1 when a rule fails, e.g. `no-ttl-pct<20`. Repeatable. See below. |
+| `--rules FILE`, `--strict` | Read rules from a TOML file; fail rules that couldn't be judged. |
+| `--report md\|html\|csv`, `-o FILE`, `--examples` | Write a shareable report. Example key names only with `--examples`. |
+
+### Gate a deploy with `--check`
+
+```sh
+redis-lens scan staging --check 'no-ttl-pct<20' --check 'verdict!=persistent-growing' --check 'total-bytes<2GiB'
+```
+
+Each rule is `<metric><op><value>[,min-keys=N]`. The metrics are `no-ttl-pct`, `growth` (against the newest earlier
+snapshot), `pattern-bytes`, `verdict` and `total-bytes`; the ops are `< <= > >= = !=`. Per-pattern rules skip patterns
+with fewer than 50 sampled keys, so small patterns don't flap. A rule that can't be judged (no `MEMORY USAGE`, no
+baseline) is reported as SKIP, and fails only with `--strict`. Exit codes: 0 pass, 1 a rule failed, 2 the scan
+itself broke. Rules can live in a file: `--rules lens-rules.toml` with a `[check]` table holding `rules = [...]` and an
+optional `min_keys = 100`.
+
+In GitHub Actions:
+
+```yaml
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install redis-lens
+        run: cargo install redis-lens --locked
+      - name: Gate the deploy
+        # 0 pass, 1 a rule failed, 2 the scan itself broke
+        run: |
+          redis-lens conn add staging --url "$STAGING_REDIS_URL" --env stage
+          redis-lens scan staging --sample 50000 \
+            --check 'no-ttl-pct<20' --check 'total-bytes<2GiB' \
+            --report md -o redis-report.md
+        env:
+          STAGING_REDIS_URL: ${{ secrets.STAGING_REDIS_URL }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: redis-report
+          path: redis-report.md
+```
+
+Credentials go to the OS keychain, which a headless runner may not have. On CI prefer a connection without a stored
+password (a token command, or a network-restricted user), and check `conn add` works on your runner first. `growth`
+rules need a baseline, so keep the snapshot directory between runs (`--save`, and cache it) or they are skipped.
+
+### Reports
+
+```sh
+redis-lens scan prod-cache --report md -o report.md
+redis-lens scan prod-cache --report html -o report.html
+redis-lens scan prod-cache --report csv > patterns.csv
+```
+
+Markdown and HTML hold a summary, the top patterns, TTL risks and, when there is an earlier snapshot, what changed.
+The HTML is one file with no external requests. Key names are escaped for each format (including spreadsheet formula
+injection in CSV), and example key names are left out unless you pass `--examples`, because they can hold user ids
+or emails.
 
 ### Compare with an earlier scan
 
@@ -130,6 +193,39 @@ redis-lens diff prod-cache --against ~/old-snapshot.json --json
 saves the new scan. It takes `--max-rate` and `--json` too. `diff` scans the whole keyspace, so it needs a baseline
 taken without `--match`: run `redis-lens scan <profile> --save` (no `--match`) once first. Snapshots taken with
 `--match` are only compared with scans that used the same glob.
+
+### Compare two instances
+
+```sh
+redis-lens compare staging prod
+redis-lens compare staging prod --right-file ~/prod-snapshot.json --json
+```
+
+Scans both (each with its own rate limit; production stays read-only) or reads a saved snapshot for a side, and
+compares per pattern: share of total memory, key-count and average-size ratios, and the share of keys without a TTL
+on each side. "No TTL on one side, set on the other" is flagged first, since it is the likely bug. Shares and ratios
+come first because datasets rarely have the same size. Standalone servers only for now.
+
+### Scheduled snapshots and trends
+
+redis-lens has no daemon; let cron, systemd or CI run it. A nightly snapshot that keeps a month of history:
+
+```sh
+# m h dom mon dow  command
+15 3 * * *  redis-lens scan prod-cache --save --keep 30 >/dev/null
+```
+
+`--keep-days 30` keeps by age instead; both together keep a snapshot only while both allow it. The newest snapshot is
+never deleted. Then:
+
+```sh
+redis-lens trend prod-cache                            # memory per pattern over the last 7 snapshots, growth per day
+redis-lens snapshots list prod-cache
+redis-lens snapshots prune prod-cache --keep 10        # shows what would go
+redis-lens snapshots prune prod-cache --keep 10 --yes  # deletes it
+```
+
+The Diff view shows the same trend as a sparkline column once there are two earlier snapshots.
 
 ### Find containers
 
@@ -169,8 +265,9 @@ addresses with placeholders. For example `user:88213:cart` becomes `user:{id}:ca
 |---|---|
 | None | No `AUTH` is sent. |
 | ACL user and password, or password only | Both are stored in the OS keychain. |
-| TLS | `rediss://` or `ssl=True`, verified against the webpki root certificates. |
+| TLS | `rediss://` or `ssl=True`, verified against the OS trust store (with the Mozilla roots as a fallback). |
 | Microsoft Entra ID | Behind a cargo feature, see below. |
+| Token command | A command that prints a short-lived token (AWS, Azure and Google Cloud IAM), see below. |
 | Docker discovery | Containers are found through the Docker socket. |
 
 **Entra ID.** For Azure Cache for Redis and Azure Managed Redis. Install with the feature enabled:
@@ -182,6 +279,45 @@ redis-lens conn add azure-cache --url rediss://my-cache.redis.azure.net:10000 --
 
 It uses the developer-tools credential, so run `az login` first. Managed identity is not verified yet. Azure hosts
 (`*.redis.cache.windows.net`, `*.redis.azure.net`) are recognised and the environment is guessed from the host name.
+
+**Short-lived tokens (IAM).** Managed services sign in with short-lived tokens sent as the password. Give
+redis-lens the command that prints one, after `--`. It runs that command at every connect and never stores the token.
+
+```sh
+# Azure Managed Redis / Azure Cache for Redis with Microsoft Entra ID. The username is your object ID.
+redis-lens conn add azure-prod --url rediss://<object-id>@contoso.eastus.redis.azure.net:10000 -- \
+  az account get-access-token --resource https://redis.azure.com --query accessToken -o tsv
+
+# Google Cloud Memorystore with IAM auth. The access token is the password.
+redis-lens conn add gcp-prod --url rediss://10.0.0.5:6378 --provider memorystore -- \
+  gcloud auth print-access-token
+
+# AWS ElastiCache or MemoryDB with IAM auth. The username is the IAM-enabled user ID; the command is any tool or
+# script that prints the SigV4 auth token (valid 15 minutes; see AWS's "Authenticating with IAM" page).
+redis-lens conn add aws-prod --url rediss://<iam-user-id>@master.my-cluster.abc123.use1.cache.amazonaws.com:6379 -- \
+  /usr/local/bin/elasticache-iam-token my-cluster <iam-user-id> us-east-1
+```
+
+`conn add` shows the command and asks before saving it (`--yes` skips the question in scripts). The command is run
+directly, not through a shell, with a 10 s limit. Its error output is never shown, because some tools print tokens
+there; if it fails, run it yourself to see why. The username goes to the keychain, the command to the config file.
+
+**What works where.** redis-lens recognises ElastiCache, ElastiCache Serverless, MemoryDB and Azure from the host
+name (`--provider` sets it by hand, and is the only way for Memorystore) and says before a scan what will be missing.
+The permission check (`redis-lens conn test`) is what decides; this table is what to expect.
+
+| Service | Sizes (`MEMORY USAGE`) | Hot keys (`OBJECT FREQ`) | Dataset figures (`MEMORY STATS`) | `INFO keysizes` | Default rate |
+|---|---|---|---|---|---|
+| Redis 8+ (self-hosted) | yes | with an LFU policy | yes | yes | 5,000/s |
+| Redis 6.2–7.x, Valkey 8 | yes | with an LFU policy | yes | no | 5,000/s |
+| ElastiCache Serverless | no (restricted) | no (restricted) | no (restricted) | no | 1,000/s |
+| ElastiCache (node-based) | yes | with an LFU policy in the parameter group | yes* | engine-dependent | 5,000/s |
+| MemoryDB | yes* | with an LFU policy* | yes* | engine-dependent | 5,000/s |
+| Azure Cache for Redis | yes* | with an LFU policy* | yes* | no | 5,000/s |
+| Azure Managed Redis / Enterprise | yes* | * | no (unsupported) | * | 5,000/s |
+| Memorystore | yes* | with an LFU policy* | yes* | engine-dependent | 5,000/s |
+
+\* Not checked against the service; the permission check shows what actually works.
 
 **Docker discovery.** Lists running containers whose image is redis, valkey, redis-stack or bitnami/redis and that
 publish port 6379. A password found in `--requirepass` or in `REDIS_PASSWORD` or `VALKEY_PASSWORD` is held in memory
@@ -201,7 +337,7 @@ TUI tells you it is waiting on the keychain.
 redis-lens needs only a handful of read commands. A minimal user:
 
 ```
-ACL SETUSER lens-ro on >… ~* resetchannels -@all +ping +hello +client|setinfo +client|setname +select +info +dbsize +scan +type +ttl +pttl +memory|usage +object|freq
+ACL SETUSER lens-ro on >… ~* resetchannels -@all +ping +hello +client|setinfo +client|setname +select +info +dbsize +scan +type +ttl +pttl +memory|usage +object|freq +memory|stats
 ```
 
 Before scanning, redis-lens tries each command once and turns off what it can't use. It never aborts a scan over a
@@ -211,6 +347,7 @@ missing permission.
 |---|---|
 | `MEMORY USAGE` | Sizes. You still get key counts and TTLs. |
 | `OBJECT FREQ`, or a non-LFU eviction policy | The Hot keys view. |
+| `MEMORY STATS` | The `dataset.bytes` figures in the server context strip. |
 | A key ACL on some keys (`NOPERM`) | Those keys' sizes. The scan carries on. |
 
 `conn test <name>` shows the result of the check.
@@ -220,8 +357,8 @@ missing permission.
 - Read-only. redis-lens never sends a write command. Profiles with env `prod` are read-only by default.
 - The keyspace is walked with `SCAN cursor COUNT n`. Never `KEYS`. Per-key commands (`TYPE`, `PTTL`, `MEMORY USAGE
   ... SAMPLES 5`, `OBJECT FREQ`) are pipelined in batches.
-- A command budget limits load. The default is no limit for `local` profiles and 5,000 commands per second for
-  everything else. Change it with `--max-rate`.
+- A command budget limits load. The default is no limit for `local` profiles, 1,000 commands per second on
+  ElastiCache Serverless and 5,000 for everything else. Change it with `--max-rate`.
 - With `conn add --prefer-replica`, scans run against an online replica found through `INFO replication`, so the
   primary serves no scan traffic. The replica is verified first: its `INFO replication` must say it is a replica and
   carry the primary's replication ID (`master_replid`). An ordinary unrelated server on the announced address fails
@@ -249,7 +386,8 @@ credentials. Example key names can still be sensitive, so treat snapshot files l
 `redis-lens diff <profile>` and the Diff view compare a scan with the newest earlier snapshot taken with the same
 `--match` glob. For `diff` that means a snapshot taken without `--match`.
 
-A cron job that runs `redis-lens scan <profile> --save` once a day gives you something to diff against.
+A cron job that runs `redis-lens scan <profile> --save --keep 30` once a day gives you something to diff against
+and a month of trend (see [Scheduled snapshots and trends](#scheduled-snapshots-and-trends)).
 
 ## Development
 

@@ -50,10 +50,34 @@ Integration branch `quickwins/integration` (worktree `.claude/worktrees/qw`, fro
 
 | Part | Content | Agent | Branch | State |
 |---|---|---|---|---|
-| R | 1 `--check` rules with exit codes; 2 Markdown, HTML and CSV reports | implementer [sonnet] | `quickwins/r` | in progress |
-| S | 6 snapshot retention, `snapshots list/prune`, `trend` and a trend column in the Diff view; 7 `compare` | implementer [opus] | `quickwins/s` | in progress |
-| C | 3 provider detection and notices; 4 server context (`INFO keysizes`, `INFO keyspace`, `MEMORY STATS`); 5 token-command auth | implementer [opus] | `quickwins/c` | in progress |
+| R | 1 `--check` rules with exit codes; 2 Markdown, HTML and CSV reports | implementer [sonnet] | `quickwins/r` | **done** (850cefa; Markdown names as code spans in 8d0a175), merged |
+| S | 6 snapshot retention, `snapshots list/prune`, `trend` and a trend column in the Diff view; 7 `compare` | implementer [opus] | `quickwins/s` | **done** (827ba4c, 9e5d008, 98318f3), merged; `prune` needs `--keep` or `--keep-days` (clap, f0cbbe0) |
+| C | 3 provider detection and notices; 4 server context (`INFO keysizes`, `INFO keyspace`, `MEMORY STATS`); 5 token-command auth | implementer [opus] | `quickwins/c` | **done** (7cfbd00, 0e8d584), merged |
 | V | Verifier on the merged branch | verifier [opus] | pinned detached worktree | not started |
+
+**How each item is covered** (the agents' change → test maps are in their reports; the verifier audits them):
+- `--check`: `check::tests` (every metric and op, the min-keys floor, not judged and `--strict`, growth with and without a baseline, the TOML file, parser errors, a parser proptest); `cli::tests::exit_codes`; `scan_cli_it` passing and failing gates, a growth rule against a saved baseline (Redis and Valkey).
+- Reports: `report::{md,html,csv}::tests` snapshots of each format and hostile names (`<script>`, `|`, `=cmd()`, newlines, backticks); `scan_cli_it` writing `--report md -o`.
+- Providers: `conn::provider::tests` (each provider and negatives, notices); the serverless rate in `scan::tests`; TUI notice snapshots in `tui::snapshot_tests_server`.
+- Server context: parser tests for `INFO keysizes`, `INFO keyspace` and `MEMORY STATS` with documented formats, plus proptests; `context_summary` lines and sampling-bias warnings; `scan_it` on real servers (also `redis:8` for `INFO keysizes`) and with `MEMORY STATS` denied by ACL; the Patterns strip snapshots.
+- Token command: `conn::token::tests` (success, timeout, non-zero exit, empty, too long, not UTF-8; Unix only); `conn add` with a token command (argv in the config, username only in the keychain, URL password refused, confirmation and `--yes`); `conn_it` connecting with a token command to a `requirepass` server and with an ACL user.
+- Retention and snapshots: `snapshot::tests` (keep only, days only, both, newest kept, other profiles' and foreign files and symlinks untouched); `cli::tests::prune_needs_a_retention_rule`; `diff_it` `scan --save --keep 2` over three scans.
+- Trend: sparkline and least-squares tests (empty, one point, flat, rising, gaps); Diff view snapshots with and without a trend column; stale-run tests unchanged.
+- Compare: `diff::tests` for the classification and ratios with zeros; `compare_it` on two seeded servers, checking neither was written to (Redis and Valkey).
+
+**Decisions taken in the wave (owner may revisit):**
+- `ServerContext` is a boxed newtype (`Deref` to its parts), so `ScanReport` doesn't grow by 176 bytes and trip clippy's `large_enum_variant` on the TUI messages. The JSON is unchanged.
+- The ElastiCache Serverless default budget is 1,000 commands/s. AWS publishes no figure; it is chosen from AWS's warning that frequent or large `SCAN`s raise latency there, and ECPU billing.
+- The trend reaches the TUI as its own `Msg::Trend` after `Msg::History`, through the same stale-run guard.
+- `scan --save --keep` into a profile directory that is a symlink saves the snapshot, then exits 1 with an "unsafe directory" error and deletes nothing.
+- `compare` compares the share of keys without a TTL on each side, not the full TTL histogram.
+- Markdown reports put pattern and key names in code spans, so a hostile name can't make a link or emphasis.
+
+**Follow-ups found in the wave (not done):**
+- Rule 1 (from wave 8): permission-check rows and `conn test` show the server's `NOPERM` text, which names the ACL user.
+- The provider table's starred cells (MemoryDB, Memorystore, node-based ElastiCache command lists, Azure Enterprise, China and US Government suffixes) and the AWS token tool's exact name were not checked against the services (no web access in the agent).
+- The token runner's unit tests are Unix-only; the interactive confirmation in `conn add` has no unit test (`--yes` and the no-terminal refusal do).
+- The GitHub Actions example has not been run on a real runner (the OS keychain may be missing there).
 
 ## Wave 8 (2026-11-11): usability
 
