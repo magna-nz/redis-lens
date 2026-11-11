@@ -34,7 +34,7 @@ expression: t.backend()
 "│ Auth        required                                                   – MEMORY USAGE                                │"
 "│ Credential  not found: save it as a profile with credentials           – OBJECT FREQ                                 │"
 "│ TLS         off                                                        – INFO                                        │"
-"│ Read-only   no                                                                                                       │"
+"│ Read-only   no                                                         – MEMORY STATS                                │"
 "│ Found in Docker: container acl-valkey-1 (valkey/valkey:8.1-alpine). Press enter to connect.                          │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 " ↑↓ Move   enter Connect   a Add   r Rescan Docker   0-4 View   ? Help   q Quit                                         "

@@ -1,0 +1,28 @@
+---
+source: src/tui/snapshot_tests_server.rs
+expression: t.backend()
+---
+" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
+" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
+"  0 Connections   1 Patterns   2 TTL   3 Diff   4 Hot keys                      "
+"┌─ Patterns ────────────────────────────────── 11 patterns · sorted by memory ─┐"
+"│ PATTERN            TYPE       KEYS   MEMORY▼ SHARE       %      AVG  NO TTL  │"
+"│   session:{uuid}   string    1.84M     6.1G  ███▋░░░░  46%     3.5K      0%  │"
+"│ ▾ cache:*          string    1.34M     3.6G  ██▏░░░░░  27%     2.8K     10%  │"
+"│     cache:search:… string    1.12M     2.2G  █▍░░░░░░  16%     2.1K   ▲ 12%  │"
+"│     cache:product… string     220K     1.4G  ▉░░░░░░░  10%     6.7K      0%  │"
+"│ ▾ user:{id}:*      mixed      896K     1.9G  █▏░░░░░░  14%     2.2K     59%  │"
+"│     user:{id}:cart hash       388K     1.2G  ▊░░░░░░░   9%     3.2K   ▲ 31%  │"
+"│     user:{id}:pro… hash       412K     553M  ▍░░░░░░░   4%     1.4K    100%  │"
+"└─ sample explains 98% of dataset.bytes 14G · exact keys 7,920,000 · 64% with…─┘"
+"┌─ session:{uuid} ──────────────────────────────── string · 1.84M keys · 6.1G ─┐"
+"│ SAMPLE KEYS              SIZE   TTL      SIZE DISTRIBUTION                   │"
+"│ session:c41f0e9a-2d6b…    41K   23h 12m  p50 3.1K   p99 9.8K   max 41K       │"
+"│ session:7a2d9b14-6e0c…   3.4K   16h 40m  avg 3.5K   sampled 23,232 keys      │"
+"│ session:9f1c2a7e-4b3d…   3.2K   11h 04m  TTL REMAINING                       │"
+"│ session:03be77d1-91aa…   2.9K   2h 51m   none <1m  <1h  <1d  <7d  <30d >30d  │"
+"│ session:e8b03c5d-7f21…   2.7K   47m 00s  ·    ▁▁▁  ▄▄▄  ███  ·    ·    ·     │"
+"│ ✓ No TTL or size problems in the sample.                                     │"
+"│ $ redis-cli --scan --pattern "session:*"                                     │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" ↑↓ Move   →← Fold   / Filter   o Sort   s Snapshot   0-4 View   ? Help   q Quit"

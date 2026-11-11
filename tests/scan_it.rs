@@ -5,9 +5,10 @@ mod common;
 
 use redis::AsyncCommands;
 use redis_lens::model::{
-    KeyType, PERM_FREQ, PERM_INFO, PERM_MEMORY, PERM_SCAN, PERM_TYPE_TTL, PermCheck, PermStatus,
-    PermissionReport, ScanReport,
+    ContextGap, KeyType, PERM_FREQ, PERM_INFO, PERM_MEMORY, PERM_MEMORY_STATS, PERM_SCAN,
+    PERM_TYPE_TTL, PermCheck, PermStatus, PermissionReport, ScanReport, ServerFlavor,
 };
+use redis_lens::scan::context::context_summary;
 use redis_lens::scan::{ScanOptions, sample_keys, scan};
 
 fn perms(denied: &[&str]) -> PermissionReport {
@@ -362,4 +363,212 @@ async fn empty_db_progress_target_redis() {
 #[tokio::test]
 async fn empty_db_progress_target_valkey() {
     empty_progress(common::valkey().await).await;
+}
+
+// ---------------------------------------------------------------------------
+// Server context: INFO keyspace, INFO keysizes, MEMORY STATS
+// ---------------------------------------------------------------------------
+
+/// Whether this server has `INFO keysizes`: Redis 8 and later. Only the test looks at
+/// the version; the scanner detects the section by its presence.
+fn has_keysizes(r: &ScanReport) -> bool {
+    r.server.flavor == ServerFlavor::Redis
+        && r.server
+            .version
+            .split('.')
+            .next()
+            .and_then(|m| m.parse::<u32>().ok())
+            .is_some_and(|m| m >= 8)
+}
+
+async fn server_context(server: common::TestServer) {
+    let mut conn = server.admin().await;
+    seed(&mut conn).await;
+    let report = scan("t", &mut conn, &ScanOptions::default(), &perms(&[]), None)
+        .await
+        .unwrap();
+    let ctx = report.server_context.clone().expect("a server context");
+    let ks = ctx.keyspace.expect("INFO keyspace");
+    assert_eq!(ks.db, 0);
+    assert_eq!(ks.keys, 501);
+    // 200 of the 300 carts and all 200 sessions expire.
+    assert_eq!(ks.expires, 400);
+    // avg_ttl is estimated by the server's expire cycle, so it can still be 0 here.
+    let version = &report.server.version;
+    let field_ttl = report.server.flavor == ServerFlavor::Redis && !version.starts_with("6.");
+    assert_eq!(ks.subexpiry.is_some(), field_ttl, "{version}: {ks:?}");
+
+    let m = ctx.memory.expect("MEMORY STATS");
+    assert!(m.dataset_bytes.is_some_and(|b| b > 0), "{m:?}");
+    assert!(m.overhead_total.is_some(), "{m:?}");
+    assert!(m.fragmentation.is_some(), "{m:?}");
+    assert_eq!(m.keys_count, Some(501));
+
+    if has_keysizes(&report) {
+        let h = ctx.keysizes.as_ref().expect("INFO keysizes on Redis 8");
+        let count = |t: &str| -> u64 {
+            h.iter()
+                .filter(|x| x.key_type == t)
+                .flat_map(|x| &x.bins)
+                .map(|(_, n)| n)
+                .sum()
+        };
+        assert_eq!(count("strings"), 200);
+        assert_eq!(count("hashes"), 300);
+        assert_eq!(count("lists"), 1);
+        assert!(!ctx.missing.contains(&ContextGap::NoKeysizes));
+    } else {
+        assert_eq!(ctx.keysizes, None, "{version}");
+        assert!(ctx.missing.contains(&ContextGap::NoKeysizes));
+    }
+    assert!(!ctx.missing.contains(&ContextGap::MemoryStatsDenied));
+
+    let lines = context_summary(&report);
+    assert!(
+        lines[0].starts_with("The sample explains "),
+        "{version}: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("Keys in db0 (INFO keyspace, exact): 501 · 400 with a TTL")),
+        "{lines:?}"
+    );
+    // A complete scan of these keys agrees with the histogram: no bias warning.
+    assert!(!lines.iter().any(|l| l.starts_with('▲')), "{lines:?}");
+}
+
+#[tokio::test]
+async fn server_context_redis() {
+    server_context(common::redis().await).await;
+}
+
+#[tokio::test]
+async fn server_context_valkey() {
+    server_context(common::valkey().await).await;
+}
+
+/// The scanned database's line, not db0's.
+async fn server_context_other_db(server: common::TestServer) {
+    let mut admin = server.admin().await;
+    let _: () = redis::cmd("SET")
+        .arg("in-db0")
+        .arg(1)
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    let mut conn = redis::Client::open(format!("redis://127.0.0.1:{}/3", server.port))
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    for i in 0..7 {
+        let _: () = conn.set_ex(format!("k:{i}"), "v", 100).await.unwrap();
+    }
+    let opts = ScanOptions {
+        db: 3,
+        ..ScanOptions::default()
+    };
+    let report = scan("t", &mut conn, &opts, &perms(&[]), None)
+        .await
+        .unwrap();
+    let ks = report.server_context.unwrap().keyspace.unwrap();
+    assert_eq!((ks.db, ks.keys, ks.expires), (3, 7, 7));
+}
+
+#[tokio::test]
+async fn server_context_other_db_redis() {
+    server_context_other_db(common::redis().await).await;
+}
+
+#[tokio::test]
+async fn server_context_other_db_valkey() {
+    server_context_other_db(common::valkey().await).await;
+}
+
+/// A user without `+memory|stats`: the permission check says so and the scan leaves
+/// MEMORY STATS out, without sending it. A caller with no MEMORY STATS check tries it
+/// and takes the NOPERM as the same gap.
+async fn memory_stats_denied(server: &common::TestServer) {
+    let mut admin = server.admin().await;
+    seed(&mut admin).await;
+    let mut conn = redis::Client::open(format!("redis://lim:pw@127.0.0.1:{}", server.port))
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let probed = redis_lens::conn::check_permissions(&mut conn).await;
+    let stats = probed
+        .checks
+        .iter()
+        .find(|c| c.label == PERM_MEMORY_STATS)
+        .unwrap();
+    assert!(
+        matches!(&stats.status, PermStatus::Denied(m) if m.starts_with("NOPERM")),
+        "{stats:?}"
+    );
+    for p in [probed, perms(&[])] {
+        let report = scan("t", &mut conn, &ScanOptions::default(), &p, None)
+            .await
+            .expect("a denied MEMORY STATS must not fail the scan");
+        assert_eq!(report.sampled_keys, 501);
+        assert!(report.sizes_available);
+        let ctx = report.server_context.clone().unwrap();
+        assert_eq!(ctx.memory, None);
+        assert!(
+            ctx.missing.contains(&ContextGap::MemoryStatsDenied),
+            "{:?}",
+            ctx.missing
+        );
+        assert_eq!(ctx.keyspace.map(|k| k.keys), Some(501));
+        assert!(
+            context_summary(&report)
+                .iter()
+                .any(|l| l.starts_with("MEMORY STATS is denied")),
+            "{:?}",
+            context_summary(&report)
+        );
+    }
+}
+
+/// Everything a scan needs but `+memory|stats`. An allow-list, because Redis 6.2 can't
+/// take a subcommand away (`-memory|stats`).
+const NO_STATS_RULES: [&str; 19] = [
+    "lim",
+    "on",
+    ">pw",
+    "~*",
+    "-@all",
+    "+ping",
+    "+hello",
+    "+client|setinfo",
+    "+client|setname",
+    "+select",
+    "+info",
+    "+dbsize",
+    "+scan",
+    "+type",
+    "+ttl",
+    "+pttl",
+    "+memory|usage",
+    "+object|freq",
+    "+auth",
+];
+
+#[tokio::test]
+async fn memory_stats_denied_redis() {
+    let mut args = vec!["--user"];
+    args.extend(NO_STATS_RULES);
+    let server = common::redis_with(&args).await;
+    memory_stats_denied(&server).await;
+}
+
+#[tokio::test]
+async fn memory_stats_denied_valkey() {
+    let server = common::valkey().await;
+    let mut admin = server.admin().await;
+    let mut setuser = redis::cmd("ACL");
+    setuser.arg("SETUSER").arg(&NO_STATS_RULES[..]);
+    let _: () = setuser.query_async(&mut admin).await.unwrap();
+    memory_stats_denied(&server).await;
 }
