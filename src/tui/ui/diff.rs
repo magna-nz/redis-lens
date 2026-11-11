@@ -1,4 +1,5 @@
-//! View 3: the current scan against the previous snapshot of the same profile.
+//! View 3: the current scan against the previous snapshot of the same profile, with a
+//! trend column over the earlier snapshots when there are enough of them.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -7,7 +8,7 @@ use ratatui::text::{Line, Span};
 
 use crate::diff::{Cause, PatternDiff, ReportDiff};
 use crate::format;
-use crate::snapshot::format_utc;
+use crate::snapshot::{PatternTrend, Trend, TrendMetric, format_utc};
 use crate::tui::app::{App, History};
 
 use super::delta::{Change, cause_words, ratio_change, signed_bytes, signed_percent};
@@ -22,8 +23,15 @@ const BAR_W: usize = HALF * 2 + 1 + 3;
 /// Wide enough for `smaller values`.
 const WHY_W: usize = 14;
 
-fn name_width(inner: usize) -> usize {
-    let fixed = (NUM_W + 2) * 3 + PCT_W + 2 + BAR_W + WHY_W;
+/// The trend column's width for `trend`, 0 without one: a cell per point, at least as
+/// wide as its heading.
+fn trend_width(trend: Option<&Trend>) -> usize {
+    trend.map_or(0, |t| t.points.len().max("TREND".len()))
+}
+
+fn name_width(inner: usize, trend_w: usize) -> usize {
+    let trend = if trend_w > 0 { trend_w + 2 } else { 0 };
+    let fixed = (NUM_W + 2) * 3 + PCT_W + 2 + trend + BAR_W + WHY_W;
     inner.saturating_sub(fixed).max(12)
 }
 
@@ -105,19 +113,30 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, d: &ReportDiff) {
     let (main, detail) = split_body(area);
     let sel = app.sel.diff.min(d.patterns.len() - 1);
     let inner = panel(frame, main, "Diff", &mark_previous(app, &header(d)));
-    let name = name_width(usize::from(inner.width));
-    let head = Line::from(vec![
+    let trend = app.trend();
+    let trend_w = trend_width(trend);
+    let name = name_width(usize::from(inner.width), trend_w);
+    let mut head = vec![
         Span::styled(pad_r(" PATTERN", name), style::hd()),
         Span::styled(format!("{}  ", pad_l("BEFORE", NUM_W)), style::hd()),
         Span::styled(format!("{}  ", pad_l("NOW", NUM_W)), style::hd()),
         Span::styled(format!("{}  ", pad_l("Δ", NUM_W)), style::hd()),
         Span::styled(format!("{}  ", pad_l("Δ%", PCT_W)), style::hd()),
+    ];
+    if trend.is_some() {
+        head.push(Span::styled(
+            format!("{}  ", pad_r("TREND", trend_w)),
+            style::hd(),
+        ));
+    }
+    head.extend([
         Span::styled(
             pad_r(&format!("{} grew", pad_l("shrank", HALF)), BAR_W),
             style::hd(),
         ),
         Span::styled("WHY", style::hd()),
     ]);
+    let head = Line::from(head);
     rows(frame, inner, vec![head], None);
     let body = Rect {
         y: inner.y + 1,
@@ -137,10 +156,28 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, d: &ReportDiff) {
         .skip(off)
         .take(usize::from(body.height))
         .enumerate()
-        .map(|(i, p)| diff_row(p, max, name, (off + i == sel).then(|| app.sel_ticks())))
+        .map(|(i, p)| {
+            let spark = trend.map(|t| (sparkline_for(t, &p.pattern), trend_w));
+            diff_row(
+                p,
+                max,
+                name,
+                spark,
+                (off + i == sel).then(|| app.sel_ticks()),
+            )
+        })
         .collect();
     rows(frame, body, lines, Some(sel - off));
-    detail_panel(frame, detail, &d.patterns[sel]);
+    detail_panel(frame, detail, &d.patterns[sel], trend);
+}
+
+/// The pattern's sparkline over the trend's points, all gaps when it is in none of
+/// them (only possible for a pattern gone from the current scan and every snapshot).
+fn sparkline_for(t: &Trend, pattern: &str) -> String {
+    match t.pattern(pattern) {
+        Some(p) => format::sparkline(&p.values),
+        None => format::sparkline(&vec![None; t.points.len()]),
+    }
 }
 
 /// Formats a byte or key figure.
@@ -174,7 +211,14 @@ fn grew_style(c: Change) -> Style {
     }
 }
 
-fn diff_row(p: &PatternDiff, max: u64, name: usize, scroll: Option<u64>) -> Line<'static> {
+/// One row. `spark` is the trend cell and the column's width, when there is a trend.
+fn diff_row(
+    p: &PatternDiff,
+    max: u64,
+    name: usize,
+    spark: Option<(String, usize)>,
+    scroll: Option<u64>,
+) -> Line<'static> {
     let dash = || "—".to_string();
     let c = Change::of(p);
     let (before, after, fmt) = sides(p);
@@ -210,6 +254,11 @@ fn diff_row(p: &PatternDiff, max: u64, name: usize, scroll: Option<u64>) -> Line
             format!("{}  ", pad_l(&percent_text(p, before, after), PCT_W)),
             c.style(),
         ),
+    ]);
+    if let Some((cells, w)) = spark {
+        spans.push(Span::styled(format!("{}  ", pad_r(&cells, w)), style::fg()));
+    }
+    spans.extend([
         Span::raw(" ".repeat(HALF - neg)),
         Span::styled("█".repeat(neg), style::ok()),
         Span::styled("│", style::border()),
@@ -286,7 +335,52 @@ fn cause_sentence(p: &PatternDiff) -> (&'static str, Style) {
     (text, st)
 }
 
-fn detail_panel(frame: &mut Frame, area: Rect, p: &PatternDiff) {
+/// Growth of at least this share a day, either way, is coloured in the trend line.
+const NOTABLE_GROWTH: f64 = 0.005;
+
+/// The detail panel's trend line: the sparkline and the least-squares growth a day.
+fn trend_line(t: &Trend, pattern: &str) -> Line<'static> {
+    let fmt: fn(u64) -> String = match t.metric {
+        TrendMetric::Bytes => format::bytes,
+        TrendMetric::Keys => format::count,
+    };
+    let scans = t.points.len();
+    let partial = t.partial_points();
+    let over = match partial {
+        0 => format!("over {scans} scans"),
+        n if n == scans => format!("over {scans} scans, all partial"),
+        n => format!("over {scans} scans, {n} partial"),
+    };
+    let pt: Option<&PatternTrend> = t.pattern(pattern);
+    let (text, st) = match pt.and_then(|p| p.growth) {
+        Some(g) => {
+            let abs = format::signed_with(g.per_day, fmt);
+            let pct = g.ratio_per_day.map(format::signed_percent1);
+            let text = match pct {
+                Some(p) if p == "0.0%" => format!("flat {over}"),
+                Some(p) => format!("{p} a day ({abs} a day) {over}"),
+                None => format!("{abs} a day {over}"),
+            };
+            let st = match g.ratio_per_day {
+                Some(r) if r >= NOTABLE_GROWTH => style::amber(),
+                Some(r) if r <= -NOTABLE_GROWTH => style::ok(),
+                _ => style::dim(),
+            };
+            (text, st)
+        }
+        None => (
+            format!("too few scans with this pattern for a growth rate ({over})"),
+            style::dim(),
+        ),
+    };
+    Line::from(vec![
+        Span::styled(pad_r(" trend", 16), style::dim()),
+        Span::styled(format!("{}  ", sparkline_for(t, pattern)), style::fg()),
+        Span::styled(text, st),
+    ])
+}
+
+fn detail_panel(frame: &mut Frame, area: Rect, p: &PatternDiff, trend: Option<&Trend>) {
     let c = Change::of(p);
     let right = format!("{} since the snapshot", c.text());
     let inner = panel(frame, area, &p.pattern, &right);
@@ -317,17 +411,35 @@ fn detail_panel(frame: &mut Frame, area: Rect, p: &PatternDiff) {
             format::bytes,
             sizes,
         ),
+    ];
+    let spacer = if let Some(t) = trend {
+        lines.push(Line::from(fit(
+            trend_line(t, &p.pattern).spans,
+            usize::from(inner.width),
+        )));
+        Some(lines.len())
+    } else {
+        None
+    };
+    lines.extend([
         Line::default(),
         Line::from(fit(
             vec![Span::styled(format!(" {sentence}"), st)],
             usize::from(inner.width),
         )),
-    ];
+    ]);
     if !sizes {
         lines.push(Line::from(Span::styled(
             " Sizes unavailable: one of the scans could not run MEMORY USAGE.",
             style::dim(),
         )));
+    }
+    // The trend line takes a row: give up the blank one before the sentence rather than
+    // the last line, when the panel is too short for both.
+    if let Some(i) = spacer
+        && lines.len() > usize::from(inner.height)
+    {
+        lines.remove(i);
     }
     rows(frame, inner, lines, None);
 }

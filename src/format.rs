@@ -1,4 +1,5 @@
-//! Human-readable numbers shared by the TUI and the `scan` command.
+//! Human-readable numbers shared by the TUI and the commands: sizes, counts, durations,
+//! percentages, ratios and sparklines.
 
 use std::time::Duration;
 
@@ -98,6 +99,83 @@ pub fn glob(pattern: &str) -> String {
     out
 }
 
+/// The block characters of a sparkline, lowest first.
+pub const SPARK_LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// A sparkline cell for a missing point (a pattern not in that snapshot).
+pub const SPARK_GAP: char = '·';
+
+/// One character per value, scaled from the smallest to the largest present value: `▁`
+/// for the smallest, `█` for the largest, `·` for a gap. When every present value is the
+/// same the line is flat at `▄`. Scaling from the minimum rather than from zero makes a
+/// slow, steady leak visible; the growth rate says how big it is.
+pub fn sparkline(values: &[Option<u64>]) -> String {
+    let present = values.iter().flatten();
+    let (Some(&min), Some(&max)) = (present.clone().min(), present.max()) else {
+        return values.iter().map(|_| SPARK_GAP).collect();
+    };
+    values
+        .iter()
+        .map(|v| match v {
+            None => SPARK_GAP,
+            Some(_) if max == min => SPARK_LEVELS[3],
+            Some(v) => {
+                let r = (v - min) as f64 / (max - min) as f64;
+                SPARK_LEVELS[((r * 7.0).round() as usize).min(7)]
+            }
+        })
+        .collect()
+}
+
+/// A signed percentage for small rates: `+2.1%`, `-0.4%`, `0.0%`, and whole numbers from
+/// 10% up: `+12%`. `ratio` is a fraction (0.021 is 2.1%).
+pub fn signed_percent1(ratio: f64) -> String {
+    let pct = ratio * 100.0;
+    let text = if pct.abs() >= 9.95 {
+        format!("{}%", pct.abs().round())
+    } else {
+        format!("{:.1}%", pct.abs())
+    };
+    if text == "0.0%" {
+        text
+    } else if pct > 0.0 {
+        format!("+{text}")
+    } else {
+        format!("-{text}")
+    }
+}
+
+/// `n` formatted by `fmt` with its sign: `+94M`, `-1.2K`, `0B`. Rounds to whole units
+/// first, so it suits rates such as bytes per day.
+pub fn signed_with(n: f64, fmt: impl Fn(u64) -> String) -> String {
+    let r = n.round();
+    if r == 0.0 || !r.is_finite() {
+        return fmt(0);
+    }
+    // `as u64` saturates, so huge rates stay finite text.
+    let text = fmt(r.abs() as u64);
+    if r > 0.0 {
+        format!("+{text}")
+    } else {
+        format!("-{text}")
+    }
+}
+
+/// A ratio such as right / left: `×1.00`, `×0.12`, `×12.5`, `×340`, `×<0.01`.
+pub fn ratio(r: f64) -> String {
+    if !r.is_finite() {
+        return "—".to_string();
+    }
+    if r > 0.0 && r < 0.005 {
+        "×<0.01".to_string()
+    } else if r < 9.995 {
+        format!("×{r:.2}")
+    } else if r < 99.95 {
+        format!("×{r:.1}")
+    } else {
+        format!("×{}", r.round() as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +249,56 @@ mod tests {
         assert_eq!(glob("user:{id}:cart"), "user:*:cart");
         assert_eq!(glob("rl:{ip}:{id}"), "rl:*:*");
         assert_eq!(glob("queue:emails"), "queue:emails");
+    }
+    #[test]
+    fn sparkline_shapes() {
+        // Empty, one point, flat, rising, gaps.
+        assert_eq!(sparkline(&[]), "");
+        assert_eq!(sparkline(&[Some(5)]), "▄");
+        assert_eq!(sparkline(&[Some(7), Some(7), Some(7)]), "▄▄▄");
+        assert_eq!(sparkline(&[Some(0), Some(0)]), "▄▄");
+        assert_eq!(sparkline(&(0..8).map(Some).collect::<Vec<_>>()), "▁▂▃▄▅▆▇█");
+        assert_eq!(sparkline(&[Some(10), None, Some(20)]), "▁·█");
+        assert_eq!(sparkline(&[None, None]), "··");
+        assert_eq!(sparkline(&[None, Some(3), None]), "·▄·");
+        assert_eq!(sparkline(&[Some(30), Some(20), Some(10)]), "█▅▁");
+        // Huge values don't overflow.
+        assert_eq!(sparkline(&[Some(0), Some(u64::MAX)]), "▁█");
+        assert_eq!(sparkline(&[Some(u64::MAX), Some(u64::MAX)]), "▄▄");
+    }
+
+    #[test]
+    fn small_signed_percentages() {
+        assert_eq!(signed_percent1(0.021), "+2.1%");
+        assert_eq!(signed_percent1(-0.004), "-0.4%");
+        assert_eq!(signed_percent1(0.0), "0.0%");
+        assert_eq!(signed_percent1(0.0001), "0.0%");
+        assert_eq!(signed_percent1(-0.0001), "0.0%");
+        assert_eq!(signed_percent1(0.12), "+12%");
+        assert_eq!(signed_percent1(-1.5), "-150%");
+        assert_eq!(signed_percent1(0.0996), "+10%");
+    }
+
+    #[test]
+    fn signed_rates() {
+        assert_eq!(signed_with(98_566_144.0, bytes), "+94M");
+        assert_eq!(signed_with(-1_234.0, count), "-1.2K");
+        assert_eq!(signed_with(0.4, bytes), "0B");
+        assert_eq!(signed_with(-0.4, count), "0");
+        assert_eq!(signed_with(f64::NAN, count), "0");
+        assert!(signed_with(1e30, bytes).starts_with('+'));
+    }
+
+    #[test]
+    fn ratios() {
+        assert_eq!(ratio(1.0), "×1.00");
+        assert_eq!(ratio(0.123), "×0.12");
+        assert_eq!(ratio(12.46), "×12.5");
+        assert_eq!(ratio(340.2), "×340");
+        assert_eq!(ratio(0.001), "×<0.01");
+        assert_eq!(ratio(0.0), "×0.00");
+        assert_eq!(ratio(9.999), "×10.0");
+        assert_eq!(ratio(f64::INFINITY), "—");
+        assert_eq!(ratio(f64::NAN), "—");
     }
 }

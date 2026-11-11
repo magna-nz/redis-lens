@@ -18,6 +18,7 @@ use crate::model::{
 };
 use crate::pattern::pattern_for_key;
 use crate::scan::{PartialPatterns, ScanProgress};
+use crate::snapshot::Trend;
 use crate::verdict::ttl_verdict;
 
 use super::clipboard::{self, CopyText};
@@ -155,7 +156,8 @@ pub enum Effect {
         profile: Profile,
         credentials: Option<Credentials>,
     },
-    /// Find the newest snapshot taken before `report` and diff it against `report`.
+    /// Find the newest snapshot taken before `report` and diff it against `report`
+    /// ([`Msg::History`]), then load the trend over the snapshots before it ([`Msg::Trend`]).
     LoadHistory {
         id: ConnId,
         scan: ScanId,
@@ -221,6 +223,16 @@ pub enum Msg {
         taken_at_unix: i64,
         result: Result<Option<ReportDiff>, String>,
     },
+    /// The trend over the [`TREND_SNAPSHOTS`] newest snapshots taken before the scan at
+    /// `taken_at_unix` with its `MATCH` glob, with that scan as the last point. `None`
+    /// when they could not be read. Accepted exactly when the same scan's
+    /// [`Msg::History`] would be.
+    Trend {
+        id: ConnId,
+        scan: ScanId,
+        taken_at_unix: i64,
+        trend: Option<Trend>,
+    },
     SnapshotSaved(PathBuf),
     SnapshotFailed(String),
     /// Writing the OSC 52 sequence to the terminal failed.
@@ -266,6 +278,9 @@ pub struct Session {
     pub partial: Option<Arc<PartialPatterns>>,
     pub report: Option<ScanReport>,
     pub history: History,
+    /// The trend behind the Diff view's trend column, loaded with `history` and cleared
+    /// with it.
+    pub trend: Option<Trend>,
     /// `Some(run)` while `report` and `history` are those of `run`, an earlier run of
     /// this entry, kept on screen during a rescan until the new run's first partial
     /// results (or its report) replace them. They stay, still marked, when the rescan
@@ -283,7 +298,20 @@ impl Session {
             _ => None,
         }
     }
+
+    /// The trend for the Diff view's trend column: only with at least
+    /// [`TREND_MIN_POINTS`] points, since two are just the diff itself.
+    pub fn trend(&self) -> Option<&Trend> {
+        self.trend
+            .as_ref()
+            .filter(|t| t.points.len() >= TREND_MIN_POINTS)
+    }
 }
+
+/// How many earlier snapshots the Diff view's trend column loads, besides the scan.
+pub const TREND_SNAPSHOTS: usize = 7;
+/// The fewest points (the scan included) the Diff view shows a trend for.
+pub const TREND_MIN_POINTS: usize = 3;
 
 /// The patterns the Patterns view shows.
 #[derive(Debug, Clone, Copy)]
@@ -656,6 +684,11 @@ impl App {
 
     pub fn diff(&self) -> Option<&ReportDiff> {
         self.session.as_ref().and_then(|s| s.diff())
+    }
+
+    /// The trend for the Diff view, when there are enough snapshots for one.
+    pub fn trend(&self) -> Option<&Trend> {
+        self.session.as_ref().and_then(|s| s.trend())
     }
 
     /// Rows of the TTL view: indices into the report's patterns, most worrying verdict
@@ -1222,6 +1255,7 @@ impl App {
             partial: None,
             report: None,
             history: History::Pending,
+            trend: None,
             previous: None,
             rescan: false,
         });
@@ -1361,6 +1395,17 @@ impl App {
             .is_some_and(|s| s.id == id && s.scan == scan)
     }
 
+    /// True when a [`Msg::History`] or [`Msg::Trend`] of `id`'s run `scan` for the scan
+    /// taken at `taken_at_unix` belongs on screen: this run's, or that of the previous
+    /// run whose report is still kept, and for the report shown.
+    fn history_applies(&self, id: ConnId, scan: ScanId, taken_at_unix: i64) -> bool {
+        self.session.as_ref().is_some_and(|s| {
+            // This run's, or that of the previous run whose report is still kept.
+            let run = s.scan == scan || s.previous == Some(scan);
+            s.id == id && run && s.report.as_ref().map(|r| r.taken_at_unix) == Some(taken_at_unix)
+        })
+    }
+
     /// Apply a message. Returns follow-up work, e.g. loading history after a scan.
     pub fn apply(&mut self, msg: Msg) -> Vec<Effect> {
         let effects = self.apply_inner(msg);
@@ -1469,6 +1514,7 @@ impl App {
                         // The first results of a rescan replace the previous report.
                         s.report = None;
                         s.history = History::Pending;
+                        s.trend = None;
                     }
                     s.partial = Some(partial);
                 }
@@ -1499,6 +1545,7 @@ impl App {
                     s.partial = None;
                     s.report = Some(report);
                     s.history = History::Pending;
+                    s.trend = None;
                     s.previous = None;
                 }
                 self.rebuild_patterns(anchor);
@@ -1517,17 +1564,12 @@ impl App {
                 taken_at_unix,
                 result,
             } => {
+                if !self.history_applies(id, scan, taken_at_unix) {
+                    return Vec::new();
+                }
                 let Some(s) = self.session.as_mut() else {
                     return Vec::new();
                 };
-                // This run's, or that of the previous run whose report is still kept.
-                let run = s.scan == scan || s.previous == Some(scan);
-                if s.id != id
-                    || !run
-                    || s.report.as_ref().map(|r| r.taken_at_unix) != Some(taken_at_unix)
-                {
-                    return Vec::new();
-                }
                 let rescan = s.rescan;
                 match result {
                     Ok(Some(d)) => s.history = History::Diff(d),
@@ -1544,6 +1586,19 @@ impl App {
                 } else {
                     0
                 };
+            }
+            Msg::Trend {
+                id,
+                scan,
+                taken_at_unix,
+                trend,
+            } => {
+                if !self.history_applies(id, scan, taken_at_unix) {
+                    return Vec::new();
+                }
+                if let Some(s) = self.session.as_mut() {
+                    s.trend = trend;
+                }
             }
             Msg::SnapshotSaved(path) => {
                 let name = path.file_name().map_or_else(
@@ -3672,6 +3727,127 @@ mod tests {
             partial: fixtures::partial(false),
         });
         assert_eq!(app.session.as_ref().unwrap().partial, before);
+    }
+
+    fn trend_msg(id: ConnId, scan: ScanId, taken_at_unix: i64) -> Msg {
+        Msg::Trend {
+            id,
+            scan,
+            taken_at_unix,
+            trend: Some(fixtures::trend(true)),
+        }
+    }
+
+    #[test]
+    fn trend_is_kept_for_its_own_scan_only() {
+        let (mut app, id, report) = finished_with_history();
+        let s1 = scan_of(&app);
+        assert!(app.trend().is_none());
+        // Another entry, another run, or another scan time: ignored.
+        for msg in [
+            trend_msg(id + 100, s1, report.taken_at_unix),
+            trend_msg(id, s1 + 100, report.taken_at_unix),
+            trend_msg(id, s1, report.taken_at_unix - 1),
+        ] {
+            assert!(app.apply(msg).is_empty());
+            assert!(app.session.as_ref().unwrap().trend.is_none());
+        }
+        app.apply(trend_msg(id, s1, report.taken_at_unix));
+        assert_eq!(app.trend(), Some(&fixtures::trend(true)));
+        // A trend too short to show is stored but not offered to the view.
+        app.apply(Msg::Trend {
+            id,
+            scan: s1,
+            taken_at_unix: report.taken_at_unix,
+            trend: Some(fixtures::short_trend(true)),
+        });
+        assert!(app.session.as_ref().unwrap().trend.is_some());
+        assert!(app.trend().is_none());
+        // Unreadable snapshots: no trend.
+        app.apply(Msg::Trend {
+            id,
+            scan: s1,
+            taken_at_unix: report.taken_at_unix,
+            trend: None,
+        });
+        assert!(app.session.as_ref().unwrap().trend.is_none());
+    }
+
+    #[test]
+    fn replaced_run_of_the_same_entry_sends_no_trend() {
+        let (mut app, id, s1, s2) = reconnected_same_entry();
+        let at = fixtures::report(true).taken_at_unix;
+        assert!(app.apply(trend_msg(id, s1, at)).is_empty());
+        assert!(app.session.as_ref().unwrap().trend.is_none());
+        connected(&mut app, id, s2);
+        assert!(app.apply(trend_msg(id, s1, at)).is_empty());
+        assert!(app.session.as_ref().unwrap().trend.is_none());
+        app.apply(Msg::ScanDone {
+            id,
+            scan: s2,
+            report: fixtures::report(true),
+        });
+        // A late trend of s1 for the same scan time stays out; s2's gets in.
+        app.apply(trend_msg(id, s1, at));
+        assert!(app.session.as_ref().unwrap().trend.is_none());
+        app.apply(trend_msg(id, s2, at));
+        assert_eq!(app.trend(), Some(&fixtures::trend(true)));
+    }
+
+    #[test]
+    fn rescan_keeps_the_trend_with_the_old_report_until_it_is_replaced() {
+        let (mut app, id, report) = finished_with_history();
+        let s1 = scan_of(&app);
+        app.apply(trend_msg(id, s1, report.taken_at_unix));
+        let s2 = press_rescan(&mut app, id);
+        connected(&mut app, id, s2);
+        // The kept report keeps its trend, and s1's trend still applies to it.
+        assert_eq!(app.trend(), Some(&fixtures::trend(true)));
+        app.apply(Msg::Trend {
+            id,
+            scan: s1,
+            taken_at_unix: report.taken_at_unix,
+            trend: None,
+        });
+        assert!(app.trend().is_none());
+        app.apply(trend_msg(id, s1, report.taken_at_unix));
+        assert!(app.trend().is_some());
+        // The first partial replaces the old report, and its trend goes with it.
+        send_partial(&mut app, id, fixtures::partial(true));
+        assert!(app.session.as_ref().unwrap().trend.is_none());
+        app.apply(trend_msg(id, s1, report.taken_at_unix));
+        assert!(app.session.as_ref().unwrap().trend.is_none());
+        // The new report starts without one until its own arrives.
+        app.apply(Msg::ScanDone {
+            id,
+            scan: s2,
+            report: report.clone(),
+        });
+        assert!(app.session.as_ref().unwrap().trend.is_none());
+        app.apply(trend_msg(id, s2, report.taken_at_unix));
+        assert!(app.trend().is_some());
+    }
+
+    #[test]
+    fn rescan_without_partials_drops_the_old_trend() {
+        let (mut app, id, report) = finished_with_history();
+        let s1 = scan_of(&app);
+        app.apply(trend_msg(id, s1, report.taken_at_unix));
+        let s2 = press_rescan(&mut app, id);
+        connected(&mut app, id, s2);
+        let mut newer = report.clone();
+        newer.taken_at_unix += 60;
+        app.apply(Msg::ScanDone {
+            id,
+            scan: s2,
+            report: newer.clone(),
+        });
+        assert!(app.session.as_ref().unwrap().trend.is_none());
+        // s1's trend was for the old report's time.
+        app.apply(trend_msg(id, s1, report.taken_at_unix));
+        assert!(app.session.as_ref().unwrap().trend.is_none());
+        app.apply(trend_msg(id, s2, newer.taken_at_unix));
+        assert!(app.trend().is_some());
     }
 
     #[test]
