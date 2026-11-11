@@ -188,6 +188,9 @@ pub struct ConnAddArgs {
     /// through a shell.
     #[arg(last = true, value_name = "TOKEN_COMMAND")]
     pub token_command: Vec<String>,
+    /// Save a token command without asking first.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

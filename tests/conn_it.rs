@@ -307,6 +307,7 @@ async fn conn_add_keeps_credentials_out_of_the_config_file() {
         prefer_replica: false,
         provider: None,
         token_command: Vec::new(),
+        yes: false,
     };
     let msg = cli_conn::add(&path, &secrets, &args, Some("uniq-pw-4242\n".into()))
         .await

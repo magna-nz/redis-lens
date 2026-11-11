@@ -394,6 +394,7 @@ mod tests {
             prefer_replica: false,
             provider: None,
             token_command: Vec::new(),
+            yes: false,
         }
     }
 

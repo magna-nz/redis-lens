@@ -19,6 +19,7 @@ use crate::secrets::{SecretError, SecretStore};
 
 pub mod docker;
 pub mod parse;
+pub mod provider;
 mod tls;
 
 pub use parse::{AzureKind, ConnFormat, ParsedConnection, parse_connection_string};
