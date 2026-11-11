@@ -219,7 +219,12 @@ fn value_u64(v: &Value) -> Option<u64> {
 /// an array or map, or holds none of the fields.
 pub fn parse_memory_stats(v: &Value) -> Option<MemoryStats> {
     let pairs: Vec<(&Value, &Value)> = match v {
-        Value::Array(items) => items.chunks_exact(2).map(|c| (&c[0], &c[1])).collect(),
+        Value::Array(items) => items
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[k, v]| (k, v))
+            .collect(),
         Value::Map(items) => items.iter().map(|(k, v)| (k, v)).collect(),
         _ => return None,
     };
