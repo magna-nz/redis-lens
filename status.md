@@ -64,6 +64,8 @@ Integration branch `wave7/fixes` (worktree `.claude/worktrees/wave7`, from main 
 - Real keychain: `secrets::tests::keyring_store_round_trip` stays `#[ignore]`, because it needs a person to answer the keychain prompts. The timeout around it is tested with a blocking fake (`secrets::tests::with_timeout_*`).
 - Horizontal scrolling: not implemented (see Known issues); waiting for the owner.
 
+**Coverage (`make coverage`, unit + integration, 2026-11-11 at 208156d):** 93.48% of lines (wave 6: 92.6%). All tests pass: 291 unit, cli_config 4, conn 25, diff 4, os_trust 2 (skipped locally), replica 11, scan_cli 5, scan 15, smoke 3, tls 6; the integration tests also pass with `REDIS_LENS_IT_REDIS_IMAGE=redis:6.2-alpine`. Lowest: `cli/mod.rs` 59% (clap dispatch), `tui/mod.rs` 63% (terminal event loop; was 52%), `secrets.rs` 71% (the real keychain, an ignored test), `tui/ui/connections.rs` 82%.
+
 **Wave 6 follow-ups (from the verifier; N1, N4 and the test gaps are done in wave 7; N2 and N3 are later):**
 - N1: after reconnecting the same entry, a stale partial (or `ScanDone`) from the aborted scan can show for up to about 250 ms. The forwarder outlives the aborted scan and sends with the same `ConnId`. Fix: a per-scan id, or abort the forwarder from a drop guard (`tui/app.rs` ~1065, `tui/mod.rs` ~177/378).
 - N2 and N3 (UX): the Patterns selection is a row index, so it moves as partials re-sort and resets to 0 on `ScanDone`. A collapse is lost when a group's key changes.
