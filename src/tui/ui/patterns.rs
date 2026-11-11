@@ -6,7 +6,8 @@ use ratatui::text::{Line, Span};
 
 use crate::diff::ReportDiff;
 use crate::format;
-use crate::model::{PatternStats, TTL_BUCKET_LABELS, Ttl};
+use crate::model::{ContextGap, PatternStats, ScanReport, TTL_BUCKET_LABELS, Ttl};
+use crate::scan::context::{bias_warnings, big_keys_total, coverage};
 use crate::tui::app::{App, PatternData};
 use crate::tui::clipboard::{NO_COMMAND, suggested_command};
 use crate::tui::tree::{Root, Row, SortBy, Summary, Verdict, summarize, summarize_group};
@@ -47,6 +48,13 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             .collect()
     });
     table(frame, main, app, data, &summaries, changes.as_deref(), sel);
+    // The server context of a finished report (also one kept during a rescan), on the
+    // table's bottom border so it takes no list row.
+    if data.partial.is_none()
+        && let Some(report) = app.session.as_ref().and_then(|s| s.report.as_ref())
+    {
+        context_strip(frame, main, report);
+    }
     match summaries.get(sel) {
         Some((s, _, _)) => detail_panel(frame, detail, s, data.sizes_available),
         None => {
@@ -72,6 +80,112 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             );
         }
     }
+}
+
+/// The parts of the server context strip: a sampling-bias warning first (so a narrow
+/// strip cuts the rest), how much of `dataset.bytes` the sample explains, the exact key
+/// count and TTL share, big keys from `INFO keysizes`, and a missing `MEMORY STATS`.
+/// Empty without a server context.
+pub(super) fn context_parts(report: &ScanReport) -> Vec<Vec<Span<'static>>> {
+    let Some(ctx) = &report.server_context else {
+        return Vec::new();
+    };
+    let mut parts: Vec<Vec<Span<'static>>> = Vec::new();
+    if !bias_warnings(report).is_empty() {
+        parts.push(vec![Span::styled(
+            "▲ possible sampling bias (INFO keysizes disagrees)",
+            style::warn(),
+        )]);
+    }
+    if let Some((ratio, dataset)) = coverage(report) {
+        parts.push(vec![
+            Span::styled("sample explains ", style::dim()),
+            Span::styled(format::percent(ratio), style::fgb()),
+            Span::styled(
+                format!(" of dataset.bytes {}", format::bytes(dataset)),
+                style::dim(),
+            ),
+        ]);
+    } else if let Some(d) = ctx.memory.and_then(|m| m.dataset_bytes) {
+        parts.push(vec![
+            Span::styled("dataset.bytes ", style::dim()),
+            Span::styled(format::bytes(d), style::fg()),
+        ]);
+    }
+    if let Some(k) = &ctx.keyspace {
+        let mut spans = vec![
+            Span::styled("exact keys ", style::dim()),
+            Span::styled(format::grouped(k.keys), style::fg()),
+        ];
+        if k.keys > 0 {
+            spans.push(Span::styled(
+                format!(
+                    " · {} with TTL",
+                    format::percent(k.expires as f64 / k.keys as f64)
+                ),
+                style::dim(),
+            ));
+        }
+        parts.push(spans);
+    }
+    if let Some(h) = &ctx.keysizes {
+        let big = big_keys_total(h);
+        if big > 0 {
+            parts.push(vec![Span::styled(
+                format!(
+                    "{} big {} (INFO keysizes)",
+                    format::grouped(big),
+                    plural(big, "key", "keys")
+                ),
+                style::amber(),
+            )]);
+        }
+    }
+    for gap in &ctx.missing {
+        match gap {
+            ContextGap::MemoryStatsDenied => {
+                parts.push(vec![Span::styled("no MEMORY STATS: denied", style::dim())])
+            }
+            ContextGap::MemoryStatsUnavailable => parts.push(vec![Span::styled(
+                "no MEMORY STATS on this server",
+                style::dim(),
+            )]),
+            _ => {}
+        }
+    }
+    parts
+}
+
+/// [`context_parts`] on the bottom border of `area`, cut with `…` when narrow.
+fn context_strip(frame: &mut Frame, area: Rect, report: &ScanReport) {
+    let parts = context_parts(report);
+    if parts.is_empty() || area.height < 2 || area.width < 12 {
+        return;
+    }
+    let mut spans = vec![Span::styled(" ", style::border())];
+    for (i, p) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", style::dim()));
+        }
+        spans.extend(p);
+    }
+    spans.push(Span::styled(" ", style::border()));
+    // Two border cells on each side stay visible.
+    let room = usize::from(area.width) - 4;
+    let total: usize = spans.iter().map(|s| width(&s.content)).sum();
+    let w = total.min(room);
+    let spans = if total > room {
+        fit(spans, room)
+    } else {
+        spans
+    };
+    let strip = Rect {
+        x: area.x + 2,
+        y: area.y + area.height - 1,
+        width: w as u16,
+        height: 1,
+    };
+    frame.render_widget(Line::from(spans), strip);
 }
 
 /// The change since the snapshot for a row. Parent rows sum their children.

@@ -34,7 +34,7 @@ expression: t.backend()
 "│ Auth        password or ACL user                                       ✓ MEMORY USAGE                                │"
 "│ Credential  OS keychain                                                ✓ OBJECT FREQ                                 │"
 "│ TLS         on                                                         ✓ INFO                                        │"
-"│ Read-only   yes (production profile)                                                                                 │"
+"│ Read-only   yes (production profile)                                   – MEMORY STATS                                │"
 "│ ✓ Every permission check passed.                                                                                     │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 " ↑↓ Move   enter Connect   a Add   r Rescan Docker   0-4 View   ? Help   q Quit                                         "

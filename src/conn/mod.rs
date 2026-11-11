@@ -12,8 +12,8 @@ use redis::{
 use secrecy::ExposeSecret;
 
 use crate::model::{
-    Auth, Endpoint, PERM_FREQ, PERM_INFO, PERM_LABELS, PERM_MEMORY, PERM_SCAN, PERM_TYPE_TTL,
-    PermCheck, PermStatus, PermissionReport, Profile,
+    Auth, Endpoint, PERM_FREQ, PERM_INFO, PERM_LABELS, PERM_MEMORY, PERM_MEMORY_STATS, PERM_SCAN,
+    PERM_TYPE_TTL, PermCheck, PermStatus, PermissionReport, Profile,
 };
 use crate::secrets::{SecretError, SecretStore};
 
@@ -21,6 +21,7 @@ pub mod docker;
 pub mod parse;
 pub mod provider;
 mod tls;
+pub mod token;
 
 pub use parse::{AzureKind, ConnFormat, ParsedConnection, parse_connection_string};
 
@@ -34,6 +35,9 @@ pub enum ConnError {
     MissingCredentials(String),
     #[error("this build has no Entra ID support; rebuild with --features entra-id")]
     EntraUnsupported,
+    /// The token command gave no token. Never holds the token or the command's output.
+    #[error(transparent)]
+    Token(#[from] token::TokenError),
     #[error(transparent)]
     Redis(#[from] redis::RedisError),
     #[error("Docker: {0}")]
@@ -45,20 +49,41 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_KEY: &str = "redis-lens:probe";
 
 /// Open a connection for a profile, reading credentials from `secrets` when
-/// `profile.auth` is `Auth::Keychain`. Selects `profile.db`.
+/// `profile.auth` is `Auth::Keychain`, or running its token command for `Auth::Command`.
+/// Selects `profile.db`.
 ///
-/// Errors never contain the password: the server's `WRONGPASS` message does not echo it
-/// and `RedisConnectionInfo`'s `Debug` redacts it.
+/// Errors never contain the password or token: the server's `WRONGPASS` message does
+/// not echo it, `RedisConnectionInfo`'s `Debug` redacts it, and a failed token command
+/// is reported by program and exit status only.
 pub async fn connect(
     profile: &Profile,
     secrets: &dyn SecretStore,
 ) -> Result<MultiplexedConnection, ConnError> {
-    let auth = ResolvedAuth::new(profile, secrets)?;
+    let auth = ResolvedAuth::new(profile, secrets).await?;
     auth.open(&profile.endpoint).await
 }
 
+/// Run the profile's token command (see [`token`]) on a blocking thread and return the
+/// token. Runs again on every call: tokens are short-lived and never stored.
+async fn token_for(profile: &Profile) -> Result<secrecy::SecretString, ConnError> {
+    let argv = profile.token_command.clone().unwrap_or_default();
+    match tokio::task::spawn_blocking(move || token::run_token_command(&argv)).await {
+        Ok(r) => Ok(r?),
+        Err(_) => Err(token::TokenError::Spawn {
+            program: profile
+                .token_command
+                .as_ref()
+                .and_then(|a| a.first().cloned())
+                .unwrap_or_default(),
+            reason: "the task running it failed".into(),
+        }
+        .into()),
+    }
+}
+
 /// A profile's credentials and connection settings, resolved once: one keychain read,
-/// or one Entra ID token provider, shared by every connection opened with it.
+/// one token command run, or one Entra ID token provider, shared by every connection
+/// opened with it.
 struct ResolvedAuth {
     /// Username, password and database.
     settings: RedisConnectionInfo,
@@ -69,7 +94,7 @@ struct ResolvedAuth {
 }
 
 impl ResolvedAuth {
-    fn new(profile: &Profile, secrets: &dyn SecretStore) -> Result<Self, ConnError> {
+    async fn new(profile: &Profile, secrets: &dyn SecretStore) -> Result<Self, ConnError> {
         let mut settings = RedisConnectionInfo::default().set_db(i64::from(profile.db));
         let mut config = base_config();
         let mut sends_credentials = false;
@@ -93,8 +118,18 @@ impl ResolvedAuth {
                 config = entra_config(config)?;
                 sends_credentials = true;
             }
-            // Contract stub for the quick-wins wave (agent C builds it).
-            Auth::Command => unimplemented!("token command auth"),
+            Auth::Command => {
+                // The username, if any, is in the keychain (rule 1); no entry means none.
+                // Read it before running the command, so the token is held for as short
+                // a time as possible.
+                let username = secrets.get(&profile.secret_ref())?.and_then(|c| c.username);
+                let token = token_for(profile).await?;
+                if let Some(user) = &username {
+                    settings = settings.set_username(user);
+                }
+                settings = settings.set_password(token.expose_secret());
+                sends_credentials = true;
+            }
         }
         Ok(Self {
             settings,
@@ -428,7 +463,7 @@ pub async fn connect_for_scan(
     profile: &Profile,
     secrets: &dyn SecretStore,
 ) -> Result<(MultiplexedConnection, ScanTarget), ConnError> {
-    let auth = ResolvedAuth::new(profile, secrets)?;
+    let auth = ResolvedAuth::new(profile, secrets).await?;
     let mut primary = auth.open(&profile.endpoint).await?;
     if !profile.prefer_replica {
         return Ok((primary, ScanTarget::Primary));
@@ -604,12 +639,18 @@ pub async fn check_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Permis
         }
     };
 
+    // MEMORY STATS: no key involved, so any error other than NOPERM (an unknown
+    // command on a managed service, say) is a denial with the server's reason.
+    let stats: Result<redis::Value, _> = redis::cmd("MEMORY").arg("STATS").query_async(conn).await;
+    let memory_stats = classify(stats.map(|_| ()), false);
+
     let mut statuses = [
         (PERM_SCAN, scan_status),
         (PERM_TYPE_TTL, type_ttl),
         (PERM_MEMORY, memory),
         (PERM_FREQ, freq),
         (PERM_INFO, info_status),
+        (PERM_MEMORY_STATS, memory_stats),
     ];
     let mut checks = Vec::with_capacity(PERM_LABELS.len());
     for label in PERM_LABELS {
@@ -791,6 +832,99 @@ mod tests {
             ScanTarget::PrimaryFallback("timed out".into()).to_string(),
             "primary (replica unreachable: timed out)"
         );
+    }
+
+    #[cfg(unix)]
+    fn command_profile(cmd: &[&str]) -> Profile {
+        Profile {
+            name: "tok".into(),
+            env: crate::model::Env::Prod,
+            endpoint: ep("cache.example", 6380, true),
+            db: 2,
+            auth: Auth::Command,
+            read_only: None,
+            prefer_replica: false,
+            provider: None,
+            token_command: Some(cmd.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    /// The token is sent as the password, with the keychain's username when there is
+    /// one, and appears nowhere else.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn token_command_is_run_at_every_resolve() {
+        use crate::model::Credentials;
+        use crate::secrets::MemoryStore;
+        let store = MemoryStore::default();
+        let p = command_profile(&["echo", "secret-token-123"]);
+        let auth = ResolvedAuth::new(&p, &store).await.unwrap();
+        assert!(auth.sends_credentials);
+        assert_eq!(auth.settings.username(), None);
+        assert_eq!(auth.settings.password(), Some("secret-token-123"));
+        assert_eq!(auth.settings.db(), 2);
+        assert!(!format!("{:?}", auth.settings).contains("secret-token-123"));
+
+        store
+            .set(
+                &p.secret_ref(),
+                &Credentials {
+                    username: Some("oid-1234".into()),
+                    password: secrecy::SecretString::from(String::new()),
+                },
+            )
+            .unwrap();
+        let auth = ResolvedAuth::new(&p, &store).await.unwrap();
+        assert_eq!(auth.settings.username(), Some("oid-1234"));
+        assert_eq!(auth.settings.password(), Some("secret-token-123"));
+
+        // Run again each time: a command whose output changes gives a new token.
+        let dir = std::env::temp_dir().join(format!("redis-lens-tok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("t");
+        std::fs::write(&file, "first\n").unwrap();
+        let cat = command_profile(&["cat", file.to_str().unwrap()]);
+        let empty = MemoryStore::default();
+        let a = ResolvedAuth::new(&cat, &empty).await.unwrap();
+        assert_eq!(a.settings.password(), Some("first"));
+        std::fs::write(&file, "second\n").unwrap();
+        let a = ResolvedAuth::new(&cat, &empty).await.unwrap();
+        assert_eq!(a.settings.password(), Some("second"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_token_command_never_shows_its_output() {
+        use crate::secrets::MemoryStore;
+        let store = MemoryStore::default();
+        let p = command_profile(&[
+            "/bin/sh",
+            "-c",
+            "echo secret-token-123; echo secret-err >&2; exit 7",
+        ]);
+        let Err(e) = ResolvedAuth::new(&p, &store).await else {
+            panic!("expected an error");
+        };
+        assert!(matches!(e, ConnError::Token(_)), "{e:?}");
+        for text in [e.to_string(), format!("{e:?}")] {
+            assert!(!text.contains("secret-token-123"), "{text}");
+            assert!(!text.contains("secret-err"), "{text}");
+        }
+        assert!(
+            e.to_string().contains("/bin/sh failed (exit status 7)"),
+            "{e}"
+        );
+        // Through `connect`, too, before any connection is tried.
+        let e = connect(&p, &store).await.unwrap_err();
+        assert!(matches!(e, ConnError::Token(_)), "{e:?}");
+        // No command saved at all.
+        let mut none = command_profile(&[]);
+        none.token_command = None;
+        let Err(e) = ResolvedAuth::new(&none, &store).await else {
+            panic!("expected an error");
+        };
+        assert!(e.to_string().contains("no token command"), "{e}");
     }
 
     #[test]
