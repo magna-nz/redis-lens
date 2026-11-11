@@ -36,7 +36,7 @@ fn timeout_message(account: &str) -> String {
     let secs = KEYCHAIN_TIMEOUT.as_secs();
     if cfg!(target_os = "macos") {
         format!(
-            "macOS is waiting for permission to read the keychain entry {account}. \
+            "macOS is waiting for permission to use the keychain entry {account}. \
              Click \"Always Allow\" in the dialog, then try again."
         )
     } else {
