@@ -179,25 +179,39 @@ fn collapse(patterns: &BTreeSet<String>) -> BTreeMap<String, String> {
 /// Patterns are sorted by `est_bytes` (None counts as 0), then `est_keys`, then name,
 /// largest first.
 pub fn aggregate(samples: &[KeySample], scale: f64) -> Vec<PatternStats> {
-    let mut by_pattern: BTreeMap<String, Vec<&KeySample>> = BTreeMap::new();
-    for s in samples {
+    let mut stats: Vec<PatternStats> = group_by_pattern(samples.iter(), |s| s.key.as_str())
+        .into_iter()
+        .map(|(pattern, group)| build_stats(pattern, group, scale))
+        .collect();
+    sort_stats(&mut stats);
+    stats
+}
+
+/// Group `items` by their key's final pattern: [`pattern_for_key`], then the `{var}`
+/// collapse over every pattern seen. Items keep their order inside each group.
+fn group_by_pattern<T>(
+    items: impl Iterator<Item = T>,
+    key: impl Fn(&T) -> &str,
+) -> BTreeMap<String, Vec<T>> {
+    let mut by_pattern: BTreeMap<String, Vec<T>> = BTreeMap::new();
+    for item in items {
         by_pattern
-            .entry(pattern_for_key(&s.key))
+            .entry(pattern_for_key(key(&item)))
             .or_default()
-            .push(s);
+            .push(item);
     }
     let names: BTreeSet<String> = by_pattern.keys().cloned().collect();
     let mapping = collapse(&names);
-    let mut merged: BTreeMap<String, Vec<&KeySample>> = BTreeMap::new();
+    let mut merged: BTreeMap<String, Vec<T>> = BTreeMap::new();
     for (old, group) in by_pattern {
         let new = mapping.get(&old).cloned().unwrap_or(old);
         merged.entry(new).or_default().extend(group);
     }
+    merged
+}
 
-    let mut stats: Vec<PatternStats> = merged
-        .into_iter()
-        .map(|(pattern, group)| build_stats(pattern, group, scale))
-        .collect();
+/// By `est_bytes` (None counts as 0), then `est_keys`, then name, largest first.
+fn sort_stats(stats: &mut [PatternStats]) {
     stats.sort_by(|a, b| {
         b.est_bytes
             .unwrap_or(0)
@@ -205,7 +219,66 @@ pub fn aggregate(samples: &[KeySample], scale: f64) -> Vec<PatternStats> {
             .then(b.est_keys.cmp(&a.est_keys))
             .then(a.pattern.cmp(&b.pattern))
     });
-    stats
+}
+
+/// Patterns over the samples of several nodes (the shards of a cluster), each node with
+/// its own `scale`. Returns the merged rows and each node's own rows, both sorted like
+/// [`aggregate`].
+///
+/// Patterns are inferred once, over the union of every node's keys, so the `{var}`
+/// collapse sees all of them and a key gets the same pattern in both views. Then:
+/// - a node's row is [`aggregate`]'s row for that node's samples of the pattern, with
+///   the node's own scale and `examples` left empty;
+/// - a merged row sums the node rows' `est_keys` and `est_bytes` (so the node rows
+///   always add up to it), and takes everything else from the combined samples as
+///   [`aggregate`] does: sampled counts, the TTL histogram and `no_ttl` (sums), the
+///   percentiles and maximum, the key type and the examples.
+///
+/// `scales` must have one entry per node; a missing entry counts as 1.0.
+pub fn aggregate_nodes(
+    nodes: &[&[KeySample]],
+    scales: &[f64],
+) -> (Vec<PatternStats>, Vec<Vec<PatternStats>>) {
+    // Each sample with the index of its node.
+    let tagged = nodes
+        .iter()
+        .enumerate()
+        .flat_map(|(i, samples)| samples.iter().map(move |s| (i, s)));
+    let groups = group_by_pattern(tagged, |(_, s)| s.key.as_str());
+
+    let mut merged = Vec::with_capacity(groups.len());
+    let mut per_node: Vec<Vec<PatternStats>> = vec![Vec::new(); nodes.len()];
+    for (pattern, group) in groups {
+        let mut by_node: Vec<Vec<&KeySample>> = vec![Vec::new(); nodes.len()];
+        for (i, s) in &group {
+            by_node[*i].push(*s);
+        }
+        let group: Vec<&KeySample> = group.into_iter().map(|(_, s)| s).collect();
+        let mut est_keys = 0u64;
+        let mut est_bytes: Option<u64> = None;
+        for (i, node_group) in by_node.into_iter().enumerate() {
+            if node_group.is_empty() {
+                continue;
+            }
+            let scale = scales.get(i).copied().unwrap_or(1.0);
+            let mut row = build_stats(pattern.clone(), node_group, scale);
+            row.examples.clear();
+            est_keys = est_keys.saturating_add(row.est_keys);
+            if let Some(b) = row.est_bytes {
+                est_bytes = Some(est_bytes.unwrap_or(0).saturating_add(b));
+            }
+            per_node[i].push(row);
+        }
+        let mut row = build_stats(pattern, group, 1.0);
+        row.est_keys = est_keys;
+        row.est_bytes = est_bytes;
+        merged.push(row);
+    }
+    sort_stats(&mut merged);
+    for rows in &mut per_node {
+        sort_stats(rows);
+    }
+    (merged, per_node)
 }
 
 fn build_stats(pattern: String, group: Vec<&KeySample>, scale: f64) -> PatternStats {
@@ -521,6 +594,119 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].pattern, "p:{var}:{var}:{id}");
         assert_eq!(out[0].sampled_keys, 400);
+    }
+
+    #[test]
+    fn one_node_is_the_standalone_aggregate() {
+        let mut samples = tenants(25);
+        samples.extend((1..=40u64).map(|n| {
+            sample(
+                &format!("user:{n}"),
+                KeyType::Hash,
+                Some(n * 3),
+                Ttl::Expires(Duration::from_secs(n * 100)),
+            )
+        }));
+        for scale in [1.0, 2.5, 13.7] {
+            let (merged, per_node) = aggregate_nodes(&[&samples], &[scale]);
+            assert_eq!(merged, aggregate(&samples, scale));
+            let mut no_examples = aggregate(&samples, scale);
+            for p in &mut no_examples {
+                p.examples.clear();
+            }
+            assert_eq!(per_node, vec![no_examples]);
+        }
+    }
+
+    #[test]
+    fn nodes_scale_on_their_own_and_collapse_together() {
+        // 12 tenants on each node: below the threshold alone, 24 together.
+        let a: Vec<KeySample> = (0..12)
+            .map(|i| s(&format!("cfg:t{i:02}x:flags"), Some(10)))
+            .collect();
+        let b: Vec<KeySample> = (12..24)
+            .map(|i| s(&format!("cfg:t{i:02}x:flags"), Some(30)))
+            .collect();
+        let (merged, per_node) = aggregate_nodes(&[&a, &b], &[10.0, 2.0]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].pattern, "cfg:{var}:flags");
+        assert_eq!(per_node[0][0].pattern, "cfg:{var}:flags");
+        assert_eq!(per_node[0][0].est_keys, 120);
+        assert_eq!(per_node[1][0].est_keys, 24);
+        assert_eq!(merged[0].est_keys, 144);
+        assert_eq!(per_node[0][0].est_bytes, Some(1_200));
+        assert_eq!(per_node[1][0].est_bytes, Some(720));
+        assert_eq!(merged[0].est_bytes, Some(1_920));
+        assert_eq!(merged[0].sampled_keys, 24);
+        assert_eq!(merged[0].sampled_bytes, Some(480));
+        // Percentiles over the combined samples, examples from both nodes.
+        assert_eq!(merged[0].size_p50, Some(10));
+        assert_eq!(merged[0].size_max, Some(30));
+        assert_eq!(merged[0].examples.len(), 5);
+        assert!(per_node.iter().flatten().all(|p| p.examples.is_empty()));
+        // A node without sizes adds keys but no bytes.
+        let c = vec![s("cfg:t99x:flags", None)];
+        let (merged, _) = aggregate_nodes(&[&a, &b, &c], &[1.0, 1.0, 7.0]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].est_keys, 31);
+        assert_eq!(merged[0].est_bytes, Some(480));
+        // No node with sizes: no bytes at all.
+        let (merged, _) = aggregate_nodes(&[&c], &[1.0]);
+        assert_eq!(merged[0].est_bytes, None);
+    }
+
+    fn node_samples() -> impl Strategy<Value = Vec<Vec<KeySample>>> {
+        let key = prop_oneof![
+            (0u32..500).prop_map(|n| format!("user:{n}")),
+            (0u32..40).prop_map(|n| format!("cfg:t{n}x:flags")),
+            "[a-c]{1,2}:[a-z]{1,3}",
+        ];
+        let one = (
+            key,
+            prop::option::of(0u64..5_000),
+            prop::option::of(0u64..100_000),
+        )
+            .prop_map(|(key, bytes, ttl)| KeySample {
+                key,
+                key_type: KeyType::String,
+                bytes,
+                ttl: ttl.map_or(Ttl::Persistent, |s| Ttl::Expires(Duration::from_secs(s))),
+                lfu_freq: None,
+                node: None,
+            });
+        prop::collection::vec(prop::collection::vec(one, 0..60), 1..5)
+    }
+
+    proptest! {
+        #[test]
+        fn node_rows_add_up_to_the_merged_rows(
+            nodes in node_samples(),
+            scales in prop::collection::vec(1.0f64..50.0, 5),
+        ) {
+            let views: Vec<&[KeySample]> = nodes.iter().map(Vec::as_slice).collect();
+            let (merged, per_node) = aggregate_nodes(&views, &scales);
+            let total: usize = nodes.iter().map(Vec::len).sum();
+            prop_assert_eq!(merged.iter().map(|p| p.sampled_keys).sum::<u64>(), total as u64);
+            for m in &merged {
+                let rows: Vec<&PatternStats> = per_node
+                    .iter()
+                    .filter_map(|rows| rows.iter().find(|p| p.pattern == m.pattern))
+                    .collect();
+                prop_assert_eq!(rows.iter().map(|p| p.sampled_keys).sum::<u64>(), m.sampled_keys);
+                prop_assert_eq!(rows.iter().map(|p| p.est_keys).sum::<u64>(), m.est_keys);
+                prop_assert_eq!(rows.iter().map(|p| p.no_ttl).sum::<u64>(), m.no_ttl);
+                let bytes: Option<u64> = rows.iter().filter_map(|p| p.est_bytes).reduce(|a, b| a + b);
+                prop_assert_eq!(bytes, m.est_bytes);
+                for b in 0..7 {
+                    prop_assert_eq!(rows.iter().map(|p| p.ttl_hist[b]).sum::<u64>(), m.ttl_hist[b]);
+                }
+            }
+            for rows in &per_node {
+                for p in rows {
+                    prop_assert!(merged.iter().any(|m| m.pattern == p.pattern));
+                }
+            }
+        }
     }
 
     proptest! {
