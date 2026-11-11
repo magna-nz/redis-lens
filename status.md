@@ -93,13 +93,13 @@ See the overnight table above.
 
 - **Replica scans (`--prefer-replica`) trust the announced address**, like Cluster and Sentinel clients do. A server that imitates a replica, since the replication ID isn't secret, can be scanned without credentials, and its data is filed under the profile. A profile that reaches prod through an SSH tunnel on 127.0.0.1 treats local services on the announced port as on the primary's host. A replica scanned without credentials runs as its default user. No TLS replica test yet.
 
-- **macOS keychain prompt after rebuilds.** Keychain entries are tied to the binary that wrote them. A rebuilt or upgraded binary has to ask macOS for access, and until someone answers the dialog, connecting hangs. Wave 5: add a README note (click "Always Allow") and a TUI hint when a keychain read takes more than 2 s.
+- **macOS keychain prompt after rebuilds.** Keychain entries are tied to the binary that wrote them. A rebuilt or upgraded binary has to ask macOS for access, and until someone answers the dialog, connecting hangs. Mitigated in wave 5: the README says to click "Always Allow", and the TUI shows a hint when a keychain read takes more than 2 s.
 
 - **Lesson:** never switch the main checkout's branch while an agent is reading it. Do all work in worktrees.
 
 - **`vhs` doesn't work here.** It drives headless Chromium, which produces no output, and turning off its browser sandbox was refused. Use `demo/record.py` with `agg` for GIFs instead.
 
-- **Scans of local servers are slow.** The default budget of 5,000 commands per second with 4 commands per key means 55K demo keys take about 45 s. Planned for wave 4: no limit by default for `Local` profiles, plus a `--max-rate` flag. Note that the demo's `rl:*` and `lock:*` keys expire after up to 30 minutes, so re-run `make demo-up` before recording.
+- The demo's `rl:*` and `lock:*` keys expire after up to 30 minutes, so re-run `make demo-up` before recording a GIF. (Local profiles scan with no rate limit since wave 4; `--max-rate` overrides it.)
 
 - Agent worktrees made by the harness branch from `main`, not the current branch, so create them by hand.
 - **Entra ID** is implemented behind `--features entra-id`, using redis-rs's `EntraIdCredentialsProvider::new_developer_tools()` (az login and other developer tools). It is untested against real Azure, and managed identity isn't covered yet.
