@@ -19,6 +19,7 @@ use crate::secrets::{SecretError, SecretStore};
 
 pub mod docker;
 pub mod parse;
+mod tls;
 
 pub use parse::{AzureKind, ConnFormat, ParsedConnection, parse_connection_string};
 
@@ -111,21 +112,25 @@ fn base_config() -> AsyncConnectionConfig {
         .set_response_timeout(Some(RESPONSE_TIMEOUT))
 }
 
+/// The address to connect to for `ep`. A TLS endpoint gets the process's trust roots
+/// (see [`tls`]) and keeps its host name, which the certificate is checked against even
+/// when a pinned resolver supplies the IP addresses. `roots` is only called for TLS, so
+/// a plain connection never loads the OS certificate store.
+fn connection_addr<'a>(ep: &Endpoint, roots: impl FnOnce() -> &'a tls::TlsRoots) -> ConnectionAddr {
+    if ep.tls {
+        roots().tls_addr(&ep.host, ep.port)
+    } else {
+        ConnectionAddr::Tcp(ep.host.clone(), ep.port)
+    }
+}
+
+/// Every connection, to a primary or a replica candidate, is opened here.
 async fn open(
     ep: &Endpoint,
     settings: RedisConnectionInfo,
     config: &AsyncConnectionConfig,
 ) -> Result<MultiplexedConnection, ConnError> {
-    let addr = if ep.tls {
-        ConnectionAddr::TcpTls {
-            host: ep.host.clone(),
-            port: ep.port,
-            insecure: false,
-            tls_params: None,
-        }
-    } else {
-        ConnectionAddr::Tcp(ep.host.clone(), ep.port)
-    };
+    let addr = connection_addr(ep, tls::tls_roots);
     let info = addr.into_connection_info()?.set_redis_settings(settings);
     let client = redis::Client::open(info)?;
     Ok(client
@@ -773,5 +778,73 @@ mod tests {
         ));
         assert_eq!(classify(Err(nokey), true), PermStatus::Allowed);
         assert_eq!(classify(Ok(()), false), PermStatus::Allowed);
+    }
+
+    fn ep(host: &str, port: u16, tls: bool) -> Endpoint {
+        Endpoint {
+            host: host.to_string(),
+            port,
+            tls,
+        }
+    }
+
+    fn test_roots() -> tls::TlsRoots {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let ca = params.self_signed(&key).unwrap().der().clone();
+        tls::TlsRoots::from_choice(tls::choose_roots(vec![ca], 0))
+    }
+
+    #[test]
+    fn plain_tcp_gets_no_tls_params_and_never_loads_the_roots() {
+        let addr = connection_addr(&ep("127.0.0.1", 6379, false), || {
+            panic!("the trust roots were loaded for a plain connection")
+        });
+        assert_eq!(addr, ConnectionAddr::Tcp("127.0.0.1".into(), 6379));
+    }
+
+    #[test]
+    fn tls_gets_the_shared_roots_and_verification_stays_on() {
+        let roots = test_roots();
+        let ConnectionAddr::TcpTls {
+            host,
+            port,
+            insecure,
+            tls_params: Some(params),
+        } = connection_addr(&ep("db.example", 6380, true), || &roots)
+        else {
+            panic!("expected TLS with the OS roots");
+        };
+        assert_eq!((host.as_str(), port, insecure), ("db.example", 6380, false));
+        assert!(format!("{params:?}").contains("root_cert_store: Some("));
+    }
+
+    /// A replica candidate is opened through the same [`connection_addr`] as the primary:
+    /// the same roots, and its own announced name for the certificate check (the pinned
+    /// resolver only supplies addresses).
+    #[test]
+    fn a_replica_candidate_gets_the_same_roots_and_its_announced_name() {
+        let roots = test_roots();
+        let params = |addr: ConnectionAddr| match addr {
+            ConnectionAddr::TcpTls {
+                host,
+                insecure: false,
+                tls_params: Some(p),
+                ..
+            } => (host, format!("{p:?}")),
+            other => panic!("unexpected {other:?}"),
+        };
+        let (primary_host, primary_roots) =
+            params(connection_addr(&ep("primary.example", 6380, true), || {
+                &roots
+            }));
+        let (replica_host, replica_roots) = params(connection_addr(
+            &ep("replica-1.example", 6380, true),
+            || &roots,
+        ));
+        assert_eq!(primary_host, "primary.example");
+        assert_eq!(replica_host, "replica-1.example");
+        assert_eq!(primary_roots, replica_roots);
     }
 }
