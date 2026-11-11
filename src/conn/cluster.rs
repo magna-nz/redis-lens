@@ -1586,7 +1586,16 @@ mod tests {
         let n = announced(Some("redis-1.internal"), Some("10.0.0.1"), Some(6379));
         assert_eq!(ep(&n, false), Ok("redis-1.internal:6379".into()));
         // `?`, empty and unspecified endpoints fall back to the IP.
-        for bad in ["?", "", "0.0.0.0", "::", "[::]", "bad host"] {
+        for bad in [
+            "?",
+            "",
+            "0.0.0.0",
+            "::",
+            "[::]",
+            "bad host",
+            "127.1",
+            "0x7f000001",
+        ] {
             let n = announced(Some(bad), Some("10.0.0.1"), Some(6379));
             assert_eq!(ep(&n, false), Ok("10.0.0.1:6379".into()), "{bad:?}");
             let n = announced(Some(bad), None, Some(6379));

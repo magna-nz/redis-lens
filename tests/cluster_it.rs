@@ -11,7 +11,8 @@ use redis_lens::conn::cluster::{
     ClusterTargets, REPLICA_FALLBACK_PREFIX, SHARDS_UNREADABLE, ScanTargets, connect_targets,
 };
 use redis_lens::model::{
-    Auth, Credentials, Endpoint, Env, NodeRole, NodeStatus, PERM_SCAN, Profile, ScanReport,
+    Auth, Credentials, Endpoint, Env, NodeRole, NodeStatus, PERM_MEMORY, PERM_SCAN, PERM_TYPE_TTL,
+    Profile, ScanReport,
 };
 use redis_lens::scan::ScanOptions;
 use redis_lens::scan::cluster::scan_cluster;
@@ -323,6 +324,31 @@ async fn stopped_node(valkey: bool) {
     }
 }
 
+/// Keys under one hash tag leave two shards empty. The one that doesn't own the probe
+/// key's slot answers `MOVED` to the permission probe, which must not turn sizes off.
+async fn empty_shards(valkey: bool) {
+    let c = cluster(valkey, false).await;
+    let tagged: Vec<(String, String)> = (0..300)
+        .map(|i| (format!("{{tag}}:item:{i}"), "x".repeat(20)))
+        .collect();
+    c.seed(&tagged).await;
+    let mut t = targets(&profile(c.seed_port()), &MemoryStore::default()).await;
+    let mut empty = 0;
+    for n in &t.nodes {
+        if dbsize(&c, n.endpoint.port).await == 0 {
+            empty += 1;
+        }
+    }
+    assert_eq!(empty, 2, "one hash tag fills one shard of three");
+    let perms = t.check_permissions().await;
+    assert!(perms.allowed(PERM_MEMORY), "{perms:?}");
+    assert!(perms.allowed(PERM_TYPE_TTL), "{perms:?}");
+    let r = scan(&mut t).await;
+    assert!(r.sizes_available, "an empty shard turned sizes off");
+    assert!(r.complete);
+    assert_eq!(r.sampled_keys, 300);
+}
+
 /// An ACL user denied `CLUSTER SHARDS` falls back to `CLUSTER SLOTS`; one denied both
 /// gets the seed alone, with a note.
 async fn acl_fallbacks(valkey: bool) {
@@ -424,4 +450,14 @@ async fn redis_acl_fallbacks() {
 #[tokio::test]
 async fn valkey_acl_fallbacks() {
     acl_fallbacks(true).await;
+}
+
+#[tokio::test]
+async fn redis_empty_shards() {
+    empty_shards(false).await;
+}
+
+#[tokio::test]
+async fn valkey_empty_shards() {
+    empty_shards(true).await;
 }

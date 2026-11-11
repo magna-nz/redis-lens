@@ -1070,6 +1070,38 @@ mod tests {
         assert_eq!(r.sampled_keys, 200);
     }
 
+    /// Sizes need every scanned node: one node denied `MEMORY USAGE` turns them off for
+    /// the cluster, while its own row says which node it was.
+    #[test]
+    fn one_node_without_memory_usage_turns_sizes_off() {
+        let mut servers = vec![
+            fake::Server::new(keys(&["user"], 0..100), 100),
+            fake::Server::new(keys(&["user"], 100..200), 100),
+            fake::Server::new(keys(&["user"], 200..300), 100),
+        ];
+        let all = run(scan_nodes(
+            "c",
+            inputs(&mut servers),
+            &opts(1_000, 50),
+            None,
+            None,
+        ))
+        .unwrap();
+        assert!(all.sizes_available);
+
+        let mut nodes = inputs(&mut servers);
+        nodes[1].perms.checks.retain(|c| c.label != PERM_MEMORY);
+        nodes[1].perms.checks.push(PermCheck {
+            label: PERM_MEMORY,
+            status: PermStatus::Denied("NOPERM".into()),
+        });
+        let r = run(scan_nodes("c", nodes, &opts(1_000, 50), None, None)).unwrap();
+        assert!(!r.sizes_available);
+        let rows = r.nodes.unwrap();
+        let sizes: Vec<bool> = rows.iter().map(|n| n.sizes_available).collect();
+        assert_eq!(sizes, [true, false, true]);
+    }
+
     #[test]
     fn match_never_makes_a_cluster_complete() {
         let mut servers = vec![fake::Server::new(keys(&["user"], 0..10), 100)];

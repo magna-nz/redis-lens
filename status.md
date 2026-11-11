@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** v0.3 (cluster and SSH tunnels) built on `v03/integration`; verifier and PR next
-**Last updated:** 2026-11-12 (v0.3 wave B merged into `v03/integration`)
+**Last updated:** 2026-11-12 (v0.3: verifier blockers fixed on `v03/integration`, re-verification next)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -252,7 +252,9 @@ Integration branch `v03/integration` (worktree `.claude/worktrees/v03`). Agent w
 | B | `scan` Nodes table, `--check` note, md/html Nodes section, snapshots, `diff` node-set note, `compare` on a cluster; `tests/cluster_cli_it.rs` (4) | implementer [sonnet] | `v03/cli` | **done**, merged (5ad766f) |
 | B | Cluster behind a bastion (`tests/ssh_cluster_it.rs`, 10); one primary connect for a standalone `--prefer-replica`; no extra `INFO` per scan (the detection reply answers the scan's first `INFO server`); Valkey 8 `server_mode` | implementer [opus], resumed | `v03/ssh` | **done**, merged (0eb1832) |
 | fix | The cluster futures were not `Send` (rustc's higher-ranked limitation with iterator closures held in streams); boxed and collected first, guarded by `scan::cluster::tests::futures_are_send`; the TUI's blocking-thread workaround removed | me | 621502c | **done** |
-| V | Verifier on the merged branch | verifier [opus] | | next |
+| V | Verifier on the merged branch (8c02a1a): BLOCK on two findings, 41 mutations run | verifier [opus] | | **done** |
+| fix V | B1: an empty shard that doesn't own `redis-lens:probe`'s slot answered `MOVED`, counted as a denial, which turned sizes off for the whole cluster; a redirect on the missing probe key now counts as allowed (`tests/cluster_it.rs` `*_empty_shards`). B2: behind SSH, an announced `127.1` (or `0`, `2130706433`, `0x7f000001`) got credentials on the bastion's loopback; announced hosts whose last label is numeric are now refused (`tests/ssh_it.rs` `a_shorthand_loopback_*`). Tests added for the surviving mutations on sizes merging, case and IPv4-mapped loopback; spec.md states the forward-port race, `conn add --ssh USER@` on the command line and `conn test` on a cluster | me | | **done** |
+| V2 | Verifier on the fix diff | verifier [opus] | | next |
 
 Checks on the merged branch (621502c plus the spec, status and note edits): fmt and clippy clean; 704 unit tests pass. Integration on Redis 7.4 + Valkey 8.1: 134 of 135 passed, and on `redis:6.2-alpine` 133 of 135; os_trust's 2 are ignored as usual. The three failures were Docker Desktop errors in the container helper (a host-port bind race and `PortNotExposed`), not assertions, and each passed when rerun alone: `replica_it::an_open_replica_is_scanned_without_credentials`, `conn_it::probe_server_with_default_user_off_is_required`, `scan_cli_it::sample_limit_is_not_complete`. CI on Linux is the real check. `make coverage` (unit and integration, default images, no failures): 95.54% of lines, 95.62% of regions; `conn/cluster.rs` 94.8%, `scan/cluster.rs` 97.7%, `conn/ssh.rs` 98.6%, `tui/ui/nodes.rs` 98.1% of lines.
 
@@ -264,6 +266,11 @@ Open points:
 - `diff --json` has no node-set note.
 - Not tested end to end: a TLS cluster, and a TLS cluster behind a bastion.
 - The TUI sends `INFO server`, `INFO memory` and `DBSIZE` per node for the header before a cluster scan, as it does for a standalone server.
+- The local forward port is free-picked and released before ssh binds it: a local process that wins the race receives `AUTH`. Any local user can use a running forward, as with any `ssh -L`. Both documented in spec.md; binding the port in redis-lens and passing it to ssh would need a different forwarding mechanism.
+- `conn test` on a cluster checks the seed node only (documented).
+- A refused node's raw announced address is printed unescaped in text output and the TUI (md and html escape it): the same class as the open point on control characters in key names.
+- Not covered by a test: the `CLUSTER MYID` check on cluster replicas (primaries are tested), and starting a cluster node's SSH forward before the 5 s node timeout (the standalone replica's is tested).
+- The `.boxed()` in `conn::cluster::discover` isn't needed for `Send`; harmless.
 
 ### How to resume after a restart or compaction
 

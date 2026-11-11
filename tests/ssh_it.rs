@@ -433,6 +433,16 @@ async fn scans_a_replica_through_the_bastion_valkey() {
 /// A replica in the bastion's own network namespace, announced as `127.0.0.1:6380`, of
 /// `primary_host`. Needs credentials.
 async fn loopback_replica(w: &World, valkey: bool, primary_host: &str) -> HiddenServer {
+    loopback_replica_announcing(w, valkey, primary_host, "127.0.0.1").await
+}
+
+/// A replica on the bastion's loopback, announcing `announce` as its address.
+async fn loopback_replica_announcing(
+    w: &World,
+    valkey: bool,
+    primary_host: &str,
+    announce: &str,
+) -> HiddenServer {
     let mut args: Vec<&str> = LENS_ONLY.to_vec();
     args.extend(MASTER_AUTH);
     args.extend([
@@ -440,7 +450,7 @@ async fn loopback_replica(w: &World, valkey: bool, primary_host: &str) -> Hidden
         primary_host,
         "6379",
         "--replica-announce-ip",
-        "127.0.0.1",
+        announce,
         "--replica-announce-port",
         "6380",
     ]);
@@ -470,6 +480,58 @@ async fn an_announced_loopback_behind_the_bastion_gets_no_credentials(valkey: bo
     assert!(info(&mut c).await.contains("role:master"));
     // No failed AUTH reached the replica: nothing was sent to it.
     assert_eq!(replica.sh(&format!("{AS_LENS} ACL LOG")).await, before);
+}
+
+/// `127.1` is 127.0.0.1 to ssh on the bastion but not loopback by name, so it is
+/// refused as an announced host: the scan stays on the primary and the replica gets
+/// nothing.
+async fn a_shorthand_loopback_behind_the_bastion_gets_no_credentials(valkey: bool) {
+    let w = World::new("shorthand").await;
+    let primary = w.server(valkey, &LENS_ONLY).await;
+    seed(&primary, AS_LENS).await;
+    let replica = loopback_replica_announcing(&w, valkey, &primary.ip().await, "127.1").await;
+    // `wait_for_replication` parses the reply as redis-lens does, which now refuses
+    // `127.1`; wait for the raw entry instead.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let info = primary.sh(&format!("{AS_LENS} INFO replication")).await;
+        if info.contains("ip=127.1,") && info.contains("state=online") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replication did not come up: {info}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Clients signed in as `lens` other than the CLIENT LIST call itself.
+    let lens_clients = || async {
+        let list = replica.sh(&format!("{AS_LENS} CLIENT LIST")).await;
+        list.lines()
+            .filter(|l| l.contains("user=lens") && !l.contains("cmd=client"))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(lens_clients().await, Vec::<String>::new());
+
+    let p = w.profile(primary.endpoint(), Auth::Keychain, true);
+    let (mut c, target) = conn::connect_for_scan(&p, &w.store(&p)).await.unwrap();
+    assert_eq!(
+        target,
+        ScanTarget::PrimaryFallback("no online replica".into())
+    );
+    assert!(info(&mut c).await.contains("role:master"));
+    assert_eq!(lens_clients().await, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_shorthand_loopback_behind_the_bastion_gets_no_credentials_redis() {
+    a_shorthand_loopback_behind_the_bastion_gets_no_credentials(false).await;
+}
+
+#[tokio::test]
+async fn a_shorthand_loopback_behind_the_bastion_gets_no_credentials_valkey() {
+    a_shorthand_loopback_behind_the_bastion_gets_no_credentials(true).await;
 }
 
 #[tokio::test]

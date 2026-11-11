@@ -479,7 +479,10 @@ pub fn parse_replication(info: &str) -> Replication {
 ///
 /// An IP address is returned in its normal form, without brackets; the unspecified
 /// addresses (`0.0.0.0`, `::`) are refused. Anything else must look like a host name:
-/// dot-separated labels of ASCII letters, digits, `-` and `_`.
+/// dot-separated labels of ASCII letters, digits, `-` and `_`, the last one not
+/// numeric. That refuses the shorthand address forms a resolver may accept (`127.1`,
+/// `0`, `2130706433`, `0x7f000001`): behind an SSH bastion they would reach the bastion
+/// itself without being recognised as loopback by name.
 fn replica_host(ip: &str) -> Option<String> {
     let ip = ip.trim();
     let bare = ip
@@ -494,7 +497,14 @@ fn replica_host(ip: &str) -> Option<String> {
             && l.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     };
-    (bare.len() <= 253 && bare.split('.').all(label_ok)).then(|| bare.to_string())
+    // No top-level domain is all digits (RFC 3696 §2), and `0x…` is a hex number.
+    let numeric = |l: &str| {
+        let hex = l.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("0x"))
+            && l[2..].bytes().all(|b| b.is_ascii_hexdigit());
+        hex || l.bytes().all(|b| b.is_ascii_digit())
+    };
+    let last = bare.rsplit('.').next().unwrap_or_default();
+    (bare.len() <= 253 && bare.split('.').all(label_ok) && !numeric(last)).then(|| bare.to_string())
 }
 
 /// Loopback by name alone: `localhost` (and `*.localhost`), `127.0.0.0/8`, `::1`, and
@@ -799,11 +809,13 @@ fn server_message(e: &redis::RedisError) -> String {
 }
 
 /// `missing_key`: the probe key does not exist, so a plain `ERR` (such as
-/// `ERR no such key`) says the command ran.
+/// `ERR no such key`) says the command ran, and so does a cluster redirect (see
+/// [`is_redirect`]).
 fn classify(r: Result<(), redis::RedisError>, missing_key: bool) -> PermStatus {
     match r {
         Ok(()) => PermStatus::Allowed,
         Err(e) if is_noperm(&e) => PermStatus::Denied(server_message(&e)),
+        Err(e) if missing_key && is_redirect(&e) => PermStatus::Allowed,
         Err(e)
             if missing_key
                 && e.kind() == redis::ErrorKind::Server(ServerErrorKind::ResponseError)
@@ -815,6 +827,16 @@ fn classify(r: Result<(), redis::RedisError>, missing_key: bool) -> PermStatus {
         }
         Err(e) => PermStatus::Denied(server_message(&e)),
     }
+}
+
+/// `MOVED` or `ASK`: on a cluster node that doesn't own the probe key's slot (an empty
+/// shard, say). Redis and Valkey check ACLs, key patterns included, before they
+/// redirect, so the reply says the command would have been allowed.
+fn is_redirect(e: &redis::RedisError) -> bool {
+    matches!(
+        e.kind(),
+        redis::ErrorKind::Server(ServerErrorKind::Moved | ServerErrorKind::Ask)
+    )
 }
 
 fn policy_from_info(info: &str) -> Option<String> {
@@ -846,12 +868,16 @@ pub async fn check_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Permis
 
     // TYPE and PTTL
     let ty: Result<String, _> = redis::cmd("TYPE").arg(&probe_key).query_async(conn).await;
-    let type_ttl = match ty {
-        Ok(_) => {
-            let r: Result<i64, _> = redis::cmd("PTTL").arg(&probe_key).query_async(conn).await;
-            classify(r.map(|_| ()), missing)
-        }
-        Err(e) => classify(Err(e), missing),
+    // A redirect says TYPE is allowed; PTTL still needs its own check.
+    let type_ran = match &ty {
+        Ok(_) => true,
+        Err(e) => missing && is_redirect(e),
+    };
+    let type_ttl = if type_ran {
+        let r: Result<i64, _> = redis::cmd("PTTL").arg(&probe_key).query_async(conn).await;
+        classify(r.map(|_| ()), missing)
+    } else {
+        classify(ty.map(|_| ()), missing)
     };
 
     // MEMORY USAGE
@@ -1019,6 +1045,62 @@ mod tests {
         assert!(may_send_credentials(true, false));
         assert!(may_send_credentials(true, true));
         assert!(!may_send_credentials(false, true));
+    }
+
+    /// Shorthand address forms are refused as announced hosts: behind a bastion, ssh
+    /// would read `127.1` as 127.0.0.1 there, while the name check sees a remote host.
+    #[test]
+    fn announced_hosts_in_shorthand_address_form_are_refused() {
+        for host in [
+            "127.1",
+            "127.0.1",
+            "0",
+            "2130706433",
+            "0x7f000001",
+            "0X7F.1",
+            "017700000001",
+            "10.1",
+            "host.123",
+            "a.0x",
+            "cache.0xdb",
+        ] {
+            assert_eq!(replica_host(host), None, "{host}");
+        }
+        for (host, want) in [
+            ("127.0.0.1", "127.0.0.1"),
+            ("[::1]", "::1"),
+            ("10.0.0.5", "10.0.0.5"),
+            ("redis-1.internal", "redis-1.internal"),
+            ("LOCALHOST", "LOCALHOST"),
+            ("cache.db0x", "cache.db0x"),
+            ("123.example", "123.example"),
+            ("node-0", "node-0"),
+        ] {
+            assert_eq!(replica_host(host).as_deref(), Some(want), "{host}");
+        }
+        for host in ["0.0.0.0", "::", "localhost.", "bad host", ""] {
+            assert_eq!(replica_host(host), None, "{host:?}");
+        }
+    }
+
+    /// Loopback by name ignores case and recognises IPv4-mapped loopback.
+    #[test]
+    fn loopback_by_name_ignores_case_and_sees_mapped_addresses() {
+        for host in [
+            "LOCALHOST",
+            "LocalHost",
+            "DB.LOCALHOST",
+            "localhost.",
+            "::ffff:127.0.0.1",
+            "::FFFF:127.0.0.9",
+            "0.0.0.0",
+            "::",
+        ] {
+            assert!(is_loopback_name(host), "{host}");
+        }
+        for host in ["::ffff:10.0.0.5", "localhost.example", "notlocalhost"] {
+            assert!(!is_loopback_name(host), "{host}");
+        }
     }
 
     #[tokio::test]
@@ -1200,8 +1282,9 @@ mod tests {
     }
 
     /// A minimal RESP server for tests: answers `INFO <section>` from `info` (an empty
-    /// text for a section it doesn't have) and `+OK` to anything else, and records every
-    /// connection and command.
+    /// text for a section it doesn't have), a command `X` with the raw RESP in an
+    /// `info` entry named `reply:X` when there is one, and `+OK` to anything else, and
+    /// records every connection and command.
     struct FakeServer {
         addr: SocketAddr,
         connections: Arc<std::sync::atomic::AtomicUsize>,
@@ -1255,7 +1338,10 @@ mod tests {
                                     .unwrap_or_default();
                                 format!("${}\r\n{text}\r\n", text.len())
                             } else {
-                                "+OK\r\n".to_string()
+                                let key = format!("reply:{}", args[0].to_ascii_lowercase());
+                                info.iter()
+                                    .find(|(k, _)| *k == key)
+                                    .map_or_else(|| "+OK\r\n".to_string(), |(_, v)| v.clone())
                             };
                             if s.get_mut().write_all(reply.as_bytes()).await.is_err() {
                                 return;
@@ -1651,6 +1737,68 @@ while (my $c = $l->accept) {
         ));
         assert_eq!(classify(Err(nokey), true), PermStatus::Allowed);
         assert_eq!(classify(Ok(()), false), PermStatus::Allowed);
+    }
+
+    /// An empty shard that doesn't own the probe key's slot answers `MOVED` to every
+    /// key command. That is not a denial: the ACL check comes before the redirect.
+    #[test]
+    fn a_redirect_on_the_missing_probe_key_is_allowed() {
+        let moved = || {
+            redis::RedisError::from((
+                redis::ErrorKind::Server(ServerErrorKind::Moved),
+                "MOVED",
+                "2115 127.0.0.1:7000".to_string(),
+            ))
+        };
+        let ask = redis::RedisError::from((
+            redis::ErrorKind::Server(ServerErrorKind::Ask),
+            "ASK",
+            "2115 127.0.0.1:7000".to_string(),
+        ));
+        assert_eq!(classify(Err(moved()), true), PermStatus::Allowed);
+        assert_eq!(classify(Err(ask), true), PermStatus::Allowed);
+        // On a real key (one SCAN returned), a redirect proves nothing.
+        assert!(matches!(
+            classify(Err(moved()), false),
+            PermStatus::Denied(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_empty_shard_that_redirects_the_probe_key_allows_sizes() {
+        let moved = "-MOVED 2115 127.0.0.1:7000\r\n".to_string();
+        let server = FakeServer::start(&[
+            ("reply:scan", "*2\r\n$1\r\n0\r\n*0\r\n".into()),
+            ("reply:type", moved.clone()),
+            ("reply:pttl", moved.clone()),
+            ("reply:memory", moved),
+        ])
+        .await;
+        let client = redis::Client::open(format!("redis://{}", server.addr)).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let report = check_permissions(&mut conn).await;
+        assert!(report.allowed(PERM_TYPE_TTL), "{report:?}");
+        assert!(report.allowed(PERM_MEMORY), "{report:?}");
+        // TYPE redirected, so PTTL was still checked on its own.
+        assert_eq!(server.count("PTTL redis-lens:probe"), 1);
+    }
+
+    /// TYPE redirects but PTTL is denied: the pair is denied.
+    #[tokio::test]
+    async fn a_redirected_type_does_not_vouch_for_pttl() {
+        let server = FakeServer::start(&[
+            ("reply:scan", "*2\r\n$1\r\n0\r\n*0\r\n".into()),
+            ("reply:type", "-MOVED 2115 127.0.0.1:7000\r\n".into()),
+            (
+                "reply:pttl",
+                "-NOPERM this user has no permissions to run the 'pttl' command\r\n".into(),
+            ),
+        ])
+        .await;
+        let client = redis::Client::open(format!("redis://{}", server.addr)).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let report = check_permissions(&mut conn).await;
+        assert!(!report.allowed(PERM_TYPE_TTL), "{report:?}");
     }
 
     fn ep(host: &str, port: u16, tls: bool) -> Endpoint {
