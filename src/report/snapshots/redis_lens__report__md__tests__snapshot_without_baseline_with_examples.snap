@@ -15,18 +15,18 @@ expression: "render(&after, None, true)"
 
 | Pattern | Type | Keys | Memory | Share | Avg | No TTL |
 |---|---|---:|---:|---:|---:|---:|
-| user:{id}:cart | hash | 2.0K | 29M | 83% | 15K | 100% |
-| session:{id} | hash | 3.0K | 4.8M | 14% | 1.6K | 0% |
-| search:{id} | hash | 1.0K | 977K | 3% | 1000B | 40% |
-| job:{id} | hash | 600 | 195K | <1% | 333B | 100% |
+| `user:{id}:cart` | hash | 2.0K | 29M | 83% | 15K | 100% |
+| `session:{id}` | hash | 3.0K | 4.8M | 14% | 1.6K | 0% |
+| `search:{id}` | hash | 1.0K | 977K | 3% | 1000B | 40% |
+| `job:{id}` | hash | 600 | 195K | <1% | 333B | 100% |
 
 ## TTL risks
 
 | Pattern | Verdict | No TTL | Why |
 |---|---|---:|---|
-| search:{id} | mixed · likely bug | 40% | 40% of 1.0K keys never expire, while the rest expire in about a day. A write path probably skips EXPIRE. |
+| `search:{id}` | mixed · likely bug | 40% | 40% of 1.0K keys never expire, while the rest expire in about a day. A write path probably skips EXPIRE. |
 
 ## Example keys
 
-- user:{id}:cart: user:1001:cart, user:1002:cart
-- session:{id}: session:abc
+- `user:{id}:cart`: `user:1001:cart`, `user:1002:cart`
+- `session:{id}`: `session:abc`

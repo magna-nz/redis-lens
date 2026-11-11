@@ -10,13 +10,14 @@ use crate::model::ScanReport;
 use crate::scan::context::context_summary;
 use crate::snapshot::format_utc;
 
-/// Escape text from the server or from key names: `\ | ` < > [ ]` get a backslash, `&`
-/// becomes `&amp;`, and line breaks and other control characters become spaces.
+/// Escape other text (server facts, reasons): `\ | ` < > [ ] * _ ~` get a backslash,
+/// `&` becomes `&amp;`, and line breaks and other control characters become spaces.
+/// Pattern and key names go through [`code`] instead.
 pub(crate) fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            '\\' | '|' | '`' | '<' | '>' | '[' | ']' => {
+            '\\' | '|' | '`' | '<' | '>' | '[' | ']' | '*' | '_' | '~' => {
                 out.push('\\');
                 out.push(c);
             }
@@ -26,6 +27,38 @@ pub(crate) fn esc(s: &str) -> String {
         }
     }
     out
+}
+
+/// A pattern or key name as an inline code span, so nothing in it is read as Markdown:
+/// no emphasis, link, auto-link (`https://…`) or HTML. Key names come from whoever writes
+/// keys. The fence is one backtick longer than the longest run of backticks in the name,
+/// with a space inside when the name starts or ends with one. Control characters become
+/// spaces. In a table cell (`in_table`), `|` is written `\|`, which GFM reads as a pipe
+/// inside the span instead of a cell break.
+pub(crate) fn code(s: &str, in_table: bool) -> String {
+    let mut clean: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if in_table {
+        clean = clean.replace('|', "\\|");
+    }
+    if clean.trim().is_empty() {
+        return "(empty)".to_string();
+    }
+    let mut longest = 0;
+    let mut run = 0;
+    for c in clean.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat(longest + 1);
+    let pad = if clean.starts_with('`') || clean.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{clean}{pad}{fence}")
 }
 
 pub fn render(report: &ScanReport, diff: Option<&ReportDiff>, examples: bool) -> String {
@@ -55,7 +88,7 @@ pub fn render(report: &ScanReport, diff: Option<&ReportDiff>, examples: bool) ->
             let _ = writeln!(
                 out,
                 "| {} | {} | {} | {} | {} | {} | {} |",
-                esc(&p.pattern),
+                code(&p.pattern, true),
                 p.key_type.map_or("mixed", |t| t.as_str()),
                 format::count(p.est_keys),
                 p.est_bytes.map_or("—".to_string(), format::bytes),
@@ -86,7 +119,7 @@ pub fn render(report: &ScanReport, diff: Option<&ReportDiff>, examples: bool) ->
             let _ = writeln!(
                 out,
                 "| {} | {} | {} | {} |",
-                esc(&r.stats.pattern),
+                code(&r.stats.pattern, true),
                 r.verdict.label(),
                 format::percent(r.stats.no_ttl_ratio()),
                 esc(&why)
@@ -116,7 +149,7 @@ pub fn render(report: &ScanReport, diff: Option<&ReportDiff>, examples: bool) ->
                 let _ = writeln!(
                     out,
                     "| {} | {} | {} |",
-                    esc(&c.pattern),
+                    code(&c.pattern, true),
                     change_text(c),
                     c.cause.words()
                 );
@@ -141,8 +174,18 @@ fn example_section(out: &mut String, rows: &[Row<'_>]) {
     }
     let _ = writeln!(out, "\n## Example keys\n");
     for r in with {
-        let keys: Vec<String> = r.stats.examples.iter().map(|k| esc(&k.key)).collect();
-        let _ = writeln!(out, "- {}: {}", esc(&r.stats.pattern), keys.join(", "));
+        let keys: Vec<String> = r
+            .stats
+            .examples
+            .iter()
+            .map(|k| code(&k.key, false))
+            .collect();
+        let _ = writeln!(
+            out,
+            "- {}: {}",
+            code(&r.stats.pattern, false),
+            keys.join(", ")
+        );
     }
 }
 
@@ -191,9 +234,19 @@ mod tests {
     fn hostile_names_cannot_break_out() {
         let r = hostile();
         let out = render(&r, None, true);
-        // No raw HTML tag survives.
-        assert!(!out.contains("<script>"), "{out}");
-        assert!(out.contains("\\<script\\>alert(1)\\</script\\>"));
+        // Every hostile name is inside a code span, where Markdown is not read: remove
+        // the spans and no HTML, link or emphasis syntax from a name is left.
+        let mut rest = out.clone();
+        for p in &r.patterns {
+            rest = rest.replace(&code(&p.pattern, true), "");
+            rest = rest.replace(&code(&p.pattern, false), "");
+            for k in &p.examples {
+                rest = rest.replace(&code(&k.key, false), "");
+            }
+        }
+        for bad in ["<script>", "](e)", "<f>", "=cmd()", "line1", "\tTAB"] {
+            assert!(!rest.contains(bad), "{bad:?} outside a code span:\n{rest}");
+        }
         // Table rows stay one line each: a header and one row per pattern.
         let table_rows = out.lines().filter(|l| l.starts_with("| ")).count();
         assert_eq!(table_rows, 1 + r.patterns.len(), "{out}");
@@ -204,6 +257,19 @@ mod tests {
             assert_eq!(unescaped, 8, "{l}");
         }
         assert!(out.contains("line1 line2"));
-        assert!(!out.contains("](e)") || out.contains("\\](e)"));
+    }
+
+    #[test]
+    fn names_become_code_spans() {
+        assert_eq!(code("user:{id}", true), "`user:{id}`");
+        assert_eq!(code("https://x.io", false), "`https://x.io`");
+        assert_eq!(code("*a*_b_", false), "`*a*_b_`");
+        assert_eq!(code("a`b", false), "``a`b``");
+        assert_eq!(code("`a", false), "`` `a ``");
+        assert_eq!(code("a|b", true), "`a\\|b`");
+        assert_eq!(code("a|b", false), "`a|b`");
+        assert_eq!(code("a\nb", false), "`a b`");
+        assert_eq!(code("", false), "(empty)");
+        assert_eq!(esc("*a*_b_~"), "\\*a\\*\\_b\\_\\~");
     }
 }

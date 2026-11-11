@@ -15,10 +15,10 @@ expression: "render(&r, None, false)"
 
 | Pattern | Type | Keys | Memory | Share | Avg | No TTL |
 |---|---|---:|---:|---:|---:|---:|
-| a:{id} | hash | 1.0K | — | 100% | — | 50% |
+| `a:{id}` | hash | 1.0K | — | 100% | — | 50% |
 
 ## TTL risks
 
 | Pattern | Verdict | No TTL | Why |
 |---|---|---:|---|
-| a:{id} | mixed · likely bug | 50% | 50% of 1.0K keys never expire, while the rest expire in about a day. A write path probably skips EXPIRE. |
+| `a:{id}` | mixed · likely bug | 50% | 50% of 1.0K keys never expire, while the rest expire in about a day. A write path probably skips EXPIRE. |
