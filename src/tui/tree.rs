@@ -1,12 +1,18 @@
 //! The Patterns tree: grouping patterns under a shared first segment, filtering, and
 //! the per-row summaries and verdicts the view shows. Pure data, no IO.
 
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::model::{KeySample, KeyType, PatternStats};
 
-/// Same separators as pattern inference.
+/// The separators that split off the first segment, which names a group. Pattern
+/// inference also splits on `.` (see [`same_up_to_var`]), but a group is the text
+/// before the first of these.
 const SEPARATORS: [char; 3] = [':', '/', '|'];
+
+/// The placeholders pattern inference writes. `{var}` replaces a literal segment.
+const PLACEHOLDERS: [&str; 6] = ["{id}", "{uuid}", "{ulid}", "{hash}", "{ip}", "{var}"];
 
 /// A key at or above this size is "very large".
 pub const LARGE_MAX: u64 = 50 * 1024 * 1024;
@@ -86,6 +92,124 @@ pub enum Row {
     Pattern { idx: usize, parent: Option<usize> },
 }
 
+/// How the Patterns view orders its rows. Groups sort by their totals and children
+/// sort inside their group, by the same key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SortBy {
+    /// Estimated memory, largest first. Without sizes: estimated keys.
+    #[default]
+    Memory,
+    /// Estimated keys, most first.
+    Keys,
+    /// Average size per sampled key, largest first; patterns without sizes last.
+    AvgSize,
+    /// Share of sampled keys without a TTL, largest first.
+    NoTtl,
+    /// Pattern (or group label), A to Z.
+    Name,
+}
+
+impl SortBy {
+    /// What the sort means for a scan: without sizes, memory and average size are
+    /// unknown, so both sort by keys.
+    pub fn effective(self, sizes: bool) -> Self {
+        match self {
+            Self::Memory | Self::AvgSize if !sizes => Self::Keys,
+            s => s,
+        }
+    }
+
+    /// The next sort for `o`: memory, keys, avg size, no-TTL %, name, then memory
+    /// again. Without sizes memory and avg size are skipped: keys, no-TTL %, name.
+    pub fn next(self, sizes: bool) -> Self {
+        match (self.effective(sizes), sizes) {
+            (Self::Memory, _) => Self::Keys,
+            (Self::Keys, true) => Self::AvgSize,
+            (Self::Keys, false) | (Self::AvgSize, _) => Self::NoTtl,
+            (Self::NoTtl, _) => Self::Name,
+            (Self::Name, true) => Self::Memory,
+            (Self::Name, false) => Self::Keys,
+        }
+    }
+
+    /// For "sorted by ...".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Keys => "keys",
+            Self::AvgSize => "avg size",
+            Self::NoTtl => "no-TTL %",
+            Self::Name => "name",
+        }
+    }
+
+    /// Name sorts A to Z; every other key largest first.
+    pub fn ascending(self) -> bool {
+        self == Self::Name
+    }
+}
+
+/// What a row sorts by: a pattern's figures, or a group's totals as
+/// [`summarize_group`] adds them up.
+struct Rank<'a> {
+    /// Estimated bytes with sizes, else estimated keys, as the share bar uses.
+    weight: u64,
+    keys: u64,
+    avg: Option<u64>,
+    no_ttl: u64,
+    sampled: u64,
+    name: &'a str,
+}
+
+impl<'a> Rank<'a> {
+    fn of(p: &'a PatternStats, sizes: bool) -> Self {
+        Self::sum(std::slice::from_ref(p).iter(), &p.pattern, sizes)
+    }
+
+    fn sum(
+        kids: impl Iterator<Item = &'a PatternStats> + Clone,
+        name: &'a str,
+        sizes: bool,
+    ) -> Self {
+        let sampled: u64 = kids.clone().map(|k| k.sampled_keys).sum();
+        let sampled_bytes = sum_opt(kids.clone().map(|k| k.sampled_bytes));
+        Self {
+            weight: kids.clone().map(|k| weight(k, sizes)).sum(),
+            keys: kids.clone().map(|k| k.est_keys).sum(),
+            avg: sampled_bytes.filter(|_| sampled > 0).map(|b| b / sampled),
+            no_ttl: kids.map(|k| k.no_ttl).sum(),
+            sampled,
+            name,
+        }
+    }
+
+    /// `self` before `other` gives `Less`. Ties go by name, A to Z.
+    fn cmp(&self, other: &Self, sort: SortBy) -> Ordering {
+        let primary = match sort {
+            SortBy::Memory => other.weight.cmp(&self.weight),
+            SortBy::Keys => other.keys.cmp(&self.keys),
+            SortBy::AvgSize => other.avg.cmp(&self.avg),
+            SortBy::NoTtl => other.no_ttl_cmp(self),
+            SortBy::Name => Ordering::Equal,
+        };
+        primary.then_with(|| self.name.cmp(other.name))
+    }
+
+    /// Compares no-TTL ratios exactly. No sampled keys counts as 0.
+    fn no_ttl_cmp(&self, other: &Self) -> Ordering {
+        let frac = |r: &Self| {
+            if r.sampled == 0 {
+                (0u128, 1u128)
+            } else {
+                (u128::from(r.no_ttl), u128::from(r.sampled))
+            }
+        };
+        let (an, ad) = frac(self);
+        let (bn, bd) = frac(other);
+        (an * bd).cmp(&(bn * ad))
+    }
+}
+
 fn weight(p: &PatternStats, sizes: bool) -> u64 {
     if sizes {
         p.est_bytes.unwrap_or(0)
@@ -95,9 +219,16 @@ fn weight(p: &PatternStats, sizes: bool) -> u64 {
 }
 
 impl PatternTree {
-    /// Group patterns: two or more with the same first segment go under a parent.
-    /// Roots are ordered by memory (or keys without sizes), largest first.
+    /// [`PatternTree::build_sorted`] by memory (or keys without sizes), largest first.
     pub fn build(patterns: &[PatternStats], sizes: bool) -> Self {
+        Self::build_sorted(patterns, sizes, SortBy::Memory)
+    }
+
+    /// Group patterns: two or more with the same first segment go under a parent.
+    /// Roots are ordered by `sort` (groups by their totals), children by `sort` inside
+    /// their group; ties go by name, A to Z.
+    pub fn build_sorted(patterns: &[PatternStats], sizes: bool, sort: SortBy) -> Self {
+        let sort = sort.effective(sizes);
         let mut keys: Vec<Option<&str>> = Vec::new();
         let mut members: Vec<Vec<usize>> = Vec::new();
         for (i, p) in patterns.iter().enumerate() {
@@ -115,29 +246,44 @@ impl PatternTree {
                 }
             }
         }
-        let mut roots: Vec<(u64, Root)> = keys
+        let roots: Vec<Root> = keys
             .into_iter()
             .zip(members)
-            .map(|(key, idx)| {
-                let w = idx.iter().map(|&i| weight(&patterns[i], sizes)).sum();
-                let root = match key {
-                    Some(key) if idx.len() >= 2 => {
-                        let names: Vec<&str> =
-                            idx.iter().map(|&i| patterns[i].pattern.as_str()).collect();
-                        Root::Group(Group {
-                            key: key.to_string(),
-                            label: group_label(&names),
-                            children: idx,
-                        })
-                    }
-                    _ => Root::Single(idx[0]),
-                };
-                (w, root)
+            .map(|(key, mut idx)| match key {
+                Some(key) if idx.len() >= 2 => {
+                    let names: Vec<&str> =
+                        idx.iter().map(|&i| patterns[i].pattern.as_str()).collect();
+                    let label = group_label(&names);
+                    idx.sort_by(|&a, &b| {
+                        Rank::of(&patterns[a], sizes).cmp(&Rank::of(&patterns[b], sizes), sort)
+                    });
+                    Root::Group(Group {
+                        key: key.to_string(),
+                        label,
+                        children: idx,
+                    })
+                }
+                _ => Root::Single(idx[0]),
             })
             .collect();
-        roots.sort_by_key(|r| std::cmp::Reverse(r.0));
+        let order: Vec<usize> = {
+            let ranks: Vec<Rank<'_>> = roots
+                .iter()
+                .map(|r| match r {
+                    Root::Single(i) => Rank::of(&patterns[*i], sizes),
+                    Root::Group(g) => {
+                        Rank::sum(g.children.iter().map(|&i| &patterns[i]), &g.label, sizes)
+                    }
+                })
+                .collect();
+            let mut order: Vec<usize> = (0..roots.len()).collect();
+            // Stable, so rows that tie on every key keep report order.
+            order.sort_by(|&a, &b| ranks[a].cmp(&ranks[b], sort));
+            order
+        };
+        let mut slots: Vec<Option<Root>> = roots.into_iter().map(Some).collect();
         Self {
-            roots: roots.into_iter().map(|(_, r)| r).collect(),
+            roots: order.into_iter().filter_map(|i| slots[i].take()).collect(),
         }
     }
 
@@ -146,7 +292,7 @@ impl PatternTree {
     pub fn visible(
         &self,
         patterns: &[PatternStats],
-        collapsed: &HashSet<String>,
+        collapsed: &Collapsed,
         filter: &str,
     ) -> Vec<Row> {
         let f = filter.to_lowercase();
@@ -186,6 +332,218 @@ impl PatternTree {
             }
         }
         out
+    }
+
+    /// The groups of the tree, in order.
+    pub fn groups(&self) -> impl Iterator<Item = &Group> {
+        self.roots.iter().filter_map(|r| match r {
+            Root::Group(g) => Some(g),
+            Root::Single(_) => None,
+        })
+    }
+
+    /// What a row is, independent of where it sits: a group by its key, a pattern by
+    /// its name. `None` when `row` is not of this tree.
+    pub fn row_id(&self, patterns: &[PatternStats], row: Row) -> Option<RowId> {
+        match row {
+            Row::Group { root } => match self.roots.get(root)? {
+                Root::Group(g) => Some(RowId::Group(g.key.clone())),
+                Root::Single(i) => Some(RowId::Pattern(patterns.get(*i)?.pattern.clone())),
+            },
+            Row::Pattern { idx, .. } => Some(RowId::Pattern(patterns.get(idx)?.pattern.clone())),
+        }
+    }
+
+    /// The patterns a row stands for: a group's children, or the pattern itself.
+    pub fn row_members(&self, patterns: &[PatternStats], row: Row) -> Vec<String> {
+        let name = |i: usize| patterns.get(i).map(|p| p.pattern.clone());
+        match row {
+            Row::Group { root } => match self.roots.get(root) {
+                Some(Root::Group(g)) => g.children.iter().filter_map(|&i| name(i)).collect(),
+                Some(Root::Single(i)) => name(*i).into_iter().collect(),
+                None => Vec::new(),
+            },
+            Row::Pattern { idx, .. } => name(idx).into_iter().collect(),
+        }
+    }
+
+    /// Where the row that was `id`, standing for `members`, is now among `rows` (the
+    /// visible rows of this tree):
+    ///
+    /// - a pattern: its row; else the row of the group it is in (collapsed); else a
+    ///   pattern or group that it merged into or split from through `{var}`;
+    /// - a group: the group with the same key; else a group holding one of its
+    ///   patterns, also through `{var}` (its key changed); else one of its patterns
+    ///   shown on its own (the group dropped to a single pattern).
+    ///
+    /// `None` when none of these is visible.
+    pub fn find(
+        &self,
+        patterns: &[PatternStats],
+        rows: &[Row],
+        id: &RowId,
+        members: &[String],
+    ) -> Option<usize> {
+        let name = |i: usize| patterns.get(i).map_or("", |p| p.pattern.as_str());
+        let kids = |root: usize| match self.roots.get(root) {
+            Some(Root::Group(g)) => g.children.as_slice(),
+            _ => &[],
+        };
+        let pattern_row = |pred: &dyn Fn(&str) -> bool| {
+            rows.iter()
+                .position(|r| matches!(*r, Row::Pattern { idx, .. } if pred(name(idx))))
+        };
+        let group_row = |pred: &dyn Fn(&str) -> bool| {
+            rows.iter().position(
+                |r| matches!(*r, Row::Group { root } if kids(root).iter().any(|&i| pred(name(i)))),
+            )
+        };
+        let exact = |n: &str| members.iter().any(|m| m == n);
+        let close = |n: &str| members.iter().any(|m| same_up_to_var(m, n));
+        match id {
+            RowId::Pattern(p) => {
+                let is = |n: &str| n == p;
+                pattern_row(&is)
+                    .or_else(|| group_row(&is))
+                    .or_else(|| pattern_row(&close))
+                    .or_else(|| group_row(&close))
+            }
+            RowId::Group(key) => rows
+                .iter()
+                .position(|r| {
+                    matches!(*r, Row::Group { root }
+                        if matches!(self.roots.get(root), Some(Root::Group(g)) if g.key == *key))
+                })
+                .or_else(|| group_row(&exact))
+                .or_else(|| group_row(&close))
+                .or_else(|| pattern_row(&exact))
+                .or_else(|| pattern_row(&close)),
+        }
+    }
+}
+
+/// A Patterns row by identity, so the selection can follow it when the tree is rebuilt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowId {
+    /// A group, by its key ([`Group::key`]).
+    Group(String),
+    /// A pattern, by its name. Also a single pattern at the top level.
+    Pattern(String),
+}
+
+/// Segments and separators as pattern inference splits them: on `:` `/` `|` and `.`.
+fn inference_tokens(pattern: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, c) in pattern.char_indices() {
+        if SEPARATORS.contains(&c) || c == '.' {
+            out.push(&pattern[start..i]);
+            out.push(&pattern[i..i + 1]);
+            start = i + 1;
+        }
+    }
+    out.push(&pattern[start..]);
+    out
+}
+
+/// True when `a` and `b` are the same pattern except where one has `{var}` and the
+/// other a literal segment: what pattern inference merges once a segment has 20
+/// distinct values (`tenant.a1:cfg` and `tenant.{var}:cfg`). Equal patterns match too.
+pub fn same_up_to_var(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (ta, tb) = (inference_tokens(a), inference_tokens(b));
+    let literal = |t: &str| !t.is_empty() && !PLACEHOLDERS.contains(&t);
+    ta.len() == tb.len()
+        && ta
+            .iter()
+            .zip(&tb)
+            .all(|(x, y)| x == y || (*x == "{var}" && literal(y)) || (*y == "{var}" && literal(x)))
+}
+
+/// The collapsed groups of the Patterns view. A group starts expanded.
+///
+/// A collapse is remembered by the group's key and by its member patterns. When the
+/// tree is rebuilt (new partial results, the finished scan, another sort),
+/// [`Collapsed::reconcile`] keeps a group collapsed when
+///
+/// 1. its key was collapsed, whatever patterns it holds now; or
+/// 2. its key is new but one of its patterns is a member of a collapsed group whose
+///    key is gone, equal or up to `{var}` ([`same_up_to_var`]). This is a group whose
+///    key changed because a segment of its first part merged into `{var}`
+///    (`tenant.a1:*` and `tenant.a2:*` become `tenant.{var}:*`), or split back out.
+///
+/// A collapsed group that is gone, or dropped to a single pattern, stays remembered by
+/// key, so it is collapsed again if it comes back. One carried over by rule 2 is
+/// forgotten under its old key: expanding the new group expands it for good.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Collapsed {
+    /// Group key to the patterns it held when last seen.
+    groups: BTreeMap<String, Vec<String>>,
+}
+
+impl Collapsed {
+    pub fn contains(&self, key: &str) -> bool {
+        self.groups.contains_key(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.groups.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    pub fn collapse(&mut self, g: &Group, patterns: &[PatternStats]) {
+        let members = g
+            .children
+            .iter()
+            .filter_map(|&i| patterns.get(i).map(|p| p.pattern.clone()))
+            .collect();
+        self.groups.insert(g.key.clone(), members);
+    }
+
+    /// Expands the group `key`. False when it was not collapsed.
+    pub fn expand(&mut self, key: &str) -> bool {
+        self.groups.remove(key).is_some()
+    }
+
+    /// Applies the rules above to a rebuilt `tree`, and records each collapsed group's
+    /// patterns as they are now.
+    pub fn reconcile(&mut self, tree: &PatternTree, patterns: &[PatternStats]) {
+        if self.groups.is_empty() {
+            return;
+        }
+        let present: HashSet<&str> = tree.groups().map(|g| g.key.as_str()).collect();
+        let old = std::mem::take(&mut self.groups);
+        let mut carried: HashSet<&str> = HashSet::new();
+        for g in tree.groups() {
+            let members: Vec<String> = g
+                .children
+                .iter()
+                .filter_map(|&i| patterns.get(i).map(|p| p.pattern.clone()))
+                .collect();
+            let from: Vec<&str> = old
+                .iter()
+                .filter(|(k, _)| !present.contains(k.as_str()))
+                .filter(|(_, ms)| {
+                    ms.iter()
+                        .any(|m| members.iter().any(|n| same_up_to_var(m, n)))
+                })
+                .map(|(k, _)| k.as_str())
+                .collect();
+            if old.contains_key(&g.key) || !from.is_empty() {
+                carried.extend(from);
+                self.groups.insert(g.key.clone(), members);
+            }
+        }
+        for (k, ms) in &old {
+            if !present.contains(k.as_str()) && !carried.contains(k.as_str()) {
+                self.groups.insert(k.clone(), ms.clone());
+            }
+        }
     }
 }
 
@@ -402,7 +760,7 @@ mod tests {
             p("lock:{var}", KeyType::String, 1, 10),
         ];
         let tree = PatternTree::build(&pats, true);
-        let rows = tree.visible(&pats, &HashSet::new(), "CART");
+        let rows = tree.visible(&pats, &Collapsed::default(), "CART");
         assert_eq!(
             rows,
             vec![
@@ -413,6 +771,383 @@ mod tests {
                 }
             ]
         );
+    }
+
+    /// `keys` sampled and estimated, `bytes` in total, `no_ttl` of them without a TTL.
+    fn q(pattern: &str, keys: u64, bytes: Option<u64>, no_ttl: u64) -> PatternStats {
+        PatternStats {
+            sampled_bytes: bytes,
+            est_bytes: bytes,
+            no_ttl,
+            ..p(pattern, KeyType::String, keys, 0)
+        }
+    }
+
+    /// Each root's label (a group's label, or a pattern), with a group's children
+    /// indented under it.
+    fn order(tree: &PatternTree, pats: &[PatternStats]) -> Vec<String> {
+        let mut out = Vec::new();
+        for r in &tree.roots {
+            match r {
+                Root::Single(i) => out.push(pats[*i].pattern.clone()),
+                Root::Group(g) => {
+                    out.push(g.label.clone());
+                    out.extend(g.children.iter().map(|&i| format!("  {}", pats[i].pattern)));
+                }
+            }
+        }
+        out
+    }
+
+    /// A group `a:*` of three small children whose total beats the singles, and
+    /// singles that each beat every child on its own.
+    fn sortable() -> Vec<PatternStats> {
+        vec![
+            // keys, bytes, no TTL
+            q("big:{id}", 50, Some(5_000), 0), // avg 100, 0%
+            q("a:x", 30, Some(1_200), 30),     // avg 40, 100%
+            q("a:y", 20, Some(1_000), 5),      // avg 50, 25%
+            q("a:z", 10, Some(2_000), 0),      // avg 200, 0%
+            q("mid", 40, Some(4_000), 10),     // avg 100, 25%
+        ]
+    }
+
+    #[test]
+    fn sort_by_memory_groups_by_total_and_children_inside() {
+        let pats = sortable();
+        // big 5,000 > a:* 4,200 (summed) > mid 4,000; children by their own bytes.
+        assert_eq!(
+            order(
+                &PatternTree::build_sorted(&pats, true, SortBy::Memory),
+                &pats
+            ),
+            ["big:{id}", "a:*", "  a:z", "  a:x", "  a:y", "mid"]
+        );
+        // `build` is the memory sort.
+        assert_eq!(
+            PatternTree::build(&pats, true),
+            PatternTree::build_sorted(&pats, true, SortBy::Memory)
+        );
+    }
+
+    #[test]
+    fn sort_by_keys() {
+        let pats = sortable();
+        assert_eq!(
+            order(&PatternTree::build_sorted(&pats, true, SortBy::Keys), &pats),
+            ["a:*", "  a:x", "  a:y", "  a:z", "big:{id}", "mid"]
+        );
+    }
+
+    #[test]
+    fn sort_by_avg_size() {
+        let mut pats = sortable();
+        // Without sizes a pattern sorts after every one with them.
+        pats.push(q("nosize", 1000, None, 0));
+        assert_eq!(
+            order(
+                &PatternTree::build_sorted(&pats, true, SortBy::AvgSize),
+                &pats
+            ),
+            // big and mid tie at 100 and go by name; a:* is 4,200 / 60 = 70.
+            [
+                "big:{id}", "mid", "a:*", "  a:z", "  a:y", "  a:x", "nosize"
+            ]
+        );
+    }
+
+    #[test]
+    fn sort_by_no_ttl() {
+        let pats = sortable();
+        assert_eq!(
+            order(
+                &PatternTree::build_sorted(&pats, true, SortBy::NoTtl),
+                &pats
+            ),
+            // a:* is 35 / 60; mid 25%; big 0%. Children: 100%, 25%, 0%.
+            ["a:*", "  a:x", "  a:y", "  a:z", "mid", "big:{id}"]
+        );
+    }
+
+    #[test]
+    fn no_ttl_ratios_compare_exactly() {
+        // 1/3 against 333/1000: close as floats, different as fractions.
+        let pats = vec![q("b", 1000, None, 333), q("a", 3, None, 1)];
+        let tree = PatternTree::build_sorted(&pats, false, SortBy::NoTtl);
+        assert_eq!(order(&tree, &pats), ["a", "b"]);
+        // No sampled keys counts as 0%.
+        let pats = vec![q("z", 0, None, 0), q("y", 10, None, 1)];
+        let tree = PatternTree::build_sorted(&pats, false, SortBy::NoTtl);
+        assert_eq!(order(&tree, &pats), ["y", "z"]);
+    }
+
+    #[test]
+    fn sort_by_name_uses_group_labels() {
+        let pats = sortable();
+        assert_eq!(
+            order(&PatternTree::build_sorted(&pats, true, SortBy::Name), &pats),
+            ["a:*", "  a:x", "  a:y", "  a:z", "big:{id}", "mid"]
+        );
+    }
+
+    #[test]
+    fn ties_go_by_name() {
+        // Equal on every figure, given in reverse name order.
+        let pats = vec![
+            q("c:{id}", 5, Some(50), 1),
+            q("b:{id}:y", 5, Some(50), 1),
+            q("b:{id}:x", 5, Some(50), 1),
+            q("a:{id}", 10, Some(100), 2),
+        ];
+        for sort in [SortBy::Memory, SortBy::Keys, SortBy::AvgSize, SortBy::NoTtl] {
+            let tree = PatternTree::build_sorted(&pats, true, sort);
+            let got = order(&tree, &pats);
+            // a:{id} and b:{id}:* tie on memory and keys (10, 100) and on avg and no TTL.
+            assert_eq!(
+                got,
+                ["a:{id}", "b:{id}:*", "  b:{id}:x", "  b:{id}:y", "c:{id}"],
+                "{sort:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_sizes_memory_and_avg_sort_by_keys() {
+        let pats: Vec<PatternStats> = sortable()
+            .into_iter()
+            .map(|mut p| {
+                p.est_bytes = None;
+                p.sampled_bytes = None;
+                p
+            })
+            .collect();
+        let keys = PatternTree::build_sorted(&pats, false, SortBy::Keys);
+        assert_eq!(
+            PatternTree::build_sorted(&pats, false, SortBy::Memory),
+            keys
+        );
+        assert_eq!(
+            PatternTree::build_sorted(&pats, false, SortBy::AvgSize),
+            keys
+        );
+        assert_eq!(PatternTree::build(&pats, false), keys);
+    }
+
+    #[test]
+    fn sort_cycles() {
+        let cycle = |sizes: bool| {
+            let mut s = SortBy::default();
+            let mut seen = vec![s.effective(sizes)];
+            for _ in 0..5 {
+                s = s.next(sizes);
+                seen.push(s.effective(sizes));
+            }
+            seen
+        };
+        use SortBy::*;
+        assert_eq!(cycle(true), [Memory, Keys, AvgSize, NoTtl, Name, Memory]);
+        // Without sizes memory and avg size are skipped; memory starts as keys.
+        assert_eq!(cycle(false), [Keys, NoTtl, Name, Keys, NoTtl, Name]);
+        assert_eq!(AvgSize.next(false), NoTtl);
+        assert!(Name.ascending() && !Memory.ascending());
+        assert_eq!(NoTtl.label(), "no-TTL %");
+    }
+
+    #[test]
+    fn var_matching() {
+        assert!(same_up_to_var("tenant.a1:cfg", "tenant.{var}:cfg"));
+        assert!(same_up_to_var("cfg:{var}:flags", "cfg:blue:flags"));
+        assert!(same_up_to_var("p:{var}:{var}:{id}", "p:a1x:b2x:{id}"));
+        assert!(same_up_to_var("a:b", "a:b"));
+        // A placeholder is not a literal that {var} stands for.
+        assert!(!same_up_to_var("cfg:{var}:flags", "cfg:{id}:flags"));
+        assert!(!same_up_to_var("cfg:a:flags", "cfg:b:flags"));
+        assert!(!same_up_to_var("cfg:{var}", "cfg:{var}:x"));
+        assert!(!same_up_to_var("cfg:{var}", "cfg/a"));
+    }
+
+    fn names(v: &[&str]) -> Vec<PatternStats> {
+        v.iter()
+            .enumerate()
+            .map(|(i, n)| q(n, 100 - i as u64, None, 0))
+            .collect()
+    }
+
+    /// `collapsed` after collapsing the group `key` of `before`, then rebuilding from
+    /// `after`.
+    fn carry(
+        before: &[&str],
+        key: &str,
+        after: &[&str],
+    ) -> (Collapsed, PatternTree, Vec<PatternStats>) {
+        let pats = names(before);
+        let tree = PatternTree::build(&pats, false);
+        let mut c = Collapsed::default();
+        let g = tree.groups().find(|g| g.key == key).unwrap();
+        c.collapse(g, &pats);
+        let pats = names(after);
+        let tree = PatternTree::build(&pats, false);
+        c.reconcile(&tree, &pats);
+        (c, tree, pats)
+    }
+
+    #[test]
+    fn collapse_kept_when_the_group_gains_or_loses_members() {
+        let (c, ..) = carry(
+            &["user:{id}:cart", "user:{id}:feed"],
+            "user",
+            &["user:{id}:cart", "user:{id}:feed", "user:{id}:profile"],
+        );
+        assert!(c.contains("user"));
+        let (c, ..) = carry(
+            &["user:{id}:cart", "user:{id}:feed", "user:{id}:profile"],
+            "user",
+            &["user:{id}:cart", "user:{id}:profile"],
+        );
+        assert!(c.contains("user"));
+    }
+
+    #[test]
+    fn a_single_that_gains_a_sibling_starts_expanded() {
+        let pats = names(&["user:{id}:cart", "lock:{var}"]);
+        let tree = PatternTree::build(&pats, false);
+        assert!(tree.groups().next().is_none());
+        let mut c = Collapsed::default();
+        let pats = names(&["user:{id}:cart", "user:{id}:feed", "lock:{var}"]);
+        let tree = PatternTree::build(&pats, false);
+        c.reconcile(&tree, &pats);
+        assert!(!c.contains("user"));
+        assert_eq!(tree.visible(&pats, &c, "").len(), 4);
+    }
+
+    #[test]
+    fn a_group_that_drops_to_a_single_is_remembered_by_key() {
+        // Twenty values merge the two children into one {var} pattern: no group.
+        let (mut c, tree, _) = carry(
+            &["cfg:blue:flags", "cfg:red:flags"],
+            "cfg",
+            &["cfg:{var}:flags"],
+        );
+        assert!(tree.groups().next().is_none());
+        assert!(c.contains("cfg"));
+        // When it is a group again, it is collapsed again.
+        let pats2 = names(&["cfg:{var}:flags", "cfg:{var}:rules"]);
+        let tree2 = PatternTree::build(&pats2, false);
+        c.reconcile(&tree2, &pats2);
+        assert!(c.contains("cfg"));
+        assert_eq!(tree2.visible(&pats2, &c, "").len(), 1);
+    }
+
+    #[test]
+    fn a_group_whose_key_changes_through_var_stays_collapsed() {
+        // `tenant.a1` and its siblings merge into `tenant.{var}` once 20 values show.
+        let (c, tree, pats) = carry(
+            &[
+                "tenant.a1:cfg",
+                "tenant.a1:flags",
+                "tenant.a2:cfg",
+                "tenant.a2:flags",
+            ],
+            "tenant.a1",
+            &["tenant.{var}:cfg", "tenant.{var}:flags"],
+        );
+        assert!(c.contains("tenant.{var}"));
+        // Carried over: the old key is forgotten.
+        assert!(!c.contains("tenant.a1"));
+        assert_eq!(c.len(), 1);
+        assert_eq!(tree.visible(&pats, &c, "").len(), 1);
+        // And back (a new scan that has seen fewer values): both splits are collapsed.
+        let mut c = c;
+        let pats = names(&[
+            "tenant.a1:cfg",
+            "tenant.a1:flags",
+            "tenant.a2:cfg",
+            "tenant.a2:flags",
+        ]);
+        let tree = PatternTree::build(&pats, false);
+        c.reconcile(&tree, &pats);
+        assert!(c.contains("tenant.a1") && c.contains("tenant.a2"));
+        assert!(!c.contains("tenant.{var}"));
+    }
+
+    #[test]
+    fn expanding_a_carried_group_forgets_it() {
+        let (mut c, ..) = carry(
+            &["tenant.a1:cfg", "tenant.a1:flags"],
+            "tenant.a1",
+            &["tenant.{var}:cfg", "tenant.{var}:flags"],
+        );
+        assert!(c.expand("tenant.{var}"));
+        assert!(c.is_empty());
+        assert!(!c.expand("tenant.{var}"));
+        let pats = names(&["tenant.a1:cfg", "tenant.a1:flags"]);
+        let tree = PatternTree::build(&pats, false);
+        c.reconcile(&tree, &pats);
+        assert!(!c.contains("tenant.a1"));
+    }
+
+    #[test]
+    fn an_unrelated_new_group_starts_expanded() {
+        let (c, ..) = carry(
+            &["cfg:blue:flags", "cfg:red:flags"],
+            "cfg",
+            &["cfg:{var}:flags", "job:{id}:a", "job:{id}:b"],
+        );
+        assert!(!c.contains("job"));
+        assert!(c.contains("cfg"));
+    }
+
+    #[test]
+    fn find_follows_rows_by_identity() {
+        let pats = names(&[
+            "user:{id}:cart",
+            "user:{id}:feed",
+            "lock:{var}",
+            "tenant.{var}:x",
+            "tenant.{var}:y",
+        ]);
+        let tree = PatternTree::build(&pats, false);
+        let mut c = Collapsed::default();
+        let rows = tree.visible(&pats, &c, "");
+        let at = |id: RowId, members: &[&str], rows: &[Row]| {
+            let members: Vec<String> = members.iter().map(|m| m.to_string()).collect();
+            tree.find(&pats, rows, &id, &members)
+                .map(|i| tree.row_id(&pats, rows[i]).unwrap())
+        };
+        let pat = |n: &str| RowId::Pattern(n.into());
+        let grp = |n: &str| RowId::Group(n.into());
+        // The pattern itself.
+        assert_eq!(
+            at(pat("user:{id}:feed"), &["user:{id}:feed"], &rows),
+            Some(pat("user:{id}:feed"))
+        );
+        // A group by key.
+        assert_eq!(at(grp("user"), &[], &rows), Some(grp("user")));
+        // A pattern inside a collapsed group: the group.
+        let g = tree.groups().find(|g| g.key == "user").unwrap().clone();
+        c.collapse(&g, &pats);
+        let folded = tree.visible(&pats, &c, "");
+        assert_eq!(
+            at(pat("user:{id}:feed"), &["user:{id}:feed"], &folded),
+            Some(grp("user"))
+        );
+        // A pattern that merged into {var}.
+        assert_eq!(
+            at(pat("tenant.b7:y"), &["tenant.b7:y"], &rows),
+            Some(pat("tenant.{var}:y"))
+        );
+        // A group whose key changed through {var}.
+        assert_eq!(
+            at(grp("tenant.b7"), &["tenant.b7:x", "tenant.b7:y"], &rows),
+            Some(grp("tenant.{var}"))
+        );
+        // A group that dropped to a single pattern.
+        assert_eq!(
+            at(grp("lock"), &["lock:{var}"], &rows),
+            Some(pat("lock:{var}"))
+        );
+        // Gone.
+        assert_eq!(at(pat("gone:{id}"), &["gone:{id}"], &rows), None);
     }
 
     #[test]

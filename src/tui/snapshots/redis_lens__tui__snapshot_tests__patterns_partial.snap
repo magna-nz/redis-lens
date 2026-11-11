@@ -6,7 +6,7 @@ expression: t.backend()
 " Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   ⠋ Sampled 3,200 / 100,000                                   "
 "  0 Connections   1 Patterns   2 TTL   3 Diff   4 Hot keys                                                              "
 "┌─ Patterns ─────────────────────────────────────── partial · 3,200 / 100,000 sampled · 8 patterns · sorted by memory ─┐"
-"│ PATTERN                                              TYPE       KEYS   MEMORY  SHARE             %      AVG  NO TTL  │"
+"│ PATTERN                                              TYPE       KEYS   MEMORY▼ SHARE             %      AVG  NO TTL  │"
 "│   session:{uuid}                                     string    1.84M     6.1G  ██████▌░░░░░░░  46%     3.5K      0%  │"
 "│ ▾ cache:*                                            string    1.34M     3.6G  ███▉░░░░░░░░░░  27%     2.8K     10%  │"
 "│     cache:search:{hash}                              string    1.12M     2.2G  ██▍░░░░░░░░░░░  17%     2.1K   ▲ 12%  │"
