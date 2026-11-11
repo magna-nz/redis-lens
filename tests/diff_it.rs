@@ -205,6 +205,49 @@ async fn diff_finds_causes_on_redis_and_valkey() {
     }
 }
 
+/// `scan --save --keep 2` three times: the oldest snapshot goes, the two newest stay,
+/// and another profile's snapshot in the same directory is untouched.
+#[tokio::test]
+async fn save_with_keep_prunes_old_snapshots() {
+    for server in [common::redis().await, common::valkey().await] {
+        let mut admin = server.admin().await;
+        for i in 0..20 {
+            set(&mut admin, format!("keep:{i}"), "v".to_string()).await;
+        }
+        let config = temp_config(server.port);
+        let dir = temp_dir("diff-it-keep");
+        let secrets = MemoryStore::default();
+        let mut other = report(&config, &secrets, &scan_args(false), None)
+            .await
+            .unwrap()
+            .0;
+        other.profile = "someone-else".to_string();
+        other.taken_at_unix -= 86_400;
+        snapshot::save(&dir, &other).unwrap();
+
+        let mut args = scan_args(true);
+        args.keep = Some(2);
+        let mut saved = Vec::new();
+        for n in 0..3 {
+            if n > 0 {
+                // Snapshots are named by the second.
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+            }
+            let (r, _) = report(&config, &secrets, &args, None).await.unwrap();
+            saved.push(save_if_requested(&dir, &args, &r).unwrap().unwrap());
+        }
+        let left: Vec<PathBuf> = snapshot::list(&dir, "it")
+            .unwrap()
+            .into_iter()
+            .map(|i| i.path)
+            .collect();
+        assert_eq!(left, [saved[2].clone(), saved[1].clone()]);
+        assert!(!saved[0].exists(), "{} was kept", saved[0].display());
+        assert_eq!(snapshot::list(&dir, "someone-else").unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[tokio::test]
 async fn hot_keys_with_lfu_redis() {
     hot_keys_with_lfu(common::redis_with(&["--maxmemory-policy", "allkeys-lfu"]).await).await;
