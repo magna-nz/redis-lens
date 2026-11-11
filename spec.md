@@ -18,7 +18,7 @@ A terminal UI that answers "what is using the memory in this Redis or Valkey, an
 
 ## Views
 
-The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move, `→←` to expand and collapse, `/` to filter, `s` to snapshot and `q` to quit. Narrow terminals scroll horizontally rather than wrapping.
+The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move, `→←` to expand and collapse, `/` to filter, `s` to snapshot and `q` to quit. Narrow terminals never wrap: names are shortened with `…`, and a row too wide for the terminal is cut at the right edge. On the selected row, text that doesn't fit its column scrolls across: it rests for 1 s, scrolls about 5 columns a second until its end is visible, holds 1 s and starts again; moving the selection or switching views restarts it.
 
 ### 0 Connections
 - Lists saved profiles and the Redis or Valkey containers found in Docker.

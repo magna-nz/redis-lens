@@ -46,6 +46,7 @@ Integration branch `wave7/fixes` (worktree `.claude/worktrees/wave7`, from main 
 | B | Keychain calls give up after 15 s (`SecretError::Timeout`, "Always Allow" on macOS); `discover` probes with a credential-less `PING` (none / required / unknown); tests: URL-password warning, `--ask-password`, `--config` and `REDIS_LENS_CONFIG` (`tests/cli_config.rs`), `conn test`, the spec's `lens-ro` ACL line (Redis 6.2, 7.4, Valkey 8.1) | implementer [sonnet] | `wave7/conn` | **done** (ff681cd), merged |
 | C | Bundled roots as an explicit store from `webpki-root-certs` 1.0.9; Windows trusts the OS store plus the bundle (N4); D2 (exact store sizes, Cargo.lock pin on redis 1.8.1), D3 (bundle non-empty, holds ISRG Root X1), D4 reduced to one fallback; `tests/os_trust.rs` plus a CI step that installs a throwaway CA in the OS store on macOS, Windows and Ubuntu | implementer [opus] | `wave7/tls` | **done** (2a4196c), merged. The CI trust-store step runs for the first time on the PR |
 | D | Limiter pacing (virtual clock, plus a rate lower bound over the fake), `--max-rate` into `ScanOptions` for `scan` and `diff`, SCAN deduplication | implementer [sonnet] | `wave7/scan` | **done** (21e8dbb), merged |
+| M | Selected row's overflowing text scrolls across (`ui::widgets::marquee`), restarted on selection change; narrow-width test. Owner-approved after the horizontal-scroll finding | implementer [sonnet] | `wave7/marquee` | in progress |
 | V | Verifier on the merged `wave7/fixes` | verifier [opus] | pinned detached worktree | pending |
 
 **Test gaps from wave 6, and where each is covered now:**
@@ -62,7 +63,7 @@ Integration branch `wave7/fixes` (worktree `.claude/worktrees/wave7`, from main 
 - `conn test`: `conn_it::conn_test_*`. `lens-ro` line: `conn_it::spec_minimal_read_only_user_can_connect_check_and_scan`.
 - Per-OS trust store: `tests/os_trust.rs` (runs in CI's unit-test job on three OSes; skipped locally).
 - Real keychain: `secrets::tests::keyring_store_round_trip` stays `#[ignore]`, because it needs a person to answer the keychain prompts. The timeout around it is tested with a blocking fake (`secrets::tests::with_timeout_*`).
-- Horizontal scrolling: not implemented (see Known issues); waiting for the owner.
+- Horizontal scrolling: the owner chose not to build it (counter-intuitive in a TUI, and `←`/`→` expand and collapse). The spec now describes truncation, and the selected row's overflowing text scrolls across (part M below). Covered by the narrow-width and marquee tests.
 
 **Coverage (`make coverage`, unit + integration, 2026-11-11 at 208156d):** 93.48% of lines (wave 6: 92.6%). All tests pass: 291 unit, cli_config 4, conn 25, diff 4, os_trust 2 (skipped locally), replica 11, scan_cli 5, scan 15, smoke 3, tls 6; the integration tests also pass with `REDIS_LENS_IT_REDIS_IMAGE=redis:6.2-alpine`. Lowest: `cli/mod.rs` 59% (clap dispatch), `tui/mod.rs` 63% (terminal event loop; was 52%), `secrets.rs` 71% (the real keychain, an ignored test), `tui/ui/connections.rs` 82%.
 
@@ -158,7 +159,7 @@ See the overnight table above.
 - Agent worktrees made by the harness branch from `main`, not the current branch, so create them by hand.
 - **Entra ID** is implemented behind `--features entra-id`, using redis-rs's `EntraIdCredentialsProvider::new_developer_tools()` (az login and other developer tools). It is untested against real Azure, and managed identity isn't covered yet.
 - `discover` shows the demo Redis as auth "required" (since wave 7; it was "none"), because its passwords live in an ACL file discovery can't see. Save it as a profile instead (`make demo-profiles`).
-- **Horizontal scrolling is not implemented**, although the spec's Views section says narrow terminals scroll horizontally. Rows are drawn at fixed column widths and cut off at the right edge; nothing wraps, but there is no scroll offset or key. Found in wave 7.
+- Narrow terminals: rows are drawn at fixed column widths and cut off at the right edge (the spec said "scroll horizontally" until wave 7; the owner chose truncation plus scrolling text on the selected row). Hiding low-priority columns at narrow widths is a candidate for the usability wave.
 - For Redis ACL rules passed as server arguments, use one argument per word (`tests/common/mod.rs`).
 - `ParsedConnection.credentials` is `Some` with an empty password when a URL has a username but no password, so `conn add` can ask for `--password-stdin` or `--ask-password`.
 
