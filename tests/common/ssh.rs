@@ -113,10 +113,16 @@ impl SshBastion {
             .start()
             .await
             .expect("start the sshd container (is Docker running?)");
-        let port = container
-            .get_host_port_ipv4(SSH_PORT.tcp())
-            .await
-            .expect("mapped ssh port");
+        // Under load Docker can report a started container before its port mapping:
+        // ask again for a few seconds.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let port = loop {
+            match container.get_host_port_ipv4(SSH_PORT.tcp()).await {
+                Ok(p) => break p,
+                Err(e) if Instant::now() >= deadline => panic!("mapped ssh port: {e}"),
+                Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
+        };
         wait_for_banner(port).await;
         let mut exec = container
             .exec(
@@ -134,6 +140,16 @@ impl SshBastion {
             network: network.to_string(),
             container,
         }
+    }
+
+    /// The bastion's address on its network: how a server in its namespace is reached
+    /// from the bastion without going through its loopback.
+    pub async fn ip(&self) -> String {
+        self.container
+            .get_bridge_ip_address()
+            .await
+            .expect("the bastion's network address")
+            .to_string()
     }
 
     /// The container's ID, to start servers in its network namespace.

@@ -125,14 +125,44 @@ impl Route {
 pub struct Connection {
     conn: MultiplexedConnection,
     _route: Arc<Route>,
+    /// An `INFO server` reply this connection already received, kept to answer the next
+    /// `INFO server` instead of sending it again (see [`Self::keep_info_server`]).
+    /// Shared by clones; taken once.
+    info_server: Arc<std::sync::Mutex<Option<(std::time::Instant, redis::Value)>>>,
 }
+
+/// How long a kept `INFO server` reply may answer the next `INFO server`.
+const INFO_SERVER_REUSE: Duration = Duration::from_secs(10);
 
 impl Connection {
     fn new(conn: MultiplexedConnection, route: &Arc<Route>) -> Self {
         Self {
             conn,
             _route: Arc::clone(route),
+            info_server: Arc::default(),
         }
+    }
+
+    /// Keep `reply`, an `INFO server` reply just read on this connection, so that the
+    /// next `INFO server` sent through it (within [`INFO_SERVER_REUSE`]) is answered
+    /// with it and not sent. Cluster detection reads `INFO server`, and the scan's first
+    /// command is `INFO server` again: this saves the server one command per scan.
+    fn keep_info_server(&self, reply: redis::Value) {
+        *self
+            .info_server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((std::time::Instant::now(), reply));
+    }
+
+    /// The kept reply, when `cmd` is `INFO server` and the reply is fresh (see
+    /// [`take_kept_info`]).
+    fn take_info_server(&self, cmd: &redis::Cmd) -> Option<redis::Value> {
+        let mut kept = self
+            .info_server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        take_kept_info(&mut kept, cmd, std::time::Instant::now())
     }
 
     /// The bare connection. Only for direct routes: through SSH the forward closes once
@@ -140,6 +170,25 @@ impl Connection {
     pub fn into_inner(self) -> MultiplexedConnection {
         self.conn
     }
+}
+
+/// Take the kept `INFO server` reply when `cmd` is `INFO server` and the reply is at
+/// most [`INFO_SERVER_REUSE`] old at `now`: it answers one command at most. A stale
+/// reply is dropped; any other command leaves a fresh one in place.
+fn take_kept_info(
+    kept: &mut Option<(std::time::Instant, redis::Value)>,
+    cmd: &redis::Cmd,
+    now: std::time::Instant,
+) -> Option<redis::Value> {
+    let at = kept.as_ref()?.0;
+    if now.saturating_duration_since(at) > INFO_SERVER_REUSE {
+        *kept = None;
+        return None;
+    }
+    if !is_info_server(cmd) {
+        return None;
+    }
+    kept.take().map(|(_, v)| v)
 }
 
 /// Says only which kind of route the connection uses: nothing about the server, the
@@ -167,11 +216,27 @@ impl std::ops::DerefMut for Connection {
     }
 }
 
+/// `cmd` is exactly `INFO server` (any case).
+fn is_info_server(cmd: &redis::Cmd) -> bool {
+    let mut args = cmd.args_iter().map(|a| match a {
+        redis::Arg::Simple(b) => Some(b),
+        _ => None,
+    });
+    matches!(
+        (args.next(), args.next(), args.next()),
+        (Some(Some(a)), Some(Some(b)), None)
+            if a.eq_ignore_ascii_case(b"INFO") && b.eq_ignore_ascii_case(b"server")
+    )
+}
+
 impl ConnectionLike for Connection {
     fn req_packed_command<'a>(
         &'a mut self,
         cmd: &'a redis::Cmd,
     ) -> redis::RedisFuture<'a, redis::Value> {
+        if let Some(reply) = self.take_info_server(cmd) {
+            return Box::pin(async move { Ok(reply) });
+        }
         self.conn.req_packed_command(cmd)
     }
 
@@ -629,18 +694,30 @@ async fn connect_for_scan_with(
     route: &Arc<Route>,
     auth: &ResolvedAuth,
 ) -> Result<(Connection, ScanTarget), ConnError> {
-    let mut primary = auth.open(route, &profile.endpoint).await?;
+    let primary = auth.open(route, &profile.endpoint).await?;
     if !profile.prefer_replica {
         return Ok((primary, ScanTarget::Primary));
     }
-    let fallback = |c, why: String| Ok((c, ScanTarget::PrimaryFallback(why)));
+    Ok(replica_step(profile, route, auth, primary).await)
+}
+
+/// The `prefer_replica` step of [`connect_for_scan`] on an open connection to the
+/// profile's own server (`primary`), which it reuses: returned as is when it is already
+/// a replica, or as the fallback; otherwise the verified replica's connection.
+async fn replica_step(
+    profile: &Profile,
+    route: &Arc<Route>,
+    auth: &ResolvedAuth,
+    mut primary: Connection,
+) -> (Connection, ScanTarget) {
+    let fallback = |c, why: String| (c, ScanTarget::PrimaryFallback(why));
     let info = match info_replication(&mut primary).await {
         Ok(i) => i,
         Err(e) => return fallback(primary, format!("INFO replication: {}", server_message(&e))),
     };
     match parse_replication(&info) {
-        Replication::Replica => Ok((primary, ScanTarget::Replica(profile.endpoint.clone()))),
-        Replication::Unknown => Ok((primary, ScanTarget::Primary)),
+        Replication::Replica => (primary, ScanTarget::Replica(profile.endpoint.clone())),
+        Replication::Unknown => (primary, ScanTarget::Primary),
         Replication::Master { online } => {
             let Some((host, port)) = online.into_iter().next() else {
                 return fallback(primary, "no online replica".to_string());
@@ -667,7 +744,7 @@ async fn connect_for_scan_with(
             let attempt =
                 verified_replica(auth, route, profile.db, &profile.endpoint, &replid, &ep);
             match tokio::time::timeout(REPLICA_TIMEOUT, attempt).await {
-                Ok(Ok(c)) => Ok((c, ScanTarget::Replica(ep))),
+                Ok(Ok(c)) => (c, ScanTarget::Replica(ep)),
                 Ok(Err(why)) => fallback(primary, unusable_reason(&ep, why, route.is_ssh())),
                 Err(_) => fallback(primary, format!("{ep}: timed out")),
             }
@@ -1120,6 +1197,315 @@ mod tests {
                 .any(|a| a.ends_with(":replica.invalid:6380"))
         );
         assert!(fake.accepts(pids[1]) >= 2);
+    }
+
+    /// A minimal RESP server for tests: answers `INFO <section>` from `info` (an empty
+    /// text for a section it doesn't have) and `+OK` to anything else, and records every
+    /// connection and command.
+    struct FakeServer {
+        addr: SocketAddr,
+        connections: Arc<std::sync::atomic::AtomicUsize>,
+        commands: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeServer {
+        async fn start(info: &[(&str, String)]) -> Self {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let info: Arc<Vec<(String, String)>> = Arc::new(
+                info.iter()
+                    .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+                    .collect(),
+            );
+            let (conns, cmds) = (Arc::clone(&connections), Arc::clone(&commands));
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (cmds, info) = (Arc::clone(&cmds), Arc::clone(&info));
+                    tokio::spawn(async move {
+                        let mut s = tokio::io::BufReader::new(stream);
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            if s.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let Some(n) = line.trim().strip_prefix('*') else {
+                                return;
+                            };
+                            let mut args = Vec::new();
+                            for _ in 0..n.parse::<usize>().unwrap_or(0) {
+                                line.clear();
+                                s.read_line(&mut line).await.unwrap();
+                                let len: usize = line.trim()[1..].parse().unwrap();
+                                let mut buf = vec![0; len + 2];
+                                s.read_exact(&mut buf).await.unwrap();
+                                args.push(String::from_utf8_lossy(&buf[..len]).into_owned());
+                            }
+                            cmds.lock().unwrap().push(args.join(" "));
+                            let reply = if args[0].eq_ignore_ascii_case("INFO") {
+                                let section = args.get(1).map(|a| a.to_ascii_lowercase());
+                                let text = info
+                                    .iter()
+                                    .find(|(k, _)| Some(k) == section.as_ref())
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or_default();
+                                format!("${}\r\n{text}\r\n", text.len())
+                            } else {
+                                "+OK\r\n".to_string()
+                            };
+                            if s.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                addr,
+                connections,
+                commands,
+            }
+        }
+
+        fn connections(&self) -> usize {
+            self.connections.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn count(&self, cmd: &str) -> usize {
+            let cmds = self.commands.lock().unwrap();
+            cmds.iter().filter(|c| c.eq_ignore_ascii_case(cmd)).count()
+        }
+    }
+
+    const STANDALONE: &str = "# Server\r\nredis_version:7.4.0\r\nredis_mode:standalone\r\n";
+
+    /// A primary at a fake server announcing one online replica at `replica_port`, and
+    /// that replica.
+    async fn fake_pair() -> (FakeServer, FakeServer) {
+        let replica = FakeServer::start(&[
+            ("server", STANDALONE.to_string()),
+            (
+                "replication",
+                "role:slave\r\nmaster_host:127.0.0.1\r\nmaster_replid:abc123\r\n".into(),
+            ),
+        ])
+        .await;
+        let primary = FakeServer::start(&[
+            ("server", STANDALONE.to_string()),
+            (
+                "replication",
+                format!(
+                    "role:master\r\nslave0:ip=127.0.0.1,port={},state=online,offset=1,lag=0\r\nmaster_replid:abc123\r\n",
+                    replica.addr.port()
+                ),
+            ),
+        ])
+        .await;
+        (primary, replica)
+    }
+
+    fn fake_profile(port: u16, prefer_replica: bool) -> Profile {
+        let mut p = ssh::tests::profile(None);
+        p.endpoint = ep("127.0.0.1", port, false);
+        p.prefer_replica = prefer_replica;
+        p
+    }
+
+    #[test]
+    fn a_kept_info_server_reply_answers_one_info_server_while_fresh() {
+        use std::time::Instant;
+        let now = Instant::now();
+        let reply = redis::Value::BulkString(b"redis_version:7.4.0".to_vec());
+        let info = |section: &str| redis::cmd("INFO").arg(section).clone();
+        let mut kept = Some((now, reply.clone()));
+        // Other commands pass through and leave it.
+        assert_eq!(take_kept_info(&mut kept, &info("memory"), now), None);
+        assert_eq!(take_kept_info(&mut kept, &redis::cmd("INFO"), now), None);
+        assert_eq!(
+            take_kept_info(&mut kept, redis::cmd("INFO").arg("server").arg("x"), now),
+            None
+        );
+        assert_eq!(take_kept_info(&mut kept, &redis::cmd("PING"), now), None);
+        assert!(kept.is_some());
+        // One INFO server, in any case, gets it; the next goes to the server.
+        let later = now + INFO_SERVER_REUSE;
+        assert_eq!(
+            take_kept_info(&mut kept, redis::cmd("info").arg("SERVER"), later),
+            Some(reply.clone())
+        );
+        assert_eq!(take_kept_info(&mut kept, &info("server"), later), None);
+        // Too old: dropped, and the command goes to the server.
+        let mut stale = Some((now, reply));
+        let too_late = now + INFO_SERVER_REUSE + Duration::from_millis(1);
+        assert_eq!(take_kept_info(&mut stale, &info("server"), too_late), None);
+        assert!(stale.is_none());
+    }
+
+    /// Through a real connection: the kept reply is answered without reaching the
+    /// server, once, and only for `INFO server`.
+    #[tokio::test]
+    async fn a_connection_answers_the_kept_info_server_without_sending_it() {
+        let server = FakeServer::start(&[("server", STANDALONE.to_string())]).await;
+        let p = fake_profile(server.addr.port(), false);
+        let mut c = connect(&p, &crate::secrets::MemoryStore::default())
+            .await
+            .unwrap();
+        c.keep_info_server(redis::Value::BulkString(b"kept".to_vec()));
+        let clone = c.clone();
+        let first: String = redis::cmd("INFO")
+            .arg("memory")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(first, "");
+        let kept: String = redis::cmd("INFO")
+            .arg("server")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(kept, "kept");
+        assert_eq!(server.count("INFO server"), 0);
+        // Taken: a clone shares it, so it is gone there too.
+        let mut clone = clone;
+        let fresh: String = redis::cmd("INFO")
+            .arg("server")
+            .query_async(&mut clone)
+            .await
+            .unwrap();
+        assert_eq!(fresh, STANDALONE);
+        assert_eq!(server.count("INFO server"), 1);
+    }
+
+    /// A standalone `prefer_replica` scan through `connect_targets` connects to the
+    /// primary once (the replica step reuses the seed), and the `INFO server` it reads
+    /// to tell a cluster apart is the scan's own.
+    #[tokio::test]
+    async fn connect_targets_opens_a_standalone_primary_once() {
+        use crate::secrets::MemoryStore;
+        let (primary, replica) = fake_pair().await;
+        let p = fake_profile(primary.addr.port(), true);
+        let targets = cluster::connect_targets(&p, &MemoryStore::default())
+            .await
+            .unwrap();
+        let cluster::ScanTargets::Single { target, .. } = &targets else {
+            panic!("a standalone server was taken for a cluster");
+        };
+        assert_eq!(
+            target,
+            &ScanTarget::Replica(ep("127.0.0.1", replica.addr.port(), false))
+        );
+        assert_eq!(primary.connections(), 1, "{:?}", primary.commands);
+        assert_eq!(primary.count("INFO server"), 1);
+        assert_eq!(primary.count("INFO replication"), 1);
+
+        // Scanned on the seed itself: its first INFO server is answered from detection.
+        let (primary, _replica) = fake_pair().await;
+        let p = fake_profile(primary.addr.port(), false);
+        let mut targets = cluster::connect_targets(&p, &MemoryStore::default())
+            .await
+            .unwrap();
+        let cluster::ScanTargets::Single { conn, target } = &mut targets else {
+            panic!("a standalone server was taken for a cluster");
+        };
+        assert_eq!(target, &ScanTarget::Primary);
+        let info: String = redis::cmd("INFO")
+            .arg("server")
+            .query_async(conn)
+            .await
+            .unwrap();
+        assert_eq!(info, STANDALONE);
+        assert_eq!(primary.connections(), 1);
+        assert_eq!(
+            primary.count("INFO server"),
+            1,
+            "detection and the scan's, once"
+        );
+    }
+
+    /// Behind SSH, the replica's forward is started before the 2 s replica timeout:
+    /// with a bastion that takes longer than that to log in, the replica is still used.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slow_replica_forward_is_started_before_the_replica_timeout() {
+        use crate::secrets::MemoryStore;
+        // A fake ssh that waits `delay` before it listens, then proxies every
+        // connection to the `-L` target.
+        const SLOW_PROXY: &str = r#"
+use strict; use warnings; use IO::Socket::INET; use IO::Select;
+my $delay = shift @ARGV;
+my ($spec) = map { $ARGV[$_ + 1] } grep { $ARGV[$_] eq '-L' } 0 .. $#ARGV;
+my (undef, $port, $th, $tp) = split /:/, $spec;
+select(undef, undef, undef, $delay);
+my $l = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => $port, Listen => 16, ReuseAddr => 1) or exit 255;
+$SIG{CHLD} = 'IGNORE';
+while (my $c = $l->accept) {
+  my $pid = fork();
+  if (defined $pid && $pid == 0) {
+    my $up = IO::Socket::INET->new(PeerAddr => $th, PeerPort => $tp) or exit 0;
+    my $sel = IO::Select->new($c, $up);
+    while (my @r = $sel->can_read) {
+      for my $fh (@r) {
+        my $n = sysread($fh, my $buf, 65536);
+        exit 0 unless $n;
+        syswrite($fh == $c ? $up : $c, $buf) or exit 0;
+      }
+    }
+    exit 0;
+  }
+  close $c;
+}
+"#;
+        let dir = std::env::temp_dir().join(format!(
+            "redis-lens-slow-ssh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("slow-ssh.pl");
+        std::fs::write(&script, SLOW_PROXY).unwrap();
+        let delay = REPLICA_TIMEOUT + Duration::from_millis(500);
+
+        let (primary, replica) = fake_pair().await;
+        let p = fake_profile(primary.addr.port(), true);
+        let t = ssh::tests::tunnel("b.example");
+        let bastion = ssh::Bastion::new(
+            &ssh::tests::profile(Some(t.clone())),
+            &t,
+            &MemoryStore::default(),
+        )
+        .unwrap()
+        .with_launcher(
+            vec![
+                "perl".into(),
+                script.clone().into(),
+                format!("{}", delay.as_secs_f64()).into(),
+            ],
+            ssh::READY_TIMEOUT,
+        );
+        let route = Arc::new(Route::Ssh(bastion));
+        let auth = ResolvedAuth::new(&p, &MemoryStore::default())
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let (c, target) = connect_for_scan_with(&p, &route, &auth).await.unwrap();
+        assert_eq!(
+            target,
+            ScanTarget::Replica(ep("127.0.0.1", replica.addr.port(), false)),
+            "the replica's forward was cut short by the replica timeout"
+        );
+        // Both forwards really took longer than the replica timeout to start.
+        assert!(started.elapsed() >= delay * 2);
+        assert!(replica.count("INFO replication") >= 1);
+        drop(c);
+        drop(route);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
