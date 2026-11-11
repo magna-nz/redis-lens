@@ -30,6 +30,7 @@ The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move,
 ### 1 Patterns
 - Key patterns sorted by estimated memory. Each row shows the pattern, type, estimated keys, estimated memory, share bar, average size, percentage with no TTL, and the change since the last snapshot.
 - Child patterns group under their shared prefix and can be expanded or collapsed.
+- While a scan runs, the view shows partial results aggregated from the keys sampled so far (no extra server commands, at most four updates a second), marked `partial · N / M sampled` in the title and without the Δ column. The finished scan replaces them; a failed or cancelled scan clears them. The TTL, Diff and Hot keys views wait for the finished scan. `s` never saves partial results: it says to wait for the scan to finish.
 - The detail panel shows up to five example keys with their sizes and TTLs, a size distribution (p50, p99, max), a TTL histogram, a one-line verdict, and a suggested command.
 
 ### 2 TTL
@@ -57,7 +58,7 @@ The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move,
 3. For each batch, pipeline `TYPE`, `PTTL`, `MEMORY USAGE key SAMPLES 5` (when allowed) and `OBJECT FREQ` (when allowed and the policy is LFU).
 4. Stop at the sample limit (default 100,000) or when the cursor returns to 0.
 5. Stay under a command budget: 5,000 commands per second by default, none for `local` profiles. `--max-rate N` overrides it (`0` means no limit).
-6. Scale sampled counts to estimates with `DBSIZE / keys seen`, where keys seen counts every distinct key SCAN returned, including keys that vanished or could not be read (for example `NOPERM` from a key ACL). The scale is never below 1, and it is 1 when the SCAN cursor returned to 0 (the whole keyspace was seen) or when `MATCH` is used.
+6. Scale sampled counts to estimates with `DBSIZE / keys present`, where keys present counts every distinct key SCAN returned that still existed when it was looked up: the samples plus keys that exist but could not be read (for example `NOPERM` from a key ACL, or names that are not UTF-8). Keys that vanished between SCAN and the lookup (`TYPE` `none`, `PTTL` -2) are left out, so short-lived keys don't shrink the estimates. The scale is never below 1, and it is 1 when the SCAN cursor returned to 0 (the whole keyspace was seen), when `MATCH` is used, or when no key seen still existed.
 
 A per-key error such as `NOPERM` drops that field (sizes, frequency) and never aborts the scan.
 
