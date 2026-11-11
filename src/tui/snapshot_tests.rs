@@ -10,6 +10,7 @@ use super::fixtures;
 use super::tree::{Root, Row};
 use super::ui;
 use crate::conn::ScanTarget;
+use crate::conn::docker::DiscoveredAuth;
 use crate::model::{PermissionReport, ScanReport};
 use crate::scan::ScanProgress;
 
@@ -131,6 +132,118 @@ fn select_pattern(app: &mut App, label: &str) {
         .unwrap_or_else(|| panic!("no row {label}"));
     while app.patterns.sel < at {
         app.handle_key(ch('j'));
+    }
+}
+
+/// Docker containers whose discovery found a password, no auth, auth it could not
+/// satisfy, and nothing conclusive. The password is fixture data and never on screen.
+fn docker_auth_app() -> App {
+    let mut app = App::new(fixtures::profiles());
+    let mut with_password = fixtures::docker_instance();
+    with_password.container = "pw-redis-1".into();
+    with_password.profile.name = "pw-redis-1".into();
+    with_password.profile.auth = crate::model::Auth::Keychain;
+    with_password.credentials = Some(crate::model::Credentials {
+        username: None,
+        password: secrecy::SecretString::from("Fixture-Container-Pw"),
+    });
+    with_password.auth = DiscoveredAuth::Password;
+    app.apply(Msg::DockerFound(vec![
+        with_password,
+        fixtures::docker_instance(),
+        fixtures::docker_instance_auth("acl-valkey-1", 6391, DiscoveredAuth::Required),
+        fixtures::docker_instance_auth("odd-valkey-1", 6392, DiscoveredAuth::Unknown),
+    ]));
+    app
+}
+
+/// Select the entry called `name` on the Connections view.
+fn select_entry(app: &mut App, name: &str) {
+    for _ in 0..app.entries.len() + 1 {
+        if app.selected_entry().is_some_and(|e| e.profile.name == name) {
+            return;
+        }
+        app.handle_key(ch('j'));
+    }
+    panic!("no entry {name}");
+}
+
+#[test]
+fn connections_docker_auth() {
+    let mut app = docker_auth_app();
+    select_entry(&mut app, "acl-valkey-1");
+    let t = render(&app, 120, 36);
+    let lines = buffer_lines(&t);
+    let row = |name: &str| {
+        lines
+            .iter()
+            .find(|l| l.contains(&format!("{name} ")) && l.contains("127.0.0.1"))
+            .unwrap_or_else(|| panic!("no row {name}"))
+            .clone()
+    };
+    // The list's AUTH column shows what discovery found.
+    for (name, label) in [
+        ("pw-redis-1", "password"),
+        ("myapp-redis-1", "none"),
+        ("acl-valkey-1", "required"),
+        ("odd-valkey-1", "unknown"),
+    ] {
+        let r = row(name);
+        assert!(r.contains(&format!(" {label} ")), "{name}: {r}");
+    }
+    for line in &lines {
+        assert!(
+            !line.contains("Fixture-Container-Pw"),
+            "password on screen: {line}"
+        );
+    }
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn docker_auth_detail_panel() {
+    let mut app = docker_auth_app();
+    for (name, auth, cred) in [
+        (
+            "pw-redis-1",
+            "password (default user)",
+            "from the container, memory only",
+        ),
+        ("myapp-redis-1", "none", "none"),
+        (
+            "acl-valkey-1",
+            "required",
+            "not found: save it as a profile with credentials",
+        ),
+        ("odd-valkey-1", "unknown", "could not tell"),
+    ] {
+        select_entry(&mut app, name);
+        let lines = buffer_lines(&render(&app, 140, 40));
+        let field = |key: &str| {
+            lines
+                .iter()
+                .find_map(|l| {
+                    l.split_once(&format!(" {key}  "))
+                        .map(|(_, v)| v.trim_start().to_string())
+                })
+                .unwrap_or_else(|| panic!("{name}: no {key} field"))
+        };
+        assert!(
+            field("Auth").starts_with(&format!("{auth}  ")),
+            "{name}: {}",
+            field("Auth")
+        );
+        assert!(
+            field("Credential").starts_with(&format!("{cred}  ")),
+            "{name}: {}",
+            field("Credential")
+        );
+        for line in &lines {
+            assert!(
+                !line.contains("Fixture-Container-Pw"),
+                "password on screen: {line}"
+            );
+        }
     }
 }
 

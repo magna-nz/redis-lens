@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::conn::ScanTarget;
-use crate::conn::docker::DiscoveredInstance;
+use crate::conn::docker::{DiscoveredAuth, DiscoveredInstance};
 use crate::conn::parse::{ParsedConnection, mask, parse_connection_string};
 use crate::diff::ReportDiff;
 use crate::model::{
@@ -77,6 +77,8 @@ pub enum Source {
         container: String,
         image: String,
         credentials: Option<Credentials>,
+        /// What discovery found out about authentication, shown on the Connections view.
+        auth: DiscoveredAuth,
     },
 }
 
@@ -1241,6 +1243,7 @@ impl App {
                 container: inst.container,
                 image: inst.image,
                 credentials: inst.credentials,
+                auth: inst.auth,
             };
             let entry = match keep {
                 Some(e) => ConnEntry {

@@ -81,6 +81,27 @@ pub fn docker_instance() -> DiscoveredInstance {
     }
 }
 
+/// A container without credentials whose discovery said `auth`: `None`, `Required` or
+/// `Unknown` (`Password` comes with credentials, so tests build it themselves).
+pub fn docker_instance_auth(
+    container: &str,
+    port: u16,
+    auth: DiscoveredAuth,
+) -> DiscoveredInstance {
+    assert_ne!(
+        auth,
+        DiscoveredAuth::Password,
+        "a password needs credentials"
+    );
+    DiscoveredInstance {
+        container: container.into(),
+        image: "valkey/valkey:8.1-alpine".into(),
+        profile: profile(container, Env::Local, "127.0.0.1", port, false, Auth::None),
+        credentials: None,
+        auth,
+    }
+}
+
 pub fn server() -> ServerInfo {
     ServerInfo {
         flavor: ServerFlavor::Redis,
