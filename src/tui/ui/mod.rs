@@ -17,6 +17,7 @@ use super::app::{App, Phase, Session, View};
 mod connections;
 mod delta;
 mod diff;
+pub mod help;
 mod hot;
 mod patterns;
 pub mod style;
