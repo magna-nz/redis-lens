@@ -214,6 +214,18 @@ pub fn markdown() -> String {
 mod tests {
     use super::*;
 
+    /// `spec.md` holds the key table exactly as [`markdown`] renders it, so the spec,
+    /// the footer and the overlay can't drift apart.
+    #[test]
+    fn spec_lists_every_key() {
+        let spec = include_str!("../../spec.md");
+        assert!(
+            spec.contains(&markdown()),
+            "spec.md's key table differs from keymap::markdown():\n{}",
+            markdown()
+        );
+    }
+
     #[test]
     fn no_duplicate_key_within_a_view() {
         for v in View::ALL {

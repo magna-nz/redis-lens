@@ -18,7 +18,7 @@ A terminal UI that answers "what is using the memory in this Redis or Valkey, an
 
 ## Views
 
-The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move, `→←` to expand and collapse, `/` to filter, `s` to snapshot and `q` to quit. Narrow terminals never wrap: names are shortened with `…`. On the Patterns view, when the pattern column would get narrower than 12 cells, columns are hidden in this order: the share bar (the share percentage stays), then Δ, then the average size. Only when all three are hidden is a row too wide for the terminal cut at the right edge. Other views cut a row too wide at the right edge. On the selected row, text that doesn't fit its column scrolls across: it rests for 1 s, scrolls about 5 columns a second until its end is visible, holds 1 s and starts again. On the Patterns view only the name scrolls; the tree indent and the `▾`/`▸` mark stay in place. Selecting a different row or switching views restarts it; the same row moving to another position does not.
+The TUI has five views, switched with `0` to `4`. The keys are listed in [Keys](#keys) and in the `?` overlay; both, and the key bar at the bottom of the screen, come from one table in `src/tui/keymap.rs`. Every list view moves with `↑↓` (`j` `k`), `PgUp` `PgDn` (one page: as many rows as the list shows on screen, at least one; it stops at the first and last row) and `Home` `End` (`g` `G`). Narrow terminals never wrap: names are shortened with `…`. On the Patterns view, when the pattern column would get narrower than 12 cells, columns are hidden in this order: the share bar (the share percentage stays), then Δ, then the average size. Only when all three are hidden is a row too wide for the terminal cut at the right edge. Other views cut a row too wide at the right edge. On the selected row, text that doesn't fit its column scrolls across: it rests for 1 s, scrolls about 5 columns a second until its end is visible, holds 1 s and starts again. On the Patterns view only the name scrolls; the tree indent and the `▾`/`▸` mark stay in place. Selecting a different row or switching views restarts it; the same row moving to another position does not.
 
 ### 0 Connections
 - Lists saved profiles and the Redis or Valkey containers found in Docker.
@@ -35,7 +35,7 @@ The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move,
 - Child patterns group under their shared prefix and can be expanded or collapsed.
 - The selection follows its row, not its position, whenever the rows change (new partial results, the finished scan, another sort): a group by its shared prefix, a pattern by its name. A pattern now inside a collapsed group selects the group; a group that became a single pattern selects that pattern; a group or pattern that merged into `{var}` selects what it merged into. When the row is gone the selection stays at the same position, or the last row if there are fewer.
 - A collapsed group stays collapsed when its patterns change: it is remembered by its prefix and by its patterns. If its prefix changes because part of it merged into `{var}` (`tenant.a1:*` and `tenant.a2:*` become `tenant.{var}:*`), or splits back out, the new group is collapsed when it holds one of the collapsed group's patterns, equal or up to `{var}`. A collapsed group that disappears or becomes a single pattern is collapsed again if it comes back. New groups start expanded.
-- While a scan runs, the view shows partial results aggregated from the keys sampled so far (no extra server commands, at most four updates a second), marked `partial · N / M sampled` in the title and without the Δ column. The finished scan replaces them; a failed or cancelled scan clears them. The TTL, Diff and Hot keys views wait for the finished scan. `s` never saves partial results: it says to wait for the scan to finish.
+- While a scan runs, the view shows partial results aggregated from the keys sampled so far (no extra server commands, at most four updates a second), marked `partial · N / M sampled` in the title and without the Δ column. The finished scan replaces them; a failed or cancelled scan clears them (see [Rescan](#rescan) for the previous results kept during a rescan). The TTL, Diff and Hot keys views wait for the finished scan. `s` never saves partial results: it says to wait for the scan to finish.
 - The detail panel shows up to five example keys with their sizes and TTLs, a size distribution (p50, p99, max), a TTL histogram, a one-line verdict, and a suggested command.
 
 ### 2 TTL
@@ -55,6 +55,98 @@ The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move,
 - Up to 50 sampled keys with an LFU counter (`OBJECT FREQ`) above 0, ranked by that counter, showing the key, pattern, type, counter and size. A node column comes with cluster support (v0.3).
 - Keys with a counter of at least 100 and a size of at least 10 MiB are flagged as hot and big.
 - Needs an LFU eviction policy. Without one, the view says so and offers an opt-in, time-limited `MONITOR` sample (planned for v0.2).
+
+### Keys
+
+#### Everywhere
+
+| Keys | Action |
+|---|---|
+| `0-4` | Switch view, 0 Connections to 4 Hot keys |
+| `?` | Show or hide this key list |
+| `a` | Add a connection |
+| `q` `ctrl-c` | Quit |
+
+#### Connections
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `enter` | Connect and scan |
+| `r` | Look for Docker containers again |
+
+#### Patterns
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `→` `←` `l` `h` | Expand or collapse the selected group |
+| `enter` | Expand or collapse |
+| `/` | Filter patterns by name |
+| `esc` | Clear the filter |
+| `o` | Sort by memory, keys, avg size, no-TTL % or name |
+| `y` | Copy the selected pattern to the clipboard |
+| `Y` | Copy a redis-cli --scan command for the pattern |
+| `r` | Scan again, keeping old results meanwhile |
+| `s` | Save a scan snapshot file |
+
+#### TTL
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `y` | Copy the selected pattern to the clipboard |
+| `Y` | Copy a redis-cli --scan command for the pattern |
+| `r` | Scan again, keeping old results meanwhile |
+| `s` | Save a scan snapshot file |
+
+#### Diff
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `y` | Copy the selected pattern to the clipboard |
+| `Y` | Copy a redis-cli --scan command for the pattern |
+| `r` | Scan again, keeping old results meanwhile |
+| `s` | Save a scan snapshot file |
+
+#### Hot keys
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `y` | Copy the selected key name to the clipboard |
+| `Y` | Copy a redis-cli --scan command for the pattern |
+| `r` | Scan again, keeping old results meanwhile |
+| `s` | Save a scan snapshot file |
+
+The key bar shows the main keys of the current view, from this table: Connections `↑↓ Move · enter Connect · a Add · r Rescan Docker · 0-4 View · ? Help · q Quit`; Patterns `↑↓ Move · →← Fold · / Filter · o Sort · s Snapshot · 0-4 View · ? Help · q Quit`; TTL, Diff and Hot keys with a result `↑↓ Move · r Rescan · s Snapshot · 0-4 View · ? Help · q Quit`, otherwise `0-4 View · a Add · ? Help · q Quit`. Paging, copy and (on Patterns) rescan are only in the `?` overlay, so the bar fits 80 columns. A notice or an input line replaces the bar while shown. A test checks that this table is exactly what `keymap::markdown()` renders.
+
+### Help overlay
+
+`?` opens a centred overlay titled "Keys · <view>" that lists the keys that work everywhere and the current view's keys. `?` or `esc` closes it; `q` and ctrl-c still quit; every other key is ignored while it is open. On small terminals it shrinks to the screen and cuts text with `…`. In the add flow and the filter input every key is text, `?`, `y`, `Y` and `r` included.
+
+### Rescan
+
+`r` on views 1-4 scans the shown connection again as a new run, the same way `enter` connects it (same scan options, rate limit and read-only rules; the connection's current profile and credential source). It works when the scan has finished or failed. While a connect or scan is running it only says "A scan is already running"; with no connection yet it says to connect first. On Connections `r` still looks for Docker containers again.
+
+A rescan keeps the view, the Patterns filter, collapsed groups, sort and selected row, and the TTL, Diff and Hot keys selections (moved to the last row if the new results are shorter). The previous results stay on every view, marked `rescanning · previous results` at the start of the panel title, until the new run's first partial results arrive. From then on Patterns shows the partial results (the selection follows its row) and TTL, Diff and Hot keys wait for the finished scan. If the rescan fails before any results of its own, the error is shown and the previous results stay, marked `rescan failed · previous results`. If it fails after partial results it behaves like any failed scan. While a rescan runs, `s` says to wait for it to finish; it never saves partial results and does not save the previous results again. Results, partials and progress of the replaced run are ignored. The one exception is the replaced run's snapshot lookup, which still fills in the Diff of its own report while that report is on screen. A slow keychain read during a rescan shows the keychain hint in the status line.
+
+### Copy
+
+`y` copies the selected row's pattern: a group row copies its label, such as `user:{id}:*`; on Hot keys it copies the key name. `Y` copies the suggested command `redis-cli --scan --pattern '<glob>'` for that pattern (on Hot keys, the key's pattern), the same text as the `$` line in the detail panel. Only on Patterns, TTL, Diff and Hot keys; never on Connections or in the add flow or filter input. With nothing selected it says so.
+
+Copying uses the OSC 52 terminal sequence (no clipboard library), written to the terminal between frames, so it also works over SSH. Terminals without OSC 52 (macOS Terminal.app, for one) ignore it, and the terminal never confirms a copy, so the notice says "Copied <pattern|key|command> to the clipboard (needs a terminal with OSC 52)". Text whose sequence would be over 100,000 bytes is not sent ("too long to copy"). A write error is shown as an error notice. Only a pattern name, a key name or that command can be copied (the `CopyText` type has no other constructor), so credentials, connection strings and profiles never reach the clipboard.
 
 ## Scanning
 

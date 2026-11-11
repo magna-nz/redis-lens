@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** v0.2 done on main; waves 6 and 7 merged (PRs #10, #11); wave 8 (usability) in progress; then v0.3 (cluster) or the feature ideas below
-**Last updated:** 2026-11-11 (wave 8 started)
+**Last updated:** 2026-11-11 (wave 8 merged on the integration branch; verifier next)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -48,11 +48,36 @@ Integration branch `wave8/usability` (worktree `.claude/worktrees/wave8`, from m
 
 | Part | Content | Agent | Branch | State |
 |---|---|---|---|---|
-| A | Selection follows the pattern (N2), collapse kept when a group's key changes (N3), sorting, marquee follow-ups, narrow columns | implementer [opus] | `wave8/tree` | in progress |
-| B | Key table (`tui/keymap.rs`), `?` help overlay (`tui/ui/help.rs`), OSC 52 clipboard (`tui/clipboard.rs`), standalone | implementer [sonnet] | `wave8/keys` | in progress |
-| D | Keychain panic text, parallel discovery probes, `os_trust` skipped | implementer [sonnet] | `wave8/extras` | in progress |
-| C | Rescan, `?` and clipboard wired in, footer from the key table, Page Up/Down and Home/End in every list view | implementer [opus] | `wave8/wire`, after A, B and D | not started |
-| V | Verifier on the merged `wave8/usability` | verifier [opus] | pinned detached worktree | not started |
+| A | Selection follows the pattern (N2), collapse kept when a group's key changes (N3), sorting, marquee follow-ups, narrow columns | implementer [opus] | `wave8/tree` | **done** (253aa13), merged |
+| B | Key table (`tui/keymap.rs`), `?` help overlay (`tui/ui/help.rs`), OSC 52 clipboard (`tui/clipboard.rs`), standalone | implementer [sonnet] | `wave8/keys` | **done** (d34d3fa), merged |
+| D | Keychain panic text, parallel discovery probes, `os_trust` skipped | implementer [sonnet] | `wave8/extras` | **done** (693d575), merged |
+| C | Rescan, `?` and clipboard wired in, footer from the key table, Page Up/Down and Home/End in every list view | implementer [opus] | `wave8/wire`, after A, B and D | **done** (75804f2), merged |
+| V | Verifier on the merged `wave8/usability` | verifier [opus] | pinned detached worktree | in progress |
+
+**How each item is covered** (agents' change → test maps are in their reports; the verifier audits them):
+- Selection follows the pattern: `tui::app::tests::selection_follows_the_pattern_across_partials`, `selection_follows_the_pattern_into_the_finished_scan` and the collapsed-group, `{var}` and gone-row cases. Restart by a message: `a_message_that_changes_the_selected_row_restarts_the_marquee` (fails with `track_selection()` removed from `apply`).
+- Collapse kept: `tui::tree::tests` for `Collapsed` (key change through `{var}`, split back, single to group and back) and `tui::app::tests` through partials and `ScanDone`.
+- Sorting: `tui::tree::tests` per sort key, ties, groups and children, the no-sizes cycle; a sorted-table snapshot.
+- Marquee: indent and mark stay put (`patterns_long_name_mid_scroll`, a group-row snapshot, a child-row test).
+- Narrow columns: snapshots at each hiding step, with and without Δ; header and row alignment test.
+- Key table: `tui::keymap::tests` (no duplicates, footer subset and width, `spec_lists_every_key`); table and handlers agree both ways (`tui::app::tests`).
+- Help overlay: `tui::ui::help::tests` snapshots for every view, tiny terminals; key routing tests; overlay over a view snapshot.
+- Copy: `tui::clipboard::tests` (bytes, cap, control characters, command text); `tui::app::tests::copy_never_carries_credentials` (rule 1: every view, row kind and the add flow); runtime write and error (`tui::tests`).
+- Rescan: `tui::app::tests` rescan versions of the stale-run tests, previous results kept until the first partial, failure before and after partials, `s` while rescanning, `r` while running or with no session; snapshots of the rescanning and rescan-failed titles.
+- Paging: every list view, page sizes 0 and 1, clamps; `list_rows` against the rows each view draws.
+- Keychain panic: `secrets::tests::a_panicking_keychain_call_gives_a_fixed_error_without_the_payload`, `the_hook_is_silent_for_the_keychain_thread_and_forwards_other_threads`.
+- Parallel discovery: `conn::docker::tests::discovery_probes_run_concurrently_and_keep_order`; `conn_it` on Redis, Valkey and 6.2.
+- `os_trust`: `#[ignore]`d locally; CI runs `cargo test --test os_trust -- --ignored` after installing the CA, and the tests fail without it.
+
+**Decisions taken in the wave (owner may revisit):**
+- The Patterns key bar has no `r Rescan`: with `? Help` and `o Sort` it is 79 columns, and rescan would make it 90. Rescan is in the `?` overlay.
+- After a failed rescan, `s` saves the previous report that is still shown. It has the same snapshot file name as that report's own snapshot, so nothing is duplicated.
+- The replaced run's snapshot lookup still fills in the Diff of its own report while that report is on screen; otherwise a lookup still running when `r` was pressed would leave Diff stuck on "Looking for an earlier snapshot…".
+- Paging on Connections counts only selectable rows, not the SAVED and DOCKER headings.
+
+**Follow-ups found in the wave (not done):**
+- Rule 1: a server's `NOPERM` reply names the ACL user (`NOPERM User <name> has no permissions …`), and the Connections detail panel shows it (fixture: `connections_view` snapshot). It never reaches the scan report or snapshot files. The username should be masked in permission results before they are shown (TUI and `conn test`).
+- The failed-scan waiting panel says "Press 0 to go back to Connections and try again" and doesn't mention `r`.
 
 ## Wave 7 (2026-11-11): four bugs and the test gaps
 
