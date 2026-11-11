@@ -322,3 +322,256 @@ async fn conn_add_keeps_credentials_out_of_the_config_file() {
     assert_eq!(c.password.expose_secret(), "uniq-pw-4242");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Auth probe used by `discover`
+// ---------------------------------------------------------------------------
+
+use redis_lens::conn::docker::{DiscoveredAuth, probe_auth};
+
+fn endpoint(port: u16) -> Endpoint {
+    Endpoint {
+        host: "127.0.0.1".to_string(),
+        port,
+        tls: false,
+    }
+}
+
+#[tokio::test]
+async fn probe_no_auth_server_is_none() {
+    for server in [common::redis().await, common::valkey().await] {
+        assert_eq!(
+            probe_auth(&endpoint(server.port)).await,
+            DiscoveredAuth::None
+        );
+    }
+}
+
+#[tokio::test]
+async fn probe_requirepass_server_is_required() {
+    for valkey in [false, true] {
+        let server = common::server_with(valkey, &["--requirepass", "probe-pw-1"]).await;
+        assert_eq!(
+            probe_auth(&endpoint(server.port)).await,
+            DiscoveredAuth::Required,
+            "valkey={valkey}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn probe_server_with_default_user_off_is_required() {
+    let args = [
+        "--user", "default", "off", "--user", "lens", "on", ">lens-pw", "~*", "+@all",
+    ];
+    for valkey in [false, true] {
+        let server = common::server_with(valkey, &args).await;
+        assert_eq!(
+            probe_auth(&endpoint(server.port)).await,
+            DiscoveredAuth::Required,
+            "valkey={valkey}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn probe_unreachable_port_is_unknown() {
+    let port = common::free_port();
+    assert_eq!(probe_auth(&endpoint(port)).await, DiscoveredAuth::Unknown);
+}
+
+#[tokio::test]
+async fn probe_needs_only_ping() {
+    // A default user that may only PING: the probe needs nothing else.
+    let args = ["--user", "default", "on", "nopass", "~*", "-@all", "+ping"];
+    for valkey in [false, true] {
+        let server = common::server_with(valkey, &args).await;
+        assert_eq!(
+            probe_auth(&endpoint(server.port)).await,
+            DiscoveredAuth::None,
+            "valkey={valkey}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn discover_reports_auth_for_each_kind_of_container() {
+    for valkey in [false, true] {
+        let open = common::server_with(valkey, &[]).await;
+        let pw = common::server_with(valkey, &["--requirepass", "disc-pw-2"]).await;
+        let acl = common::server_with(
+            valkey,
+            &[
+                "--user", "default", "off", "--user", "lens", "on", ">lens-pw", "~*", "+@all",
+            ],
+        )
+        .await;
+        let found = conn::docker::discover().await.unwrap();
+        let find = |port: u16| {
+            found
+                .iter()
+                .find(|d| d.profile.endpoint.port == port)
+                .expect("container is discovered")
+        };
+        let d = find(open.port);
+        assert_eq!(d.auth, DiscoveredAuth::None, "valkey={valkey}");
+        assert_eq!(d.profile.auth, Auth::None);
+        let d = find(pw.port);
+        assert_eq!(d.auth, DiscoveredAuth::Password);
+        assert_eq!(d.profile.auth, Auth::Keychain);
+        let d = find(acl.port);
+        assert_eq!(d.auth, DiscoveredAuth::Required, "valkey={valkey}");
+        assert_eq!(d.profile.auth, Auth::None);
+        assert!(d.credentials.is_none());
+
+        let out = cli_conn::format_discovered(&found);
+        for word in ["none", "password", "required"] {
+            assert!(out.contains(word), "{out}");
+        }
+        assert!(!out.contains("disc-pw-2"), "{out}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `conn test`
+// ---------------------------------------------------------------------------
+
+fn temp_config(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join(format!("redis-lens-conn-it-{tag}-{}", std::process::id()))
+        .join("config.toml")
+}
+
+fn save_profile(path: &std::path::Path, p: &Profile) {
+    let mut config = Config::load(path).unwrap();
+    config.add(p.clone(), true).unwrap();
+    config.save(path).unwrap();
+}
+
+#[tokio::test]
+async fn conn_test_reports_success_and_permissions() {
+    for valkey in [false, true] {
+        let server = common::server_with(valkey, &lens_args(None, &[])).await;
+        seed(&server).await;
+        let secrets = MemoryStore::default();
+        let p = profile("lens-profile", server.port, Auth::Keychain);
+        secrets
+            .set(&p.secret_ref(), &creds(Some("lens"), "lens-pw"))
+            .unwrap();
+        let path = temp_config(&format!("test-ok-{valkey}"));
+        save_profile(&path, &p);
+
+        let out = cli_conn::test(&path, &secrets, "lens-profile")
+            .await
+            .unwrap();
+        assert!(out.starts_with("Connected to lens-profile"), "{out}");
+        for label in [PERM_SCAN, PERM_TYPE_TTL, PERM_MEMORY, PERM_INFO] {
+            assert!(out.contains(&format!("✓ {label}")), "{label}: {out}");
+        }
+        // noeviction, so OBJECT FREQ is skipped with a reason, not denied.
+        assert!(out.contains(&format!("– {PERM_FREQ}")), "{out}");
+        assert!(!out.contains("lens-pw"), "{out}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}
+
+#[tokio::test]
+async fn conn_test_reports_denied_commands() {
+    let server = common::redis_with(&lens_args(Some("+memory|usage"), &[])).await;
+    seed(&server).await;
+    let secrets = MemoryStore::default();
+    let p = profile("limited", server.port, Auth::Keychain);
+    secrets
+        .set(&p.secret_ref(), &creds(Some("lens"), "lens-pw"))
+        .unwrap();
+    let path = temp_config("test-denied");
+    save_profile(&path, &p);
+    let out = cli_conn::test(&path, &secrets, "limited").await.unwrap();
+    assert!(out.contains(&format!("✗ {PERM_MEMORY}")), "{out}");
+    assert!(out.contains(&format!("✓ {PERM_SCAN}")), "{out}");
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn conn_test_wrong_password_fails_without_the_password() {
+    for valkey in [false, true] {
+        let server = common::server_with(valkey, &lens_args(None, &[])).await;
+        let secrets = MemoryStore::default();
+        let p = profile("badpw", server.port, Auth::Keychain);
+        let bad = "wrong-pw-for-conn-test-5521";
+        secrets
+            .set(&p.secret_ref(), &creds(Some("lens"), bad))
+            .unwrap();
+        let path = temp_config(&format!("test-bad-{valkey}"));
+        save_profile(&path, &p);
+        let e = cli_conn::test(&path, &secrets, "badpw").await.unwrap_err();
+        assert!(!format!("{e:#}").contains(bad), "{e:#}");
+        assert!(!format!("{e:?}").contains(bad), "{e:?}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}
+
+#[tokio::test]
+async fn conn_test_unknown_profile_is_an_error() {
+    let secrets = MemoryStore::default();
+    let path = temp_config("test-unknown");
+    let e = cli_conn::test(&path, &secrets, "nope").await.unwrap_err();
+    assert!(e.to_string().contains("nope"), "{e}");
+}
+
+// ---------------------------------------------------------------------------
+// The minimal read-only ACL user from spec.md "Permission check"
+// ---------------------------------------------------------------------------
+
+/// The spec's line, word by word, with the password where it has `…`.
+const SPEC_RO_RULES: &str = "on >{PW} ~* resetchannels -@all +ping +hello +client|setinfo +client|setname +select +info +dbsize +scan +type +ttl +pttl +memory|usage +object|freq";
+
+#[tokio::test]
+async fn spec_minimal_read_only_user_can_connect_check_and_scan() {
+    use redis_lens::scan::{ScanOptions, scan};
+    let pw = "ro-secret-pw-8731";
+    for valkey in [false, true] {
+        // LFU, so OBJECT FREQ is checked and used too.
+        let server = common::server_with(valkey, &["--maxmemory-policy", "allkeys-lfu"]).await;
+        let mut admin = server.admin().await;
+        for i in 0..20 {
+            let _: () = redis::cmd("SET")
+                .arg(format!("user:{i}"))
+                .arg("v")
+                .query_async(&mut admin)
+                .await
+                .unwrap();
+        }
+        let mut setuser = redis::cmd("ACL");
+        setuser.arg("SETUSER").arg("lens-ro");
+        for word in SPEC_RO_RULES.replace("{PW}", pw).split_whitespace() {
+            setuser.arg(word);
+        }
+        let _: () = setuser.query_async(&mut admin).await.unwrap();
+
+        let secrets = MemoryStore::default();
+        let p = profile("ro", server.port, Auth::Keychain);
+        secrets
+            .set(&p.secret_ref(), &creds(Some("lens-ro"), pw))
+            .unwrap();
+        let (mut conn, target) = conn::connect_for_scan(&p, &secrets)
+            .await
+            .unwrap_or_else(|e| panic!("valkey={valkey}: connect as lens-ro: {e}"));
+        assert_eq!(target, conn::ScanTarget::Primary);
+        let perms = check_permissions(&mut conn).await;
+        assert_labels_in_order(&perms);
+        for c in &perms.checks {
+            assert_eq!(
+                c.status,
+                PermStatus::Allowed,
+                "valkey={valkey}: {}",
+                c.label
+            );
+        }
+        let report = scan("ro", &mut conn, &ScanOptions::default(), &perms, None)
+            .await
+            .unwrap_or_else(|e| panic!("valkey={valkey}: scan as lens-ro: {e}"));
+        assert_eq!(report.sampled_keys, 20, "valkey={valkey}");
+        assert!(report.sizes_available);
+    }
+}

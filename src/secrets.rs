@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,53 @@ pub enum SecretError {
     Store(String),
     #[error("the keychain entry is not in the expected format")]
     Corrupt,
+    /// The keychain call did not return in time. The field is the account name.
+    #[error("{}", timeout_message(.0))]
+    Timeout(String),
+}
+
+/// How long a keychain call may take before [`SecretError::Timeout`].
+pub const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The text for [`SecretError::Timeout`]. Names the entry's account, never its contents.
+fn timeout_message(account: &str) -> String {
+    let secs = KEYCHAIN_TIMEOUT.as_secs();
+    if cfg!(target_os = "macos") {
+        format!(
+            "macOS is waiting for permission to read the keychain entry {account}. \
+             Click \"Always Allow\" in the dialog, then try again."
+        )
+    } else {
+        format!(
+            "the OS keychain did not answer within {secs} s for {account} \
+             (it may be locked or waiting for you); unlock it and try again."
+        )
+    }
+}
+
+/// Run `f` on a worker thread and wait up to `dur` for it. On timeout the worker is left
+/// to finish on its own and [`SecretError::Timeout`] names `account`.
+fn with_timeout<T: Send + 'static>(
+    dur: Duration,
+    account: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, SecretError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("keychain".into())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .map_err(|_| SecretError::Store("could not start a keychain thread".to_string()))?;
+    match rx.recv_timeout(dur) {
+        Ok(v) => Ok(v),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(SecretError::Timeout(account.to_string()))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(SecretError::Store("the keychain call failed".to_string()))
+        }
+    }
 }
 
 /// Somewhere credentials can be kept.
@@ -81,25 +129,39 @@ fn entry(r: &SecretRef) -> Result<keyring::Entry, SecretError> {
 }
 
 /// The real store: macOS Keychain, Windows Credential Manager, or the Secret Service on Linux.
+///
+/// Each call runs on a worker thread and gives up after [`KEYCHAIN_TIMEOUT`]: on macOS a
+/// rebuilt binary makes the keychain ask for access, and the call blocks until someone
+/// answers the dialog.
 #[derive(Debug, Default)]
 pub struct KeyringStore;
 
 impl SecretStore for KeyringStore {
     fn get(&self, r: &SecretRef) -> Result<Option<Credentials>, SecretError> {
-        match entry(r)?.get_password() {
-            Ok(s) => decode(&s).map(Some),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(map_err(e)),
-        }
+        let owned = r.clone();
+        with_timeout(KEYCHAIN_TIMEOUT, &r.account, move || {
+            match entry(&owned)?.get_password() {
+                Ok(s) => decode(&s).map(Some),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(e) => Err(map_err(e)),
+            }
+        })?
     }
     fn set(&self, r: &SecretRef, creds: &Credentials) -> Result<(), SecretError> {
-        entry(r)?.set_password(&encode(creds)).map_err(map_err)
+        let owned = r.clone();
+        let encoded = encode(creds);
+        with_timeout(KEYCHAIN_TIMEOUT, &r.account, move || {
+            entry(&owned)?.set_password(&encoded).map_err(map_err)
+        })?
     }
     fn delete(&self, r: &SecretRef) -> Result<(), SecretError> {
-        match entry(r)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(map_err(e)),
-        }
+        let owned = r.clone();
+        with_timeout(KEYCHAIN_TIMEOUT, &r.account, move || {
+            match entry(&owned)?.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(map_err(e)),
+            }
+        })?
     }
 }
 
@@ -204,6 +266,50 @@ mod tests {
             assert!(matches!(e, SecretError::Corrupt));
             assert!(!e.to_string().contains("not json"));
         }
+    }
+
+    #[test]
+    fn with_timeout_returns_a_value_in_time() {
+        let v = with_timeout(Duration::from_secs(5), "acct", || 42).unwrap();
+        assert_eq!(v, 42);
+    }
+
+    #[test]
+    fn with_timeout_gives_up_on_a_blocked_call() {
+        let started = std::time::Instant::now();
+        let e = with_timeout(Duration::from_millis(50), "profile:cache", || {
+            std::thread::sleep(Duration::from_secs(3));
+            "late"
+        })
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(e, SecretError::Timeout(_)));
+        let text = e.to_string();
+        assert!(text.contains("profile:cache"), "{text}");
+        if cfg!(target_os = "macos") {
+            assert!(text.contains("Always Allow"), "{text}");
+            assert!(text.contains("macOS is waiting for permission"), "{text}");
+        } else {
+            assert!(text.contains("did not answer within 15 s"), "{text}");
+        }
+    }
+
+    #[test]
+    fn with_timeout_reports_a_panicking_call_without_its_message() {
+        let e = with_timeout(Duration::from_secs(5), "a", || -> u8 {
+            panic!("hunter2-secret")
+        })
+        .unwrap_err();
+        assert!(matches!(e, SecretError::Store(_)));
+        assert!(!e.to_string().contains("hunter2"));
+    }
+
+    #[test]
+    fn timeout_message_survives_the_tui_scrub_and_names_no_secret() {
+        let e = crate::conn::ConnError::from(SecretError::Timeout("profile:cache".into()));
+        let shown = crate::conn::parse::mask(&e.to_string());
+        assert_eq!(shown, e.to_string());
+        assert!(shown.contains("profile:cache"));
     }
 
     /// Manual only: touches the real OS keychain.
