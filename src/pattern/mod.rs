@@ -172,8 +172,8 @@ fn collapse(patterns: &BTreeSet<String>) -> BTreeMap<String, String> {
 
 /// Group sampled keys into patterns and compute per-pattern statistics.
 ///
-/// `scale` is `total_keys / sampled_keys` and turns sampled counts and bytes into
-/// keyspace-wide estimates. Patterns with the same shape that differ at one literal
+/// `scale` turns sampled counts and bytes into keyspace-wide estimates (the scanner's
+/// `estimate_scale`: `total_keys` over the keys seen that still existed, at least 1). Patterns with the same shape that differ at one literal
 /// segment other than the first, with 20 or more distinct values there, merge into one
 /// `{var}` pattern.
 /// Patterns are sorted by `est_bytes` (None counts as 0), then `est_keys`, then name,
