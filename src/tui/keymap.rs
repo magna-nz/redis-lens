@@ -40,10 +40,10 @@ const fn k(
 }
 
 const VIEW_KEYS: KeyHelp = k(
-    "0-4",
-    "0-4",
+    "0-5",
+    "0-5",
     "View",
-    "Switch view, 0 Connections to 4 Hot keys",
+    "Switch view, 0 Connections to 5 Nodes",
     true,
 );
 const HELP: KeyHelp = k("?", "?", "Help", "Show or hide this key list", true);
@@ -118,7 +118,13 @@ static PATTERNS: [KeyHelp; 12] = [
     ),
     k("enter", "enter", "Toggle", "Expand or collapse", false),
     k("/", "/", "Filter", "Filter patterns by name", true),
-    k("esc", "esc", "Clear", "Clear the filter", false),
+    k(
+        "esc",
+        "esc",
+        "Clear",
+        "Clear the filter, or show all nodes again",
+        false,
+    ),
     k(
         "o",
         "o",
@@ -136,6 +142,21 @@ static TTL_DIFF: [KeyHelp; 7] = [MOVE, PAGE, ENDS, COPY_PATTERN, COPY_CMD, RESCA
 
 static HOT: [KeyHelp; 7] = [MOVE, PAGE, ENDS, COPY_KEY, COPY_CMD, RESCAN, SNAPSHOT];
 
+static NODES: [KeyHelp; 6] = [
+    MOVE,
+    PAGE,
+    ENDS,
+    k(
+        "enter",
+        "enter",
+        "Patterns",
+        "Show the selected node's patterns on 1 Patterns",
+        true,
+    ),
+    RESCAN,
+    SNAPSHOT,
+];
+
 /// Keys that work in every view.
 pub fn global() -> &'static [KeyHelp] {
     &GLOBAL
@@ -148,6 +169,7 @@ pub fn for_view(view: View) -> &'static [KeyHelp] {
         View::Patterns => &PATTERNS,
         View::Ttl | View::Diff => &TTL_DIFF,
         View::HotKeys => &HOT,
+        View::Nodes => &NODES,
     }
 }
 
@@ -161,18 +183,19 @@ fn find(view: View, keys: &str) -> (&'static str, &'static str) {
 }
 
 /// Footer hints as `(key, label)`, in display order. `has_report` is whether a scan
-/// result exists; without one, views 2-4 have nothing to move through.
+/// result exists; without one, views 2-5 have nothing to move through.
 ///
 /// Rescan on Patterns, and the page and copy keys everywhere, are left out because
 /// they do not fit in 80 columns; the overlay lists them.
 pub fn footer(view: View, has_report: bool) -> Vec<(&'static str, &'static str)> {
     let order: &[&str] = match view {
-        View::Connections => &["↑↓ j k", "enter", "a", "r", "0-4", "?", "q ctrl-c"],
-        View::Patterns => &["↑↓ j k", "→ ← l h", "/", "o", "s", "0-4", "?", "q ctrl-c"],
+        View::Connections => &["↑↓ j k", "enter", "a", "r", "0-5", "?", "q ctrl-c"],
+        View::Patterns => &["↑↓ j k", "→ ← l h", "/", "o", "s", "0-5", "?", "q ctrl-c"],
         View::Ttl | View::Diff | View::HotKeys if has_report => {
-            &["↑↓ j k", "r", "s", "0-4", "?", "q ctrl-c"]
+            &["↑↓ j k", "r", "s", "0-5", "?", "q ctrl-c"]
         }
-        _ => &["0-4", "a", "?", "q ctrl-c"],
+        View::Nodes if has_report => &["↑↓ j k", "enter", "r", "s", "0-5", "?", "q ctrl-c"],
+        _ => &["0-5", "a", "?", "q ctrl-c"],
     };
     order.iter().map(|keys| find(view, keys)).collect()
 }
@@ -295,6 +318,13 @@ mod tests {
         );
         assert_eq!(names(View::Diff, false), ["View", "Add", "Help", "Quit"]);
         assert_eq!(names(View::HotKeys, false), ["View", "Add", "Help", "Quit"]);
+        assert_eq!(
+            names(View::Nodes, true),
+            [
+                "Move", "Patterns", "Rescan", "Snapshot", "View", "Help", "Quit"
+            ]
+        );
+        assert_eq!(names(View::Nodes, false), ["View", "Add", "Help", "Quit"]);
     }
 
     #[test]

@@ -155,6 +155,7 @@ fn profile_for(name: String, port: u16, password: bool) -> Profile {
         prefer_replica: false,
         provider: None,
         token_command: None,
+        ssh: None,
     }
 }
 

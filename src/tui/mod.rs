@@ -23,8 +23,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
+use crate::conn::cluster::{ClusterTargets, ScanTargets};
 use crate::conn::{self, ScanTarget};
-use crate::model::{Credentials, Profile, ScanReport};
+use crate::model::{Credentials, Profile, ScanReport, ServerInfo, ServerMode};
 use crate::scan::{self, ScanOptions, ScanProgress};
 use crate::secrets::{KeyringStore, MemoryStore, SecretStore};
 use crate::{diff, snapshot};
@@ -39,6 +40,10 @@ pub mod ui;
 mod fixtures;
 #[cfg(test)]
 mod snapshot_tests;
+/// Snapshots of cluster scans: Nodes, Patterns narrowed to a node, the Hot keys node
+/// column, and the cluster summary.
+#[cfg(test)]
+mod snapshot_tests_cluster;
 /// Snapshots of the provider notices and the server context strip (quick-wins agent C).
 #[cfg(test)]
 mod snapshot_tests_server;
@@ -334,10 +339,12 @@ fn scrub(text: String, secret: Option<&str>) -> String {
 }
 
 /// A fallback reason is free text built from server replies and addresses: it goes
-/// through the same `clean` as error messages before the TUI shows it.
+/// through the same `clean` as error messages before the TUI shows it. A cluster's
+/// summary is fixed text and counts, cleaned all the same.
 fn clean_target(target: ScanTarget, clean: impl Fn(String) -> String) -> ScanTarget {
     match target {
         ScanTarget::PrimaryFallback(why) => ScanTarget::PrimaryFallback(clean(why)),
+        ScanTarget::Cluster(summary) => ScanTarget::Cluster(clean(summary)),
         t => t,
     }
 }
@@ -436,7 +443,11 @@ where
     send(
         &tx,
         match result {
-            Ok(report) => Msg::ScanDone { id, scan, report },
+            Ok(report) => Msg::ScanDone {
+                id,
+                scan,
+                report: Box::new(report),
+            },
             Err(error) => Msg::ScanFailed { id, scan, error },
         },
     );
@@ -466,8 +477,9 @@ async fn connect_and_scan(
     };
     let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
 
-    let (mut c, target) = match conn::connect_for_scan(&profile, store.as_ref()).await {
-        Ok((c, target)) => (c, clean_target(target, clean)),
+    // A standalone server, or every shard of a cluster.
+    let mut targets = match conn::cluster::connect_targets(&profile, store.as_ref()).await {
+        Ok(t) => t,
         Err(e) => {
             send(
                 &tx,
@@ -480,8 +492,12 @@ async fn connect_and_scan(
             return;
         }
     };
-    let perms = conn::check_permissions(&mut c).await;
-    let server = scan::server_info(&mut c).await.ok();
+    let target = clean_target(targets.target(), clean);
+    let perms = targets.check_permissions().await;
+    let server = match &mut targets {
+        ScanTargets::Single { conn, .. } => scan::server_info(conn).await.ok(),
+        ScanTargets::Cluster(c) => cluster_server_info(c).await,
+    };
     if !send(
         &tx,
         Msg::Connected {
@@ -497,11 +513,46 @@ async fn connect_and_scan(
 
     let opts = ScanOptions::for_profile(&profile);
     scan_and_report(id, scan_id, tx, |ptx, partial_tx| async move {
-        scan::scan_with_partial(&name, &mut c, &opts, &perms, Some(&ptx), Some(&partial_tx))
-            .await
-            .map_err(|e| clean(e.to_string()))
+        scan::cluster::scan_targets(
+            &name,
+            &mut targets,
+            &opts,
+            &perms,
+            Some(&ptx),
+            Some(&partial_tx),
+        )
+        .await
+        .map_err(|e| clean(e.to_string()))
     })
     .await;
+}
+
+/// The header's server line before a cluster scan finishes: `INFO` and `DBSIZE` of
+/// every connected node, merged by [`merge_servers`]. `None` when no node answered.
+async fn cluster_server_info(c: &mut ClusterTargets) -> Option<ServerInfo> {
+    let mut found = Vec::new();
+    for node in &mut c.nodes {
+        if let Some(conn) = node.conn.as_mut()
+            && let Ok(s) = scan::server_info(conn).await
+        {
+            found.push(s);
+        }
+    }
+    merge_servers(found)
+}
+
+/// One server line for a cluster, the way the finished report has it: the first node's
+/// flavor, version and policy, with memory, the limit and keys summed over the nodes.
+fn merge_servers(servers: Vec<ServerInfo>) -> Option<ServerInfo> {
+    let mut it = servers.into_iter();
+    let mut out = it.next()?;
+    out.mode = ServerMode::Cluster;
+    for s in it {
+        out.used_memory = out.used_memory.saturating_add(s.used_memory);
+        out.maxmemory = out.maxmemory.saturating_add(s.maxmemory);
+        out.total_keys = out.total_keys.saturating_add(s.total_keys);
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -571,6 +622,7 @@ mod tests {
             prefer_replica: false,
             provider: None,
             token_command: None,
+            ssh: None,
         }
     }
 
@@ -772,7 +824,7 @@ mod tests {
             panic!("expected ScanDone last, got {last:?}");
         };
         assert_eq!((id, scan), (3, 30));
-        assert_eq!(r, report);
+        assert_eq!(*r, report);
     }
 
     #[tokio::test]
@@ -871,6 +923,99 @@ mod tests {
             clean_target(ScanTarget::Primary, clean),
             ScanTarget::Primary
         );
+    }
+
+    #[test]
+    fn cluster_summaries_are_cleaned_too() {
+        let secret = Some("hunter2");
+        let clean = |e: String| conn::parse::mask(&scrub(e, secret));
+        let summary = "cluster · 3 shards · replicas 2/3 · 1 unreachable";
+        assert_eq!(
+            clean_target(ScanTarget::Cluster(summary.into()), clean),
+            ScanTarget::Cluster(summary.into())
+        );
+        let t = clean_target(ScanTarget::Cluster("cluster · hunter2".into()), clean);
+        assert_eq!(t, ScanTarget::Cluster("cluster · ******".into()));
+    }
+
+    #[test]
+    fn cluster_server_lines_sum_memory_limits_and_keys() {
+        assert_eq!(merge_servers(Vec::new()), None);
+        let node = |used: u64, max: u64, keys: u64, version: &str| ServerInfo {
+            version: version.into(),
+            used_memory: used,
+            maxmemory: max,
+            total_keys: keys,
+            ..crate::tui::fixtures::server()
+        };
+        let one = merge_servers(vec![node(10, 100, 3, "7.4.2")]).unwrap();
+        assert_eq!(one.mode, ServerMode::Cluster);
+        assert_eq!(
+            (one.used_memory, one.maxmemory, one.total_keys),
+            (10, 100, 3)
+        );
+        let m = merge_servers(vec![
+            node(10, 100, 3, "7.4.2"),
+            node(20, 0, 4, "7.4.1"),
+            node(30, 300, 5, "7.4.0"),
+        ])
+        .unwrap();
+        // The first node's version and policy, the rest summed.
+        assert_eq!(m.version, "7.4.2");
+        assert_eq!(m.maxmemory_policy, "allkeys-lfu");
+        assert_eq!((m.used_memory, m.maxmemory, m.total_keys), (60, 400, 12));
+        assert_eq!(m.mode, ServerMode::Cluster);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spawned_scan_reports_the_whole_cluster_report() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let report = crate::tui::fixtures::cluster_report();
+        let sent = report.clone();
+        let _task = tokio::spawn(scan_and_report(
+            3,
+            30,
+            tx,
+            move |ptx, _partial| async move {
+                ptx.send_replace(ScanProgress {
+                    sampled: 1,
+                    target: 2,
+                    done: false,
+                });
+                Ok(sent)
+            },
+        ));
+        let mut done = None;
+        while let Some(incoming) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a message")
+        {
+            if let Incoming::Msg(Msg::ScanDone { id, scan, report }) = incoming {
+                done = Some((id, scan, *report));
+                break;
+            }
+        }
+        let (id, scan, got) = done.expect("ScanDone");
+        assert_eq!((id, scan), (3, 30));
+        // The cluster report arrives whole: nodes and the hot keys' node indices.
+        assert_eq!(got, report);
+        assert!(got.nodes.is_some());
+    }
+
+    #[test]
+    fn a_cluster_snapshot_keeps_its_nodes() {
+        let dir = temp_path("cluster-snap").parent().unwrap().to_path_buf();
+        let report = crate::tui::fixtures::cluster_report_degraded();
+        let path = snapshot::save(&dir, &report).unwrap();
+        let back = snapshot::load(&path).unwrap();
+        assert_eq!(back, report);
+        let nodes = back.nodes.unwrap();
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[2].status, crate::model::NodeStatus::Failed);
+        assert!(back.hot_keys.iter().all(|k| k.node.is_some()));
+        // The diff and trend of the TUI load it like any snapshot.
+        assert_eq!(load_trend(&dir, &report).unwrap().points.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

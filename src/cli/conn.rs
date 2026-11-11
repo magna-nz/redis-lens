@@ -14,8 +14,8 @@ use super::{ConnAddArgs, ConnCommand};
 use crate::config::Config;
 use crate::conn::docker::DiscoveredInstance;
 use crate::conn::token::display_command;
-use crate::conn::{self, parse_connection_string, provider};
-use crate::model::{Auth, Credentials, PermStatus, Profile, SecretRef};
+use crate::conn::{self, parse_connection_string, provider, ssh};
+use crate::model::{Auth, Credentials, Env, PermStatus, Profile, SecretRef, SshTunnel};
 use crate::secrets::{KeyringStore, SecretError, SecretStore};
 
 fn config_path(config: Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -118,6 +118,109 @@ fn prompt_password() -> anyhow::Result<String> {
     rpassword::prompt_password("Password: ").context("could not read the password")
 }
 
+/// What `conn add --ssh [USER@]HOST[:PORT]` names: the bastion, and the SSH user that
+/// goes to the keychain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshTarget {
+    pub user: Option<String>,
+    /// An IPv6 address without brackets; anything else as given.
+    pub host: String,
+    pub port: Option<u16>,
+}
+
+/// Parse `[USER@]HOST[:PORT]`. The user is everything before the last `@` (as ssh
+/// splits it); an IPv6 address takes brackets to carry a port (`[::1]:2222`). Errors are
+/// fixed texts that never repeat the value, which may hold the user.
+pub(crate) fn parse_ssh_target(s: &str) -> anyhow::Result<SshTarget> {
+    let (user, rest) = match s.rsplit_once('@') {
+        Some((u, rest)) => {
+            if u.is_empty() || u.chars().any(char::is_control) {
+                bail!("--ssh: the user before '@' is empty or has control characters");
+            }
+            (Some(u.to_string()), rest)
+        }
+        None => (None, s),
+    };
+    let port = |p: &str| -> anyhow::Result<u16> {
+        match p.parse::<u16>() {
+            Ok(n) if n != 0 => Ok(n),
+            _ => bail!("--ssh: the port must be a number from 1 to 65535"),
+        }
+    };
+    let (host, port) = if let Some(inner) = rest.strip_prefix('[') {
+        let Some((h, after)) = inner.split_once(']') else {
+            bail!("--ssh: a '[' without its ']'; write an IPv6 address as [ADDRESS]:PORT");
+        };
+        if h.parse::<std::net::Ipv6Addr>().is_err() {
+            bail!("--ssh: only an IPv6 address goes in brackets");
+        }
+        let p = match after {
+            "" => None,
+            a => match a.strip_prefix(':') {
+                Some(p) => Some(port(p)?),
+                None => bail!("--ssh: expected :PORT after the ']'"),
+            },
+        };
+        (h, p)
+    } else if rest.matches(':').count() > 1 {
+        if rest.parse::<std::net::Ipv6Addr>().is_err() {
+            bail!("--ssh: put an IPv6 address in brackets to give a port: [ADDRESS]:PORT");
+        }
+        (rest, None)
+    } else if let Some((h, p)) = rest.split_once(':') {
+        (h, Some(port(p)?))
+    } else {
+        (rest, None)
+    };
+    if ssh::check_host(host).is_err() {
+        bail!(
+            "--ssh: the bastion host must be a host name, an address or a ~/.ssh/config alias \
+             of at most 253 bytes, with no spaces and no leading '-'"
+        );
+    }
+    Ok(SshTarget {
+        user,
+        host: host.to_string(),
+        port,
+    })
+}
+
+/// The tunnel and SSH user from `--ssh`, `--ssh-identity` and `--ssh-known-hosts`, with
+/// the files checked to exist. `None` without `--ssh`.
+fn ssh_from_args(args: &ConnAddArgs) -> anyhow::Result<Option<(SshTunnel, Option<String>)>> {
+    let Some(spec) = &args.ssh else {
+        if args.ssh_identity.is_some() || args.ssh_known_hosts.is_some() {
+            bail!("--ssh-identity and --ssh-known-hosts need --ssh");
+        }
+        return Ok(None);
+    };
+    let target = parse_ssh_target(spec)?;
+    for (flag, path, what) in [
+        ("--ssh-identity", &args.ssh_identity, "identity file"),
+        (
+            "--ssh-known-hosts",
+            &args.ssh_known_hosts,
+            "known_hosts file",
+        ),
+    ] {
+        if let Some(p) = path {
+            if !p.is_file() {
+                bail!("{flag}: {} does not exist or is not a file", p.display());
+            }
+            ssh::check_path(p, what)?;
+        }
+    }
+    Ok(Some((
+        SshTunnel {
+            host: target.host,
+            port: target.port,
+            identity_file: args.ssh_identity.clone(),
+            known_hosts_file: args.ssh_known_hosts.clone(),
+        },
+        target.user,
+    )))
+}
+
 /// Save a connection. `stdin_password` is everything read from standard input when
 /// `--password-stdin` was given. Returns the line to print.
 pub async fn add(
@@ -205,6 +308,9 @@ pub async fn add_confirmed(
         );
     }
 
+    // Checked before anything is written.
+    let ssh = ssh_from_args(args)?;
+
     let (url_user, url_password) = match &parsed.credentials {
         Some(c) => (
             c.username.clone(),
@@ -282,9 +388,16 @@ pub async fn add_confirmed(
         .provider
         .map(Into::into)
         .or_else(|| provider::classify(&parsed.endpoint.host));
+    let (tunnel, ssh_user) = ssh.unzip();
+    let ssh_user = ssh_user.flatten();
+    // Behind a bastion, a loopback host is the bastion's, not this machine's: not LOCAL.
+    let env_guess = match (parsed.env_guess, &tunnel) {
+        (Env::Local, Some(_)) => Env::Other,
+        (guess, _) => guess,
+    };
     let profile = Profile {
         name: args.name.clone(),
-        env: args.env.map(Into::into).unwrap_or(parsed.env_guess),
+        env: args.env.map(Into::into).unwrap_or(env_guess),
         endpoint: parsed.endpoint,
         db: parsed.db,
         auth,
@@ -292,27 +405,47 @@ pub async fn add_confirmed(
         prefer_replica: args.prefer_replica,
         provider,
         token_command,
+        ssh: tunnel,
     };
 
     let r = profile.secret_ref();
+    let ssh_ref = profile.ssh_secret_ref();
     let mut save = || -> anyhow::Result<()> {
         config.add(profile.clone(), args.force)?;
         config.save(path)?;
         Ok(())
     };
-    match &creds {
-        // Credentials first, rolled back if the config can't be written.
-        Some(c) => set_credentials_then_save(secrets, &r, c, save)?,
-        None => {
-            // Switching to no stored credentials: the old entry goes only once the
-            // config no longer points at it.
-            save()?;
-            if existing.is_some_and(|e| matches!(e.auth, Auth::Keychain | Auth::Command)) {
-                secrets.delete(&r).context(
-                    "the profile was saved, but its old keychain entry could not be deleted",
-                )?;
-            }
+    // Credentials first, rolled back if the config can't be written.
+    let save_with_credentials = || -> anyhow::Result<()> {
+        match &creds {
+            Some(c) => set_credentials_then_save(secrets, &r, c, save),
+            None => save(),
         }
+    };
+    let ssh_creds = ssh_user.map(|u| Credentials {
+        username: Some(u),
+        password: SecretString::from(String::new()),
+    });
+    match &ssh_creds {
+        // The SSH user the same way, around the rest: put back if anything fails.
+        Some(c) => set_credentials_then_save(secrets, &ssh_ref, c, save_with_credentials)?,
+        None => save_with_credentials()?,
+    }
+    // Old entries the saved profile no longer uses go only once the config no longer
+    // points at them.
+    if creds.is_none()
+        && existing
+            .as_ref()
+            .is_some_and(|e| matches!(e.auth, Auth::Keychain | Auth::Command))
+    {
+        secrets
+            .delete(&r)
+            .context("the profile was saved, but its old keychain entry could not be deleted")?;
+    }
+    if ssh_creds.is_none() && existing.as_ref().is_some_and(|e| e.ssh.is_some()) {
+        secrets.delete(&ssh_ref).context(
+            "the profile was saved, but its old SSH username could not be deleted from the keychain",
+        )?;
     }
 
     let mut msg = format!(
@@ -333,6 +466,12 @@ pub async fn add_confirmed(
         }
         (None, Some(_)) => msg.push_str(" Credentials are in the OS keychain."),
         (None, None) => {}
+    }
+    if let Some(t) = &profile.ssh {
+        msg.push_str(&format!(" Through SSH bastion {}.", ssh::label(t)));
+        if ssh_creds.is_some() {
+            msg.push_str(" The SSH username is in the OS keychain.");
+        }
     }
     if let Some(p) = profile.provider {
         msg.push_str(&format!(" Provider: {}.", provider::label(p)));
@@ -389,24 +528,32 @@ pub fn list(path: &Path) -> anyhow::Result<String> {
     if config.profiles.is_empty() {
         return Ok("No saved connections. Add one with `redis-lens conn add`.".to_string());
     }
+    // The SSH column only when some profile goes through a bastion.
+    let any_ssh = config.profiles.iter().any(|p| p.ssh.is_some());
     let rows: Vec<Vec<String>> = config
         .profiles
         .iter()
         .map(|p| {
-            vec![
+            let mut row = vec![
                 p.name.clone(),
                 p.env.label().to_string(),
                 p.endpoint.to_string(),
                 if p.endpoint.tls { "tls" } else { "plain" }.to_string(),
                 auth_label(p.auth).to_string(),
-                p.provider.map_or("", provider::label).to_string(),
-            ]
+            ];
+            if any_ssh {
+                row.push(p.ssh.as_ref().map(ssh::label).unwrap_or_default());
+            }
+            row.push(p.provider.map_or("", provider::label).to_string());
+            row
         })
         .collect();
-    Ok(table(
-        &["NAME", "ENV", "ENDPOINT", "TLS", "AUTH", "PROVIDER"],
-        &rows,
-    ))
+    let header: &[&str] = if any_ssh {
+        &["NAME", "ENV", "ENDPOINT", "TLS", "AUTH", "SSH", "PROVIDER"]
+    } else {
+        &["NAME", "ENV", "ENDPOINT", "TLS", "AUTH", "PROVIDER"]
+    };
+    Ok(table(header, &rows))
 }
 
 /// Remove a profile from the config, then its keychain entry. The entry is deleted
@@ -415,9 +562,17 @@ pub fn remove(path: &Path, secrets: &dyn SecretStore, name: &str) -> anyhow::Res
     let mut config = Config::load(path)?;
     let profile = config.remove(name)?;
     config.save(path)?;
-    secrets
+    let main = secrets
         .delete(&profile.secret_ref())
-        .context("the profile was removed, but its keychain entry could not be deleted")?;
+        .context("the profile was removed, but its keychain entry could not be deleted");
+    let ssh = match profile.ssh {
+        Some(_) => secrets.delete(&profile.ssh_secret_ref()).context(
+            "the profile was removed, but its SSH username could not be deleted from the keychain",
+        ),
+        None => Ok(()),
+    };
+    main?;
+    ssh?;
     Ok(format!("Removed {name}."))
 }
 
@@ -435,6 +590,9 @@ pub async fn test(path: &Path, secrets: &dyn SecretStore, name: &str) -> anyhow:
         profile.endpoint,
         profile.env.label()
     )];
+    if let Some(t) = &profile.ssh {
+        lines.push(format!("Through SSH bastion {}.", ssh::label(t)));
+    }
     if let Some(p) = profile.provider {
         let mut line = format!("Provider: {}.", provider::label(p));
         if let Some(n) = provider::notice(Some(p)) {
@@ -479,6 +637,7 @@ mod tests {
     use crate::cli::EnvArg;
     use crate::model::{Endpoint, Env};
     use crate::secrets::MemoryStore;
+    use proptest::strategy::Strategy as _;
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir()
@@ -506,6 +665,9 @@ mod tests {
             provider: None,
             token_command: Vec::new(),
             yes: false,
+            ssh: None,
+            ssh_identity: None,
+            ssh_known_hosts: None,
         }
     }
 
@@ -1153,6 +1315,325 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    const SSH_USER: &str = "jump-user-x93k";
+
+    fn ssh_ref(name: &str) -> SecretRef {
+        SecretRef {
+            service: crate::model::SECRET_SERVICE.to_string(),
+            account: format!("ssh:profile:{name}"),
+        }
+    }
+
+    fn ssh_user_in(store: &MemoryStore, name: &str) -> Option<String> {
+        store.get(&ssh_ref(name)).unwrap().and_then(|c| c.username)
+    }
+
+    /// A temp dir with an identity file and a known_hosts file in it.
+    fn key_files(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let path = temp_path(tag);
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = dir.join("id_ed25519");
+        let kh = dir.join("known_hosts");
+        std::fs::write(&id, "not a real key").unwrap();
+        std::fs::write(&kh, "").unwrap();
+        (path, id, kh)
+    }
+
+    fn ssh_args(name: &str, url: &str, ssh: &str) -> ConnAddArgs {
+        let mut a = args(name, url);
+        a.ssh = Some(ssh.into());
+        a
+    }
+
+    fn target(user: Option<&str>, host: &str, port: Option<u16>) -> SshTarget {
+        SshTarget {
+            user: user.map(String::from),
+            host: host.into(),
+            port,
+        }
+    }
+
+    #[test]
+    fn ssh_targets_parse() {
+        let ok = [
+            (
+                "bastion.example.com",
+                target(None, "bastion.example.com", None),
+            ),
+            (
+                "ops@bastion:2222",
+                target(Some("ops"), "bastion", Some(2222)),
+            ),
+            ("10.0.0.1:22", target(None, "10.0.0.1", Some(22))),
+            ("jump", target(None, "jump", None)),
+            ("::1", target(None, "::1", None)),
+            (
+                "[2001:db8::1]:2222",
+                target(None, "2001:db8::1", Some(2222)),
+            ),
+            ("u@[::1]", target(Some("u"), "::1", None)),
+            // The user is everything before the last '@', as ssh splits it.
+            (
+                "me@corp.example@b",
+                target(Some("me@corp.example"), "b", None),
+            ),
+        ];
+        for (text, want) in ok {
+            assert_eq!(parse_ssh_target(text).unwrap(), want, "{text}");
+        }
+        let bad = [
+            "",
+            "@host",
+            "secret-user@",
+            "secret-user@-oProxyCommand=x",
+            "secret-user@host:0",
+            "secret-user@host:99999",
+            "secret-user@host:x",
+            "secret-user@2001:db8::1:2222x",
+            "secret-user@[2001:db8::1",
+            "secret-user@[host]:22",
+            "secret-user@[::1]2222",
+            "secret-user@two words",
+        ];
+        for text in bad {
+            let e = parse_ssh_target(text).unwrap_err().to_string();
+            assert!(e.starts_with("--ssh:"), "{text}: {e}");
+            assert!(!e.contains("secret-user"), "{text}: {e}");
+        }
+    }
+
+    proptest::proptest! {
+        /// Whatever `[USER@]HOST[:PORT]` is built from the parts parses back to them.
+        #[test]
+        fn ssh_targets_round_trip(
+            user in proptest::option::of("[a-z_][a-z0-9_.@-]{0,15}"),
+            host in proptest::prop_oneof![
+                "[a-z][a-z0-9-]{0,20}(\\.[a-z][a-z0-9-]{0,10}){0,3}",
+                proptest::prelude::any::<std::net::Ipv4Addr>().prop_map(|a| a.to_string()),
+                proptest::prelude::any::<std::net::Ipv6Addr>().prop_map(|a| a.to_string()),
+            ],
+            port in proptest::option::of(1u16..),
+        ) {
+            let v6 = host.contains(':');
+            let mut text = user.as_ref().map(|u| format!("{u}@")).unwrap_or_default();
+            match (v6, port) {
+                (true, Some(p)) => text.push_str(&format!("[{host}]:{p}")),
+                (false, Some(p)) => text.push_str(&format!("{host}:{p}")),
+                (_, None) => text.push_str(&host),
+            }
+            let got = parse_ssh_target(&text).unwrap();
+            proptest::prop_assert_eq!(got, SshTarget { user, host, port });
+        }
+
+        /// Anything at all: no panic, and what parses is a host ssh can take.
+        #[test]
+        fn ssh_targets_never_panic(text in "\\PC{0,40}") {
+            if let Ok(t) = parse_ssh_target(&text) {
+                proptest::prop_assert!(ssh::check_host(&t.host).is_ok());
+                proptest::prop_assert!(!t.host.contains('@'));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn add_ssh_stores_the_tunnel_and_the_user_only_in_the_keychain() {
+        let (path, id, kh) = key_files("ssh-add");
+        let store = MemoryStore::default();
+        let mut a = ssh_args(
+            "behind",
+            "redis://u:redis-pw@10.0.0.5:6379",
+            &format!("{SSH_USER}@bastion.example.com:2222"),
+        );
+        a.ssh_identity = Some(id.clone());
+        a.ssh_known_hosts = Some(kh.clone());
+        let msg = add_with(&path, &store, &a, None, &mut Vec::new(), &|| {
+            panic!("no prompt")
+        })
+        .await
+        .unwrap();
+        assert!(
+            msg.contains("Through SSH bastion bastion.example.com:2222."),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("The SSH username is in the OS keychain."),
+            "{msg}"
+        );
+        assert!(!msg.contains(SSH_USER), "{msg}");
+
+        let p = Config::load(&path).unwrap().get("behind").unwrap().clone();
+        assert_eq!(
+            p.ssh,
+            Some(SshTunnel {
+                host: "bastion.example.com".into(),
+                port: Some(2222),
+                identity_file: Some(id),
+                known_hosts_file: Some(kh),
+            })
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains(SSH_USER), "{text}");
+        assert!(text.contains("[profile.ssh]"), "{text}");
+        assert_eq!(ssh_user_in(&store, "behind").as_deref(), Some(SSH_USER));
+        let c = store.get(&ssh_ref("behind")).unwrap().unwrap();
+        assert_eq!(c.password.expose_secret(), "");
+        // The profile's own credentials are separate.
+        assert_eq!(
+            entry(&store, "behind"),
+            Some((Some("u".into()), "redis-pw".into()))
+        );
+
+        let out = list(&path).unwrap();
+        assert!(out.lines().next().unwrap().contains("SSH"), "{out}");
+        assert!(out.contains("bastion.example.com:2222"), "{out}");
+        assert!(!out.contains(SSH_USER), "{out}");
+
+        remove(&path, &store, "behind").unwrap();
+        assert_eq!(ssh_user_in(&store, "behind"), None);
+        assert_eq!(entry(&store, "behind"), None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn add_ssh_without_a_user_makes_no_ssh_entry_and_is_not_local() {
+        let path = temp_path("ssh-nouser");
+        let store = MemoryStore::default();
+        let msg = add(
+            &path,
+            &store,
+            &ssh_args("b", "redis://127.0.0.1:6379", "[2001:db8::1]:2222"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            msg.contains("Through SSH bastion [2001:db8::1]:2222."),
+            "{msg}"
+        );
+        assert!(!msg.contains("keychain"), "{msg}");
+        assert_eq!(ssh_user_in(&store, "b"), None);
+        let p = Config::load(&path).unwrap().get("b").unwrap().clone();
+        assert_eq!(p.ssh.as_ref().unwrap().host, "2001:db8::1");
+        // 127.0.0.1 behind a bastion is on the bastion, not this machine.
+        assert_eq!(p.env, Env::Other);
+        // Without --ssh the column stays out of `conn list`.
+        let plain = temp_path("ssh-nocol");
+        add(&plain, &store, &args("p", "redis://localhost"), None)
+            .await
+            .unwrap();
+        assert!(!list(&plain).unwrap().contains("SSH"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(plain.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn add_ssh_refuses_missing_files_and_bad_values_before_saving() {
+        let (path, id, _) = key_files("ssh-missing");
+        let store = MemoryStore::default();
+        let mut a = ssh_args("b", "redis://u:pw@h", &format!("{SSH_USER}@bastion"));
+        a.ssh_identity = Some(path.parent().unwrap().join("no-such-key"));
+        let e = add(&path, &store, &a, None).await.unwrap_err().to_string();
+        assert!(
+            e.starts_with("--ssh-identity:") && e.contains("does not exist"),
+            "{e}"
+        );
+        assert!(!e.contains(SSH_USER), "{e}");
+        a.ssh_identity = Some(id);
+        a.ssh_known_hosts = Some(path.parent().unwrap().join("no-such-kh"));
+        let e = add(&path, &store, &a, None).await.unwrap_err().to_string();
+        assert!(e.starts_with("--ssh-known-hosts:"), "{e}");
+        // A directory is not a file either.
+        a.ssh_known_hosts = Some(path.parent().unwrap().to_path_buf());
+        assert!(add(&path, &store, &a, None).await.is_err());
+        let e = add(
+            &path,
+            &store,
+            &ssh_args("b", "redis://h", &format!("{SSH_USER}@-x")),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!e.contains(SSH_USER), "{e}");
+        // The key flags need --ssh.
+        let mut lone = args("b", "redis://h");
+        lone.ssh_known_hosts = Some("/x".into());
+        assert!(add(&path, &store, &lone, None).await.is_err());
+        assert!(!path.exists());
+        assert_eq!(ssh_user_in(&store, "b"), None);
+        assert_eq!(entry(&store, "b"), None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn force_replaces_or_removes_the_ssh_user() {
+        let path = temp_path("ssh-force");
+        let store = MemoryStore::default();
+        add(
+            &path,
+            &store,
+            &ssh_args("b", "redis://h", "old-user@bastion"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ssh_user_in(&store, "b").as_deref(), Some("old-user"));
+        let mut a = ssh_args("b", "redis://h", "new-user@bastion");
+        a.force = true;
+        add(&path, &store, &a, None).await.unwrap();
+        assert_eq!(ssh_user_in(&store, "b").as_deref(), Some("new-user"));
+        // Still through SSH, without a user: the entry goes.
+        let mut a = ssh_args("b", "redis://h", "bastion");
+        a.force = true;
+        add(&path, &store, &a, None).await.unwrap();
+        assert_eq!(ssh_user_in(&store, "b"), None);
+        // And back, then no SSH at all.
+        let mut a = ssh_args("b", "redis://h", "again@bastion");
+        a.force = true;
+        add(&path, &store, &a, None).await.unwrap();
+        let mut a = args("b", "redis://h");
+        a.force = true;
+        add(&path, &store, &a, None).await.unwrap();
+        assert_eq!(ssh_user_in(&store, "b"), None);
+        assert_eq!(Config::load(&path).unwrap().get("b").unwrap().ssh, None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_puts_the_ssh_user_back() {
+        let path = temp_path("ssh-rb");
+        let store = MemoryStore::default();
+        add(
+            &path,
+            &store,
+            &ssh_args("b", "redis://u:old-pw@h", "old-user@bastion"),
+            None,
+        )
+        .await
+        .unwrap();
+        let before = entry(&store, "b");
+        make_unsaveable(&path);
+        let mut a = ssh_args("b", "redis://v:new-pw@h2", "new-user@bastion");
+        a.force = true;
+        assert!(add(&path, &store, &a, None).await.is_err());
+        assert_eq!(ssh_user_in(&store, "b").as_deref(), Some("old-user"));
+        assert_eq!(entry(&store, "b"), before);
+        // A new profile whose save fails leaves no SSH entry behind.
+        assert!(
+            add(
+                &path,
+                &store,
+                &ssh_args("n", "redis://h", "u@bastion"),
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(ssh_user_in(&store, "n"), None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn discovered_output_hides_passwords() {
         let d = DiscoveredInstance {
@@ -1172,6 +1653,7 @@ mod tests {
                 prefer_replica: false,
                 provider: None,
                 token_command: None,
+                ssh: None,
             },
             credentials: Some(Credentials {
                 username: None,

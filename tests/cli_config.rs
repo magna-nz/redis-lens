@@ -40,6 +40,7 @@ fn config_with(dir: &Path, file: &str, name: &str, port: u16) -> PathBuf {
                 prefer_replica: false,
                 provider: None,
                 token_command: None,
+                ssh: None,
             },
             false,
         )

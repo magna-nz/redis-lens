@@ -64,7 +64,7 @@ fn scanned_with(report: ScanReport, perms: PermissionReport) -> (App, ConnId) {
     app.apply(Msg::ScanDone {
         id,
         scan: scan_of(&app),
-        report,
+        report: Box::new(report),
     });
     (app, id)
 }
@@ -771,7 +771,7 @@ fn every_tab_at_60x20_and_200x60() {
         with_trend_keys,
     ];
     for app in &mut apps {
-        for view in ['0', '1', '2', '3', '4'] {
+        for view in ['0', '1', '2', '3', '4', '5'] {
             app.handle_key(ch(view));
             // Move to the end of each list too, so scrolling is exercised.
             for _ in 0..60 {
@@ -833,7 +833,7 @@ fn small_terminals_do_not_panic() {
     adding.handle_paste(fixtures::PROD_URL.into());
     apps.push(adding);
     for app in &mut apps {
-        for view in ['0', '1', '2', '3', '4'] {
+        for view in ['0', '1', '2', '3', '4', '5'] {
             if app.add.is_none() {
                 app.handle_key(ch(view));
             }
@@ -1153,7 +1153,7 @@ fn ttl_rescanning_shows_previous_results() {
 fn every_view_marks_previous_results_until_the_rescans_first_partial() {
     let (mut app, id, scan) = rescanning('1');
     let top = |app: &App, w| buffer_lines(&render(app, w, 36))[3].clone();
-    for view in ['1', '2', '3', '4'] {
+    for view in ['1', '2', '3', '4', '5'] {
         app.handle_key(ch(view));
         assert!(top(&app, 120).contains(RESCANNING), "view {view}");
         // On a narrow terminal the marker is kept, the rest is cut.
@@ -1168,7 +1168,7 @@ fn every_view_marks_previous_results_until_the_rescans_first_partial() {
     set_history(&mut app2, id2, None);
     app2.handle_key(ch('3'));
     app2.handle_key(ch('r'));
-    for view in ['3', '4'] {
+    for view in ['3', '4', '5'] {
         app2.handle_key(ch(view));
         assert!(top(&app2, 120).contains(RESCANNING), "view {view}");
     }
@@ -1182,7 +1182,7 @@ fn every_view_marks_previous_results_until_the_rescans_first_partial() {
     let line = top(&app, 120);
     assert!(line.contains("partial · 3,200 / 100,000 sampled"), "{line}");
     assert!(!line.contains("previous"), "{line}");
-    for view in ['2', '3', '4'] {
+    for view in ['2', '3', '4', '5'] {
         app.handle_key(ch(view));
         let text = buffer_lines(&render(&app, 120, 36)).join("\n");
         assert!(!text.contains("previous results"), "view {view}");
@@ -1202,7 +1202,7 @@ fn patterns_rescan_failed_keeps_previous_results_marked() {
     let lines = buffer_lines(&t);
     assert!(lines[3].contains(RESCAN_FAILED), "{}", lines[3]);
     assert!(lines[23].contains("Scan failed: connection reset"));
-    for view in ['2', '3', '4'] {
+    for view in ['2', '3', '4', '5'] {
         app.handle_key(ch(view));
         assert!(
             buffer_lines(&render(&app, 120, 36))[3].contains(RESCAN_FAILED),
@@ -1237,7 +1237,7 @@ fn help_over_connections_120x36() {
 #[test]
 fn help_overlay_on_every_view_and_size_does_not_panic() {
     let mut app = scanned_with_history(true);
-    for view in ['0', '1', '2', '3', '4'] {
+    for view in ['0', '1', '2', '3', '4', '5'] {
         press(&mut app, &format!("{view}?"));
         for (w, h) in [(80, 24), (40, 12), (20, 5), (1, 1), (200, 60)] {
             render(&app, w, h);
@@ -1295,7 +1295,7 @@ fn list_rows_is_what_every_list_view_draws() {
     let mut app = scanned_with_history(true);
     for (w, h) in [(80, 24), (120, 36), (60, 20), (200, 60), (80, 17), (80, 18)] {
         let rows = ui::list_rows(ratatui::layout::Rect::new(0, 0, w, h));
-        for view in ['0', '1', '2', '3', '4'] {
+        for view in ['0', '1', '2', '3', '4', '5'] {
             app.handle_key(ch(view));
             let lines = buffer_lines(&render(&app, w, h));
             assert_eq!(drawn_list_rows(&lines), rows, "view {view} at {w}x{h}");

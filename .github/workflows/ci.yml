@@ -99,7 +99,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Pull images
-        run: docker pull redis:7.4-alpine && docker pull valkey/valkey:8.1-alpine
+        run: docker pull redis:7.4-alpine && docker pull valkey/valkey:8.1-alpine && docker pull linuxserver/openssh-server:10.3_p1-r2-ls243
       - run: cargo test --locked --features integration-tests --tests
 
   integration-redis-6-2:
@@ -112,7 +112,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Pull images
-        run: docker pull redis:6.2-alpine && docker pull valkey/valkey:8.1-alpine
+        run: docker pull redis:6.2-alpine && docker pull valkey/valkey:8.1-alpine && docker pull linuxserver/openssh-server:10.3_p1-r2-ls243
       - run: cargo test --locked --features integration-tests --tests
 
   msrv:

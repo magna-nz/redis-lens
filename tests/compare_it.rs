@@ -42,6 +42,7 @@ fn profile(name: &str, env: Env, port: u16) -> Profile {
         prefer_replica: false,
         provider: None,
         token_command: None,
+        ssh: None,
     }
 }
 

@@ -636,6 +636,21 @@ pub fn render_lines(evals: &[Evaluation], strict: bool) -> Vec<String> {
     lines
 }
 
+/// A line saying which nodes of a cluster scan were not scanned to the end, or `None` when
+/// the scan is standalone or every node was scanned. Rules still judge the merged
+/// patterns; the line says they may rest on partial data. It changes no exit code (the
+/// same as a partial scan of a standalone server).
+pub fn coverage_line(report: &ScanReport) -> Option<String> {
+    let nodes = crate::report::unfinished_nodes(report);
+    if nodes.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "NOTE not fully scanned: {}; rules judge the merged patterns, which may be incomplete",
+        nodes.join(", ")
+    ))
+}
+
 fn offender(o: &Offender) -> String {
     if o.pattern == "(whole scan)" {
         format!("(whole scan) {}", clean(&o.value))
@@ -702,6 +717,7 @@ mod tests {
             complete,
             match_glob: None,
             server_context: None,
+            nodes: None,
         }
     }
 
@@ -889,6 +905,26 @@ mod tests {
             eval("total-bytes>1MiB", &r, None),
             Outcome::Pass { .. }
         ));
+    }
+
+    #[test]
+    fn coverage_line_names_unfinished_nodes() {
+        let r = crate::report::fixtures::cluster_report();
+        assert_eq!(
+            coverage_line(&r).unwrap(),
+            "NOTE not fully scanned: 10.0.1.2:7000 (partial), 10.0.1.3:7000 (failed); \
+             rules judge the merged patterns, which may be incomplete"
+        );
+    }
+
+    #[test]
+    fn no_coverage_line_when_standalone_or_all_scanned() {
+        assert_eq!(coverage_line(&rep(vec![], true, false)), None);
+        let mut r = crate::report::fixtures::cluster_report();
+        for n in r.nodes.as_mut().unwrap() {
+            n.status = crate::model::NodeStatus::Scanned;
+        }
+        assert_eq!(coverage_line(&r), None);
     }
 
     #[test]

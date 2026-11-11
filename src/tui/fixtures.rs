@@ -5,9 +5,9 @@ use std::time::Duration;
 use crate::conn::docker::{DiscoveredAuth, DiscoveredInstance};
 use crate::diff::{self, ReportDiff};
 use crate::model::{
-    Auth, Endpoint, Env, KeySample, KeyType, PERM_FREQ, PERM_INFO, PERM_MEMORY, PERM_SCAN,
-    PERM_TYPE_TTL, PatternStats, PermCheck, PermStatus, PermissionReport, Profile, ScanReport,
-    ServerFlavor, ServerInfo, ServerMode, Ttl,
+    Auth, Endpoint, Env, KeySample, KeyType, NodeReport, NodeRole, NodeStatus, PERM_FREQ,
+    PERM_INFO, PERM_MEMORY, PERM_SCAN, PERM_TYPE_TTL, PatternStats, PermCheck, PermStatus,
+    PermissionReport, Profile, ScanReport, ServerFlavor, ServerInfo, ServerMode, Ttl,
 };
 
 pub const PROD_URL: &str = "rediss://lens-ro:Sup3rS3cret@prod-cache-02.internal:6380/0";
@@ -33,6 +33,7 @@ fn profile(name: &str, env: Env, host: &str, port: u16, tls: bool, auth: Auth) -
         prefer_replica: false,
         provider: None,
         token_command: None,
+        ssh: None,
     }
 }
 
@@ -197,6 +198,7 @@ fn build(p: &Pat, sizes: bool) -> PatternStats {
             bytes: opt(*b),
             ttl: ttl(t),
             lfu_freq: None,
+            node: None,
         })
         .collect();
     examples.sort_by_key(|e| std::cmp::Reverse(e.bytes));
@@ -465,6 +467,7 @@ pub fn report(sizes: bool) -> ScanReport {
         complete: false,
         match_glob: None,
         server_context: None,
+        nodes: None,
     }
 }
 
@@ -581,6 +584,7 @@ fn hot(key: &str, key_type: KeyType, bytes: f64, t: &str, freq: u8) -> KeySample
         bytes: Some(bytes as u64),
         ttl: ttl(t),
         lfu_freq: Some(freq),
+        node: None,
     }
 }
 
@@ -654,4 +658,193 @@ pub fn perms_freq_denied() -> PermissionReport {
         }
     }
     p
+}
+
+// ---------------------------------------------------------------------------
+// Clusters. Made-up node IDs and 10.0.1.x addresses; no credentials anywhere.
+// ---------------------------------------------------------------------------
+
+/// Node IDs: the primaries first, then their replicas.
+const NODE_IDS: [&str; 12] = [
+    "a1f3c9e27b4d6e8f0a2c4e6b8d0f1a3c5e7b9d21",
+    "b2e4d0f38c5e7f9a1b3d5f7c9e1a2b4d6f8c0e32",
+    "c3f5e1a49d6f8a0b2c4e6a8d0f2b3c5e7a9d1f43",
+    "d4a6f2b50e7a9b1c3d5f7b9e1a3c4d6f8b0e2a54",
+    "e5b7a3c61f8b0c2d4e6a8c0f2b4d5e7a9c1f3b65",
+    "f6c8b4d72a9c1d3e5f7b9d1a3c5e6f8b0d2a4c76",
+    "17d9c5e83b0d2e4f6a8c0e2b4d6f7a9c1e3b5d87",
+    "28e0d6f94c1e3f5a7b9d1f3c5e7a8b0d2f4c6e98",
+    "39f1e7a05d2f4a6b8c0e2a4d6f8b9c1e3a5d7f09",
+    "4a02f8b16e3a5b7c9d1f3b5e7a9c0d2f4b6e8a1a",
+    "5b13a9c27f4b6c8d0e2a4c6f8b0d1e3a5c7f9b2b",
+    "6c24b0d38a5c7d9e1f3b5d7a9c1e2f4b6d8a0c3c",
+];
+
+const NODE_MAX_MEMORY: f64 = 8.0 * GIB;
+
+/// `10.0.1.<last>:6379`.
+fn node_endpoint(last: u8) -> Endpoint {
+    Endpoint {
+        host: format!("10.0.1.{last}"),
+        port: 6379,
+        tls: false,
+    }
+}
+
+/// `n` slot ranges covering 0-16383: for 3, as `redis-cli --cluster create` splits
+/// them; otherwise evenly.
+fn slot_split(n: usize) -> Vec<(u16, u16)> {
+    if n == 3 {
+        return vec![(0, 5460), (5461, 10922), (10923, 16383)];
+    }
+    let n = n.max(1) as u32;
+    (0..n)
+        .map(|i| {
+            let a = 16_384 * i / n;
+            let b = 16_384 * (i + 1) / n - 1;
+            (a as u16, b as u16)
+        })
+        .collect()
+}
+
+/// `whole` split by `shares`; the last share takes what rounding leaves.
+fn split(whole: u64, shares: &[f64], i: usize) -> u64 {
+    let part = |j: usize| (whole as f64 * shares[j]).floor() as u64;
+    if i + 1 == shares.len() {
+        whole - (0..i).map(part).sum::<u64>()
+    } else {
+        part(i)
+    }
+}
+
+/// [`report`]'s patterns on node `i` of a cluster whose nodes hold `shares` of the
+/// keys. A pattern of fewer than 1,000 keys sits on one node only (picked by its
+/// position), as a handful of keys would. Examples are left out, as the scanner does.
+fn node_patterns(shares: &[f64], i: usize) -> Vec<PatternStats> {
+    let mut out: Vec<PatternStats> = report(true)
+        .patterns
+        .into_iter()
+        .enumerate()
+        .filter_map(|(at, mut p)| {
+            let n = shares.len();
+            let (keys, sampled) = if p.est_keys < 1_000 {
+                if at % n != i {
+                    return None;
+                }
+                (p.est_keys, p.sampled_keys)
+            } else {
+                (
+                    split(p.est_keys, shares, i),
+                    split(p.sampled_keys, shares, i).max(1),
+                )
+            };
+            let f = sampled as f64 / p.sampled_keys as f64;
+            let scale = |v: u64| (v as f64 * f).round() as u64;
+            p.est_bytes = p
+                .est_bytes
+                .map(|b| (b as f64 * keys as f64 / p.est_keys.max(1) as f64) as u64);
+            p.sampled_bytes = p.sampled_bytes.map(scale);
+            p.no_ttl = scale(p.no_ttl);
+            p.ttl_hist = p.ttl_hist.map(scale);
+            p.est_keys = keys;
+            p.sampled_keys = sampled;
+            p.examples.clear();
+            Some(p)
+        })
+        .collect();
+    out.sort_by_key(|p| std::cmp::Reverse(p.est_bytes));
+    out
+}
+
+/// A finished scan of a healthy cluster of `shares.len()` primaries (10.0.1.11 and up)
+/// that hold `shares` of [`report`]'s keys and memory. The merged fields are
+/// [`report`]'s, with the server line summed over the nodes; hot keys are
+/// [`hot_keys`], spread over the nodes.
+pub fn cluster_report_with(shares: &[f64]) -> ScanReport {
+    let base = report(true);
+    let slots = slot_split(shares.len());
+    let nodes: Vec<NodeReport> = shares
+        .iter()
+        .enumerate()
+        .map(|(i, _)| NodeReport {
+            id: NODE_IDS[i].into(),
+            endpoint: node_endpoint(11 + i as u8),
+            role: NodeRole::Primary,
+            primary_id: NODE_IDS[i].into(),
+            slots: vec![slots[i]],
+            server: Some(ServerInfo {
+                mode: ServerMode::Cluster,
+                used_memory: split(base.server.used_memory, shares, i),
+                maxmemory: NODE_MAX_MEMORY as u64,
+                total_keys: split(TOTAL_KEYS, shares, i),
+                ..server()
+            }),
+            status: NodeStatus::Scanned,
+            note: None,
+            sampled_keys: split(SAMPLED, shares, i),
+            complete: false,
+            sizes_available: true,
+            patterns: node_patterns(shares, i),
+        })
+        .collect();
+    let mut merged = base.server.clone();
+    merged.mode = ServerMode::Cluster;
+    merged.maxmemory = NODE_MAX_MEMORY as u64 * shares.len() as u64;
+    let mut hot = hot_keys();
+    for (i, k) in hot.iter_mut().enumerate() {
+        k.node = Some((i % shares.len()) as u16);
+    }
+    ScanReport {
+        profile: "prod-cluster".into(),
+        server: merged,
+        hot_keys: hot,
+        nodes: Some(nodes),
+        ..base
+    }
+}
+
+/// A healthy 3-shard cluster: 40%, 35% and 25% of the keys.
+pub fn cluster_report() -> ScanReport {
+    cluster_report_with(&[0.40, 0.35, 0.25])
+}
+
+/// The note the scanner gives a node that failed mid-scan.
+pub const NOTE_STOPPED: &str =
+    "the scan of this node stopped early (a connection or server error); its results are partial";
+/// The note connecting gives a node that could not be reached.
+pub const NOTE_UNREACHABLE: &str = "10.0.1.13:6379: could not connect";
+
+/// [`cluster_report`] with the second shard partial (its scan stopped early, a fifth of
+/// its sample kept) and the third failed (unreachable): no server, no results, and no
+/// hot keys from it.
+pub fn cluster_report_degraded() -> ScanReport {
+    let mut r = cluster_report();
+    let nodes = r.nodes.as_mut().unwrap();
+    let partial = &mut nodes[1];
+    partial.status = NodeStatus::Partial;
+    partial.note = Some(NOTE_STOPPED.into());
+    partial.sampled_keys /= 5;
+    let failed = &mut nodes[2];
+    failed.status = NodeStatus::Failed;
+    failed.note = Some(NOTE_UNREACHABLE.into());
+    failed.server = None;
+    failed.sampled_keys = 0;
+    failed.sizes_available = false;
+    failed.patterns.clear();
+    r.hot_keys.retain(|k| k.node != Some(2));
+    r
+}
+
+/// [`cluster_report`] scanned with `prefer_replica`: the first two shards on verified
+/// replicas (10.0.1.21 and .22), the third on its primary because its replica timed out.
+pub fn cluster_report_replicas() -> ScanReport {
+    let mut r = cluster_report();
+    let nodes = r.nodes.as_mut().unwrap();
+    for (i, n) in nodes.iter_mut().enumerate().take(2) {
+        n.role = NodeRole::Replica;
+        n.id = NODE_IDS[6 + i].into();
+        n.endpoint = node_endpoint(21 + i as u8);
+    }
+    nodes[2].note = Some("replica not used: 10.0.1.23:6379: timed out".into());
+    r
 }
