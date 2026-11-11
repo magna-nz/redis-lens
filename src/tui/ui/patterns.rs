@@ -8,12 +8,12 @@ use crate::diff::ReportDiff;
 use crate::format;
 use crate::model::{PatternStats, TTL_BUCKET_LABELS, Ttl};
 use crate::tui::app::{App, PatternData};
-use crate::tui::tree::{Root, Row, Summary, Verdict, summarize, summarize_group};
+use crate::tui::tree::{Root, Row, SortBy, Summary, Verdict, summarize, summarize_group};
 
 use super::delta::Change;
 use super::widgets::{
     bar, fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset, split_cols,
-    trunc, ttl_hist_spans,
+    trunc, ttl_hist_spans, width,
 };
 use super::{report_or_wait, split_body, style};
 
@@ -104,9 +104,16 @@ fn row_summary(app: &App, patterns: &[PatternStats], row: Row) -> (Summary, usiz
     }
 }
 
+/// Column widths of the table. A hidden column is 0 or false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Cols {
     name: usize,
+    /// The share bar; 0 when hidden. The share percentage always shows.
     share: usize,
+    /// The Δ column.
+    delta: bool,
+    /// The average size column.
+    avg: bool,
 }
 
 const TYPE_W: usize = 8;
@@ -115,17 +122,63 @@ const PCT_W: usize = 4;
 const TTL_W: usize = 6;
 /// The Δ column, shown only when there is a snapshot to compare with.
 const DELTA_W: usize = 7;
+/// The narrowest the pattern column gets before another column is hidden.
+const NAME_MIN: usize = 12;
 
+impl Cols {
+    /// Everything but the pattern column.
+    fn fixed(&self) -> usize {
+        let mut w = TYPE_W + (NUM_W + 2) * 2 + self.share + 1 + PCT_W + 2 + TTL_W + 2;
+        if self.avg {
+            w += NUM_W + 2;
+        }
+        if self.delta {
+            w += DELTA_W + 1;
+        }
+        w
+    }
+}
+
+/// Column widths for a table `inner` cells wide. When the pattern column would get
+/// narrower than [`NAME_MIN`], columns are hidden in this order: the share bar, Δ, the
+/// average size. Only when all three are hidden is a row cut at the right edge.
 fn cols(inner: usize, delta: bool) -> Cols {
     let share = if inner >= 100 { 14 } else { 8 };
-    let mut fixed = TYPE_W + (NUM_W + 2) * 3 + share + 1 + PCT_W + 2 + TTL_W + 2;
-    if delta {
-        fixed += DELTA_W + 1;
-    }
-    Cols {
-        name: inner.saturating_sub(fixed).max(12),
+    let full = Cols {
+        name: 0,
         share,
+        delta,
+        avg: true,
+    };
+    let steps = [
+        full,
+        Cols { share: 0, ..full },
+        Cols {
+            share: 0,
+            delta: false,
+            ..full
+        },
+        Cols {
+            share: 0,
+            delta: false,
+            avg: false,
+            ..full
+        },
+    ];
+    let pick = steps
+        .iter()
+        .find(|c| inner >= c.fixed() + NAME_MIN)
+        .unwrap_or(&steps[3]);
+    Cols {
+        name: inner.saturating_sub(pick.fixed()).max(NAME_MIN),
+        ..*pick
     }
+}
+
+/// A right-aligned header `w` wide and its two-cell gap, with the sort arrow first in
+/// the gap when `arrow` is set.
+fn head_num(label: &str, w: usize, arrow: Option<&str>) -> String {
+    format!("{}{} ", pad_l(label, w), arrow.unwrap_or(" "))
 }
 
 fn type_label(s: &Summary) -> &'static str {
@@ -142,6 +195,7 @@ fn table(
     sel: usize,
 ) {
     let sizes = data.sizes_available;
+    let sort = app.patterns.sort.effective(sizes);
     let mut right = if !app.patterns.filter.is_empty() {
         format!(
             "filter \"{}\" · {} rows",
@@ -149,9 +203,16 @@ fn table(
             summaries.len()
         )
     } else if !sizes {
-        "sizes unavailable: MEMORY USAGE denied · sorted by keys".to_string()
+        format!(
+            "sizes unavailable: MEMORY USAGE denied · sorted by {}",
+            sort.label()
+        )
     } else {
-        format!("{} patterns · sorted by memory", data.patterns.len())
+        format!(
+            "{} patterns · sorted by {}",
+            data.patterns.len(),
+            sort.label()
+        )
     };
     // The marker comes first, so a narrow title cuts the rest, not the marker.
     if let Some(p) = data.partial {
@@ -163,17 +224,39 @@ fn table(
     }
     let inner = panel(frame, area, "Patterns", &right);
     let c = cols(usize::from(inner.width), changes.is_some());
+    // ▼ beside the sorted column, ▲ for name (A to Z).
+    let arrow = |s: SortBy| (sort == s).then_some(if s.ascending() { "▲" } else { "▼" });
+    let pattern_head = match arrow(SortBy::Name) {
+        Some(a) => format!(" PATTERN {a}"),
+        None => " PATTERN".to_string(),
+    };
     let mut head = Line::from(vec![
-        Span::styled(pad_r(" PATTERN", c.name), style::hd()),
+        Span::styled(pad_r(&pattern_head, c.name), style::hd()),
         Span::styled(pad_r("TYPE", TYPE_W), style::hd()),
-        Span::styled(format!("{}  ", pad_l("KEYS", NUM_W)), style::hd()),
-        Span::styled(format!("{}  ", pad_l("MEMORY", NUM_W)), style::hd()),
-        Span::styled(pad_r("SHARE", c.share), style::hd()),
-        Span::styled(format!(" {}  ", pad_l("%", PCT_W)), style::hd()),
-        Span::styled(format!("{}  ", pad_l("AVG", NUM_W)), style::hd()),
-        Span::styled(format!("{}  ", pad_l("NO TTL", TTL_W)), style::hd()),
+        Span::styled(head_num("KEYS", NUM_W, arrow(SortBy::Keys)), style::hd()),
+        Span::styled(
+            head_num("MEMORY", NUM_W, arrow(SortBy::Memory)),
+            style::hd(),
+        ),
     ]);
-    if changes.is_some() {
+    if c.share > 0 {
+        head.push_span(Span::styled(pad_r("SHARE", c.share), style::hd()));
+    }
+    head.push_span(Span::styled(
+        format!(" {}  ", pad_l("%", PCT_W)),
+        style::hd(),
+    ));
+    if c.avg {
+        head.push_span(Span::styled(
+            head_num("AVG", NUM_W, arrow(SortBy::AvgSize)),
+            style::hd(),
+        ));
+    }
+    head.push_span(Span::styled(
+        head_num("NO TTL", TTL_W, arrow(SortBy::NoTtl)),
+        style::hd(),
+    ));
+    if c.delta {
         head.push_span(Span::styled(
             format!("{} ", pad_l("Δ", DELTA_W)),
             style::hd(),
@@ -196,7 +279,7 @@ fn table(
         .map(|(i, (s, depth, open))| {
             let scroll = (i == sel).then(|| app.sel_ticks());
             let mut line = pattern_row(s, *depth, *open, total, sizes, &c, scroll);
-            if let Some(ch) = changes {
+            if let Some(ch) = changes.filter(|_| c.delta) {
                 line.push_span(match ch.get(i).copied().flatten() {
                     Some(d) => Span::styled(format!("{} ", pad_l(&d.text(), DELTA_W)), d.style()),
                     None => Span::styled(format!("{} ", pad_l("—", DELTA_W)), style::dim()),
@@ -235,15 +318,15 @@ fn pattern_row(
     } else {
         (style::fg(), style::ph())
     };
-    let mut name = vec![Span::styled(
-        format!(" {}{mark}", "  ".repeat(depth)),
-        style::dim(),
-    )];
-    name.extend(pattern_spans(&s.label, base, ph));
-    let mut spans = match scroll {
-        Some(ticks) => marquee_spans(name, c.name - 1, ticks),
-        None => fit(name, c.name - 1),
-    };
+    // The indent and the fold mark stay put; only the text after them scrolls.
+    let lead = format!(" {}{mark}", "  ".repeat(depth));
+    let text_w = (c.name - 1).saturating_sub(width(&lead));
+    let text = pattern_spans(&s.label, base, ph);
+    let mut spans = vec![Span::styled(lead, style::dim())];
+    spans.extend(match scroll {
+        Some(ticks) => marquee_spans(text, text_w, ticks),
+        None => fit(text, text_w),
+    });
     spans.push(Span::raw(" "));
 
     let weight = if sizes {
@@ -278,15 +361,19 @@ fn pattern_row(
             style::fg(),
         ),
         Span::styled(format!("{}  ", pad_l(&mem, NUM_W)), style::fg()),
-        Span::styled(fill, style::amber()),
-        Span::styled(track, style::track()),
-        Span::styled(
-            format!(" {}  ", pad_l(&format::percent(share), PCT_W)),
-            style::dim(),
-        ),
-        Span::styled(format!("{}  ", pad_l(&avg, NUM_W)), avg_style),
-        Span::styled(format!("{}  ", pad_l(&ttl, TTL_W)), ttl_style),
     ]);
+    if c.share > 0 {
+        spans.push(Span::styled(fill, style::amber()));
+        spans.push(Span::styled(track, style::track()));
+    }
+    spans.push(Span::styled(
+        format!(" {}  ", pad_l(&format::percent(share), PCT_W)),
+        style::dim(),
+    ));
+    if c.avg {
+        spans.push(Span::styled(format!("{}  ", pad_l(&avg, NUM_W)), avg_style));
+    }
+    spans.push(Span::styled(format!("{}  ", pad_l(&ttl, TTL_W)), ttl_style));
     Line::from(spans)
 }
 

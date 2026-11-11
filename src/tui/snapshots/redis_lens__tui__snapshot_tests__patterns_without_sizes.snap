@@ -6,7 +6,7 @@ expression: t.backend()
 " Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)  ▲ sizes unavailable: MEMORY USAGE denied "
 "  0 Connections   1 Patterns   2 TTL   3 Diff   4 Hot keys                                                              "
 "┌─ Patterns ───────────────────────────────────────────────── sizes unavailable: MEMORY USAGE denied · sorted by keys ─┐"
-"│ PATTERN                                              TYPE       KEYS   MEMORY  SHARE             %      AVG  NO TTL  │"
+"│ PATTERN                                              TYPE       KEYS▼  MEMORY  SHARE             %      AVG  NO TTL  │"
 "│   rl:{ip}:{id}                                       string    2.31M        —  █████░░░░░░░░░  36%        —      0%  │"
 "│   session:{uuid}                                     string    1.84M        —  ████░░░░░░░░░░  29%        —      0%  │"
 "│ ▾ cache:*                                            string    1.34M        —  ██▉░░░░░░░░░░░  21%        —     10%  │"

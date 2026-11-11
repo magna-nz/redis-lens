@@ -795,7 +795,8 @@ fn patterns_narrow_rows_do_not_wrap() {
     tick(&mut app, 25);
     let after = buffer_lines(&render(&app, 60, 24));
     assert_ne!(after[5], before[5]);
-    assert!(after[5].starts_with("│…"), "{}", after[5]);
+    // Only the name scrolls: the indent and the (empty) fold mark stay in front.
+    assert!(after[5].starts_with("│   …"), "{}", after[5]);
     assert!(after[6].starts_with("│ ▾ cache:"), "{}", after[6]);
     assert!(
         !after.iter().any(|l| l.contains("descriptive")),
@@ -812,4 +813,159 @@ fn patterns_long_name_mid_scroll() {
     tick(&mut app, 10 + 2 * 12);
     let t = render(&app, 120, 36);
     insta::assert_snapshot!(t.backend());
+}
+
+const LONG_GROUP: &str = "cache-of-a-service-with-an-exceedingly-long-descriptive-name";
+
+/// A finished scan whose `cache:*` group (second row) has a very long label.
+fn long_group_app() -> App {
+    let mut report = fixtures::report(true);
+    for p in &mut report.patterns {
+        if let Some(rest) = p.pattern.strip_prefix("cache:") {
+            p.pattern = format!("{LONG_GROUP}:{rest}");
+        }
+    }
+    let mut app = scanned_with(report, fixtures::perms_ok()).0;
+    select_pattern(&mut app, &format!("{LONG_GROUP}:*"));
+    app
+}
+
+#[test]
+fn patterns_long_group_name_mid_scroll() {
+    let mut app = long_group_app();
+    tick(&mut app, 10 + 2 * 12);
+    let t = render(&app, 120, 36);
+    let lines = buffer_lines(&t);
+    // The fold mark stays visible; the label scrolls after it.
+    assert!(lines[6].starts_with("│ ▾ …"), "{}", lines[6]);
+    // Collapsed, the mark changes and stays visible too.
+    app.handle_key(key(KeyCode::Left));
+    tick(&mut app, 10 + 2 * 12);
+    let lines = buffer_lines(&render(&app, 120, 36));
+    assert!(lines[6].starts_with("│ ▸ …"), "{}", lines[6]);
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn patterns_long_child_name_keeps_its_indent() {
+    let mut app = long_group_app();
+    app.handle_key(key(KeyCode::Right));
+    tick(&mut app, 10 + 2 * 12);
+    let lines = buffer_lines(&render(&app, 120, 36));
+    assert!(lines[7].starts_with("│     …"), "{}", lines[7]);
+}
+
+#[test]
+fn patterns_sorted_by_keys() {
+    let mut app = scanned(true);
+    select_pattern(&mut app, "user:{id}:cart");
+    app.handle_key(ch('o'));
+    let t = render(&app, 120, 36);
+    let lines = buffer_lines(&t);
+    assert!(lines[3].contains("sorted by keys"), "{}", lines[3]);
+    assert!(lines[4].contains("KEYS▼"), "{}", lines[4]);
+    assert!(!lines[4].contains("MEMORY▼"), "{}", lines[4]);
+    // The selection stayed on the same pattern, now further down.
+    assert!(
+        lines.iter().any(|l| l.starts_with("┌─ user:{id}:cart ")),
+        "{lines:#?}"
+    );
+    assert!(lines[12].contains("user:{id}:cart"), "{}", lines[12]);
+    assert!(lines.last().unwrap().contains("Sorted by keys"));
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn patterns_sorted_by_name_shows_an_up_arrow() {
+    let mut app = scanned(true);
+    press(&mut app, "oooo");
+    let lines = buffer_lines(&render(&app, 120, 36));
+    assert!(lines[3].contains("sorted by name"), "{}", lines[3]);
+    assert!(lines[4].starts_with("│ PATTERN ▲"), "{}", lines[4]);
+    assert!(!lines[4].contains('▼'), "{}", lines[4]);
+}
+
+/// The table of the Patterns view (title, header, rows) rendered `w` wide.
+fn table_at(app: &App, w: u16) -> Vec<String> {
+    let lines = buffer_lines(&render(app, w, 24));
+    let end = lines[3..].iter().position(|l| l.starts_with('└')).unwrap() + 3;
+    lines[3..=end].to_vec()
+}
+
+/// Asserts the header shows exactly `shown` of the optional columns and that the
+/// share percentage lines up between the header and every row.
+fn check_columns(table: &[String], w: u16, shown: &[&str]) {
+    let head = &table[1];
+    for col in ["SHARE", "AVG", "Δ"] {
+        assert_eq!(
+            head.contains(col),
+            shown.contains(&col),
+            "{w}: {col} in {head}"
+        );
+    }
+    let pct = |l: &str| l.chars().position(|c| c == '%');
+    let at = pct(head).unwrap();
+    for row in &table[2..table.len() - 1] {
+        if row.trim_matches(|c| c == '│' || c == ' ').is_empty() {
+            continue;
+        }
+        assert_eq!(pct(row), Some(at), "{w}: {row}\n{head}");
+    }
+    for l in table {
+        assert_eq!(l.chars().count(), usize::from(w), "{l}");
+    }
+}
+
+fn narrow_steps(app: &App, steps: &[(u16, &[&str])]) -> String {
+    let mut out = String::new();
+    for (w, shown) in steps {
+        let table = table_at(app, *w);
+        check_columns(&table, *w, shown);
+        out.push_str(&format!("{w} wide:\n{}\n\n", table.join("\n")));
+    }
+    out
+}
+
+#[test]
+fn patterns_narrow_columns() {
+    let mut app = scanned(true);
+    select_pattern(&mut app, "user:{id}:cart");
+    // 72 is the narrowest with every column; then the share bar goes (71), then the
+    // average size (63); below 55 the row is cut at the right edge.
+    let snap = narrow_steps(
+        &app,
+        &[
+            (72, &["SHARE", "AVG"]),
+            (71, &["AVG"]),
+            (64, &["AVG"]),
+            (63, &[]),
+            (55, &[]),
+        ],
+    );
+    let cut = table_at(&app, 50);
+    // Every column is hidden and the name is at its narrowest: the row is cut.
+    assert!(cut[1].starts_with("│ PATTERN    TYPE"), "{}", cut[1]);
+    assert!(!cut[1].contains("NO TTL"), "{}", cut[1]);
+    insta::assert_snapshot!(format!("{snap}50 wide:\n{}", cut.join("\n")));
+}
+
+#[test]
+fn patterns_narrow_columns_with_delta() {
+    let mut app = scanned_with_history(true);
+    select_pattern(&mut app, "user:{id}:cart");
+    // 80 is the narrowest with every column; the share bar goes first (79), then Δ
+    // (71), then the average size (63).
+    let snap = narrow_steps(
+        &app,
+        &[
+            (80, &["SHARE", "AVG", "Δ"]),
+            (79, &["AVG", "Δ"]),
+            (72, &["AVG", "Δ"]),
+            (71, &["AVG"]),
+            (64, &["AVG"]),
+            (63, &[]),
+            (55, &[]),
+        ],
+    );
+    insta::assert_snapshot!(snap);
 }

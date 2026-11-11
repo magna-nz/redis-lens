@@ -1,7 +1,6 @@
 //! TUI state and the pure update functions. Nothing here does IO: key presses and
 //! messages change the state and return [`Effect`]s for the runtime to carry out.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,7 +19,7 @@ use crate::model::{
 use crate::scan::{PartialPatterns, ScanProgress};
 use crate::verdict::ttl_verdict;
 
-use super::tree::{PatternTree, Root, Row};
+use super::tree::{Collapsed, Group, PatternTree, Root, Row, RowId, SortBy};
 
 /// Ticks (100 ms each) an info notice stays up.
 const NOTICE_TICKS: u64 = 40;
@@ -305,8 +304,14 @@ impl AddState {
 #[derive(Debug, Clone, Default)]
 pub struct PatternsState {
     pub tree: PatternTree,
-    /// Keys of collapsed groups. Groups start expanded.
-    pub collapsed: HashSet<String>,
+    /// Collapsed groups. Groups start expanded. See [`Collapsed`] for how a collapse
+    /// carries over when the tree is rebuilt.
+    pub collapsed: Collapsed,
+    /// The row order, changed with `o`. Kept while the session's scan runs and
+    /// finishes; a new connect starts again by memory.
+    pub sort: SortBy,
+    /// Index into the visible rows. Follows the selected row's identity (see
+    /// [`App::selected_row_id`]) whenever the tree is rebuilt.
     pub sel: usize,
     pub filter: String,
     /// The filter input is open.
@@ -354,16 +359,17 @@ pub struct App {
     next_scan: ScanId,
 }
 
-/// Everything that decides which row is selected, cheap to copy and compare.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Everything that decides which row is selected, to spot a change. The Patterns row is
+/// by identity, so the same pattern at another index is no change and another pattern
+/// at the same index is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SelId {
     view: View,
     conn: ConnSel,
-    patterns: usize,
+    /// Only tracked on the Patterns view.
+    patterns: Option<RowId>,
     sel: ViewSel,
     session: Option<(ConnId, ScanId)>,
-    filter_len: usize,
-    collapsed: usize,
 }
 
 impl Default for SelId {
@@ -371,13 +377,28 @@ impl Default for SelId {
         Self {
             view: View::Connections,
             conn: ConnSel::Add,
-            patterns: 0,
+            patterns: None,
             sel: ViewSel::default(),
             session: None,
-            filter_len: 0,
-            collapsed: 0,
         }
     }
+}
+
+/// What the Patterns view shows for `s`: see [`App::pattern_data`].
+fn pattern_data_of(s: &Session) -> Option<PatternData<'_>> {
+    if let Some(r) = &s.report {
+        return Some(PatternData {
+            patterns: &r.patterns,
+            sizes_available: r.sizes_available,
+            partial: None,
+        });
+    }
+    let p = s.partial.as_deref()?;
+    Some(PatternData {
+        patterns: &p.patterns,
+        sizes_available: p.sizes_available,
+        partial: Some(p),
+    })
 }
 
 fn is_press(key: &KeyEvent) -> bool {
@@ -532,20 +553,7 @@ impl App {
     /// results while the scan runs, or `None`. `self.patterns.tree` is always built
     /// from these.
     pub fn pattern_data(&self) -> Option<PatternData<'_>> {
-        let s = self.session.as_ref()?;
-        if let Some(r) = &s.report {
-            return Some(PatternData {
-                patterns: &r.patterns,
-                sizes_available: r.sizes_available,
-                partial: None,
-            });
-        }
-        let p = s.partial.as_deref()?;
-        Some(PatternData {
-            patterns: &p.patterns,
-            sizes_available: p.sizes_available,
-            partial: Some(p),
-        })
+        pattern_data_of(self.session.as_ref()?)
     }
 
     /// Rows currently visible on the Patterns view.
@@ -558,6 +566,51 @@ impl App {
             ),
             None => Vec::new(),
         }
+    }
+
+    /// The selected Patterns row by identity: a group by its key, a pattern by its
+    /// name. `None` when there are no rows.
+    pub fn selected_row_id(&self) -> Option<RowId> {
+        let d = self.pattern_data()?;
+        self.patterns.tree.row_id(d.patterns, self.selected_row()?)
+    }
+
+    /// The selected row of the Patterns view, `None` when there are no rows.
+    fn selected_row(&self) -> Option<Row> {
+        let rows = self.pattern_rows();
+        rows.get(self.patterns.sel.min(rows.len().saturating_sub(1)))
+            .copied()
+    }
+
+    /// The selected row's identity and the patterns it stands for, to find it again
+    /// after the tree is rebuilt.
+    fn selection_anchor(&self) -> Option<(RowId, Vec<String>)> {
+        let d = self.pattern_data()?;
+        let row = self.selected_row()?;
+        let tree = &self.patterns.tree;
+        Some((
+            tree.row_id(d.patterns, row)?,
+            tree.row_members(d.patterns, row),
+        ))
+    }
+
+    /// Rebuilds the Patterns tree from the current pattern data and sort, carries the
+    /// collapsed groups over, and moves the selection to the row that was `anchor`
+    /// (see [`PatternTree::find`]). When that row is gone the index stays, clamped to
+    /// the rows.
+    fn rebuild_patterns(&mut self, anchor: Option<(RowId, Vec<String>)>) {
+        let Some(d) = self.session.as_ref().and_then(pattern_data_of) else {
+            self.patterns.tree = PatternTree::default();
+            self.patterns.sel = 0;
+            return;
+        };
+        let p = &mut self.patterns;
+        p.tree = PatternTree::build_sorted(d.patterns, d.sizes_available, p.sort);
+        p.collapsed.reconcile(&p.tree, d.patterns);
+        let rows = p.tree.visible(d.patterns, &p.collapsed, &p.filter);
+        p.sel = anchor
+            .and_then(|(id, members)| p.tree.find(d.patterns, &rows, &id, &members))
+            .unwrap_or_else(|| p.sel.min(rows.len().saturating_sub(1)));
     }
 
     pub fn report(&self) -> Option<&ScanReport> {
@@ -639,15 +692,18 @@ impl App {
     }
 
     /// Restarts the marquee when the selected row, the view or the session changed.
+    /// A Patterns row counts by identity, not index.
     fn track_selection(&mut self) {
         let id = SelId {
             view: self.view,
             conn: self.conn_sel,
-            patterns: self.patterns.sel,
+            patterns: if self.view == View::Patterns {
+                self.selected_row_id()
+            } else {
+                None
+            },
             sel: self.sel,
             session: self.session.as_ref().map(|s| (s.id, s.scan)),
-            filter_len: self.patterns.filter.len(),
-            collapsed: self.patterns.collapsed.len(),
         };
         if id != self.sel_id {
             self.sel_id = id;
@@ -1011,14 +1067,32 @@ impl App {
                 self.patterns.filter.clear();
                 self.patterns.sel = 0;
             }
+            (_, Some('o')) => self.cycle_sort(),
             _ => {}
         }
     }
 
-    fn group_key(&self, root: usize) -> Option<String> {
+    /// `o`: the next sort (see [`SortBy::next`]). The selected row stays selected.
+    fn cycle_sort(&mut self) {
+        let sizes = self.pattern_data().is_none_or(|d| d.sizes_available);
+        let anchor = self.selection_anchor();
+        self.patterns.sort = self.patterns.sort.next(sizes);
+        self.rebuild_patterns(anchor);
+        let label = self.patterns.sort.effective(sizes).label();
+        self.set_info(format!("Sorted by {label}"));
+    }
+
+    fn group(&self, root: usize) -> Option<Group> {
         match self.patterns.tree.roots.get(root) {
-            Some(Root::Group(g)) => Some(g.key.clone()),
+            Some(Root::Group(g)) => Some(g.clone()),
             _ => None,
+        }
+    }
+
+    /// Collapses `g`, remembering its patterns (see [`Collapsed`]).
+    fn collapse_group(&mut self, g: &Group) {
+        if let Some(d) = self.session.as_ref().and_then(pattern_data_of) {
+            self.patterns.collapsed.collapse(g, d.patterns);
         }
     }
 
@@ -1026,10 +1100,10 @@ impl App {
         let Some(Row::Group { root }) = rows.get(sel).copied() else {
             return;
         };
-        let Some(key) = self.group_key(root) else {
+        let Some(g) = self.group(root) else {
             return;
         };
-        if !self.patterns.collapsed.remove(&key)
+        if !self.patterns.collapsed.expand(&g.key)
             && matches!(rows.get(sel + 1), Some(Row::Pattern { parent: Some(p), .. }) if *p == root)
         {
             self.patterns.sel = sel + 1;
@@ -1039,8 +1113,8 @@ impl App {
     fn collapse(&mut self, rows: &[Row], sel: usize) {
         match rows.get(sel).copied() {
             Some(Row::Group { root }) => {
-                if let Some(key) = self.group_key(root) {
-                    self.patterns.collapsed.insert(key);
+                if let Some(g) = self.group(root) {
+                    self.collapse_group(&g);
                 }
             }
             Some(Row::Pattern {
@@ -1056,10 +1130,10 @@ impl App {
 
     fn toggle(&mut self, rows: &[Row], sel: usize) {
         if let Some(Row::Group { root }) = rows.get(sel).copied()
-            && let Some(key) = self.group_key(root)
-            && !self.patterns.collapsed.remove(&key)
+            && let Some(g) = self.group(root)
+            && !self.patterns.collapsed.expand(&g.key)
         {
-            self.patterns.collapsed.insert(key);
+            self.collapse_group(&g);
         }
     }
 
@@ -1172,8 +1246,11 @@ impl App {
                 {
                     return Vec::new();
                 }
-                self.patterns.tree = PatternTree::build(&partial.patterns, partial.sizes_available);
-                s.partial = Some(partial);
+                let anchor = self.selection_anchor();
+                if let Some(s) = self.session.as_mut() {
+                    s.partial = Some(partial);
+                }
+                self.rebuild_patterns(anchor);
             }
             Msg::ScanDone { id, scan, report } => {
                 if !self.is_session(id, scan) {
@@ -1182,8 +1259,8 @@ impl App {
                 if let Some(e) = self.entry_mut(id) {
                     e.server = Some(report.server.clone());
                 }
-                self.patterns.tree = PatternTree::build(&report.patterns, report.sizes_available);
-                self.patterns.sel = 0;
+                // The selection follows its row from the partial results, if any.
+                let anchor = self.selection_anchor();
                 self.sel = ViewSel::default();
                 let effect = Effect::LoadHistory {
                     id,
@@ -1197,6 +1274,7 @@ impl App {
                     s.report = Some(report);
                     s.history = History::Pending;
                 }
+                self.rebuild_patterns(anchor);
                 return vec![effect];
             }
             Msg::History {
@@ -1348,6 +1426,7 @@ mod tests {
     use super::*;
     use crate::model::{Env, PERM_MEMORY};
     use crate::tui::fixtures;
+    use crate::tui::tree::Collapsed;
 
     fn key(c: KeyCode) -> KeyEvent {
         KeyEvent::new(c, KeyModifiers::NONE)
@@ -1466,7 +1545,7 @@ mod tests {
             app.pattern_rows(),
             PatternTree::build(&report.patterns, true).visible(
                 &report.patterns,
-                &HashSet::new(),
+                &Collapsed::default(),
                 ""
             )
         );
@@ -2255,6 +2334,361 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         assert!(!app.patterns.filtering);
         assert_eq!(app.patterns.filter, "");
+    }
+
+    fn pat(n: &str) -> RowId {
+        RowId::Pattern(n.into())
+    }
+
+    fn grp(n: &str) -> RowId {
+        RowId::Group(n.into())
+    }
+
+    /// The fixture partial results with `patterns` instead.
+    fn partial_of(patterns: Vec<PatternStats>) -> Arc<PartialPatterns> {
+        let mut p = (*fixtures::partial(true)).clone();
+        p.patterns = patterns;
+        Arc::new(p)
+    }
+
+    /// A pattern called `name` with `bytes` of memory.
+    fn named(name: &str, bytes: u64) -> PatternStats {
+        let mut p = fixtures::report(true).patterns[0].clone();
+        p.pattern = name.into();
+        p.est_bytes = Some(bytes);
+        p
+    }
+
+    fn send_partial(app: &mut App, id: ConnId, partial: Arc<PartialPatterns>) {
+        app.apply(Msg::ScanPartial {
+            id,
+            scan: scan_of(app),
+            partial,
+        });
+    }
+
+    /// Moves the Patterns selection down to `id`.
+    fn select(app: &mut App, id: &RowId) {
+        app.handle_key(ch('1'));
+        for _ in 0..app.pattern_rows().len() {
+            if app.selected_row_id().as_ref() == Some(id) {
+                return;
+            }
+            app.handle_key(ch('j'));
+        }
+        panic!("no row {id:?}");
+    }
+
+    #[test]
+    fn selection_follows_the_pattern_across_partials() {
+        let (mut app, id) = scanning();
+        send_partial(&mut app, id, fixtures::partial(true));
+        select(&mut app, &pat("user:{id}:cart"));
+        let before = app.patterns.sel;
+        app.apply(Msg::Tick);
+        app.apply(Msg::Tick);
+        assert_eq!(app.sel_ticks(), 2);
+        // The cart pattern grows past everything: its group moves to the top.
+        let mut grown = (*fixtures::partial(true)).clone();
+        let cart = grown
+            .patterns
+            .iter_mut()
+            .find(|p| p.pattern == "user:{id}:cart")
+            .unwrap();
+        cart.est_bytes = Some(1 << 40);
+        send_partial(&mut app, id, Arc::new(grown));
+        assert_eq!(app.selected_row_id(), Some(pat("user:{id}:cart")));
+        assert_ne!(app.patterns.sel, before);
+        assert_eq!(app.patterns.sel, 1);
+        // The same pattern at another index: the marquee does not restart.
+        assert_eq!(app.sel_ticks(), 2);
+    }
+
+    #[test]
+    fn selection_follows_the_pattern_into_the_finished_scan() {
+        let (mut app, id) = scanning();
+        // Partial results without the biggest pattern, so indices shift in the finished
+        // scan: session:{uuid} comes first and user:{id}:feed joins its group.
+        let mut p = (*fixtures::partial(true)).clone();
+        p.patterns.retain(|p| p.pattern != "session:{uuid}");
+        send_partial(&mut app, id, Arc::new(p));
+        select(&mut app, &pat("tmp:import:{ulid}"));
+        let before = app.patterns.sel;
+        app.apply(Msg::Tick);
+        app.apply(Msg::ScanDone {
+            id,
+            scan: scan_of(&app),
+            report: fixtures::report(true),
+        });
+        assert_eq!(app.selected_row_id(), Some(pat("tmp:import:{ulid}")));
+        assert_eq!(app.patterns.sel, before + 2);
+        assert_eq!(app.sel_ticks(), 1);
+        // A group too.
+        let (mut app, id) = scanning();
+        send_partial(&mut app, id, fixtures::partial(true));
+        select(&mut app, &grp("user"));
+        app.apply(Msg::ScanDone {
+            id,
+            scan: scan_of(&app),
+            report: fixtures::report(true),
+        });
+        assert_eq!(app.selected_row_id(), Some(grp("user")));
+    }
+
+    #[test]
+    fn a_finished_scan_without_partials_starts_at_the_top() {
+        let app = scanned_app(true);
+        assert_eq!(app.patterns.sel, 0);
+        assert_eq!(app.selected_row_id(), Some(pat("session:{uuid}")));
+    }
+
+    #[test]
+    fn selected_pattern_gone_keeps_the_index_clamped() {
+        let (mut app, id) = scanning();
+        send_partial(&mut app, id, fixtures::partial(true));
+        select(&mut app, &pat("cache:product:{id}"));
+        assert_eq!(app.patterns.sel, 3);
+        let mut p = (*fixtures::partial(true)).clone();
+        p.patterns.retain(|p| p.pattern != "cache:product:{id}");
+        send_partial(&mut app, id, Arc::new(p));
+        // cache:* dropped to the single cache:search:{hash}, so its group row and
+        // cache:product:{id} are gone; index 3 is now user:{id}:cart.
+        assert_eq!(app.patterns.sel, 3);
+        assert_eq!(app.selected_row_id(), Some(pat("user:{id}:cart")));
+        // Fewer rows than the index: the last row.
+        send_partial(
+            &mut app,
+            id,
+            partial_of(vec![named("a:{id}", 10), named("b:{id}", 5)]),
+        );
+        assert_eq!(app.patterns.sel, 1);
+        assert_eq!(app.selected_row_id(), Some(pat("b:{id}")));
+        // No rows: 0.
+        send_partial(&mut app, id, partial_of(vec![]));
+        assert_eq!(app.patterns.sel, 0);
+        assert_eq!(app.selected_row_id(), None);
+    }
+
+    #[test]
+    fn a_group_that_drops_to_a_single_keeps_the_selection() {
+        let (mut app, id) = scanning();
+        send_partial(&mut app, id, fixtures::partial(true));
+        select(&mut app, &grp("cache"));
+        let mut p = (*fixtures::partial(true)).clone();
+        p.patterns.retain(|p| p.pattern != "cache:product:{id}");
+        send_partial(&mut app, id, Arc::new(p));
+        assert_eq!(app.selected_row_id(), Some(pat("cache:search:{hash}")));
+    }
+
+    /// The marquee restarts when a message, not a key, changes the selected row. Fails
+    /// if `App::apply` stops calling `track_selection`.
+    #[test]
+    fn a_message_that_changes_the_selected_row_restarts_the_marquee() {
+        let (mut app, id) = scanning();
+        send_partial(&mut app, id, fixtures::partial(true));
+        select(&mut app, &pat("rl:{ip}:{id}"));
+        for _ in 0..7 {
+            app.apply(Msg::Tick);
+        }
+        assert_eq!(app.sel_ticks(), 7);
+        // The selected pattern is gone from the next partial: another one is selected.
+        let mut p = (*fixtures::partial(true)).clone();
+        p.patterns.retain(|p| p.pattern != "rl:{ip}:{id}");
+        send_partial(&mut app, id, Arc::new(p));
+        assert_ne!(app.selected_row_id(), Some(pat("rl:{ip}:{id}")));
+        assert_eq!(app.sel_ticks(), 0);
+        app.apply(Msg::Tick);
+        assert_eq!(app.sel_ticks(), 1);
+        // The scan fails: its partial results go, and with them the selection.
+        app.apply(Msg::ScanFailed {
+            id,
+            scan: scan_of(&app),
+            error: "connection reset".into(),
+        });
+        assert_eq!(app.selected_row_id(), None);
+        assert_eq!(app.sel_ticks(), 0);
+    }
+
+    #[test]
+    fn a_pattern_that_moves_into_a_collapsed_group_selects_the_group() {
+        let (mut app, id) = scanning();
+        send_partial(
+            &mut app,
+            id,
+            partial_of(vec![
+                named("a:{id}:x", 30),
+                named("a:{id}:y", 20),
+                named("b:{id}", 10),
+            ]),
+        );
+        select(&mut app, &grp("a"));
+        app.handle_key(key(KeyCode::Left));
+        assert!(app.patterns.collapsed.contains("a"));
+        // `a` has one pattern for now (a new run that has seen less), selected.
+        send_partial(
+            &mut app,
+            id,
+            partial_of(vec![named("a:{id}:z", 30), named("b:{id}", 10)]),
+        );
+        select(&mut app, &pat("a:{id}:z"));
+        // It has a sibling again: the group is collapsed, so the group row is selected.
+        send_partial(
+            &mut app,
+            id,
+            partial_of(vec![
+                named("a:{id}:x", 30),
+                named("a:{id}:z", 20),
+                named("b:{id}", 10),
+            ]),
+        );
+        assert_eq!(app.pattern_rows().len(), 2);
+        assert_eq!(app.selected_row_id(), Some(grp("a")));
+    }
+
+    #[test]
+    fn collapse_survives_partials_and_scan_done() {
+        let (mut app, id) = scanning();
+        send_partial(&mut app, id, fixtures::partial(true));
+        select(&mut app, &grp("cache"));
+        app.handle_key(key(KeyCode::Left));
+        let folded = app.pattern_rows().len();
+        send_partial(&mut app, id, fixtures::partial(true));
+        assert_eq!(app.pattern_rows().len(), folded);
+        app.apply(Msg::ScanDone {
+            id,
+            scan: scan_of(&app),
+            report: fixtures::report(true),
+        });
+        assert!(app.patterns.collapsed.contains("cache"));
+        assert_eq!(app.selected_row_id(), Some(grp("cache")));
+        // Expanding works on the new tree.
+        app.handle_key(key(KeyCode::Right));
+        assert!(!app.patterns.collapsed.contains("cache"));
+    }
+
+    #[test]
+    fn a_collapsed_group_whose_key_changes_through_var_stays_collapsed() {
+        let (mut app, id) = scanning();
+        send_partial(
+            &mut app,
+            id,
+            partial_of(vec![
+                named("tenant.a1:cfg", 40),
+                named("tenant.a1:flags", 30),
+                named("lock:{var}", 1),
+            ]),
+        );
+        select(&mut app, &grp("tenant.a1"));
+        app.handle_key(key(KeyCode::Left));
+        // Twenty tenants later the first part merged into {var}.
+        send_partial(
+            &mut app,
+            id,
+            partial_of(vec![
+                named("tenant.{var}:cfg", 400),
+                named("tenant.{var}:flags", 300),
+                named("lock:{var}", 1),
+            ]),
+        );
+        assert!(app.patterns.collapsed.contains("tenant.{var}"));
+        assert_eq!(app.pattern_rows().len(), 2);
+        assert_eq!(app.selected_row_id(), Some(grp("tenant.{var}")));
+    }
+
+    #[test]
+    fn o_cycles_the_sort_and_keeps_the_selection() {
+        let mut app = scanned_app(true);
+        select(&mut app, &pat("user:{id}:cart"));
+        let before = app.patterns.sel;
+        app.apply(Msg::Tick);
+        app.apply(Msg::Tick);
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            app.handle_key(ch('o'));
+            let n = app.notice.clone().unwrap();
+            assert!(!n.error);
+            seen.push((app.patterns.sort, n.text));
+            assert_eq!(app.selected_row_id(), Some(pat("user:{id}:cart")));
+            let d = app.pattern_data().unwrap();
+            assert_eq!(
+                app.patterns.tree,
+                PatternTree::build_sorted(d.patterns, true, app.patterns.sort)
+            );
+        }
+        assert_eq!(
+            seen,
+            [
+                (SortBy::Keys, "Sorted by keys".to_string()),
+                (SortBy::AvgSize, "Sorted by avg size".to_string()),
+                (SortBy::NoTtl, "Sorted by no-TTL %".to_string()),
+                (SortBy::Name, "Sorted by name".to_string()),
+                (SortBy::Memory, "Sorted by memory".to_string()),
+            ]
+        );
+        assert_eq!(app.patterns.sel, before);
+        // Re-sorting moved the row around but it stayed selected: no marquee restart.
+        assert_eq!(app.sel_ticks(), 2);
+    }
+
+    #[test]
+    fn o_without_sizes_skips_memory_and_avg_size() {
+        let mut app = scanned_app(false);
+        app.handle_key(ch('1'));
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            app.handle_key(ch('o'));
+            seen.push(app.notice.clone().unwrap().text);
+        }
+        assert_eq!(
+            seen,
+            [
+                "Sorted by no-TTL %",
+                "Sorted by name",
+                "Sorted by keys",
+                "Sorted by no-TTL %"
+            ]
+        );
+    }
+
+    #[test]
+    fn sort_survives_partials_and_scan_done_but_not_a_new_connect() {
+        let (mut app, id) = scanning();
+        send_partial(&mut app, id, fixtures::partial(true));
+        app.handle_key(ch('o'));
+        assert_eq!(app.patterns.sort, SortBy::Keys);
+        send_partial(&mut app, id, fixtures::partial(true));
+        assert_eq!(app.patterns.sort, SortBy::Keys);
+        let p = fixtures::partial(true);
+        assert_eq!(
+            app.patterns.tree,
+            PatternTree::build_sorted(&p.patterns, true, SortBy::Keys)
+        );
+        let report = fixtures::report(true);
+        app.apply(Msg::ScanDone {
+            id,
+            scan: scan_of(&app),
+            report: report.clone(),
+        });
+        assert_eq!(app.patterns.sort, SortBy::Keys);
+        assert_eq!(
+            app.patterns.tree,
+            PatternTree::build_sorted(&report.patterns, true, SortBy::Keys)
+        );
+        // Connecting another entry starts again by memory.
+        app.handle_key(ch('0'));
+        app.handle_key(ch('j'));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.patterns.sort, SortBy::Memory);
+    }
+
+    #[test]
+    fn o_before_any_results_only_changes_the_sort() {
+        let (mut app, _) = scanning();
+        app.handle_key(ch('1'));
+        app.handle_key(ch('o'));
+        assert_eq!(app.patterns.sort, SortBy::Keys);
+        assert!(app.patterns.tree.roots.is_empty());
+        assert_eq!(app.patterns.sel, 0);
     }
 
     /// Connected to prod-cache-01 with `perms`, and `report` finished scanning.
