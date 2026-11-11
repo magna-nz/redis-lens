@@ -6,8 +6,8 @@ use ratatui::text::{Line, Span};
 
 use crate::diff::ReportDiff;
 use crate::format;
-use crate::model::{ScanReport, TTL_BUCKET_LABELS, Ttl};
-use crate::tui::app::App;
+use crate::model::{PatternStats, TTL_BUCKET_LABELS, Ttl};
+use crate::tui::app::{App, PatternData};
 use crate::tui::tree::{Root, Row, Summary, Verdict, summarize, summarize_group};
 
 use super::delta::Change;
@@ -17,41 +17,48 @@ use super::widgets::{
 };
 use super::{report_or_wait, split_body, style};
 
+/// Draws the finished report or, while the scan runs, its partial results (marked as
+/// such, without the Δ column). Otherwise the waiting or failure message.
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
-    let Some((session, report)) = report_or_wait(frame, area, app, "Patterns") else {
+    let Some(data) = app.pattern_data() else {
+        // No report and no partial results: draws the waiting or failure message.
+        let _ = report_or_wait(frame, area, app, "Patterns");
         return;
     };
     let (main, detail) = split_body(area);
     let rows_ = app.pattern_rows();
     let sel = app.patterns.sel.min(rows_.len().saturating_sub(1));
-    let summaries: Vec<(Summary, usize, Option<bool>)> =
-        rows_.iter().map(|r| row_summary(app, report, *r)).collect();
-    let changes: Option<Vec<Option<Change>>> = session.diff().map(|d| {
+    let patterns = data.patterns;
+    let summaries: Vec<(Summary, usize, Option<bool>)> = rows_
+        .iter()
+        .map(|r| row_summary(app, patterns, *r))
+        .collect();
+    // Changes only for a finished scan: a snapshot diff is of the final report.
+    let diff = app
+        .session
+        .as_ref()
+        .and_then(|s| s.diff())
+        .filter(|_| data.partial.is_none());
+    let changes: Option<Vec<Option<Change>>> = diff.map(|d| {
         rows_
             .iter()
-            .map(|r| row_change(app, report, d, *r))
+            .map(|r| row_change(app, patterns, d, *r))
             .collect()
     });
-    table(
-        frame,
-        main,
-        app,
-        report,
-        &summaries,
-        changes.as_deref(),
-        sel,
-    );
+    table(frame, main, app, data, &summaries, changes.as_deref(), sel);
     match summaries.get(sel) {
-        Some((s, _, _)) => detail_panel(frame, detail, s, report.sizes_available),
+        Some((s, _, _)) => detail_panel(frame, detail, s, data.sizes_available),
         None => {
             let inner = panel(frame, detail, "No match", "");
-            let text = if app.patterns.filter.is_empty() {
-                " No keys were sampled.".to_string()
-            } else {
+            let text = if !app.patterns.filter.is_empty() {
                 format!(
                     " No pattern matches \"{}\". Press esc to clear the filter.",
                     app.patterns.filter
                 )
+            } else if data.partial.is_some() {
+                " No keys sampled yet.".to_string()
+            } else {
+                " No keys were sampled.".to_string()
             };
             rows(
                 frame,
@@ -67,8 +74,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// The change since the snapshot for a row. Parent rows sum their children.
-fn row_change(app: &App, report: &ScanReport, d: &ReportDiff, row: Row) -> Option<Change> {
-    let of = |i: usize| d.pattern(&report.patterns[i].pattern).map(Change::of);
+fn row_change(app: &App, patterns: &[PatternStats], d: &ReportDiff, row: Row) -> Option<Change> {
+    let of = |i: usize| d.pattern(&patterns[i].pattern).map(Change::of);
     match row {
         Row::Group { root } => match &app.patterns.tree.roots[root] {
             Root::Group(g) => Change::sum(g.children.iter().filter_map(|&i| of(i))),
@@ -79,18 +86,18 @@ fn row_change(app: &App, report: &ScanReport, d: &ReportDiff, row: Row) -> Optio
 }
 
 /// The summary for a row, its depth, and for groups whether they are expanded.
-fn row_summary(app: &App, report: &ScanReport, row: Row) -> (Summary, usize, Option<bool>) {
+fn row_summary(app: &App, patterns: &[PatternStats], row: Row) -> (Summary, usize, Option<bool>) {
     match row {
         Row::Group { root } => match &app.patterns.tree.roots[root] {
             Root::Group(g) => (
-                summarize_group(g, &report.patterns),
+                summarize_group(g, patterns),
                 0,
                 Some(!app.patterns.collapsed.contains(&g.key)),
             ),
-            Root::Single(i) => (summarize(&report.patterns[*i]), 0, None),
+            Root::Single(i) => (summarize(&patterns[*i]), 0, None),
         },
         Row::Pattern { idx, parent } => (
-            summarize(&report.patterns[idx]),
+            summarize(&patterns[idx]),
             usize::from(parent.is_some()),
             None,
         ),
@@ -129,13 +136,13 @@ fn table(
     frame: &mut Frame,
     area: Rect,
     app: &App,
-    report: &ScanReport,
+    data: PatternData<'_>,
     summaries: &[(Summary, usize, Option<bool>)],
     changes: Option<&[Option<Change>]>,
     sel: usize,
 ) {
-    let sizes = report.sizes_available;
-    let right = if !app.patterns.filter.is_empty() {
+    let sizes = data.sizes_available;
+    let mut right = if !app.patterns.filter.is_empty() {
         format!(
             "filter \"{}\" · {} rows",
             app.patterns.filter,
@@ -144,8 +151,16 @@ fn table(
     } else if !sizes {
         "sizes unavailable: MEMORY USAGE denied · sorted by keys".to_string()
     } else {
-        format!("{} patterns · sorted by memory", report.patterns.len())
+        format!("{} patterns · sorted by memory", data.patterns.len())
     };
+    // The marker comes first, so a narrow title cuts the rest, not the marker.
+    if let Some(p) = data.partial {
+        right = format!(
+            "partial · {} / {} sampled · {right}",
+            format::grouped(p.sampled),
+            format::grouped(p.target)
+        );
+    }
     let inner = panel(frame, area, "Patterns", &right);
     let c = cols(usize::from(inner.width), changes.is_some());
     let mut head = Line::from(vec![
@@ -164,7 +179,7 @@ fn table(
             style::hd(),
         ));
     }
-    let total: u64 = report
+    let total: u64 = data
         .patterns
         .iter()
         .map(|p| {

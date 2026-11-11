@@ -11,6 +11,7 @@
 
 use std::io::stdout;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::bail;
@@ -288,6 +289,45 @@ fn report_name(profile: &Profile, secrets: &SecretSource) -> String {
     }
 }
 
+/// Pass progress and partial results on as messages until both senders are dropped.
+async fn forward_progress(
+    id: ConnId,
+    mut progress: watch::Receiver<ScanProgress>,
+    mut partial: watch::Receiver<Option<Arc<scan::PartialPatterns>>>,
+    tx: Tx,
+) {
+    let (mut progress_open, mut partial_open) = (true, true);
+    while progress_open || partial_open {
+        let msg = tokio::select! {
+            r = progress.changed(), if progress_open => match r {
+                Ok(()) => Some(Msg::ScanProgress {
+                    id,
+                    progress: *progress.borrow_and_update(),
+                }),
+                Err(_) => {
+                    progress_open = false;
+                    None
+                }
+            },
+            r = partial.changed(), if partial_open => match r {
+                Ok(()) => partial
+                    .borrow_and_update()
+                    .clone()
+                    .map(|partial| Msg::ScanPartial { id, partial }),
+                Err(_) => {
+                    partial_open = false;
+                    None
+                }
+            },
+        };
+        if let Some(msg) = msg
+            && !send(&tx, msg)
+        {
+            break;
+        }
+    }
+}
+
 async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, tx: Tx) {
     let name = report_name(&profile, &secrets);
     let (store, secret): (Box<dyn SecretStore>, Option<String>) = match secrets {
@@ -333,25 +373,22 @@ async fn connect_and_scan(id: ConnId, profile: Profile, secrets: SecretSource, t
         return;
     }
 
-    let (ptx, mut prx) = watch::channel(ScanProgress::default());
-    let ftx = tx.clone();
-    let forward = tokio::spawn(async move {
-        while prx.changed().await.is_ok() {
-            let progress = *prx.borrow_and_update();
-            if !send(&ftx, Msg::ScanProgress { id, progress }) {
-                break;
-            }
-        }
-    });
-    let result = scan::scan(
+    let (ptx, prx) = watch::channel(ScanProgress::default());
+    let (partial_tx, partial_rx) = watch::channel(None);
+    let forward = tokio::spawn(forward_progress(id, prx, partial_rx, tx.clone()));
+    let result = scan::scan_with_partial(
         &name,
         &mut c,
         &ScanOptions::for_profile(&profile),
         &perms,
         Some(&ptx),
+        Some(&partial_tx),
     )
     .await;
+    // Dropping the senders ends the forwarder once it has passed on the last values, so
+    // every progress and partial message arrives before ScanDone or ScanFailed.
     drop(ptx);
+    drop(partial_tx);
     let _ = forward.await;
     send(
         &tx,
@@ -461,6 +498,61 @@ mod tests {
         assert_eq!(got.password.expose_secret(), "leftover");
         assert!(Config::load(&path).unwrap().profiles.is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn forwarder_passes_on_the_last_progress_and_partial_then_ends() {
+        let (ptx, prx) = watch::channel(ScanProgress::default());
+        let (partial_tx, partial_rx) = watch::channel(None);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let forward = tokio::spawn(forward_progress(7, prx, partial_rx, tx));
+        let partial = crate::tui::fixtures::partial(true);
+        ptx.send_replace(ScanProgress {
+            sampled: 3_200,
+            target: 100_000,
+            done: false,
+        });
+        partial_tx.send_replace(Some(partial.clone()));
+        // Dropped right after sending, as at the end of a scan: nothing is lost.
+        drop(ptx);
+        drop(partial_tx);
+        forward.await.unwrap();
+
+        let (mut last_progress, mut last_partial) = (None, None);
+        while let Ok(incoming) = rx.try_recv() {
+            match incoming {
+                Incoming::Msg(Msg::ScanProgress { id, progress }) => {
+                    assert_eq!(id, 7);
+                    last_progress = Some(progress);
+                }
+                Incoming::Msg(Msg::ScanPartial { id, partial }) => {
+                    assert_eq!(id, 7);
+                    last_partial = Some(partial);
+                }
+                _ => panic!("unexpected message"),
+            }
+        }
+        assert_eq!(last_progress.unwrap().sampled, 3_200);
+        assert_eq!(last_partial.unwrap(), partial);
+    }
+
+    #[tokio::test]
+    async fn forwarder_stops_when_the_app_is_gone() {
+        let (ptx, prx) = watch::channel(ScanProgress::default());
+        let (_partial_tx, partial_rx) = watch::channel(None);
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let forward = tokio::spawn(forward_progress(1, prx, partial_rx, tx));
+        ptx.send_replace(ScanProgress {
+            sampled: 1,
+            target: 2,
+            done: false,
+        });
+        // Ends even though both senders are still alive.
+        tokio::time::timeout(Duration::from_secs(5), forward)
+            .await
+            .expect("forwarder kept running")
+            .unwrap();
     }
 
     #[test]

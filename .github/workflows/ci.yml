@@ -54,6 +54,19 @@ jobs:
         run: docker pull redis:7.4-alpine && docker pull valkey/valkey:8.1-alpine
       - run: cargo test --locked --features integration-tests --tests
 
+  integration-redis-6-2:
+    name: integration tests (Redis 6.2)
+    runs-on: ubuntu-latest
+    env:
+      REDIS_LENS_IT_REDIS_IMAGE: redis:6.2-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Pull images
+        run: docker pull redis:6.2-alpine && docker pull valkey/valkey:8.1-alpine
+      - run: cargo test --locked --features integration-tests --tests
+
   msrv:
     name: MSRV (1.89)
     runs-on: ubuntu-latest

@@ -12,7 +12,7 @@ A terminal UI that answers "what is using the memory in this Redis or Valkey, an
 
 ## Supported servers and platforms
 
-- **Servers:** Redis 7.x and Valkey 8.x, standalone, are tested in CI. Redis 6.2 should work (ACLs and `MEMORY USAGE` exist there) but isn't tested yet. Cluster comes in v0.3.
+- **Servers:** Redis 7.x and Valkey 8.x, standalone, are tested in CI. Redis 6.2 is tested in CI too (a separate integration job). Cluster comes in v0.3.
 - **Platforms:** macOS, Linux and Windows on x86_64, plus aarch64 for macOS and Linux.
 - **Minimum Rust version:** 1.89.
 
@@ -30,6 +30,7 @@ The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move,
 ### 1 Patterns
 - Key patterns sorted by estimated memory. Each row shows the pattern, type, estimated keys, estimated memory, share bar, average size, percentage with no TTL, and the change since the last snapshot.
 - Child patterns group under their shared prefix and can be expanded or collapsed.
+- While a scan runs, the view shows partial results aggregated from the keys sampled so far (no extra server commands, at most four updates a second), marked `partial · N / M sampled` in the title and without the Δ column. The finished scan replaces them; a failed or cancelled scan clears them. The TTL, Diff and Hot keys views wait for the finished scan. `s` never saves partial results: it says to wait for the scan to finish.
 - The detail panel shows up to five example keys with their sizes and TTLs, a size distribution (p50, p99, max), a TTL histogram, a one-line verdict, and a suggested command.
 
 ### 2 TTL
@@ -57,7 +58,7 @@ The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move,
 3. For each batch, pipeline `TYPE`, `PTTL`, `MEMORY USAGE key SAMPLES 5` (when allowed) and `OBJECT FREQ` (when allowed and the policy is LFU).
 4. Stop at the sample limit (default 100,000) or when the cursor returns to 0.
 5. Stay under a command budget: 5,000 commands per second by default, none for `local` profiles. `--max-rate N` overrides it (`0` means no limit).
-6. Scale sampled counts to estimates with `DBSIZE / keys seen`, where keys seen counts every distinct key SCAN returned, including keys that vanished or could not be read (for example `NOPERM` from a key ACL). The scale is never below 1, and it is 1 when the SCAN cursor returned to 0 (the whole keyspace was seen) or when `MATCH` is used.
+6. Scale sampled counts to estimates with `DBSIZE / keys present`, where keys present counts every distinct key SCAN returned that still existed when it was looked up: the samples plus keys that exist but could not be read (for example `NOPERM` from a key ACL, or names that are not UTF-8). Keys that vanished between SCAN and the lookup (`TYPE` `none`, `PTTL` -2) are left out, so short-lived keys don't shrink the estimates. The scale is never below 1, and it is 1 when the SCAN cursor returned to 0 (the whole keyspace was seen), when `MATCH` is used, or when no key seen still existed.
 
 A per-key error such as `NOPERM` drops that field (sizes, frequency) and never aborts the scan.
 
@@ -83,7 +84,7 @@ Examples: `user:88213:cart` → `user:{id}:cart`, `rl:10.0.4.12:29187460` → `r
 |---|---|---|
 | None | No `AUTH`. | v0.1 |
 | ACL user and password, or a password only | Both are kept in the OS keychain. | v0.1 |
-| TLS | `rediss://` or `ssl=True`, verified against webpki roots. | v0.1 |
+| TLS | `rediss://` or `ssl=True`. Certificates are checked against the OS trust store (macOS Keychain, Windows certificate store, the system CA bundle on Linux; `SSL_CERT_FILE`/`SSL_CERT_DIR` replace it when set), loaded once per process. Certificates that fail to load are skipped. If the store has no usable certificate, the bundled webpki roots are used instead, never in addition. Certificate and host name checks are always on. | v0.1 |
 | Microsoft Entra ID | redis-rs `EntraIdCredentialsProvider::new_developer_tools()`, the developer-tools credential chain (az login and similar), behind the `entra-id` cargo feature. Managed identity and workload identity are not covered yet. | v0.2 |
 | AWS ElastiCache IAM | | later |
 | Sentinel, SSH tunnel | | later |
@@ -99,7 +100,7 @@ Examples: `user:88213:cart` → `user:{id}:cart`, `rl:10.0.4.12:29187460` → `r
 ### Safety
 
 - Profiles with env `prod` are read-only by default. redis-lens never sends a write command, and the later `expire` command is refused on production profiles.
-- Scans can prefer replicas. It is opt-in per profile: `conn add --prefer-replica` sets `prefer_replica = true` in the config (absent when false). `conn::connect_for_scan` resolves the profile's credentials once (one keychain read, or one Entra ID token provider) and uses them for every connection it opens. It connects to the primary, reads `INFO replication` and, on `role:master`, takes the first `slaveN:…state=online` entry with a usable address: an IPv4 or IPv6 address other than `0.0.0.0` or `::`, or a host name, and a port other than 0. It connects to that candidate with the same credentials and TLS and verifies it (below); connecting and verifying share one 2 s timeout, and reading the keychain happens before it starts. On `role:slave` (or `role:replica`) the profile already points at a replica. The result is a `ScanTarget`: `Primary`, `Replica(endpoint)`, or `PrimaryFallback(reason)` when the replica could not be used or verified (the scan then runs on the primary). `scan` and `diff` print a `Target:` line for a replica or a fallback (`Target:  replica 10.0.1.21:6379`, `Target:  primary (replica unreachable: …)`); the TUI shows it in the header and the Connections detail panel, with the reason passed through the same masking as error messages. Endpoints with an IPv6 address are shown in brackets, `[::1]:6379`. A replica can lag, so counts and sizes may trail the primary slightly.
+- Scans can prefer replicas. It is opt-in per profile: `conn add --prefer-replica` sets `prefer_replica = true` in the config (absent when false). `conn::connect_for_scan` resolves the profile's credentials once (one keychain read, or one Entra ID token provider) and uses them for every connection it opens. It connects to the primary, reads `INFO replication` and, on `role:master`, takes the first `slaveN:…state=online` entry with a usable address: an IPv4 or IPv6 address other than `0.0.0.0` or `::`, or a host name, and a port other than 0. It connects to that candidate with the same credentials and TLS settings (the same trust roots, with the certificate checked against the announced host name) and verifies it (below); connecting and verifying share one 2 s timeout, and reading the keychain happens before it starts. On `role:slave` (or `role:replica`) the profile already points at a replica. The result is a `ScanTarget`: `Primary`, `Replica(endpoint)`, or `PrimaryFallback(reason)` when the replica could not be used or verified (the scan then runs on the primary). `scan` and `diff` print a `Target:` line for a replica or a fallback (`Target:  replica 10.0.1.21:6379`, `Target:  primary (replica unreachable: …)`); the TUI shows it in the header and the Connections detail panel, with the reason passed through the same masking as error messages. Endpoints with an IPv6 address are shown in brackets, `[::1]:6379`. A replica can lag, so counts and sizes may trail the primary slightly.
 - **Replica verification.** The address in `INFO replication` is whatever the replica announced, and anything may be listening there. redis-lens only scans a candidate it has checked against this primary (the replication ID is not secret, so a server built to imitate a replica can pass the check; it is then scanned without credentials, and its data is filed under the profile): the candidate's `INFO replication` must say `role:slave` (or `role:replica`) and its `master_replid` must equal the primary's. The steps:
   1. Read the primary's `master_replid`. Without one, nothing can be verified: fall back.
   2. Resolve the candidate's host once (`tokio::net::lookup_host`). Every connection to it uses those addresses, so DNS can't change between the check and the connection; TLS still checks the certificate against the announced name.

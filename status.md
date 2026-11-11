@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** v0.2 done on main; next is v0.3 (cluster) or the feature ideas below
-**Last updated:** 2026-11-11 (overnight run complete: waves 2 to 5 merged)
+**Current milestone:** v0.2 done on main; wave 6 (bug fixes and rough edges) in progress; then v0.3 (cluster) or the feature ideas below
+**Last updated:** 2026-11-11 (wave 6 verified; PR next)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -22,6 +22,45 @@ The owner approved waves 3, 4 and 5 to run unattended, with these rules:
 | 3 | TUI (Connections and Patterns views), `scan` command, verifier fixes | | `v0.1-core` → PR #6 | **done**: verified, CI green, merged into main (6dc45c6) |
 | 4 | Snapshots and diff engine; TTL, Diff and Hot keys views | | `v0.2-views` → PR #7 | **done**: verified, CI green, merged into main |
 | 5 | Docs, logo, GIF, CHANGELOG, Dependabot ignore; replica preference with verification; keychain-wait hint; v0.2 follow-ups | implementer [sonnet] ×2, implementer [opus], verifier [opus] | `wave5/polish` → PR | **done**: verified after three rounds (the first two BLOCKED on replica trust, both fixed), CI green, merged into main as PR #8 (0f981e9) |
+
+## Wave 6 (2026-11-11): bugs and rough edges
+
+Approved by the owner: "Approve, merge when green". Same merge rules as the overnight run: all required checks green and verifier sign-off, `gh pr merge --merge --admin`, no tag, release or publish.
+
+| Part | Content | Agent | Branch | State |
+|---|---|---|---|---|
+| A | Scale estimate ignores keys that vanish between `SCAN` and the per-key lookups (counts come out low); live partial results in the Patterns view | implementer [opus] | `wave6/scan` (worktree `.claude/worktrees/w6-scan`) | **done** (5eea369, 008d6a8): denominator is keys present (seen minus vanished; unreadable keys stay in); partials on a second channel via `scan_with_partial`; 247 unit tests; merged into `wave6/fixes` |
+| B | Redis 6.2 in the integration job, as a new CI job (existing required check names unchanged) | implementer [sonnet] | `wave6/tests` (worktree `.claude/worktrees/w6-tests`) | **done** (89f0274): all integration tests pass on 6.2 with no test changes; merged into `wave6/fixes` |
+| C | OS trust store for TLS (load native certs, skip ones that fail to load, fall back to bundled roots when the store is empty); TLS replica test on Redis and Valkey via a throwaway CA and `SSL_CERT_FILE` | implementer [opus] | `wave6/tls` from `wave6/fixes` after B | **done** (9291fba, 3a54fdc): `src/conn/tls.rs`; `tests/tls_it.rs` (6 tests, Redis + Valkey, also on 6.2); merged into `wave6/fixes` |
+| V | Verifier on the merged `wave6/fixes` | verifier [opus] | pinned detached worktree at 09343e2 | **APPROVE**, no blockers. Its ready-made test for the partial denominator (D1) is added. Follow-ups below |
+
+**Wave 6 follow-ups (from the verifier; not fixed in this wave):**
+- N1: after reconnecting the same entry, a stale partial (or `ScanDone`) from the aborted scan can show for up to about 250 ms. The forwarder outlives the aborted scan and sends with the same `ConnId`. Fix: a per-scan id, or abort the forwarder from a drop guard (`tui/app.rs` ~1065, `tui/mod.rs` ~177/378).
+- N2 and N3 (UX): the Patterns selection is a row index, so it moves as partials re-sort and resets to 0 on `ScanDone`. A collapse is lost when a group's key changes.
+- N4 (Windows): the Windows store fills public roots lazily, so a root that hasn't been fetched yet now gives `UnknownIssuer` where bundled-only used to connect.
+- Test gaps in the diff:
+  - D2: nothing catches a redis-rs upgrade that merges stores.
+  - D3: the empty-store TLS test would also pass with zero roots.
+  - D5: the ordering inside `connect_and_scan`.
+  - D6: the N1 window.
+- Spec behaviours with no test:
+  - limiter pacing and `--max-rate`
+  - SCAN deduplication
+  - the shell-history warning for a URL password
+  - `--ask-password` and `REDIS_LENS_CONFIG`
+  - `conn test`
+  - horizontal scrolling
+  - the spec's `lens-ro` ACL line
+  - per-OS trust-store connections
+  - the real keychain (an ignored test)
+
+**TLS replica test (resolved: the owner chose the OS trust store, done in part C).** Original blocker: `src/conn/mod.rs:119` builds TLS connections with `tls_params: None` on redis-rs's `tls-rustls-webpki-roots`, so only public CAs are trusted and a test with a throwaway CA can't connect. This is also a product gap: a server behind a private or corporate CA can't be reached. It needs a decision (OS trust store, or a per-profile CA file) before a test can be written.
+
+**Owner instruction (2026-11-11): "make sure we have tests for everything".** Every behaviour change in this wave needs a test. Each agent reports a test map (change → test), and the verifier audits it, plus a repo-wide check that each behaviour in `spec.md` has a test.
+
+**Coverage (`make coverage`, unit + integration, 2026-11-11 at 09343e2):** 92.6% of lines. All tests pass: 260 unit, conn 14, diff 4, replica 11, scan_cli 5, scan 15, smoke 3, tls 6. Lowest: `main.rs` 0% (entry point only), `cli/mod.rs` 24% (clap dispatch), `tui/mod.rs` 52% (terminal event loop), `secrets.rs` 70% (the real keychain, an ignored test), `tui/ui/connections.rs` 77%.
+
+Integration branch: `wave6/fixes` (worktree `.claude/worktrees/wave6`). Out of scope: Entra ID against real Azure and managed identity (needs Azure; feature idea 10), and the `--prefer-replica` trust boundary (a documented design trade-off).
 
 ### How to resume after a restart or compaction
 
@@ -74,21 +113,20 @@ See the overnight table above.
 
 ## Known issues and notes
 
-- **Replica scans (`--prefer-replica`) trust the announced address**, like Cluster and Sentinel clients do. A server that imitates a replica, since the replication ID isn't secret, can be scanned without credentials, and its data is filed under the profile. A profile that reaches prod through an SSH tunnel on 127.0.0.1 treats local services on the announced port as on the primary's host. A replica scanned without credentials runs as its default user. No TLS replica test yet.
+- **Replica scans (`--prefer-replica`) trust the announced address**, like Cluster and Sentinel clients do. A server that imitates a replica, since the replication ID isn't secret, can be scanned without credentials, and its data is filed under the profile. A profile that reaches prod through an SSH tunnel on 127.0.0.1 treats local services on the announced port as on the primary's host. A replica scanned without credentials runs as its default user. TLS replica scans are tested (`tests/tls_it.rs`).
 
-- **macOS keychain prompt after rebuilds.** Keychain entries are tied to the binary that wrote them. A rebuilt or upgraded binary has to ask macOS for access, and until someone answers the dialog, connecting hangs. Wave 5: add a README note (click "Always Allow") and a TUI hint when a keychain read takes more than 2 s.
+- **macOS keychain prompt after rebuilds.** Keychain entries are tied to the binary that wrote them. A rebuilt or upgraded binary has to ask macOS for access, and until someone answers the dialog, connecting hangs. Mitigated in wave 5: the README says to click "Always Allow", and the TUI shows a hint when a keychain read takes more than 2 s.
 
 - **Lesson:** never switch the main checkout's branch while an agent is reading it. Do all work in worktrees.
 
 - **`vhs` doesn't work here.** It drives headless Chromium, which produces no output, and turning off its browser sandbox was refused. Use `demo/record.py` with `agg` for GIFs instead.
-- **The Patterns view stays empty while a scan runs.** Showing partial results is a follow-up.
 
-- **Scans of local servers are slow.** The default budget of 5,000 commands per second with 4 commands per key means 55K demo keys take about 45 s. Planned for wave 4: no limit by default for `Local` profiles, plus a `--max-rate` flag. Note that the demo's `rl:*` and `lock:*` keys expire after up to 30 minutes, so re-run `make demo-up` before recording.
+- The demo's `rl:*` and `lock:*` keys expire after up to 30 minutes, so re-run `make demo-up` before recording a GIF. (Local profiles scan with no rate limit since wave 4; `--max-rate` overrides it.)
 
 - Agent worktrees made by the harness branch from `main`, not the current branch, so create them by hand.
 - **Entra ID** is implemented behind `--features entra-id`, using redis-rs's `EntraIdCredentialsProvider::new_developer_tools()` (az login and other developer tools). It is untested against real Azure, and managed identity isn't covered yet.
 - `discover` reports the demo Redis as auth "none", because its passwords live in an ACL file discovery can't see. Save it as a profile instead (`make demo-profiles`).
-- If keys vanish during a scan, the sample can come up short, and the scale is then assumed to be 1. This needs a verifier check.
+- `ConnId` identifies a connection entry, not a scan. If the same entry is reconnected, a `ScanDone` the old scan already queued is still accepted (found in wave 6; not fixed). A per-scan id would fix it.
 - For Redis ACL rules passed as server arguments, use one argument per word (`tests/common/mod.rs`).
 - `ParsedConnection.credentials` is `Some` with an empty password when a URL has a username but no password, so `conn add` can ask for `--password-stdin` or `--ask-password`.
 

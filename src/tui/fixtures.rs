@@ -443,6 +443,26 @@ pub fn report(sizes: bool) -> ScanReport {
     }
 }
 
+/// Partial results of the scan behind [`report`], 3,200 of 100,000 keys in: the same
+/// estimates for the patterns found so far, from fewer samples, without the three
+/// smallest patterns (not sampled yet).
+pub fn partial(sizes: bool) -> std::sync::Arc<crate::scan::PartialPatterns> {
+    const PARTIAL_SAMPLED: u64 = 3_200;
+    let mut patterns = report(sizes).patterns;
+    patterns.truncate(patterns.len().saturating_sub(3));
+    for p in &mut patterns {
+        p.sampled_keys = (p.sampled_keys * PARTIAL_SAMPLED / SAMPLED).max(1);
+        p.no_ttl = p.no_ttl * PARTIAL_SAMPLED / SAMPLED;
+        p.sampled_bytes = p.sampled_bytes.map(|b| b * PARTIAL_SAMPLED / SAMPLED);
+    }
+    std::sync::Arc::new(crate::scan::PartialPatterns {
+        patterns,
+        sampled: PARTIAL_SAMPLED,
+        target: SAMPLED,
+        sizes_available: sizes,
+    })
+}
+
 /// The scan a day before [`report`]: `cache:search` and `session` grew by more keys,
 /// `queue:emails` by bigger values, `user:{id}:profile` (no TTL) grew, `rl` shrank,
 /// `tmp:import` is new, and `job:legacy:{id}` has gone. The rest are unchanged.
