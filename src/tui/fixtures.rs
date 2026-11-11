@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::conn::docker::DiscoveredInstance;
+use crate::conn::docker::{DiscoveredAuth, DiscoveredInstance};
 use crate::diff::{self, ReportDiff};
 use crate::model::{
     Auth, Endpoint, Env, KeySample, KeyType, PERM_FREQ, PERM_INFO, PERM_MEMORY, PERM_SCAN,
@@ -77,6 +77,7 @@ pub fn docker_instance() -> DiscoveredInstance {
             Auth::None,
         ),
         credentials: None,
+        auth: DiscoveredAuth::None,
     }
 }
 

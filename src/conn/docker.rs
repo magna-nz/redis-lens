@@ -11,6 +11,35 @@ use crate::model::{Auth, Credentials, Endpoint, Env, Profile};
 
 use super::ConnError;
 
+/// What discovery could tell about a container's authentication.
+///
+/// Discovery-only: a saved [`Profile`] still has [`Auth`], which is what goes to the
+/// config file. "Unknown" is not a way to authenticate, so it never reaches `Profile`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveredAuth {
+    /// A password was found in the container's command line or environment.
+    Password,
+    /// The server answered without credentials.
+    None,
+    /// The server wants credentials that discovery could not find (an ACL file, a
+    /// config file).
+    Required,
+    /// Discovery could not tell.
+    Unknown,
+}
+
+impl DiscoveredAuth {
+    /// The word shown in `discover` output and the Connections view.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::None => "none",
+            Self::Required => "required",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiscoveredInstance {
     pub container: String,
@@ -20,6 +49,9 @@ pub struct DiscoveredInstance {
     /// A password read from the container's command line (`--requirepass`) or
     /// environment (`REDIS_PASSWORD`). Kept in memory only.
     pub credentials: Option<Credentials>,
+    /// What discovery found out about authentication. `Password` exactly when
+    /// `credentials` is `Some`.
+    pub auth: DiscoveredAuth,
 }
 
 const UNREACHABLE: &str = "Docker isn't running or can't be reached";
@@ -142,7 +174,15 @@ async fn instance(docker: &Docker, c: ContainerSummary) -> Option<DiscoveredInst
         }
         Err(_) => None,
     };
+    // Contract stub for wave 7: without a password this says Unknown until discovery
+    // probes the server.
+    let auth = if password.is_some() {
+        DiscoveredAuth::Password
+    } else {
+        DiscoveredAuth::Unknown
+    };
     Some(DiscoveredInstance {
+        auth,
         container: name.clone(),
         image,
         profile: profile_for(name, port, password.is_some()),
@@ -156,6 +196,14 @@ async fn instance(docker: &Docker, c: ContainerSummary) -> Option<DiscoveredInst
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovered_auth_labels() {
+        assert_eq!(DiscoveredAuth::Password.label(), "password");
+        assert_eq!(DiscoveredAuth::None.label(), "none");
+        assert_eq!(DiscoveredAuth::Required.label(), "required");
+        assert_eq!(DiscoveredAuth::Unknown.label(), "unknown");
+    }
 
     #[test]
     fn image_matching() {

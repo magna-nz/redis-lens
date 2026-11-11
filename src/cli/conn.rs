@@ -670,6 +670,7 @@ mod tests {
                 username: None,
                 password: SecretString::from("s3cret".to_string()),
             }),
+            auth: crate::conn::docker::DiscoveredAuth::Password,
         };
         let out = format_discovered(&[d]);
         assert!(out.contains("127.0.0.1:49153") && out.contains("password"));
