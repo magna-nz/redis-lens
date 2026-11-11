@@ -8,13 +8,14 @@ use crate::diff::ReportDiff;
 use crate::format;
 use crate::model::{PatternStats, TTL_BUCKET_LABELS};
 use crate::tui::app::App;
+use crate::tui::clipboard::suggested_command;
 use crate::verdict::{TtlVerdict, explain, ttl_verdict};
 
 use super::widgets::ttl_hist_spans;
 use super::widgets::{
     fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset, trunc,
 };
-use super::{notice_panels, report_or_wait, split_body, style};
+use super::{mark_previous, notice_panels, report_or_wait, split_body, style};
 
 const NUM_W: usize = 7;
 const TTL_W: usize = 6;
@@ -37,7 +38,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             frame,
             area,
             "TTL",
-            "",
+            &mark_previous(app, ""),
             vec![Line::from(Span::styled(
                 " No keys were sampled.",
                 style::dim(),
@@ -56,7 +57,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let right = format!("{} patterns · riskiest first", rows_.len());
+    let right = mark_previous(app, &format!("{} patterns · riskiest first", rows_.len()));
     let inner = panel(frame, main, "TTL", &right);
     let name = name_width(usize::from(inner.width));
     let head = Line::from(vec![
@@ -186,7 +187,8 @@ fn detail_panel(
         Span::styled(v.label(), verdict_style(v)),
     ]));
     lines.push(Line::default());
-    let cmd = format!("redis-cli --scan --pattern '{}'", format::glob(&p.pattern));
+    // The same text `Y` copies.
+    let cmd = suggested_command(&p.pattern);
     lines.push(Line::from(vec![
         Span::styled(" $ ", style::dim()),
         Span::styled(trunc(&cmd, w.saturating_sub(3)), style::cmd()),

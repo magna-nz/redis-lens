@@ -8,6 +8,7 @@ use crate::diff::ReportDiff;
 use crate::format;
 use crate::model::{PatternStats, TTL_BUCKET_LABELS, Ttl};
 use crate::tui::app::{App, PatternData};
+use crate::tui::clipboard::suggested_command;
 use crate::tui::tree::{Root, Row, SortBy, Summary, Verdict, summarize, summarize_group};
 
 use super::delta::Change;
@@ -15,7 +16,7 @@ use super::widgets::{
     bar, fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset, split_cols,
     trunc, ttl_hist_spans, width,
 };
-use super::{report_or_wait, split_body, style};
+use super::{mark_previous, report_or_wait, split_body, style};
 
 /// Draws the finished report or, while the scan runs, its partial results (marked as
 /// such, without the Δ column). Otherwise the waiting or failure message.
@@ -222,6 +223,7 @@ fn table(
             format::grouped(p.target)
         );
     }
+    let right = mark_previous(app, &right);
     let inner = panel(frame, area, "Patterns", &right);
     let c = cols(usize::from(inner.width), changes.is_some());
     // ▼ beside the sorted column, ▲ for name (A to Z).
@@ -503,7 +505,8 @@ fn detail_panel(frame: &mut Frame, area: Rect, s: &Summary, sizes: bool) {
         lines.push(Line::from(spans));
     }
     lines.push(Line::from(verdict_line(s)));
-    let cmd = format!("redis-cli --scan --pattern '{}'", format::glob(&s.label));
+    // The same text `Y` copies.
+    let cmd = suggested_command(&s.label);
     lines.push(Line::from(vec![
         Span::styled(" $ ", style::dim()),
         Span::styled(

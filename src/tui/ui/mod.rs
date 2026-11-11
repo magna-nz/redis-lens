@@ -6,6 +6,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Block;
 
 use crate::conn::ScanTarget;
 use crate::conn::parse::mask;
@@ -13,6 +14,7 @@ use crate::format;
 use crate::model::{PERM_MEMORY, ScanReport, ServerFlavor, ServerInfo};
 
 use super::app::{App, Phase, Session, View};
+use super::keymap;
 
 mod connections;
 mod delta;
@@ -35,13 +37,27 @@ pub fn spinner(tick: u64) -> &'static str {
     SPINNER[(tick % SPINNER.len() as u64) as usize]
 }
 
-pub fn draw(frame: &mut Frame, app: &App) {
-    let [head, body, foot] = Layout::vertical([
+/// The header, the view's body and the footer.
+fn screen(area: Rect) -> [Rect; 3] {
+    Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area)
+}
+
+/// List rows a view shows on a screen of `area`: what PgUp and PgDn move by. Every list
+/// view (Connections, Patterns, TTL, Diff, Hot keys) has the same layout: the main panel
+/// above the detail panel, its border, one header row, then the rows.
+pub fn list_rows(area: Rect) -> usize {
+    let [_, body, _] = screen(area);
+    let (main, _) = split_body(body);
+    usize::from(Block::bordered().inner(main).height.saturating_sub(1))
+}
+
+pub fn draw(frame: &mut Frame, app: &App) {
+    let [head, body, foot] = screen(frame.area());
     header(frame, head, app);
     match app.view {
         View::Connections => connections::draw(frame, body, app),
@@ -51,6 +67,30 @@ pub fn draw(frame: &mut Frame, app: &App) {
         View::HotKeys => hot::draw(frame, body, app),
     }
     footer(frame, foot, app);
+    if app.help {
+        help::draw(frame, frame.area(), app.view);
+    }
+}
+
+/// Marks results kept from the previous run while a rescan runs, or after it failed
+/// before any results of its own came.
+pub fn previous_marker(app: &App) -> Option<&'static str> {
+    let s = app.session.as_ref()?;
+    s.previous?;
+    Some(match s.phase {
+        Phase::Failed(_) => "rescan failed · previous results",
+        _ => "rescanning · previous results",
+    })
+}
+
+/// `right`, a panel's right title, with [`previous_marker`] first when there is one,
+/// so a narrow title cuts the rest, not the marker.
+pub fn mark_previous(app: &App, right: &str) -> String {
+    match (previous_marker(app), right.is_empty()) {
+        (Some(m), true) => m.to_string(),
+        (Some(m), false) => format!("{m} · {right}"),
+        (None, _) => right.to_string(),
+    }
 }
 
 /// The main table above, the 8-row detail panel below.
@@ -279,6 +319,16 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
 
 fn server_line(app: &App, s: &Session, w: usize) -> Line<'static> {
     let spin = spinner(app.tick);
+    // A rescan keeps the old report in the body, where the hint would otherwise go.
+    if s.report.is_some()
+        && let Some(hint) = app.keychain_hint()
+    {
+        return Line::from(vec![
+            Span::raw(" "),
+            Span::styled(spin, style::amber()),
+            Span::styled(format!(" {hint}"), style::amber()),
+        ]);
+    }
     let Some(srv) = &s.server else {
         return Line::from(match &s.phase {
             Phase::Failed(e) => vec![Span::styled(format!(" ✗ {e}"), style::warn())],
@@ -447,34 +497,10 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
         };
         Line::from(Span::styled(format!(" {}", n.text), s))
     } else {
-        let keys: &[(&str, &str)] = match app.view {
-            View::Connections => &[
-                ("↑↓", "Move"),
-                ("enter", "Connect"),
-                ("a", "Add"),
-                ("r", "Rescan Docker"),
-                ("0-4", "View"),
-                ("q", "Quit"),
-            ],
-            View::Patterns => &[
-                ("↑↓", "Move"),
-                ("→←", "Fold"),
-                ("/", "Filter"),
-                ("s", "Snapshot"),
-                ("0-4", "View"),
-                ("q", "Quit"),
-            ],
-            View::Ttl | View::Diff | View::HotKeys if app.report().is_some() => &[
-                ("↑↓", "Move"),
-                ("s", "Snapshot"),
-                ("0-4", "View"),
-                ("q", "Quit"),
-            ],
-            _ => &[("0-4", "View"), ("a", "Add"), ("q", "Quit")],
-        };
+        let keys = keymap::footer(app.view, app.report().is_some());
         let mut spans = vec![Span::raw(" ")];
         for (k, l) in keys {
-            spans.push(Span::styled(*k, style::key()));
+            spans.push(Span::styled(k, style::key()));
             spans.push(Span::styled(format!(" {l}   "), style::dim()));
         }
         Line::from(spans)

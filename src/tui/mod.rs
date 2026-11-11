@@ -9,7 +9,7 @@
 //! - This module: terminal setup, the event loop, and the tokio tasks that carry out
 //!   effects and send [`app::Msg`]s back. All server IO goes through `conn` and `scan`.
 
-use std::io::stdout;
+use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +41,7 @@ mod fixtures;
 mod snapshot_tests;
 
 use app::{App, ConnId, Effect, Msg, ScanId, SecretSource};
+use clipboard::CopyText;
 
 const TICK: Duration = Duration::from_millis(100);
 
@@ -117,11 +118,18 @@ async fn event_loop(
 
     loop {
         for effect in pending.drain(..) {
-            if runner.run(effect) {
+            // A copy goes to the same output the frames are drawn to, between frames.
+            if runner.run(effect, terminal.backend_mut()) {
                 return Ok(());
             }
         }
-        terminal.draw(|f| ui::draw(f, &app))?;
+        let mut list_rows = 0;
+        terminal.draw(|f| {
+            list_rows = ui::list_rows(f.area());
+            ui::draw(f, &app);
+        })?;
+        // The page for PgUp and PgDn, from the area just drawn.
+        app.set_list_rows(list_rows);
         tokio::select! {
             incoming = rx.recv() => match incoming {
                 Some(Incoming::Input(Event::Key(k))) => pending = app.handle_key(k),
@@ -155,12 +163,33 @@ fn send(tx: &Tx, msg: Msg) -> bool {
     tx.send(Incoming::Msg(msg)).is_ok()
 }
 
+/// Write `text` to the terminal output `out` as an OSC 52 sequence and flush. The
+/// sequence moves no cursor and draws nothing, so the next frame is unaffected.
+/// Returns the message to send when it could not be written.
+fn copy_to(out: &mut impl Write, text: &CopyText) -> Option<Msg> {
+    match clipboard::write_osc52(out, text) {
+        Ok(true) => None,
+        // The app checks the length before it asks; this is a second line of defence.
+        Ok(false) => Some(Msg::CopyFailed(format!(
+            "the {} is too long to copy",
+            text.what()
+        ))),
+        Err(e) => Some(Msg::CopyFailed(e.to_string())),
+    }
+}
+
 impl Runner {
-    /// Returns true when the app should quit.
-    fn run(&mut self, effect: Effect) -> bool {
+    /// Returns true when the app should quit. `out` is the terminal's output, for
+    /// effects that write to the terminal itself.
+    fn run(&mut self, effect: Effect, out: &mut impl Write) -> bool {
         let tx = self.tx.clone();
         match effect {
             Effect::Quit => return true,
+            Effect::Copy(text) => {
+                if let Some(msg) = copy_to(out, &text) {
+                    send(&tx, msg);
+                }
+            }
             Effect::DiscoverDocker => {
                 tokio::spawn(async move {
                     let msg = match conn::docker::discover().await {
@@ -786,5 +815,88 @@ mod tests {
         );
         assert_eq!(scrub("x".into(), Some("")), "x");
         assert_eq!(scrub("x".into(), None), "x");
+    }
+
+    /// A terminal output that fails every write.
+    struct Broken;
+
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Records writes and flushes.
+    #[derive(Default)]
+    struct Recorder {
+        bytes: Vec<u8>,
+        flushed: usize,
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushed = self.bytes.len();
+            Ok(())
+        }
+    }
+
+    fn runner() -> (Runner, mpsc::UnboundedReceiver<Incoming>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let runner = Runner {
+            tx,
+            path: temp_path("unused"),
+            scan_task: None,
+        };
+        (runner, rx)
+    }
+
+    #[test]
+    fn copy_effect_writes_osc52_to_the_terminal_output_and_flushes() {
+        let (mut runner, mut rx) = runner();
+        let mut out = Recorder::default();
+        let text = CopyText::suggested_command("user:{id}:cart");
+        assert!(!runner.run(Effect::Copy(text.clone()), &mut out));
+        assert_eq!(out.bytes, clipboard::osc52(&text).unwrap().as_bytes());
+        // Flushed after the whole sequence, so it never mixes with the next frame.
+        assert_eq!(out.flushed, out.bytes.len());
+        // Nothing to report on success.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_copy_that_cannot_be_written_becomes_an_error_message() {
+        let (mut runner, mut rx) = runner();
+        assert!(!runner.run(Effect::Copy(CopyText::key("user:1")), &mut Broken));
+        let Ok(Incoming::Msg(Msg::CopyFailed(e))) = rx.try_recv() else {
+            panic!("no CopyFailed");
+        };
+        assert_eq!(e, "broken pipe");
+        // Over the cap: nothing is written, and the app hears why.
+        let mut out = Recorder::default();
+        let big = CopyText::key(&"k".repeat(clipboard::MAX_OSC52_BYTES));
+        runner.run(Effect::Copy(big), &mut out);
+        assert!(out.bytes.is_empty());
+        let Ok(Incoming::Msg(Msg::CopyFailed(e))) = rx.try_recv() else {
+            panic!("no CopyFailed");
+        };
+        assert_eq!(e, "the key is too long to copy");
+    }
+
+    #[test]
+    fn other_effects_write_nothing_to_the_terminal() {
+        let (mut runner, _rx) = runner();
+        let mut out = Recorder::default();
+        assert!(runner.run(Effect::Quit, &mut out));
+        assert!(out.bytes.is_empty());
     }
 }
