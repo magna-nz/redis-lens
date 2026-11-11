@@ -341,12 +341,43 @@ pub struct App {
     pub sel: ViewSel,
     pub notice: Option<Notice>,
     pub tick: u64,
+    /// The value of `tick` when the selected row last changed. The marquee that scrolls
+    /// a long selected name counts from here (see [`App::sel_ticks`]).
+    sel_since: u64,
+    /// What the selection was at the last check, to spot a change.
+    sel_id: SelId,
     /// The latest time given by `Msg::TickAt`. The app never reads the clock itself.
     now: Option<Instant>,
     /// When the current connect started, by the clock above.
     connect_started: Option<Instant>,
     next_id: ConnId,
     next_scan: ScanId,
+}
+
+/// Everything that decides which row is selected, cheap to copy and compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelId {
+    view: View,
+    conn: ConnSel,
+    patterns: usize,
+    sel: ViewSel,
+    session: Option<(ConnId, ScanId)>,
+    filter_len: usize,
+    collapsed: usize,
+}
+
+impl Default for SelId {
+    fn default() -> Self {
+        Self {
+            view: View::Connections,
+            conn: ConnSel::Add,
+            patterns: 0,
+            sel: ViewSel::default(),
+            session: None,
+            filter_len: 0,
+            collapsed: 0,
+        }
+    }
 }
 
 fn is_press(key: &KeyEvent) -> bool {
@@ -383,6 +414,8 @@ impl App {
             sel: ViewSel::default(),
             notice: None,
             tick: 0,
+            sel_since: 0,
+            sel_id: SelId::default(),
             now: None,
             connect_started: None,
             next_id: 1,
@@ -600,7 +633,35 @@ impl App {
     // Input
     // -----------------------------------------------------------------------
 
+    /// Ticks since the selected row last changed. Drives the marquee on long names.
+    pub fn sel_ticks(&self) -> u64 {
+        self.tick.saturating_sub(self.sel_since)
+    }
+
+    /// Restarts the marquee when the selected row, the view or the session changed.
+    fn track_selection(&mut self) {
+        let id = SelId {
+            view: self.view,
+            conn: self.conn_sel,
+            patterns: self.patterns.sel,
+            sel: self.sel,
+            session: self.session.as_ref().map(|s| (s.id, s.scan)),
+            filter_len: self.patterns.filter.len(),
+            collapsed: self.patterns.collapsed.len(),
+        };
+        if id != self.sel_id {
+            self.sel_id = id;
+            self.sel_since = self.tick;
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let effects = self.key_inner(key);
+        self.track_selection();
+        effects
+    }
+
+    fn key_inner(&mut self, key: KeyEvent) -> Vec<Effect> {
         if !is_press(&key) {
             return Vec::new();
         }
@@ -1016,13 +1077,19 @@ impl App {
 
     /// Apply a message. Returns follow-up work, e.g. loading history after a scan.
     pub fn apply(&mut self, msg: Msg) -> Vec<Effect> {
+        let effects = self.apply_inner(msg);
+        self.track_selection();
+        effects
+    }
+
+    fn apply_inner(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
             Msg::TickAt(now) => {
                 self.now = Some(now);
                 if self.connect_started.is_none() && self.is_connecting() {
                     self.connect_started = Some(now);
                 }
-                return self.apply(Msg::Tick);
+                return self.apply_inner(Msg::Tick);
             }
             Msg::Tick => {
                 self.tick += 1;
@@ -1316,6 +1383,40 @@ mod tests {
             target: ScanTarget::Primary,
         });
         (app, id)
+    }
+
+    #[test]
+    fn selection_change_restarts_the_marquee() {
+        let (mut app, id) = scanning();
+        app.apply(Msg::ScanPartial {
+            id,
+            scan: scan_of(&app),
+            partial: fixtures::partial(true),
+        });
+        app.handle_key(ch('1'));
+        assert_eq!(app.sel_ticks(), 0);
+        for _ in 0..7 {
+            app.apply(Msg::Tick);
+        }
+        assert_eq!(app.sel_ticks(), 7);
+        // Another partial result for the same selection does not restart it.
+        app.apply(Msg::ScanPartial {
+            id,
+            scan: scan_of(&app),
+            partial: fixtures::partial(true),
+        });
+        assert_eq!(app.sel_ticks(), 7);
+        // Moving the selection does.
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.sel_ticks(), 0);
+        app.apply(Msg::Tick);
+        app.apply(Msg::Tick);
+        assert_eq!(app.sel_ticks(), 2);
+        // So does a view switch.
+        app.handle_key(ch('2'));
+        assert_eq!(app.sel_ticks(), 0);
+        app.apply(Msg::Tick);
+        assert_eq!(app.sel_ticks(), 1);
     }
 
     #[test]

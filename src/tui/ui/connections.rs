@@ -12,7 +12,9 @@ use crate::format;
 use crate::model::{Auth, Env, PERM_LABELS, PERM_MEMORY, PermStatus};
 use crate::tui::app::{AddState, App, ConnEntry, ConnSel, ConnStatus, DockerState, Source};
 
-use super::widgets::{fit, pad_l, pad_r, panel, rows, scroll_offset, split_cols, trunc};
+use super::widgets::{
+    fit, pad_l, pad_r, pad_r_marquee, panel, rows, scroll_offset, split_cols, trunc,
+};
 use super::{server_label, spinner, split_body, style};
 
 struct Cols {
@@ -74,6 +76,15 @@ fn auth_label(e: &ConnEntry) -> &'static str {
 fn entry_line(app: &App, e: &ConnEntry, c: &Cols) -> Line<'static> {
     let active = app.session.as_ref().is_some_and(|s| s.id == e.id);
     let (st, st_style) = status(e);
+    let selected = app.conn_sel == ConnSel::Entry(e.id);
+    let ticks = app.sel_ticks();
+    let cell = |s: &str, w: usize| {
+        if selected {
+            pad_r_marquee(s, w, ticks)
+        } else {
+            pad_r(s, w)
+        }
+    };
     let env = e.profile.env.label();
     let mem = e
         .server
@@ -82,12 +93,12 @@ fn entry_line(app: &App, e: &ConnEntry, c: &Cols) -> Line<'static> {
     Line::from(vec![
         Span::styled(if active { " › " } else { "   " }, style::amber()),
         Span::styled(
-            pad_r(&e.profile.name, c.name - 3),
+            cell(&e.profile.name, c.name - 3),
             if active { style::fgb() } else { style::fg() },
         ),
         Span::styled(format!(" {env} "), style::env_badge(e.profile.env)),
         Span::raw(" ".repeat(c.env.saturating_sub(env.len() + 2))),
-        Span::styled(pad_r(&e.profile.endpoint.to_string(), c.ep), style::dim()),
+        Span::styled(cell(&e.profile.endpoint.to_string(), c.ep), style::dim()),
         Span::styled(pad_r(auth_label(e), c.auth), style::fg()),
         Span::styled(pad_r(st, c.status), st_style),
         Span::styled(format!("{} ", pad_l(&mem, c.mem - 1)), style::fg()),

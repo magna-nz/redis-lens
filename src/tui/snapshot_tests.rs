@@ -755,3 +755,61 @@ fn keychain_hint_and_scan_target_are_drawn() {
     let t = text(&app);
     assert!(t.contains("scanning replica 10.0.1.21:6379"), "{t}");
 }
+
+const LONG_NAME: &str = "audit-trail-{id}-with-an-exceedingly-long-descriptive-pattern-name-{uuid}";
+
+/// A finished scan whose biggest pattern (the first row, selected) has a very long name.
+fn long_name_app() -> App {
+    let mut report = fixtures::report(true);
+    report.patterns[0].pattern = LONG_NAME.into();
+    scanned_with(report, fixtures::perms_ok()).0
+}
+
+fn tick(app: &mut App, n: usize) {
+    for _ in 0..n {
+        app.apply(Msg::Tick);
+    }
+}
+
+#[test]
+fn patterns_narrow_rows_do_not_wrap() {
+    let mut app = long_name_app();
+    let before = buffer_lines(&render(&app, 60, 24));
+    // The table's rows, between its header and its closing border.
+    let end = before.iter().position(|l| l.starts_with('└')).unwrap();
+    let table = &before[5..end];
+    let report = app.report().unwrap();
+    assert_eq!(table.len(), 7, "{before:#?}");
+    assert!(report.patterns.len() >= table.len());
+    // One line for the long name, cut with `…`, and none for its tail.
+    assert!(table[0].starts_with("│   audit-t"), "{}", table[0]);
+    assert!(table[0].contains('…'), "{}", table[0]);
+    assert!(
+        !table.iter().any(|l| l.contains("descriptive")),
+        "{table:#?}"
+    );
+    for l in &before {
+        assert_eq!(l.chars().count(), 60, "{l}");
+    }
+    // Scrolled it is still one line, in the same place, and not wider.
+    tick(&mut app, 25);
+    let after = buffer_lines(&render(&app, 60, 24));
+    assert_ne!(after[5], before[5]);
+    assert!(after[5].starts_with("│…"), "{}", after[5]);
+    assert!(after[6].starts_with("│ ▾ cache:"), "{}", after[6]);
+    assert!(
+        !after.iter().any(|l| l.contains("descriptive")),
+        "{after:#?}"
+    );
+    for l in &after {
+        assert_eq!(l.chars().count(), 60, "{l}");
+    }
+}
+
+#[test]
+fn patterns_long_name_mid_scroll() {
+    let mut app = long_name_app();
+    tick(&mut app, 10 + 2 * 12);
+    let t = render(&app, 120, 36);
+    insta::assert_snapshot!(t.backend());
+}
