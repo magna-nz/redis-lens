@@ -101,6 +101,21 @@ impl Route {
             Self::Ssh(bastion) => bastion.reach(ep).await,
         }
     }
+
+    /// Whether `ep` is on the same machine as whatever reaches it, without starting a
+    /// forward: direct, `ep`'s host resolved here (a name that no longer resolves counts
+    /// as remote, which only restricts); through SSH, `ep`'s host is loopback by name, as
+    /// seen from the bastion. The same judgement as [`Self::reach`]'s `local`.
+    async fn is_local(&self, ep: &Endpoint) -> bool {
+        match self {
+            Self::Direct => resolve(&ep.host, ep.port).await.is_ok_and(|r| r.local),
+            Self::Ssh(_) => is_loopback_name(&ep.host),
+        }
+    }
+
+    fn is_ssh(&self) -> bool {
+        matches!(self, Self::Ssh(_))
+    }
 }
 
 /// A connection to one server, holding on to its [`Route`] so an SSH forward it goes
@@ -562,11 +577,9 @@ async fn verified_replica(
     }
     drop(probe);
 
-    // A primary whose name no longer resolves counts as remote, which only restricts.
-    let primary_local = match route.reach(primary).await {
-        Ok(r) => r.local,
-        Err(_) => false,
-    };
+    // Both judged the same way: from this machine when direct, from the bastion through
+    // SSH, where a forward's local end says nothing about where the server is.
+    let primary_local = route.is_local(primary).await;
     if !may_send_credentials(primary_local, candidate.local) {
         return Err(Unusable::WontSendCredentials);
     }
@@ -640,28 +653,39 @@ async fn connect_for_scan_with(
                 port,
                 tls: profile.endpoint.tls,
             };
+            // Through SSH the candidate's forward is started first, within ssh's own
+            // readiness limit, so the 2 s below covers the check, not ssh's login.
+            if route.is_ssh()
+                && let Err(why) = route.reach(&ep).await
+            {
+                return fallback(primary, unusable_reason(&ep, why, true));
+            }
             let attempt =
                 verified_replica(auth, route, profile.db, &profile.endpoint, &replid, &ep);
             match tokio::time::timeout(REPLICA_TIMEOUT, attempt).await {
                 Ok(Ok(c)) => Ok((c, ScanTarget::Replica(ep))),
-                Ok(Err(Unusable::NotAReplica)) => fallback(
-                    primary,
-                    format!("replica at {ep} is not a replica of this primary"),
-                ),
-                Ok(Err(Unusable::WontSendCredentials)) => fallback(
-                    primary,
-                    format!(
-                        "replica at {ep} needs credentials to be verified and is a loopback \
-                         address that is not the primary's host"
-                    ),
-                ),
-                Ok(Err(Unusable::Resolve(e))) => {
-                    fallback(primary, format!("{ep}: could not resolve the host: {e}"))
-                }
-                Ok(Err(Unusable::Conn(e))) => fallback(primary, format!("{ep}: {e}")),
+                Ok(Err(why)) => fallback(primary, unusable_reason(&ep, why, route.is_ssh())),
                 Err(_) => fallback(primary, format!("{ep}: timed out")),
             }
         }
+    }
+}
+
+/// The `PrimaryFallback` reason for a replica candidate at `ep` that can't be used.
+/// `ssh`: the route goes through a bastion, where loopback is judged.
+fn unusable_reason(ep: &Endpoint, why: Unusable, ssh: bool) -> String {
+    match why {
+        Unusable::NotAReplica => format!("replica at {ep} is not a replica of this primary"),
+        Unusable::WontSendCredentials if ssh => format!(
+            "replica at {ep} needs credentials to be verified and is a loopback address, as \
+             seen from the SSH bastion, that is not the primary's host"
+        ),
+        Unusable::WontSendCredentials => format!(
+            "replica at {ep} needs credentials to be verified and is a loopback address that \
+             is not the primary's host"
+        ),
+        Unusable::Resolve(e) => format!("{ep}: could not resolve the host: {e}"),
+        Unusable::Conn(e) => format!("{ep}: {e}"),
     }
 }
 
@@ -951,6 +975,147 @@ mod tests {
         if let Ok(candidate) = resolve("127.1", 6379).await {
             assert!(!may_send_credentials(primary.local, candidate.local));
         }
+    }
+
+    fn ssh_route(host: &str) -> Route {
+        let t = ssh::tests::tunnel(host);
+        let p = ssh::tests::profile(Some(t.clone()));
+        Route::Ssh(ssh::Bastion::new(&p, &t, &crate::secrets::MemoryStore::default()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_profile_with_a_bastion_gets_an_ssh_route() {
+        let store = crate::secrets::MemoryStore::default();
+        let direct = ssh::tests::profile(None);
+        let r = Route::for_profile(&direct, &store).await.unwrap();
+        assert!(matches!(r.as_ref(), Route::Direct));
+        let behind = ssh::tests::profile(Some(ssh::tests::tunnel("b.example")));
+        let r = Route::for_profile(&behind, &store).await.unwrap();
+        assert!(r.is_ssh());
+        // A bad bastion fails before anything is started or read.
+        let bad = ssh::tests::profile(Some(ssh::tests::tunnel("-oProxyCommand=x")));
+        let Err(e) = Route::for_profile(&bad, &store).await else {
+            panic!("expected an error");
+        };
+        assert!(
+            matches!(e, ConnError::Ssh(ssh::SshError::InvalidHost)),
+            "{e:?}"
+        );
+        let Err(e) = connect(&bad, &store).await else {
+            panic!("expected an error");
+        };
+        assert!(
+            matches!(e, ConnError::Ssh(ssh::SshError::InvalidHost)),
+            "{e:?}"
+        );
+    }
+
+    /// Behind a bastion, "on this machine" means on the bastion: judged from the host
+    /// name, never from the forward's 127.0.0.1.
+    #[tokio::test]
+    async fn behind_a_bastion_loopback_is_judged_from_the_bastion() {
+        let route = ssh_route("b.example");
+        for host in ["127.0.0.1", "localhost", "::1", "db.localhost"] {
+            assert!(route.is_local(&ep(host, 6379, false)).await, "{host}");
+        }
+        for host in ["10.0.0.5", "cache.internal", "2001:db8::5"] {
+            assert!(!route.is_local(&ep(host, 6379, false)).await, "{host}");
+        }
+        // Direct, the same names are judged here.
+        assert!(Route::Direct.is_local(&ep("127.0.0.1", 6379, false)).await);
+        assert!(!Route::Direct.is_local(&ep("10.0.0.5", 6379, false)).await);
+        assert!(
+            !Route::Direct
+                .is_local(&ep("nope.invalid", 6379, false))
+                .await
+        );
+    }
+
+    /// The trust rule behind a bastion: a primary at 10.0.0.5 that announces
+    /// 127.0.0.1 names the bastion itself, so the candidate gets no credentials; a
+    /// profile whose host is loopback on the bastion may send them to another loopback
+    /// address there.
+    #[tokio::test]
+    async fn behind_a_bastion_an_announced_loopback_gets_no_credentials() {
+        let route = ssh_route("b.example");
+        let candidate = route.is_local(&ep("127.0.0.1", 6380, false)).await;
+        let remote_primary = route.is_local(&ep("10.0.0.5", 6379, false)).await;
+        assert!(!may_send_credentials(remote_primary, candidate));
+        let primary_on_bastion = route.is_local(&ep("localhost", 6379, false)).await;
+        assert!(may_send_credentials(primary_on_bastion, candidate));
+        // A remote candidate is fine either way.
+        let remote = route.is_local(&ep("10.0.0.6", 6379, false)).await;
+        assert!(may_send_credentials(remote_primary, remote));
+        // Direct, a profile on 127.0.0.1 (a tunnel the user opened by hand) counts as on
+        // this machine: why `--ssh` is the way to reach a server through a bastion.
+        let own_tunnel = Route::Direct.is_local(&ep("127.0.0.1", 16379, false)).await;
+        assert!(may_send_credentials(own_tunnel, candidate));
+    }
+
+    #[test]
+    fn fallback_reasons_say_where_loopback_was_judged() {
+        let e = ep("127.0.0.1", 6380, false);
+        let ssh = unusable_reason(&e, Unusable::WontSendCredentials, true);
+        assert!(ssh.contains("as seen from the SSH bastion"), "{ssh}");
+        let direct = unusable_reason(&e, Unusable::WontSendCredentials, false);
+        assert!(!direct.contains("bastion"), "{direct}");
+        assert_eq!(
+            unusable_reason(&e, Unusable::NotAReplica, true),
+            "replica at 127.0.0.1:6380 is not a replica of this primary"
+        );
+        let tunnel = unusable_reason(&e, ssh::SshError::Auth.into(), true);
+        assert!(
+            tunnel.starts_with("127.0.0.1:6380: the SSH bastion refused"),
+            "{tunnel}"
+        );
+    }
+
+    /// Every connection a profile opens goes through its route: the primary
+    /// ([`ResolvedAuth::open`], so `connect`), the scan connect, and the replica check.
+    /// The fake ssh accepts and closes, so each attempt fails, but at the forward.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connections_go_through_the_route() {
+        use crate::secrets::MemoryStore;
+        let fake = ssh::tests::fake::Fake::new("route");
+        let route = Arc::new(Route::Ssh(fake.bastion("listen", None, ssh::READY_TIMEOUT)));
+        // A name that only the bastion could resolve.
+        let mut p = ssh::tests::profile(None);
+        p.endpoint = ep("redis.invalid", 6379, false);
+        let auth = ResolvedAuth::new(&p, &MemoryStore::default())
+            .await
+            .unwrap();
+
+        let e = auth.open(&route, &p.endpoint).await.unwrap_err();
+        assert!(!matches!(e, ConnError::Ssh(_)), "{e:?}");
+        let pids = fake.starts();
+        assert_eq!(pids.len(), 1);
+        assert!(
+            fake.argv(pids[0])
+                .iter()
+                .any(|a| a.ends_with(":redis.invalid:6379")),
+            "{:?}",
+            fake.argv(pids[0])
+        );
+        // The readiness probe, then the connection itself.
+        assert!(fake.accepts(pids[0]) >= 2);
+
+        let before = fake.accepts(pids[0]);
+        assert!(connect_for_scan_with(&p, &route, &auth).await.is_err());
+        assert_eq!(fake.starts().len(), 1, "the forward is reused");
+        assert!(fake.accepts(pids[0]) > before);
+
+        let candidate = ep("replica.invalid", 6380, false);
+        let r = verified_replica(&auth, &route, 0, &p.endpoint, "id", &candidate).await;
+        assert!(matches!(r, Err(Unusable::Conn(ConnError::Redis(_)))));
+        let pids = fake.starts();
+        assert_eq!(pids.len(), 2);
+        assert!(
+            fake.argv(pids[1])
+                .iter()
+                .any(|a| a.ends_with(":replica.invalid:6380"))
+        );
+        assert!(fake.accepts(pids[1]) >= 2);
     }
 
     #[tokio::test]
