@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** v0.2 done on main; waves 6-8 merged (PRs #10-#12); the quick wins (feature ideas 1-7) in progress; then v0.3 (cluster) or the bigger bets below
-**Last updated:** 2026-11-11 (quick wins verified; PR #13)
+**Current milestone:** v0.3 (cluster and SSH tunnels) built on `v03/integration`; verifier and PR next
+**Last updated:** 2026-11-12 (v0.3 wave B merged into `v03/integration`)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -236,6 +236,35 @@ Integration branch `wave7/fixes` (worktree `.claude/worktrees/wave7`, from main 
 
 Integration branch: `wave6/fixes` (worktree `.claude/worktrees/wave6`). Out of scope: Entra ID against real Azure and managed identity (needs Azure; feature idea 10), and the `--prefer-replica` trust boundary (a documented design trade-off).
 
+## v0.3 (2026-11-11 to 2026-11-12): cluster and SSH tunnels
+
+Started from the parent session's brief. Owner decisions (2026-11-11, the recommended options): our own discovery (`CLUSTER SHARDS`, falling back to `CLUSTER SLOTS`), not redis-rs's cluster client; the rate limit per node, up to 4 nodes at once, the sample limit split by `DBSIZE`; a view 5 Nodes where `enter` narrows Patterns to a node; snapshots keep per-node pattern rows; the system `ssh -N -L` with `BatchMode=yes` and `StrictHostKeyChecking=yes`, one forward per endpoint. Not in scope: Sentinel, the per-slot view, Azure managed identity. No tag, release or publish; the owner merges the PR.
+
+Integration branch `v03/integration` (worktree `.claude/worktrees/v03`). Agent worktrees made by hand from it.
+
+| Wave | Content | Agent | Branch | State |
+|---|---|---|---|---|
+| contract | `NodeReport`, `NodeRole`, `NodeStatus`, `ScanReport.nodes`, `KeySample.node`, `Profile.ssh`, `SshTunnel`; `Route`/`Connection` (a connection keeps its SSH forward open); stubs | me | d807cff | **done** |
+| A | SSH tunnels: `src/conn/ssh.rs`, `conn add --ssh`, `tests/ssh_it.rs` (19) | implementer [opus] | `v03/ssh` | **done**, merged (8004d94) |
+| A | Cluster discovery and per-shard scanning: `src/conn/cluster.rs`, `src/scan/cluster.rs`, `pattern::aggregate_nodes`, `tests/cluster_it.rs` (8) | implementer [opus] | `v03/cluster` | **done**, merged (11b002c) |
+| contract B | `ScanTarget::Cluster`, `ScanTargets::target()`/`check_permissions()`, `scan::cluster::scan_targets` | me | b225131 | **done** |
+| B | TUI: wiring, view 5 Nodes, narrowing, Hot keys node column, header and Connections summary | implementer [opus] | `v03/tui` | **done**, merged (e06cc73) |
+| B | `scan` Nodes table, `--check` note, md/html Nodes section, snapshots, `diff` node-set note, `compare` on a cluster; `tests/cluster_cli_it.rs` (4) | implementer [sonnet] | `v03/cli` | **done**, merged (5ad766f) |
+| B | Cluster behind a bastion (`tests/ssh_cluster_it.rs`, 10); one primary connect for a standalone `--prefer-replica`; no extra `INFO` per scan (the detection reply answers the scan's first `INFO server`); Valkey 8 `server_mode` | implementer [opus], resumed | `v03/ssh` | **done**, merged (0eb1832) |
+| fix | The cluster futures were not `Send` (rustc's higher-ranked limitation with iterator closures held in streams); boxed and collected first, guarded by `scan::cluster::tests::futures_are_send`; the TUI's blocking-thread workaround removed | me | 621502c | **done** |
+| V | Verifier on the merged branch | verifier [opus] | | next |
+
+Checks on the merged branch (621502c plus the spec, status and note edits): fmt and clippy clean; 704 unit tests pass. Integration on Redis 7.4 + Valkey 8.1: 141 of 142 passed, and on `redis:6.2-alpine` 140 of 142; os_trust's 2 are ignored as usual. The three failures were Docker Desktop errors in the container helper (a host-port bind race and `PortNotExposed`), not assertions, and each passed when rerun alone: `replica_it::an_open_replica_is_scanned_without_credentials`, `conn_it::probe_server_with_default_user_off_is_required`, `scan_cli_it::sample_limit_is_not_complete`. CI on Linux is the real check.
+
+Open points:
+- With `-l <user>`, the SSH username is visible in the process list while a tunnel runs (documented in spec.md; `User` in `~/.ssh/config` avoids it).
+- The ssh child uses `std::process` with a kill on drop, not tokio's `process` feature. Windows is not compiled locally; CI's Windows unit tests are the check.
+- The kept `INFO server` reply can be up to 10 s old when the scan reads it (version and mode are what the scan uses from it).
+- The TUI colours the cluster summary amber by matching its wording ("unreachable", "seed node only"); a structured field would need a contract change.
+- `diff --json` has no node-set note.
+- Not tested end to end: a TLS cluster, and a TLS cluster behind a bastion.
+- The TUI sends `INFO server`, `INFO memory` and `DBSIZE` per node for the header before a cluster scan, as it does for a standalone server.
+
 ### How to resume after a restart or compaction
 
 1. Read this file, `spec.md` and `CLAUDE.md`.
@@ -287,7 +316,7 @@ See the overnight table above.
 
 ## Known issues and notes
 
-- **Replica scans (`--prefer-replica`) trust the announced address**, like Cluster and Sentinel clients do. A server that imitates a replica, since the replication ID isn't secret, can be scanned without credentials, and its data is filed under the profile. A profile that reaches prod through an SSH tunnel on 127.0.0.1 treats local services on the announced port as on the primary's host. A replica scanned without credentials runs as its default user. TLS replica scans are tested (`tests/tls_it.rs`).
+- **Replica scans (`--prefer-replica`) trust the announced address**, like Cluster and Sentinel clients do. A server that imitates a replica, since the replication ID isn't secret, can be scanned without credentials, and its data is filed under the profile. A profile that reaches prod through a tunnel opened by hand on 127.0.0.1 treats local services on the announced port as on the primary's host; `--ssh` (v0.3) judges loopback from the bastion instead. Announced cluster nodes are trusted the same way (spec.md, Safety). A replica scanned without credentials runs as its default user. TLS replica scans are tested (`tests/tls_it.rs`).
 
 - **macOS keychain prompt after rebuilds.** Keychain entries are tied to the binary that wrote them. A rebuilt or upgraded binary has to ask macOS for access, and until someone answers the dialog, connecting hangs. Mitigated in wave 5: the README says to click "Always Allow", and the TUI shows a hint when a keychain read takes more than 2 s. Since wave 7 a keychain call gives up after 15 s with an error saying to click "Always Allow" and try again, so nothing hangs. A write that timed out can still finish once the dialog is answered, leaving an entry no profile points to (still only in the keychain).
 
@@ -328,5 +357,5 @@ Researched on 2026-11-11. Proposals only; nothing here is built. The full write-
 
 **Verified facts that affect the roadmap:**
 - ElastiCache Serverless blocks `MEMORY USAGE` and `OBJECT FREQ`.
-- The OSS clustering policy on Azure Managed Redis needs v0.3 cluster support.
+- The OSS clustering policy on Azure Managed Redis needs v0.3 cluster support (built; untested against Azure).
 - `HEXPIRE` exists in Redis from 7.4 and in Valkey only from 9.0, so CI would need a newer Valkey to test it.

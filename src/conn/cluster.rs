@@ -688,8 +688,8 @@ impl NodeFailure {
             }
             Self::Resolve => format!("{ep}: the host name could not be resolved"),
             Self::WontSendCredentials => format!(
-                "{ep} is a loopback address and the seed is not on this machine, so \
-                 credentials are not sent to it"
+                "{ep} is a loopback address and the seed is not on the same machine (behind SSH: \
+                 the bastion), so credentials are not sent to it"
             ),
             Self::Auth => format!("{ep}: authentication failed"),
             Self::Unreachable => format!("{ep}: could not connect"),
