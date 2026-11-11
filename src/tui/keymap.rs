@@ -218,7 +218,8 @@ mod tests {
     /// the footer and the overlay can't drift apart.
     #[test]
     fn spec_lists_every_key() {
-        let spec = include_str!("../../spec.md");
+        // Windows checkouts may turn line endings into CRLF.
+        let spec = include_str!("../../spec.md").replace("\r\n", "\n");
         assert!(
             spec.contains(&markdown()),
             "spec.md's key table differs from keymap::markdown():\n{}",
