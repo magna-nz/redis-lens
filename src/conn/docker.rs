@@ -11,6 +11,67 @@ use crate::model::{Auth, Credentials, Endpoint, Env, Profile};
 
 use super::ConnError;
 
+/// How long discovery waits for the `PING` that tells whether a server needs a password.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What a credential-less `PING` says about authentication. A pure function of the
+/// probe result: `PONG` means none; `NOAUTH`, `WRONGPASS` or an authentication failure
+/// means credentials are required; anything else (refused, timeout, `NOPERM`, other
+/// errors) means unknown.
+pub fn classify_probe(r: &Result<String, ConnError>) -> DiscoveredAuth {
+    match r {
+        Ok(reply) if reply.eq_ignore_ascii_case("PONG") => DiscoveredAuth::None,
+        Ok(_) => DiscoveredAuth::Unknown,
+        Err(ConnError::Redis(e))
+            if matches!(e.code(), Some("NOAUTH" | "WRONGPASS"))
+                || e.kind() == redis::ErrorKind::AuthenticationFailed =>
+        {
+            DiscoveredAuth::Required
+        }
+        Err(_) => DiscoveredAuth::Unknown,
+    }
+}
+
+/// Probe `ep` with `PING` and no credentials, and classify the result.
+pub async fn probe_auth(ep: &Endpoint) -> DiscoveredAuth {
+    probe_auth_within(ep, PROBE_TIMEOUT).await
+}
+
+/// [`probe_auth`] with its own timeout (tests use a longer one, so a loaded machine
+/// doesn't turn an answer into `Unknown`).
+pub async fn probe_auth_within(ep: &Endpoint, timeout: std::time::Duration) -> DiscoveredAuth {
+    classify_probe(&super::ping_without_credentials(ep, timeout).await)
+}
+
+/// What discovery could tell about a container's authentication.
+///
+/// Discovery-only: a saved [`Profile`] still has [`Auth`], which is what goes to the
+/// config file. "Unknown" is not a way to authenticate, so it never reaches `Profile`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveredAuth {
+    /// A password was found in the container's command line or environment.
+    Password,
+    /// The server answered without credentials.
+    None,
+    /// The server wants credentials that discovery could not find (an ACL file, a
+    /// config file).
+    Required,
+    /// Discovery could not tell.
+    Unknown,
+}
+
+impl DiscoveredAuth {
+    /// The word shown in `discover` output and the Connections view.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::None => "none",
+            Self::Required => "required",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiscoveredInstance {
     pub container: String,
@@ -20,6 +81,9 @@ pub struct DiscoveredInstance {
     /// A password read from the container's command line (`--requirepass`) or
     /// environment (`REDIS_PASSWORD`). Kept in memory only.
     pub credentials: Option<Credentials>,
+    /// What discovery found out about authentication. `Password` exactly when
+    /// `credentials` is `Some`.
+    pub auth: DiscoveredAuth,
 }
 
 const UNREACHABLE: &str = "Docker isn't running or can't be reached";
@@ -142,10 +206,18 @@ async fn instance(docker: &Docker, c: ContainerSummary) -> Option<DiscoveredInst
         }
         Err(_) => None,
     };
+    let profile = profile_for(name.clone(), port, password.is_some());
+    // A found password needs no probe; otherwise ask the server with a bare PING.
+    let auth = if password.is_some() {
+        DiscoveredAuth::Password
+    } else {
+        probe_auth(&profile.endpoint).await
+    };
     Some(DiscoveredInstance {
-        container: name.clone(),
+        auth,
+        container: name,
         image,
-        profile: profile_for(name, port, password.is_some()),
+        profile,
         credentials: password.map(|pw| Credentials {
             username: None,
             password: SecretString::from(pw),
@@ -156,6 +228,66 @@ async fn instance(docker: &Docker, c: ContainerSummary) -> Option<DiscoveredInst
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovered_auth_labels() {
+        assert_eq!(DiscoveredAuth::Password.label(), "password");
+        assert_eq!(DiscoveredAuth::None.label(), "none");
+        assert_eq!(DiscoveredAuth::Required.label(), "required");
+        assert_eq!(DiscoveredAuth::Unknown.label(), "unknown");
+    }
+
+    /// The error redis-rs builds from a server reply such as `-NOAUTH Authentication required.`
+    fn server_reply(line: &str) -> ConnError {
+        let v = redis::parse_redis_value(format!("-{line}\r\n").as_bytes()).unwrap();
+        match v {
+            redis::Value::ServerError(e) => ConnError::Redis(redis::RedisError::from(e)),
+            other => panic!("not an error reply: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_classification() {
+        let c = |r: Result<String, ConnError>| classify_probe(&r);
+        assert_eq!(c(Ok("PONG".into())), DiscoveredAuth::None);
+        assert_eq!(c(Ok("something else".into())), DiscoveredAuth::Unknown);
+        for line in [
+            "NOAUTH Authentication required.",
+            "WRONGPASS invalid username-password pair or user is disabled.",
+        ] {
+            assert_eq!(
+                c(Err(server_reply(line))),
+                DiscoveredAuth::Required,
+                "{line}"
+            );
+        }
+        let auth_failed = ConnError::Redis(redis::RedisError::from((
+            redis::ErrorKind::AuthenticationFailed,
+            "auth",
+        )));
+        assert_eq!(c(Err(auth_failed)), DiscoveredAuth::Required);
+        assert_eq!(
+            c(Err(server_reply("NOPERM this user has no permissions"))),
+            DiscoveredAuth::Unknown
+        );
+        assert_eq!(
+            c(Err(server_reply("ERR something"))),
+            DiscoveredAuth::Unknown
+        );
+        let io = |k| ConnError::Redis(redis::RedisError::from(std::io::Error::new(k, "x")));
+        assert_eq!(
+            c(Err(io(std::io::ErrorKind::ConnectionRefused))),
+            DiscoveredAuth::Unknown
+        );
+        assert_eq!(
+            c(Err(io(std::io::ErrorKind::TimedOut))),
+            DiscoveredAuth::Unknown
+        );
+        assert_eq!(
+            c(Err(ConnError::Docker("x".into()))),
+            DiscoveredAuth::Unknown
+        );
+    }
 
     #[test]
     fn image_matching() {

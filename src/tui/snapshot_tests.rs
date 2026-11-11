@@ -5,11 +5,12 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
-use super::app::{App, ConnId, Effect, Msg};
+use super::app::{App, ConnId, Effect, Msg, ScanId};
 use super::fixtures;
 use super::tree::{Root, Row};
 use super::ui;
 use crate::conn::ScanTarget;
+use crate::conn::docker::DiscoveredAuth;
 use crate::model::{PermissionReport, ScanReport};
 use crate::scan::ScanProgress;
 
@@ -43,6 +44,11 @@ fn connect_selected(app: &mut App) -> u64 {
     }
 }
 
+/// The current session's run, for messages that should be accepted.
+fn scan_of(app: &App) -> ScanId {
+    app.session.as_ref().unwrap().scan
+}
+
 /// Connected to prod-cache-01 with `perms`, and `report` finished scanning.
 fn scanned_with(report: ScanReport, perms: PermissionReport) -> (App, ConnId) {
     let mut app = App::new(fixtures::profiles());
@@ -50,11 +56,16 @@ fn scanned_with(report: ScanReport, perms: PermissionReport) -> (App, ConnId) {
     let id = connect_selected(&mut app);
     app.apply(Msg::Connected {
         id,
+        scan: scan_of(&app),
         server: Some(report.server.clone()),
         perms,
         target: ScanTarget::Primary,
     });
-    app.apply(Msg::ScanDone { id, report });
+    app.apply(Msg::ScanDone {
+        id,
+        scan: scan_of(&app),
+        report,
+    });
     (app, id)
 }
 
@@ -80,6 +91,7 @@ fn set_history(app: &mut App, id: ConnId, diff: Option<crate::diff::ReportDiff>)
         .taken_at_unix;
     app.apply(Msg::History {
         id,
+        scan: scan_of(app),
         taken_at_unix,
         result: Ok(diff),
     });
@@ -123,6 +135,118 @@ fn select_pattern(app: &mut App, label: &str) {
     }
 }
 
+/// Docker containers whose discovery found a password, no auth, auth it could not
+/// satisfy, and nothing conclusive. The password is fixture data and never on screen.
+fn docker_auth_app() -> App {
+    let mut app = App::new(fixtures::profiles());
+    let mut with_password = fixtures::docker_instance();
+    with_password.container = "pw-redis-1".into();
+    with_password.profile.name = "pw-redis-1".into();
+    with_password.profile.auth = crate::model::Auth::Keychain;
+    with_password.credentials = Some(crate::model::Credentials {
+        username: None,
+        password: secrecy::SecretString::from("Fixture-Container-Pw"),
+    });
+    with_password.auth = DiscoveredAuth::Password;
+    app.apply(Msg::DockerFound(vec![
+        with_password,
+        fixtures::docker_instance(),
+        fixtures::docker_instance_auth("acl-valkey-1", 6391, DiscoveredAuth::Required),
+        fixtures::docker_instance_auth("odd-valkey-1", 6392, DiscoveredAuth::Unknown),
+    ]));
+    app
+}
+
+/// Select the entry called `name` on the Connections view.
+fn select_entry(app: &mut App, name: &str) {
+    for _ in 0..app.entries.len() + 1 {
+        if app.selected_entry().is_some_and(|e| e.profile.name == name) {
+            return;
+        }
+        app.handle_key(ch('j'));
+    }
+    panic!("no entry {name}");
+}
+
+#[test]
+fn connections_docker_auth() {
+    let mut app = docker_auth_app();
+    select_entry(&mut app, "acl-valkey-1");
+    let t = render(&app, 120, 36);
+    let lines = buffer_lines(&t);
+    let row = |name: &str| {
+        lines
+            .iter()
+            .find(|l| l.contains(&format!("{name} ")) && l.contains("127.0.0.1"))
+            .unwrap_or_else(|| panic!("no row {name}"))
+            .clone()
+    };
+    // The list's AUTH column shows what discovery found.
+    for (name, label) in [
+        ("pw-redis-1", "password"),
+        ("myapp-redis-1", "none"),
+        ("acl-valkey-1", "required"),
+        ("odd-valkey-1", "unknown"),
+    ] {
+        let r = row(name);
+        assert!(r.contains(&format!(" {label} ")), "{name}: {r}");
+    }
+    for line in &lines {
+        assert!(
+            !line.contains("Fixture-Container-Pw"),
+            "password on screen: {line}"
+        );
+    }
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn docker_auth_detail_panel() {
+    let mut app = docker_auth_app();
+    for (name, auth, cred) in [
+        (
+            "pw-redis-1",
+            "password (default user)",
+            "from the container, memory only",
+        ),
+        ("myapp-redis-1", "none", "none"),
+        (
+            "acl-valkey-1",
+            "required",
+            "not found: save it as a profile with credentials",
+        ),
+        ("odd-valkey-1", "unknown", "could not tell"),
+    ] {
+        select_entry(&mut app, name);
+        let lines = buffer_lines(&render(&app, 140, 40));
+        let field = |key: &str| {
+            lines
+                .iter()
+                .find_map(|l| {
+                    l.split_once(&format!(" {key}  "))
+                        .map(|(_, v)| v.trim_start().to_string())
+                })
+                .unwrap_or_else(|| panic!("{name}: no {key} field"))
+        };
+        assert!(
+            field("Auth").starts_with(&format!("{auth}  ")),
+            "{name}: {}",
+            field("Auth")
+        );
+        assert!(
+            field("Credential").starts_with(&format!("{cred}  ")),
+            "{name}: {}",
+            field("Credential")
+        );
+        for line in &lines {
+            assert!(
+                !line.contains("Fixture-Container-Pw"),
+                "password on screen: {line}"
+            );
+        }
+    }
+}
+
 #[test]
 fn connections_view() {
     let mut app = App::new(fixtures::profiles());
@@ -132,6 +256,7 @@ fn connections_view() {
     let id = connect_selected(&mut app);
     app.apply(Msg::Connected {
         id,
+        scan: scan_of(&app),
         server: Some(crate::model::ServerInfo {
             version: "7.2.5".into(),
             used_memory: 2_254_857_830,
@@ -144,6 +269,7 @@ fn connections_view() {
     });
     app.apply(Msg::ScanProgress {
         id,
+        scan: scan_of(&app),
         progress: ScanProgress {
             sampled: 12_400,
             target: 85_964,
@@ -161,12 +287,14 @@ fn scanning_progress_header() {
     let id = connect_selected(&mut app);
     app.apply(Msg::Connected {
         id,
+        scan: scan_of(&app),
         server: Some(fixtures::server()),
         perms: fixtures::perms_ok(),
         target: ScanTarget::Primary,
     });
     app.apply(Msg::ScanProgress {
         id,
+        scan: scan_of(&app),
         progress: ScanProgress {
             sampled: 12_400,
             target: 85_964,
@@ -234,6 +362,7 @@ fn partial_after_previous_profile() -> App {
     let id = connect_selected(&mut app);
     app.apply(Msg::Connected {
         id,
+        scan: scan_of(&app),
         server: Some(fixtures::server()),
         perms: fixtures::perms_ok(),
         target: ScanTarget::Primary,
@@ -241,13 +370,18 @@ fn partial_after_previous_profile() -> App {
     let partial = fixtures::partial(true);
     app.apply(Msg::ScanProgress {
         id,
+        scan: scan_of(&app),
         progress: ScanProgress {
             sampled: partial.sampled,
             target: partial.target,
             done: false,
         },
     });
-    app.apply(Msg::ScanPartial { id, partial });
+    app.apply(Msg::ScanPartial {
+        id,
+        scan: scan_of(&app),
+        partial,
+    });
     app
 }
 
@@ -303,6 +437,7 @@ fn failed_scan_drops_partial_results_from_the_screen() {
     let id = app.session.as_ref().unwrap().id;
     app.apply(Msg::ScanFailed {
         id,
+        scan: scan_of(&app),
         error: "connection reset by peer".into(),
     });
     app.handle_key(ch('x')); // clear the error notice
@@ -324,6 +459,7 @@ fn empty_partial_says_nothing_sampled_yet() {
     let id = connect_selected(&mut app);
     app.apply(Msg::Connected {
         id,
+        scan: scan_of(&app),
         server: Some(fixtures::server()),
         perms: fixtures::perms_ok(),
         target: ScanTarget::Primary,
@@ -333,6 +469,7 @@ fn empty_partial_says_nothing_sampled_yet() {
     partial.sampled = 0;
     app.apply(Msg::ScanPartial {
         id,
+        scan: scan_of(&app),
         partial: std::sync::Arc::new(partial),
     });
     let lines = buffer_lines(&render(&app, 120, 36));
@@ -497,6 +634,7 @@ fn every_tab_at_60x20_and_200x60() {
     let taken_at_unix = failed.report().unwrap().taken_at_unix;
     failed.apply(Msg::History {
         id,
+        scan: scan_of(&failed),
         taken_at_unix,
         result: Err("could not find a data directory for this user".into()),
     });
@@ -605,6 +743,7 @@ fn keychain_hint_and_scan_target_are_drawn() {
     };
     app.apply(Msg::Connected {
         id,
+        scan: scan_of(&app),
         server: Some(fixtures::server()),
         perms: fixtures::perms_ok(),
         target: ScanTarget::Replica(ep),
@@ -615,4 +754,62 @@ fn keychain_hint_and_scan_target_are_drawn() {
     app.handle_key(ch('0'));
     let t = text(&app);
     assert!(t.contains("scanning replica 10.0.1.21:6379"), "{t}");
+}
+
+const LONG_NAME: &str = "audit-trail-{id}-with-an-exceedingly-long-descriptive-pattern-name-{uuid}";
+
+/// A finished scan whose biggest pattern (the first row, selected) has a very long name.
+fn long_name_app() -> App {
+    let mut report = fixtures::report(true);
+    report.patterns[0].pattern = LONG_NAME.into();
+    scanned_with(report, fixtures::perms_ok()).0
+}
+
+fn tick(app: &mut App, n: usize) {
+    for _ in 0..n {
+        app.apply(Msg::Tick);
+    }
+}
+
+#[test]
+fn patterns_narrow_rows_do_not_wrap() {
+    let mut app = long_name_app();
+    let before = buffer_lines(&render(&app, 60, 24));
+    // The table's rows, between its header and its closing border.
+    let end = before.iter().position(|l| l.starts_with('└')).unwrap();
+    let table = &before[5..end];
+    let report = app.report().unwrap();
+    assert_eq!(table.len(), 7, "{before:#?}");
+    assert!(report.patterns.len() >= table.len());
+    // One line for the long name, cut with `…`, and none for its tail.
+    assert!(table[0].starts_with("│   audit-t"), "{}", table[0]);
+    assert!(table[0].contains('…'), "{}", table[0]);
+    assert!(
+        !table.iter().any(|l| l.contains("descriptive")),
+        "{table:#?}"
+    );
+    for l in &before {
+        assert_eq!(l.chars().count(), 60, "{l}");
+    }
+    // Scrolled it is still one line, in the same place, and not wider.
+    tick(&mut app, 25);
+    let after = buffer_lines(&render(&app, 60, 24));
+    assert_ne!(after[5], before[5]);
+    assert!(after[5].starts_with("│…"), "{}", after[5]);
+    assert!(after[6].starts_with("│ ▾ cache:"), "{}", after[6]);
+    assert!(
+        !after.iter().any(|l| l.contains("descriptive")),
+        "{after:#?}"
+    );
+    for l in &after {
+        assert_eq!(l.chars().count(), 60, "{l}");
+    }
+}
+
+#[test]
+fn patterns_long_name_mid_scroll() {
+    let mut app = long_name_app();
+    tick(&mut app, 10 + 2 * 12);
+    let t = render(&app, 120, 36);
+    insta::assert_snapshot!(t.backend());
 }

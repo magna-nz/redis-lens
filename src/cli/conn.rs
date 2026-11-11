@@ -108,6 +108,15 @@ pub fn has_docker_prefix(name: &str) -> bool {
         .is_some_and(|p| p.eq_ignore_ascii_case(DOCKER_PREFIX))
 }
 
+/// The warning printed when the URL carried a password. Never contains the password.
+const URL_PASSWORD_WARNING: &str = "warning: the password was given in the URL, so it may now be in your shell history. \
+     Prefer --password-stdin or --ask-password.";
+
+/// Ask for a password on the terminal without echo.
+fn prompt_password() -> anyhow::Result<String> {
+    rpassword::prompt_password("Password: ").context("could not read the password")
+}
+
 /// Save a connection. `stdin_password` is everything read from standard input when
 /// `--password-stdin` was given. Returns the line to print.
 pub async fn add(
@@ -115,6 +124,26 @@ pub async fn add(
     secrets: &dyn SecretStore,
     args: &ConnAddArgs,
     stdin_password: Option<String>,
+) -> anyhow::Result<String> {
+    add_with(
+        path,
+        secrets,
+        args,
+        stdin_password,
+        &mut std::io::stderr(),
+        &prompt_password,
+    )
+    .await
+}
+
+/// [`add`] with the warning's destination and the `--ask-password` prompt injected.
+pub async fn add_with(
+    path: &Path,
+    secrets: &dyn SecretStore,
+    args: &ConnAddArgs,
+    stdin_password: Option<String>,
+    warn: &mut dyn std::io::Write,
+    prompt: &dyn Fn() -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
     if has_docker_prefix(&args.name) {
         bail!("names starting with {DOCKER_PREFIX} are reserved for discovered containers");
@@ -141,10 +170,8 @@ pub async fn add(
         (Auth::EntraId, None)
     } else {
         let password: Option<SecretString> = if let Some(p) = url_password {
-            eprintln!(
-                "warning: the password was given in the URL, so it may now be in your shell history. \
-                 Prefer --password-stdin or --ask-password."
-            );
+            // A failed warning write must not stop the save.
+            let _ = writeln!(warn, "{URL_PASSWORD_WARNING}");
             Some(SecretString::from(p))
         } else if args.password_stdin {
             let raw = stdin_password.ok_or_else(|| {
@@ -152,9 +179,7 @@ pub async fn add(
             })?;
             Some(SecretString::from(trim_newline(&raw).to_string()))
         } else if args.ask_password {
-            let p =
-                rpassword::prompt_password("Password: ").context("could not read the password")?;
-            Some(SecretString::from(p))
+            Some(SecretString::from(prompt()?))
         } else {
             None
         };
@@ -327,12 +352,7 @@ pub fn format_discovered(found: &[DiscoveredInstance]) -> String {
                 d.container.clone(),
                 d.image.clone(),
                 d.profile.endpoint.to_string(),
-                if d.credentials.is_some() {
-                    "password"
-                } else {
-                    "none"
-                }
-                .to_string(),
+                d.auth.label().to_string(),
             ]
         })
         .collect();
@@ -416,6 +436,78 @@ mod tests {
         assert!(!cfg.get("n").unwrap().prefer_replica);
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches("prefer_replica").count(), 1, "{text}");
+    }
+
+    #[tokio::test]
+    async fn url_password_warns_without_echoing_it() {
+        let path = temp_path("warn");
+        let store = MemoryStore::default();
+        let no_prompt = || -> anyhow::Result<String> { panic!("no prompt expected") };
+        let mut out = Vec::new();
+        add_with(
+            &path,
+            &store,
+            &args("w", "redis://u:url-pw-123@localhost"),
+            None,
+            &mut out,
+            &no_prompt,
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("shell history"), "{text}");
+        assert!(!text.contains("url-pw-123"), "{text}");
+
+        let mut out = Vec::new();
+        add_with(
+            &path,
+            &store,
+            &args("nw", "redis://localhost"),
+            None,
+            &mut out,
+            &no_prompt,
+        )
+        .await
+        .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ask_password_goes_to_store_only() {
+        let path = temp_path("ask");
+        let store = MemoryStore::default();
+        let mut a = args("asked", "redis://svc@localhost:6390");
+        a.ask_password = true;
+        let prompt = || -> anyhow::Result<String> { Ok("prompted-pw-456".to_string()) };
+        let mut out = Vec::new();
+        let msg = add_with(&path, &store, &a, None, &mut out, &prompt)
+            .await
+            .unwrap();
+        assert!(msg.contains("Credentials are in the OS keychain"));
+        assert!(
+            out.is_empty(),
+            "no URL-password warning without a URL password"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("prompted-pw-456") && !text.contains("svc"),
+            "{text}"
+        );
+        let p = Config::load(&path).unwrap().get("asked").unwrap().clone();
+        assert_eq!(p.auth, Auth::Keychain);
+        let c = store.get(&p.secret_ref()).unwrap().unwrap();
+        assert_eq!(c.username.as_deref(), Some("svc"));
+        assert_eq!(c.password.expose_secret(), "prompted-pw-456");
+
+        // An empty prompted password is refused and nothing is saved for it.
+        let empty = || -> anyhow::Result<String> { Ok(String::new()) };
+        let mut b = args("empty", "redis://localhost");
+        b.ask_password = true;
+        let e = add_with(&path, &store, &b, None, &mut Vec::new(), &empty)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("empty"), "{e}");
+        assert!(Config::load(&path).unwrap().get("empty").is_none());
     }
 
     #[tokio::test]
@@ -670,6 +762,7 @@ mod tests {
                 username: None,
                 password: SecretString::from("s3cret".to_string()),
             }),
+            auth: crate::conn::docker::DiscoveredAuth::Password,
         };
         let out = format_discovered(&[d]);
         assert!(out.contains("127.0.0.1:49153") && out.contains("password"));

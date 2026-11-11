@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::conn::docker::DiscoveredInstance;
+use crate::conn::docker::{DiscoveredAuth, DiscoveredInstance};
 use crate::diff::{self, ReportDiff};
 use crate::model::{
     Auth, Endpoint, Env, KeySample, KeyType, PERM_FREQ, PERM_INFO, PERM_MEMORY, PERM_SCAN,
@@ -77,6 +77,28 @@ pub fn docker_instance() -> DiscoveredInstance {
             Auth::None,
         ),
         credentials: None,
+        auth: DiscoveredAuth::None,
+    }
+}
+
+/// A container without credentials whose discovery said `auth`: `None`, `Required` or
+/// `Unknown` (`Password` comes with credentials, so tests build it themselves).
+pub fn docker_instance_auth(
+    container: &str,
+    port: u16,
+    auth: DiscoveredAuth,
+) -> DiscoveredInstance {
+    assert_ne!(
+        auth,
+        DiscoveredAuth::Password,
+        "a password needs credentials"
+    );
+    DiscoveredInstance {
+        container: container.into(),
+        image: "valkey/valkey:8.1-alpine".into(),
+        profile: profile(container, Env::Local, "127.0.0.1", port, false, Auth::None),
+        credentials: None,
+        auth,
     }
 }
 

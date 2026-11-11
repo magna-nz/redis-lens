@@ -9,7 +9,9 @@ use crate::model::{KeySample, ScanReport, Ttl};
 use crate::pattern::pattern_for_key;
 use crate::tui::app::App;
 
-use super::widgets::{bar, fit, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset};
+use super::widgets::{
+    bar, fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset,
+};
 use super::{notice_panels, report_or_wait, split_body, style};
 
 /// A hot key at least this big is flagged.
@@ -82,7 +84,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .skip(off)
         .take(usize::from(body.height))
-        .map(|k| hot_row(k, kw))
+        .enumerate()
+        .map(|(i, k)| hot_row(k, kw, (off + i == sel).then(|| app.sel_ticks())))
         .collect();
     rows(frame, body, lines, Some(sel - off));
     if let Some(k) = keys.get(sel) {
@@ -90,14 +93,15 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn hot_row(k: &KeySample, kw: usize) -> Line<'static> {
+fn hot_row(k: &KeySample, kw: usize, scroll: Option<u64>) -> Line<'static> {
     let dash = || "—".to_string();
     let freq = k.lfu_freq.unwrap_or(0);
     let big = is_hot_big(k);
-    let mut spans = fit(
-        vec![Span::styled(format!(" {}", k.key), style::fg())],
-        kw.saturating_sub(1),
-    );
+    let key = vec![Span::styled(format!(" {}", k.key), style::fg())];
+    let mut spans = match scroll {
+        Some(ticks) => marquee_spans(key, kw.saturating_sub(1), ticks),
+        None => fit(key, kw.saturating_sub(1)),
+    };
     spans.push(Span::raw(" "));
     spans.extend(fit(
         pattern_spans(&pattern_for_key(&k.key), style::dim(), style::ph()),

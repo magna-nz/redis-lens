@@ -138,6 +138,33 @@ async fn open(
         .await?)
 }
 
+/// Send one `PING` to `ep` on a connection that sends no credentials (no `AUTH`, no
+/// `HELLO`, no `CLIENT SETINFO`, no `SELECT`) and return the reply. Used by Docker
+/// discovery to see whether a server wants a password. Never writes. A probe that takes
+/// longer than `timeout` fails with an I/O timeout error.
+pub async fn ping_without_credentials(
+    ep: &Endpoint,
+    timeout: Duration,
+) -> Result<String, ConnError> {
+    let timed_out = || {
+        ConnError::Redis(redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the probe timed out",
+        )))
+    };
+    let probe = async {
+        let settings = RedisConnectionInfo::default().set_skip_set_lib_name();
+        let config = base_config()
+            .set_connection_timeout(Some(timeout))
+            .set_response_timeout(Some(timeout));
+        let mut c = open(ep, settings, &config).await?;
+        Ok(redis::cmd("PING").query_async::<String>(&mut c).await?)
+    };
+    tokio::time::timeout(timeout, probe)
+        .await
+        .unwrap_or_else(|_| Err(timed_out()))
+}
+
 /// Which server a scan reads from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanTarget {

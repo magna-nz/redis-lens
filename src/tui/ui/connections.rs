@@ -6,12 +6,15 @@ use ratatui::text::{Line, Span};
 use secrecy::ExposeSecret;
 
 use crate::conn::ScanTarget;
+use crate::conn::docker::DiscoveredAuth;
 use crate::conn::parse::{AzureKind, ConnFormat, ParsedConnection, mask};
 use crate::format;
 use crate::model::{Auth, Env, PERM_LABELS, PERM_MEMORY, PermStatus};
 use crate::tui::app::{AddState, App, ConnEntry, ConnSel, ConnStatus, DockerState, Source};
 
-use super::widgets::{fit, pad_l, pad_r, panel, rows, scroll_offset, split_cols, trunc};
+use super::widgets::{
+    fit, pad_l, pad_r, pad_r_marquee, panel, rows, scroll_offset, split_cols, trunc,
+};
 use super::{server_label, spinner, split_body, style};
 
 struct Cols {
@@ -63,14 +66,8 @@ fn status(e: &ConnEntry) -> (&'static str, ratatui::style::Style) {
 
 fn auth_label(e: &ConnEntry) -> &'static str {
     match (&e.source, e.profile.auth) {
-        (
-            Source::Docker {
-                credentials: Some(_),
-                ..
-            },
-            _,
-        ) => "password",
-        (Source::Docker { .. }, _) | (_, Auth::None) => "none",
+        (Source::Docker { auth, .. }, _) => auth.label(),
+        (_, Auth::None) => "none",
         (_, Auth::Keychain) => "keychain",
         (_, Auth::EntraId) => "Entra ID",
     }
@@ -79,6 +76,15 @@ fn auth_label(e: &ConnEntry) -> &'static str {
 fn entry_line(app: &App, e: &ConnEntry, c: &Cols) -> Line<'static> {
     let active = app.session.as_ref().is_some_and(|s| s.id == e.id);
     let (st, st_style) = status(e);
+    let selected = app.conn_sel == ConnSel::Entry(e.id);
+    let ticks = app.sel_ticks();
+    let cell = |s: &str, w: usize| {
+        if selected {
+            pad_r_marquee(s, w, ticks)
+        } else {
+            pad_r(s, w)
+        }
+    };
     let env = e.profile.env.label();
     let mem = e
         .server
@@ -87,12 +93,12 @@ fn entry_line(app: &App, e: &ConnEntry, c: &Cols) -> Line<'static> {
     Line::from(vec![
         Span::styled(if active { " › " } else { "   " }, style::amber()),
         Span::styled(
-            pad_r(&e.profile.name, c.name - 3),
+            cell(&e.profile.name, c.name - 3),
             if active { style::fgb() } else { style::fg() },
         ),
         Span::styled(format!(" {env} "), style::env_badge(e.profile.env)),
         Span::raw(" ".repeat(c.env.saturating_sub(env.len() + 2))),
-        Span::styled(pad_r(&e.profile.endpoint.to_string(), c.ep), style::dim()),
+        Span::styled(cell(&e.profile.endpoint.to_string(), c.ep), style::dim()),
         Span::styled(pad_r(auth_label(e), c.auth), style::fg()),
         Span::styled(pad_r(st, c.status), st_style),
         Span::styled(format!("{} ", pad_l(&mem, c.mem - 1)), style::fg()),
@@ -176,8 +182,9 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
         Source::Docker {
             container,
             image,
-            credentials,
-        } => Some((container, image, credentials.is_some())),
+            auth,
+            ..
+        } => Some((container, image, *auth)),
         Source::Saved => None,
     };
     let right = format!(
@@ -207,9 +214,16 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
         ),
         None => ("not connected yet".to_string(), style::dim()),
     };
-    let (auth, cred) = match (docker, p.auth) {
-        (Some((_, _, true)), _) => ("password (default user)", "from the container, memory only"),
-        (Some(_), _) | (None, Auth::None) => ("none", "none"),
+    let (auth, cred) = match (docker.map(|(_, _, auth)| auth), p.auth) {
+        (Some(DiscoveredAuth::Password), _) => {
+            ("password (default user)", "from the container, memory only")
+        }
+        (Some(DiscoveredAuth::None), _) | (None, Auth::None) => ("none", "none"),
+        (Some(DiscoveredAuth::Required), _) => (
+            "required",
+            "not found: save it as a profile with credentials",
+        ),
+        (Some(DiscoveredAuth::Unknown), _) => ("unknown", "could not tell"),
         (None, Auth::Keychain) => ("password or ACL user", "OS keychain"),
         (None, Auth::EntraId) => ("Entra ID", "developer tools (az login)"),
     };

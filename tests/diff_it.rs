@@ -274,3 +274,65 @@ async fn match_snapshot_is_not_a_baseline() {
         assert!(d.patterns.iter().all(|p| p.cause != Cause::New));
     }
 }
+
+/// Commands the server has processed so far (`INFO stats`).
+async fn commands_processed(admin: &mut redis::aio::MultiplexedConnection) -> u64 {
+    let info: String = redis::cmd("INFO")
+        .arg("stats")
+        .query_async(admin)
+        .await
+        .unwrap();
+    info.lines()
+        .find_map(|l| l.strip_prefix("total_commands_processed:"))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("total_commands_processed in INFO stats")
+}
+
+/// `--max-rate N` reaches the scans of both `scan` and `diff`, through the same entry
+/// points the CLI uses: the profile is `local` (no limit by default), so only the flag
+/// can slow them down to at least commands / N seconds. Rule 2.
+#[tokio::test]
+async fn max_rate_paces_scan_and_diff() {
+    const RATE: u32 = 200;
+    for server in [common::redis().await, common::valkey().await] {
+        let mut admin = server.admin().await;
+        for i in 0..60 {
+            set(&mut admin, format!("rate:{i}"), "v".to_string()).await;
+        }
+        let config = temp_config(server.port);
+        let dir = temp_dir("diff-it-rate");
+        let secrets = MemoryStore::default();
+        // A baseline for `diff`, scanned without a limit.
+        let base = scan_args(true);
+        let (first, _) = report(&config, &secrets, &base, None).await.unwrap();
+        save_if_requested(&dir, &base, &first).unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let mut paced = scan_args(false);
+        paced.max_rate = Some(RATE);
+        let mut paced_diff = diff_args();
+        paced_diff.max_rate = Some(RATE);
+        for which in ["scan", "diff"] {
+            let before = commands_processed(&mut admin).await;
+            let started = std::time::Instant::now();
+            if which == "scan" {
+                report(&config, &secrets, &paced, None).await.unwrap();
+            } else {
+                diff_profile(&config, &secrets, &paced_diff, &dir, None)
+                    .await
+                    .unwrap();
+            }
+            let took = started.elapsed();
+            // Less the INFO call that reads the count after.
+            let sent = commands_processed(&mut admin).await - before - 1;
+            assert!(sent >= 120, "{which}: only {sent} commands");
+            // The limiter paces what it sends after the permission probes and INFO;
+            // leave 20 commands of slack for those.
+            let min = Duration::from_secs_f64((sent - 20) as f64 / f64::from(RATE));
+            assert!(
+                took >= min,
+                "{which}: {sent} commands in {took:?}, budget {RATE}/s needs {min:?}"
+            );
+        }
+    }
+}

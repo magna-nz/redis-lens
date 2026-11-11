@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** v0.2 done on main; wave 6 (bug fixes and rough edges) in progress; then v0.3 (cluster) or the feature ideas below
-**Last updated:** 2026-11-11 (wave 6 verified; PR next)
+**Current milestone:** v0.2 done on main; wave 6 merged (PR #10); wave 7 (four bugs and the test gaps) in progress; then usability, then v0.3 (cluster) or the feature ideas below
+**Last updated:** 2026-11-11 (wave 7 verified; PR #11)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -34,7 +34,50 @@ Approved by the owner: "Approve, merge when green". Same merge rules as the over
 | C | OS trust store for TLS (load native certs, skip ones that fail to load, fall back to bundled roots when the store is empty); TLS replica test on Redis and Valkey via a throwaway CA and `SSL_CERT_FILE` | implementer [opus] | `wave6/tls` from `wave6/fixes` after B | **done** (9291fba, 3a54fdc): `src/conn/tls.rs`; `tests/tls_it.rs` (6 tests, Redis + Valkey, also on 6.2); merged into `wave6/fixes` |
 | V | Verifier on the merged `wave6/fixes` | verifier [opus] | pinned detached worktree at 09343e2 | **APPROVE**, no blockers. Its ready-made test for the partial denominator (D1) is added. Follow-ups below |
 
-**Wave 6 follow-ups (from the verifier; not fixed in this wave):**
+## Wave 7 (2026-11-11): four bugs and the test gaps
+
+Approved by the owner ("Approve all"): the split below; on Windows the OS store plus the bundled roots; a throwaway CA installed in each CI runner's OS store; merge with `gh pr merge --merge --admin` when all checks are green and the verifier approves. No tag, release or publish. Later waves, not started: rescan key, sorting, `?` help, clipboard, selection following the pattern (N2, N3), Page Up/Down, `--check`, report export, v0.3 cluster.
+
+Integration branch `wave7/fixes` (worktree `.claude/worktrees/wave7`, from main 92adb64). Contract commit e8973be: `conn::docker::DiscoveredAuth` (`model::Auth` unchanged: it is written to the config file, and "unknown" is not a way to authenticate).
+
+| Part | Content | Agent | Branch | State |
+|---|---|---|---|---|
+| A | Per-scan id (`ScanId`) on `Effect::Connect`, `LoadHistory` and every `Msg::Connected/ConnectFailed/Scan*/History`; forwarder aborted with its scan (`AbortOnDrop`) through the `scan_and_report` seam; D5 and D6 tests; discovered auth in the Connections view | implementer [opus] | `wave7/tui` | **done** (9ebc063, bc26d61), merged |
+| B | Keychain calls give up after 15 s (`SecretError::Timeout`, "Always Allow" on macOS); `discover` probes with a credential-less `PING` (none / required / unknown); tests: URL-password warning, `--ask-password`, `--config` and `REDIS_LENS_CONFIG` (`tests/cli_config.rs`), `conn test`, the spec's `lens-ro` ACL line (Redis 6.2, 7.4, Valkey 8.1) | implementer [sonnet] | `wave7/conn` | **done** (ff681cd), merged |
+| C | Bundled roots as an explicit store from `webpki-root-certs` 1.0.9; Windows trusts the OS store plus the bundle (N4); D2 (exact store sizes, Cargo.lock pin on redis 1.8.1), D3 (bundle non-empty, holds ISRG Root X1), D4 reduced to one fallback; `tests/os_trust.rs` plus a CI step that installs a throwaway CA in the OS store on macOS, Windows and Ubuntu | implementer [opus] | `wave7/tls` | **done** (2a4196c), merged. The CI trust-store step runs for the first time on the PR |
+| D | Limiter pacing (virtual clock, plus a rate lower bound over the fake), `--max-rate` into `ScanOptions` for `scan` and `diff`, SCAN deduplication | implementer [sonnet] | `wave7/scan` | **done** (21e8dbb), merged |
+| M | Selected row's overflowing text scrolls across (`ui::widgets::marquee`), restarted on selection change; narrow-width test. Owner-approved after the horizontal-scroll finding | implementer [sonnet] | `wave7/marquee` | **done** (fd51556), merged; 301 unit tests |
+| V | Verifier on the merged `wave7/fixes` | verifier [opus] | pinned detached worktree (208156d, then 137b0ff) | round 1 **BLOCKED** on B1, fixed (below); round 2 at 137b0ff **APPROVE**, no blockers |
+
+**Verifier round 1 (BLOCKED, report `.claude/worktrees/w7-verify-report.md`), and the fixes:**
+- B1: `webpki-root-certs` loses Mozilla's name constraints, so the TUBITAK root (limited to `.tr` in `webpki-roots`) would have vouched for any host name: on every Windows machine, and elsewhere when the OS store is empty. Fixed: the bundle is the certificates whose anchor is in `webpki-roots` with no name constraint (`webpki-roots` is now a direct dependency); `conn::tls::tests::the_bundle_is_webpki_roots_without_the_name_constrained_roots`, `unlisted_certificates_are_not_bundled`.
+- CI: on Linux cargo sets `SSL_CERT_FILE` for the processes it starts (openssl-probe), so `tests/os_trust.rs` refused to run in `unit tests (ubuntu-latest)`. Each test now re-runs itself in a child without `SSL_CERT_FILE`/`SSL_CERT_DIR`. macOS (System keychain) and Windows (Root store) installed the CA and passed on the first CI run.
+- `--max-rate` was only tested by rebuilding the options: `diff_it::max_rate_paces_scan_and_diff` now runs `scan` and `diff` through the CLI entry points on a `local` profile and checks they take at least commands / N (Redis and Valkey); dropping the flag at the call site fails it.
+- "Only `PING`" rested on reading the code: `conn_it::probe_sends_only_ping` counts commands on the server after `CONFIG RESETSTAT`; making the probe send `CLIENT SETINFO` fails it.
+- The probe ITs use a 5 s timeout (`probe_auth_within`), after one `Unknown` in 17 runs on a loaded machine; discovery keeps 1 s.
+- `conn_test_reports_denied_commands` now runs on Valkey too.
+- Round 2 findings, not blocking, left for the usability wave: removing `App::track_selection()` from `apply` passes every test (a selection reset by `ScanDone` or a new session is untested; the scroll just may not restart); the scrolling name cell includes the tree indent and the `▾` mark, so a long group row hides its mark while it scrolls; partials re-sort rows under a fixed selection index (wave 6 N2/N3), so the scroll keeps going on a different pattern; `os_trust` reports ok without testing when `REDIS_LENS_OS_TRUST_CA` is unset (CI sets it).
+- Not changed (noted): the keychain worker's panic message would print to stderr under the TUI; probes run one container at a time (an unreachable one adds up to 1 s); `replica_it` failed once on container start-up timeouts (unchanged code, passed on re-runs).
+
+**Test gaps from wave 6, and where each is covered now:**
+- D1 partial denominator: `scan::tests::partial_denominator_leaves_out_pending_and_vanished_keys` (wave 6).
+- D2: `conn::tls::tests::a_template_holds_exactly_the_given_roots`, `redis_is_still_the_version_whose_store_handling_was_checked`.
+- D3: `conn::tls::tests::the_bundle_is_the_crate_set_and_holds_isrg_root_x1`, `bundled_roots_are_an_explicit_store_of_exactly_the_crate_certs`.
+- D4: one shared fallback, unreachable (comment in `TlsRoots::from_choice`).
+- D5: `tui::tests::progress_and_partials_all_arrive_before_scan_done` / `_before_scan_failed`, `aborting_the_scan_task_stops_its_forwarder`.
+- D6: `tui::app::tests::replaced_run_of_the_same_entry_is_ignored`, `replaced_run_of_the_same_entry_does_not_mask_the_new_runs_failures`.
+- D7 (`make coverage`) and D8 (throttle wiring): unchanged; dev target and low value.
+- Limiter and `--max-rate`: `scan::tests::limiter_*`, `scan_with_a_rate_takes_at_least_commands_over_rate`, `cli::scan::tests::max_rate_flag_reaches_the_scan_options`, `cli::diff::tests::diff_max_rate_flag_reaches_the_scan_options`.
+- SCAN dedup: `scan::tests::repeated_scan_keys_are_looked_up_once`, `repeated_scan_keys_do_not_skew_the_scale_estimate`.
+- URL-password warning: `cli::conn::tests::url_password_warns_without_echoing_it`. `--ask-password`: `ask_password_goes_to_store_only`. `REDIS_LENS_CONFIG` / `--config`: `tests/cli_config.rs`.
+- `conn test`: `conn_it::conn_test_*`. `lens-ro` line: `conn_it::spec_minimal_read_only_user_can_connect_check_and_scan`.
+- Per-OS trust store: `tests/os_trust.rs` (runs in CI's unit-test job on three OSes; skipped locally).
+- Real keychain: `secrets::tests::keyring_store_round_trip` stays `#[ignore]`, because it needs a person to answer the keychain prompts. The timeout around it is tested with a blocking fake (`secrets::tests::with_timeout_*`).
+- Horizontal scrolling: the owner chose not to build it (counter-intuitive in a TUI, and `←`/`→` expand and collapse). The spec now describes truncation, and the selected row's overflowing text scrolls across (part M below). Covered by the narrow-width and marquee tests.
+
+**Coverage (`make coverage`, unit + integration, 2026-11-11 at 208156d):** 93.48% of lines (wave 6: 92.6%). All tests pass: 291 unit, cli_config 4, conn 25, diff 4, os_trust 2 (skipped locally), replica 11, scan_cli 5, scan 15, smoke 3, tls 6; the integration tests also pass with `REDIS_LENS_IT_REDIS_IMAGE=redis:6.2-alpine`. Lowest: `cli/mod.rs` 59% (clap dispatch), `tui/mod.rs` 63% (terminal event loop; was 52%), `secrets.rs` 71% (the real keychain, an ignored test), `tui/ui/connections.rs` 82%.
+
+**Wave 6 follow-ups (from the verifier; N1, N4 and the test gaps are done in wave 7; N2 and N3 are later):**
 - N1: after reconnecting the same entry, a stale partial (or `ScanDone`) from the aborted scan can show for up to about 250 ms. The forwarder outlives the aborted scan and sends with the same `ConnId`. Fix: a per-scan id, or abort the forwarder from a drop guard (`tui/app.rs` ~1065, `tui/mod.rs` ~177/378).
 - N2 and N3 (UX): the Patterns selection is a row index, so it moves as partials re-sort and resets to 0 on `ScanDone`. A collapse is lost when a group's key changes.
 - N4 (Windows): the Windows store fills public roots lazily, so a root that hasn't been fetched yet now gives `UnknownIssuer` where bundled-only used to connect.
@@ -115,7 +158,7 @@ See the overnight table above.
 
 - **Replica scans (`--prefer-replica`) trust the announced address**, like Cluster and Sentinel clients do. A server that imitates a replica, since the replication ID isn't secret, can be scanned without credentials, and its data is filed under the profile. A profile that reaches prod through an SSH tunnel on 127.0.0.1 treats local services on the announced port as on the primary's host. A replica scanned without credentials runs as its default user. TLS replica scans are tested (`tests/tls_it.rs`).
 
-- **macOS keychain prompt after rebuilds.** Keychain entries are tied to the binary that wrote them. A rebuilt or upgraded binary has to ask macOS for access, and until someone answers the dialog, connecting hangs. Mitigated in wave 5: the README says to click "Always Allow", and the TUI shows a hint when a keychain read takes more than 2 s.
+- **macOS keychain prompt after rebuilds.** Keychain entries are tied to the binary that wrote them. A rebuilt or upgraded binary has to ask macOS for access, and until someone answers the dialog, connecting hangs. Mitigated in wave 5: the README says to click "Always Allow", and the TUI shows a hint when a keychain read takes more than 2 s. Since wave 7 a keychain call gives up after 15 s with an error saying to click "Always Allow" and try again, so nothing hangs. A write that timed out can still finish once the dialog is answered, leaving an entry no profile points to (still only in the keychain).
 
 - **Lesson:** never switch the main checkout's branch while an agent is reading it. Do all work in worktrees.
 
@@ -125,8 +168,8 @@ See the overnight table above.
 
 - Agent worktrees made by the harness branch from `main`, not the current branch, so create them by hand.
 - **Entra ID** is implemented behind `--features entra-id`, using redis-rs's `EntraIdCredentialsProvider::new_developer_tools()` (az login and other developer tools). It is untested against real Azure, and managed identity isn't covered yet.
-- `discover` reports the demo Redis as auth "none", because its passwords live in an ACL file discovery can't see. Save it as a profile instead (`make demo-profiles`).
-- `ConnId` identifies a connection entry, not a scan. If the same entry is reconnected, a `ScanDone` the old scan already queued is still accepted (found in wave 6; not fixed). A per-scan id would fix it.
+- `discover` shows the demo Redis as auth "required" (since wave 7; it was "none"), because its passwords live in an ACL file discovery can't see. Save it as a profile instead (`make demo-profiles`).
+- Narrow terminals: rows are drawn at fixed column widths and cut off at the right edge (the spec said "scroll horizontally" until wave 7; the owner chose truncation plus scrolling text on the selected row). Hiding low-priority columns at narrow widths is a candidate for the usability wave.
 - For Redis ACL rules passed as server arguments, use one argument per word (`tests/common/mod.rs`).
 - `ParsedConnection.credentials` is `Some` with an empty password when a URL has a username but no password, so `conn add` can ask for `--password-stdin` or `--ask-password`.
 

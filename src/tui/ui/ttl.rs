@@ -11,7 +11,9 @@ use crate::tui::app::App;
 use crate::verdict::{TtlVerdict, explain, ttl_verdict};
 
 use super::widgets::ttl_hist_spans;
-use super::widgets::{fit, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset, trunc};
+use super::widgets::{
+    fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset, trunc,
+};
 use super::{notice_panels, report_or_wait, split_body, style};
 
 const NUM_W: usize = 7;
@@ -81,7 +83,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .skip(off)
         .take(usize::from(body.height))
-        .map(|(p, v)| ttl_row(p, *v, name))
+        .enumerate()
+        .map(|(i, (p, v))| ttl_row(p, *v, name, (off + i == sel).then(|| app.sel_ticks())))
         .collect();
     rows(frame, body, lines, Some(sel - off));
 
@@ -104,10 +107,13 @@ fn verdict_style(v: TtlVerdict) -> ratatui::style::Style {
     }
 }
 
-fn ttl_row(p: &PatternStats, v: TtlVerdict, name: usize) -> Line<'static> {
+fn ttl_row(p: &PatternStats, v: TtlVerdict, name: usize, scroll: Option<u64>) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     spans.extend(pattern_spans(&p.pattern, style::fg(), style::ph()));
-    let mut spans = fit(spans, name.saturating_sub(1));
+    let mut spans = match scroll {
+        Some(ticks) => marquee_spans(spans, name.saturating_sub(1), ticks),
+        None => fit(spans, name.saturating_sub(1)),
+    };
     spans.push(Span::raw(" "));
     let pct = format::percent(p.no_ttl_ratio());
     let (no_ttl, no_ttl_style) = if v.is_warning() {

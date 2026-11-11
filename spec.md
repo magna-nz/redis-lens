@@ -18,14 +18,16 @@ A terminal UI that answers "what is using the memory in this Redis or Valkey, an
 
 ## Views
 
-The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move, `→←` to expand and collapse, `/` to filter, `s` to snapshot and `q` to quit. Narrow terminals scroll horizontally rather than wrapping.
+The TUI has five views, switched with `0` to `4`. The keys are `↑↓` to move, `→←` to expand and collapse, `/` to filter, `s` to snapshot and `q` to quit. Narrow terminals never wrap: names are shortened with `…`, and a row too wide for the terminal is cut at the right edge. On the selected row, text that doesn't fit its column scrolls across: it rests for 1 s, scrolls about 5 columns a second until its end is visible, holds 1 s and starts again; moving the selection or switching views restarts it.
 
 ### 0 Connections
 - Lists saved profiles and the Redis or Valkey containers found in Docker.
 - For each one it shows the name, environment badge (PROD, STAGE, LOCAL, OTHER), endpoint, auth method, status and memory.
 - The detail panel shows the endpoint, server version and topology, auth, where the credentials come from, TLS, and the permission check results.
 - `a` adds a connection by pasting a connection string (see [Connection strings](#connection-strings)). The parsed result is previewed with the password masked before anything is saved.
-- `enter` connects to the selected profile. When a connect for a keychain profile takes longer than 2 s, the status line and the connecting panel say "Waiting for the OS keychain. If a permission dialog is open, choose Always Allow."
+- For a Docker container the auth column shows what discovery found out (see [Docker discovery](#docker-discovery)): `password`, `none`, `required` or `unknown`. The detail panel adds where the credentials come from: for `password`, the container, held in memory only; for `required`, not found, so save it as a profile with credentials.
+- `enter` connects to the selected profile. When a connect for a keychain profile takes longer than 2 s, the status line and the connecting panel say "Waiting for the OS keychain. If a permission dialog is open, choose Always Allow." After 15 s the keychain read gives up (see [Credential rules](#credential-rules)).
+- Each `enter` starts a new scan run, also when the same entry is connected again. Connection results, progress, partial results and results of a replaced or cancelled run are ignored.
 
 ### 1 Patterns
 - Key patterns sorted by estimated memory. Each row shows the pattern, type, estimated keys, estimated memory, share bar, average size, percentage with no TTL, and the change since the last snapshot.
@@ -84,7 +86,7 @@ Examples: `user:88213:cart` → `user:{id}:cart`, `rl:10.0.4.12:29187460` → `r
 |---|---|---|
 | None | No `AUTH`. | v0.1 |
 | ACL user and password, or a password only | Both are kept in the OS keychain. | v0.1 |
-| TLS | `rediss://` or `ssl=True`. Certificates are checked against the OS trust store (macOS Keychain, Windows certificate store, the system CA bundle on Linux; `SSL_CERT_FILE`/`SSL_CERT_DIR` replace it when set), loaded once per process. Certificates that fail to load are skipped. If the store has no usable certificate, the bundled webpki roots are used instead, never in addition. Certificate and host name checks are always on. | v0.1 |
+| TLS | `rediss://` or `ssl=True`. Certificates are checked against the OS trust store (macOS Keychain, Windows certificate store, the system CA bundle on Linux; `SSL_CERT_FILE`/`SSL_CERT_DIR` replace it when set), loaded once per process. Certificates that fail to load are skipped. On macOS and Linux the OS store is used on its own; if it has no usable certificate, the bundled Mozilla roots are used instead, never in addition. The bundled roots are the certificates in `webpki-root-certs` whose trust anchor is in `webpki-roots` with no name constraint: a certificate cannot carry Mozilla's name constraints, so a root limited to some domains (today one, limited to `.tr`) is left out rather than trusted for every host name. On Windows the OS store and the bundled roots are trusted together (each certificate once), because Windows fills its root store lazily through Automatic Root Update and a public root it has not fetched yet would otherwise be refused (`UnknownIssuer`). The trade-off: on Windows a bundled root that an administrator removed from the store is still trusted. Certificate and host name checks are always on. | v0.1 |
 | Microsoft Entra ID | redis-rs `EntraIdCredentialsProvider::new_developer_tools()`, the developer-tools credential chain (az login and similar), behind the `entra-id` cargo feature. Managed identity and workload identity are not covered yet. | v0.2 |
 | AWS ElastiCache IAM | | later |
 | Sentinel, SSH tunnel | | later |
@@ -95,6 +97,7 @@ Examples: `user:88213:cart` → `user:{id}:cart`, `rl:10.0.4.12:29187460` → `r
 - There is one entry per profile, with service `redis-lens` and account `profile:<name>`.
 - The config file never holds a credential, and the `Profile` type has no field for one.
 - Credentials never appear in logs, error text, `Debug` output or snapshots.
+- Keychain reads, writes and deletes give up after 15 s. On macOS the error says macOS is waiting for permission to use the keychain entry and to click "Always Allow" in the dialog, then try again; elsewhere it says the OS keychain did not answer (it may be locked). The error names the entry's account, never its contents.
 - A password typed into a URL on the command line is accepted, with a warning about shell history. `--password-stdin` and `--ask-password` are the preferred ways in.
 
 ### Safety
@@ -133,7 +136,7 @@ ACL SETUSER lens-ro on >… ~* resetchannels -@all +ping +hello +client|setinfo 
 
 ### Docker discovery
 
-Lists running containers whose image is redis, valkey, redis-stack or bitnami/redis and that publish port 6379. A password found in `--requirepass` or in `REDIS_PASSWORD`/`VALKEY_PASSWORD` is held in memory only.
+Lists running containers whose image is redis, valkey, redis-stack or bitnami/redis and that publish port 6379. A password found in `--requirepass` or in `REDIS_PASSWORD`/`VALKEY_PASSWORD` is held in memory only, and the auth shows as `password`. Without one, discovery sends a single `PING` to the published port on 127.0.0.1 with no credentials (no `AUTH`, `HELLO` or `CLIENT SETINFO`; 1 s timeout) and shows `none` (PONG), `required` (`NOAUTH` or `WRONGPASS`: the server wants credentials discovery cannot see, such as an ACL file) or `unknown` (refused, timed out, or any other answer). Only `PING` is sent.
 
 ## Command line
 

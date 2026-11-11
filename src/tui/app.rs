@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::conn::ScanTarget;
-use crate::conn::docker::DiscoveredInstance;
+use crate::conn::docker::{DiscoveredAuth, DiscoveredInstance};
 use crate::conn::parse::{ParsedConnection, mask, parse_connection_string};
 use crate::diff::ReportDiff;
 use crate::model::{
@@ -64,6 +64,11 @@ impl View {
 /// Stable id of a row in the Connections list.
 pub type ConnId = u64;
 
+/// Id of one connect-and-scan run. A new one is allocated on every connect, also when
+/// the same entry is connected again, so messages from a replaced run are told apart
+/// from the current one even though they carry the same [`ConnId`].
+pub type ScanId = u64;
+
 #[derive(Debug, Clone)]
 pub enum Source {
     Saved,
@@ -72,6 +77,8 @@ pub enum Source {
         container: String,
         image: String,
         credentials: Option<Credentials>,
+        /// What discovery found out about authentication, shown on the Connections view.
+        auth: DiscoveredAuth,
     },
 }
 
@@ -137,6 +144,7 @@ pub enum Effect {
     /// Connect, check permissions, then scan with the profile's default options.
     Connect {
         id: ConnId,
+        scan: ScanId,
         profile: Profile,
         secrets: SecretSource,
     },
@@ -149,6 +157,7 @@ pub enum Effect {
     /// Find the newest snapshot taken before `report` and diff it against `report`.
     LoadHistory {
         id: ConnId,
+        scan: ScanId,
         report: Box<ScanReport>,
     },
     /// Write `report` to the snapshot directory.
@@ -166,30 +175,36 @@ pub enum Msg {
     DockerFailed(String),
     Connected {
         id: ConnId,
+        scan: ScanId,
         server: Option<ServerInfo>,
         perms: PermissionReport,
         target: ScanTarget,
     },
     ConnectFailed {
         id: ConnId,
+        scan: ScanId,
         error: String,
     },
     ScanProgress {
         id: ConnId,
+        scan: ScanId,
         progress: ScanProgress,
     },
     /// Pattern stats from the keys sampled so far. Shown on the Patterns view until the
     /// scan finishes or fails; never saved.
     ScanPartial {
         id: ConnId,
+        scan: ScanId,
         partial: Arc<PartialPatterns>,
     },
     ScanDone {
         id: ConnId,
+        scan: ScanId,
         report: ScanReport,
     },
     ScanFailed {
         id: ConnId,
+        scan: ScanId,
         error: String,
     },
     Saved(Profile),
@@ -198,6 +213,7 @@ pub enum Msg {
     /// `Ok(None)` when there is no earlier snapshot.
     History {
         id: ConnId,
+        scan: ScanId,
         taken_at_unix: i64,
         result: Result<Option<ReportDiff>, String>,
     },
@@ -229,6 +245,9 @@ pub enum History {
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: ConnId,
+    /// The connect-and-scan run this session shows. Messages from any other run are
+    /// ignored.
+    pub scan: ScanId,
     pub profile: Profile,
     pub server: Option<ServerInfo>,
     /// Which server is scanned, known once connected.
@@ -322,11 +341,43 @@ pub struct App {
     pub sel: ViewSel,
     pub notice: Option<Notice>,
     pub tick: u64,
+    /// The value of `tick` when the selected row last changed. The marquee that scrolls
+    /// a long selected name counts from here (see [`App::sel_ticks`]).
+    sel_since: u64,
+    /// What the selection was at the last check, to spot a change.
+    sel_id: SelId,
     /// The latest time given by `Msg::TickAt`. The app never reads the clock itself.
     now: Option<Instant>,
     /// When the current connect started, by the clock above.
     connect_started: Option<Instant>,
     next_id: ConnId,
+    next_scan: ScanId,
+}
+
+/// Everything that decides which row is selected, cheap to copy and compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelId {
+    view: View,
+    conn: ConnSel,
+    patterns: usize,
+    sel: ViewSel,
+    session: Option<(ConnId, ScanId)>,
+    filter_len: usize,
+    collapsed: usize,
+}
+
+impl Default for SelId {
+    fn default() -> Self {
+        Self {
+            view: View::Connections,
+            conn: ConnSel::Add,
+            patterns: 0,
+            sel: ViewSel::default(),
+            session: None,
+            filter_len: 0,
+            collapsed: 0,
+        }
+    }
 }
 
 fn is_press(key: &KeyEvent) -> bool {
@@ -363,9 +414,12 @@ impl App {
             sel: ViewSel::default(),
             notice: None,
             tick: 0,
+            sel_since: 0,
+            sel_id: SelId::default(),
             now: None,
             connect_started: None,
             next_id: 1,
+            next_scan: 1,
         };
         for p in profiles {
             let id = app.alloc_id();
@@ -579,7 +633,35 @@ impl App {
     // Input
     // -----------------------------------------------------------------------
 
+    /// Ticks since the selected row last changed. Drives the marquee on long names.
+    pub fn sel_ticks(&self) -> u64 {
+        self.tick.saturating_sub(self.sel_since)
+    }
+
+    /// Restarts the marquee when the selected row, the view or the session changed.
+    fn track_selection(&mut self) {
+        let id = SelId {
+            view: self.view,
+            conn: self.conn_sel,
+            patterns: self.patterns.sel,
+            sel: self.sel,
+            session: self.session.as_ref().map(|s| (s.id, s.scan)),
+            filter_len: self.patterns.filter.len(),
+            collapsed: self.patterns.collapsed.len(),
+        };
+        if id != self.sel_id {
+            self.sel_id = id;
+            self.sel_since = self.tick;
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let effects = self.key_inner(key);
+        self.track_selection();
+        effects
+    }
+
+    fn key_inner(&mut self, key: KeyEvent) -> Vec<Effect> {
         if !is_press(&key) {
             return Vec::new();
         }
@@ -861,10 +943,14 @@ impl App {
             Source::Saved => SecretSource::Keychain,
             Source::Docker { credentials, .. } => SecretSource::Container(credentials.clone()),
         };
+        let server = entry.server.clone();
+        let scan = self.next_scan;
+        self.next_scan += 1;
         self.session = Some(Session {
             id,
+            scan,
             profile: profile.clone(),
-            server: entry.server.clone(),
+            server,
             target: None,
             progress: None,
             phase: Phase::Connecting,
@@ -878,6 +964,7 @@ impl App {
         self.view = View::Patterns;
         vec![Effect::Connect {
             id,
+            scan,
             profile,
             secrets,
         }]
@@ -980,19 +1067,29 @@ impl App {
     // Messages
     // -----------------------------------------------------------------------
 
-    fn is_session(&self, id: ConnId) -> bool {
-        self.session.as_ref().is_some_and(|s| s.id == id)
+    /// True when `id` and `scan` are the current session's entry and run. A message
+    /// from a replaced run of the same entry has the right `id` but an older `scan`.
+    fn is_session(&self, id: ConnId, scan: ScanId) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.id == id && s.scan == scan)
     }
 
     /// Apply a message. Returns follow-up work, e.g. loading history after a scan.
     pub fn apply(&mut self, msg: Msg) -> Vec<Effect> {
+        let effects = self.apply_inner(msg);
+        self.track_selection();
+        effects
+    }
+
+    fn apply_inner(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
             Msg::TickAt(now) => {
                 self.now = Some(now);
                 if self.connect_started.is_none() && self.is_connecting() {
                     self.connect_started = Some(now);
                 }
-                return self.apply(Msg::Tick);
+                return self.apply_inner(Msg::Tick);
             }
             Msg::Tick => {
                 self.tick += 1;
@@ -1012,11 +1109,12 @@ impl App {
             }
             Msg::Connected {
                 id,
+                scan,
                 server,
                 perms,
                 target,
             } => {
-                if !self.is_session(id) {
+                if !self.is_session(id, scan) {
                     return Vec::new();
                 }
                 self.connect_started = None;
@@ -1040,8 +1138,8 @@ impl App {
                     s.phase = Phase::Scanning;
                 }
             }
-            Msg::ConnectFailed { id, error } => {
-                if !self.is_session(id) {
+            Msg::ConnectFailed { id, scan, error } => {
+                if !self.is_session(id, scan) {
                     return Vec::new();
                 }
                 self.connect_started = None;
@@ -1054,29 +1152,31 @@ impl App {
                 }
                 self.set_error(format!("Could not connect: {error}"));
             }
-            Msg::ScanProgress { id, progress } => {
+            Msg::ScanProgress { id, scan, progress } => {
                 if let Some(s) = self.session.as_mut()
                     && s.id == id
+                    && s.scan == scan
                     && s.phase != Phase::Done
                 {
                     s.progress = Some(progress);
                 }
             }
-            Msg::ScanPartial { id, partial } => {
-                // Only while this session's scan runs: not before it is connected (a
-                // scan of the same entry that was replaced), not after it finished or
+            Msg::ScanPartial { id, scan, partial } => {
+                // Only while this session's own scan runs: not from a replaced run of
+                // the same entry, not before it is connected, not after it finished or
                 // failed.
                 let Some(s) = self.session.as_mut() else {
                     return Vec::new();
                 };
-                if s.id != id || s.phase != Phase::Scanning || s.report.is_some() {
+                if s.id != id || s.scan != scan || s.phase != Phase::Scanning || s.report.is_some()
+                {
                     return Vec::new();
                 }
                 self.patterns.tree = PatternTree::build(&partial.patterns, partial.sizes_available);
                 s.partial = Some(partial);
             }
-            Msg::ScanDone { id, report } => {
-                if !self.is_session(id) {
+            Msg::ScanDone { id, scan, report } => {
+                if !self.is_session(id, scan) {
                     return Vec::new();
                 }
                 if let Some(e) = self.entry_mut(id) {
@@ -1087,6 +1187,7 @@ impl App {
                 self.sel = ViewSel::default();
                 let effect = Effect::LoadHistory {
                     id,
+                    scan,
                     report: Box::new(report.clone()),
                 };
                 if let Some(s) = self.session.as_mut() {
@@ -1100,13 +1201,17 @@ impl App {
             }
             Msg::History {
                 id,
+                scan,
                 taken_at_unix,
                 result,
             } => {
                 let Some(s) = self.session.as_mut() else {
                     return Vec::new();
                 };
-                if s.id != id || s.report.as_ref().map(|r| r.taken_at_unix) != Some(taken_at_unix) {
+                if s.id != id
+                    || s.scan != scan
+                    || s.report.as_ref().map(|r| r.taken_at_unix) != Some(taken_at_unix)
+                {
                     return Vec::new();
                 }
                 match result {
@@ -1127,8 +1232,8 @@ impl App {
                 self.set_info(format!("Saved snapshot {name}"));
             }
             Msg::SnapshotFailed(e) => self.set_error(format!("Could not save snapshot: {e}")),
-            Msg::ScanFailed { id, error } => {
-                if !self.is_session(id) {
+            Msg::ScanFailed { id, scan, error } => {
+                if !self.is_session(id, scan) {
                     return Vec::new();
                 }
                 if let Some(s) = self.session.as_mut() {
@@ -1205,6 +1310,7 @@ impl App {
                 container: inst.container,
                 image: inst.image,
                 credentials: inst.credentials,
+                auth: inst.auth,
             };
             let entry = match keep {
                 Some(e) => ConnEntry {
@@ -1247,6 +1353,11 @@ mod tests {
         KeyEvent::new(c, KeyModifiers::NONE)
     }
 
+    /// The current session's run, for messages that should be accepted.
+    fn scan_of(app: &App) -> ScanId {
+        app.session.as_ref().unwrap().scan
+    }
+
     fn ch(c: char) -> KeyEvent {
         key(KeyCode::Char(c))
     }
@@ -1266,11 +1377,46 @@ mod tests {
         };
         app.apply(Msg::Connected {
             id,
+            scan: scan_of(&app),
             server: Some(fixtures::server()),
             perms: fixtures::perms_ok(),
             target: ScanTarget::Primary,
         });
         (app, id)
+    }
+
+    #[test]
+    fn selection_change_restarts_the_marquee() {
+        let (mut app, id) = scanning();
+        app.apply(Msg::ScanPartial {
+            id,
+            scan: scan_of(&app),
+            partial: fixtures::partial(true),
+        });
+        app.handle_key(ch('1'));
+        assert_eq!(app.sel_ticks(), 0);
+        for _ in 0..7 {
+            app.apply(Msg::Tick);
+        }
+        assert_eq!(app.sel_ticks(), 7);
+        // Another partial result for the same selection does not restart it.
+        app.apply(Msg::ScanPartial {
+            id,
+            scan: scan_of(&app),
+            partial: fixtures::partial(true),
+        });
+        assert_eq!(app.sel_ticks(), 7);
+        // Moving the selection does.
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.sel_ticks(), 0);
+        app.apply(Msg::Tick);
+        app.apply(Msg::Tick);
+        assert_eq!(app.sel_ticks(), 2);
+        // So does a view switch.
+        app.handle_key(ch('2'));
+        assert_eq!(app.sel_ticks(), 0);
+        app.apply(Msg::Tick);
+        assert_eq!(app.sel_ticks(), 1);
     }
 
     #[test]
@@ -1280,6 +1426,7 @@ mod tests {
         let partial = fixtures::partial(true);
         app.apply(Msg::ScanPartial {
             id,
+            scan: scan_of(&app),
             partial: partial.clone(),
         });
         let data = app.pattern_data().unwrap();
@@ -1298,6 +1445,7 @@ mod tests {
         fewer.sampled = 6_400;
         app.apply(Msg::ScanPartial {
             id,
+            scan: scan_of(&app),
             partial: Arc::new(fewer),
         });
         assert_eq!(app.pattern_data().unwrap().patterns.len(), 1);
@@ -1306,6 +1454,7 @@ mod tests {
         let report = fixtures::report(true);
         app.apply(Msg::ScanDone {
             id,
+            scan: scan_of(&app),
             report: report.clone(),
         });
         let s = app.session.as_ref().unwrap();
@@ -1329,7 +1478,11 @@ mod tests {
         assert_eq!(**r, report);
 
         // A partial arriving after the scan finished is ignored.
-        app.apply(Msg::ScanPartial { id, partial });
+        app.apply(Msg::ScanPartial {
+            id,
+            scan: scan_of(&app),
+            partial,
+        });
         assert!(app.session.as_ref().unwrap().partial.is_none());
         assert_eq!(app.pattern_data().unwrap().patterns, &report.patterns[..]);
     }
@@ -1339,6 +1492,7 @@ mod tests {
         let (mut app, id) = scanning();
         app.apply(Msg::ScanPartial {
             id,
+            scan: scan_of(&app),
             partial: fixtures::partial(true),
         });
         // `s` does not save partial results, on any report view; it says why.
@@ -1357,18 +1511,28 @@ mod tests {
     #[test]
     fn cancelled_scan_drops_partial_results() {
         // Pressing enter again on the same connection cancels its scan (the runtime
-        // aborts the task) and starts a new one under the same id.
+        // aborts the task) and starts a new one under the same id, as a new run.
         let (mut app, id) = scanning();
+        let old = scan_of(&app);
         app.apply(Msg::ScanPartial {
             id,
+            scan: old,
             partial: fixtures::partial(true),
         });
         app.handle_key(ch('0'));
         let effects = app.handle_key(key(KeyCode::Enter));
-        let [Effect::Connect { id: again, .. }] = effects[..] else {
+        let [
+            Effect::Connect {
+                id: again,
+                scan: new,
+                ..
+            },
+        ] = effects[..]
+        else {
             panic!("unexpected effects {effects:?}");
         };
         assert_eq!(again, id);
+        assert_ne!(new, old);
         let s = app.session.as_ref().unwrap();
         assert_eq!(s.phase, Phase::Connecting);
         assert!(s.partial.is_none());
@@ -1378,18 +1542,28 @@ mod tests {
         // one is still connecting: ignored.
         app.apply(Msg::ScanPartial {
             id,
+            scan: old,
+            partial: fixtures::partial(true),
+        });
+        assert!(app.pattern_data().is_none());
+        // So is one of the new run before it is connected.
+        app.apply(Msg::ScanPartial {
+            id,
+            scan: new,
             partial: fixtures::partial(true),
         });
         assert!(app.pattern_data().is_none());
         // The new scan's own partials show once it is connected.
         app.apply(Msg::Connected {
             id,
+            scan: scan_of(&app),
             server: Some(fixtures::server()),
             perms: fixtures::perms_ok(),
             target: ScanTarget::Primary,
         });
         app.apply(Msg::ScanPartial {
             id,
+            scan: scan_of(&app),
             partial: fixtures::partial(false),
         });
         assert!(!app.pattern_data().unwrap().sizes_available);
@@ -1398,8 +1572,10 @@ mod tests {
     #[test]
     fn switching_profile_while_partial_drops_it() {
         let (mut app, first) = scanning();
+        let first_scan = scan_of(&app);
         app.apply(Msg::ScanPartial {
             id: first,
+            scan: first_scan,
             partial: fixtures::partial(true),
         });
         app.handle_key(key(KeyCode::Down));
@@ -1418,6 +1594,7 @@ mod tests {
         assert_eq!(app.patterns.sel, 0);
         app.apply(Msg::Connected {
             id: second,
+            scan: scan_of(&app),
             server: Some(fixtures::server()),
             perms: fixtures::perms_ok(),
             target: ScanTarget::Primary,
@@ -1425,6 +1602,7 @@ mod tests {
         // The first profile's partials stay out even once the second is scanning.
         app.apply(Msg::ScanPartial {
             id: first,
+            scan: first_scan,
             partial: fixtures::partial(true),
         });
         assert!(app.pattern_data().is_none());
@@ -1435,11 +1613,13 @@ mod tests {
         let (mut app, id) = scanning();
         app.apply(Msg::ScanPartial {
             id,
+            scan: scan_of(&app),
             partial: fixtures::partial(true),
         });
         assert!(app.pattern_data().is_some());
         app.apply(Msg::ScanFailed {
             id,
+            scan: scan_of(&app),
             error: "connection reset".into(),
         });
         let s = app.session.as_ref().unwrap();
@@ -1451,6 +1631,7 @@ mod tests {
         // Late partials of the failed scan stay out.
         app.apply(Msg::ScanPartial {
             id,
+            scan: scan_of(&app),
             partial: fixtures::partial(true),
         });
         assert!(app.pattern_data().is_none());
@@ -1471,6 +1652,7 @@ mod tests {
         // Another connection's id.
         app.apply(Msg::ScanPartial {
             id: id + 100,
+            scan: scan_of(&app),
             partial: fixtures::partial(true),
         });
         assert!(app.pattern_data().is_none());
@@ -1486,14 +1668,234 @@ mod tests {
         assert_ne!(second, id);
         app.apply(Msg::ScanPartial {
             id,
+            scan: scan_of(&app),
             partial: fixtures::partial(true),
         });
         app.apply(Msg::ScanPartial {
             id: second,
+            scan: scan_of(&app),
             partial: fixtures::partial(true),
         });
         assert!(app.pattern_data().is_none());
         assert!(app.patterns.tree.roots.is_empty());
+    }
+
+    /// Connected to the first profile (run `s1`), then Enter on it again (run `s2`):
+    /// returns the app before `s2` is connected, with the entry id and both runs.
+    fn reconnected_same_entry() -> (App, ConnId, ScanId, ScanId) {
+        let mut app = App::new(fixtures::profiles());
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { id, scan: s1, .. }] = effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        app.apply(Msg::Connected {
+            id,
+            scan: s1,
+            server: Some(fixtures::server()),
+            perms: fixtures::perms_ok(),
+            target: ScanTarget::Primary,
+        });
+        assert_eq!(app.session.as_ref().unwrap().phase, Phase::Scanning);
+        app.handle_key(ch('0'));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [
+            Effect::Connect {
+                id: again,
+                scan: s2,
+                ..
+            },
+        ] = effects[..]
+        else {
+            panic!("unexpected effects {effects:?}");
+        };
+        assert_eq!(again, id);
+        assert_ne!(s2, s1);
+        assert_eq!(scan_of(&app), s2);
+        (app, id, s1, s2)
+    }
+
+    /// Every message the replaced run `s1` can still send, as the runtime would send it.
+    fn stale_messages(id: ConnId, s1: ScanId) -> Vec<Msg> {
+        let progress = ScanProgress {
+            sampled: 9_000,
+            target: 10_000,
+            done: false,
+        };
+        vec![
+            Msg::ScanPartial {
+                id,
+                scan: s1,
+                partial: fixtures::partial(true),
+            },
+            Msg::ScanProgress {
+                id,
+                scan: s1,
+                progress,
+            },
+            Msg::Connected {
+                id,
+                scan: s1,
+                server: Some(fixtures::server()),
+                perms: fixtures::perms_memory_denied(),
+                target: ScanTarget::PrimaryFallback("stale".into()),
+            },
+            Msg::ConnectFailed {
+                id,
+                scan: s1,
+                error: "stale connect error".into(),
+            },
+            Msg::ScanFailed {
+                id,
+                scan: s1,
+                error: "stale scan error".into(),
+            },
+            Msg::ScanDone {
+                id,
+                scan: s1,
+                report: fixtures::report(true),
+            },
+            Msg::History {
+                id,
+                scan: s1,
+                taken_at_unix: fixtures::report(true).taken_at_unix,
+                result: Ok(Some(fixtures::history(true))),
+            },
+        ]
+    }
+
+    /// Asserts the session is `s2`, connected and scanning, untouched by `s1`.
+    fn assert_untouched(app: &App, id: ConnId, s2: ScanId, phase: Phase) {
+        let s = app.session.as_ref().unwrap();
+        assert_eq!((s.id, s.scan), (id, s2));
+        assert_eq!(s.phase, phase);
+        assert!(s.partial.is_none());
+        assert!(s.progress.is_none());
+        assert!(s.report.is_none());
+        assert_eq!(s.history, History::Pending);
+        assert!(app.pattern_data().is_none());
+        assert!(app.patterns.tree.roots.is_empty());
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+        let e = app.entry(id).unwrap();
+        assert!(e.error.is_none());
+        if phase == Phase::Scanning {
+            assert_eq!(s.target, Some(ScanTarget::Primary));
+            assert_eq!(e.status, ConnStatus::Connected);
+            assert_eq!(e.target, Some(ScanTarget::Primary));
+        } else {
+            assert_eq!(e.status, ConnStatus::Connecting);
+        }
+    }
+
+    #[test]
+    fn replaced_run_of_the_same_entry_is_ignored() {
+        let (mut app, id, s1, s2) = reconnected_same_entry();
+        // Before s2 is connected: nothing from s1 gets in, not even its Connected.
+        for msg in stale_messages(id, s1) {
+            let what = format!("{msg:?}");
+            assert!(app.apply(msg).is_empty(), "{what}");
+            assert_untouched(&app, id, s2, Phase::Connecting);
+        }
+        app.apply(Msg::Connected {
+            id,
+            scan: s2,
+            server: Some(fixtures::server()),
+            perms: fixtures::perms_ok(),
+            target: ScanTarget::Primary,
+        });
+        assert_untouched(&app, id, s2, Phase::Scanning);
+        // After s2's Connected: same entry id, but s1's messages are all ignored.
+        for msg in stale_messages(id, s1) {
+            let what = format!("{msg:?}");
+            assert!(app.apply(msg).is_empty(), "{what}");
+            assert_untouched(&app, id, s2, Phase::Scanning);
+        }
+
+        // s2's own messages are accepted.
+        app.apply(Msg::ScanProgress {
+            id,
+            scan: s2,
+            progress: ScanProgress {
+                sampled: 100,
+                target: 10_000,
+                done: false,
+            },
+        });
+        assert_eq!(app.session.as_ref().unwrap().progress.unwrap().sampled, 100);
+        let partial = fixtures::partial(false);
+        app.apply(Msg::ScanPartial {
+            id,
+            scan: s2,
+            partial: partial.clone(),
+        });
+        assert_eq!(app.pattern_data().unwrap().partial, Some(&*partial));
+        let report = fixtures::report(true);
+        let effects = app.apply(Msg::ScanDone {
+            id,
+            scan: s2,
+            report: report.clone(),
+        });
+        let [Effect::LoadHistory { id: got, scan, .. }] = &effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        assert_eq!((*got, *scan), (id, s2));
+        let s = app.session.as_ref().unwrap();
+        assert_eq!(s.phase, Phase::Done);
+        assert_eq!(s.report.as_ref(), Some(&report));
+        // A late History of s1 for the same scan time stays out; s2's gets in.
+        app.apply(Msg::History {
+            id,
+            scan: s1,
+            taken_at_unix: report.taken_at_unix,
+            result: Ok(None),
+        });
+        assert_eq!(app.session.as_ref().unwrap().history, History::Pending);
+        app.apply(Msg::History {
+            id,
+            scan: s2,
+            taken_at_unix: report.taken_at_unix,
+            result: Ok(None),
+        });
+        assert_eq!(app.session.as_ref().unwrap().history, History::NoSnapshot);
+    }
+
+    #[test]
+    fn replaced_run_of_the_same_entry_does_not_mask_the_new_runs_failures() {
+        // s2's connect failure is accepted.
+        let (mut app, id, s1, s2) = reconnected_same_entry();
+        app.apply(Msg::ConnectFailed {
+            id,
+            scan: s2,
+            error: "Connection refused".into(),
+        });
+        assert_eq!(
+            app.session.as_ref().unwrap().phase,
+            Phase::Failed("Connection refused".into())
+        );
+        assert_eq!(app.entry(id).unwrap().status, ConnStatus::Failed);
+
+        // s2's scan failure is accepted, also after s1 sent its own.
+        let (mut app, id, s1b, s2b) = reconnected_same_entry();
+        assert_eq!((s1b, s2b), (s1, s2));
+        app.apply(Msg::Connected {
+            id,
+            scan: s2,
+            server: Some(fixtures::server()),
+            perms: fixtures::perms_ok(),
+            target: ScanTarget::Primary,
+        });
+        app.apply(Msg::ScanDone {
+            id,
+            scan: s1,
+            report: fixtures::report(true),
+        });
+        app.apply(Msg::ScanFailed {
+            id,
+            scan: s2,
+            error: "connection reset".into(),
+        });
+        let s = app.session.as_ref().unwrap();
+        assert_eq!(s.phase, Phase::Failed("connection reset".into()));
+        assert!(s.report.is_none());
     }
 
     #[test]
@@ -1592,6 +1994,7 @@ mod tests {
         );
         app.apply(Msg::Connected {
             id,
+            scan: scan_of(&app),
             server: Some(fixtures::server()),
             perms: fixtures::perms_ok(),
             target: ScanTarget::Primary,
@@ -1623,6 +2026,7 @@ mod tests {
         let id = app.session.as_ref().unwrap().id;
         app.apply(Msg::ConnectFailed {
             id,
+            scan: scan_of(&app),
             error: "denied".into(),
         });
         assert_eq!(app.keychain_hint(), None);
@@ -1639,6 +2043,7 @@ mod tests {
         let target = ScanTarget::PrimaryFallback("10.0.1.21:6379: timed out".into());
         app.apply(Msg::Connected {
             id: *id,
+            scan: scan_of(&app),
             server: Some(fixtures::server()),
             perms: fixtures::perms_ok(),
             target: target.clone(),
@@ -1664,6 +2069,7 @@ mod tests {
         let [
             Effect::Connect {
                 id,
+                scan,
                 profile,
                 secrets: SecretSource::Keychain,
             },
@@ -1671,6 +2077,7 @@ mod tests {
         else {
             panic!("unexpected effects {effects:?}");
         };
+        assert_eq!(*scan, scan_of(&app));
         assert_eq!(profile.name, "staging-cache");
         assert_eq!(app.view, View::Patterns);
         assert_eq!(app.entry(*id).unwrap().status, ConnStatus::Connecting);
@@ -1678,6 +2085,7 @@ mod tests {
 
         app.apply(Msg::Connected {
             id: *id,
+            scan: scan_of(&app),
             server: Some(fixtures::server()),
             perms: fixtures::perms_memory_denied(),
             target: ScanTarget::Primary,
@@ -1695,6 +2103,7 @@ mod tests {
 
         app.apply(Msg::ScanDone {
             id: *id,
+            scan: scan_of(&app),
             report: fixtures::report(true),
         });
         assert_eq!(app.session.as_ref().unwrap().phase, Phase::Done);
@@ -1735,6 +2144,7 @@ mod tests {
         };
         app.apply(Msg::ConnectFailed {
             id,
+            scan: scan_of(&app),
             error: "Connection refused".into(),
         });
         assert_eq!(app.entry(id).unwrap().status, ConnStatus::Failed);
@@ -1742,6 +2152,7 @@ mod tests {
         // Messages for a connection that is no longer active are ignored.
         app.apply(Msg::ScanDone {
             id: 999,
+            scan: scan_of(&app),
             report: fixtures::report(true),
         });
         assert!(app.session.as_ref().unwrap().report.is_none());
@@ -1758,12 +2169,14 @@ mod tests {
         };
         app.apply(Msg::Connected {
             id,
+            scan: scan_of(&app),
             server: Some(fixtures::server()),
             perms: fixtures::perms_ok(),
             target: ScanTarget::Primary,
         });
         app.apply(Msg::ScanDone {
             id,
+            scan: scan_of(&app),
             report: fixtures::report(sizes),
         });
         app
@@ -1853,11 +2266,16 @@ mod tests {
         };
         app.apply(Msg::Connected {
             id,
+            scan: scan_of(&app),
             server: Some(report.server.clone()),
             perms,
             target: ScanTarget::Primary,
         });
-        app.apply(Msg::ScanDone { id, report });
+        app.apply(Msg::ScanDone {
+            id,
+            scan: scan_of(&app),
+            report,
+        });
         (app, id)
     }
 
@@ -1865,6 +2283,7 @@ mod tests {
         let taken_at_unix = app.report().unwrap().taken_at_unix;
         app.apply(Msg::History {
             id,
+            scan: scan_of(app),
             taken_at_unix,
             result: Ok(Some(fixtures::history(true))),
         });
@@ -1930,12 +2349,21 @@ mod tests {
         let report = fixtures::report(true);
         let effects = app.apply(Msg::ScanDone {
             id,
+            scan: scan_of(&app),
             report: report.clone(),
         });
-        let [Effect::LoadHistory { id: got, report: r }] = &effects[..] else {
+        let [
+            Effect::LoadHistory {
+                id: got,
+                scan: got_scan,
+                report: r,
+            },
+        ] = &effects[..]
+        else {
             panic!("unexpected effects {effects:?}");
         };
         assert_eq!(*got, id);
+        assert_eq!(*got_scan, scan_of(&app));
         assert_eq!(**r, report);
         assert_eq!(app.session.as_ref().unwrap().history, History::Pending);
         assert!(app.diff().is_none());
@@ -1943,12 +2371,22 @@ mod tests {
         // A reply for another scan is ignored.
         app.apply(Msg::History {
             id,
+            scan: scan_of(&app),
             taken_at_unix: report.taken_at_unix - 1,
             result: Ok(Some(fixtures::history(true))),
         });
         assert!(app.diff().is_none());
         app.apply(Msg::History {
             id: id + 100,
+            scan: scan_of(&app),
+            taken_at_unix: report.taken_at_unix,
+            result: Ok(Some(fixtures::history(true))),
+        });
+        assert!(app.diff().is_none());
+        // The same entry and scan time, but another run of it.
+        app.apply(Msg::History {
+            id,
+            scan: scan_of(&app) + 100,
             taken_at_unix: report.taken_at_unix,
             result: Ok(Some(fixtures::history(true))),
         });
@@ -1956,6 +2394,7 @@ mod tests {
 
         app.apply(Msg::History {
             id,
+            scan: scan_of(&app),
             taken_at_unix: report.taken_at_unix,
             result: Ok(Some(fixtures::history(true))),
         });
@@ -1963,6 +2402,7 @@ mod tests {
 
         app.apply(Msg::History {
             id,
+            scan: scan_of(&app),
             taken_at_unix: report.taken_at_unix,
             result: Ok(None),
         });
@@ -1972,6 +2412,7 @@ mod tests {
         // A missing data directory is reported and the app carries on.
         app.apply(Msg::History {
             id,
+            scan: scan_of(&app),
             taken_at_unix: report.taken_at_unix,
             result: Err("could not find a data directory for this user".into()),
         });
@@ -2045,6 +2486,7 @@ mod tests {
         // A new scan starts every list at the top.
         app.apply(Msg::ScanDone {
             id,
+            scan: scan_of(&app),
             report: fixtures::report(true),
         });
         assert_eq!(app.sel, ViewSel::default());
