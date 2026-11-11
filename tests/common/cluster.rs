@@ -413,3 +413,228 @@ fn flatten(v: &redis::Value) -> Vec<String> {
         _ => Vec::new(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// A cluster that the host can't reach (for SSH tests)
+// ---------------------------------------------------------------------------
+
+/// The ports of a [`HiddenCluster`]'s nodes: fixed, since nothing is published. The
+/// first three are the primaries.
+pub const HIDDEN_PORTS: [u16; 6] = [7000, 7001, 7002, 7003, 7004, 7005];
+
+/// Where a [`HiddenCluster`] runs, and what its nodes announce.
+pub enum ClusterPlace<'a> {
+    /// On a Docker network under a container name, announcing the container's address
+    /// on that network.
+    Network { network: &'a str, name: &'a str },
+    /// In another container's network namespace (an SSH bastion's), announcing
+    /// 127.0.0.1.
+    Namespace(&'a str),
+}
+
+/// A cluster in one container with no published port: 3 primaries on
+/// [`HIDDEN_PORTS`], plus 3 replicas when asked.
+pub struct HiddenCluster {
+    /// The container name on the network, or 127.0.0.1 in a namespace.
+    pub host: String,
+    /// The address every node announces.
+    pub announced: String,
+    pub ports: Vec<u16>,
+    pub valkey: bool,
+    container: ContainerAsync<GenericImage>,
+}
+
+/// Start a [`HiddenCluster`] in `place`, every node with `extra` server arguments (one
+/// word each). The script waits until the cluster is settled (every node
+/// `cluster_state:ok`; with replicas, every replica online and, where `CLUSTER SHARDS`
+/// exists, every node `online`) before it says it is ready.
+pub async fn hidden_cluster(
+    place: ClusterPlace<'_>,
+    valkey: bool,
+    replicas: bool,
+    extra: &[&str],
+) -> HiddenCluster {
+    let n = if replicas { 6 } else { 3 };
+    let ports: Vec<u16> = HIDDEN_PORTS[..n].to_vec();
+    let (image, bin, cli) = if valkey {
+        (valkey_image(), "valkey-server", "valkey-cli")
+    } else {
+        (redis_image(), "redis-server", "redis-cli")
+    };
+    let list = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let primaries = list.split(' ').take(3).collect::<Vec<_>>().join(" ");
+    let extra = extra
+        .iter()
+        .map(|a| sh_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let announce = match place {
+        ClusterPlace::Network { .. } => "$(hostname -i | awk '{print $1}')",
+        ClusterPlace::Namespace(_) => "127.0.0.1",
+    };
+    let script = format!(
+        r#"IP={announce}
+for p in {list}; do
+  mkdir -p /tmp/n$p
+  {bin} --port $p --cluster-enabled yes --cluster-config-file /tmp/n$p/nodes.conf \
+    --dir /tmp/n$p --cluster-announce-ip $IP --cluster-announce-port $p \
+    --cluster-announce-bus-port $((p+10000)) --cluster-node-timeout 3000 \
+    --protected-mode no --save '' --appendonly no --repl-ping-replica-period 1 \
+    {extra} --daemonize yes --logfile /tmp/n$p/log
+done
+for p in {list}; do until {cli} -p $p ping >/dev/null 2>&1; do sleep 0.1; done; done
+ADDRS=""; for p in {list}; do ADDRS="$ADDRS $IP:$p"; done
+{cli} --cluster create $ADDRS --cluster-replicas {r} --cluster-yes >/tmp/create.log 2>&1
+for p in {list}; do
+  until {cli} -p $p cluster info | grep -q cluster_state:ok; do sleep 0.2; done
+done
+if [ {r} = 1 ]; then
+  until [ "$({cli} -p 7000 cluster nodes | grep -c slave)" = 3 ] \
+    && [ "$({cli} -p 7000 cluster nodes | grep -c ' connected')" = 6 ] \
+    && ! {cli} -p 7000 cluster nodes | grep -qE 'fail|handshake|noaddr'; do sleep 0.2; done
+  for p in {primaries}; do
+    until {cli} -p $p info replication | grep -q state=online; do sleep 0.2; done
+  done
+  if {cli} -p 7000 cluster shards 2>/dev/null | grep -qx online; then
+    until [ "$({cli} -p 7000 cluster shards | grep -cx online)" -ge 6 ]; do sleep 0.2; done
+  fi
+fi
+echo "CLUSTER-READY $IP"
+exec tail -f /dev/null
+"#,
+        r = if replicas { 1 } else { 0 },
+    );
+    let request = GenericImage::new(image.0, image.1)
+        .with_wait_for(WaitFor::message_on_stdout("CLUSTER-READY"))
+        .with_cmd(["sh".to_string(), "-c".to_string(), script])
+        .with_startup_timeout(Duration::from_secs(120));
+    let (request, host) = match place {
+        ClusterPlace::Network { network, name } => (
+            request.with_network(network).with_container_name(name),
+            name.to_string(),
+        ),
+        ClusterPlace::Namespace(id) => (
+            request.with_network(format!("container:{id}")),
+            "127.0.0.1".to_string(),
+        ),
+    };
+    let container = request
+        .with_host_config_modifier(|hc| {
+            hc.publish_all_ports = Some(false);
+            hc.port_bindings = None;
+        })
+        .start()
+        .await
+        .expect("start the cluster container (is Docker running?)");
+    let announced = match place {
+        ClusterPlace::Network { .. } => container
+            .get_bridge_ip_address()
+            .await
+            .expect("the cluster's network address")
+            .to_string(),
+        ClusterPlace::Namespace(_) => "127.0.0.1".to_string(),
+    };
+    HiddenCluster {
+        host,
+        announced,
+        ports,
+        valkey,
+        container,
+    }
+}
+
+impl HiddenCluster {
+    /// Run `sh -c <script>` in the container and return its standard output; `$CLI` is
+    /// the cluster's CLI.
+    pub async fn sh(&self, script: &str) -> String {
+        let cli = if self.valkey {
+            "valkey-cli"
+        } else {
+            "redis-cli"
+        };
+        let script = format!("CLI='{cli} --no-auth-warning'; {script}");
+        let mut exec = self
+            .container
+            .exec(
+                ExecCommand::new(["sh", "-c", &script])
+                    .with_cmd_ready_condition(CmdWaitFor::exit_code(0)),
+            )
+            .await
+            .expect("run a command in the cluster container");
+        String::from_utf8(exec.stdout_to_vec().await.expect("output")).expect("UTF-8")
+    }
+
+    pub async fn dbsize(&self, port: u16) -> u64 {
+        self.sh(&format!("$CLI -p {port} DBSIZE"))
+            .await
+            .trim()
+            .parse()
+            .expect("DBSIZE")
+    }
+
+    /// Write `SET <prefix><i> x` for `i` in `0..n` with `redis-cli -c`, which follows
+    /// the cluster's redirects. See [`Self::wait_for_keys`].
+    pub async fn seed(&self, prefix: &str, n: u64) {
+        self.sh(&format!(
+            "i=0; while [ $i -lt {n} ]; do echo \"SET {prefix}$i x\"; i=$((i+1)); done \
+             | $CLI -c -p 7000 > /dev/null"
+        ))
+        .await;
+    }
+
+    /// The keys on every primary, and on every node.
+    pub async fn key_counts(&self) -> (u64, u64) {
+        let (mut primaries, mut all) = (0, 0);
+        for (i, p) in self.ports.iter().enumerate() {
+            let n = self.dbsize(*p).await;
+            all += n;
+            if i < 3 {
+                primaries += n;
+            }
+        }
+        (primaries, all)
+    }
+
+    /// Wait until the primaries hold `keys` and, with replicas, the replicas too.
+    pub async fn wait_for_keys(&self, keys: u64) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let want_all = keys * (self.ports.len() as u64 / 3);
+        loop {
+            let (primaries, all) = self.key_counts().await;
+            if primaries == keys && all == want_all {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the cluster holds {primaries}/{all} keys, not {keys}/{want_all}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Stop the node on `port` (`SHUTDOWN NOSAVE`).
+    pub async fn stop_node(&self, port: u16) {
+        self.sh(&format!(
+            "$CLI -p {port} shutdown nosave >/dev/null 2>&1; \
+             while $CLI -p {port} ping >/dev/null 2>&1; do sleep 0.1; done"
+        ))
+        .await;
+    }
+
+    /// `CONFIG RESETSTAT` on every node.
+    pub async fn reset_stats(&self) {
+        for p in &self.ports {
+            self.sh(&format!("$CLI -p {p} CONFIG RESETSTAT >/dev/null"))
+                .await;
+        }
+    }
+
+    /// `INFO commandstats` of one node, as [`parse_commandstats`] reads it.
+    pub async fn commandstats(&self, port: u16) -> HashMap<String, (u64, u64)> {
+        parse_commandstats(&self.sh(&format!("$CLI -p {port} INFO commandstats")).await)
+    }
+}

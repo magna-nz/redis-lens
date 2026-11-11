@@ -30,8 +30,7 @@ use crate::secrets::SecretStore;
 
 use super::{
     ConnError, Connection, Pinned, REPLICA_TIMEOUT, ResolvedAuth, Route, ScanTarget, Unusable,
-    connect_for_scan_with, info_replication, master_replid, may_send_credentials, open,
-    verified_replica,
+    info_replication, master_replid, may_send_credentials, open, replica_step, verified_replica,
 };
 
 /// What a scan runs against.
@@ -223,10 +222,15 @@ pub(crate) fn merge_permissions(reports: &[PermissionReport]) -> PermissionRepor
 }
 
 /// Connect for a scan. Connects to the profile's endpoint as
-/// [`super::connect_for_scan`] does; when that server is a cluster node
-/// (`cluster_enabled:1` in `INFO cluster`), discovers the shards and connects to the
+/// [`super::connect_for_scan`] does; when that server is a cluster node (`INFO server`
+/// says so, or `INFO cluster` when it doesn't), discovers the shards and connects to the
 /// node to scan for each, returning [`ScanTargets::Cluster`]. Otherwise returns what
 /// `connect_for_scan` returns, as [`ScanTargets::Single`].
+///
+/// The profile's server is connected to once: a standalone server's replica step runs
+/// on that connection, and a cluster reuses it for the seed's shard. The `INFO server`
+/// read to tell a cluster apart answers the scan's own first `INFO server` on that
+/// connection, so detection costs the server no extra command.
 ///
 /// A cluster only has database 0: a profile with another `db` is refused with an error
 /// before any other node is connected to.
@@ -237,11 +241,10 @@ pub async fn connect_targets(
     let route = Route::for_profile(profile, secrets).await?;
     let auth = ResolvedAuth::new(profile, secrets).await?;
 
-    // The seed, without the replica step: on a cluster, replicas are chosen per shard.
-    let mut seed_profile = profile.clone();
-    seed_profile.prefer_replica = false;
-    let mut seed = match connect_for_scan_with(&seed_profile, &route, &auth).await {
-        Ok((c, _)) => c,
+    // The seed, without the replica step yet: on a cluster, replicas are chosen per
+    // shard.
+    let mut seed = match auth.open(&route, &profile.endpoint).await {
+        Ok(c) => c,
         Err(e) => {
             // A cluster node refuses `SELECT` for any database but 0 (a server error,
             // not an I/O or authentication one): say why.
@@ -262,10 +265,8 @@ pub async fn connect_targets(
     };
     if !is_cluster(&mut seed).await {
         if profile.prefer_replica {
-            // The replica step of `connect_for_scan`, exactly as it is for a standalone
-            // server (it opens the primary again).
-            drop(seed);
-            let (conn, target) = connect_for_scan_with(profile, &route, &auth).await?;
+            // The replica step of `connect_for_scan`, on the seed's connection.
+            let (conn, target) = replica_step(profile, &route, &auth, seed).await;
             return Ok(ScanTargets::Single { conn, target });
         }
         return Ok(ScanTargets::Single {
@@ -323,18 +324,28 @@ pub(crate) fn cluster_mode(info: &str) -> Option<bool> {
             (k == name).then(|| v.trim())
         })
     };
-    if let Some(mode) = field("redis_mode") {
+    // Valkey 8 says `server_mode`; Redis (and Valkey 7) `redis_mode`.
+    if let Some(mode) = field("redis_mode").or_else(|| field("server_mode")) {
         return Some(mode == "cluster");
     }
     field("cluster_enabled").map(|v| v == "1")
 }
 
-/// `INFO server` says `redis_mode:cluster`, or (when it has no `redis_mode` or can't be
-/// read) `INFO cluster` says `cluster_enabled:1`.
+/// `INFO server` says `redis_mode:cluster` (Valkey 8: `server_mode:cluster`), or (when
+/// it has neither or can't be read) `INFO cluster` says `cluster_enabled:1`. A readable
+/// `INFO server` reply is kept on `c` to answer the scan's own `INFO server` (see
+/// `Connection::keep_info_server`).
 async fn is_cluster(c: &mut Connection) -> bool {
-    let server: Result<String, _> = redis::cmd("INFO").arg("server").query_async(c).await;
-    if let Some(mode) = server.ok().as_deref().and_then(cluster_mode) {
-        return mode;
+    let reply: Result<Value, _> = redis::cmd("INFO").arg("server").query_async(c).await;
+    let server = reply.ok().and_then(|v| {
+        let text = redis::from_redis_value_ref::<String>(&v).ok()?;
+        Some((v, text))
+    });
+    if let Some((reply, text)) = server {
+        c.keep_info_server(reply);
+        if let Some(mode) = cluster_mode(&text) {
+            return mode;
+        }
     }
     let cluster: Result<String, _> = redis::cmd("INFO").arg("cluster").query_async(c).await;
     cluster
@@ -1787,6 +1798,17 @@ mod tests {
             Some(false)
         );
         assert_eq!(cluster_mode("# Server\r\nredis_version:7.4.2\r\n"), None);
+    }
+
+    /// Valkey 8 names the field `server_mode`, so no `INFO cluster` is needed there.
+    #[test]
+    fn valkey_server_mode_is_read() {
+        let valkey = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nvalkey_version:8.1.4\r\nserver_mode:cluster\r\n";
+        assert_eq!(cluster_mode(valkey), Some(true));
+        assert_eq!(
+            cluster_mode("# Server\r\nserver_mode:standalone\r\n"),
+            Some(false)
+        );
     }
 
     fn shard(role: NodeRole, connected: bool, note: Option<&str>) -> ShardState<'_> {
