@@ -13,7 +13,7 @@ use super::ScanArgs;
 use crate::config::Config;
 use crate::conn::{self, ScanTarget};
 use crate::format;
-use crate::model::{PERM_FREQ, PatternStats, PermStatus, PermissionReport, ScanReport};
+use crate::model::{PERM_FREQ, PatternStats, PermStatus, PermissionReport, Profile, ScanReport};
 use crate::scan::{self, ScanOptions, ScanProgress};
 use crate::secrets::{KeyringStore, SecretStore};
 use crate::snapshot;
@@ -95,14 +95,44 @@ pub async fn scan_profile_with_target(
     })?;
     let (mut connection, target) = conn::connect_for_scan(profile, secrets).await?;
     let perms = conn::check_permissions(&mut connection).await;
+    let opts = scan_options(profile, sample, match_glob, max_rate);
+    let report = scan::scan(&profile.name, &mut connection, &opts, &perms, progress).await?;
+    Ok((report, perms, target))
+}
+
+/// The options for one scan of `profile`. `max_rate` overrides the profile's default
+/// command budget; `Some(0)` means no limit.
+pub(crate) fn scan_options(
+    profile: &Profile,
+    sample: u64,
+    match_glob: Option<String>,
+    max_rate: Option<u32>,
+) -> ScanOptions {
     let mut opts = ScanOptions::for_profile(profile);
     opts.sample_limit = sample;
     opts.match_glob = match_glob;
     if let Some(rate) = max_rate {
         opts.max_commands_per_sec = (rate > 0).then_some(rate);
     }
-    let report = scan::scan(&profile.name, &mut connection, &opts, &perms, progress).await?;
-    Ok((report, perms, target))
+    opts
+}
+
+#[cfg(test)]
+pub(crate) fn profile_in(env: crate::model::Env) -> Profile {
+    use crate::model::{Auth, Endpoint};
+    Profile {
+        name: "p".into(),
+        env,
+        endpoint: Endpoint {
+            host: "h".into(),
+            port: 1,
+            tls: false,
+        },
+        db: 0,
+        auth: Auth::None,
+        read_only: None,
+        prefer_replica: false,
+    }
 }
 
 /// With `--save`, write the report into `dir` and tell the user where on stderr.
@@ -443,6 +473,44 @@ mod tests {
             max_rate: None,
             save,
         }
+    }
+
+    fn parsed_scan(extra: &[&str]) -> ScanArgs {
+        use clap::Parser;
+        let mut argv = vec!["redis-lens", "scan", "p"];
+        argv.extend_from_slice(extra);
+        match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+            Some(crate::cli::Command::Scan(a)) => a,
+            other => panic!("not scan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_rate_flag_reaches_the_scan_options() {
+        use crate::model::Env;
+        let rate = |env, extra: &[&str]| {
+            let a = parsed_scan(extra);
+            scan_options(&profile_in(env), a.sample, a.match_glob, a.max_rate).max_commands_per_sec
+        };
+        assert_eq!(rate(Env::Prod, &["--max-rate", "250"]), Some(250));
+        assert_eq!(rate(Env::Local, &["--max-rate", "250"]), Some(250));
+        // 0 means no limit, even where the profile has a default.
+        assert_eq!(rate(Env::Prod, &["--max-rate", "0"]), None);
+        // Absent keeps the profile default.
+        assert_eq!(rate(Env::Prod, &[]), Some(5_000));
+        assert_eq!(rate(Env::Local, &[]), None);
+    }
+
+    #[test]
+    fn scan_options_carry_sample_and_match() {
+        let o = scan_options(
+            &profile_in(crate::model::Env::Prod),
+            42,
+            Some("user:*".into()),
+            None,
+        );
+        assert_eq!(o.sample_limit, 42);
+        assert_eq!(o.match_glob.as_deref(), Some("user:*"));
     }
 
     #[test]
