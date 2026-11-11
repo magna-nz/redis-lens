@@ -85,6 +85,27 @@ const NODE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The highest slot of a cluster.
 const MAX_SLOT: u16 = 16_383;
 
+impl ScanTargets {
+    /// Which server(s) the scan reads from: the standalone target, or
+    /// [`ScanTarget::Cluster`] with [`ClusterTargets::summary`].
+    pub fn target(&self) -> ScanTarget {
+        match self {
+            Self::Single { target, .. } => target.clone(),
+            Self::Cluster(c) => ScanTarget::Cluster(c.summary()),
+        }
+    }
+
+    /// [`super::check_permissions`] on the standalone connection, or
+    /// [`ClusterTargets::check_permissions`] (merged over every connected node, each
+    /// node's report kept in [`NodeTarget::perms`]).
+    pub async fn check_permissions(&mut self) -> PermissionReport {
+        match self {
+            Self::Single { conn, .. } => super::check_permissions(conn).await,
+            Self::Cluster(c) => c.check_permissions().await,
+        }
+    }
+}
+
 impl ClusterTargets {
     /// One line for the `Target:` line and the TUI header, for example
     /// `cluster · 3 shards · replicas 2/3` or `cluster · 3 shards · 1 unreachable`.

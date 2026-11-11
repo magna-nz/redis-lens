@@ -225,7 +225,7 @@ pub struct ScanReport {
     /// On a cluster scan, one entry per shard, in slot order: the node that was
     /// scanned for it and that node's own results. `None` on a standalone scan and in
     /// snapshots written before v0.3. On a cluster scan the report's other fields hold
-    /// the merged results: `server` is the seed node's flavor, version and policy with
+    /// the merged results: `server` is the first scanned shard's flavor, version and policy with
     /// `used_memory`, `maxmemory` and `total_keys` summed over the shards, `patterns`
     /// are merged over the shards (estimates summed), and `complete` is true only when
     /// every shard was seen completely.

@@ -347,6 +347,9 @@ pub enum ScanTarget {
     Replica(Endpoint),
     /// `prefer_replica` was set but no replica could be used; the reason is shown.
     PrimaryFallback(String),
+    /// A cluster, one node per shard. Holds [`cluster::ClusterTargets::summary`]: fixed
+    /// text and counts only, never a server's reply.
+    Cluster(String),
 }
 
 impl std::fmt::Display for ScanTarget {
@@ -355,6 +358,7 @@ impl std::fmt::Display for ScanTarget {
             Self::Primary => write!(f, "primary"),
             Self::Replica(ep) => write!(f, "replica {ep}"),
             Self::PrimaryFallback(why) => write!(f, "primary (replica unreachable: {why})"),
+            Self::Cluster(summary) => write!(f, "{summary}"),
         }
     }
 }
@@ -1145,6 +1149,10 @@ mod tests {
         assert_eq!(
             ScanTarget::PrimaryFallback("timed out".into()).to_string(),
             "primary (replica unreachable: timed out)"
+        );
+        assert_eq!(
+            ScanTarget::Cluster("cluster · 3 shards".into()).to_string(),
+            "cluster · 3 shards"
         );
     }
 

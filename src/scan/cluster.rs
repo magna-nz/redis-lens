@@ -24,7 +24,7 @@ use futures::stream::{self, StreamExt};
 use redis::aio::ConnectionLike;
 use tokio::sync::watch;
 
-use crate::conn::cluster::ClusterTargets;
+use crate::conn::cluster::{ClusterTargets, ScanTargets};
 use crate::model::{
     Endpoint, KeySample, KeysizeHistogram, KeyspaceInfo, MemoryStats, NodeReport, NodeRole,
     NodeStatus, PERM_MEMORY, PermissionReport, ScanReport, ServerContext, ServerContextParts,
@@ -50,6 +50,27 @@ const NOTE_STOPPED: &str =
     "the scan of this node stopped early (a connection or server error); its results are partial";
 /// Note for a node that was not connected and carries no note of its own.
 const NOTE_NOT_CONNECTED: &str = "this node could not be connected to";
+
+/// Scan whatever [`crate::conn::cluster::connect_targets`] returned: a standalone server
+/// with [`super::scan_with_partial`] and `perms`, or a cluster with [`scan_cluster`]
+/// (which uses each node's own report and ignores `perms`).
+///
+/// Run [`ScanTargets::check_permissions`] first and pass its result as `perms`.
+pub async fn scan_targets(
+    profile_name: &str,
+    targets: &mut ScanTargets,
+    opts: &ScanOptions,
+    perms: &PermissionReport,
+    progress: Option<&watch::Sender<ScanProgress>>,
+    partial: Option<&PartialSender>,
+) -> Result<ScanReport, ScanError> {
+    match targets {
+        ScanTargets::Single { conn, .. } => {
+            super::scan_with_partial(profile_name, conn, opts, perms, progress, partial).await
+        }
+        ScanTargets::Cluster(c) => scan_cluster(profile_name, c, opts, progress, partial).await,
+    }
+}
 
 /// Scan every shard of `targets` and merge the results into one [`ScanReport`] with
 /// [`ScanReport::nodes`] set (see its docs for what the merged fields hold). Hot keys
