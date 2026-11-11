@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** v0.2 done on main; wave 6 merged (PR #10); wave 7 (four bugs and the test gaps) in progress; then usability, then v0.3 (cluster) or the feature ideas below
-**Last updated:** 2026-11-11 (wave 7 verified; PR #11)
+**Current milestone:** v0.2 done on main; waves 6 and 7 merged (PRs #10, #11); wave 8 (usability) in progress; then v0.3 (cluster) or the feature ideas below
+**Last updated:** 2026-11-11 (wave 8 verified; PR #12)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -33,6 +33,63 @@ Approved by the owner: "Approve, merge when green". Same merge rules as the over
 | B | Redis 6.2 in the integration job, as a new CI job (existing required check names unchanged) | implementer [sonnet] | `wave6/tests` (worktree `.claude/worktrees/w6-tests`) | **done** (89f0274): all integration tests pass on 6.2 with no test changes; merged into `wave6/fixes` |
 | C | OS trust store for TLS (load native certs, skip ones that fail to load, fall back to bundled roots when the store is empty); TLS replica test on Redis and Valkey via a throwaway CA and `SSL_CERT_FILE` | implementer [opus] | `wave6/tls` from `wave6/fixes` after B | **done** (9291fba, 3a54fdc): `src/conn/tls.rs`; `tests/tls_it.rs` (6 tests, Redis + Valkey, also on 6.2); merged into `wave6/fixes` |
 | V | Verifier on the merged `wave6/fixes` | verifier [opus] | pinned detached worktree at 09343e2 | **APPROVE**, no blockers. Its ready-made test for the partial denominator (D1) is added. Follow-ups below |
+
+## Wave 8 (2026-11-11): usability
+
+Approved by the owner ("go do all then merge in when green"): the split below; merge with `gh pr merge --merge --admin` when all checks are green and the verifier approves. No tag, release or publish. Not in this wave: `--check`, report export, v0.3 cluster.
+
+Owner decisions:
+- Rescan: `r` in views 1-4 (Connections keeps `r` = Rescan Docker). The old results stay until the first partial arrives; filter, collapse, sort and the selected pattern are kept.
+- Clipboard: OSC 52, no new dependency. `y` copies the selected pattern (Hot keys: the key), `Y` the suggested command. Nothing is copied on the Connections view or in the add flow (rule 1).
+- Sorting: Patterns only. `o` cycles memory, keys, avg size, no-TTL %, name.
+- Also in: hiding the share bar, Δ and avg size on narrow terminals before cutting rows; keychain worker panics stay off the TUI; Docker probes run in parallel; `os_trust` shows as skipped locally.
+
+Integration branch `wave8/usability` (worktree `.claude/worktrees/wave8`, from main 3e347df).
+
+| Part | Content | Agent | Branch | State |
+|---|---|---|---|---|
+| A | Selection follows the pattern (N2), collapse kept when a group's key changes (N3), sorting, marquee follow-ups, narrow columns | implementer [opus] | `wave8/tree` | **done** (253aa13), merged |
+| B | Key table (`tui/keymap.rs`), `?` help overlay (`tui/ui/help.rs`), OSC 52 clipboard (`tui/clipboard.rs`), standalone | implementer [sonnet] | `wave8/keys` | **done** (d34d3fa), merged |
+| D | Keychain panic text, parallel discovery probes, `os_trust` skipped | implementer [sonnet] | `wave8/extras` | **done** (693d575), merged |
+| C | Rescan, `?` and clipboard wired in, footer from the key table, Page Up/Down and Home/End in every list view | implementer [opus] | `wave8/wire`, after A, B and D | **done** (75804f2), merged |
+| V | Verifier on the merged `wave8/usability` | verifier [opus] | pinned detached worktree (3de2853, then the fix commit) | round 1 **BLOCKED** on B1 and B2, fixed; round 2 **BLOCKED** on B3, fixed; round 3 **BLOCKED** on B4 (test only), fixed (below); round 4 at 0eaa9e2 **APPROVE**, no blockers |
+
+**Verifier round 1 (BLOCKED, report `w8-verify-report.md` in the session notes), and the fixes:**
+- B1: the suggested command (`Y` and the detail panel's `$` line) put the glob in single quotes without escaping `'`, so a key named ``evil:x'$(touch pwned)'`` gave a command that ran `touch` when pasted into a shell. Fixed in `tui::clipboard::suggested_command`: `'` is written as `'\''`, and control characters and `\` (fish's escape inside single quotes) become `?`. Tests: `a_key_name_cannot_break_out_of_the_command` (exact text) and the proptest `the_pattern_is_always_one_quoted_word` (the text after `--pattern` is exactly one quoted word holding the glob, and has no control characters). Checked in bash with a stub `redis-cli`: one argument, nothing run.
+- B3 (round 2): the single-quote fix holds in POSIX shells and fish, but not on Windows: cmd.exe has no single quotes (`x&calc&` runs `calc`), and PowerShell also ends a single-quoted string at typographic quotes and has no `\` escape. Fixed by offering the command only when the glob is ASCII letters, digits and `_ : . / * ? { } [ ] @ # + = , ~ - |`, in double quotes (`redis-cli --scan --pattern "<glob>"`, which also works in cmd); otherwise the `$` line says there is no command and `Y` says why. `y` no longer copies text with control characters. Tests: `tui::clipboard::tests::a_key_name_cannot_break_out_of_the_command` (POSIX, cmd and PowerShell break-outs, newline, `%`, `!`, backtick, non-ASCII), the proptest `the_command_holds_only_safe_characters`, `tui::app::tests::unsafe_patterns_and_control_characters_are_not_copied`, snapshot `patterns_detail_without_a_safe_command`. Eleven existing Patterns and TTL snapshots changed in the `$` line only (single to double quotes).
+- B4 (round 3, test only): the B3 code was right, but nothing failed if `$`, `;`, `'`, `^`, `(` or `)` were added to the safe set. `tui::clipboard::tests::every_character_is_classified` puts every Unicode character between two letters and checks a command exists exactly for the safe set (written out again in the test); adding `$` fails it. Also: the TTL panel's no-command path has a snapshot (`ttl_detail_without_a_safe_command`), and the no-command line has no `$ ` prompt, so copying it with the mouse gives nothing that looks like a command. The verifier checked the safe set inside double quotes in bash, `bash --posix`, zsh (with `extendedglob`, `rcquotes`, `equals`), dash, ksh, tcsh and csh, and against fish's, PowerShell's and cmd.exe's documented rules.
+- B2: the panic-hook test passed with the silencing removed, and nothing checked the hook is installed. The test now records keychain-thread panics too, and `keychain_calls_install_the_silencing_hook` checks the install; both fail under those mutations.
+- Not changed (noted): `copy_never_carries_credentials` checks held credentials only through the Docker entry, since the app never holds a saved profile's credentials; `CopyText` constructors take any `&str`, so "only a pattern, key or command" rests on `App::copy`'s call sites; the discovery concurrency test is timing-based (1.2 s limit for about 0.4 s of work).
+
+**How each item is covered** (agents' change → test maps are in their reports; the verifier audits them):
+- Selection follows the pattern: `tui::app::tests::selection_follows_the_pattern_across_partials`, `selection_follows_the_pattern_into_the_finished_scan` and the collapsed-group, `{var}` and gone-row cases. Restart by a message: `a_message_that_changes_the_selected_row_restarts_the_marquee` (fails with `track_selection()` removed from `apply`).
+- Collapse kept: `tui::tree::tests` for `Collapsed` (key change through `{var}`, split back, single to group and back) and `tui::app::tests` through partials and `ScanDone`.
+- Sorting: `tui::tree::tests` per sort key, ties, groups and children, the no-sizes cycle; a sorted-table snapshot.
+- Marquee: indent and mark stay put (`patterns_long_name_mid_scroll`, a group-row snapshot, a child-row test).
+- Narrow columns: snapshots at each hiding step, with and without Δ; header and row alignment test.
+- Key table: `tui::keymap::tests` (no duplicates, footer subset and width, `spec_lists_every_key`); table and handlers agree both ways (`tui::app::tests`).
+- Help overlay: `tui::ui::help::tests` snapshots for every view, tiny terminals; key routing tests; overlay over a view snapshot.
+- Copy: `tui::clipboard::tests` (bytes, cap, control characters, command text); `tui::app::tests::copy_never_carries_credentials` (rule 1: every view, row kind and the add flow); runtime write and error (`tui::tests`).
+- Rescan: `tui::app::tests` rescan versions of the stale-run tests, previous results kept until the first partial, failure before and after partials, `s` while rescanning, `r` while running or with no session; snapshots of the rescanning and rescan-failed titles.
+- Paging: every list view, page sizes 0 and 1, clamps; `list_rows` against the rows each view draws.
+- Keychain panic: `secrets::tests::a_panicking_keychain_call_gives_a_fixed_error_without_the_payload`, `the_hook_is_silent_for_the_keychain_thread_and_forwards_other_threads`.
+- Parallel discovery: `conn::docker::tests::discovery_probes_run_concurrently_and_keep_order`; `conn_it` on Redis, Valkey and 6.2.
+- `os_trust`: `#[ignore]`d locally; CI runs `cargo test --test os_trust -- --ignored` after installing the CA, and the tests fail without it.
+
+**Checks at 3de2853:** fmt, clippy `-D warnings`, 400 unit tests; every integration test on Redis 7.4, Valkey 8.1 and Redis 6.2 (cli_config 4, conn 26, diff 5, replica 11, scan_cli 5, scan 15, smoke 3, tls 6; os_trust 2 ignored locally). Two failures on the first run, both passing on re-run with code unchanged in this wave: `replica_it` on 6.2 (container start-up, as in wave 7) and `conn_it::connect_with_keychain_credentials` under coverage (a reply that wasn't RESP, likely another process on the mapped port).
+
+**Coverage (`make coverage`, unit + integration, at 3de2853):** 94.46% of lines (wave 7: 93.48%). New modules: `tui/clipboard.rs` 100%, `tui/ui/help.rs` 100%, `tui/tree.rs` 98.8%, `tui/app.rs` 97.8%, `tui/keymap.rs` 86.5%. Lowest: `tui/mod.rs` 67% (terminal event loop), `secrets.rs` 76% (the real keychain, an ignored test), `tui/ui/connections.rs` 82%.
+
+**Decisions taken in the wave (owner may revisit):**
+- The Patterns key bar has no `r Rescan`: with `? Help` and `o Sort` it is 79 columns, and rescan would make it 90. Rescan is in the `?` overlay.
+- After a failed rescan, `s` saves the previous report that is still shown. It has the same snapshot file name as that report's own snapshot, so nothing is duplicated.
+- The replaced run's snapshot lookup still fills in the Diff of its own report while that report is on screen; otherwise a lookup still running when `r` was pressed would leave Diff stuck on "Looking for an earlier snapshot…".
+- Paging on Connections counts only selectable rows, not the SAVED and DOCKER headings.
+
+**Follow-ups found in the wave (not done):**
+- Rule 1: a server's `NOPERM` reply names the ACL user (`NOPERM User <name> has no permissions …`), and the Connections detail panel shows it (fixture: `connections_view` snapshot). It never reaches the scan report or snapshot files. The username should be masked in permission results before they are shown (TUI and `conn test`).
+- spec.md "4 Hot keys" promises an opt-in `MONITOR` sample "planned for v0.2"; it was never built (from before this wave).
+- The failed-scan waiting panel says "Press 0 to go back to Connections and try again" and doesn't mention `r`.
 
 ## Wave 7 (2026-11-11): four bugs and the test gaps
 

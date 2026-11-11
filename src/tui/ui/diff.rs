@@ -12,7 +12,7 @@ use crate::tui::app::{App, History};
 
 use super::delta::{Change, cause_words, ratio_change, signed_bytes, signed_percent};
 use super::widgets::{fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset};
-use super::{notice_panels, report_or_wait, spinner, split_body, style};
+use super::{mark_previous, notice_panels, report_or_wait, spinner, split_body, style};
 
 const NUM_W: usize = 7;
 const PCT_W: usize = 6;
@@ -37,7 +37,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             frame,
             area,
             "Diff",
-            "",
+            &mark_previous(app, ""),
             vec![Line::from(vec![
                 Span::raw(" "),
                 Span::styled(spinner(app.tick), style::amber()),
@@ -48,7 +48,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             frame,
             area,
             "Diff",
-            "no history",
+            &mark_previous(app, "no history"),
             vec![
                 line(
                     format!(" No earlier snapshot for {}.", session.profile.name),
@@ -64,7 +64,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             frame,
             area,
             "Diff",
-            "",
+            &mark_previous(app, ""),
             vec![
                 line(format!(" ✗ Could not load snapshots: {e}"), style::warn()),
                 line(
@@ -94,7 +94,7 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, d: &ReportDiff) {
             frame,
             area,
             "Diff",
-            &header(d),
+            &mark_previous(app, &header(d)),
             vec![Line::from(Span::styled(
                 " Neither scan sampled any keys.",
                 style::dim(),
@@ -104,7 +104,7 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, d: &ReportDiff) {
     }
     let (main, detail) = split_body(area);
     let sel = app.sel.diff.min(d.patterns.len() - 1);
-    let inner = panel(frame, main, "Diff", &header(d));
+    let inner = panel(frame, main, "Diff", &mark_previous(app, &header(d)));
     let name = name_width(usize::from(inner.width));
     let head = Line::from(vec![
         Span::styled(pad_r(" PATTERN", name), style::hd()),

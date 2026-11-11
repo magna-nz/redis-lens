@@ -1,0 +1,28 @@
+---
+source: src/tui/snapshot_tests.rs
+expression: t.backend()
+---
+" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
+" Redis ┌─ Keys · Patterns ──────────────────────────────────────────────┐(1%)   "
+"  0 Con│Everywhere                                                      │       "
+"┌─ Patt│0-4            Switch view, 0 Connections to 4 Hot keys         │mory ─┐"
+"│ PATTE│?              Show or hide this key list                       │    Δ │"
+"│   ses│a              Add a connection                                 │+215M │"
+"│ ▾ cac│q ctrl-c       Quit                                             │+655M │"
+"│     c│Patterns                                                        │+655M │"
+"│     c│↑↓ j k         Move the selection                               │    · │"
+"│ ▾ use│PgUp PgDn      Move one page                                    │ +61M │"
+"│     u│Home End g G   Jump to the first or last row                    │    · │"
+"│     u│→ ← l h        Expand or collapse the selected group            │ +61M │"
+"└──────│enter          Expand or collapse                               │──────┘"
+"┌─ cach│/              Filter patterns by name                          │3.6G ─┐"
+"│ SAMPL│esc            Clear the filter                                 │      │"
+"│ cache│o              Sort by memory, keys, avg size, no-TTL % or name │      │"
+"│ cache│y              Copy the selected pattern to the clipboard       │      │"
+"│ cache│Y              Copy a redis-cli --scan command for the pattern  │      │"
+"│ cache│r              Scan again, keeping old results meanwhile        │>30d  │"
+"│ cache│s              Save a scan snapshot file                        │·     │"
+"│ ▲ 1 o│                                                                │      │"
+"│ $ red│? or esc closes                                                 │      │"
+"└──────└────────────────────────────────────────────────────────────────┘──────┘"
+" ↑↓ Move   →← Fold   / Filter   o Sort   s Snapshot   0-4 View   ? Help   q Quit"

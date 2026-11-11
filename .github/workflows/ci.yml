@@ -42,8 +42,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # For tests/os_trust.rs: a CA in the real OS trust store (System keychain, Windows
-      # Root store, update-ca-certificates). Fails rather than skips if it can't be
-      # installed, since the test only skips when REDIS_LENS_OS_TRUST_CA is unset.
+      # Root store, update-ca-certificates). The tests are #[ignore]d locally; the step
+      # below runs them with --ignored and they fail if REDIS_LENS_OS_TRUST_CA is unset.
       - name: Install a throwaway CA in the OS trust store
         shell: bash
         env:
@@ -88,6 +88,8 @@ jobs:
           echo "REDIS_LENS_OS_TRUST_CA=$dir/ca.pem" >> "$GITHUB_ENV"
           echo "REDIS_LENS_OS_TRUST_CA_KEY=$dir/ca.key" >> "$GITHUB_ENV"
       - run: cargo test --locked
+      - name: OS trust store tests (ignored by default)
+        run: cargo test --locked --test os_trust -- --ignored
 
   integration:
     name: integration tests (Redis + Valkey in Docker)
