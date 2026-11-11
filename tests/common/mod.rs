@@ -3,7 +3,7 @@
 
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers::{ContainerAsync, CopyTargetOptions, GenericImage, ImageExt};
 
 /// Environment variable that overrides the Redis image, as `name:tag`
 /// (e.g. `redis:6.2-alpine`). Unset, the default is `redis:7.4-alpine`.
@@ -77,22 +77,30 @@ impl TestServer {
 }
 
 async fn start(image: (String, String), server_bin: &str, args: &[&str]) -> TestServer {
-    start_on(image, server_bin, args, None).await
+    start_on(image, server_bin, args, None, &[]).await
 }
 
-/// [`start`], publishing port 6379 on `host_port` when given.
+/// [`start`], publishing port 6379 on `host_port` when given, with `files` (container
+/// path, contents) copied in before the server starts.
 async fn start_on(
     image: (String, String),
     server_bin: &str,
     args: &[&str],
     host_port: Option<u16>,
+    files: &[(&str, &[u8])],
 ) -> TestServer {
     let mut cmd = vec![server_bin.to_string()];
     cmd.extend(args.iter().map(|a| a.to_string()));
-    let container = GenericImage::new(image.0, image.1)
+    let mut container = GenericImage::new(image.0, image.1)
         .with_exposed_port(6379.tcp())
         .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
         .with_cmd(cmd);
+    for (path, data) in files {
+        container = container.with_copy_to(
+            CopyTargetOptions::new(*path).with_mode(0o644),
+            data.to_vec(),
+        );
+    }
     let container = match host_port {
         Some(p) => container.with_mapped_port(p, 6379.tcp()),
         None => container,
@@ -161,6 +169,17 @@ pub async fn replica_of_with(
     announce_port: Option<u16>,
     extra: &[&str],
 ) -> TestServer {
+    replica_start(primary, valkey, announce_port, extra, &[]).await
+}
+
+/// [`replica_of_with`], with `files` copied into the container first.
+async fn replica_start(
+    primary: &TestServer,
+    valkey: bool,
+    announce_port: Option<u16>,
+    extra: &[&str],
+    files: &[(&str, &[u8])],
+) -> TestServer {
     let host_port = free_port();
     let announce = announce_port.unwrap_or(host_port).to_string();
     let ip = primary.bridge_ip().await;
@@ -179,7 +198,7 @@ pub async fn replica_of_with(
     } else {
         (redis_image(), "redis-server")
     };
-    start_on(image, bin, &args, Some(host_port)).await
+    start_on(image, bin, &args, Some(host_port), files).await
 }
 
 /// Redis (7.4 by default, overridable; or Valkey 8.1 when `valkey`) with extra server arguments.
@@ -189,4 +208,115 @@ pub async fn server_with(valkey: bool, args: &[&str]) -> TestServer {
     } else {
         redis_with(args).await
     }
+}
+
+/// A throwaway certificate authority for TLS tests, generated at test time.
+pub struct TestCa {
+    issuer: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
+}
+
+impl TestCa {
+    pub fn new(name: &str) -> Self {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        let key = rcgen::KeyPair::generate().expect("CA key");
+        let issuer = rcgen::CertifiedIssuer::self_signed(params, key).expect("CA certificate");
+        Self { issuer }
+    }
+
+    /// The CA certificate, PEM.
+    pub fn pem(&self) -> String {
+        self.issuer.pem()
+    }
+
+    /// A certificate for these names (IP addresses become IP SANs), signed by this CA, for
+    /// a server that verifies its own peers against `peer_ca`.
+    pub fn server(&self, names: &[&str], peer_ca: &TestCa) -> ServerTls {
+        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let mut params = rcgen::CertificateParams::new(names).expect("server params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "redis-lens test server");
+        // The replica also presents its certificate as a client on the replication link.
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let key = rcgen::KeyPair::generate().expect("server key");
+        let cert = params
+            .signed_by(&key, &self.issuer)
+            .expect("server certificate");
+        ServerTls {
+            cert: cert.pem(),
+            key: key.serialize_pem(),
+            ca: peer_ca.pem(),
+        }
+    }
+}
+
+/// A server's TLS files, PEM: its certificate and key, and the CA it checks peers
+/// against (for a replica, the primary's certificate on the replication link).
+#[derive(Clone)]
+pub struct ServerTls {
+    pub cert: String,
+    pub key: String,
+    pub ca: String,
+}
+
+const TLS_CERT: &str = "/tls/server.crt";
+const TLS_KEY: &str = "/tls/server.key";
+const TLS_CA: &str = "/tls/ca.crt";
+
+impl ServerTls {
+    fn files(&self) -> [(&'static str, &[u8]); 3] {
+        [
+            (TLS_CERT, self.cert.as_bytes()),
+            (TLS_KEY, self.key.as_bytes()),
+            (TLS_CA, self.ca.as_bytes()),
+        ]
+    }
+}
+
+/// Serve TLS only, on 6379. Clients need no certificate; replication runs over TLS.
+const TLS_ARGS: [&str; 14] = [
+    "--tls-port",
+    "6379",
+    "--port",
+    "0",
+    "--tls-cert-file",
+    TLS_CERT,
+    "--tls-key-file",
+    TLS_KEY,
+    "--tls-ca-cert-file",
+    TLS_CA,
+    "--tls-auth-clients",
+    "no",
+    "--tls-replication",
+    "yes",
+];
+
+/// Redis (7.4 by default, overridable) or Valkey 8.1 serving only TLS with `tls`.
+pub async fn tls_server(valkey: bool, tls: &ServerTls) -> TestServer {
+    let (image, bin) = if valkey {
+        (valkey_image(), "valkey-server")
+    } else {
+        (redis_image(), "redis-server")
+    };
+    start_on(image, bin, &TLS_ARGS, None, &tls.files()).await
+}
+
+/// A TLS-only replica of the TLS `primary`, announced as `127.0.0.1:<published port>`
+/// as [`replica_of`] does, replicating over TLS. Redis and Valkey check the primary's
+/// certificate against `tls.ca` but not its host name, so the primary's certificate
+/// needs no SAN for its bridge address.
+pub async fn tls_replica_of(primary: &TestServer, valkey: bool, tls: &ServerTls) -> TestServer {
+    replica_start(primary, valkey, None, &TLS_ARGS, &tls.files()).await
 }
