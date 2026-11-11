@@ -188,12 +188,14 @@ fn detail_panel(
     ]));
     lines.push(Line::default());
     // The same text `Y` copies.
-    let (cmd, cmd_style) = match suggested_command(&p.pattern) {
-        Some(c) => (c, style::cmd()),
-        None => (NO_COMMAND.to_string(), style::dim()),
+    // Without a command there is no `$ ` prompt, so copying the line with the mouse
+    // gives nothing that looks like a command.
+    let (prompt, cmd, cmd_style) = match suggested_command(&p.pattern) {
+        Some(c) => (" $ ", c, style::cmd()),
+        None => ("   ", NO_COMMAND.to_string(), style::dim()),
     };
     lines.push(Line::from(vec![
-        Span::styled(" $ ", style::dim()),
+        Span::styled(prompt, style::dim()),
         Span::styled(trunc(&cmd, w.saturating_sub(3)), cmd_style),
     ]));
     rows(frame, inner, lines, None);

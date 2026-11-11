@@ -239,6 +239,27 @@ mod tests {
         }
     }
 
+    /// Every character, one at a time between safe letters: a command exists exactly for
+    /// the characters of the safe set, written out again here. Catches any loosening of
+    /// [`shell_safe`] (e.g. `$`, `;`, `'`, `^`, `(`), which the examples above may not.
+    #[test]
+    fn every_character_is_classified() {
+        let safe = |c: char| c.is_ascii_alphanumeric() || "_:./*?[]@#+=,~-|".contains(c);
+        for c in (0u32..=0x10FFFF).filter_map(char::from_u32) {
+            if c == '{' || c == '}' {
+                continue; // placeholders: the glob rewrites them
+            }
+            assert_eq!(
+                suggested_command(&format!("a{c}b")).is_some(),
+                safe(c),
+                "{c:?}"
+            );
+        }
+        assert!(suggested_command("a{x}b").is_some());
+        assert!(suggested_command("a{b").is_some());
+        assert!(suggested_command("a}b").is_some());
+    }
+
     proptest::proptest! {
         /// A command is offered exactly when every character of the glob is in the safe
         /// set (written out again here), and then it is the glob in double quotes.

@@ -552,6 +552,20 @@ fn patterns_without_history_have_no_delta_column() {
     assert!(lines.iter().all(|l| !l.contains('Δ')));
 }
 
+/// The TTL detail panel, like the Patterns one, has no command for a pattern with
+/// characters that are not safe in a shell.
+#[test]
+fn ttl_detail_without_a_safe_command() {
+    let mut report = fixtures::report(true);
+    for p in &mut report.patterns {
+        p.pattern = format!("{};x", p.pattern);
+    }
+    let (mut app, _) = scanned_with(report, fixtures::perms_ok());
+    press(&mut app, "2");
+    let t = render(&app, 120, 36);
+    insta::assert_snapshot!(t.backend());
+}
+
 #[test]
 fn ttl_view() {
     let mut app = scanned_with_history(true);
