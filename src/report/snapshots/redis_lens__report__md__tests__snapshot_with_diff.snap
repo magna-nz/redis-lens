@@ -1,0 +1,38 @@
+---
+source: src/report/md.rs
+expression: "render(&after, Some(&d), false)"
+---
+# redis-lens report: staging
+
+- **Server:** Redis 7.4.2 (standalone)
+- **Scanned:** 2024-03-01 12:34:56 UTC
+- **Memory:** 50M used of no limit, eviction allkeys-lfu
+- **Keys:** 660 sampled of 10,000 total (7%)
+- **Coverage:** whole keyspace
+- **Sizes:** available (MEMORY USAGE)
+
+## Top patterns
+
+| Pattern | Type | Keys | Memory | Share | Avg | No TTL |
+|---|---|---:|---:|---:|---:|---:|
+| user:{id}:cart | hash | 2.0K | 29M | 83% | 15K | 100% |
+| session:{id} | hash | 3.0K | 4.8M | 14% | 1.6K | 0% |
+| search:{id} | hash | 1.0K | 977K | 3% | 1000B | 40% |
+| job:{id} | hash | 600 | 195K | <1% | 333B | 100% |
+
+## TTL risks
+
+| Pattern | Verdict | No TTL | Why |
+|---|---|---:|---|
+| user:{id}:cart | persistent · growing | 100% | All 2.0K keys never expire and the pattern is growing. It grew by 19M since the last snapshot. This is probably a leak: nothing ever removes these keys. |
+| search:{id} | mixed · likely bug | 40% | 40% of 1.0K keys never expire, while the rest expire in about a day. A write path probably skips EXPIRE. |
+| job:{id} | persistent · growing | 100% | All 600 keys never expire and the pattern is growing. It is new since the last snapshot. This is probably a leak: nothing ever removes these keys. |
+
+## Changes since 2024-02-29 12:34:56 UTC
+
+Memory used: 50M → 50M (0B).
+
+| Pattern | Change | Cause |
+|---|---:|---|
+| user:{id}:cart | +19M | bigger values |
+| job:{id} | +195K | new |

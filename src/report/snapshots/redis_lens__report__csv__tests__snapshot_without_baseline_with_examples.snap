@@ -1,0 +1,9 @@
+---
+source: src/report/csv.rs
+expression: "render(&after, None, true)"
+---
+pattern,type,sampled_keys,est_keys,est_bytes,avg_bytes,share_pct,no_ttl_pct,verdict,delta_bytes,delta_keys,change,examples
+user:{id}:cart,hash,200,2000,30000000,15000,82.87,100.00,persistent-stable,,,,user:1001:cart user:1002:cart
+session:{id},hash,300,3000,5000000,1666,13.81,0.00,ok,,,,session:abc
+search:{id},hash,100,1000,1000000,1000,2.76,40.00,mixed,,,,
+job:{id},hash,60,600,200000,333,0.55,100.00,persistent-stable,,,,

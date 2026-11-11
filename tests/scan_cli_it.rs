@@ -6,8 +6,8 @@ mod common;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use redis_lens::cli::ScanArgs;
-use redis_lens::cli::scan::{render_table, report};
+use redis_lens::cli::scan::{execute, render_table, report};
+use redis_lens::cli::{ReportFormat, ScanArgs, exit_code};
 use redis_lens::config::Config;
 use redis_lens::model::{Auth, Credentials, Endpoint, Env, Profile, ScanReport};
 use redis_lens::secrets::{MemoryStore, SecretStore};
@@ -218,4 +218,292 @@ async fn limited_acl_user_degrades() {
     println!("{table}");
     assert!(table.contains("sizes unavailable: MEMORY USAGE denied"));
     assert!(!table.contains("pw"));
+}
+
+// ---------------------------------------------------------------------------
+// scan --check and --report
+// ---------------------------------------------------------------------------
+
+fn temp_dir(tag: &str) -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "redis-lens-scan-it-{tag}-{}-{n}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Run `scan` end to end; returns what went to standard output and the result.
+async fn run_scan(
+    config: &std::path::Path,
+    snapshots: &std::path::Path,
+    args: &ScanArgs,
+) -> (String, anyhow::Result<()>) {
+    let mut out: Vec<u8> = Vec::new();
+    let snapshots = snapshots.to_path_buf();
+    let result = execute(
+        config,
+        &MemoryStore::default(),
+        args,
+        || Ok(snapshots.clone()),
+        &mut out,
+    )
+    .await;
+    (String::from_utf8(out).unwrap(), result)
+}
+
+fn checks(rules: &[&str]) -> ScanArgs {
+    let mut a = args();
+    a.checks = rules.iter().map(|r| r.to_string()).collect();
+    a
+}
+
+#[tokio::test]
+async fn passing_check_exits_zero() {
+    for server in [common::redis().await, common::valkey().await] {
+        seed(&server).await;
+        let config = temp_config(&profile(server.port, Auth::None));
+        let snaps = temp_dir("pass");
+        let a = checks(&[
+            "verdict!=mixed",
+            "total-bytes<100MiB",
+            "pattern-bytes<10MiB",
+        ]);
+        let (out, result) = run_scan(&config, &snaps, &a).await;
+        result.unwrap();
+        assert!(out.contains("PASS verdict!=mixed"), "{out}");
+        assert!(out.contains("3 passed, 0 failed, 0 skipped"), "{out}");
+        // The table is still printed.
+        assert!(out.contains("PATTERN"), "{out}");
+    }
+}
+
+#[tokio::test]
+async fn failing_check_exits_one() {
+    for server in [common::redis().await, common::valkey().await] {
+        seed(&server).await;
+        let config = temp_config(&profile(server.port, Auth::None));
+        let snaps = temp_dir("fail");
+        let a = checks(&["no-ttl-pct<20", "total-bytes<100MiB"]);
+        let (out, result) = run_scan(&config, &snaps, &a).await;
+        let err = result.unwrap_err();
+        assert_eq!(exit_code(&err), 1, "{err:?}");
+        assert!(
+            out.contains("FAIL no-ttl-pct<20  ")
+                && out.contains("user:{id}:profile 100% (100 sampled)"),
+            "{out}"
+        );
+        assert!(out.contains("order:{id}"), "{out}");
+        assert!(!out.contains("session:{id} 0%"), "session has TTLs: {out}");
+        assert!(out.contains("PASS total-bytes<100MiB"), "{out}");
+        assert!(out.contains("1 passed, 1 failed, 0 skipped"), "{out}");
+    }
+}
+
+#[tokio::test]
+async fn broken_scan_and_bad_rules_exit_two() {
+    let server = common::redis().await;
+    seed(&server).await;
+    let config = temp_config(&profile(server.port, Auth::None));
+    let snaps = temp_dir("broken");
+
+    let mut a = checks(&["no-ttl-pct<20"]);
+    a.profile = "nope".to_string();
+    let (_, result) = run_scan(&config, &snaps, &a).await;
+    let err = result.unwrap_err();
+    assert_eq!(exit_code(&err), 2, "{err:?}");
+    assert!(format!("{err:#}").contains("nope"));
+
+    // A rule that doesn't parse is a usage error, found before the server is touched.
+    let (out, result) = run_scan(&config, &snaps, &checks(&["no-ttl-pct<<"])).await;
+    let err = result.unwrap_err();
+    assert_eq!(exit_code(&err), 2, "{err:?}");
+    assert!(err.to_string().contains("no-ttl-pct<<"), "{err}");
+    assert!(out.is_empty());
+
+    // A server that isn't there.
+    let dead = temp_config(&profile(1, Auth::None));
+    let (_, result) = run_scan(&dead, &snaps, &checks(&["no-ttl-pct<20"])).await;
+    assert_eq!(exit_code(&result.unwrap_err()), 2);
+}
+
+#[tokio::test]
+async fn rules_file_and_strict_without_sizes() {
+    let server = common::redis_with(&[
+        "--user",
+        "lim",
+        "on",
+        ">pw",
+        "~*",
+        "-@all",
+        "+ping",
+        "+hello",
+        "+client|setinfo",
+        "+client|setname",
+        "+select",
+        "+info",
+        "+dbsize",
+        "+scan",
+        "+type",
+        "+ttl",
+        "+pttl",
+    ])
+    .await;
+    seed(&server).await;
+    let p = profile(server.port, Auth::Keychain);
+    let secrets = MemoryStore::default();
+    secrets
+        .set(
+            &p.secret_ref(),
+            &Credentials {
+                username: Some("lim".to_string()),
+                password: SecretString::from("pw".to_string()),
+            },
+        )
+        .unwrap();
+    let config = temp_config(&p);
+    let snaps = temp_dir("strict");
+    let rules = temp_dir("rules").join("rules.toml");
+    std::fs::write(
+        &rules,
+        "[check]\nrules = [\"pattern-bytes<1MiB\", \"no-ttl-pct<=100\"]\nmin_keys = 10\n",
+    )
+    .unwrap();
+
+    let run = |strict: bool| {
+        let (config, snaps, secrets, rules) = (&config, &snaps, &secrets, &rules);
+        async move {
+            let mut a = args();
+            a.rules = Some(rules.clone());
+            a.strict = strict;
+            let mut out: Vec<u8> = Vec::new();
+            let result = execute(config, secrets, &a, || Ok(snaps.clone()), &mut out).await;
+            (String::from_utf8(out).unwrap(), result)
+        }
+    };
+    let (out, result) = run(false).await;
+    result.unwrap();
+    assert!(
+        out.contains("SKIP pattern-bytes<1MiB  (no MEMORY USAGE)"),
+        "{out}"
+    );
+    assert!(out.contains("PASS no-ttl-pct<=100"), "{out}");
+    let (out, result) = run(true).await;
+    assert_eq!(exit_code(&result.unwrap_err()), 1);
+    assert!(
+        out.contains("FAIL pattern-bytes<1MiB  (not judged: no MEMORY USAGE"),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn growth_rule_against_a_saved_baseline() {
+    for server in [common::redis().await, common::valkey().await] {
+        seed(&server).await;
+        let config = temp_config(&profile(server.port, Auth::None));
+        let snaps = temp_dir("growth");
+
+        // No snapshot yet: the growth rule is skipped, and fails under --strict.
+        let (out, result) = run_scan(&config, &snaps, &checks(&["growth<25%"])).await;
+        result.unwrap();
+        assert!(
+            out.contains("SKIP growth<25%  (no baseline snapshot)"),
+            "{out}"
+        );
+        let mut strict = checks(&["growth<25%"]);
+        strict.strict = true;
+        let (_, result) = run_scan(&config, &snaps, &strict).await;
+        assert_eq!(exit_code(&result.unwrap_err()), 1);
+
+        // Save a baseline, then triple the user profiles.
+        let mut save = args();
+        save.save = true;
+        let (_, result) = run_scan(&config, &snaps, &save).await;
+        result.unwrap();
+        let mut admin = server.admin().await;
+        for i in 0..200 {
+            let _: () = redis::cmd("SET")
+                .arg(format!("user:{}:profile", 2000 + i))
+                .arg("x".repeat(50))
+                .query_async(&mut admin)
+                .await
+                .unwrap();
+        }
+        // Snapshots have one-second resolution and the baseline must be strictly older.
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+        let (out, result) = run_scan(&config, &snaps, &checks(&["growth<25%"])).await;
+        let err = result.unwrap_err();
+        assert_eq!(exit_code(&err), 1, "{out}");
+        assert!(
+            out.contains("FAIL growth<25%  user:{id}:profile +"),
+            "{out}"
+        );
+        assert!(!out.contains("session:{id} +"), "{out}");
+        let (out, result) = run_scan(&config, &snaps, &checks(&["growth<500%"])).await;
+        result.unwrap();
+        assert!(out.contains("PASS growth<500%"), "{out}");
+
+        // Reports pick up the same baseline.
+        let mut rep = args();
+        rep.report = Some(ReportFormat::Md);
+        let (out, result) = run_scan(&config, &snaps, &rep).await;
+        result.unwrap();
+        assert!(out.contains("## Changes since"), "{out}");
+    }
+}
+
+#[tokio::test]
+async fn report_files_are_written() {
+    for server in [common::redis().await, common::valkey().await] {
+        seed(&server).await;
+        let config = temp_config(&profile(server.port, Auth::None));
+        let snaps = temp_dir("report");
+        let dir = temp_dir("reportout");
+        for (format, name, needle) in [
+            (ReportFormat::Md, "report.md", "## Top patterns"),
+            (ReportFormat::Html, "report.html", "<!DOCTYPE html>"),
+            (ReportFormat::Csv, "report.csv", "pattern,type,sampled_keys"),
+        ] {
+            let path = dir.join(name);
+            let mut a = args();
+            a.report = Some(format);
+            a.output = Some(path.clone());
+            let (out, result) = run_scan(&config, &snaps, &a).await;
+            result.unwrap();
+            assert!(
+                out.is_empty(),
+                "the report goes to the file, not stdout: {out}"
+            );
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains(needle), "{text}");
+            for name in ["user:{id}:profile", "session:{id}", "order:{id}"] {
+                assert!(text.contains(name), "{text}");
+            }
+            // Example key names stay out unless asked for.
+            assert!(!text.contains("user:10"), "{text}");
+            assert!(!text.contains("127.0.0.1"), "{text}");
+        }
+
+        let path = dir.join("with-examples.md");
+        let mut a = args();
+        a.report = Some(ReportFormat::Md);
+        a.output = Some(path.clone());
+        a.examples = true;
+        run_scan(&config, &snaps, &a).await.1.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("## Example keys") && text.contains("user:10"),
+            "{text}"
+        );
+
+        // Without -o the report goes to standard output; --check lines go to stderr then.
+        let mut a = checks(&["no-ttl-pct<20"]);
+        a.report = Some(ReportFormat::Csv);
+        let (out, result) = run_scan(&config, &snaps, &a).await;
+        assert_eq!(exit_code(&result.unwrap_err()), 1);
+        assert!(out.starts_with("pattern,type"), "{out}");
+        assert!(!out.contains("FAIL"), "{out}");
+    }
 }

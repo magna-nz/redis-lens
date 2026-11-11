@@ -1,0 +1,24 @@
+---
+source: src/report/md.rs
+expression: "render(&r, None, false)"
+---
+# redis-lens report: staging
+
+- **Server:** Redis 7.4.2 (standalone)
+- **Scanned:** 1970-01-01 00:00:00 UTC
+- **Memory:** 50M used of no limit, eviction allkeys-lfu
+- **Keys:** 100 sampled of 10,000 total (1%)
+- **Coverage:** whole keyspace
+- **Sizes:** unavailable: MEMORY USAGE denied, so sizes are left out
+
+## Top patterns
+
+| Pattern | Type | Keys | Memory | Share | Avg | No TTL |
+|---|---|---:|---:|---:|---:|---:|
+| a:{id} | hash | 1.0K | — | 100% | — | 50% |
+
+## TTL risks
+
+| Pattern | Verdict | No TTL | Why |
+|---|---|---:|---|
+| a:{id} | mixed · likely bug | 50% | 50% of 1.0K keys never expire, while the rest expire in about a day. A write path probably skips EXPIRE. |
