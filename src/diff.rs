@@ -1,7 +1,7 @@
 //! Comparing two scan reports: of the same server over time ([`diff`]), or of two
 //! instances such as staging and prod ([`compare`]).
 
-use crate::model::{PatternStats, ScanReport};
+use crate::model::{NodeStatus, PatternStats, ScanReport};
 
 /// Why a pattern's memory changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -82,6 +82,31 @@ impl ReportDiff {
     pub fn pattern(&self, pattern: &str) -> Option<&PatternDiff> {
         self.patterns.iter().find(|p| p.pattern == pattern)
     }
+}
+
+/// The one line `diff` prints when the two scans did not read the same nodes.
+pub const NODES_DIFFER_NOTE: &str = "the two scans read different nodes (standalone or cluster, shard count, or node ids \
+     or addresses); patterns are compared on the merged rows";
+
+/// The nodes a report was read from: `None` for a standalone scan, else each node's ID and
+/// announced address, sorted.
+fn node_set(r: &ScanReport) -> Option<Vec<(&str, String)>> {
+    r.nodes.as_ref().map(|nodes| {
+        let mut set: Vec<_> = nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n.endpoint.to_string()))
+            .collect();
+        set.sort();
+        set
+    })
+}
+
+/// [`NODES_DIFFER_NOTE`] when `before` and `after` were not read from the same nodes: one
+/// is standalone and the other a cluster, or both are clusters with a different number of
+/// nodes or different node IDs or addresses. `None` when they match, and for two
+/// standalone scans.
+pub fn node_set_note(before: &ScanReport, after: &ScanReport) -> Option<&'static str> {
+    (node_set(before) != node_set(after)).then_some(NODES_DIFFER_NOTE)
 }
 
 /// `a - b` without overflow, clamped to the `i64` range.
@@ -308,6 +333,16 @@ pub struct CompareSummary {
     pub sizes_available: bool,
     pub complete: bool,
     pub match_glob: Option<String>,
+    /// The number of shards of a cluster scan; `None` for a standalone one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shards: Option<usize>,
+    /// Shards of a cluster scan whose node was not scanned to the end.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub shards_unfinished: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl CompareSummary {
@@ -323,6 +358,13 @@ impl CompareSummary {
             sizes_available: r.sizes_available,
             complete: r.complete,
             match_glob: r.match_glob.clone(),
+            shards: r.nodes.as_ref().map(Vec::len),
+            shards_unfinished: r
+                .nodes
+                .iter()
+                .flatten()
+                .filter(|n| n.status != NodeStatus::Scanned)
+                .count(),
         }
     }
 }
@@ -1059,5 +1101,75 @@ mod tests {
         left.match_glob = Some("user:*".into());
         let right = report(vec![stats("order:{id}", 1, Some(1))], true);
         assert!(!compare(&left, &right).same_keyspace);
+    }
+
+    fn cluster_of(n: u16) -> ScanReport {
+        let mut r = crate::report::fixtures::cluster_report();
+        r.nodes.as_mut().unwrap().truncate(n as usize);
+        r
+    }
+
+    #[test]
+    fn node_set_note_when_standalone_meets_cluster() {
+        let standalone = crate::report::fixtures::report(vec![], true, 0);
+        let cluster = cluster_of(3);
+        assert_eq!(
+            node_set_note(&standalone, &cluster),
+            Some(NODES_DIFFER_NOTE)
+        );
+        assert_eq!(
+            node_set_note(&cluster, &standalone),
+            Some(NODES_DIFFER_NOTE)
+        );
+    }
+
+    #[test]
+    fn node_set_note_on_a_different_shard_count_id_or_endpoint() {
+        let three = cluster_of(3);
+        assert_eq!(
+            node_set_note(&three, &cluster_of(2)),
+            Some(NODES_DIFFER_NOTE)
+        );
+        let mut moved = cluster_of(3);
+        moved.nodes.as_mut().unwrap()[1].endpoint.host = "10.0.1.99".into();
+        assert_eq!(node_set_note(&three, &moved), Some(NODES_DIFFER_NOTE));
+        let mut other_id = cluster_of(3);
+        other_id.nodes.as_mut().unwrap()[0].id = "f".repeat(40);
+        assert_eq!(node_set_note(&three, &other_id), Some(NODES_DIFFER_NOTE));
+    }
+
+    #[test]
+    fn no_node_set_note_when_the_nodes_match() {
+        let a = crate::report::fixtures::report(vec![], true, 0);
+        assert_eq!(node_set_note(&a, &a), None);
+        let mut x = cluster_of(3);
+        let mut y = cluster_of(3);
+        // Order, status and figures do not matter, only which nodes.
+        y.nodes.as_mut().unwrap().reverse();
+        y.nodes.as_mut().unwrap()[0].sampled_keys = 7;
+        x.nodes.as_mut().unwrap()[0].status = NodeStatus::Failed;
+        assert_eq!(node_set_note(&x, &y), None);
+    }
+
+    #[test]
+    fn patterns_are_still_diffed_across_node_sets() {
+        let (before, _) = crate::report::fixtures::before_after();
+        let after = cluster_of(3);
+        let d = diff(&before, &after);
+        assert!(d.pattern("user:{id}:cart").is_some());
+        assert!(d.pattern("job:{id}").is_some());
+    }
+
+    #[test]
+    fn compare_summary_counts_shards() {
+        let c = compare(
+            &cluster_of(3),
+            &crate::report::fixtures::report(vec![], true, 0),
+        );
+        assert_eq!(c.left.shards, Some(3));
+        assert_eq!(c.left.shards_unfinished, 2);
+        assert_eq!(c.right.shards, None);
+        let json = serde_json::to_string(&c.right).unwrap();
+        assert!(!json.contains("shards"), "{json}");
     }
 }
