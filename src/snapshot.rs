@@ -348,8 +348,13 @@ pub fn retention_plan(
         .into_iter()
         .filter(|info| written_by_save(&pdir, info))
         .collect();
+    // Snapshots dated after `now_unix` (a clock that was ahead, or a file copied from
+    // another machine) are never deleted and take no keep slot: otherwise they would
+    // rank as the newest and `scan --save --keep N` would delete the snapshot it just
+    // wrote. Only snapshots up to now are ranked.
     Ok(owned
         .into_iter()
+        .filter(|info| info.taken_at_unix <= now_unix)
         .enumerate()
         .filter(|(i, info)| !retention.keeps(*i, info.taken_at_unix, now_unix))
         .map(|(_, info)| info)
@@ -903,6 +908,39 @@ mod tests {
         // Applying it again finds nothing more.
         assert!(apply_retention(&dir, "p", r, now).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clock skew: snapshots dated after now must not push out the one just saved.
+    #[test]
+    fn future_dated_snapshots_never_cost_the_newest_real_one() {
+        let now = 1_800_000_000;
+        for keep in [1, 2] {
+            let dir = temp_dir(&format!("ret-future-{keep}"));
+            for ahead in [300 * DAY, 200 * DAY] {
+                save(&dir, &report("p", now + ahead)).unwrap();
+            }
+            for back in [0, DAY, 2 * DAY] {
+                save(&dir, &report("p", now - back)).unwrap();
+            }
+            let r = Retention {
+                keep: Some(keep),
+                keep_days: None,
+            };
+            let deleted = apply_retention(&dir, "p", r, now).unwrap();
+            // The future files and the newest `keep` real ones stay; nothing at or
+            // after `now` is deleted.
+            assert!(times(&deleted).iter().all(|t| *t < now), "keep {keep}");
+            let left = listed(&dir, "p");
+            assert!(
+                left.contains(&now),
+                "keep {keep}: the snapshot just saved is gone"
+            );
+            assert!(left.contains(&(now + 300 * DAY)) && left.contains(&(now + 200 * DAY)));
+            assert_eq!(left.len(), 2 + keep as usize, "keep {keep}");
+            // `snapshots prune` uses the same plan.
+            assert!(retention_plan(&dir, "p", r, now).unwrap().is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

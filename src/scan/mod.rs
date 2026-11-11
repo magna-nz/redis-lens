@@ -1085,6 +1085,27 @@ mod tests {
         assert_eq!(l.wait(Duration::from_secs(3)), Duration::ZERO);
     }
 
+    /// The server-context commands (`INFO keyspace`, `INFO keysizes`, `MEMORY STATS`) each
+    /// count against the scan's command budget, so `--max-rate` covers them too.
+    #[test]
+    fn context_commands_count_against_the_budget() {
+        let mut server = fake::Server::new(keyspace(10, |_| Fate::Present), 10);
+        let mut l = Limiter::new(Some(1_000_000));
+        run_timed(context::read(&mut server, 0, &perms_all(), &mut l));
+        assert_eq!(server.log.len(), 3, "{:?}", server.log);
+        assert_eq!(l.sent, server.log.len() as u64);
+        // A denied MEMORY STATS is not sent and not counted.
+        let mut server = fake::Server::new(keyspace(10, |_| Fate::Present), 10);
+        let mut l = Limiter::new(Some(1_000_000));
+        let denied = perms_with(
+            crate::model::PERM_MEMORY_STATS,
+            crate::model::PermStatus::Denied("NOPERM".into()),
+        );
+        run_timed(context::read(&mut server, 0, &denied, &mut l));
+        assert_eq!(l.sent, 2);
+        assert_eq!(server.log.len(), 2, "{:?}", server.log);
+    }
+
     #[test]
     fn limiter_without_a_limit_never_waits() {
         for rate in [None, Some(0)] {

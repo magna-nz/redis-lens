@@ -9,7 +9,7 @@
 
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{RecvTimeoutError, channel};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use secrecy::SecretString;
@@ -21,6 +21,23 @@ pub const TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// most (an Entra ID access token is about 2 KiB, an AWS IAM auth token about 1 KiB);
 /// anything longer is not a token, and reading stops there.
 pub const TOKEN_MAX_BYTES: usize = 64 * 1024;
+
+/// After the command exits, how long its output may stay open before what it printed
+/// is taken as the output (a background process it started can hold it open).
+const CLOSE_GRACE: Duration = Duration::from_millis(250);
+
+/// What the reader thread has collected so far.
+#[derive(Default)]
+struct Output {
+    bytes: Vec<u8>,
+    /// The output reached its end (or the read limit).
+    closed: bool,
+    error: Option<std::io::ErrorKind>,
+}
+
+fn lock(m: &Mutex<Output>) -> MutexGuard<'_, Output> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// How often [`run_with`] checks whether the command has exited.
 const POLL: Duration = Duration::from_millis(10);
@@ -82,16 +99,29 @@ fn run_with(argv: &[String], timeout: Duration, max: usize) -> Result<SecretStri
             reason: e.to_string(),
         })?;
 
-    // Read on a helper thread so the timeout holds even while the command writes
-    // nothing. At most `max + 1` bytes are read: one more than allowed says "too long".
+    // A helper thread copies the output into `shared` as it arrives, so the timeout holds
+    // even while the command writes nothing. It reads at most `max + 1` bytes: one more
+    // than allowed says "too long".
     let mut stdout = child.stdout.take().expect("stdout is piped");
-    let (tx, rx) = channel();
+    let shared = Arc::new(Mutex::new(Output::default()));
+    let sink = Arc::clone(&shared);
     let reader = std::thread::Builder::new()
         .name("token-command".into())
         .spawn(move || {
-            let mut buf = Vec::new();
-            let r = (&mut stdout).take(max as u64 + 1).read_to_end(&mut buf);
-            let _ = tx.send(r.map(|_| buf));
+            let mut chunk = [0u8; 4096];
+            let mut limited = (&mut stdout).take(max as u64 + 1);
+            loop {
+                match limited.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => lock(&sink).bytes.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => {
+                        lock(&sink).error = Some(e.kind());
+                        break;
+                    }
+                }
+            }
+            lock(&sink).closed = true;
         });
     if reader.is_err() {
         stop(&mut child);
@@ -100,52 +130,53 @@ fn run_with(argv: &[String], timeout: Duration, max: usize) -> Result<SecretStri
             reason: "could not start a thread to read its output".into(),
         });
     }
-
-    let left = |now: Instant| timeout.saturating_sub(now.saturating_duration_since(started));
-    let out = match rx.recv_timeout(left(Instant::now())) {
-        Ok(Ok(buf)) => buf,
-        Ok(Err(e)) => {
+    // Wait for the command to exit, not for its output to close: a helper process it
+    // started in the background (telemetry, a credential cache) can inherit standard
+    // output and keep it open long after the token was printed. Once the command has
+    // exited, the output gets [`CLOSE_GRACE`] to close, and then what it printed is
+    // the output.
+    let mut exited: Option<(ExitStatus, Instant)> = None;
+    let out = loop {
+        let (closed, len, error) = {
+            let o = lock(&shared);
+            (o.closed, o.bytes.len(), o.error)
+        };
+        if len > max {
+            stop(&mut child);
+            return Err(TokenError::TooLong { program: name() });
+        }
+        if let Some(kind) = error {
             stop(&mut child);
             return Err(TokenError::Spawn {
                 program: name(),
-                reason: format!("could not read its output: {}", e.kind()),
+                reason: format!("could not read its output: {kind}"),
             });
         }
-        Err(RecvTimeoutError::Timeout) => {
+        if exited.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => exited = Some((status, Instant::now())),
+                Ok(None) => {}
+                Err(e) => {
+                    stop(&mut child);
+                    return Err(TokenError::Spawn {
+                        program: name(),
+                        reason: format!("could not wait for it: {}", e.kind()),
+                    });
+                }
+            }
+        }
+        if let Some((_, at)) = exited
+            && (closed || at.elapsed() >= CLOSE_GRACE)
+        {
+            break std::mem::take(&mut lock(&shared).bytes);
+        }
+        if exited.is_none() && started.elapsed() >= timeout {
             stop(&mut child);
             return Err(TokenError::Timeout { program: name() });
         }
-        Err(RecvTimeoutError::Disconnected) => {
-            stop(&mut child);
-            return Err(TokenError::Spawn {
-                program: name(),
-                reason: "its output could not be read".into(),
-            });
-        }
+        std::thread::sleep(POLL);
     };
-    if out.len() > max {
-        stop(&mut child);
-        return Err(TokenError::TooLong { program: name() });
-    }
-
-    // Output is closed; wait for the exit status within what is left of the timeout.
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if left(Instant::now()).is_zero() => {
-                stop(&mut child);
-                return Err(TokenError::Timeout { program: name() });
-            }
-            Ok(None) => std::thread::sleep(POLL),
-            Err(e) => {
-                stop(&mut child);
-                return Err(TokenError::Spawn {
-                    program: name(),
-                    reason: format!("could not wait for it: {}", e.kind()),
-                });
-            }
-        }
-    };
+    let (status, _) = exited.expect("the loop only ends after the command exited");
     if !status.success() {
         return Err(TokenError::Failed {
             program: name(),
@@ -155,8 +186,7 @@ fn run_with(argv: &[String], timeout: Duration, max: usize) -> Result<SecretStri
 
     let mut token = String::from_utf8(out).map_err(|_| TokenError::NotUtf8 { program: name() })?;
     // One trailing newline (`\n` or `\r\n`), as `echo`, `az … -o tsv` and most tools
-    // print; anything else is part of the token. Truncating keeps the allocation, so
-    // no copy of the token is left behind.
+    // print; anything else is part of the token.
     if token.ends_with('\n') {
         token.pop();
         if token.ends_with('\r') {
@@ -250,6 +280,57 @@ mod tests {
         assert!(matches!(e, TokenError::NoOutput { .. }), "{e:?}");
         let t = run_token_command(&sh("echo leaked-on-stderr >&2; echo tok")).unwrap();
         assert_eq!(t.expose_secret(), "tok");
+    }
+
+    /// Standard input and standard error are both `/dev/null`: the command can't wait
+    /// for input, and nothing it writes to stderr (where tools sometimes echo tokens)
+    /// reaches the terminal. The script prints a token only when both hold.
+    #[test]
+    fn stdin_and_stderr_are_dev_null() {
+        let t = run_token_command(&sh(
+            "test /dev/fd/0 -ef /dev/null && test /dev/fd/2 -ef /dev/null && echo both-null",
+        ))
+        .unwrap();
+        assert_eq!(t.expose_secret(), "both-null");
+    }
+
+    /// The command that times out is really killed, not left running.
+    #[test]
+    fn a_timed_out_command_is_killed() {
+        let dir = std::env::temp_dir().join(format!("lens-token-kill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        let e = run_with(&sh(&script), Duration::from_millis(300), 1024).unwrap_err();
+        assert!(matches!(e, TokenError::Timeout { .. }), "{e}");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "pid {} still runs after the timeout", pid.trim());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A command that exits after printing its token, but leaves a background process
+    /// holding standard output open, still gives the token, without waiting for it.
+    #[test]
+    fn a_background_child_holding_stdout_does_not_cost_the_token() {
+        let started = Instant::now();
+        let t = run_with(
+            &sh("sleep 5 & echo tok-from-parent"),
+            Duration::from_secs(3),
+            1024,
+        )
+        .unwrap();
+        assert_eq!(t.expose_secret(), "tok-from-parent");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

@@ -889,6 +889,27 @@ mod tests {
         panic!("no confirmation expected")
     }
 
+    /// Replacing a password profile with a token command that has no username leaves
+    /// no keychain entry behind: the old username and password are deleted.
+    #[tokio::test]
+    async fn replacing_with_a_token_command_without_a_username_deletes_the_old_entry() {
+        let path = temp_path("token-replace");
+        let store = MemoryStore::default();
+        add(&path, &store, &args("c", "redis://u:old-pw@h"), None)
+            .await
+            .unwrap();
+        assert!(entry(&store, "c").is_some());
+        let mut a = token_args("c", "rediss://h2:6380", &["printf", "tok"]);
+        a.force = true;
+        a.yes = true;
+        add_token(&path, &store, &a, &never).await.unwrap();
+        assert_eq!(entry(&store, "c"), None);
+        let p = Config::load(&path).unwrap().get("c").unwrap().clone();
+        assert_eq!(p.auth, Auth::Command);
+        assert_eq!(p.token_command, Some(vec!["printf".into(), "tok".into()]));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[tokio::test]
     async fn token_command_goes_to_the_config_and_the_username_to_the_keychain() {
         let path = temp_path("token-user");

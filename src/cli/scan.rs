@@ -823,4 +823,38 @@ mod tests {
             assert!(l.chars().count() <= 60);
         }
     }
+
+    /// The `--check` baseline is the newest earlier snapshot with the scan's own
+    /// `MATCH` glob: a newer snapshot taken with another glob is passed over.
+    #[test]
+    fn the_baseline_shares_the_scans_match_glob() {
+        let dir = std::env::temp_dir().join(format!(
+            "lens-baseline-glob-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut whole = report(vec![], true, "noeviction");
+        whole.taken_at_unix = 1_000;
+        let mut narrowed = report(vec![], true, "noeviction");
+        narrowed.taken_at_unix = 2_000;
+        narrowed.match_glob = Some("user:*".into());
+        snapshot::save(&dir, &whole).unwrap();
+        snapshot::save(&dir, &narrowed).unwrap();
+        let mut now = report(vec![], true, "noeviction");
+        now.taken_at_unix = 3_000;
+        let d = baseline_diff(&|| Ok(dir.clone()), &now).expect("a baseline");
+        assert_eq!(d.before_taken_at_unix, 1_000, "the snapshot with no glob");
+        now.match_glob = Some("user:*".into());
+        let d = baseline_diff(&|| Ok(dir.clone()), &now).expect("a baseline");
+        assert_eq!(
+            d.before_taken_at_unix, 2_000,
+            "the snapshot with the same glob"
+        );
+        now.match_glob = Some("order:*".into());
+        assert!(baseline_diff(&|| Ok(dir.clone()), &now).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

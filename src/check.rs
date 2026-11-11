@@ -432,8 +432,12 @@ fn per_pattern(rule: &Rule, report: &ScanReport, baseline: Option<&ReportDiff>) 
     if matches!(rule.metric, Metric::PatternBytes | Metric::Growth) && !report.sizes_available {
         return Outcome::NotJudged("no MEMORY USAGE".to_string());
     }
-    let verdict_needs_history =
-        matches!(rule.limit, Limit::Verdict(VerdictName::PersistentGrowing));
+    // Growing and stable can only be told apart with history: without a baseline every
+    // persistent pattern would look stable.
+    let verdict_needs_history = matches!(
+        rule.limit,
+        Limit::Verdict(VerdictName::PersistentGrowing | VerdictName::PersistentStable)
+    );
     if baseline.is_none() && (rule.metric == Metric::Growth || verdict_needs_history) {
         return Outcome::NotJudged("no baseline snapshot".to_string());
     }
@@ -1010,20 +1014,39 @@ mod tests {
         );
         assert_eq!(fails(&eval("verdict!=mixed", &r, None)), ["mixedp"]);
         assert_eq!(fails(&eval("verdict=ok", &r, None)), ["mixedp", "persist"]);
-        assert_eq!(
-            fails(&eval("verdict!=persistent-stable", &r, None)),
-            ["persist"]
-        );
         // The verdict a failure shows is the verdict word.
         match eval("verdict!=mixed", &r, None) {
             Outcome::Fail { offenders, .. } => assert_eq!(offenders[0].value, "mixed"),
             other => panic!("{other:?}"),
         }
-        // "growing" can't be judged without history.
-        assert_eq!(
-            eval("verdict!=persistent-growing", &r, None),
-            Outcome::NotJudged("no baseline snapshot".into())
-        );
+        // "growing" and "stable" can't be told apart without history.
+        for text in [
+            "verdict!=persistent-growing",
+            "verdict!=persistent-stable",
+            "verdict=persistent-stable",
+        ] {
+            assert_eq!(
+                eval(text, &r, None),
+                Outcome::NotJudged("no baseline snapshot".into()),
+                "{text}"
+            );
+        }
+    }
+
+    /// Growth and verdict rules ask for a baseline; the others don't, so a scan with only
+    /// those skips the snapshot lookup.
+    #[test]
+    fn which_rules_need_a_baseline() {
+        for text in [
+            "growth<25%",
+            "verdict!=mixed",
+            "verdict!=persistent-growing",
+        ] {
+            assert!(rule(text).needs_baseline(), "{text}");
+        }
+        for text in ["no-ttl-pct<20", "pattern-bytes<1GiB", "total-bytes<2GiB"] {
+            assert!(!rule(text).needs_baseline(), "{text}");
+        }
     }
 
     #[test]

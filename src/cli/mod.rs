@@ -24,6 +24,16 @@ pub struct ChecksFailed(pub usize);
 #[error(transparent)]
 pub struct GateError(pub anyhow::Error);
 
+/// `--keep N`: a count of at least 1. The newest snapshot is always kept, so 0 would
+/// silently mean 1.
+fn keep_count(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err("must be at least 1 (the newest snapshot is always kept)".to_string()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// The process exit code for an error from [`run`]: 2 for [`GateError`], 1 otherwise
 /// ([`ChecksFailed`] included).
 pub fn exit_code(err: &anyhow::Error) -> u8 {
@@ -83,8 +93,8 @@ pub enum SnapshotsCommand {
     Prune {
         /// Profile name.
         profile: String,
-        /// Keep only the newest N snapshots.
-        #[arg(long)]
+        /// Keep only the newest N snapshots (N is at least 1).
+        #[arg(long, value_parser = keep_count)]
         keep: Option<usize>,
         /// Delete snapshots older than D days.
         #[arg(long)]
@@ -254,8 +264,8 @@ pub struct ScanArgs {
     /// Save the report as a snapshot for later comparison.
     #[arg(long)]
     pub save: bool,
-    /// With --save, keep only the newest N snapshots of this profile.
-    #[arg(long, requires = "save")]
+    /// With --save, keep only the newest N snapshots of this profile (N is at least 1).
+    #[arg(long, requires = "save", value_parser = keep_count)]
     pub keep: Option<usize>,
     /// With --save, delete this profile's snapshots older than D days.
     #[arg(long, requires = "save")]
@@ -342,6 +352,23 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn keep_must_be_at_least_one() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv);
+        for argv in [
+            &["redis-lens", "snapshots", "prune", "p", "--keep", "0"][..],
+            &["redis-lens", "scan", "p", "--save", "--keep", "0"][..],
+        ] {
+            let e = parse(argv).unwrap_err();
+            assert_eq!(
+                e.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{argv:?}"
+            );
+        }
+        assert!(parse(&["redis-lens", "scan", "p", "--save", "--keep", "1"]).is_ok());
     }
 
     #[test]
