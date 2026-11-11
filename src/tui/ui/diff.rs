@@ -11,7 +11,7 @@ use crate::snapshot::format_utc;
 use crate::tui::app::{App, History};
 
 use super::delta::{Change, cause_words, ratio_change, signed_bytes, signed_percent};
-use super::widgets::{fit, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset};
+use super::widgets::{fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset};
 use super::{notice_panels, report_or_wait, spinner, split_body, style};
 
 const NUM_W: usize = 7;
@@ -136,7 +136,8 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, d: &ReportDiff) {
         .iter()
         .skip(off)
         .take(usize::from(body.height))
-        .map(|p| diff_row(p, max, name))
+        .enumerate()
+        .map(|(i, p)| diff_row(p, max, name, (off + i == sel).then(|| app.sel_ticks())))
         .collect();
     rows(frame, body, lines, Some(sel - off));
     detail_panel(frame, detail, &d.patterns[sel]);
@@ -173,13 +174,16 @@ fn grew_style(c: Change) -> Style {
     }
 }
 
-fn diff_row(p: &PatternDiff, max: u64, name: usize) -> Line<'static> {
+fn diff_row(p: &PatternDiff, max: u64, name: usize, scroll: Option<u64>) -> Line<'static> {
     let dash = || "—".to_string();
     let c = Change::of(p);
     let (before, after, fmt) = sides(p);
     let mut spans = vec![Span::raw(" ")];
     spans.extend(pattern_spans(&p.pattern, style::fg(), style::ph()));
-    let mut spans = fit(spans, name.saturating_sub(1));
+    let mut spans = match scroll {
+        Some(ticks) => marquee_spans(spans, name.saturating_sub(1), ticks),
+        None => fit(spans, name.saturating_sub(1)),
+    };
     spans.push(Span::raw(" "));
     let len = if c.unchanged || c.value == 0 || max == 0 {
         0

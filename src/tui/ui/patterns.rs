@@ -12,8 +12,8 @@ use crate::tui::tree::{Root, Row, Summary, Verdict, summarize, summarize_group};
 
 use super::delta::Change;
 use super::widgets::{
-    bar, fit, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset, split_cols, trunc,
-    ttl_hist_spans,
+    bar, fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset, split_cols,
+    trunc, ttl_hist_spans,
 };
 use super::{report_or_wait, split_body, style};
 
@@ -194,7 +194,8 @@ fn table(
         .iter()
         .enumerate()
         .map(|(i, (s, depth, open))| {
-            let mut line = pattern_row(s, *depth, *open, total, sizes, &c);
+            let scroll = (i == sel).then(|| app.sel_ticks());
+            let mut line = pattern_row(s, *depth, *open, total, sizes, &c, scroll);
             if let Some(ch) = changes {
                 line.push_span(match ch.get(i).copied().flatten() {
                     Some(d) => Span::styled(format!("{} ", pad_l(&d.text(), DELTA_W)), d.style()),
@@ -222,6 +223,7 @@ fn pattern_row(
     total: u64,
     sizes: bool,
     c: &Cols,
+    scroll: Option<u64>,
 ) -> Line<'static> {
     let mark = match open {
         Some(true) => "▾ ",
@@ -238,7 +240,10 @@ fn pattern_row(
         style::dim(),
     )];
     name.extend(pattern_spans(&s.label, base, ph));
-    let mut spans = fit(name, c.name - 1);
+    let mut spans = match scroll {
+        Some(ticks) => marquee_spans(name, c.name - 1, ticks),
+        None => fit(name, c.name - 1),
+    };
     spans.push(Span::raw(" "));
 
     let weight = if sizes {

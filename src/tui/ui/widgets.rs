@@ -54,6 +54,94 @@ pub fn pad_l(s: &str, w: usize) -> String {
     format!("{}{t}", " ".repeat(n))
 }
 
+/// Ticks (100 ms each) a long name rests before it starts to scroll, and holds at its end.
+const MARQUEE_REST: u64 = 10;
+/// Ticks per column of scrolling: 5 columns a second.
+const MARQUEE_STEP: u64 = 2;
+
+/// How far a text `total` cells wide is scrolled in a cell `w` wide after `ticks`:
+/// `None` at rest (the `trunc` view), else the first text column shown (at least 1).
+/// Only for `total > w >= 2`. The cycle is rest, scroll, hold, and then it repeats.
+fn marquee_offset(total: usize, w: usize, ticks: u64) -> Option<usize> {
+    // The last window shows `w - 1` cells after the leading `…`.
+    let max = (total - (w - 1)) as u64;
+    // The last column step is reached after `max - 1` steps, and then the hold starts.
+    let scroll = MARQUEE_STEP * (max - 1);
+    let t = ticks % (MARQUEE_REST + scroll + MARQUEE_REST);
+    if t < MARQUEE_REST {
+        return None;
+    }
+    Some((((t - MARQUEE_REST) / MARQUEE_STEP + 1).min(max)) as usize)
+}
+
+/// `s` in a cell `w` wide, scrolling when it does not fit. `ticks` counts from when the
+/// row was selected. Text that fits is returned unchanged. Otherwise for the first 10
+/// ticks the result is `trunc(s, w)`; then the text slides left one column every 2
+/// ticks until its end shows, holds there for 10 ticks, rests again and repeats.
+/// A scrolled window is a leading `…` and then the text from the scrolled column on, so
+/// it is never cut on the right until the end is reached. A double-width character that
+/// the scroll cuts is dropped and a space pads, so the result is exactly `w` cells.
+pub fn marquee(s: &str, w: usize, ticks: u64) -> String {
+    if width(s) <= w {
+        return s.to_string();
+    }
+    marquee_spans(vec![Span::raw(s.to_string())], w, ticks)
+        .iter()
+        .map(|sp| sp.content.as_ref())
+        .collect()
+}
+
+/// Like [`fit`] (padded to exactly `w` cells), but a cut text scrolls as in [`marquee`].
+pub fn marquee_spans(spans: Vec<Span<'static>>, w: usize, ticks: u64) -> Vec<Span<'static>> {
+    let total: usize = spans.iter().map(|s| width(&s.content)).sum();
+    if total <= w || w < 2 {
+        return fit(spans, w);
+    }
+    let Some(from) = marquee_offset(total, w, ticks) else {
+        return fit(spans, w);
+    };
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 1; // The leading `…`.
+    let mut col = 0;
+    let mut full = false;
+    for sp in &spans {
+        let mut part = String::new();
+        for c in sp.content.chars() {
+            let cw = char_width(c);
+            let start = col;
+            col += cw;
+            if start < from {
+                continue;
+            }
+            if used + cw > w {
+                full = true;
+                break;
+            }
+            part.push(c);
+            used += cw;
+        }
+        if !part.is_empty() {
+            out.push(Span::styled(part, sp.style));
+        }
+        if full {
+            break;
+        }
+    }
+    let lead = Span::styled("…", out.first().map_or(Style::default(), |s| s.style));
+    out.insert(0, lead);
+    if used < w {
+        out.push(Span::raw(" ".repeat(w - used)));
+    }
+    out
+}
+
+/// Exactly `w` cells, left-aligned; a cut text scrolls as in [`marquee`].
+pub fn pad_r_marquee(s: &str, w: usize, ticks: u64) -> String {
+    let t = marquee(s, w, ticks);
+    let n = w.saturating_sub(width(&t));
+    format!("{t}{}", " ".repeat(n))
+}
+
 /// Spans cut or padded to exactly `w` cells. A cut ends in `…`.
 pub fn fit(spans: Vec<Span<'static>>, w: usize) -> Vec<Span<'static>> {
     let total: usize = spans.iter().map(|s| width(&s.content)).sum();
@@ -241,6 +329,82 @@ pub fn split_cols(inner: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marquee_fits_unchanged() {
+        assert_eq!(marquee("abc", 5, 0), "abc");
+        assert_eq!(marquee("abc", 3, 999), "abc");
+    }
+
+    #[test]
+    fn marquee_rests_for_a_second() {
+        let s = "abcdefghijklmnop";
+        for t in 0..10 {
+            assert_eq!(marquee(s, 6, t), trunc(s, 6), "tick {t}");
+        }
+        assert_eq!(marquee(s, 6, 0), "abcde…");
+    }
+
+    #[test]
+    fn marquee_scrolls_a_column_every_two_ticks() {
+        let s = "abcdefghijklmnop";
+        assert_eq!(marquee(s, 6, 10), "…bcdef");
+        assert_eq!(marquee(s, 6, 11), "…bcdef");
+        assert_eq!(marquee(s, 6, 12), "…cdefg");
+        assert_eq!(marquee(s, 6, 16), "…efghi");
+    }
+
+    #[test]
+    fn marquee_end_window_shows_the_end_and_holds() {
+        let s = "abcdefghijklmnop"; // 16 wide, w 6: last offset 11, reached at tick 30.
+        let end = "…lmnop";
+        assert_eq!(marquee(s, 6, 28), "…klmno");
+        assert_eq!(marquee(s, 6, 29), "…klmno");
+        for t in 30..40 {
+            assert_eq!(marquee(s, 6, t), end, "tick {t}");
+        }
+        assert_eq!(marquee(s, 6, 40), trunc(s, 6));
+    }
+
+    #[test]
+    fn marquee_repeats() {
+        let s = "abcdefghijklmnop";
+        let cycle = 10 + 20 + 10;
+        for t in 0..cycle {
+            assert_eq!(marquee(s, 6, t), marquee(s, 6, t + cycle), "tick {t}");
+            assert_eq!(marquee(s, 6, t), marquee(s, 6, t + 5 * cycle), "tick {t}");
+        }
+        assert_eq!(marquee(s, 6, cycle), trunc(s, 6));
+    }
+
+    #[test]
+    fn marquee_keeps_the_width_with_double_width_text() {
+        let s = "日本語のキー名前テスト";
+        for w in [2, 3, 4, 5, 8, 9] {
+            for t in 0..200 {
+                assert_eq!(width(&marquee(s, w, t)), w, "w {w} tick {t}");
+            }
+        }
+        let s = "a日b本c語d";
+        for t in 0..200 {
+            assert_eq!(width(&marquee(s, 4, t)), 4, "tick {t}");
+        }
+    }
+
+    #[test]
+    fn marquee_spans_keep_styles_and_width() {
+        let spans = vec![
+            Span::raw(" "),
+            Span::styled("user:", style::fg()),
+            Span::styled("{id}", style::ph()),
+            Span::styled(":profile:settings", style::fg()),
+        ];
+        let out = marquee_spans(spans, 12, 16);
+        let text: String = out.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(width(&text), 12);
+        assert!(text.starts_with('…'));
+        assert!(out.iter().any(|s| s.style == style::ph()) || !text.contains('{'));
+    }
 
     #[test]
     fn truncation() {
