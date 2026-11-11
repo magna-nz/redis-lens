@@ -35,6 +35,6 @@ expression: t.backend()
 "│ user:331870:cart                                       4.4K   6d 11h   none <1m  <1h  <1d  <7d  <30d >30d            │"
 "│ user:88213:cart                                        3.1K   6d 23h   ███  ·    ▁▁▁  ▁▁▁  ▅▅▅  ·    ·               │"
 "│ ▲ 1 of 3 child patterns has a warning. Expand the group to see them.                                                 │"
-"│ $ redis-cli --scan --pattern 'user:*:*'                                                                              │"
+"│ $ redis-cli --scan --pattern "user:*:*"                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 " ↑↓ Move   →← Fold   / Filter   o Sort   s Snapshot   0-4 View   ? Help   q Quit                                        "

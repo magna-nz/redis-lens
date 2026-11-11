@@ -8,7 +8,7 @@ use crate::diff::ReportDiff;
 use crate::format;
 use crate::model::{PatternStats, TTL_BUCKET_LABELS, Ttl};
 use crate::tui::app::{App, PatternData};
-use crate::tui::clipboard::suggested_command;
+use crate::tui::clipboard::{NO_COMMAND, suggested_command};
 use crate::tui::tree::{Root, Row, SortBy, Summary, Verdict, summarize, summarize_group};
 
 use super::delta::Change;
@@ -506,12 +506,15 @@ fn detail_panel(frame: &mut Frame, area: Rect, s: &Summary, sizes: bool) {
     }
     lines.push(Line::from(verdict_line(s)));
     // The same text `Y` copies.
-    let cmd = suggested_command(&s.label);
+    let (cmd, cmd_style) = match suggested_command(&s.label) {
+        Some(c) => (c, style::cmd()),
+        None => (NO_COMMAND.to_string(), style::dim()),
+    };
     lines.push(Line::from(vec![
         Span::styled(" $ ", style::dim()),
         Span::styled(
             trunc(&cmd, usize::from(inner.width).saturating_sub(3)),
-            style::cmd(),
+            cmd_style,
         ),
     ]));
     rows(frame, inner, lines, None);

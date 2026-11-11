@@ -35,6 +35,6 @@ expression: t.backend()
 "│ user:73:cart                                           2.9K   none     none <1m  <1h  <1d  <7d  <30d >30d            │"
 "│ user:500917:cart                                       2.6K   4d 02h   ▅▅▅  ·    ▁▁▁  ▁▁▁  ███  ·    ·               │"
 "│ ▲ 31% never expire while the rest do. A write path probably skips EXPIRE.                                            │"
-"│ $ redis-cli --scan --pattern 'user:*:cart'                                                                           │"
+"│ $ redis-cli --scan --pattern "user:*:cart"                                                                           │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 " Sorted by keys                                                                                                         "

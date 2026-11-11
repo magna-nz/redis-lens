@@ -864,7 +864,7 @@ mod tests {
     fn copy_effect_writes_osc52_to_the_terminal_output_and_flushes() {
         let (mut runner, mut rx) = runner();
         let mut out = Recorder::default();
-        let text = CopyText::suggested_command("user:{id}:cart");
+        let text = CopyText::suggested_command("user:{id}:cart").unwrap();
         assert!(!runner.run(Effect::Copy(text.clone()), &mut out));
         assert_eq!(out.bytes, clipboard::osc52(&text).unwrap().as_bytes());
         // Flushed after the whole sequence, so it never mixes with the next frame.

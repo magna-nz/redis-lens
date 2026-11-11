@@ -23,6 +23,6 @@ expression: t.backend()
 "│                                          none <1m  <1h  <1d  <7d  <30d >30d  │"
 "│                                          ███  ·    ·    ·    ·    ·    ·     │"
 "│ ▲ Very large keys: max 612M.                                                 │"
-"│ $ redis-cli --scan --pattern 'queue:emails'                                  │"
+"│ $ redis-cli --scan --pattern "queue:emails"                                  │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 " ↑↓ Move   →← Fold   / Filter   o Sort   s Snapshot   0-4 View   ? Help   q Quit"

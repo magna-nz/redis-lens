@@ -35,6 +35,6 @@ expression: t.backend()
 "│ cache:product:31337                                    6.2K   9h 41m   none <1m  <1h  <1d  <7d  <30d >30d            │"
 "│ cache:product:4471                                     6.0K   52m 00s  ▁▁▁  ·    ▁▁▁  ███  ·    ·    ·               │"
 "│ ▲ 1 of 2 child patterns has a warning. Expand the group to see them.                                                 │"
-"│ $ redis-cli --scan --pattern 'cache-of-a-service-with-an-exceedingly-long-descriptive-name:*'                        │"
+"│ $ redis-cli --scan --pattern "cache-of-a-service-with-an-exceedingly-long-descriptive-name:*"                        │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 " ↑↓ Move   →← Fold   / Filter   o Sort   s Snapshot   0-4 View   ? Help   q Quit                                        "

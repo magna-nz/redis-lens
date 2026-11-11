@@ -926,11 +926,12 @@ impl App {
     /// `y` (`command` false) and `Y` on views 1-4: the selected row's pattern or key
     /// name, or the suggested command for its pattern.
     fn copy(&mut self, command: bool) -> Vec<Effect> {
+        // `None` inside: a command was asked for and the pattern has no safe one.
         let of_pattern = |p: String| {
             if command {
                 CopyText::suggested_command(&p)
             } else {
-                CopyText::pattern(&p)
+                Some(CopyText::pattern(&p))
             }
         };
         let text = match self.view {
@@ -942,7 +943,7 @@ impl App {
                 if command {
                     CopyText::suggested_command(&pattern_for_key(&k))
                 } else {
-                    CopyText::key(&k)
+                    Some(CopyText::key(&k))
                 }
             }),
         };
@@ -950,6 +951,20 @@ impl App {
             self.set_info("Nothing selected to copy.");
             return Vec::new();
         };
+        let Some(text) = text else {
+            self.set_info(
+                "No command to copy: the pattern has characters that are not safe to paste into a shell. y copies the pattern.",
+            );
+            return Vec::new();
+        };
+        // A pasted newline would run whatever follows it in a shell.
+        if text.as_str().chars().any(char::is_control) {
+            self.set_info(format!(
+                "This {} has control characters, so it is not copied.",
+                text.what()
+            ));
+            return Vec::new();
+        }
         if clipboard::osc52(&text).is_none() {
             self.set_info(format!("This {} is too long to copy.", text.what()));
             return Vec::new();
@@ -3956,6 +3971,45 @@ mod tests {
         )
     }
 
+    /// `Y` offers no command for a pattern with shell-unsafe characters, and `y` never
+    /// copies text with control characters (a pasted newline would run what follows).
+    #[test]
+    fn unsafe_patterns_and_control_characters_are_not_copied() {
+        let mut report = fixtures::report(true);
+        report.patterns[0].pattern = "x&calc&".into();
+        report.patterns[1].pattern = "nl:\nrm -rf x".into();
+        let names = [
+            report.patterns[0].pattern.clone(),
+            report.patterns[1].pattern.clone(),
+        ];
+        let (mut app, _) = scanned_with(report, fixtures::perms_ok());
+        app.handle_key(ch('1'));
+        let mut saw = [false, false];
+        for _ in 0..app.pattern_rows().len() {
+            let label = selected_label(&app);
+            if label == names[0] {
+                saw[0] = true;
+                let (texts, note) = copies(&mut app, 'Y');
+                assert!(texts.is_empty());
+                assert!(note.starts_with("No command to copy"), "{note}");
+                // The pattern itself has no control characters, so `y` copies it.
+                assert_eq!(copies(&mut app, 'y').0, [CopyText::pattern("x&calc&")]);
+            }
+            if label == names[1] {
+                saw[1] = true;
+                let (texts, note) = copies(&mut app, 'y');
+                assert!(texts.is_empty());
+                assert_eq!(
+                    note,
+                    "This pattern has control characters, so it is not copied."
+                );
+                assert!(copies(&mut app, 'Y').0.is_empty());
+            }
+            app.handle_key(ch('j'));
+        }
+        assert_eq!(saw, [true, true]);
+    }
+
     #[test]
     fn y_and_shift_y_copy_the_selected_row_on_every_report_view() {
         let (mut app, _, report) = finished_with_history();
@@ -3971,8 +4025,8 @@ mod tests {
         assert_eq!(selected_label(&app), "cache:*");
         assert_eq!(copies(&mut app, 'y').0, [CopyText::pattern("cache:*")]);
         let (cmd, text) = copies(&mut app, 'Y');
-        assert_eq!(cmd, [CopyText::suggested_command("cache:*")]);
-        assert_eq!(cmd[0].as_str(), "redis-cli --scan --pattern 'cache:*'");
+        assert_eq!(cmd, [CopyText::suggested_command("cache:*").unwrap()]);
+        assert_eq!(cmd[0].as_str(), "redis-cli --scan --pattern \"cache:*\"");
         assert_eq!(text, note("command"));
         app.handle_key(ch('j'));
         assert_eq!(
@@ -3984,7 +4038,10 @@ mod tests {
         app.handle_key(ch('j'));
         let ttl = report.patterns[app.ttl_rows()[1]].pattern.clone();
         assert_eq!(copies(&mut app, 'y').0, [CopyText::pattern(&ttl)]);
-        assert_eq!(copies(&mut app, 'Y').0, [CopyText::suggested_command(&ttl)]);
+        assert_eq!(
+            copies(&mut app, 'Y').0,
+            [CopyText::suggested_command(&ttl).unwrap()]
+        );
         // Diff: the selected row's pattern.
         app.handle_key(ch('3'));
         app.handle_key(ch('j'));
@@ -3992,7 +4049,7 @@ mod tests {
         assert_eq!(copies(&mut app, 'y').0, [CopyText::pattern(&diff)]);
         assert_eq!(
             copies(&mut app, 'Y').0,
-            [CopyText::suggested_command(&diff)]
+            [CopyText::suggested_command(&diff).unwrap()]
         );
         // Hot keys: the key name, and the command for its pattern.
         app.handle_key(ch('4'));
@@ -4003,15 +4060,13 @@ mod tests {
         let (cmd, _) = copies(&mut app, 'Y');
         assert_eq!(
             cmd,
-            [CopyText::suggested_command(&pattern_for_key(
-                "queue:emails"
-            ))]
+            [CopyText::suggested_command(&pattern_for_key("queue:emails")).unwrap()]
         );
         app.handle_key(ch('j'));
         let (cmd, _) = copies(&mut app, 'Y');
         assert_eq!(
             cmd[0].as_str(),
-            "redis-cli --scan --pattern 'session:*'",
+            "redis-cli --scan --pattern \"session:*\"",
             "the key's pattern, not the key"
         );
         // Partial results can be copied too: they are on screen.

@@ -500,6 +500,18 @@ fn patterns_80x24() {
     insta::assert_snapshot!(t.backend());
 }
 
+/// A pattern whose glob has characters that are not safe in a shell: the detail panel
+/// says why there is no command instead of showing one.
+#[test]
+fn patterns_detail_without_a_safe_command() {
+    let mut report = fixtures::report(true);
+    report.patterns[0].pattern = "evil:x'$(touch pwned)'".into();
+    let (mut app, _) = scanned_with(report, fixtures::perms_ok());
+    select_pattern(&mut app, "evil:x'$(touch pwned)'");
+    let t = render(&app, 120, 36);
+    insta::assert_snapshot!(t.backend());
+}
+
 #[test]
 fn patterns_filter_applied() {
     let mut app = scanned(true);

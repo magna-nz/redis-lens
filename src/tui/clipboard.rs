@@ -60,12 +60,13 @@ impl CopyText {
         }
     }
 
-    /// The `redis-cli --scan` command for a pattern label.
-    pub fn suggested_command(label: &str) -> Self {
-        Self {
+    /// The `redis-cli --scan` command for a pattern label, or `None` when the pattern
+    /// has characters that are not safe in a shell (see [`suggested_command`]).
+    pub fn suggested_command(label: &str) -> Option<Self> {
+        Some(Self {
             kind: CopyKind::Command,
-            text: suggested_command(label),
-        }
+            text: suggested_command(label)?,
+        })
     }
 
     pub fn as_str(&self) -> &str {
@@ -79,32 +80,33 @@ impl CopyText {
 }
 
 /// The command shown in the detail panel and copied by `Y`: `redis-cli --scan
-/// --pattern` with the pattern's glob as one shell word. It carries no host or
-/// credentials.
+/// --pattern "<glob>"`, or `None` when the glob holds a character outside
+/// [`shell_safe`]. It carries no host or credentials.
 ///
 /// Key names come from the server, and anyone who can write keys picks them, so pasting
-/// the command must never run anything else. The glob goes in single quotes, where a
-/// POSIX shell treats nothing as special except `'` itself, written as `'\''`. Control
-/// characters (a newline would also break the line on screen) and `\` (an escape inside
-/// single quotes in fish) become the glob wildcard `?`, which still matches them.
-pub fn suggested_command(label: &str) -> String {
-    format!(
-        "redis-cli --scan --pattern {}",
-        shell_quote(&safe_glob(label))
-    )
+/// the command must never run anything else, in any shell redis-lens runs beside: POSIX
+/// shells, fish, PowerShell and cmd.exe. No single quoting works in all of them (cmd
+/// has no single quotes, PowerShell also ends them at typographic quotes and has no
+/// `\` escape), so instead of escaping, the command is only offered for globs made of
+/// characters that are plain text inside double quotes everywhere.
+pub fn suggested_command(label: &str) -> Option<String> {
+    let glob = format::glob(label);
+    glob.chars()
+        .all(shell_safe)
+        .then(|| format!("redis-cli --scan --pattern \"{glob}\""))
 }
 
-/// [`format::glob`] with control characters and `\` replaced by `?`.
-fn safe_glob(label: &str) -> String {
-    format::glob(label)
-        .chars()
-        .map(|c| if c.is_control() || c == '\\' { '?' } else { c })
-        .collect()
-}
+/// What the detail panel shows in place of the command when [`suggested_command`] has
+/// none.
+pub const NO_COMMAND: &str = "(no command: the pattern has characters that are not safe to paste into a shell; y copies the pattern)";
 
-/// `s` as one single-quoted POSIX shell word.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
+/// ASCII letters and digits and `_ : . / * ? { } [ ] @ # + = , ~ - |`. Inside double
+/// quotes none of them expands, escapes or ends the string in POSIX shells, fish,
+/// PowerShell or cmd.exe, and none is a control character. Left out on purpose, among
+/// others: quotes of any kind, `$`, `` ` ``, `\`, `%`, `!`, `^`, `&`, `;`, `<`, `>`,
+/// `(`, `)`, spaces and anything outside ASCII.
+fn shell_safe(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "_:./*?{}[]@#+=,~-|".contains(c)
 }
 
 /// The OSC 52 "set clipboard" sequence for `t`, or `None` when it would be longer
@@ -199,73 +201,67 @@ mod tests {
     #[test]
     fn suggested_command_format() {
         assert_eq!(
-            suggested_command("user:{id}:cart"),
-            "redis-cli --scan --pattern 'user:*:cart'"
+            suggested_command("user:{id}:cart").unwrap(),
+            "redis-cli --scan --pattern \"user:*:cart\""
         );
-        let t = CopyText::suggested_command("rl:{ip}:{id}");
-        assert_eq!(t.as_str(), "redis-cli --scan --pattern 'rl:*:*'");
+        let t = CopyText::suggested_command("rl:{ip}:{id}").unwrap();
+        assert_eq!(t.as_str(), "redis-cli --scan --pattern \"rl:*:*\"");
         assert_eq!(t.what(), "command");
         for bad in [" -a ", "--user", "--pass", " -u ", "redis://"] {
             assert!(!t.as_str().contains(bad), "{bad}");
         }
     }
 
-    /// Reads one POSIX shell word made of single-quoted runs and `\'`, as
-    /// [`shell_quote`] writes it. `None` for anything else, e.g. an unquoted character
-    /// or an unterminated quote. Also `None` when a `\` appears inside quotes, since
-    /// fish would read it as an escape.
-    fn unquote(word: &str) -> Option<String> {
-        let mut out = String::new();
-        let mut it = word.chars();
-        while let Some(c) = it.next() {
-            match c {
-                '\'' => loop {
-                    match it.next()? {
-                        '\'' => break,
-                        '\\' => return None,
-                        c => out.push(c),
-                    }
-                },
-                '\\' => out.push(it.next().filter(|c| *c == '\'')?),
-                _ => return None,
-            }
-        }
-        Some(out)
-    }
-
-    fn quoted_glob(cmd: &str) -> Option<String> {
-        unquote(cmd.strip_prefix("redis-cli --scan --pattern ")?)
-    }
-
     #[test]
     fn a_key_name_cannot_break_out_of_the_command() {
-        let cmd = suggested_command("evil:x'$(touch pwned)'");
         assert_eq!(
-            cmd,
-            r"redis-cli --scan --pattern 'evil:x'\''$(touch pwned)'\'''"
+            suggested_command("user:{id}:cart").as_deref(),
+            Some("redis-cli --scan --pattern \"user:*:cart\"")
         );
-        assert_eq!(quoted_glob(&cmd).unwrap(), "evil:x'$(touch pwned)'");
-        // A newline and fish's escape character become `?`.
-        assert_eq!(
-            suggested_command("a\nb\\'c\x1b"),
-            r"redis-cli --scan --pattern 'a?b?'\''c?'"
-        );
+        // POSIX command substitution, cmd.exe `&`, PowerShell typographic quotes and
+        // `$(...)`, fish's `\`, a newline, `%` and `!` expansion, a double quote.
+        for label in [
+            "evil:x'$(touch pwned)'",
+            "x&calc&",
+            "x\u{2019};calc;\u{2019}",
+            "x'$(calc)'",
+            "a\\'b",
+            "a\nrm -rf x",
+            "a%PATH%",
+            "a!x!",
+            "a\"b",
+            "a`b",
+            "a b",
+            "caf\u{e9}",
+        ] {
+            assert_eq!(suggested_command(label), None, "{label:?}");
+            assert_eq!(CopyText::suggested_command(label), None, "{label:?}");
+        }
     }
 
     proptest::proptest! {
-        /// Whatever the label, the command is `redis-cli --scan --pattern` plus exactly
-        /// one shell word, and that word is the label's glob (control characters and
-        /// `\` as `?`).
+        /// A command is offered exactly when every character of the glob is in the safe
+        /// set (written out again here), and then it is the glob in double quotes.
         #[test]
-        fn the_pattern_is_always_one_quoted_word(label in "\\PC*|[\\x00-\\x7f]*") {
-            let cmd = suggested_command(&label);
-            let want: String = format::glob(&label)
-                .chars()
-                .map(|c| if c.is_control() || c == '\\' { '?' } else { c })
-                .collect();
-            proptest::prop_assert_eq!(quoted_glob(&cmd), Some(want));
-            proptest::prop_assert!(!cmd.chars().any(char::is_control));
+        fn the_command_holds_only_safe_characters(label in "\\PC*|[\\x00-\\x7f]*|[a-z:{}*|#@\\[\\]-]*") {
+            let glob = format::glob(&label);
+            let safe = regex_lite_safe(&glob);
+            match suggested_command(&label) {
+                Some(cmd) => {
+                    proptest::prop_assert!(safe);
+                    proptest::prop_assert_eq!(cmd, format!("redis-cli --scan --pattern \"{glob}\""));
+                }
+                None => proptest::prop_assert!(!safe),
+            }
         }
+    }
+
+    /// `^[A-Za-z0-9_:./*?{}\[\]@#+=,~|-]*$`, by hand.
+    fn regex_lite_safe(s: &str) -> bool {
+        s.bytes().all(|b| {
+            matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9')
+                || b"_:./*?{}[]@#+=,~|-".contains(&b)
+        })
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::diff::ReportDiff;
 use crate::format;
 use crate::model::{PatternStats, TTL_BUCKET_LABELS};
 use crate::tui::app::App;
-use crate::tui::clipboard::suggested_command;
+use crate::tui::clipboard::{NO_COMMAND, suggested_command};
 use crate::verdict::{TtlVerdict, explain, ttl_verdict};
 
 use super::widgets::ttl_hist_spans;
@@ -188,10 +188,13 @@ fn detail_panel(
     ]));
     lines.push(Line::default());
     // The same text `Y` copies.
-    let cmd = suggested_command(&p.pattern);
+    let (cmd, cmd_style) = match suggested_command(&p.pattern) {
+        Some(c) => (c, style::cmd()),
+        None => (NO_COMMAND.to_string(), style::dim()),
+    };
     lines.push(Line::from(vec![
         Span::styled(" $ ", style::dim()),
-        Span::styled(trunc(&cmd, w.saturating_sub(3)), style::cmd()),
+        Span::styled(trunc(&cmd, w.saturating_sub(3)), cmd_style),
     ]));
     rows(frame, inner, lines, None);
 }

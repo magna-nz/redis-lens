@@ -35,6 +35,6 @@ expression: t.backend()
 "│ cache:search:d92f1a6c8e4b07d3a5c9e2f61b8d4a07c3e5f9…      —   none     none <1m  <1h  <1d  <7d  <30d >30d            │"
 "│ cache:search:6e3a0d8b5f2c91e7a4d06b3f8c2e5a91d7b4c0…      —   21h 47m  ▂▂▂  ·    ▁▁▁  ███  ·    ·    ·               │"
 "│ ▲ 12% never expire while the rest do. A write path probably skips EXPIRE.                                            │"
-"│ $ redis-cli --scan --pattern 'cache:search:*'                                                                        │"
+"│ $ redis-cli --scan --pattern "cache:search:*"                                                                        │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 " ↑↓ Move   →← Fold   / Filter   o Sort   s Snapshot   0-4 View   ? Help   q Quit                                        "
