@@ -53,7 +53,26 @@ Integration branch `quickwins/integration` (worktree `.claude/worktrees/qw`, fro
 | R | 1 `--check` rules with exit codes; 2 Markdown, HTML and CSV reports | implementer [sonnet] | `quickwins/r` | **done** (850cefa; Markdown names as code spans in 8d0a175), merged |
 | S | 6 snapshot retention, `snapshots list/prune`, `trend` and a trend column in the Diff view; 7 `compare` | implementer [opus] | `quickwins/s` | **done** (827ba4c, 9e5d008, 98318f3), merged; `prune` needs `--keep` or `--keep-days` (clap, f0cbbe0) |
 | C | 3 provider detection and notices; 4 server context (`INFO keysizes`, `INFO keyspace`, `MEMORY STATS`); 5 token-command auth | implementer [opus] | `quickwins/c` | **done** (7cfbd00, 0e8d584), merged |
-| V | Verifier on the merged branch | verifier [opus] | pinned detached worktree | not started |
+| V | Verifier on the merged branch | verifier [opus] | pinned detached worktree (5d11791) | round 1 **BLOCKED** on B1, fixed (below); round 2 in progress |
+
+**Verifier round 1 (BLOCKED, report `qw-verify-report.md` in the session notes), and the fixes (63e4801, 717b306):**
+- B1: with snapshots dated in the future (clock skew), `scan --save --keep N` ranked them newest and deleted the snapshot it had just written. Now snapshots dated after now are never deleted and take no keep slot. Test: `snapshot::tests::future_dated_snapshots_never_cost_the_newest_real_one` (keep 1 and 2, and the prune plan); it fails without the fix.
+- Test gaps filled:
+  - stdin and stderr are `/dev/null` (`conn::token::tests::stdin_and_stderr_are_dev_null`); a timed-out command is really killed (`a_timed_out_command_is_killed`); both checked by mutation;
+  - the `--check` baseline shares the scan's `MATCH` glob (`cli::scan::tests::the_baseline_shares_the_scans_match_glob`); which rules need a baseline (`check::tests::which_rules_need_a_baseline`);
+  - the context commands count against the budget, and a denied `MEMORY STATS` is not sent (`scan::tests::context_commands_count_against_the_budget`);
+  - replacing a password profile with a token command without a username deletes the old keychain entry (`cli::conn::tests::replacing_with_a_token_command_without_a_username_deletes_the_old_entry`).
+- Also fixed:
+  - N1: a token command that exits but leaves a background process holding stdout no longer times out; its output gets 250 ms to close after it exits (`a_background_child_holding_stdout_does_not_cost_the_token`);
+  - N3: `verdict=persistent-stable` needs a baseline, like `persistent-growing`;
+  - N9: `--keep 0` is a usage error (`cli::tests::keep_must_be_at_least_one`).
+- Not changed (noted):
+  - N2: token buffers are not zeroized;
+  - N4, N5: the big-strings bias warning ignores the sample fraction, and the server-wide `dataset.bytes` is compared with a one-database sample;
+  - N6: `compare`'s TTL mismatch has no min-keys floor;
+  - N7: `trend` and `compare` print pattern names raw, like `scan` and `diff` already did;
+  - N8: the HTML CSP allows inline scripts (the sort script is inline);
+  - N11: a token command's arguments are in clear in the config, so don't put secrets in them.
 
 **Checks at 5d11791:** fmt, clippy `-D warnings`, 560 unit tests; every integration test on Redis 7.4, Valkey 8.1 and Redis 6.2 (cli_config 4, compare 3, conn 29, diff 6, replica 11, scan_cli 11, scan 21, smoke 3, tls 6; os_trust 2 ignored locally). With the default thread count, test containers sometimes failed to start while another build ran on the machine; with `--test-threads=4` and `--no-fail-fast` everything passed on both images. The first full run also found a real bug, fixed in 5d11791: `MEMORY STATS` floats didn't always read back exactly from a snapshot, so serde_json's `float_roundtrip` feature is on, with a test using floats that fail without it.
 
@@ -78,6 +97,8 @@ Integration branch `quickwins/integration` (worktree `.claude/worktrees/qw`, fro
 - Markdown reports put pattern and key names in code spans, so a hostile name can't make a link or emphasis.
 
 **Follow-ups found in the wave (not done):**
+- Terminal escape sequences in key names reach the terminal in `scan`, `diff`, `trend` and `compare` output (verifier N7; from before this wave for `scan` and `diff`).
+- `compare` flags a TTL mismatch on patterns of any size (N6); the context strip's sampling-bias and `dataset.bytes` coverage figures are rough on large or multi-database servers (N4, N5).
 - Rule 1 (from wave 8): permission-check rows and `conn test` show the server's `NOPERM` text, which names the ACL user.
 - The provider table's starred cells (MemoryDB, Memorystore, node-based ElastiCache command lists, Azure Enterprise, China and US Government suffixes) and the AWS token tool's exact name were not checked against the services (no web access in the agent).
 - The token runner's unit tests are Unix-only; the interactive confirmation in `conn add` has no unit test (`--yes` and the no-terminal refusal do).
