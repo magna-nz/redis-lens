@@ -12,7 +12,7 @@ use crate::tui::app::App;
 use super::widgets::{
     bar, fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset,
 };
-use super::{notice_panels, report_or_wait, split_body, style};
+use super::{mark_previous, notice_panels, report_or_wait, split_body, style};
 
 /// A hot key at least this big is flagged.
 pub const HOT_BIG: u64 = 10 * 1024 * 1024;
@@ -53,15 +53,19 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                 .split_inclusive(". ")
                 .map(|s| Line::from(Span::styled(format!(" {}", s.trim_end()), style::dim()))),
         );
-        notice_panels(frame, area, "Hot keys", &policy(report), lines);
+        let right = mark_previous(app, &policy(report));
+        notice_panels(frame, area, "Hot keys", &right, lines);
         return;
     }
     let keys = &report.hot_keys;
     let (main, detail) = split_body(area);
     let sel = app.sel.hot.min(keys.len().saturating_sub(1));
-    let right = format!(
-        "{} · OBJECT FREQ on sampled keys · hottest first",
-        policy(report)
+    let right = mark_previous(
+        app,
+        &format!(
+            "{} · OBJECT FREQ on sampled keys · hottest first",
+            policy(report)
+        ),
     );
     let inner = panel(frame, main, "Hot keys", &right);
     let kw = key_width(usize::from(inner.width));

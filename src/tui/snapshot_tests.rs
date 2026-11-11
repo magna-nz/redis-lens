@@ -969,3 +969,262 @@ fn patterns_narrow_columns_with_delta() {
     );
     insta::assert_snapshot!(snap);
 }
+
+// ---------------------------------------------------------------------------
+// Wave 8: rescan, help overlay, copy, page size
+// ---------------------------------------------------------------------------
+
+/// A finished scan with history, the second row selected on `view`, then `r`: the
+/// rescan is connected and scanning, with no results of its own yet.
+fn rescanning(view: char) -> (App, ConnId, ScanId) {
+    let mut app = scanned_with_history(true);
+    press(&mut app, &format!("{view}j"));
+    let id = app.session.as_ref().unwrap().id;
+    let effects = app.handle_key(ch('r'));
+    let [Effect::Connect { scan, .. }] = effects[..] else {
+        panic!("unexpected effects {effects:?}");
+    };
+    app.apply(Msg::Connected {
+        id,
+        scan,
+        server: Some(fixtures::server()),
+        perms: fixtures::perms_ok(),
+        target: ScanTarget::Primary,
+    });
+    app.apply(Msg::ScanProgress {
+        id,
+        scan,
+        progress: ScanProgress {
+            sampled: 1_600,
+            target: 100_000,
+            done: false,
+        },
+    });
+    (app, id, scan)
+}
+
+const RESCANNING: &str = "rescanning · previous results";
+const RESCAN_FAILED: &str = "rescan failed · previous results";
+
+#[test]
+fn patterns_rescanning_shows_previous_results() {
+    let (app, _, _) = rescanning('1');
+    let t = render(&app, 120, 36);
+    let lines = buffer_lines(&t);
+    assert!(lines[3].contains(RESCANNING), "{}", lines[3]);
+    // The header says a scan runs; the Δ column of the old report stays.
+    assert!(lines[0].contains("scanning"), "{}", lines[0]);
+    assert!(lines[4].contains('Δ'), "{}", lines[4]);
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn ttl_rescanning_shows_previous_results() {
+    let (app, _, _) = rescanning('2');
+    let t = render(&app, 120, 36);
+    assert!(buffer_lines(&t)[3].contains(RESCANNING));
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn every_view_marks_previous_results_until_the_rescans_first_partial() {
+    let (mut app, id, scan) = rescanning('1');
+    let top = |app: &App, w| buffer_lines(&render(app, w, 36))[3].clone();
+    for view in ['1', '2', '3', '4'] {
+        app.handle_key(ch(view));
+        assert!(top(&app, 120).contains(RESCANNING), "view {view}");
+        // On a narrow terminal the marker is kept, the rest is cut.
+        assert!(
+            top(&app, 80).contains(RESCANNING),
+            "view {view}: {}",
+            top(&app, 80)
+        );
+    }
+    // Diff without a snapshot, and Hot keys without LFU, mark it too.
+    let (mut app2, id2) = scanned_with(fixtures::report_lru(), fixtures::perms_freq_skipped());
+    set_history(&mut app2, id2, None);
+    app2.handle_key(ch('3'));
+    app2.handle_key(ch('r'));
+    for view in ['3', '4'] {
+        app2.handle_key(ch(view));
+        assert!(top(&app2, 120).contains(RESCANNING), "view {view}");
+    }
+    // The first partial replaces them: Patterns shows partials, the rest wait.
+    app.apply(Msg::ScanPartial {
+        id,
+        scan,
+        partial: fixtures::partial(true),
+    });
+    app.handle_key(ch('1'));
+    let line = top(&app, 120);
+    assert!(line.contains("partial · 3,200 / 100,000 sampled"), "{line}");
+    assert!(!line.contains("previous"), "{line}");
+    for view in ['2', '3', '4'] {
+        app.handle_key(ch(view));
+        let text = buffer_lines(&render(&app, 120, 36)).join("\n");
+        assert!(!text.contains("previous results"), "view {view}");
+        assert!(text.contains("Sampled"), "view {view}");
+    }
+}
+
+#[test]
+fn patterns_rescan_failed_keeps_previous_results_marked() {
+    let (mut app, id, scan) = rescanning('1');
+    app.apply(Msg::ScanFailed {
+        id,
+        scan,
+        error: "connection reset".into(),
+    });
+    let t = render(&app, 80, 24);
+    let lines = buffer_lines(&t);
+    assert!(lines[3].contains(RESCAN_FAILED), "{}", lines[3]);
+    assert!(lines[23].contains("Scan failed: connection reset"));
+    for view in ['2', '3', '4'] {
+        app.handle_key(ch(view));
+        assert!(
+            buffer_lines(&render(&app, 120, 36))[3].contains(RESCAN_FAILED),
+            "view {view}"
+        );
+    }
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn help_over_patterns_80x24() {
+    let mut app = scanned_with_history(true);
+    press(&mut app, "1j?");
+    let t = render(&app, 80, 24);
+    let text = buffer_lines(&t).join("\n");
+    assert!(text.contains("Keys · Patterns"));
+    assert!(text.contains("? or esc closes"));
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn help_over_connections_120x36() {
+    let mut app = scanned_with_history(true);
+    press(&mut app, "0?");
+    let t = render(&app, 120, 36);
+    let text = buffer_lines(&t).join("\n");
+    assert!(text.contains("Keys · Connections"));
+    assert!(text.contains("Look for Docker containers again"));
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn help_overlay_on_every_view_and_size_does_not_panic() {
+    let mut app = scanned_with_history(true);
+    for view in ['0', '1', '2', '3', '4'] {
+        press(&mut app, &format!("{view}?"));
+        for (w, h) in [(80, 24), (40, 12), (20, 5), (1, 1), (200, 60)] {
+            render(&app, w, h);
+        }
+        let title = format!("Keys · {}", app.view.title());
+        assert!(
+            buffer_lines(&render(&app, 80, 24))
+                .join("\n")
+                .contains(&title)
+        );
+        app.handle_key(key(KeyCode::Esc));
+        assert!(
+            !buffer_lines(&render(&app, 80, 24))
+                .join("\n")
+                .contains(&title)
+        );
+    }
+}
+
+#[test]
+fn detail_command_is_what_shift_y_copies() {
+    let mut app = scanned_with_history(true);
+    for (view, moves) in [('1', 1), ('1', 2), ('2', 3)] {
+        press(&mut app, &format!("{view}g"));
+        for _ in 0..moves {
+            app.handle_key(ch('j'));
+        }
+        let effects = app.handle_key(ch('Y'));
+        let [Effect::Copy(t)] = &effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        let text = buffer_lines(&render(&app, 120, 36)).join("\n");
+        assert!(
+            text.contains(&format!("$ {}", t.as_str())),
+            "{}",
+            t.as_str()
+        );
+    }
+}
+
+/// The list rows a view draws, from its main panel: between the top border and the
+/// bottom border, less the column header.
+fn drawn_list_rows(lines: &[String]) -> usize {
+    let top = lines.iter().position(|l| l.starts_with('┌')).unwrap();
+    let bottom = top
+        + lines[top..]
+            .iter()
+            .position(|l| l.starts_with('└'))
+            .unwrap();
+    (bottom - top - 1).saturating_sub(1)
+}
+
+#[test]
+fn list_rows_is_what_every_list_view_draws() {
+    let mut app = scanned_with_history(true);
+    for (w, h) in [(80, 24), (120, 36), (60, 20), (200, 60), (80, 17), (80, 18)] {
+        let rows = ui::list_rows(ratatui::layout::Rect::new(0, 0, w, h));
+        for view in ['0', '1', '2', '3', '4'] {
+            app.handle_key(ch(view));
+            let lines = buffer_lines(&render(&app, w, h));
+            assert_eq!(drawn_list_rows(&lines), rows, "view {view} at {w}x{h}");
+        }
+    }
+    // 80x24 shows 7 rows. Too small for any row: 0, and PgDn still moves one.
+    assert_eq!(ui::list_rows(ratatui::layout::Rect::new(0, 0, 80, 24)), 7);
+    for h in [0, 1, 10, 16] {
+        assert_eq!(
+            ui::list_rows(ratatui::layout::Rect::new(0, 0, 80, h)),
+            0,
+            "{h}"
+        );
+    }
+}
+
+#[test]
+fn page_down_from_the_top_selects_the_row_below_the_screen() {
+    // With the page from the runtime's maths, PgDn from the top of the TTL list at
+    // 80x24 (7 rows) selects row 7: the list scrolls one row and the selection is the
+    // bottom row on screen.
+    let mut app = scanned_with_history(true);
+    app.handle_key(ch('2'));
+    app.set_list_rows(ui::list_rows(ratatui::layout::Rect::new(0, 0, 80, 24)));
+    app.handle_key(key(KeyCode::PageDown));
+    assert_eq!(app.sel.ttl, 7);
+    let t = render(&app, 80, 24);
+    let buf = t.backend().buffer();
+    let selected: Vec<u16> = (0..24u16)
+        .filter(|&y| buf[(2, y)].bg == super::ui::style::sel().bg.unwrap())
+        .collect();
+    // Rows 5-11 are the list (border at 3, header at 4); the last one is selected.
+    assert_eq!(selected, [11]);
+}
+
+#[test]
+fn a_slow_keychain_during_a_rescan_shows_the_hint_in_the_header() {
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    let mut app = scanned_with_history(true);
+    app.apply(Msg::TickAt(t0));
+    app.handle_key(ch('1'));
+    app.handle_key(ch('r'));
+    let text = |app: &App| buffer_lines(&render(app, 140, 40)).join("\n");
+    assert!(!text(&app).contains("Waiting for the OS keychain"));
+    app.apply(Msg::TickAt(t0 + Duration::from_secs(3)));
+    let lines = buffer_lines(&render(&app, 140, 40));
+    assert!(lines[1].contains(super::app::KEYCHAIN_HINT), "{}", lines[1]);
+    // The previous results stay in the body.
+    assert!(
+        lines[3].contains("rescanning · previous results"),
+        "{}",
+        lines[3]
+    );
+}

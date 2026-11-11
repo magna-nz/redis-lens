@@ -37,4 +37,4 @@ expression: t.backend()
 "│ ✓ No TTL or size problems in the sample.                                                                             │"
 "│ $ redis-cli --scan --pattern 'session:*'                                                                             │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   →← Fold   / Filter   s Snapshot   0-4 View   q Quit                                                          "
+" ↑↓ Move   →← Fold   / Filter   o Sort   s Snapshot   0-4 View   ? Help   q Quit                                        "
