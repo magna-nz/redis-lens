@@ -47,16 +47,56 @@ fn timeout_message(account: &str) -> String {
     }
 }
 
+/// Name of the worker thread that runs keychain calls.
+const WORKER_NAME: &str = "keychain";
+
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+/// A panic hook that prints nothing for the keychain worker (a panic there is reported
+/// as [`SecretError::Store`], and its message must not land on the TUI) and hands every
+/// other panic to `prev`.
+fn silence_keychain_worker(prev: PanicHook) -> PanicHook {
+    Box::new(move |info| {
+        if std::thread::current().name() != Some(WORKER_NAME) {
+            prev(info);
+        }
+    })
+}
+
+/// Install [`silence_keychain_worker`] once, on top of whatever hook is current. It runs
+/// on the first keychain call, which for the TUI is after the TUI has installed its own
+/// hook, so ours sits outermost: a keychain panic never reaches the TUI's hook (which
+/// would restore the terminal while the TUI is still running), and any other panic goes
+/// through ours to the TUI's hook and on to the default one. A hook installed later
+/// chains to ours through `take_hook` and keeps working.
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(silence_keychain_worker(prev));
+    });
+}
+
 /// Run `f` on a worker thread and wait up to `dur` for it. On timeout the worker is left
-/// to finish on its own and [`SecretError::Timeout`] names `account`.
+/// to finish on its own and [`SecretError::Timeout`] names `account`. A panic in `f`
+/// prints nothing and gives a fixed [`SecretError::Store`] text, never the payload.
 fn with_timeout<T: Send + 'static>(
+    dur: Duration,
+    account: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, SecretError> {
+    install_panic_hook();
+    run_worker(dur, account, f)
+}
+
+fn run_worker<T: Send + 'static>(
     dur: Duration,
     account: &str,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, SecretError> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
-        .name("keychain".into())
+        .name(WORKER_NAME.into())
         .spawn(move || {
             let _ = tx.send(f());
         })
@@ -194,6 +234,48 @@ impl SecretStore for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panicking_keychain_call_gives_a_fixed_error_without_the_payload() {
+        let err = run_worker(Duration::from_secs(5), "acct", || -> u8 {
+            panic!("hunter2-secret-payload")
+        })
+        .unwrap_err();
+        assert!(matches!(&err, SecretError::Store(m) if m == "the keychain call failed"));
+        assert!(!format!("{err} {err:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn the_hook_is_silent_for_the_keychain_thread_and_forwards_other_threads() {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        let orig = std::panic::take_hook();
+        let orig = std::sync::Arc::new(orig);
+        let orig2 = orig.clone();
+        let prev: PanicHook = Box::new(move |info| {
+            let name = std::thread::current().name().unwrap_or("").to_string();
+            if name.starts_with("hook-test-") {
+                seen2.lock().unwrap().push(name);
+            } else {
+                // Panics from unrelated tests running meanwhile keep their normal output.
+                orig2(info);
+            }
+        });
+        std::panic::set_hook(silence_keychain_worker(prev));
+
+        let r = run_worker(Duration::from_secs(5), "acct", || -> u8 { panic!("boom") });
+        std::thread::Builder::new()
+            .name("hook-test-other".into())
+            .spawn(|| panic!("boom"))
+            .unwrap()
+            .join()
+            .unwrap_err();
+
+        let _ = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| orig(info)));
+        assert!(matches!(r, Err(SecretError::Store(_))));
+        assert_eq!(*seen.lock().unwrap(), vec!["hook-test-other".to_string()]);
+    }
 
     fn sref(n: &str) -> SecretRef {
         SecretRef {

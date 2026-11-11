@@ -166,14 +166,25 @@ pub async fn discover() -> Result<Vec<DiscoveredInstance>, ConnError> {
         .await
         .map_err(|_| unreachable())?;
 
-    let mut found = Vec::new();
-    for c in list {
-        if let Some(inst) = instance(&docker, c).await {
-            found.push(inst);
-        }
-    }
+    let mut found = discover_with(list, |c| instance(&docker, c)).await;
     found.sort_by(|a, b| a.container.cmp(&b.container));
     Ok(found)
+}
+
+/// Run `f` on every container at once and keep the `Some` results in the order of `list`.
+/// Probes that each wait out a timeout therefore cost one timeout in total, not one each.
+async fn discover_with<T, Fut>(
+    list: Vec<ContainerSummary>,
+    f: impl Fn(ContainerSummary) -> Fut,
+) -> Vec<T>
+where
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    futures::future::join_all(list.into_iter().map(f))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 async fn instance(docker: &Docker, c: ContainerSummary) -> Option<DiscoveredInstance> {
@@ -228,6 +239,31 @@ async fn instance(docker: &Docker, c: ContainerSummary) -> Option<DiscoveredInst
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn discovery_probes_run_concurrently_and_keep_order() {
+        let list: Vec<ContainerSummary> = (0..8)
+            .map(|i| ContainerSummary {
+                id: Some(i.to_string()),
+                ..Default::default()
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let got = discover_with(list, |c| async move {
+            let id: u64 = c.id.unwrap().parse().unwrap();
+            // Earlier containers take longer, so completion order is the reverse of list order.
+            tokio::time::sleep(std::time::Duration::from_millis(400 - id * 20)).await;
+            (id % 4 != 3).then_some(id)
+        })
+        .await;
+        let took = start.elapsed();
+        assert_eq!(got, vec![0, 1, 2, 4, 5, 6]);
+        // Sequentially this is over 2 s; concurrently it is about 400 ms.
+        assert!(
+            took < std::time::Duration::from_millis(1200),
+            "took {took:?}"
+        );
+    }
 
     #[test]
     fn discovered_auth_labels() {
