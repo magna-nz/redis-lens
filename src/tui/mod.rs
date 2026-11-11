@@ -30,6 +30,8 @@ use crate::secrets::{KeyringStore, MemoryStore, SecretStore};
 use crate::{diff, snapshot};
 
 pub mod app;
+pub mod clipboard;
+pub mod keymap;
 pub mod tree;
 pub mod ui;
 
