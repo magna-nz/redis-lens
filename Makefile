@@ -1,11 +1,12 @@
 DEMO := docker compose -f demo/compose.yml
 
-.PHONY: help build test it lint fmt demo-up demo-seed demo-profiles demo demo-down gif
+.PHONY: help build test it coverage lint fmt demo-up demo-seed demo-profiles demo demo-down gif
 
 help:
 	@echo "make build          build a release binary"
 	@echo "make test           unit tests"
 	@echo "make it             integration tests (starts Redis and Valkey in Docker)"
+	@echo "make coverage       line coverage of unit + integration tests (needs cargo-llvm-cov and Docker); HTML in target/llvm-cov/html"
 	@echo "make lint           fmt check and clippy"
 	@echo "make demo-up        start and seed the demo Redis (6390) and Valkey (6391)"
 	@echo "make demo           demo-up, save the demo connections, open the TUI"
@@ -20,6 +21,15 @@ test:
 
 it:
 	cargo test --locked --features integration-tests --tests
+
+# cargo-llvm-cov needs llvm-cov and llvm-profdata. rustup's llvm-tools-preview provides
+# them; without rustup (e.g. Homebrew Rust on macOS) this falls back to Xcode's copies.
+coverage:
+	@if ! command -v rustup >/dev/null 2>&1 && command -v xcrun >/dev/null 2>&1; then \
+		export LLVM_COV="$$(xcrun --find llvm-cov)" LLVM_PROFDATA="$$(xcrun --find llvm-profdata)"; \
+	fi; \
+	cargo llvm-cov --locked --features integration-tests --tests --html && \
+	cargo llvm-cov report --summary-only
 
 lint:
 	cargo fmt --all --check
