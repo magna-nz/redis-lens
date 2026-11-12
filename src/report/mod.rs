@@ -242,6 +242,7 @@ pub(crate) mod fixtures {
             complete: true,
             match_glob: None,
             server_context: None,
+            key_sizes: None,
         }
     }
 

@@ -11,9 +11,6 @@ use crate::model::{KeySample, KeyType, PatternStats};
 /// before the first of these.
 const SEPARATORS: [char; 3] = [':', '/', '|'];
 
-/// The placeholders pattern inference writes. `{var}` replaces a literal segment.
-const PLACEHOLDERS: [&str; 6] = ["{id}", "{uuid}", "{ulid}", "{hash}", "{ip}", "{var}"];
-
 /// A key at or above this size is "very large".
 pub const LARGE_MAX: u64 = 50 * 1024 * 1024;
 /// An average at or above this size is "very large".
@@ -431,36 +428,8 @@ pub enum RowId {
     Pattern(String),
 }
 
-/// Segments and separators as pattern inference splits them: on `:` `/` `|` and `.`.
-fn inference_tokens(pattern: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for (i, c) in pattern.char_indices() {
-        if SEPARATORS.contains(&c) || c == '.' {
-            out.push(&pattern[start..i]);
-            out.push(&pattern[i..i + 1]);
-            start = i + 1;
-        }
-    }
-    out.push(&pattern[start..]);
-    out
-}
-
-/// True when `a` and `b` are the same pattern except where one has `{var}` and the
-/// other a literal segment: what pattern inference merges once a segment has 20
-/// distinct values (`tenant.a1:cfg` and `tenant.{var}:cfg`). Equal patterns match too.
-pub fn same_up_to_var(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    let (ta, tb) = (inference_tokens(a), inference_tokens(b));
-    let literal = |t: &str| !t.is_empty() && !PLACEHOLDERS.contains(&t);
-    ta.len() == tb.len()
-        && ta
-            .iter()
-            .zip(&tb)
-            .all(|(x, y)| x == y || (*x == "{var}" && literal(y)) || (*y == "{var}" && literal(x)))
-}
+/// True when two patterns are the same up to `{var}`: see the function it re-exports.
+pub use crate::analysis::same_up_to_var;
 
 /// The collapsed groups of the Patterns view. A group starts expanded.
 ///

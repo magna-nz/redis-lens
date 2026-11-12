@@ -997,9 +997,9 @@ fn patterns_long_group_name_mid_scroll() {
     let lines = buffer_lines(&t);
     // The fold mark stays visible; the label scrolls after it.
     assert!(lines[6].starts_with("│ ▾ …"), "{}", lines[6]);
-    // Collapsed, the mark changes and stays visible too.
+    // Collapsed, the mark changes and stays visible too. Same row, so the scroll goes
+    // on from the same tick: still mid-scroll, whatever the column width.
     app.handle_key(key(KeyCode::Left));
-    tick(&mut app, 10 + 2 * 12);
     let lines = buffer_lines(&render(&app, 120, 36));
     assert!(lines[6].starts_with("│ ▸ …"), "{}", lines[6]);
     insta::assert_snapshot!(t.backend());
@@ -1089,16 +1089,16 @@ fn narrow_steps(app: &App, steps: &[(u16, &[&str])]) -> String {
 fn patterns_narrow_columns() {
     let mut app = scanned(true);
     select_pattern(&mut app, "user:{id}:cart");
-    // 72 is the narrowest with every column; then the share bar goes (71), then the
-    // average size (63); below 55 the row is cut at the right edge.
+    // 83 is the narrowest with every column; then the share bar goes (82), then the
+    // average size (74); below 66 the row is cut at the right edge. VERDICT always shows.
     let snap = narrow_steps(
         &app,
         &[
-            (72, &["SHARE", "AVG"]),
-            (71, &["AVG"]),
-            (64, &["AVG"]),
-            (63, &[]),
-            (55, &[]),
+            (83, &["SHARE", "AVG"]),
+            (82, &["AVG"]),
+            (75, &["AVG"]),
+            (74, &[]),
+            (66, &[]),
         ],
     );
     let cut = table_at(&app, 50);
@@ -1112,18 +1112,18 @@ fn patterns_narrow_columns() {
 fn patterns_narrow_columns_with_delta() {
     let mut app = scanned_with_history(true);
     select_pattern(&mut app, "user:{id}:cart");
-    // 80 is the narrowest with every column; the share bar goes first (79), then Δ
-    // (71), then the average size (63).
+    // 91 is the narrowest with every column; the share bar goes first (90), then Δ
+    // (82), then the average size (74). VERDICT always shows.
     let snap = narrow_steps(
         &app,
         &[
-            (80, &["SHARE", "AVG", "Δ"]),
-            (79, &["AVG", "Δ"]),
-            (72, &["AVG", "Δ"]),
-            (71, &["AVG"]),
-            (64, &["AVG"]),
-            (63, &[]),
-            (55, &[]),
+            (91, &["SHARE", "AVG", "Δ"]),
+            (90, &["AVG", "Δ"]),
+            (83, &["AVG", "Δ"]),
+            (82, &["AVG"]),
+            (75, &["AVG"]),
+            (74, &[]),
+            (66, &[]),
         ],
     );
     insta::assert_snapshot!(snap);

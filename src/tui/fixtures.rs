@@ -462,6 +462,7 @@ pub fn report(sizes: bool) -> ScanReport {
         complete: false,
         match_glob: None,
         server_context: None,
+        key_sizes: None,
     }
 }
 

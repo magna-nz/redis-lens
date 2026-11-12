@@ -364,6 +364,7 @@ mod tests {
             complete: sampled >= total,
             match_glob: None,
             server_context: None,
+            key_sizes: None,
         }
     }
 

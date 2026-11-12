@@ -261,6 +261,7 @@ mod tests {
             complete,
             match_glob: glob.map(str::to_string),
             server_context: None,
+            key_sizes: None,
         }
     }
 

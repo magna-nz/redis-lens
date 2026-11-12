@@ -1,19 +1,20 @@
 ---
 source: src/tui/snapshot_tests.rs
+assertion_line: 1265
 expression: t.backend()
 ---
 " redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
 " Redis ┌─ Keys · Patterns ──────────────────────────────────────────────┐(1%)   "
 "  0   1│Everywhere                                                      │       "
 "┌─ Patt│0-6            Switch view, 0 Connections to 6 Search           │mory ─┐"
-"│ PATTE│?              Show or hide this key list                       │    Δ │"
-"│   ses│a              Add a connection                                 │+215M │"
-"│ ▾ cac│q ctrl-c       Quit                                             │+655M │"
-"│     c│Patterns                                                        │+655M │"
-"│     c│↑↓ j k         Move the selection                               │    · │"
-"│ ▾ use│PgUp PgDn      Move one page                                    │ +61M │"
-"│     u│Home End g G   Jump to the first or last row                    │    · │"
-"│     u│→ ← l h        Expand or collapse the selected group            │ +61M │"
+"│ PATTE│?              Show or hide this key list                       │CT    │"
+"│   ses│a              Add a connection                                 │      │"
+"│ ▾ cac│q ctrl-c       Quit                                             │      │"
+"│     c│Patterns                                                        │      │"
+"│     c│↑↓ j k         Move the selection                               │      │"
+"│ ▾ use│PgUp PgDn      Move one page                                    │ng    │"
+"│     u│Home End g G   Jump to the first or last row                    │      │"
+"│     u│→ ← l h        Expand or collapse the selected group            │ng    │"
 "└──────│enter          Fold a group, or list a pattern's keys           │──────┘"
 "┌─ cach│/              Filter patterns by name                          │3.6G ─┐"
 "│ SAMPL│esc            Clear the filter                                 │      │"

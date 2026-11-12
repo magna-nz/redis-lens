@@ -15,8 +15,8 @@ use redis::{FromRedisValue, Value};
 use tokio::sync::watch;
 
 use crate::model::{
-    KeySample, KeyType, PERM_FREQ, PERM_MEMORY, PatternStats, PermissionReport, ScanReport,
-    ServerFlavor, ServerInfo, ServerMode, Ttl,
+    KeySample, KeySizes, KeyType, PERM_FREQ, PERM_MEMORY, PatternStats, PermissionReport,
+    ScanReport, ServerFlavor, ServerInfo, ServerMode, Ttl,
 };
 
 #[derive(Debug, Clone)]
@@ -652,7 +652,52 @@ pub async fn scan_with_budget<C: ConnectionLike + Send>(
         complete,
         match_glob: opts.match_glob.clone(),
         server_context: Some(server_context),
+        key_sizes: with_sizes.then(|| {
+            Box::new(KeySizes {
+                big_keys: big_keys(&samples),
+                ttl_bytes: ttl_bytes(&samples),
+            })
+        }),
     })
+}
+
+/// How many big keys a report keeps.
+pub const BIG_KEY_LIMIT: usize = 50;
+
+/// The [`BIG_KEY_LIMIT`] sampled keys with the largest `MEMORY USAGE`: largest first,
+/// ties by key name. Keys without a size are left out. Keeps a heap of at most
+/// [`BIG_KEY_LIMIT`] + 1 entries, so the cost stays O(n log 50) and the memory bounded.
+pub fn big_keys(samples: &[KeySample]) -> Vec<KeySample> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    // The rank: more bytes first, then the smaller name. `Reverse` makes the heap a
+    // min-heap of ranks, so popping drops the smallest rank kept so far.
+    let mut heap: BinaryHeap<Reverse<(u64, Reverse<&str>, usize)>> =
+        BinaryHeap::with_capacity(BIG_KEY_LIMIT + 1);
+    for (i, s) in samples.iter().enumerate() {
+        let Some(bytes) = s.bytes else { continue };
+        heap.push(Reverse((bytes, Reverse(s.key.as_str()), i)));
+        if heap.len() > BIG_KEY_LIMIT {
+            heap.pop();
+        }
+    }
+    // Ascending `Reverse(rank)` is descending rank: largest first.
+    heap.into_sorted_vec()
+        .into_iter()
+        .map(|Reverse((_, _, i))| samples[i].clone())
+        .collect()
+}
+
+/// Sum of `MEMORY USAGE` per TTL bucket over the samples that have a size.
+pub fn ttl_bytes(samples: &[KeySample]) -> [u64; 7] {
+    let mut out = [0u64; 7];
+    for s in samples {
+        if let Some(b) = s.bytes {
+            let slot = &mut out[s.ttl.bucket()];
+            *slot = slot.saturating_add(b);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -692,6 +737,82 @@ mod tests {
         assert_eq!(hot.len(), 50);
         assert_eq!(hot[0].key, "k79");
         assert_eq!(hot[49].key, "k30");
+    }
+
+    fn sized(key: &str, bytes: Option<u64>, ttl: Ttl) -> KeySample {
+        KeySample {
+            bytes,
+            ttl,
+            ..sample(key, None)
+        }
+    }
+
+    #[test]
+    fn big_keys_keep_the_fifty_largest_largest_first_ties_by_name() {
+        // 120 keys, sizes 0..120 shuffled, plus ties at the cut and keys without a size.
+        let mut samples: Vec<KeySample> = (0..120u64)
+            .map(|i| (i * 37) % 120)
+            .map(|b| sized(&format!("k{b:03}"), Some(b * 10), Ttl::Persistent))
+            .collect();
+        samples.push(sized("tie-b", Some(710), Ttl::Persistent));
+        samples.push(sized("tie-a", Some(710), Ttl::Persistent));
+        samples.push(sized("no-size", None, Ttl::Persistent));
+        let big = big_keys(&samples);
+        assert_eq!(big.len(), BIG_KEY_LIMIT);
+        assert_eq!(big[0].key, "k119");
+        assert_eq!(big[0].bytes, Some(1190));
+        // Largest first, and equal sizes by name.
+        for w in big.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            assert!(
+                a.bytes > b.bytes || (a.bytes == b.bytes && a.key < b.key),
+                "{} {:?} before {} {:?}",
+                a.key,
+                a.bytes,
+                b.key,
+                b.bytes
+            );
+        }
+        // k119..k072 are the first 48. Three keys share 710 (k071, tie-a, tie-b): by
+        // name, k071 and tie-a fill the last two places and tie-b is cut.
+        let tail: Vec<&str> = big[46..].iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(tail, ["k073", "k072", "k071", "tie-a"]);
+        assert!(!big.iter().any(|s| s.key == "no-size"));
+        // The same with the input in another order.
+        samples.reverse();
+        assert_eq!(big_keys(&samples), big);
+    }
+
+    #[test]
+    fn big_keys_with_fewer_than_fifty_or_no_sizes() {
+        let samples = vec![
+            sized("a", Some(5), Ttl::Persistent),
+            sized("b", Some(9), Ttl::Persistent),
+            sized("c", None, Ttl::Persistent),
+        ];
+        let keys: Vec<_> = big_keys(&samples).into_iter().map(|s| s.key).collect();
+        assert_eq!(keys, ["b", "a"]);
+        assert!(big_keys(&[sized("c", None, Ttl::Persistent)]).is_empty());
+        assert!(big_keys(&[]).is_empty());
+    }
+
+    #[test]
+    fn ttl_bytes_sum_per_bucket() {
+        let secs = |s: u64| Ttl::Expires(Duration::from_secs(s));
+        let samples = vec![
+            sized("none-1", Some(100), Ttl::Persistent),
+            sized("none-2", Some(50), Ttl::Persistent),
+            sized("min", Some(7), secs(59)),
+            // A bucket starts at its bound: 60 s is <1h, not <1m.
+            sized("hour", Some(11), secs(60)),
+            sized("day", Some(13), secs(3_600)),
+            sized("week", Some(17), secs(86_400)),
+            sized("month", Some(19), secs(7 * 86_400)),
+            sized("later", Some(23), secs(30 * 86_400)),
+            sized("unsized", None, secs(10)),
+        ];
+        assert_eq!(ttl_bytes(&samples), [150, 7, 11, 13, 17, 19, 23]);
+        assert_eq!(ttl_bytes(&[]), [0; 7]);
     }
 
     #[test]
