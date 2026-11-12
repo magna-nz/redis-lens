@@ -222,6 +222,12 @@ pub struct ScanReport {
     /// set beside the sampled estimates. `None` in snapshots written before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_context: Option<ServerContext>,
+    /// The Big keys and Expiry figures, from `MEMORY USAGE` of the sampled keys. `None`
+    /// without sizes, and in snapshots written before it existed. Boxed so a
+    /// [`ScanReport`] stays small (it travels in the TUI's messages). Read it through
+    /// [`ScanReport::big_keys`] and [`ScanReport::ttl_bytes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_sizes: Option<Box<KeySizes>>,
     /// On a cluster scan, one entry per shard, in slot order: the node that was
     /// scanned for it and that node's own results. `None` on a standalone scan and in
     /// snapshots written before v0.3. On a cluster scan the report's other fields hold
@@ -231,6 +237,31 @@ pub struct ScanReport {
     /// every shard was seen completely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<NodeReport>>,
+}
+
+impl ScanReport {
+    /// [`KeySizes::big_keys`]; empty without sizes.
+    pub fn big_keys(&self) -> &[KeySample] {
+        self.key_sizes.as_deref().map_or(&[], |k| &k.big_keys)
+    }
+
+    /// [`KeySizes::ttl_bytes`]; `None` without sizes.
+    pub fn ttl_bytes(&self) -> Option<&[u64; 7]> {
+        self.key_sizes.as_deref().map(|k| &k.ttl_bytes)
+    }
+}
+
+/// What a scan with sizes keeps about single keys beyond the patterns.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct KeySizes {
+    /// Up to 50 sampled keys with the largest `MEMORY USAGE`, largest first (ties by
+    /// key), across every pattern: the Big keys panel. Key names only, never values.
+    #[serde(default)]
+    pub big_keys: Vec<KeySample>,
+    /// Sum of `MEMORY USAGE` over the sampled keys in each TTL bucket, indices as in
+    /// [`TTL_BUCKET_LABELS`] (index 0: no TTL): the Expiry panel. Sampled, not scaled.
+    #[serde(default)]
+    pub ttl_bytes: [u64; 7],
 }
 
 /// What was scanned for one shard of a cluster.
@@ -749,6 +780,57 @@ mod tests {
         for word in ["password", "username", "user", "secret", "token"] {
             assert!(!text.contains(word), "{word} in {text}");
         }
+    }
+
+    /// A snapshot written before `key_sizes` existed (the v0.2 shape,
+    /// with `hot_keys` and `complete` but no server context) still loads, with no big
+    /// keys and no TTL bytes; a new report round-trips with them.
+    #[test]
+    fn snapshots_without_key_sizes_still_load() {
+        let old = r#"{
+            "profile": "prod-cache-01",
+            "taken_at_unix": 1794319331,
+            "server": {
+                "flavor": "redis", "version": "7.4.2", "mode": "standalone",
+                "used_memory": 1000, "maxmemory": 0,
+                "maxmemory_policy": "allkeys-lfu", "total_keys": 2
+            },
+            "sampled_keys": 2,
+            "patterns": [{
+                "pattern": "user:{id}:cart", "key_type": "hash",
+                "sampled_keys": 2, "est_keys": 2,
+                "sampled_bytes": 300, "est_bytes": 300,
+                "no_ttl": 1, "ttl_hist": [1, 0, 0, 0, 1, 0, 0],
+                "size_p50": 100, "size_p99": 200, "size_max": 200,
+                "examples": [{
+                    "key": "user:1:cart", "key_type": "hash", "bytes": 200,
+                    "ttl": "Persistent", "lfu_freq": 3
+                }]
+            }],
+            "sizes_available": true,
+            "hot_keys": [],
+            "complete": true
+        }"#;
+        let r: ScanReport = serde_json::from_str(old).expect("an old snapshot loads");
+        assert!(r.big_keys().is_empty());
+        assert_eq!(r.ttl_bytes(), None);
+        assert_eq!(r.patterns[0].examples[0].key, "user:1:cart");
+
+        // Empty and missing additions are not written, so a report without sizes
+        // serializes exactly as before.
+        let text = serde_json::to_string(&r).unwrap();
+        assert!(
+            !text.contains("key_sizes") && !text.contains("big_keys"),
+            "{text}"
+        );
+
+        let mut new = r.clone();
+        new.key_sizes = Some(Box::new(KeySizes {
+            big_keys: new.patterns[0].examples.clone(),
+            ttl_bytes: [200, 0, 0, 0, 100, 0, 0],
+        }));
+        let back: ScanReport = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(back, new);
     }
 
     #[test]

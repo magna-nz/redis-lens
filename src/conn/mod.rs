@@ -723,6 +723,7 @@ async fn replica_step(
     let fallback = |c, why: String| (c, ScanTarget::PrimaryFallback(why));
     let info = match info_replication(&mut primary).await {
         Ok(i) => i,
+        Err(e) if is_noperm(&e) => return fallback(primary, noperm_text("INFO replication")),
         Err(e) => return fallback(primary, format!("INFO replication: {}", server_message(&e))),
     };
     match parse_replication(&info) {
@@ -799,6 +800,13 @@ fn is_noperm(e: &redis::RedisError) -> bool {
     e.kind() == redis::ErrorKind::Server(ServerErrorKind::NoPerm)
 }
 
+/// What a check shows when the ACL refuses `command`. Fixed text: the server's own
+/// `NOPERM` message names the ACL user (CLAUDE.md rule 1).
+pub(crate) fn noperm_text(command: &str) -> String {
+    format!("NOPERM {command} is not allowed for this user")
+}
+
+/// The server's error text, for errors other than `NOPERM` (which names the user).
 fn server_message(e: &redis::RedisError) -> String {
     match (e.code(), e.detail()) {
         (Some(c), Some(d)) => format!("{c} {d}"),
@@ -810,11 +818,12 @@ fn server_message(e: &redis::RedisError) -> String {
 
 /// `missing_key`: the probe key does not exist, so a plain `ERR` (such as
 /// `ERR no such key`) says the command ran, and so does a cluster redirect (see
-/// [`is_redirect`]).
-fn classify(r: Result<(), redis::RedisError>, missing_key: bool) -> PermStatus {
+/// [`is_redirect`]). A `NOPERM` reads [`noperm_text`] for `command`, never the
+/// server's text.
+fn classify(command: &str, r: Result<(), redis::RedisError>, missing_key: bool) -> PermStatus {
     match r {
         Ok(()) => PermStatus::Allowed,
-        Err(e) if is_noperm(&e) => PermStatus::Denied(server_message(&e)),
+        Err(e) if is_noperm(&e) => PermStatus::Denied(noperm_text(command)),
         Err(e) if missing_key && is_redirect(&e) => PermStatus::Allowed,
         Err(e)
             if missing_key
@@ -863,7 +872,11 @@ pub async fn check_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Permis
             Some(k) => (PermStatus::Allowed, k, false),
             None => (PermStatus::Allowed, PROBE_KEY.as_bytes().to_vec(), true),
         },
-        Err(e) => (classify(Err(e), false), PROBE_KEY.as_bytes().to_vec(), true),
+        Err(e) => (
+            classify("SCAN", Err(e), false),
+            PROBE_KEY.as_bytes().to_vec(),
+            true,
+        ),
     };
 
     // TYPE and PTTL
@@ -875,9 +888,9 @@ pub async fn check_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Permis
     };
     let type_ttl = if type_ran {
         let r: Result<i64, _> = redis::cmd("PTTL").arg(&probe_key).query_async(conn).await;
-        classify(r.map(|_| ()), missing)
+        classify("PTTL", r.map(|_| ()), missing)
     } else {
-        classify(ty.map(|_| ()), missing)
+        classify("TYPE", ty.map(|_| ()), missing)
     };
 
     // MEMORY USAGE
@@ -886,14 +899,14 @@ pub async fn check_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Permis
         .arg(&probe_key)
         .query_async(conn)
         .await;
-    let memory = classify(mem.map(|_| ()), missing);
+    let memory = classify("MEMORY USAGE", mem.map(|_| ()), missing);
 
     // INFO memory
     let info: Result<String, _> = redis::cmd("INFO").arg("memory").query_async(conn).await;
     let (info_status, policy) = match info {
         Ok(text) => (PermStatus::Allowed, Ok(policy_from_info(&text))),
         Err(e) => {
-            let status = classify(Err(e), false);
+            let status = classify("INFO", Err(e), false);
             let why = match &status {
                 PermStatus::Denied(m) => m.clone(),
                 _ => String::new(),
@@ -915,14 +928,15 @@ pub async fn check_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Permis
                 .arg(&probe_key)
                 .query_async(conn)
                 .await;
-            classify(r.map(|_| ()), missing)
+            classify("OBJECT FREQ", r.map(|_| ()), missing)
         }
     };
 
     // MEMORY STATS: no key involved, so any error other than NOPERM (an unknown
-    // command on a managed service, say) is a denial with the server's reason.
+    // command on a managed service, say) is a denial with the server's reason. A NOPERM
+    // reads fixed text, since the server's names the user.
     let stats: Result<redis::Value, _> = redis::cmd("MEMORY").arg("STATS").query_async(conn).await;
-    let memory_stats = classify(stats.map(|_| ()), false);
+    let memory_stats = classify("MEMORY STATS", stats.map(|_| ()), false);
 
     let mut statuses = [
         (PERM_SCAN, scan_status),
@@ -944,9 +958,161 @@ pub async fn check_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Permis
     PermissionReport { checks }
 }
 
+/// Labels for the view probes ([`check_view_permissions`]), in display order. Each one
+/// turns a view or panel on or off (spec "Permission check, additions").
+pub const PERM_SLOWLOG: &str = "SLOWLOG";
+pub const PERM_CLIENT_LIST: &str = "CLIENT LIST";
+pub const PERM_XINFO: &str = "XINFO";
+pub const PERM_PUBSUB: &str = "PUBSUB";
+/// `FT._LIST`: Redis Search or valkey-search. Without the module it reads as skipped
+/// (unsupported), never denied.
+pub const PERM_SEARCH: &str = "FT._LIST";
+pub const VIEW_PERM_LABELS: [&str; 5] = [
+    PERM_SLOWLOG,
+    PERM_CLIENT_LIST,
+    PERM_XINFO,
+    PERM_PUBSUB,
+    PERM_SEARCH,
+];
+
+/// A client ID no client has (`i64::MAX`): `CLIENT LIST ID` with it checks the ACL and
+/// returns no client's line, and needs no `+client|id` to learn the connection's own ID.
+const NO_CLIENT_ID: i64 = i64::MAX;
+
+/// What a failed view probe of `command` reads as, in redis-lens's own words (the
+/// server's text can name the ACL user). `NOPERM` is a denial; an unknown command, a
+/// missing module or any other failure turns the view off as skipped, with the reason.
+fn classify_view_probe(
+    label: &str,
+    command: &str,
+    r: Result<redis::Value, redis::RedisError>,
+) -> PermStatus {
+    match r {
+        Ok(_) => PermStatus::Allowed,
+        Err(e) if is_noperm(&e) => PermStatus::Denied(noperm_text(command)),
+        Err(e) if crate::live::is_unknown_command(&e) => {
+            if label == PERM_SEARCH {
+                PermStatus::Skipped("the Search module is not loaded".to_string())
+            } else {
+                PermStatus::Skipped(format!("the server does not support {command}"))
+            }
+        }
+        Err(_) => PermStatus::Skipped(format!("{command} could not be checked")),
+    }
+}
+
+/// Try one read-only command for each view that needs one and report which are
+/// allowed: `SLOWLOG LEN`, `CLIENT LIST ID <an id no client has>`, `XINFO HELP`,
+/// `PUBSUB NUMPAT` and `FT._LIST`.
+///
+/// Never fails as a whole, and never puts the server's error text in a status.
+pub async fn check_view_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Vec<PermCheck> {
+    let probes: [(&'static str, &str, redis::Cmd); 5] = [
+        (PERM_SLOWLOG, "SLOWLOG LEN", {
+            let mut c = redis::cmd("SLOWLOG");
+            c.arg("LEN");
+            c
+        }),
+        (PERM_CLIENT_LIST, "CLIENT LIST", {
+            let mut c = redis::cmd("CLIENT");
+            c.arg("LIST").arg("ID").arg(NO_CLIENT_ID);
+            c
+        }),
+        (PERM_XINFO, "XINFO", {
+            let mut c = redis::cmd("XINFO");
+            c.arg("HELP");
+            c
+        }),
+        (PERM_PUBSUB, "PUBSUB NUMPAT", {
+            let mut c = redis::cmd("PUBSUB");
+            c.arg("NUMPAT");
+            c
+        }),
+        (PERM_SEARCH, "FT._LIST", redis::cmd("FT._LIST")),
+    ];
+    let mut checks = Vec::with_capacity(probes.len());
+    for (label, command, cmd) in probes {
+        let r: Result<redis::Value, _> = cmd.query_async(conn).await;
+        checks.push(PermCheck {
+            label,
+            status: classify_view_probe(label, command, r),
+        });
+    }
+    checks
+}
+
+/// [`check_permissions`] followed by [`check_view_permissions`]: what the TUI checks on
+/// connect. The scan command and `conn test` use [`check_permissions`] alone.
+pub async fn check_all_permissions<C: ConnectionLike + Send>(conn: &mut C) -> PermissionReport {
+    let mut report = check_permissions(conn).await;
+    report.checks.extend(check_view_permissions(conn).await);
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_probes_read_in_redis_lens_words() {
+        let err = |kind, code: &'static str, detail: &str| {
+            Err(redis::RedisError::from((
+                redis::ErrorKind::Server(kind),
+                code,
+                detail.to_string(),
+            )))
+        };
+        let noperm = || {
+            err(
+                ServerErrorKind::NoPerm,
+                "NOPERM",
+                "User lens-ro has no permissions to run the 'slowlog|len' command",
+            )
+        };
+        assert_eq!(
+            classify_view_probe(PERM_SLOWLOG, "SLOWLOG LEN", Ok(redis::Value::Int(0))),
+            PermStatus::Allowed
+        );
+        let denied = classify_view_probe(PERM_SLOWLOG, "SLOWLOG LEN", noperm());
+        assert_eq!(
+            denied,
+            PermStatus::Denied("NOPERM SLOWLOG LEN is not allowed for this user".into())
+        );
+        // A missing module is unsupported, not denied.
+        let unknown = || {
+            err(
+                ServerErrorKind::ResponseError,
+                "ERR",
+                "unknown command 'FT._LIST', with args beginning with: ",
+            )
+        };
+        assert_eq!(
+            classify_view_probe(PERM_SEARCH, "FT._LIST", unknown()),
+            PermStatus::Skipped("the Search module is not loaded".into())
+        );
+        assert_eq!(
+            classify_view_probe(PERM_SEARCH, "FT._LIST", noperm()),
+            PermStatus::Denied("NOPERM FT._LIST is not allowed for this user".into())
+        );
+        assert_eq!(
+            classify_view_probe(PERM_XINFO, "XINFO", unknown()),
+            PermStatus::Skipped("the server does not support XINFO".into())
+        );
+        // Anything else: skipped, and the server's text is not kept.
+        let odd = classify_view_probe(
+            PERM_CLIENT_LIST,
+            "CLIENT LIST",
+            err(
+                ServerErrorKind::ResponseError,
+                "ERR",
+                "syntax error near lens-ro",
+            ),
+        );
+        assert_eq!(
+            odd,
+            PermStatus::Skipped("CLIENT LIST could not be checked".into())
+        );
+    }
 
     #[test]
     fn policy_parsing() {
@@ -1731,14 +1897,18 @@ while (my $c = $l->accept) {
             "denied",
             "User x has no permissions".to_string(),
         ));
-        assert!(matches!(classify(Err(noperm), true), PermStatus::Denied(_)));
+        // Fixed text: the server's names the ACL user.
+        assert_eq!(
+            classify("MEMORY USAGE", Err(noperm), true),
+            PermStatus::Denied("NOPERM MEMORY USAGE is not allowed for this user".into())
+        );
         let nokey = redis::RedisError::from((
             redis::ErrorKind::Server(ServerErrorKind::ResponseError),
             "ERR",
             "no such key".to_string(),
         ));
-        assert_eq!(classify(Err(nokey), true), PermStatus::Allowed);
-        assert_eq!(classify(Ok(()), false), PermStatus::Allowed);
+        assert_eq!(classify("TYPE", Err(nokey), true), PermStatus::Allowed);
+        assert_eq!(classify("SCAN", Ok(()), false), PermStatus::Allowed);
     }
 
     /// An empty shard that doesn't own the probe key's slot answers `MOVED` to every
@@ -1757,11 +1927,11 @@ while (my $c = $l->accept) {
             "ASK",
             "2115 127.0.0.1:7000".to_string(),
         ));
-        assert_eq!(classify(Err(moved()), true), PermStatus::Allowed);
-        assert_eq!(classify(Err(ask), true), PermStatus::Allowed);
+        assert_eq!(classify("TYPE", Err(moved()), true), PermStatus::Allowed);
+        assert_eq!(classify("TYPE", Err(ask), true), PermStatus::Allowed);
         // On a real key (one SCAN returned), a redirect proves nothing.
         assert!(matches!(
-            classify(Err(moved()), false),
+            classify("TYPE", Err(moved()), false),
             PermStatus::Denied(_)
         ));
     }

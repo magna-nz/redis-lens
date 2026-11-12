@@ -7,7 +7,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
-use super::app::{App, ConnId, Effect, Msg, ScanId, View};
+use super::app::{App, ConnId, Effect, Msg, ScanId, Screen};
 use super::fixtures;
 use super::ui;
 use super::ui::style::{AMBER, DIM, RED, TEAL};
@@ -30,6 +30,11 @@ fn press(app: &mut App, keys: &str) {
     for c in keys.chars() {
         app.handle_key(ch(c));
     }
+}
+
+/// Goes to `screen`: its view's digit, then `tab` to the panel.
+fn show(app: &mut App, screen: Screen) {
+    super::app::views::testing::show(app, screen);
 }
 
 fn render(app: &App, w: u16, h: u16) -> Terminal<TestBackend> {
@@ -115,16 +120,17 @@ fn column_of(lines: &[String], y: usize, needle: &str) -> usize {
 #[test]
 fn nodes_healthy_three_shards() {
     let (mut app, _) = cluster_scanned(fixtures::cluster_report(), HEALTHY);
-    app.handle_key(ch('5'));
+    show(&mut app, Screen::Nodes);
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[2].contains("5 Nodes"), "{}", lines[2]);
-    assert!(lines[3].starts_with("┌─ Nodes "), "{}", lines[3]);
-    assert!(lines[3].contains("3 shards"), "{}", lines[3]);
+    // The panel row of the tab bar names it.
+    assert!(lines[3].contains("Nodes"), "{}", lines[3]);
+    assert!(lines[4].starts_with("┌─ Nodes "), "{}", lines[4]);
+    assert!(lines[4].contains("3 shards"), "{}", lines[4]);
     for (row, slots, ep) in [
-        (5, "0-5460", "10.0.1.11:6379"),
-        (6, "5461-10922", "10.0.1.12:6379"),
-        (7, "10923-16383", "10.0.1.13:6379"),
+        (6, "0-5460", "10.0.1.11:6379"),
+        (7, "5461-10922", "10.0.1.12:6379"),
+        (8, "10923-16383", "10.0.1.13:6379"),
     ] {
         let l = &lines[row];
         assert!(l.contains(slots) && l.contains(ep), "{l}");
@@ -132,13 +138,13 @@ fn nodes_healthy_three_shards() {
     }
     // Columns line up with the header.
     for col in ["ENDPOINT", "ROLE", "STATUS"] {
-        let at = column_of(&lines, 4, col);
+        let at = column_of(&lines, 5, col);
         let first = match col {
             "ENDPOINT" => "10.0.1.11",
             "ROLE" => "primary",
             _ => "scanned",
         };
-        assert_eq!(column_of(&lines, 5, first), at, "{col}");
+        assert_eq!(column_of(&lines, 6, first), at, "{col}");
     }
     assert_eq!(colour_of(&t, "scanned"), TEAL);
     // The detail panel is the selected (first) node's.
@@ -152,10 +158,11 @@ fn nodes_healthy_three_shards() {
 #[test]
 fn nodes_with_a_failed_and_a_partial_node() {
     let (mut app, _) = cluster_scanned(fixtures::cluster_report_degraded(), DEGRADED);
-    press(&mut app, "5G");
+    show(&mut app, Screen::Nodes);
+    press(&mut app, "G");
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[3].contains("1 failed · 1 partial"), "{}", lines[3]);
+    assert!(lines[4].contains("1 failed · 1 partial"), "{}", lines[4]);
     // Failed red, partial amber, notes in the same colours.
     assert_eq!(colour_at(&t, "│ 10923-16383", "✗", 40), RED);
     assert_eq!(colour_at(&t, "│ 5461-10922", "▲", 40), AMBER);
@@ -173,7 +180,8 @@ fn nodes_with_a_failed_and_a_partial_node() {
 #[test]
 fn nodes_partial_note_wraps_in_the_detail_panel() {
     let (mut app, _) = cluster_scanned(fixtures::cluster_report_degraded(), DEGRADED);
-    press(&mut app, "5j");
+    show(&mut app, Screen::Nodes);
+    press(&mut app, "j");
     let t = render(&app, 80, 24);
     let all = text(&t);
     // Every word of the note is on screen, over two lines of the detail panel.
@@ -186,15 +194,16 @@ fn nodes_partial_note_wraps_in_the_detail_panel() {
 #[test]
 fn nodes_with_replicas_scanned() {
     let (mut app, _) = cluster_scanned(fixtures::cluster_report_replicas(), REPLICAS);
-    press(&mut app, "5G");
+    show(&mut app, Screen::Nodes);
+    press(&mut app, "G");
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[3].contains("2 on replicas"), "{}", lines[3]);
-    assert!(lines[5].contains("10.0.1.21:6379") && lines[5].contains("replica"));
-    assert!(lines[6].contains("10.0.1.22:6379") && lines[6].contains("replica"));
+    assert!(lines[4].contains("2 on replicas"), "{}", lines[4]);
+    assert!(lines[6].contains("10.0.1.21:6379") && lines[6].contains("replica"));
+    assert!(lines[7].contains("10.0.1.22:6379") && lines[7].contains("replica"));
     // The shard whose replica could not be used: its primary, with the reason.
-    assert!(lines[7].contains("10.0.1.13:6379") && lines[7].contains("primary"));
-    assert!(lines[7].contains("replica not used"), "{}", lines[7]);
+    assert!(lines[8].contains("10.0.1.13:6379") && lines[8].contains("primary"));
+    assert!(lines[8].contains("replica not used"), "{}", lines[8]);
     assert!(text(&t).contains("▲ replica not used: 10.0.1.23:6379: timed out"));
     // Not degraded: the summary in the header is dim.
     assert_eq!(colour_of(&t, REPLICAS), DIM);
@@ -208,7 +217,7 @@ fn nodes_with_replicas_scanned() {
 #[test]
 fn nodes_narrow_80x24_and_60x20() {
     let (mut app, _) = cluster_scanned(fixtures::cluster_report_degraded(), DEGRADED);
-    app.handle_key(ch('5'));
+    show(&mut app, Screen::Nodes);
     let mut snap = String::new();
     for (w, h) in [(80, 24), (60, 20)] {
         let t = render(&app, w, h);
@@ -217,8 +226,8 @@ fn nodes_narrow_80x24_and_60x20() {
             assert_eq!(l.chars().count(), usize::from(w), "{l}");
         }
         // Slots and endpoints always show; at 80 the note column has no room.
-        assert!(lines[5].contains("0-5460") && lines[5].contains("10.0.1.11:6379"));
-        assert!(!lines[4].contains("NOTE"), "{}", lines[4]);
+        assert!(lines[6].contains("0-5460") && lines[6].contains("10.0.1.11:6379"));
+        assert!(!lines[5].contains("NOTE"), "{}", lines[5]);
         snap.push_str(&format!("{w}x{h}:\n{}\n\n", lines.join("\n")));
     }
     insta::assert_snapshot!(snap);
@@ -245,13 +254,13 @@ fn nodes_on_a_standalone_report() {
         scan: scan_of(&app),
         report: Box::new(report),
     });
-    app.handle_key(ch('5'));
+    show(&mut app, Screen::Nodes);
     let t = render(&app, 80, 24);
     let all = text(&t);
     assert!(all.contains("Not a cluster: this scan read one standalone server."));
     // As on an empty Hot keys view, the footer is the view's own: r and s still work.
     assert!(
-        buffer_lines(&t)[23].starts_with(" ↑↓ Move   enter Patterns"),
+        buffer_lines(&t)[23].starts_with(" ↑↓ Move   tab Panel   enter Patterns"),
         "{}",
         buffer_lines(&t)[23]
     );
@@ -270,9 +279,10 @@ fn patterns_narrowed_to_a_node() {
         result: Ok(Some(fixtures::history(true))),
     });
     assert!(buffer_lines(&render(&app, 120, 36))[4].contains('Δ'));
-    press(&mut app, "5j");
+    show(&mut app, Screen::Nodes);
+    press(&mut app, "j");
     app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.view, View::Patterns);
+    assert_eq!(app.screen(), Screen::Patterns);
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
     assert!(
@@ -287,7 +297,7 @@ fn patterns_narrowed_to_a_node() {
     assert!(narrow[3].contains("node 10.0.1.12"), "{}", narrow[3]);
     // esc: back to Nodes, then the merged rows with their Δ column on 1.
     app.handle_key(key(KeyCode::Esc));
-    assert_eq!(app.view, View::Nodes);
+    assert_eq!(app.screen(), Screen::Nodes);
     app.handle_key(ch('1'));
     let back = buffer_lines(&render(&app, 120, 36));
     assert!(back[3].starts_with("┌─ Patterns "), "{}", back[3]);
@@ -299,17 +309,18 @@ fn patterns_narrowed_to_a_node() {
 #[test]
 fn hot_keys_with_the_node_column() {
     let (mut app, _) = cluster_scanned(fixtures::cluster_report(), HEALTHY);
-    press(&mut app, "4j");
+    show(&mut app, Screen::HotKeys);
+    press(&mut app, "j");
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[4].contains("NODE"), "{}", lines[4]);
-    let node_col = column_of(&lines, 4, "NODE");
+    assert!(lines[5].contains("NODE"), "{}", lines[5]);
+    let node_col = column_of(&lines, 5, "NODE");
     // Each key shows the node it was sampled on, under the heading.
     let report = app.report().unwrap();
     let nodes = report.nodes.as_ref().unwrap();
     for (i, k) in report.hot_keys.iter().enumerate() {
         let ep = nodes[usize::from(k.node.unwrap())].endpoint.to_string();
-        assert_eq!(column_of(&lines, 5 + i, &ep), node_col, "{}", lines[5 + i]);
+        assert_eq!(column_of(&lines, 6 + i, &ep), node_col, "{}", lines[6 + i]);
     }
     // The detail panel names the selected key's node too.
     assert!(text(&t).contains(" NODE   10.0.1.12:6379"), "{}", text(&t));
@@ -317,9 +328,9 @@ fn hot_keys_with_the_node_column() {
     let mut standalone = fixtures::report(true);
     standalone.hot_keys = fixtures::hot_keys();
     let (mut plain, _) = cluster_scanned(standalone, HEALTHY);
-    plain.handle_key(ch('4'));
+    show(&mut plain, Screen::HotKeys);
     let plain_lines = buffer_lines(&render(&plain, 120, 36));
-    assert!(!plain_lines[4].contains("NODE"), "{}", plain_lines[4]);
+    assert!(!plain_lines[5].contains("NODE"), "{}", plain_lines[5]);
     insta::assert_snapshot!(t.backend());
 }
 
@@ -328,9 +339,9 @@ fn hot_keys_node_column_cuts_a_long_address() {
     let mut report = fixtures::cluster_report();
     report.nodes.as_mut().unwrap()[0].endpoint.host = "cache-node-0001.internal".into();
     let (mut app, _) = cluster_scanned(report, HEALTHY);
-    app.handle_key(ch('4'));
+    show(&mut app, Screen::HotKeys);
     let lines = buffer_lines(&render(&app, 120, 36));
-    let row = &lines[5];
+    let row = &lines[6];
     // Cut to 15 cells, and a cell stays free before the pattern.
     assert!(row.contains(" cache-node-000… cache:"), "{row}");
 }
@@ -391,7 +402,7 @@ fn connections_detail_shows_the_cluster_summary() {
         let lines = buffer_lines(&t);
         let server = lines
             .iter()
-            .find(|l| l.contains(" Server "))
+            .find(|l| l.starts_with('│') && l.contains(" Server "))
             .unwrap_or_else(|| panic!("{lines:#?}"));
         assert!(
             server.contains(&format!("Redis 7.4.2 · {summary}")),
@@ -429,12 +440,15 @@ fn every_cluster_screen_at_every_size_does_not_panic() {
     none.nodes = Some(Vec::new());
     apps.push(cluster_scanned(none, HEALTHY).0);
     for app in &mut apps {
-        for view in ['0', '1', '2', '3', '4', '5'] {
-            app.handle_key(ch(view));
+        for screen in Screen::ALL {
+            if screen == Screen::KeyList {
+                continue;
+            }
+            show(app, screen);
             for _ in 0..3 {
                 app.handle_key(ch('j'));
             }
-            if view == '5' {
+            if screen == Screen::Nodes {
                 app.handle_key(key(KeyCode::Enter));
             }
             for (w, h) in [(60, 20), (61, 21), (80, 24), (40, 10), (1, 1), (200, 60)] {
@@ -446,9 +460,9 @@ fn every_cluster_screen_at_every_size_does_not_panic() {
     let mut odd = fixtures::cluster_report();
     odd.hot_keys[0].node = Some(99);
     let (mut app, _) = cluster_scanned(odd, HEALTHY);
-    app.handle_key(ch('4'));
+    show(&mut app, Screen::HotKeys);
     let lines = buffer_lines(&render(&app, 120, 36));
-    assert!(lines[5].contains(" —  "), "{}", lines[5]);
+    assert!(lines[6].contains(" —  "), "{}", lines[6]);
 }
 
 #[test]
@@ -470,12 +484,55 @@ fn a_seed_only_scan_is_amber_everywhere_it_is_summed_up() {
     let t = render(&app, 140, 36);
     assert_eq!(colour_of(&t, &format!("Redis 7.4.2 · {SEED}")), AMBER);
     // On Nodes the slots are unknown, and the whole note is in the detail panel.
-    app.handle_key(ch('5'));
+    show(&mut app, Screen::Nodes);
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[5].starts_with("│ —  "), "{}", lines[5]);
-    let detail = lines[26..35].join(" ");
+    assert!(lines[6].starts_with("│ —  "), "{}", lines[6]);
+    let detail = lines[27..36].join(" ");
     for word in crate::conn::cluster::SHARDS_UNREADABLE.split_whitespace() {
         assert!(detail.contains(word), "{word}: {detail}");
     }
+}
+
+/// The views that read one server are off on a cluster, say why, and ask nothing.
+#[test]
+fn live_views_are_off_on_a_cluster_and_send_nothing() {
+    let (mut app, _) = cluster_scanned(fixtures::cluster_report(), HEALTHY);
+    for screen in [
+        Screen::KeyList,
+        Screen::Overview,
+        Screen::Clients,
+        Screen::SlowLog,
+        Screen::Streams,
+        Screen::PubSub,
+        Screen::Search,
+    ] {
+        let effects = super::app::views::testing::show(&mut app, screen);
+        assert_eq!(app.screen(), screen);
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Live { .. })),
+            "{screen:?}: {effects:?}"
+        );
+        let all = text(&render(&app, 120, 36));
+        assert!(
+            all.contains("Not available on a cluster yet: this view reads one server"),
+            "{screen:?}: {all}"
+        );
+        // `r` on a live view says the same and sends nothing either.
+        let effects = app.handle_key(ch('r'));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Live { .. })),
+            "{screen:?}: {effects:?}"
+        );
+    }
+    // The Analysis panels and Patterns still show the merged results.
+    // (The notice from the last `r` is still in the key bar, so look above it.)
+    show(&mut app, Screen::BigKeys);
+    let lines = buffer_lines(&render(&app, 120, 36));
+    let body = lines[..lines.len() - 1].join("\n");
+    assert!(!body.contains("Not available on a cluster"), "{body}");
+    assert!(
+        body.contains("Lengths and encodings are not read on a cluster yet"),
+        "{body}"
+    );
 }

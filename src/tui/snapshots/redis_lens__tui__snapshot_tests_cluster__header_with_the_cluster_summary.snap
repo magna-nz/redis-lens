@@ -1,33 +1,34 @@
 ---
 source: src/tui/snapshot_tests_cluster.rs
+assertion_line: 378
 expression: snap
 ---
 cluster · 3 shards at 140:
  redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  cluster · 3 shards  read-only          ● scan complete 14:02:11 UTC 
  Redis 7.4.2   MEM ████████████▍░░░░░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                                     
-  0 Connections   1 Patterns   2 TTL   3 Diff   4 Hot keys   5 Nodes                                                                        
+  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                                     
 
 cluster · 3 shards at 120:
  redis-lens 0.1.0    PROD   prod-cache-01  cluster · 3 shards  read-only                   ● scan complete 14:02:11 UTC 
  Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                           
-  0 Connections   1 Patterns   2 TTL   3 Diff   4 Hot keys   5 Nodes                                                    
+  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 
 
 cluster · 3 shards at 80:
  redis-lens 0.1.0    PROD   prod-cache-01  cluster · 3 shards  read-only        
  Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   
-  0 Connections   1 Patterns   2 TTL   3 Diff   4 Hot keys   5 Nodes            
+  0   1 Patterns   2   3   4   5   6                                            
 
 cluster · 3 shards · 1 unreachable at 140:
  redis-lens 0.1.0    PROD   prod-cache-01  cluster · 3 shards · 1 unreachable  read-only                       ● scan complete 14:02:11 UTC 
  Redis 7.4.2   MEM ████████████▍░░░░░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                                     
-  0 Connections   1 Patterns   2 TTL   3 Diff   4 Hot keys   5 Nodes                                                                        
+  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                                     
 
 cluster · 3 shards · 1 unreachable at 120:
  redis-lens 0.1.0    PROD   prod-cache-01  cluster · 3 shards · 1 unreachable  read-only   ● scan complete 14:02:11 UTC 
  Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                           
-  0 Connections   1 Patterns   2 TTL   3 Diff   4 Hot keys   5 Nodes                                                    
+  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 
 
 cluster · 3 shards · 1 unreachable at 80:
  redis-lens 0.1.0    PROD   prod-cache-01  cluster · 3 shards · 1 u…  read-only 
  Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   
-  0 Connections   1 Patterns   2 TTL   3 Diff   4 Hot keys   5 Nodes
+  0   1 Patterns   2   3   4   5   6

@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** v0.3 (cluster and SSH tunnels) built on `v03/integration`; verifier and PR next
-**Last updated:** 2026-11-12 (v0.3: blockers fixed and re-verified on `v03/integration`; PR next)
+**Current milestone:** v0.3 (cluster and SSH tunnels) merged to main (#14); Redis Insight parity phase 1 built, merged with v0.3 and in review (#15)
+**Last updated:** 2026-11-12 (main merged into `claude/redis-insight-tui-features-60db8f` for #15: 5 Nodes became the Nodes panel of 2 Analysis; the live views are off on a cluster)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -373,3 +373,51 @@ Researched on 2026-11-11. Proposals only; nothing here is built. The full write-
 - ElastiCache Serverless blocks `MEMORY USAGE` and `OBJECT FREQ`.
 - The OSS clustering policy on Azure Managed Redis needs v0.3 cluster support (built; untested against Azure).
 - `HEXPIRE` exists in Redis from 7.4 and in Valkey only from 9.0, so CI would need a newer Valkey to test it.
+
+### Redis Insight parity (researched 2026-11-12)
+
+A gap matrix against Redis Insight v3.8.0, with a three-phase roadmap, is in [docs/redisinsight-parity.md](docs/redisinsight-parity.md).
+
+**Approved by the owner on 2026-11-12:** all three phases ("we should do phase 1, 2 and 3"). The decisions:
+- **Values:** shown on screen for every profile, never saved.
+- **Writes:** allowed with the user's permission, as in Redis Insight. Three checks must all allow a write:
+  - the server ACL;
+  - the profile's `read_only` setting, a saved toggle (`w`, `conn set --writes`). It is on by default for `prod`, and turning it off there needs the profile name typed;
+  - a confirmation for each action: `y`/`n`, or a typed name on `prod`.
+- **Recorded:**
+  - spec.md has the non-goals rewritten, a new section "Browsing, server views and writes (planned)" and the milestones for phases 1-3;
+  - the stale `MONITOR` "planned for v0.2" line is fixed;
+  - CLAUDE.md rule 2 now says read-only profiles (the `prod` default) never write, and every write goes through the one write gate.
+- **TUI design mockup**, 14 screens: https://claude.ai/artifact/2RzWTZFKwJASgtX3phxKfG (private to the owner).
+- **Phase 1, wave A: done** (on branch `claude/redis-insight-tui-features-60db8f`, not yet in a PR):
+  - contract `26a34eb`: `Budget`, `live` request and reply types, the new `Effect` and `Msg` variants;
+  - A1 (merged `20e8084`): the shared command budget (`src/budget.rs`) used by the scan and the live views, the live connection kept open after a scan (`src/live/`), the five view probes (`conn::check_view_permissions`), and the runner wiring;
+  - A2 (merged `3f01132`): seven views with panels and drill-down, the `ViewState` interface (`src/tui/views/`), the key table, the header write state and the WRITES column;
+  - verified by V-A (approve, no blockers); then step 0 fixed what it noted:
+    - a scan's batch no longer waits its slot plus its round trip;
+    - pasted text's effects are run;
+    - a new connect forgets the last connect's checks, and the view on screen is told when a check turns it off or on;
+    - a refused scan check reads fixed text instead of the server's, which named the ACL user (rule 1; older than this work).
+  - Not done: the 5 view probes don't take from the budget (5 commands per connect), and the key bar shows the ready keys while a connect runs.
+- **Phase 1, wave B: done** (same branch). Each piece ran as its own session in its own worktree, and was merged here:
+  - B1 (merged `7fc0aff`): Server Overview (INFO sparklines and rates), Clients (grouped by library and /24 or /64, idle flag, drill-down), Slow log (key names from `COMMAND INFO`, arguments dropped, notes, threshold from `CONFIG GET`).
+  - B3 (merged `897ba0e`): Streams (`XINFO` with stuck, lagging, no readers and unbounded), Pub/Sub counts, Search indexes and schema on Redis 8 and valkey-search.
+  - B2 (merged `40eae26`): the Patterns VERDICT column, the key list (SCAN MATCH filtered by inference, paged with `n`, pipelined metadata), Big keys, Expiry and Recommendations (`src/analysis.rs`). New report field `key_sizes` (top 50 keys, bytes per TTL bucket), approved by the owner; older snapshots still load.
+  - Merge fixes: `d094216` (tests), `da1c0aa` (the runner boxes `Msg`, for clippy).
+  - Verifier V-B blocked on four points, all fixed in `dd7352e` and `de3d4f8`: Search resent a failed `FT._LIST` every tick; the Slow log lost the reason key names were off; some integration tests ran on Redis only (rule 5); spec and status were not updated (this change). Also fixed from its notes: the key list loaded pages without `n`, Streams retried refused commands every 5 s, two unchecked adds, stale replies, Pub/Sub's unused `tab`, a copy of the inference helpers, and an uncapped encoding check.
+  - Re-verification V-B2 blocked on three points, fixed in the next commit: Search showed "Reading…" forever after a failed first read (it now shows the failure and `r`); an `r` on Streams during a poll lost its reset of refused commands (it now reads once more when that poll answers); the spec's key bar sentence still had `tab Panel` on Streams, Pub/Sub and Search. Its non-blocking notes are open: Pub/Sub asks a refused `NUMSUB`/`NUMPAT` every poll; the spec's `key_sizes` fields omit `lfu_freq`; Pub/Sub keeps the first 1,000 channels in server order, not the top 1,000 by subscribers; the Slow log's `r` does not ask a refused `COMMAND INFO` again while Streams' does; a Streams poll that fails whole forgets the refusals it found.
+  - Demo: `docs/demo.gif` and `demo/gif-steps.json` now tour phase 1; the demo `lens` user has the phase 1 read commands.
+  - Merged with v0.3 (main at `0480a16`) for PR #15. What changed in the merge:
+    - 5 Nodes is now the Nodes panel of 2 Analysis, after Expiry (`tab`, or `2` then `tab`). `enter` narrows Patterns to the node and `esc` comes back to the panel, as before. Its key bar drops `s Snapshot` (it is in the `?` overlay) to fit 80 columns.
+    - The scan takes every command from the shared `Budget`; a cluster scan gives each node a `Budget` of its own (per-node budget, as v0.3 has it). `sample_server` takes the budget instead of building a `Limiter`.
+    - On a cluster, the views that read one server (the key list, Server, Streams, Pub/Sub, Search) are off with a fixed reason; a cluster connect opens no live connection and runs no view probes. Big keys and Expiry cover every node's samples, each big key with its node; lengths and encodings are not read on a cluster.
+    - The live task keeps the connect's `Connection` (and so an SSH forward) open until it ends.
+    - The panel row of the tab bar closes up, then shows only the current panel (`Nodes · 6 of 6`), when the names don't fit.
+    - The permission check's `classify` keeps v0.3's redirect rule and phase 1's fixed NOPERM text.
+  - Not covered by the merge's tests: the live views on a cluster against a real cluster (they are off), and the "previous results" marking loop in `snapshot_tests.rs`, which still visits the five old screens and not Nodes.
+  - Left as is, from V-B's notes: Recommendations are recomputed on each draw (cheap); at 80 columns VERDICT cuts long pattern names (owner to decide whether VERDICT should hide first).
+  - Known flake: a test container's port is sometimes not mapped yet (`tests/common/mod.rs:114`); it passes on a rerun.
+- **Next:** a demo against `make demo-up`, then one PR to `main` for the owner to merge. Then phase 2 (values on screen).
+- **Design corrections found while writing the spec:**
+  - A stream doesn't store its `MAXLEN`, so Streams shows the age of the oldest entry and an `unbounded` verdict instead of a cap.
+  - A pattern's glob can match keys of other patterns, so the key list and bulk actions keep only keys that infer to the selected pattern.

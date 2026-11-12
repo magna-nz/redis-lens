@@ -140,10 +140,7 @@ pub fn perms_memory_denied() -> PermissionReport {
             check(PERM_TYPE_TTL, PermStatus::Allowed),
             check(
                 PERM_MEMORY,
-                PermStatus::Denied(
-                    "NOPERM User lens-limited has no permissions to run the 'memory|usage' command"
-                        .into(),
-                ),
+                PermStatus::Denied("NOPERM MEMORY USAGE is not allowed for this user".into()),
             ),
             check(
                 PERM_FREQ,
@@ -467,6 +464,7 @@ pub fn report(sizes: bool) -> ScanReport {
         complete: false,
         match_glob: None,
         server_context: None,
+        key_sizes: None,
         nodes: None,
     }
 }
@@ -651,10 +649,33 @@ pub fn perms_freq_denied() -> PermissionReport {
     let mut p = perms_ok();
     for c in &mut p.checks {
         if c.label == PERM_FREQ {
-            c.status = PermStatus::Denied(
-                "NOPERM User lens-limited has no permissions to run the 'object|freq' command"
-                    .into(),
-            );
+            c.status = PermStatus::Denied("NOPERM OBJECT FREQ is not allowed for this user".into());
+        }
+    }
+    p
+}
+
+/// [`perms_ok`] plus every phase 1 view probe, allowed.
+pub fn perms_with_probes() -> PermissionReport {
+    let mut p = perms_ok();
+    p.checks.extend(
+        crate::tui::app::views::PROBE_LABELS
+            .iter()
+            .map(|l| check(l, PermStatus::Allowed)),
+    );
+    p
+}
+
+/// [`perms_with_probes`] with `SLOWLOG` denied and `FT._LIST` skipped (no Search
+/// module), the other probes allowed.
+pub fn perms_probes_off() -> PermissionReport {
+    use crate::tui::app::views::{PROBE_FT_LIST, PROBE_SLOWLOG};
+    let mut p = perms_with_probes();
+    for c in &mut p.checks {
+        if c.label == PROBE_SLOWLOG {
+            c.status = PermStatus::Denied("NOPERM SLOWLOG LEN is not allowed for this user".into());
+        } else if c.label == PROBE_FT_LIST {
+            c.status = PermStatus::Skipped("no Search module".into());
         }
     }
     p

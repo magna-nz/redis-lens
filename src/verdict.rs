@@ -1,5 +1,6 @@
 //! TTL risk verdicts per pattern, shared by the TUI's TTL view and the CLI.
 
+use crate::analysis;
 use crate::diff::{Cause, PatternDiff};
 use crate::format;
 use crate::model::PatternStats;
@@ -198,6 +199,66 @@ pub fn explain(stats: &PatternStats, change: Option<&PatternDiff>) -> Vec<String
             s.push('.');
             vec![s]
         }
+    }
+}
+
+/// The Patterns VERDICT column (spec "1 Patterns, additions"): the TTL verdict, plus
+/// `big key` and `leak?` from "2 Analysis". One per pattern, the most worrying that
+/// applies; `Ord` follows that order, most worrying first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PatternVerdict {
+    /// A lock pattern with keys that have no TTL ([`analysis::is_lock_leak`]).
+    Leak,
+    /// [`TtlVerdict::PersistentGrowing`].
+    Growing,
+    /// [`TtlVerdict::MixedLikelyBug`].
+    Mixed,
+    /// A sampled key of 64 MiB or more ([`analysis::is_big_pattern`]).
+    BigKey,
+    /// [`TtlVerdict::PersistentStable`].
+    Persistent,
+    /// [`TtlVerdict::Ok`] and [`TtlVerdict::ShortLived`].
+    Ok,
+}
+
+impl PatternVerdict {
+    /// The column text, at most 10 cells: `leak?`, `growing`, `mixed`, `big key`,
+    /// `persistent`, `ok`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Leak => "leak?",
+            Self::Growing => "growing",
+            Self::Mixed => "mixed",
+            Self::BigKey => "big key",
+            Self::Persistent => "persistent",
+            Self::Ok => "ok",
+        }
+    }
+
+    /// True for verdicts the UI flags in red.
+    pub fn is_warning(self) -> bool {
+        matches!(self, Self::Leak | Self::Growing | Self::Mixed)
+    }
+}
+
+/// The VERDICT column for one pattern. `change` is its entry in the diff against the
+/// previous snapshot, as for [`ttl_verdict`].
+pub fn pattern_verdict(stats: &PatternStats, change: Option<&PatternDiff>) -> PatternVerdict {
+    if analysis::is_lock_leak(stats) {
+        return PatternVerdict::Leak;
+    }
+    let ttl = ttl_verdict(stats, change);
+    match ttl {
+        TtlVerdict::PersistentGrowing => return PatternVerdict::Growing,
+        TtlVerdict::MixedLikelyBug => return PatternVerdict::Mixed,
+        _ => {}
+    }
+    if analysis::is_big_pattern(stats) {
+        return PatternVerdict::BigKey;
+    }
+    match ttl {
+        TtlVerdict::PersistentStable => PatternVerdict::Persistent,
+        _ => PatternVerdict::Ok,
     }
 }
 
@@ -496,5 +557,76 @@ mod tests {
         assert_eq!(t, "2% of 100 keys never expire, typically in about a day.");
         let t = explain(&stats(100, 0, [0, 0, 0, 0, 0, 0, 100]), None).join(" ");
         assert_eq!(t, "All 100 keys expire, typically in more than 30 days.");
+    }
+
+    #[test]
+    fn pattern_verdict_thresholds_and_order() {
+        use crate::analysis::BIG_KEY_BYTES;
+        let named = |name: &str, s: PatternStats| PatternStats {
+            pattern: name.into(),
+            ..s
+        };
+        let sized = |s: PatternStats, max: u64| PatternStats {
+            size_max: Some(max),
+            ..s
+        };
+        let expiring = stats(100, 0, [0, 0, 0, 100, 0, 0, 0]);
+        assert_eq!(pattern_verdict(&expiring, None), PatternVerdict::Ok);
+        // Short-lived keys are ok too.
+        let short = stats(100, 0, [0, 100, 0, 0, 0, 0, 0]);
+        assert_eq!(pattern_verdict(&short, None), PatternVerdict::Ok);
+        // Big key: 64 MiB, not one byte less.
+        assert_eq!(
+            pattern_verdict(&sized(expiring.clone(), BIG_KEY_BYTES), None),
+            PatternVerdict::BigKey
+        );
+        assert_eq!(
+            pattern_verdict(&sized(expiring.clone(), BIG_KEY_BYTES - 1), None),
+            PatternVerdict::Ok
+        );
+        // Mixed from 5% with no TTL; 4% is ok.
+        let mixed = stats(100, 5, [5, 0, 0, 95, 0, 0, 0]);
+        assert_eq!(pattern_verdict(&mixed, None), PatternVerdict::Mixed);
+        let four = stats(100, 4, [4, 0, 0, 96, 0, 0, 0]);
+        assert_eq!(pattern_verdict(&four, None), PatternVerdict::Ok);
+        // Mixed beats big key; big key beats persistent.
+        assert_eq!(
+            pattern_verdict(&sized(mixed, BIG_KEY_BYTES), None),
+            PatternVerdict::Mixed
+        );
+        assert_eq!(
+            pattern_verdict(&persistent(), None),
+            PatternVerdict::Persistent
+        );
+        assert_eq!(
+            pattern_verdict(&sized(persistent(), BIG_KEY_BYTES), None),
+            PatternVerdict::BigKey
+        );
+        let grew = change(Cause::MoreKeys, None, None, 60);
+        assert_eq!(
+            pattern_verdict(&persistent(), Some(&grew)),
+            PatternVerdict::Growing
+        );
+        // A lock with one key without a TTL is a leak, before everything else.
+        let lock = named("lock:{id}", stats(100, 1, [1, 0, 99, 0, 0, 0, 0]));
+        assert_eq!(pattern_verdict(&lock, None), PatternVerdict::Leak);
+        let lock_ok = named("lock:{id}", stats(100, 0, [0, 0, 100, 0, 0, 0, 0]));
+        assert_eq!(pattern_verdict(&lock_ok, None), PatternVerdict::Ok);
+        let lock_growing = named("mutex:{id}", persistent());
+        assert_eq!(
+            pattern_verdict(&lock_growing, Some(&grew)),
+            PatternVerdict::Leak
+        );
+        let mut all = [
+            PatternVerdict::Ok,
+            PatternVerdict::Persistent,
+            PatternVerdict::BigKey,
+            PatternVerdict::Mixed,
+            PatternVerdict::Growing,
+            PatternVerdict::Leak,
+        ];
+        all.sort();
+        assert_eq!(all[0], PatternVerdict::Leak);
+        assert!(all.iter().all(|v| v.label().chars().count() <= 10));
     }
 }

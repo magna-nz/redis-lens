@@ -437,6 +437,7 @@ mod tests {
             complete: false,
             match_glob: Some("user:*".into()),
             server_context: None,
+            key_sizes: None,
             nodes: None,
         };
         snapshot::save(&dir, &report).unwrap();

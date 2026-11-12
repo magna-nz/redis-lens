@@ -26,16 +26,18 @@ use futures::stream::{self, StreamExt};
 use redis::aio::ConnectionLike;
 use tokio::sync::watch;
 
+use crate::budget::Budget;
 use crate::conn::cluster::{ClusterTargets, ScanTargets};
 use crate::model::{
-    Endpoint, KeySample, KeysizeHistogram, KeyspaceInfo, MemoryStats, NodeReport, NodeRole,
-    NodeStatus, PERM_MEMORY, PermissionReport, ScanReport, ServerContext, ServerContextParts,
-    ServerInfo, ServerMode,
+    Endpoint, KeySample, KeySizes, KeysizeHistogram, KeyspaceInfo, MemoryStats, NodeReport,
+    NodeRole, NodeStatus, PERM_MEMORY, PermissionReport, ScanReport, ServerContext,
+    ServerContextParts, ServerInfo, ServerMode,
 };
 
 use super::{
     PartialHook, PartialPatterns, PartialSender, ScanError, ScanOptions, ScanProgress,
-    ServerSample, Throttle, estimate_scale, hot_keys, sample_server, server_info,
+    ServerSample, Throttle, big_keys, estimate_scale, hot_keys, sample_server, server_info,
+    ttl_bytes,
 };
 
 /// How many nodes are scanned at the same time.
@@ -377,6 +379,8 @@ pub(crate) async fn scan_nodes<C: ConnectionLike + Send>(
                     }
                 };
                 let mut hook = shared.map(|shared| NodeHook { node: i, shared });
+                // The budget is per node: each node is its own server.
+                let budget = Budget::new(node_opts.max_commands_per_sec);
                 let sample = sample_server(
                     conn,
                     info,
@@ -385,6 +389,7 @@ pub(crate) async fn scan_nodes<C: ConnectionLike + Send>(
                     &|| {},
                     Some(&report),
                     hook.as_mut().map(|h| h as &mut dyn PartialHook),
+                    &budget,
                 )
                 .await;
                 (i, sample)
@@ -519,6 +524,14 @@ fn merge(
     let complete = all_complete && covers_all_slots(reports.iter().flat_map(|r| &r.slots));
     let server = merged_server(&scanned_infos);
     let refs: Vec<&ServerContext> = contexts.iter().collect();
+    // Big keys and Expiry over every node's samples (each already carries its node).
+    let key_sizes = sizes_available.then(|| {
+        let all: Vec<KeySample> = node_samples.iter().flatten().cloned().collect();
+        Box::new(KeySizes {
+            big_keys: big_keys(&all),
+            ttl_bytes: ttl_bytes(&all),
+        })
+    });
     let taken_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
@@ -533,6 +546,7 @@ fn merge(
         complete,
         match_glob: opts.match_glob.clone(),
         server_context: Some(merge_contexts(&refs)),
+        key_sizes,
         nodes: Some(reports),
     }
 }
@@ -1123,7 +1137,7 @@ mod tests {
     /// The command budget is per node: two nodes at 200 commands a second each finish
     /// in about the time one takes, not two.
     #[test]
-    fn each_node_gets_its_own_limiter() {
+    fn each_node_gets_its_own_budget() {
         let rate = 200u32;
         let mut servers = vec![
             fake::Server::new(keys(&["user"], 0..120), 40),
@@ -1140,7 +1154,7 @@ mod tests {
         let r = run(scan_nodes("c", nodes, &o, None, None)).unwrap();
         let took = t0.elapsed();
         assert!(r.complete);
-        // Commands paced by a limiter: the context reads and the walk (INFO server,
+        // Commands paced by the budget: the context reads and the walk (INFO server,
         // INFO memory and DBSIZE come before it).
         let paced = |s: &fake::Server| s.log.len() as u64 - 3;
         let per_node: Vec<u64> = servers.iter().map(paced).collect();
@@ -1227,6 +1241,30 @@ mod tests {
         assert_eq!(total, 4_000);
         assert_eq!(p.samples[1].len(), 30, "samples are copied once");
         assert!(p.samples[1].iter().all(|k| k.node == Some(1)));
+    }
+
+    /// Big keys and Expiry are over every node's samples, and each big key names its
+    /// node.
+    #[test]
+    fn big_keys_and_expiry_cover_every_node() {
+        // Every key is 100 bytes, so ties go by name: the 20 `a:` keys, then `b:`.
+        let mut servers = vec![
+            fake::Server::new(keys(&["a"], 0..20), 20),
+            fake::Server::new(keys(&["b"], 20..80), 20),
+        ];
+        let mut nodes = inputs(&mut servers);
+        nodes[0].meta.slots = vec![(0, 8000)];
+        nodes[1].meta.slots = vec![(8001, 16383)];
+        let r = run(scan_nodes("c", nodes, &opts(1_000, 20), None, None)).unwrap();
+        let big = r.big_keys();
+        assert_eq!(big.len(), crate::scan::BIG_KEY_LIMIT);
+        for k in big {
+            let want = if k.key.starts_with("a:") { 0 } else { 1 };
+            assert_eq!(k.node, Some(want), "{}", k.key);
+        }
+        assert_eq!(big.iter().filter(|k| k.node == Some(0)).count(), 20);
+        // Every sampled key has no TTL: all 80 x 100 bytes are in the first bucket.
+        assert_eq!(r.ttl_bytes(), Some(&[8_000, 0, 0, 0, 0, 0, 0]));
     }
 
     #[test]

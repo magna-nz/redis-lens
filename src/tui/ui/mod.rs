@@ -1,7 +1,8 @@
 //! Pure rendering: `draw(frame, &app)` paints the whole screen from the state.
 //!
 //! Layout, from the design mockup: three header lines (brand and connection, the
-//! memory gauge, the tabs), the view's panels, and a key bar at the bottom.
+//! memory gauge, the tabs), a fourth with the panel names on views with panels, the
+//! view's panels, and a key bar at the bottom.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -13,16 +14,23 @@ use crate::conn::{ScanTarget, provider};
 use crate::format;
 use crate::model::{NodeReport, NodeStatus, PERM_MEMORY, ScanReport, ServerFlavor, ServerInfo};
 
-use super::app::{App, Phase, Session, View};
+use super::app::views::{Ctx, Owner};
+use super::app::{App, Phase, Screen, Session, View};
 use super::keymap;
 
+mod analysis;
 mod connections;
 mod delta;
 mod diff;
 pub mod help;
 mod hot;
+mod keys;
 mod nodes;
 mod patterns;
+mod pubsub;
+mod search;
+mod server;
+mod streams;
 pub mod style;
 mod ttl;
 pub mod widgets;
@@ -38,40 +46,99 @@ pub fn spinner(tick: u64) -> &'static str {
     SPINNER[(tick % SPINNER.len() as u64) as usize]
 }
 
+/// Header rows: three, and a fourth for the panel names on a view with panels.
+fn header_rows(view: View) -> u16 {
+    if view.panels().is_empty() { 3 } else { 4 }
+}
+
 /// The header, the view's body and the footer.
-fn screen(area: Rect) -> [Rect; 3] {
+fn screen(area: Rect, view: View) -> [Rect; 3] {
     Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(header_rows(view)),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
     .areas(area)
 }
 
-/// List rows a view shows on a screen of `area`: what PgUp and PgDn move by. Every list
-/// view (Connections, Patterns, TTL, Diff, Hot keys, Nodes) has the same layout: the main panel
-/// above the detail panel, its border, one header row, then the rows.
+/// List rows a view without panels shows on a screen of `area`: what PgUp and PgDn
+/// move by. Every list view (Connections, Patterns, TTL, Diff, Hot keys, Big keys,
+/// Nodes) has the same layout: the main panel above the detail panel, its border, one
+/// header row, then the rows. On a view with panels the tab bar's second row takes one
+/// more, which `App` subtracts.
 pub fn list_rows(area: Rect) -> usize {
-    let [_, body, _] = screen(area);
+    let [_, body, _] = screen(area, View::Connections);
     let (main, _) = split_body(body);
     usize::from(Block::bordered().inner(main).height.saturating_sub(1))
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    let [head, body, foot] = screen(frame.area());
+    let [head, body, foot] = screen(frame.area(), app.view);
     header(frame, head, app);
-    match app.view {
-        View::Connections => connections::draw(frame, body, app),
-        View::Patterns => patterns::draw(frame, body, app),
-        View::Ttl => ttl::draw(frame, body, app),
-        View::Diff => diff::draw(frame, body, app),
-        View::HotKeys => hot::draw(frame, body, app),
-        View::Nodes => nodes::draw(frame, body, app),
+    let screen = app.screen();
+    match screen {
+        Screen::Connections => connections::draw(frame, body, app),
+        Screen::Patterns => patterns::draw(frame, body, app),
+        Screen::Ttl => ttl::draw(frame, body, app),
+        Screen::Diff => diff::draw(frame, body, app),
+        Screen::HotKeys => hot::draw(frame, body, app),
+        Screen::Nodes => nodes::draw(frame, body, app),
+        _ => view_state(frame, body, app, screen),
     }
     footer(frame, foot, app);
     if app.help {
-        help::draw(frame, frame.area(), app.view);
+        help::draw(frame, frame.area(), screen);
     }
+}
+
+/// A screen a view state owns: its draw function, or why there is nothing to draw (no
+/// session, the view's permission probe failed, the scan has not finished).
+fn view_state(frame: &mut Frame, area: Rect, app: &App, screen: Screen) {
+    let title = screen.name();
+    let Some(ctx) = app.ctx() else {
+        let text = " Not connected. Open 0 Connections, pick a connection and press enter.";
+        notice_panels(
+            frame,
+            area,
+            title,
+            "",
+            vec![Line::from(Span::styled(text, style::dim()))],
+        );
+        return;
+    };
+    if let Some(why) = ctx.off_reason() {
+        let lines = vec![Line::from(Span::styled(
+            format!(" ▲ {why}"),
+            style::amber(),
+        ))];
+        notice_panels(frame, area, title, "off", lines);
+        return;
+    }
+    let Some(owner) = screen.owner() else {
+        return;
+    };
+    let v = &app.views;
+    match owner {
+        Owner::Keys => keys::draw(frame, area, &v.keys, &ctx),
+        Owner::Analysis => {
+            if report_or_wait(frame, area, app, title).is_some() {
+                analysis::draw(frame, area, &v.analysis, &ctx);
+            }
+        }
+        Owner::Server => server::draw(frame, area, &v.server, &ctx),
+        Owner::Streams => streams::draw(frame, area, &v.streams, &ctx),
+        Owner::PubSub => pubsub::draw(frame, area, &v.pubsub, &ctx),
+        Owner::Search => search::draw(frame, area, &v.search, &ctx),
+    }
+}
+
+/// What a stub view draws until wave B builds it: its title and "Not built yet".
+pub fn not_built(frame: &mut Frame, area: Rect, title: &str, ctx: &Ctx<'_>) {
+    let lines = vec![Line::from(Span::styled(
+        format!(" Not built yet: {} comes in phase 1.", ctx.screen.title()),
+        style::dim(),
+    ))];
+    notice_panels(frame, area, title, "", lines);
 }
 
 /// Marks results kept from the previous run while a rescan runs, or after it failed
@@ -338,14 +405,12 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
                 ),
                 style::dim(),
             );
-            let read_only = p
-                .is_read_only()
-                .then(|| Span::styled("  read-only", style::amber()));
-            let read_only_w = read_only.as_ref().map_or(0, |r| width(&r.content));
+            let write = [Span::raw("  "), write_state(p)];
+            let write_w = spans_width(&write);
             // On a cluster the summary says more than the seed's address: the address
             // shows only when the whole summary and the status still fit beside it.
             let show_endpoint = cluster.is_none_or(|summary| {
-                let taken = spans_width(&left) + width(&endpoint.content) + read_only_w;
+                let taken = spans_width(&left) + width(&endpoint.content) + write_w;
                 taken + 2 + width(summary) + 2 + spans_width(&right) <= w
             });
             if show_endpoint {
@@ -364,7 +429,7 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
             }
             if let Some(summary) = cluster {
                 let nodes = s.report.as_ref().and_then(|r| r.nodes.as_deref());
-                let taken = spans_width(&left) + read_only_w;
+                let taken = spans_width(&left) + write_w;
                 left.push(Span::styled(
                     format!(
                         "  {}",
@@ -377,11 +442,27 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
                     },
                 ));
             }
-            left.extend(read_only);
+            left.extend(write);
             (justify(left, right, w), server_line(app, s, w))
         }
     };
-    rows(frame, area, vec![l0, l1, tabs(app)], None);
+    let mut lines = vec![l0, l1, tabs(app, w)];
+    if !app.view.panels().is_empty() {
+        lines.push(panel_tabs(app, w));
+    }
+    rows(frame, area, lines, None);
+}
+
+/// The profile's write state: `read-only` (amber), `writes on` (red), or a red
+/// `WRITES ON` badge on a `prod` profile with writes on.
+fn write_state(p: &crate::model::Profile) -> Span<'static> {
+    if p.is_read_only() {
+        Span::styled("read-only", style::amber())
+    } else if p.env == crate::model::Env::Prod {
+        Span::styled(" WRITES ON ", style::env_badge(crate::model::Env::Prod))
+    } else {
+        Span::styled("writes on", style::warn())
+    }
 }
 
 fn server_line(app: &App, s: &Session, w: usize) -> Line<'static> {
@@ -486,19 +567,29 @@ fn server_line(app: &App, s: &Session, w: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-fn tabs(app: &App) -> Line<'static> {
+/// Below this width the tab bar names only the current view; the others show their
+/// digit.
+pub const TAB_NAMES_FROM: usize = 100;
+
+/// The tab bar: every view's digit and name, the current one highlighted.
+fn tabs(app: &App, w: usize) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
-    for (i, v) in View::ALL.iter().enumerate() {
-        let s = if *v == app.view {
+    for v in View::ALL {
+        let text = if v == app.view || w >= TAB_NAMES_FROM {
+            format!(" {} {} ", v.digit(), v.title())
+        } else {
+            format!(" {} ", v.digit())
+        };
+        let s = if v == app.view {
             style::tab_on()
         } else {
             style::tab()
         };
-        spans.push(Span::styled(format!(" {i} {} ", v.title()), s));
+        spans.push(Span::styled(text, s));
         spans.push(Span::raw(" "));
     }
     let p = &app.patterns;
-    if app.view == View::Patterns && !p.filter.is_empty() && !p.filtering {
+    if app.screen() == Screen::Patterns && !p.filter.is_empty() && !p.filtering {
         spans.extend([
             Span::styled("   filter: ", style::dim()),
             Span::styled(p.filter.clone(), style::amber()),
@@ -506,6 +597,49 @@ fn tabs(app: &App) -> Line<'static> {
         ]);
     }
     Line::from(spans)
+}
+
+/// The tab bar's second row on a view with panels: the panel names, the current one
+/// highlighted, and the `tab` hint on the right.
+fn panel_tabs(app: &App, w: usize) -> Line<'static> {
+    let current = app.screen();
+    let panels = app.view.panels();
+    let style_of = |p: Screen| {
+        if p == current {
+            style::title()
+        } else {
+            style::dim()
+        }
+    };
+    // Every panel name, spaced out when it fits, closer together when not; when even
+    // that is too wide, only the current panel and where it is in the cycle.
+    let names = |indent: &'static str, sep: &'static str| {
+        let mut out = vec![Span::raw(indent)];
+        for (i, p) in panels.iter().enumerate() {
+            if i > 0 {
+                out.push(Span::styled(sep, style::track()));
+            }
+            out.push(Span::styled(p.name(), style_of(*p)));
+        }
+        out
+    };
+    let mut left = names("    ", "  ·  ");
+    if spans_width(&left) > w {
+        left = names("  ", " · ");
+    }
+    if spans_width(&left) > w {
+        let at = panels.iter().position(|p| *p == current).unwrap_or(0);
+        left = vec![
+            Span::raw("  "),
+            Span::styled(current.name(), style::title()),
+            Span::styled(format!(" · {} of {}", at + 1, panels.len()), style::dim()),
+        ];
+    }
+    let right = vec![
+        Span::styled("tab", style::key()),
+        Span::styled(" next panel", style::dim()),
+    ];
+    justify(left, right, w)
 }
 
 /// The last `w` cells of `s`, starting with `…` when cut.
@@ -549,13 +683,15 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
                 w,
             ),
         }
-    } else if app.view == View::Patterns && app.patterns.filtering {
+    } else if app.screen() == Screen::Patterns && app.patterns.filtering {
         input_line(
             "/",
             app.patterns.filter.clone(),
             "   type to filter patterns · enter to apply · esc to clear",
             w,
         )
+    } else if let Some(input) = app.view_input() {
+        input_line(input.label, input.text, input.hint, w)
     } else if let Some(n) = &app.notice {
         let s = if n.error {
             style::warn()
@@ -564,7 +700,13 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
         };
         Line::from(Span::styled(format!(" {}", n.text), s))
     } else {
-        let keys = keymap::footer(app.view, app.report().is_some());
+        let screen = app.screen();
+        let ready = if screen.is_live_view() {
+            app.session.is_some()
+        } else {
+            app.report().is_some()
+        };
+        let keys = keymap::footer(screen, ready);
         let mut spans = vec![Span::raw(" ")];
         for (k, l) in keys {
             spans.push(Span::styled(k, style::key()));

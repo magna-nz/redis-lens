@@ -11,6 +11,7 @@ use crate::scan::context::{bias_warnings, big_keys_total, coverage};
 use crate::tui::app::{App, PatternData};
 use crate::tui::clipboard::{NO_COMMAND, suggested_command};
 use crate::tui::tree::{Root, Row, SortBy, Summary, Verdict, summarize, summarize_group};
+use crate::verdict::{PatternVerdict, pattern_verdict};
 
 use super::delta::Change;
 use super::widgets::{
@@ -49,7 +50,20 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             .map(|r| row_change(app, patterns, d, *r))
             .collect()
     });
-    table(frame, main, app, data, &summaries, changes.as_deref(), sel);
+    let verdicts: Vec<PatternVerdict> = rows_
+        .iter()
+        .map(|r| row_verdict(app, patterns, diff, *r))
+        .collect();
+    table(
+        frame,
+        main,
+        app,
+        data,
+        &summaries,
+        changes.as_deref(),
+        &verdicts,
+        sel,
+    );
     // The server context of a finished report (also one kept during a rescan), on the
     // table's bottom border so it takes no list row.
     if data.partial.is_none()
@@ -205,6 +219,41 @@ fn row_change(app: &App, patterns: &[PatternStats], d: &ReportDiff, row: Row) ->
     }
 }
 
+/// The VERDICT of a row (spec "1 Patterns, additions"): a pattern's own, and for a
+/// group the most worrying of its children's.
+fn row_verdict(
+    app: &App,
+    patterns: &[PatternStats],
+    d: Option<&ReportDiff>,
+    row: Row,
+) -> PatternVerdict {
+    let of = |i: usize| {
+        let p = &patterns[i];
+        pattern_verdict(p, d.and_then(|d| d.pattern(&p.pattern)))
+    };
+    match row {
+        Row::Group { root } => match &app.patterns.tree.roots[root] {
+            Root::Group(g) => g
+                .children
+                .iter()
+                .map(|&i| of(i))
+                .min()
+                .unwrap_or(PatternVerdict::Ok),
+            Root::Single(i) => of(*i),
+        },
+        Row::Pattern { idx, .. } => of(idx),
+    }
+}
+
+fn verdict_span(v: PatternVerdict) -> Span<'static> {
+    let st = match v {
+        PatternVerdict::Leak | PatternVerdict::Growing | PatternVerdict::Mixed => style::warn(),
+        PatternVerdict::BigKey | PatternVerdict::Persistent => style::amber(),
+        PatternVerdict::Ok => style::ok(),
+    };
+    Span::styled(pad_r(v.label(), VERDICT_W), st)
+}
+
 /// The summary for a row, its depth, and for groups whether they are expanded.
 fn row_summary(app: &App, patterns: &[PatternStats], row: Row) -> (Summary, usize, Option<bool>) {
     match row {
@@ -242,13 +291,15 @@ const PCT_W: usize = 4;
 const TTL_W: usize = 6;
 /// The Δ column, shown only when there is a snapshot to compare with.
 const DELTA_W: usize = 7;
+/// The VERDICT column, always shown: the longest label (10 cells) and a gap.
+const VERDICT_W: usize = 11;
 /// The narrowest the pattern column gets before another column is hidden.
 const NAME_MIN: usize = 12;
 
 impl Cols {
     /// Everything but the pattern column.
     fn fixed(&self) -> usize {
-        let mut w = TYPE_W + (NUM_W + 2) * 2 + self.share + 1 + PCT_W + 2 + TTL_W + 2;
+        let mut w = TYPE_W + (NUM_W + 2) * 2 + self.share + 1 + PCT_W + 2 + TTL_W + 2 + VERDICT_W;
         if self.avg {
             w += NUM_W + 2;
         }
@@ -305,6 +356,7 @@ fn type_label(s: &Summary) -> &'static str {
     s.key_type.map_or("mixed", |t| t.as_str())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn table(
     frame: &mut Frame,
     area: Rect,
@@ -312,6 +364,7 @@ fn table(
     data: PatternData<'_>,
     summaries: &[(Summary, usize, Option<bool>)],
     changes: Option<&[Option<Change>]>,
+    verdicts: &[PatternVerdict],
     sel: usize,
 ) {
     let sizes = data.sizes_available;
@@ -391,6 +444,7 @@ fn table(
             style::hd(),
         ));
     }
+    head.push_span(Span::styled(pad_r("VERDICT", VERDICT_W), style::hd()));
     let total: u64 = data
         .patterns
         .iter()
@@ -413,6 +467,9 @@ fn table(
                     Some(d) => Span::styled(format!("{} ", pad_l(&d.text(), DELTA_W)), d.style()),
                     None => Span::styled(format!("{} ", pad_l("—", DELTA_W)), style::dim()),
                 });
+            }
+            if let Some(v) = verdicts.get(i) {
+                line.push_span(verdict_span(*v));
             }
             line
         })

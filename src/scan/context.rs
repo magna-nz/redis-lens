@@ -2,7 +2,7 @@
 //! beside the sampled estimates.
 //!
 //! Owner: scanner. Reading them costs three commands per scan, paced by the scan's
-//! limiter. Each part is optional: a section the server doesn't have, a denied or
+//! command budget. Each part is optional: a section the server doesn't have, a denied or
 //! unknown command, or a reply that can't be read leaves that part `None` with a
 //! [`ContextGap`] saying why, and never fails the scan.
 
@@ -15,7 +15,7 @@ use crate::model::{
     PermStatus, PermissionReport, ScanReport, ServerContext,
 };
 
-use super::Limiter;
+use crate::budget::Budget;
 
 /// Strings this long or longer count as big in the `INFO keysizes` summary.
 pub const BIG_STRING_BYTES: u64 = 1 << 20;
@@ -35,17 +35,17 @@ const MIX_MAX_UNTYPED: f64 = 0.10;
 
 /// Read the server context for database `db`. Sends `INFO keyspace`, `INFO keysizes`
 /// and, unless the permission check denied or skipped it, `MEMORY STATS`; every one is
-/// read-only. Each command counts against `limiter`.
+/// read-only. Each command is taken from `budget` before it is sent.
 pub(super) async fn read<C: ConnectionLike + Send>(
     conn: &mut C,
     db: u32,
     perms: &PermissionReport,
-    limiter: &mut Limiter,
+    budget: &Budget,
 ) -> ServerContext {
     let mut ctx = ServerContext::default();
 
+    budget.take(1).await;
     let keyspace: Result<String, _> = redis::cmd("INFO").arg("keyspace").query_async(conn).await;
-    limiter.spent(1).await;
     match keyspace {
         Ok(text) => ctx.keyspace = Some(parse_keyspace(&text, db)),
         Err(_) => ctx.missing.push(ContextGap::KeyspaceUnavailable),
@@ -53,8 +53,8 @@ pub(super) async fn read<C: ConnectionLike + Send>(
 
     // Servers without the section answer with an empty string. Detected by presence,
     // never by version.
+    budget.take(1).await;
     let keysizes: Result<String, _> = redis::cmd("INFO").arg("keysizes").query_async(conn).await;
-    limiter.spent(1).await;
     ctx.keysizes = keysizes.ok().and_then(|t| parse_keysizes(&t, db));
     if ctx.keysizes.is_none() {
         ctx.missing.push(ContextGap::NoKeysizes);
@@ -74,9 +74,9 @@ pub(super) async fn read<C: ConnectionLike + Send>(
         }
         // Allowed, or not checked by this caller: try it, and take a refusal as a gap.
         Some(PermStatus::Allowed) | None => {
+            budget.take(1).await;
             let reply: Result<Value, redis::RedisError> =
                 redis::cmd("MEMORY").arg("STATS").query_async(conn).await;
-            limiter.spent(1).await;
             match reply {
                 Ok(v) => match parse_memory_stats(&v) {
                     Some(m) => ctx.memory = Some(m),
@@ -868,6 +868,7 @@ mod tests {
             complete: false,
             match_glob: None,
             server_context: ctx,
+            key_sizes: None,
             nodes: None,
         }
     }

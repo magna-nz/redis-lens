@@ -27,7 +27,7 @@ It is built to be safe on production. It is read-only and never sends a write co
 `SCAN` and never `KEYS`. It stays under a command budget. Credentials live in your OS keychain, not in a file.
 
 <div align="center">
-  <img src="docs/demo.gif" alt="redis-lens opening the demo Redis, browsing key patterns by memory, then the TTL, Diff and Hot keys views" width="900">
+  <img src="docs/demo.gif" alt="redis-lens opening the demo Redis, browsing key patterns with their verdicts, opening one pattern's keys, then the Big keys and Expiry analysis and the Server view" width="900">
 </div>
 
 <br>

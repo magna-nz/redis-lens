@@ -5,7 +5,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
-use super::app::{App, ConnId, Effect, Msg, ScanId};
+use super::app::{App, ConnId, Effect, Msg, ScanId, Screen};
 use super::fixtures;
 use super::tree::{Root, Row};
 use super::ui;
@@ -115,6 +115,36 @@ fn press(app: &mut App, keys: &str) {
     for c in keys.chars() {
         app.handle_key(ch(c));
     }
+}
+
+/// The screens the five views of v0.2 became: `0` Connections, `1` Patterns, and `2`,
+/// `3`, `4` for the TTL, Diff and Hot keys panels of Analysis.
+const LEGACY: [Screen; 5] = [
+    Screen::Connections,
+    Screen::Patterns,
+    Screen::Ttl,
+    Screen::Diff,
+    Screen::HotKeys,
+];
+
+/// Goes to the screen that was view `c` (`'0'` to `'4'`) before Analysis had panels.
+fn go(app: &mut App, c: char) {
+    super::app::views::testing::show(app, LEGACY[c as usize - '0' as usize]);
+}
+
+/// Goes to `screen`, unless it is the key list and there is no pattern to open.
+fn show(app: &mut App, screen: Screen) -> bool {
+    if screen == Screen::KeyList && app.pattern_rows().is_empty() {
+        return false;
+    }
+    super::app::views::testing::show(app, screen);
+    true
+}
+
+/// The row of the body's first panel border: 3 below the header, 4 on a view whose
+/// tab bar has a panel row.
+fn body_top(lines: &[String]) -> usize {
+    lines.iter().position(|l| l.starts_with('┌')).unwrap()
 }
 
 /// Move the Patterns selection to the row labelled `label`.
@@ -416,16 +446,17 @@ fn partial_marker_survives_narrow_terminals() {
 fn other_views_wait_while_partial() {
     let mut app = partial_after_previous_profile();
     for (view, title) in [('2', "TTL"), ('3', "Diff"), ('4', "Hot keys")] {
-        app.handle_key(ch(view));
+        go(&mut app, view);
         let lines = buffer_lines(&render(&app, 120, 36));
-        assert!(lines[3].contains(title), "{}", lines[3]);
+        let t = body_top(&lines);
+        assert!(lines[t].contains(title), "{}", lines[t]);
         assert!(
-            lines[5].contains("Sampled 3,200 / 100,000 keys"),
+            lines[t + 2].contains("Sampled 3,200 / 100,000 keys"),
             "{view}: {}",
-            lines[5]
+            lines[t + 2]
         );
         // Nothing from prod-cache-01's report or diff.
-        for line in &lines[3..] {
+        for line in &lines[t..] {
             assert!(!line.contains("cache:search"), "{view}: {line}");
         }
     }
@@ -561,7 +592,7 @@ fn ttl_detail_without_a_safe_command() {
         p.pattern = format!("{};x", p.pattern);
     }
     let (mut app, _) = scanned_with(report, fixtures::perms_ok());
-    press(&mut app, "2");
+    go(&mut app, '2');
     let t = render(&app, 120, 36);
     insta::assert_snapshot!(t.backend());
 }
@@ -569,7 +600,8 @@ fn ttl_detail_without_a_safe_command() {
 #[test]
 fn ttl_view() {
     let mut app = scanned_with_history(true);
-    press(&mut app, "2jj");
+    go(&mut app, '2');
+    press(&mut app, "jj");
     let t = render(&app, 120, 36);
     insta::assert_snapshot!(t.backend());
 }
@@ -577,7 +609,8 @@ fn ttl_view() {
 #[test]
 fn diff_view_with_history() {
     let mut app = scanned_with_history(true);
-    press(&mut app, "3j");
+    go(&mut app, '3');
+    press(&mut app, "j");
     let t = render(&app, 120, 36);
     insta::assert_snapshot!(t.backend());
 }
@@ -599,7 +632,8 @@ fn set_trend(app: &mut App, trend: crate::snapshot::Trend) {
 fn diff_view_with_trend() {
     let mut app = scanned_with_history(true);
     set_trend(&mut app, fixtures::trend(true));
-    press(&mut app, "3j");
+    go(&mut app, '3');
+    press(&mut app, "j");
     let t = render(&app, 120, 36);
     let text = buffer_lines(&t).join("\n");
     assert!(text.contains("TREND"), "{text}");
@@ -628,7 +662,7 @@ fn diff_view_with_trend_without_sizes() {
     let mut app = scanned_with_history(false);
     set_trend(&mut app, fixtures::trend(false));
     // queue:emails: missing from one snapshot, so its line has a gap.
-    press(&mut app, "3");
+    go(&mut app, '3');
     let rows = app.diff().unwrap().patterns.clone();
     let at = rows
         .iter()
@@ -658,14 +692,16 @@ fn diff_view_with_trend_without_sizes() {
 fn diff_view_with_one_earlier_snapshot_has_no_trend() {
     let mut app = scanned_with_history(true);
     set_trend(&mut app, fixtures::short_trend(true));
-    press(&mut app, "3j");
+    go(&mut app, '3');
+    press(&mut app, "j");
     let t = render(&app, 120, 36);
     let text = buffer_lines(&t).join("\n");
     assert!(!text.contains("TREND"), "{text}");
     assert!(!text.contains(" trend "), "{text}");
     // Exactly the Diff view without a trend.
     let mut plain = scanned_with_history(true);
-    press(&mut plain, "3j");
+    go(&mut plain, '3');
+    press(&mut plain, "j");
     assert_eq!(buffer_lines(&render(&plain, 120, 36)), buffer_lines(&t));
     insta::assert_snapshot!(t.backend());
 }
@@ -674,7 +710,7 @@ fn diff_view_with_one_earlier_snapshot_has_no_trend() {
 fn diff_view_without_history() {
     let (mut app, id) = scanned_with(fixtures::report(true), fixtures::perms_ok());
     set_history(&mut app, id, None);
-    app.handle_key(ch('3'));
+    go(&mut app, '3');
     let t = render(&app, 120, 36);
     let text = buffer_lines(&t).join("\n");
     assert!(text.contains("No earlier snapshot for prod-cache-01."));
@@ -685,7 +721,8 @@ fn diff_view_without_history() {
 #[test]
 fn hot_keys_view() {
     let mut app = scanned_with_history(true);
-    press(&mut app, "4j");
+    go(&mut app, '4');
+    press(&mut app, "j");
     let t = render(&app, 120, 36);
     insta::assert_snapshot!(t.backend());
 }
@@ -693,7 +730,7 @@ fn hot_keys_view() {
 #[test]
 fn hot_keys_view_without_lfu() {
     let (mut app, _) = scanned_with(fixtures::report_lru(), fixtures::perms_freq_skipped());
-    app.handle_key(ch('4'));
+    go(&mut app, '4');
     let t = render(&app, 120, 36);
     let text = buffer_lines(&t).join("\n");
     assert!(text.contains("The eviction policy is allkeys-lru"));
@@ -722,7 +759,7 @@ fn change_and_verdict_colours() {
     assert_eq!(colour_at(&t, "queue:emails", "+", 100), AMBER);
     assert_eq!(colour_at(&t, "rl:{ip}:{id}", "-", 100), TEAL);
     assert_eq!(colour_at(&t, "lock:{var}", "·", 100), DIM);
-    app.handle_key(ch('2'));
+    go(&mut app, '2');
     let t = render(&app, 120, 36);
     // Warning rows have a red "none" bucket and verdict; stable ones amber and dim.
     assert_eq!(colour_at(&t, "user:{id}:cart", "▅", 50), RED);
@@ -730,7 +767,7 @@ fn change_and_verdict_colours() {
     assert_eq!(colour_at(&t, "feature:{var}", "█", 50), AMBER);
     assert_eq!(colour_at(&t, "feature:{var}", "p", 90), DIM);
     assert_eq!(colour_at(&t, "session:{uuid}", "█", 50), TEAL);
-    app.handle_key(ch('3'));
+    go(&mut app, '3');
     let t = render(&app, 120, 36);
     // Diff bars: growth of 300M or more red, smaller growth amber, shrink teal.
     assert_eq!(colour_at(&t, "cache:search:{hash}", "█", 80), RED);
@@ -771,16 +808,15 @@ fn every_tab_at_60x20_and_200x60() {
         with_trend_keys,
     ];
     for app in &mut apps {
-        for view in ['0', '1', '2', '3', '4', '5'] {
-            app.handle_key(ch(view));
+        for screen in Screen::ALL {
+            if !show(app, screen) {
+                continue;
+            }
             // Move to the end of each list too, so scrolling is exercised.
             for _ in 0..60 {
                 app.handle_key(ch('j'));
             }
-            assert_eq!(
-                app.view,
-                crate::tui::app::View::ALL[view as usize - '0' as usize]
-            );
+            assert_eq!(app.screen(), screen);
             for (w, h) in [(60, 20), (200, 60)] {
                 render(app, w, h);
             }
@@ -833,9 +869,9 @@ fn small_terminals_do_not_panic() {
     adding.handle_paste(fixtures::PROD_URL.into());
     apps.push(adding);
     for app in &mut apps {
-        for view in ['0', '1', '2', '3', '4', '5'] {
-            if app.add.is_none() {
-                app.handle_key(ch(view));
+        for screen in Screen::ALL {
+            if app.add.is_none() && !show(app, screen) {
+                continue;
             }
             for (w, h) in [(60, 20), (61, 21), (80, 24), (40, 10), (1, 1), (200, 60)] {
                 render(app, w, h);
@@ -961,9 +997,9 @@ fn patterns_long_group_name_mid_scroll() {
     let lines = buffer_lines(&t);
     // The fold mark stays visible; the label scrolls after it.
     assert!(lines[6].starts_with("│ ▾ …"), "{}", lines[6]);
-    // Collapsed, the mark changes and stays visible too.
+    // Collapsed, the mark changes and stays visible too. Same row, so the scroll goes
+    // on from the same tick: still mid-scroll, whatever the column width.
     app.handle_key(key(KeyCode::Left));
-    tick(&mut app, 10 + 2 * 12);
     let lines = buffer_lines(&render(&app, 120, 36));
     assert!(lines[6].starts_with("│ ▸ …"), "{}", lines[6]);
     insta::assert_snapshot!(t.backend());
@@ -1053,16 +1089,16 @@ fn narrow_steps(app: &App, steps: &[(u16, &[&str])]) -> String {
 fn patterns_narrow_columns() {
     let mut app = scanned(true);
     select_pattern(&mut app, "user:{id}:cart");
-    // 72 is the narrowest with every column; then the share bar goes (71), then the
-    // average size (63); below 55 the row is cut at the right edge.
+    // 83 is the narrowest with every column; then the share bar goes (82), then the
+    // average size (74); below 66 the row is cut at the right edge. VERDICT always shows.
     let snap = narrow_steps(
         &app,
         &[
-            (72, &["SHARE", "AVG"]),
-            (71, &["AVG"]),
-            (64, &["AVG"]),
-            (63, &[]),
-            (55, &[]),
+            (83, &["SHARE", "AVG"]),
+            (82, &["AVG"]),
+            (75, &["AVG"]),
+            (74, &[]),
+            (66, &[]),
         ],
     );
     let cut = table_at(&app, 50);
@@ -1076,18 +1112,18 @@ fn patterns_narrow_columns() {
 fn patterns_narrow_columns_with_delta() {
     let mut app = scanned_with_history(true);
     select_pattern(&mut app, "user:{id}:cart");
-    // 80 is the narrowest with every column; the share bar goes first (79), then Δ
-    // (71), then the average size (63).
+    // 91 is the narrowest with every column; the share bar goes first (90), then Δ
+    // (82), then the average size (74). VERDICT always shows.
     let snap = narrow_steps(
         &app,
         &[
-            (80, &["SHARE", "AVG", "Δ"]),
-            (79, &["AVG", "Δ"]),
-            (72, &["AVG", "Δ"]),
-            (71, &["AVG"]),
-            (64, &["AVG"]),
-            (63, &[]),
-            (55, &[]),
+            (91, &["SHARE", "AVG", "Δ"]),
+            (90, &["AVG", "Δ"]),
+            (83, &["AVG", "Δ"]),
+            (82, &["AVG"]),
+            (75, &["AVG"]),
+            (74, &[]),
+            (66, &[]),
         ],
     );
     insta::assert_snapshot!(snap);
@@ -1101,7 +1137,8 @@ fn patterns_narrow_columns_with_delta() {
 /// rescan is connected and scanning, with no results of its own yet.
 fn rescanning(view: char) -> (App, ConnId, ScanId) {
     let mut app = scanned_with_history(true);
-    press(&mut app, &format!("{view}j"));
+    go(&mut app, view);
+    press(&mut app, "j");
     let id = app.session.as_ref().unwrap().id;
     let effects = app.handle_key(ch('r'));
     let [Effect::Connect { scan, .. }] = effects[..] else {
@@ -1145,16 +1182,20 @@ fn patterns_rescanning_shows_previous_results() {
 fn ttl_rescanning_shows_previous_results() {
     let (app, _, _) = rescanning('2');
     let t = render(&app, 120, 36);
-    assert!(buffer_lines(&t)[3].contains(RESCANNING));
+    let lines = buffer_lines(&t);
+    assert!(lines[body_top(&lines)].contains(RESCANNING));
     insta::assert_snapshot!(t.backend());
 }
 
 #[test]
 fn every_view_marks_previous_results_until_the_rescans_first_partial() {
     let (mut app, id, scan) = rescanning('1');
-    let top = |app: &App, w| buffer_lines(&render(app, w, 36))[3].clone();
-    for view in ['1', '2', '3', '4', '5'] {
-        app.handle_key(ch(view));
+    let top = |app: &App, w| {
+        let lines = buffer_lines(&render(app, w, 36));
+        lines[body_top(&lines)].clone()
+    };
+    for view in ['1', '2', '3', '4'] {
+        go(&mut app, view);
         assert!(top(&app, 120).contains(RESCANNING), "view {view}");
         // On a narrow terminal the marker is kept, the rest is cut.
         assert!(
@@ -1166,10 +1207,10 @@ fn every_view_marks_previous_results_until_the_rescans_first_partial() {
     // Diff without a snapshot, and Hot keys without LFU, mark it too.
     let (mut app2, id2) = scanned_with(fixtures::report_lru(), fixtures::perms_freq_skipped());
     set_history(&mut app2, id2, None);
-    app2.handle_key(ch('3'));
+    go(&mut app2, '3');
     app2.handle_key(ch('r'));
-    for view in ['3', '4', '5'] {
-        app2.handle_key(ch(view));
+    for view in ['3', '4'] {
+        go(&mut app2, view);
         assert!(top(&app2, 120).contains(RESCANNING), "view {view}");
     }
     // The first partial replaces them: Patterns shows partials, the rest wait.
@@ -1182,8 +1223,8 @@ fn every_view_marks_previous_results_until_the_rescans_first_partial() {
     let line = top(&app, 120);
     assert!(line.contains("partial · 3,200 / 100,000 sampled"), "{line}");
     assert!(!line.contains("previous"), "{line}");
-    for view in ['2', '3', '4', '5'] {
-        app.handle_key(ch(view));
+    for view in ['2', '3', '4'] {
+        go(&mut app, view);
         let text = buffer_lines(&render(&app, 120, 36)).join("\n");
         assert!(!text.contains("previous results"), "view {view}");
         assert!(text.contains("Sampled"), "view {view}");
@@ -1202,10 +1243,11 @@ fn patterns_rescan_failed_keeps_previous_results_marked() {
     let lines = buffer_lines(&t);
     assert!(lines[3].contains(RESCAN_FAILED), "{}", lines[3]);
     assert!(lines[23].contains("Scan failed: connection reset"));
-    for view in ['2', '3', '4', '5'] {
-        app.handle_key(ch(view));
+    for view in ['2', '3', '4'] {
+        go(&mut app, view);
+        let lines = buffer_lines(&render(&app, 120, 36));
         assert!(
-            buffer_lines(&render(&app, 120, 36))[3].contains(RESCAN_FAILED),
+            lines[body_top(&lines)].contains(RESCAN_FAILED),
             "view {view}"
         );
     }
@@ -1237,12 +1279,13 @@ fn help_over_connections_120x36() {
 #[test]
 fn help_overlay_on_every_view_and_size_does_not_panic() {
     let mut app = scanned_with_history(true);
-    for view in ['0', '1', '2', '3', '4', '5'] {
-        press(&mut app, &format!("{view}?"));
+    for screen in Screen::ALL {
+        show(&mut app, screen);
+        press(&mut app, "?");
         for (w, h) in [(80, 24), (40, 12), (20, 5), (1, 1), (200, 60)] {
             render(&app, w, h);
         }
-        let title = format!("Keys · {}", app.view.title());
+        let title = format!("Keys · {}", screen.title());
         assert!(
             buffer_lines(&render(&app, 80, 24))
                 .join("\n")
@@ -1261,7 +1304,8 @@ fn help_overlay_on_every_view_and_size_does_not_panic() {
 fn detail_command_is_what_shift_y_copies() {
     let mut app = scanned_with_history(true);
     for (view, moves) in [('1', 1), ('1', 2), ('2', 3)] {
-        press(&mut app, &format!("{view}g"));
+        go(&mut app, view);
+        press(&mut app, "g");
         for _ in 0..moves {
             app.handle_key(ch('j'));
         }
@@ -1295,10 +1339,16 @@ fn list_rows_is_what_every_list_view_draws() {
     let mut app = scanned_with_history(true);
     for (w, h) in [(80, 24), (120, 36), (60, 20), (200, 60), (80, 17), (80, 18)] {
         let rows = ui::list_rows(ratatui::layout::Rect::new(0, 0, w, h));
-        for view in ['0', '1', '2', '3', '4', '5'] {
-            app.handle_key(ch(view));
+        for view in ['0', '1', '2', '3', '4'] {
+            go(&mut app, view);
             let lines = buffer_lines(&render(&app, w, h));
-            assert_eq!(drawn_list_rows(&lines), rows, "view {view} at {w}x{h}");
+            // The tab bar's panel row takes one on Analysis (`App::page` knows).
+            let panel_row = usize::from(!app.view.panels().is_empty());
+            assert_eq!(
+                drawn_list_rows(&lines),
+                rows.saturating_sub(panel_row),
+                "view {view} at {w}x{h}"
+            );
         }
     }
     // 80x24 shows 7 rows. Too small for any row: 0, and PgDn still moves one.
@@ -1315,19 +1365,19 @@ fn list_rows_is_what_every_list_view_draws() {
 #[test]
 fn page_down_from_the_top_selects_the_row_below_the_screen() {
     // With the page from the runtime's maths, PgDn from the top of the TTL list at
-    // 80x24 (7 rows) selects row 7: the list scrolls one row and the selection is the
-    // bottom row on screen.
+    // 80x24 (6 rows below the tab bar's panel row) selects row 6: the list scrolls one
+    // row and the selection is the bottom row on screen.
     let mut app = scanned_with_history(true);
-    app.handle_key(ch('2'));
+    go(&mut app, '2');
     app.set_list_rows(ui::list_rows(ratatui::layout::Rect::new(0, 0, 80, 24)));
     app.handle_key(key(KeyCode::PageDown));
-    assert_eq!(app.sel.ttl, 7);
+    assert_eq!(app.sel.ttl, 6);
     let t = render(&app, 80, 24);
     let buf = t.backend().buffer();
     let selected: Vec<u16> = (0..24u16)
         .filter(|&y| buf[(2, y)].bg == super::ui::style::sel().bg.unwrap())
         .collect();
-    // Rows 5-11 are the list (border at 3, header at 4); the last one is selected.
+    // Rows 6-11 are the list (border at 4, header at 5); the last one is selected.
     assert_eq!(selected, [11]);
 }
 
@@ -1350,4 +1400,178 @@ fn a_slow_keychain_during_a_rescan_shows_the_hint_in_the_header() {
         "{}",
         lines[3]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Seven views: the tab bar, the panel row, the write state and the probes
+// ---------------------------------------------------------------------------
+
+/// The header rows of `app` at `w` columns: everything above the body's first border.
+fn header_text(app: &App, w: u16) -> String {
+    let lines = buffer_lines(&render(app, w, 24));
+    lines[..body_top(&lines)].join("\n")
+}
+
+#[test]
+fn tab_bar_with_panels_at_80_columns() {
+    let mut app = scanned(true);
+    show(&mut app, Screen::BigKeys);
+    let header = header_text(&app, 80);
+    // Below 100 columns the views not on screen show only their digit.
+    assert!(!header.contains("Server"), "{header}");
+    insta::assert_snapshot!(header);
+}
+
+#[test]
+fn tab_bar_with_panels_at_120_columns() {
+    let mut app = scanned(true);
+    show(&mut app, Screen::Clients);
+    let header = header_text(&app, 120);
+    for name in [
+        "Connections",
+        "Patterns",
+        "Analysis",
+        "Server",
+        "Streams",
+        "Pub/Sub",
+        "Search",
+    ] {
+        assert!(header.contains(name), "{name}: {header}");
+    }
+    insta::assert_snapshot!(header);
+    // The current panel stands out; the others are dim.
+    use crate::tui::ui::style;
+    let t = render(&app, 120, 24);
+    assert_eq!(
+        colour_at(&t, "Slow log", "C", 0),
+        style::title().fg.unwrap()
+    );
+    assert_eq!(colour_at(&t, "Slow log", "O", 0), style::DIM);
+}
+
+#[test]
+fn views_without_panels_have_no_panel_row() {
+    let mut app = scanned(true);
+    for screen in [
+        Screen::Connections,
+        Screen::Patterns,
+        Screen::Streams,
+        Screen::PubSub,
+        Screen::Search,
+    ] {
+        show(&mut app, screen);
+        let lines = buffer_lines(&render(&app, 120, 24));
+        assert_eq!(body_top(&lines), 3, "{screen:?}");
+    }
+    for screen in [Screen::Ttl, Screen::Overview] {
+        show(&mut app, screen);
+        let lines = buffer_lines(&render(&app, 120, 24));
+        assert_eq!(body_top(&lines), 4, "{screen:?}");
+    }
+}
+
+/// Connected to profile `name` of the fixtures, after `edit`, with a finished scan.
+fn scanned_profile(name: &str, edit: impl FnOnce(&mut crate::model::Profile)) -> App {
+    let mut profiles = fixtures::profiles();
+    edit(profiles.iter_mut().find(|p| p.name == name).unwrap());
+    let mut app = App::new(profiles);
+    select_entry(&mut app, name);
+    let id = connect_selected(&mut app);
+    let report = fixtures::report(true);
+    app.apply(Msg::Connected {
+        id,
+        scan: scan_of(&app),
+        server: Some(report.server.clone()),
+        perms: fixtures::perms_ok(),
+        target: ScanTarget::Primary,
+    });
+    app.apply(Msg::ScanDone {
+        id,
+        scan: scan_of(&app),
+        report: Box::new(report),
+    });
+    app
+}
+
+#[test]
+fn header_says_read_only_on_prod_by_default() {
+    let app = scanned_profile("prod-cache-01", |_| {});
+    let header = header_text(&app, 120);
+    assert!(header.contains("read-only"), "{header}");
+    insta::assert_snapshot!(header);
+    let t = render(&app, 120, 24);
+    assert_eq!(
+        colour_at(&t, "read-only", "r", 70),
+        crate::tui::ui::style::AMBER
+    );
+}
+
+#[test]
+fn header_says_writes_on_outside_prod() {
+    let app = scanned_profile("staging-cache", |_| {});
+    let header = header_text(&app, 120);
+    assert!(header.contains("writes on"), "{header}");
+    insta::assert_snapshot!(header);
+    let t = render(&app, 120, 24);
+    assert_eq!(
+        colour_at(&t, "writes on", "w", 70),
+        crate::tui::ui::style::RED
+    );
+}
+
+#[test]
+fn header_badge_on_prod_with_writes_on() {
+    let app = scanned_profile("prod-cache-01", |p| p.read_only = Some(false));
+    let header = header_text(&app, 120);
+    assert!(header.contains(" WRITES ON "), "{header}");
+    insta::assert_snapshot!(header);
+    let t = render(&app, 120, 24);
+    let lines = buffer_lines(&t);
+    let y = lines.iter().position(|l| l.contains("WRITES ON")).unwrap() as u16;
+    let x = (0..120u16)
+        .find(|&x| t.backend().buffer()[(x, y)].symbol() == "W")
+        .unwrap();
+    let cell = &t.backend().buffer()[(x, y)];
+    assert_eq!(cell.bg, crate::tui::ui::style::RED);
+    // A read-only prod profile set explicitly says so too.
+    let app = scanned_profile("prod-cache-01", |p| p.read_only = Some(true));
+    assert!(header_text(&app, 120).contains("read-only"));
+}
+
+#[test]
+fn connections_detail_lists_the_view_probes() {
+    let (mut app, _) = scanned_with(fixtures::report(true), fixtures::perms_with_probes());
+    app.handle_key(ch('0'));
+    let text = buffer_lines(&render(&app, 120, 36)).join("\n");
+    for label in ["SLOWLOG", "CLIENT LIST", "XINFO", "PUBSUB", "FT._LIST"] {
+        assert!(text.contains(label), "{label}: {text}");
+    }
+    insta::assert_snapshot!(render(&app, 120, 36).backend());
+}
+
+#[test]
+fn connections_detail_with_failed_probes() {
+    let (mut app, _) = scanned_with(fixtures::report(true), fixtures::perms_probes_off());
+    app.handle_key(ch('0'));
+    let text = buffer_lines(&render(&app, 120, 36)).join("\n");
+    assert!(!text.contains("Some checks were denied"), "{text}");
+    assert!(text.contains("Views whose check failed are off"), "{text}");
+    // The NOPERM text of a view probe names the user; the list never shows it.
+    assert!(!text.contains("lens-limited"), "{text}");
+    insta::assert_snapshot!(render(&app, 120, 36).backend());
+}
+
+#[test]
+fn a_view_whose_probe_failed_says_why_it_is_off() {
+    let (mut app, _) = scanned_with(fixtures::report(true), fixtures::perms_probes_off());
+    show(&mut app, Screen::SlowLog);
+    let t = render(&app, 80, 24);
+    let text = buffer_lines(&t).join("\n");
+    // The reason names the check, never the server's error text.
+    assert!(text.contains("refused SLOWLOG"), "{text}");
+    assert!(!text.contains("NOPERM"), "{text}");
+    assert!(!text.contains("lens-limited"), "{text}");
+    insta::assert_snapshot!(t.backend());
+    show(&mut app, Screen::Search);
+    insta::assert_snapshot!(render(&app, 80, 24).backend());
 }

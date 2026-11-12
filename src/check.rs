@@ -717,6 +717,7 @@ mod tests {
             complete,
             match_glob: None,
             server_context: None,
+            key_sizes: None,
             nodes: None,
         }
     }
