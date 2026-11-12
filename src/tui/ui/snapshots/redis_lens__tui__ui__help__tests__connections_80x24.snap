@@ -1,6 +1,6 @@
 ---
 source: src/tui/ui/help.rs
-expression: "render(View::Connections, 80, 24).backend()"
+expression: "render(Screen::Connections, 80, 24).backend()"
 ---
 "                                                                                "
 "                                                                                "
@@ -8,7 +8,7 @@ expression: "render(View::Connections, 80, 24).backend()"
 "                                                                                "
 "       ┌─ Keys · Connections ───────────────────────────────────────────┐       "
 "       │Everywhere                                                      │       "
-"       │0-4            Switch view, 0 Connections to 4 Hot keys         │       "
+"       │0-6            Switch view, 0 Connections to 6 Search           │       "
 "       │?              Show or hide this key list                       │       "
 "       │a              Add a connection                                 │       "
 "       │q ctrl-c       Quit                                             │       "

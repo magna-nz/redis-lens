@@ -72,7 +72,7 @@ The TUI has five views, switched with `0` to `4` (planned: seven views, see [Nav
 
 | Keys | Action |
 |---|---|
-| `0-4` | Switch view, 0 Connections to 4 Hot keys |
+| `0-6` | Switch view, 0 Connections to 6 Search |
 | `?` | Show or hide this key list |
 | `a` | Add a connection |
 | `q` `ctrl-c` | Quit |
@@ -95,7 +95,7 @@ The TUI has five views, switched with `0` to `4` (planned: seven views, see [Nav
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
 | `→` `←` `l` `h` | Expand or collapse the selected group |
-| `enter` | Expand or collapse |
+| `enter` | Fold a group, or list a pattern's keys |
 | `/` | Filter patterns by name |
 | `esc` | Clear the filter |
 | `o` | Sort by memory, keys, avg size, no-TTL % or name |
@@ -104,43 +104,144 @@ The TUI has five views, switched with `0` to `4` (planned: seven views, see [Nav
 | `r` | Scan again, keeping old results meanwhile |
 | `s` | Save a scan snapshot file |
 
-#### TTL
+#### Patterns · key list
 
 | Keys | Action |
 |---|---|
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
+| `/` | Filter the loaded keys by name |
+| `o` | Sort the loaded keys |
+| `n` | Load 1,000 more keys |
+| `y` | Copy the selected key name to the clipboard |
+| `esc` | Clear the filter, or go back to Patterns |
+
+#### Analysis · TTL
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel |
 | `y` | Copy the selected pattern to the clipboard |
 | `Y` | Copy a redis-cli --scan command for the pattern |
 | `r` | Scan again, keeping old results meanwhile |
 | `s` | Save a scan snapshot file |
 
-#### Diff
+#### Analysis · Diff
 
 | Keys | Action |
 |---|---|
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel |
 | `y` | Copy the selected pattern to the clipboard |
 | `Y` | Copy a redis-cli --scan command for the pattern |
 | `r` | Scan again, keeping old results meanwhile |
 | `s` | Save a scan snapshot file |
 
-#### Hot keys
+#### Analysis · Hot keys
 
 | Keys | Action |
 |---|---|
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel |
 | `y` | Copy the selected key name to the clipboard |
 | `Y` | Copy a redis-cli --scan command for the pattern |
 | `r` | Scan again, keeping old results meanwhile |
 | `s` | Save a scan snapshot file |
 
-The key bar shows the main keys of the current view, from this table: Connections `↑↓ Move · enter Connect · a Add · r Rescan Docker · 0-4 View · ? Help · q Quit`; Patterns `↑↓ Move · →← Fold · / Filter · o Sort · s Snapshot · 0-4 View · ? Help · q Quit`; TTL, Diff and Hot keys with a result `↑↓ Move · r Rescan · s Snapshot · 0-4 View · ? Help · q Quit`, otherwise `0-4 View · a Add · ? Help · q Quit`. Paging, copy and (on Patterns) rescan are only in the `?` overlay, so the bar fits 80 columns. A notice or an input line replaces the bar while shown. A test checks that this table is exactly what `keymap::markdown()` renders.
+#### Analysis · Big keys
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel |
+| `y` | Copy the selected key name to the clipboard |
+| `r` | Scan again, keeping old results meanwhile |
+| `s` | Save a scan snapshot file |
+
+#### Analysis · Expiry
+
+| Keys | Action |
+|---|---|
+| `tab` `shift-tab` | Next or previous panel |
+| `r` | Scan again, keeping old results meanwhile |
+| `s` | Save a scan snapshot file |
+
+#### Server · Overview
+
+| Keys | Action |
+|---|---|
+| `tab` `shift-tab` | Next or previous panel |
+| `p` | Pause or resume polling |
+| `+` `-` | Poll more or less often, 1 to 60 s |
+| `r` | Refresh this panel now |
+
+#### Server · Clients
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel |
+| `enter` | List the selected group's connections |
+| `esc` | Back to the groups |
+| `p` | Pause or resume polling |
+| `r` | Refresh this panel now |
+
+#### Server · Slow log
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel |
+| `p` | Pause or resume polling |
+| `r` | Refresh this panel now |
+
+#### Streams
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel |
+| `p` | Pause or resume polling |
+| `r` | Refresh this panel now |
+
+#### Pub/Sub
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel |
+| `p` | Pause or resume polling |
+| `r` | Refresh this panel now |
+
+#### Search
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel |
+| `r` | Refresh this panel now |
+
+The key bar shows the main keys of the current screen, from this table: Connections `↑↓ Move · enter Connect · a Add · r Rescan Docker · 0-6 View · ? Help · q Quit`; Patterns `↑↓ Move · →← Fold · enter Open · / Filter · o Sort · 0-6 View · ? Help · q Quit`; the key list `↑↓ Move · / Filter · o Sort · n More · esc Back · 0-6 View · ? Help · q Quit`; TTL, Diff, Hot keys and Big keys with a result `↑↓ Move · tab Panel · r Rescan · s Snapshot · 0-6 View · ? Help · q Quit`, Expiry with a result `tab Panel · r Rescan · s Snapshot · 0-6 View · ? Help · q Quit`, and the Analysis panels without one `tab Panel · 0-6 View · a Add · ? Help · q Quit`; once connected, Overview `tab Panel · p Pause · +- Interval · r Refresh · 0-6 View · ? Help · q Quit`, Clients `tab Panel · ↑↓ Move · enter List · r Refresh · 0-6 View · ? Help · q Quit`, Slow log `tab Panel · ↑↓ Move · p Pause · r Refresh · 0-6 View · ? Help · q Quit`, Streams and Pub/Sub `↑↓ Move · tab Panel · p Pause · r Refresh · 0-6 View · ? Help · q Quit` and Search `↑↓ Move · tab Panel · r Refresh · 0-6 View · ? Help · q Quit`; before that, the Server panels `tab Panel · 0-6 View · a Add · ? Help · q Quit` and Streams, Pub/Sub and Search `0-6 View · a Add · ? Help · q Quit`. Snapshot and rescan on Patterns, paging and copy are only in the `?` overlay, so the bar fits 80 columns. A notice or an input line replaces the bar while shown. A test checks that this table is exactly what `keymap::markdown()` renders.
 
 ### Help overlay
 

@@ -655,3 +655,32 @@ pub fn perms_freq_denied() -> PermissionReport {
     }
     p
 }
+
+/// [`perms_ok`] plus every phase 1 view probe, allowed.
+pub fn perms_with_probes() -> PermissionReport {
+    let mut p = perms_ok();
+    p.checks.extend(
+        crate::tui::app::views::PROBE_LABELS
+            .iter()
+            .map(|l| check(l, PermStatus::Allowed)),
+    );
+    p
+}
+
+/// [`perms_with_probes`] with `SLOWLOG` denied and `FT._LIST` skipped (no Search
+/// module), the other probes allowed.
+pub fn perms_probes_off() -> PermissionReport {
+    use crate::tui::app::views::{PROBE_FT_LIST, PROBE_SLOWLOG};
+    let mut p = perms_with_probes();
+    for c in &mut p.checks {
+        if c.label == PROBE_SLOWLOG {
+            c.status = PermStatus::Denied(
+                "NOPERM User lens-limited has no permissions to run the 'slowlog|len' command"
+                    .into(),
+            );
+        } else if c.label == PROBE_FT_LIST {
+            c.status = PermStatus::Skipped("no Search module".into());
+        }
+    }
+    p
+}
