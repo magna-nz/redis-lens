@@ -207,17 +207,19 @@ impl fmt::Debug for Rendered {
     }
 }
 
-/// Draws `d` as `format`, over as many lines as it needs (at most [`MAX_LINES`]):
+/// Draws `d` as `format` in lines at most `width` display columns wide (at least 1;
+/// longer lines are wrapped), over as many lines as it needs (at most [`MAX_LINES`]):
 /// - text: the UTF-8 text split at newlines, invalid bytes as `\xNN`;
-/// - hex: 16 bytes a line, offset, hex and the printable ASCII beside it;
+/// - hex: offset, hex and the printable ASCII beside it, 16, 8 or 4 bytes a line,
+///   the most that fit in `width`;
 /// - JSON: pretty-printed with two-space indents;
 /// - MessagePack: decoded and drawn like pretty JSON.
 ///
 /// When `d` isn't valid in `format` (JSON asked for bytes that are not JSON, say), it
 /// is drawn as text if it is UTF-8, else as hex, and [`Rendered::note`] says so.
-pub fn render(d: &Decoded, format: Format) -> Rendered {
+pub fn render(d: &Decoded, format: Format, width: usize) -> Rendered {
     // Contract placeholder.
-    let _ = format;
+    let _ = (format, width);
     let lines = match std::str::from_utf8(&d.bytes) {
         Ok(s) => s.split('\n').map(escape).collect(),
         Err(_) => vec![d.bytes.iter().map(|b| format!("{b:02x}")).collect()],
@@ -311,7 +313,7 @@ mod tests {
         assert_eq!(format!("{r:?}"), "Raw(<12 bytes>)");
         let d = decode(r.as_bytes());
         assert!(!format!("{d:?}").contains("s3cret"));
-        assert!(!format!("{:?}", render(&d, Format::Text)).contains("s3cret"));
+        assert!(!format!("{:?}", render(&d, Format::Text, 80)).contains("s3cret"));
     }
 
     #[test]
