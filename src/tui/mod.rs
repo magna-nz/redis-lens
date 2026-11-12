@@ -188,6 +188,8 @@ impl Runner {
         let tx = self.tx.clone();
         match effect {
             Effect::Quit => return true,
+            // Contract stub: wave A1 routes this to the session's live task.
+            Effect::Live { .. } => {}
             Effect::Copy(text) => {
                 if let Some(msg) = copy_to(out, &text) {
                     send(&tx, msg);

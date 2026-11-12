@@ -168,6 +168,13 @@ pub enum Effect {
     /// Put the text on the clipboard with the terminal's OSC 52 sequence. Only a
     /// pattern, a key name or the suggested command can be built (see [`CopyText`]).
     Copy(CopyText),
+    /// Send `req` on the live connection of session `id` ([`crate::live`]). The answer
+    /// comes back as [`Msg::Live`].
+    Live {
+        id: ConnId,
+        req_id: crate::live::ReqId,
+        req: crate::live::LiveRequest,
+    },
     Quit,
 }
 
@@ -237,6 +244,25 @@ pub enum Msg {
     SnapshotFailed(String),
     /// Writing the OSC 52 sequence to the terminal failed.
     CopyFailed(String),
+    /// The live connection of run `scan` is open; [`Effect::Live`] can be sent.
+    LiveReady {
+        id: ConnId,
+        scan: ScanId,
+    },
+    /// The answer to the [`Effect::Live`] with `req_id`.
+    Live {
+        id: ConnId,
+        scan: ScanId,
+        req_id: crate::live::ReqId,
+        result: Result<crate::live::LiveReply, crate::live::LiveError>,
+    },
+    /// The live connection of run `scan` has closed. `error` says why, in redis-lens's
+    /// own words, when it was not closed on purpose.
+    LiveClosed {
+        id: ConnId,
+        scan: ScanId,
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1609,6 +1635,8 @@ impl App {
             }
             Msg::SnapshotFailed(e) => self.set_error(format!("Could not save snapshot: {e}")),
             Msg::CopyFailed(e) => self.set_error(format!("Could not copy: {e}")),
+            // Contract stub: wave A2 handles the live connection's messages.
+            Msg::LiveReady { .. } | Msg::Live { .. } | Msg::LiveClosed { .. } => {}
             Msg::ScanFailed { id, scan, error } => {
                 if !self.is_session(id, scan) {
                     return Vec::new();

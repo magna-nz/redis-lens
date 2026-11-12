@@ -22,11 +22,13 @@ A Rust TUI (ratatui + crossterm, tokio) that profiles Redis and Valkey keyspaces
 | `src/model.rs` | Types shared by every module. Changing it is a cross-module change: coordinate first. |
 | `src/pattern/` | Key → pattern inference and per-pattern stats (scanner). |
 | `src/scan/` | `INFO`/`DBSIZE`, `SCAN` sampling, building `ScanReport` (scanner). |
+| `src/budget.rs` | The command budget a scan and the live views share. |
+| `src/live/` | The connection kept open after a scan; one submodule per view's requests. |
 | `src/config.rs` | Profiles in TOML (connections). |
 | `src/secrets.rs` | `SecretStore`, `KeyringStore`, `MemoryStore` (connections). |
 | `src/conn/` | Connection strings, connecting, permission checks, Docker discovery (connections). |
 | `src/cli/conn.rs` | `conn add/list/remove/test`, `discover` (connections). |
-| `src/cli/mod.rs`, `src/cli/scan.rs`, `src/tui/` | CLI definition, `scan` command, TUI (wiring). |
+| `src/cli/mod.rs`, `src/cli/scan.rs`, `src/tui/` | CLI definition, `scan` command, TUI (wiring). `src/tui/views/` holds one state module per view. |
 | `tests/common/` | Container helpers shared by all integration tests. |
 
 Function signatures in the stub modules are the contract between owners. Keep them unless the change is agreed.

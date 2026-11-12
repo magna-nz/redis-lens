@@ -4,6 +4,8 @@
 //! - [`model`]: types shared by every module.
 //! - [`pattern`]: turning keys into patterns such as `user:{id}:cart`.
 //! - [`scan`]: sampling a live server with `SCAN` and building a [`model::ScanReport`].
+//! - [`budget`]: the command budget a scan and the live views share.
+//! - [`live`]: the connection kept open after a scan, for the views that poll.
 //! - [`config`]: saved connection profiles (no secrets).
 //! - [`secrets`]: credentials in the OS keychain.
 //! - [`conn`]: parsing connection strings, connecting, permission checks, Docker discovery.
@@ -13,12 +15,14 @@
 //! - [`cli`]: command-line entry points.
 //! - [`tui`]: the terminal UI.
 
+pub mod budget;
 pub mod check;
 pub mod cli;
 pub mod config;
 pub mod conn;
 pub mod diff;
 pub mod format;
+pub mod live;
 pub mod model;
 pub mod pattern;
 pub mod report;
