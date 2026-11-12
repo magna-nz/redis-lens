@@ -7,11 +7,17 @@
 //! - [`ui`]: pure rendering, `ui::draw(frame, &app)`, one module per view.
 //! - [`tree`]: grouping patterns into the Patterns tree.
 //! - This module: terminal setup, the event loop, and the tokio tasks that carry out
-//!   effects and send [`app::Msg`]s back. All server IO goes through `conn` and `scan`.
+//!   effects and send [`app::Msg`]s back. All server IO goes through `conn`, `scan` and
+//!   `live`.
+//!
+//! After a connect succeeds, the session's connection stays open as its live connection
+//! ([`crate::live`]) until the next connect or quitting, whether the scan finished or
+//! failed. The scan and the live connection take from one [`Budget`].
 
+use std::collections::HashMap;
 use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::bail;
@@ -22,8 +28,10 @@ use secrecy::ExposeSecret;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::budget::Budget;
 use crate::config::Config;
 use crate::conn::{self, ScanTarget};
+use crate::live::{self, LiveError, LiveHandle};
 use crate::model::{Credentials, Profile, ScanReport};
 use crate::scan::{self, ScanOptions, ScanProgress};
 use crate::secrets::{KeyringStore, MemoryStore, SecretStore};
@@ -110,11 +118,7 @@ async fn event_loop(
         }
     };
     spawn_input_thread(tx.clone());
-    let mut runner = Runner {
-        tx,
-        path,
-        scan_task: None,
-    };
+    let mut runner = Runner::new(tx, path);
     let mut pending = app.init();
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -152,6 +156,11 @@ struct Runner {
     tx: Tx,
     path: PathBuf,
     scan_task: Option<JoinHandle<()>>,
+    /// The current session's live connection, shared with its connect task.
+    live: LiveSlot,
+    /// The newest run of each entry, for answering an [`Effect::Live`] that can't be
+    /// sent.
+    scans: HashMap<ConnId, ScanId>,
 }
 
 impl Drop for Runner {
@@ -159,7 +168,79 @@ impl Drop for Runner {
         if let Some(t) = self.scan_task.take() {
             t.abort();
         }
+        self.close_live();
     }
+}
+
+/// The current session and, once its connect succeeded, its live task.
+struct LiveSession {
+    id: ConnId,
+    scan: ScanId,
+    handle: Option<LiveHandle>,
+}
+
+type LiveSlot = Arc<Mutex<Option<LiveSession>>>;
+
+fn lock(slot: &LiveSlot) -> MutexGuard<'_, Option<LiveSession>> {
+    // Every update is a plain assignment, so a panic elsewhere leaves it consistent.
+    slot.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Installs the live task `make` starts as session `(id, scan)`'s, then sends
+/// [`Msg::LiveReady`], both under the slot's lock: an [`Effect::Live`] that follows the
+/// message always finds the handle, and nothing can drop the handle (and so send
+/// [`Msg::LiveClosed`]) before the message is sent. Does nothing and returns false when
+/// the session is no longer current or already has a live task.
+fn install_live(
+    slot: &LiveSlot,
+    id: ConnId,
+    scan: ScanId,
+    tx: &Tx,
+    make: impl FnOnce() -> LiveHandle,
+) -> bool {
+    let mut guard = lock(slot);
+    let Some(current) = guard
+        .as_mut()
+        .filter(|s| s.id == id && s.scan == scan && s.handle.is_none())
+    else {
+        return false;
+    };
+    current.handle = Some(make());
+    send(tx, Msg::LiveReady { id, scan })
+}
+
+/// Starts session `(id, scan)`'s live task on `conn` with the scan's `budget` and
+/// installs it (see [`install_live`]). Its answers come back as [`Msg::Live`] and its
+/// end as [`Msg::LiveClosed`].
+fn start_live(
+    slot: &LiveSlot,
+    id: ConnId,
+    scan: ScanId,
+    conn: live::Conn,
+    budget: Arc<Budget>,
+    tx: &Tx,
+) -> bool {
+    install_live(slot, id, scan, tx, || {
+        let (reply_tx, close_tx) = (tx.clone(), tx.clone());
+        live::spawn_with_close(
+            conn,
+            budget,
+            move |req_id, result| {
+                send(
+                    &reply_tx,
+                    Msg::Live {
+                        id,
+                        scan,
+                        req_id,
+                        result,
+                    },
+                );
+            },
+            move |error| {
+                send(&close_tx, Msg::LiveClosed { id, scan, error });
+            },
+        )
+    })
 }
 
 fn send(tx: &Tx, msg: Msg) -> bool {
@@ -182,14 +263,64 @@ fn copy_to(out: &mut impl Write, text: &CopyText) -> Option<Msg> {
 }
 
 impl Runner {
+    fn new(tx: Tx, path: PathBuf) -> Self {
+        Self {
+            tx,
+            path,
+            scan_task: None,
+            live: Arc::new(Mutex::new(None)),
+            scans: HashMap::new(),
+        }
+    }
+
+    /// Makes `session` (or none) the current one. Dropping the old session's handle
+    /// ends its live task, which then sends [`Msg::LiveClosed`] without an error.
+    fn replace_live(&self, session: Option<LiveSession>) {
+        let old = std::mem::replace(&mut *lock(&self.live), session);
+        drop(old);
+    }
+
+    fn close_live(&self) {
+        self.replace_live(None);
+    }
+
+    /// Sends `req` on session `id`'s live task, or answers it with
+    /// [`LiveError::Closed`] when `id` isn't the current session or has no live task.
+    fn send_live(&self, id: ConnId, req_id: live::ReqId, req: live::LiveRequest) {
+        let sent = {
+            let guard = lock(&self.live);
+            match guard.as_ref() {
+                Some(LiveSession {
+                    id: current,
+                    handle: Some(handle),
+                    ..
+                }) if *current == id => handle.send(req_id, req),
+                _ => false,
+            }
+        };
+        if !sent {
+            send(
+                &self.tx,
+                Msg::Live {
+                    id,
+                    scan: self.scans.get(&id).copied().unwrap_or_default(),
+                    req_id,
+                    result: Err(LiveError::Closed),
+                },
+            );
+        }
+    }
+
     /// Returns true when the app should quit. `out` is the terminal's output, for
     /// effects that write to the terminal itself.
     fn run(&mut self, effect: Effect, out: &mut impl Write) -> bool {
         let tx = self.tx.clone();
         match effect {
-            Effect::Quit => return true,
-            // Contract stub: wave A1 routes this to the session's live task.
-            Effect::Live { .. } => {}
+            Effect::Quit => {
+                self.close_live();
+                return true;
+            }
+            Effect::Live { id, req_id, req } => self.send_live(id, req_id, req),
             Effect::Copy(text) => {
                 if let Some(msg) = copy_to(out, &text) {
                     send(&tx, msg);
@@ -213,8 +344,19 @@ impl Runner {
                 if let Some(t) = self.scan_task.take() {
                     t.abort();
                 }
+                self.scans.insert(id, scan);
+                self.replace_live(Some(LiveSession {
+                    id,
+                    scan,
+                    handle: None,
+                }));
                 self.scan_task = Some(tokio::spawn(connect_and_scan(
-                    id, scan, profile, secrets, tx,
+                    id,
+                    scan,
+                    profile,
+                    secrets,
+                    tx,
+                    Arc::clone(&self.live),
                 )));
             }
             Effect::SaveConnection {
@@ -450,6 +592,7 @@ async fn connect_and_scan(
     profile: Profile,
     secrets: SecretSource,
     tx: Tx,
+    live: LiveSlot,
 ) {
     let name = report_name(&profile, &secrets);
     let (store, secret): (Box<dyn SecretStore>, Option<String>) = match secrets {
@@ -482,8 +625,12 @@ async fn connect_and_scan(
             return;
         }
     };
-    let perms = conn::check_permissions(&mut c).await;
-    let server = scan::server_info(&mut c).await.ok();
+    // One budget for this session: the scan and the live connection both take from it.
+    // The permission probes run once on connect and don't.
+    let opts = ScanOptions::for_profile(&profile);
+    let budget = Budget::new(opts.max_commands_per_sec);
+    let perms = conn::check_all_permissions(&mut c).await;
+    let server = scan::server_info_with_budget(&mut c, &budget).await.ok();
     if !send(
         &tx,
         Msg::Connected {
@@ -496,12 +643,24 @@ async fn connect_and_scan(
     ) {
         return;
     }
+    // The live views read from the node the scan reads from (the replica when one is
+    // preferred). The live task keeps its clone open after the scan ends.
+    if !start_live(&live, id, scan_id, c.clone(), Arc::clone(&budget), &tx) {
+        return;
+    }
 
-    let opts = ScanOptions::for_profile(&profile);
     scan_and_report(id, scan_id, tx, |ptx, partial_tx| async move {
-        scan::scan_with_partial(&name, &mut c, &opts, &perms, Some(&ptx), Some(&partial_tx))
-            .await
-            .map_err(|e| clean(e.to_string()))
+        scan::scan_with_budget(
+            &name,
+            &mut c,
+            &opts,
+            &perms,
+            Some(&ptx),
+            Some(&partial_tx),
+            &budget,
+        )
+        .await
+        .map_err(|e| clean(e.to_string()))
     })
     .await;
 }
@@ -920,12 +1079,129 @@ mod tests {
 
     fn runner() -> (Runner, mpsc::UnboundedReceiver<Incoming>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let runner = Runner {
-            tx,
-            path: temp_path("unused"),
-            scan_task: None,
+        (Runner::new(tx, temp_path("unused")), rx)
+    }
+
+    fn ping() -> live::LiveRequest {
+        live::LiveRequest::Server(live::server::Request::Ping)
+    }
+
+    /// The next message, which must be `Msg::Live` answered with `Closed`.
+    fn expect_closed(rx: &mut mpsc::UnboundedReceiver<Incoming>) -> (ConnId, ScanId, u64) {
+        match rx.try_recv() {
+            Ok(Incoming::Msg(Msg::Live {
+                id,
+                scan,
+                req_id,
+                result: Err(LiveError::Closed),
+            })) => (id, scan, req_id.0),
+            _ => panic!("expected Msg::Live with Err(Closed)"),
+        }
+    }
+
+    /// Makes `(id, scan)` the current session, as `Effect::Connect` does, without
+    /// starting a connect task.
+    fn connecting(runner: &mut Runner, id: ConnId, scan: ScanId) {
+        runner.scans.insert(id, scan);
+        runner.replace_live(Some(LiveSession {
+            id,
+            scan,
+            handle: None,
+        }));
+    }
+
+    #[test]
+    fn live_requests_without_a_live_task_are_answered_closed() {
+        let (mut runner, mut rx) = runner();
+        let mut out = Recorder::default();
+        // No session at all.
+        let effect = Effect::Live {
+            id: 5,
+            req_id: live::ReqId(1),
+            req: ping(),
         };
-        (runner, rx)
+        assert!(!runner.run(effect, &mut out));
+        assert_eq!(expect_closed(&mut rx), (5, 0, 1));
+        // Still connecting: no handle yet.
+        connecting(&mut runner, 5, 50);
+        runner.run(
+            Effect::Live {
+                id: 5,
+                req_id: live::ReqId(2),
+                req: ping(),
+            },
+            &mut out,
+        );
+        assert_eq!(expect_closed(&mut rx), (5, 50, 2));
+        // Another entry than the current one.
+        connecting(&mut runner, 6, 60);
+        runner.run(
+            Effect::Live {
+                id: 5,
+                req_id: live::ReqId(3),
+                req: ping(),
+            },
+            &mut out,
+        );
+        assert_eq!(expect_closed(&mut rx), (5, 50, 3));
+        assert!(out.bytes.is_empty());
+    }
+
+    #[test]
+    fn a_live_task_is_installed_only_for_the_current_session() {
+        let (mut runner, mut rx) = runner();
+        connecting(&mut runner, 1, 10);
+        // A replaced run's connect task finishing late installs nothing.
+        let (stale, _stale_rx) = LiveHandle::detached();
+        assert!(!install_live(&runner.live, 1, 9, &runner.tx, || stale));
+        assert!(rx.try_recv().is_err());
+
+        let (handle, mut queue) = LiveHandle::detached();
+        assert!(install_live(&runner.live, 1, 10, &runner.tx, || handle));
+        let Ok(Incoming::Msg(Msg::LiveReady { id: 1, scan: 10 })) = rx.try_recv() else {
+            panic!("no LiveReady");
+        };
+        // Only once per session.
+        let (again, _again_rx) = LiveHandle::detached();
+        assert!(!install_live(&runner.live, 1, 10, &runner.tx, || again));
+
+        // Requests for the session reach its task.
+        runner.run(
+            Effect::Live {
+                id: 1,
+                req_id: live::ReqId(7),
+                req: ping(),
+            },
+            &mut Recorder::default(),
+        );
+        let (req_id, req) = queue.try_recv().expect("queued");
+        assert_eq!((req_id, req), (live::ReqId(7), ping()));
+        assert!(rx.try_recv().is_err());
+
+        // A new connect drops the old live task.
+        connecting(&mut runner, 1, 11);
+        assert!(queue.is_closed());
+        runner.run(
+            Effect::Live {
+                id: 1,
+                req_id: live::ReqId(8),
+                req: ping(),
+            },
+            &mut Recorder::default(),
+        );
+        assert_eq!(expect_closed(&mut rx), (1, 11, 8));
+    }
+
+    #[test]
+    fn quitting_drops_the_live_task() {
+        let (mut runner, _rx) = runner();
+        connecting(&mut runner, 2, 20);
+        let (handle, queue) = LiveHandle::detached();
+        assert!(install_live(&runner.live, 2, 20, &runner.tx, || handle));
+        assert!(!queue.is_closed());
+        assert!(runner.run(Effect::Quit, &mut Recorder::default()));
+        assert!(queue.is_closed());
+        assert!(lock(&runner.live).is_none());
     }
 
     #[test]

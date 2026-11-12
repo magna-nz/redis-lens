@@ -164,6 +164,14 @@ impl LiveHandle {
     pub fn send(&self, id: ReqId, req: LiveRequest) -> bool {
         self.queue.send((id, req)).is_ok()
     }
+
+    /// A handle with no task behind it, for tests: what it is sent arrives on the
+    /// receiver, and dropping the handle closes it.
+    #[cfg(test)]
+    pub(crate) fn detached() -> (Self, mpsc::UnboundedReceiver<(ReqId, LiveRequest)>) {
+        let (queue, rx) = mpsc::unbounded_channel();
+        (Self { queue }, rx)
+    }
 }
 
 /// Starts the live task on `conn`. Each finished request is passed to `reply`, in any
