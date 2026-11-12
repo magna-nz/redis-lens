@@ -415,8 +415,10 @@ fn pairs(v: &Value) -> Vec<(String, &Value)> {
             .filter_map(|(k, v)| name(k).map(|k| (k, v)))
             .collect(),
         Value::Array(a) => a
-            .chunks_exact(2)
-            .filter_map(|c| name(&c[0]).map(|k| (k, &c[1])))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .filter_map(|[k, v]| name(k).map(|k| (k, v)))
             .collect(),
         _ => Vec::new(),
     }

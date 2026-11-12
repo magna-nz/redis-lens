@@ -398,8 +398,10 @@ pub(crate) fn pairs(v: &Value) -> Vec<(String, &Value)> {
     match v {
         Value::Map(m) => m.iter().filter_map(|(k, v)| Some((text(k)?, v))).collect(),
         Value::Array(items) => items
-            .chunks_exact(2)
-            .filter_map(|c| Some((text(&c[0])?, &c[1])))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .filter_map(|[k, v]| Some((text(k)?, v)))
             .collect(),
         _ => Vec::new(),
     }

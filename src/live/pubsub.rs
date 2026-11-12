@@ -141,8 +141,10 @@ pub fn parse_numsub(v: &Value) -> Vec<(String, u64)> {
             .filter_map(|(k, n)| Some((text(k)?, uint(n)?)))
             .collect(),
         Value::Array(items) => items
-            .chunks_exact(2)
-            .filter_map(|c| Some((text(&c[0])?, uint(&c[1])?)))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .filter_map(|[k, n]| Some((text(k)?, uint(n)?)))
             .collect(),
         _ => Vec::new(),
     }
