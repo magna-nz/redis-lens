@@ -8,6 +8,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::budget::Budget;
+
 use redis::aio::ConnectionLike;
 use redis::{FromRedisValue, Value};
 use tokio::sync::watch;
@@ -86,10 +88,21 @@ pub enum ScanError {
     Protocol(String),
 }
 
-/// Read `INFO server`, `INFO memory` and `DBSIZE`.
+/// Read `INFO server`, `INFO memory` and `DBSIZE`, with no command budget.
 pub async fn server_info<C: ConnectionLike + Send>(conn: &mut C) -> Result<ServerInfo, ScanError> {
+    server_info_with_budget(conn, &Budget::new(None)).await
+}
+
+/// [`server_info`], taking its three commands from `budget`.
+pub async fn server_info_with_budget<C: ConnectionLike + Send>(
+    conn: &mut C,
+    budget: &Budget,
+) -> Result<ServerInfo, ScanError> {
+    budget.take(1).await;
     let server: String = redis::cmd("INFO").arg("server").query_async(conn).await?;
+    budget.take(1).await;
     let memory: String = redis::cmd("INFO").arg("memory").query_async(conn).await?;
+    budget.take(1).await;
     let dbsize: u64 = redis::cmd("DBSIZE").query_async(conn).await?;
     parse_info(&server, &memory, dbsize)
 }
@@ -147,45 +160,6 @@ pub fn parse_info(server: &str, memory: &str, dbsize: u64) -> Result<ServerInfo,
             .to_string(),
         total_keys: dbsize,
     })
-}
-
-/// Keeps the command rate at or below a limit by sleeping.
-struct Limiter {
-    per_sec: Option<u32>,
-    start: Instant,
-    sent: u64,
-}
-
-impl Limiter {
-    fn new(per_sec: Option<u32>) -> Self {
-        Self {
-            per_sec: per_sec.filter(|n| *n > 0),
-            start: Instant::now(),
-            sent: 0,
-        }
-    }
-
-    /// Record `n` commands just sent and sleep until the average rate is within the limit.
-    async fn spent(&mut self, n: u64) {
-        self.sent += n;
-        if self.per_sec.is_some() {
-            let wait = self.wait(self.start.elapsed());
-            if !wait.is_zero() {
-                tokio::time::sleep(wait).await;
-            }
-        }
-    }
-
-    /// How long to sleep, `elapsed` after the start, so that the commands sent so far
-    /// stay within the budget. Zero when there is no limit.
-    fn wait(&self, elapsed: Duration) -> Duration {
-        match self.per_sec {
-            Some(rate) => {
-                Duration::from_secs_f64(self.sent as f64 / f64::from(rate)).saturating_sub(elapsed)
-            }
-            None => Duration::ZERO,
-        }
-    }
 }
 
 fn parse<T: FromRedisValue>(v: &Value) -> Option<T> {
@@ -248,17 +222,21 @@ pub async fn sample_keys_detailed<C: ConnectionLike + Send>(
     with_freq: bool,
     progress: Option<&watch::Sender<ScanProgress>>,
 ) -> Result<SampleOutcome, ScanError> {
-    let mut limiter = Limiter::new(opts.max_commands_per_sec);
-    sample_inner(
-        conn,
-        opts,
-        with_sizes,
-        with_freq,
-        progress,
-        None,
-        &mut limiter,
-    )
-    .await
+    let budget = Budget::new(opts.max_commands_per_sec);
+    sample_keys_detailed_with_budget(conn, opts, with_sizes, with_freq, progress, &budget).await
+}
+
+/// [`sample_keys_detailed`], taking every command from `budget` instead of a budget of
+/// its own built from `opts.max_commands_per_sec` (which is then not used).
+pub async fn sample_keys_detailed_with_budget<C: ConnectionLike + Send>(
+    conn: &mut C,
+    opts: &ScanOptions,
+    with_sizes: bool,
+    with_freq: bool,
+    progress: Option<&watch::Sender<ScanProgress>>,
+    budget: &Budget,
+) -> Result<SampleOutcome, ScanError> {
+    sample_inner(conn, opts, with_sizes, with_freq, progress, None, budget).await
 }
 
 /// [`sample_keys_detailed`], also publishing partial pattern stats to `partial` (throttled)
@@ -270,7 +248,7 @@ async fn sample_inner<C: ConnectionLike + Send>(
     with_freq: bool,
     progress: Option<&watch::Sender<ScanProgress>>,
     mut partial: Option<&mut PartialSink<'_>>,
-    limiter: &mut Limiter,
+    budget: &Budget,
 ) -> Result<SampleOutcome, ScanError> {
     let limit = usize::try_from(opts.sample_limit).unwrap_or(usize::MAX);
     let batch_size = opts.batch_size.max(1);
@@ -304,8 +282,8 @@ async fn sample_inner<C: ConnectionLike + Send>(
         if let Some(glob) = &opts.match_glob {
             cmd.arg("MATCH").arg(glob);
         }
+        budget.take(1).await;
         let (next, keys): (u64, Vec<Vec<u8>>) = cmd.query_async(conn).await?;
-        limiter.spent(1).await;
         cursor = next;
         reached_end = cursor == 0;
 
@@ -331,7 +309,8 @@ async fn sample_inner<C: ConnectionLike + Send>(
         {
             let n = pending.len().min(batch_size);
             let batch: Vec<String> = pending.drain(..n).collect();
-            let batch_out = fetch_batch(conn, &batch, with_sizes, with_freq, &mut samples).await?;
+            let batch_out =
+                fetch_batch(conn, &batch, with_sizes, with_freq, &mut samples, budget).await?;
             vanished += batch_out.vanished;
             if let Some(sink) = partial.as_deref_mut() {
                 // Keys looked up so far that still existed; `pending` hasn't been looked up.
@@ -339,7 +318,6 @@ async fn sample_inner<C: ConnectionLike + Send>(
                 let present = looked_up.saturating_sub(vanished);
                 sink.maybe_publish(&samples, present, Instant::now());
             }
-            limiter.spent(batch_out.sent).await;
             publish(samples.len(), false);
         }
 
@@ -358,8 +336,6 @@ async fn sample_inner<C: ConnectionLike + Send>(
 
 /// What [`fetch_batch`] did.
 struct BatchOutcome {
-    /// Commands sent.
-    sent: u64,
     /// Keys that no longer existed: `TYPE` said `none` or `PTTL` said -2.
     vanished: u64,
 }
@@ -376,6 +352,7 @@ async fn fetch_batch<C: ConnectionLike + Send>(
     with_sizes: bool,
     with_freq: bool,
     out: &mut Vec<KeySample>,
+    budget: &Budget,
 ) -> Result<BatchOutcome, ScanError> {
     let stride = 2 + usize::from(with_sizes) + usize::from(with_freq);
     let mut pipe = redis::pipe();
@@ -394,6 +371,10 @@ async fn fetch_batch<C: ConnectionLike + Send>(
             pipe.cmd("OBJECT").arg("FREQ").arg(key);
         }
     }
+    // The whole pipeline counts: one command per key and per lookup.
+    budget
+        .take(u32::try_from(keys.len() * stride).unwrap_or(u32::MAX))
+        .await;
     let replies: Vec<Value> = pipe.query_async(conn).await?;
     if replies.len() != keys.len() * stride {
         return Err(ScanError::Protocol(format!(
@@ -440,10 +421,7 @@ async fn fetch_batch<C: ConnectionLike + Send>(
             lfu_freq,
         });
     }
-    Ok(BatchOutcome {
-        sent: (keys.len() * stride) as u64,
-        vanished,
-    })
+    Ok(BatchOutcome { vanished })
 }
 
 /// How many hot keys a report keeps.
@@ -596,10 +574,26 @@ pub async fn scan_with_partial<C: ConnectionLike + Send>(
     progress: Option<&watch::Sender<ScanProgress>>,
     partial: Option<&PartialSender>,
 ) -> Result<ScanReport, ScanError> {
-    let server = server_info(conn).await?;
-    let mut limiter = Limiter::new(opts.max_commands_per_sec);
+    let budget = Budget::new(opts.max_commands_per_sec);
+    scan_with_budget(profile_name, conn, opts, perms, progress, partial, &budget).await
+}
+
+/// [`scan_with_partial`], taking every command (server info, the server context and the
+/// sampling) from `budget` instead of a budget of its own built from
+/// `opts.max_commands_per_sec` (which is then not used). The TUI passes the budget its
+/// live views share.
+pub async fn scan_with_budget<C: ConnectionLike + Send>(
+    profile_name: &str,
+    conn: &mut C,
+    opts: &ScanOptions,
+    perms: &PermissionReport,
+    progress: Option<&watch::Sender<ScanProgress>>,
+    partial: Option<&PartialSender>,
+    budget: &Budget,
+) -> Result<ScanReport, ScanError> {
+    let server = server_info_with_budget(conn, budget).await?;
     // A few read-only commands; any part that fails is left out, never the scan.
-    let server_context = context::read(conn, opts.db, perms, &mut limiter).await;
+    let server_context = context::read(conn, opts.db, perms, budget).await;
     let with_sizes = perms.allowed(PERM_MEMORY);
     let with_freq = perms.allowed(PERM_FREQ) && server.lfu_enabled();
     let target = opts.sample_limit.min(server.total_keys);
@@ -627,7 +621,7 @@ pub async fn scan_with_partial<C: ConnectionLike + Send>(
         with_freq,
         progress,
         sink.as_mut(),
-        &mut limiter,
+        budget,
     )
     .await?;
     let scale = estimate_scale(
@@ -1062,27 +1056,38 @@ mod tests {
             .block_on(f)
     }
 
+    /// A runtime whose clock only moves when every task waits on a timer.
+    fn run_paused<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// Every command a scan sends (server info, the server context, `SCAN` and each
+    /// pipelined lookup) is taken from the budget, and the budget sets the pace: on a
+    /// paused clock, where commands cost nothing, the scan takes commands over rate.
     #[test]
-    fn limiter_wait_keeps_the_average_rate_within_budget() {
-        // Virtual clock: each command costs nothing, so the limiter sets the pace.
-        for (rate, n) in [(100u32, 1_000u64), (5_000, 20_000), (7, 50)] {
-            let mut l = Limiter::new(Some(rate));
-            let mut now = Duration::ZERO;
-            for _ in 0..n {
-                l.sent += 1;
-                now += l.wait(now);
-            }
-            let min = Duration::from_secs_f64(n as f64 / f64::from(rate));
-            assert!(now >= min, "rate {rate}: {now:?} < {min:?}");
-            // And it does not sleep far longer than needed.
-            assert!(now <= min + Duration::from_millis(1), "{now:?}");
+    fn budget_wait_keeps_the_average_rate_within_budget() {
+        for rate in [100u32, 5_000, 7] {
+            let mut server = fake::Server::new(keyspace(300, |_| Fate::Present), 40);
+            let budget = crate::budget::Budget::new(Some(rate));
+            let (sent, took) = run_paused(async {
+                let t0 = tokio::time::Instant::now();
+                let o = opts(1_000, 20);
+                scan_with_budget("t", &mut server, &o, &perms_all(), None, None, &budget)
+                    .await
+                    .unwrap();
+                (server.log.len() as u64, t0.elapsed())
+            });
+            assert_eq!(budget.taken(), sent, "{:?}", server.log);
+            let min = Duration::from_secs_f64(sent as f64 / f64::from(rate));
+            assert!(took >= min, "rate {rate}: {took:?} < {min:?}");
+            // And it does not wait far longer than needed.
+            assert!(took <= min + Duration::from_millis(1), "{took:?}");
         }
-        // Batches of commands count in full.
-        let mut l = Limiter::new(Some(10));
-        l.sent += 25;
-        assert_eq!(l.wait(Duration::from_secs(1)), Duration::from_millis(1_500));
-        // Time already spent is not slept again.
-        assert_eq!(l.wait(Duration::from_secs(3)), Duration::ZERO);
     }
 
     /// The server-context commands (`INFO keyspace`, `INFO keysizes`, `MEMORY STATS`) each
@@ -1090,37 +1095,38 @@ mod tests {
     #[test]
     fn context_commands_count_against_the_budget() {
         let mut server = fake::Server::new(keyspace(10, |_| Fate::Present), 10);
-        let mut l = Limiter::new(Some(1_000_000));
-        run_timed(context::read(&mut server, 0, &perms_all(), &mut l));
+        let b = crate::budget::Budget::new(Some(1_000_000));
+        run_timed(context::read(&mut server, 0, &perms_all(), &b));
         assert_eq!(server.log.len(), 3, "{:?}", server.log);
-        assert_eq!(l.sent, server.log.len() as u64);
+        assert_eq!(b.taken(), server.log.len() as u64);
         // A denied MEMORY STATS is not sent and not counted.
         let mut server = fake::Server::new(keyspace(10, |_| Fate::Present), 10);
-        let mut l = Limiter::new(Some(1_000_000));
+        let b = crate::budget::Budget::new(Some(1_000_000));
         let denied = perms_with(
             crate::model::PERM_MEMORY_STATS,
             crate::model::PermStatus::Denied("NOPERM".into()),
         );
-        run_timed(context::read(&mut server, 0, &denied, &mut l));
-        assert_eq!(l.sent, 2);
+        run_timed(context::read(&mut server, 0, &denied, &b));
+        assert_eq!(b.taken(), 2);
         assert_eq!(server.log.len(), 2, "{:?}", server.log);
     }
 
     #[test]
-    fn limiter_without_a_limit_never_waits() {
+    fn budget_without_a_limit_never_waits() {
         for rate in [None, Some(0)] {
-            let mut l = Limiter::new(rate);
-            l.sent += 1_000_000;
-            assert_eq!(l.wait(Duration::ZERO), Duration::ZERO);
+            let mut server = fake::Server::new(keyspace(300, |_| Fate::Present), 40);
+            let mut o = opts(1_000, 20);
+            o.max_commands_per_sec = rate;
+            let took = run_paused(async {
+                let t0 = tokio::time::Instant::now();
+                scan("t", &mut server, &o, &perms_all(), None)
+                    .await
+                    .unwrap();
+                t0.elapsed()
+            });
+            assert_eq!(took, Duration::ZERO, "{rate:?}");
+            assert!(server.log.len() > 12, "{:?}", server.log);
         }
-        run_timed(async {
-            let mut l = Limiter::new(Some(0));
-            let t0 = Instant::now();
-            for _ in 0..1_000 {
-                l.spent(1_000).await;
-            }
-            assert!(t0.elapsed() < Duration::from_secs(1));
-        });
     }
 
     #[test]

@@ -664,9 +664,163 @@ pub async fn check_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Permis
     PermissionReport { checks }
 }
 
+/// Labels for the view probes ([`check_view_permissions`]), in display order. Each one
+/// turns a view or panel on or off (spec "Permission check, additions").
+pub const PERM_SLOWLOG: &str = "SLOWLOG";
+pub const PERM_CLIENT_LIST: &str = "CLIENT LIST";
+pub const PERM_XINFO: &str = "XINFO";
+pub const PERM_PUBSUB: &str = "PUBSUB";
+/// `FT._LIST`: Redis Search or valkey-search. Without the module it reads as skipped
+/// (unsupported), never denied.
+pub const PERM_SEARCH: &str = "FT._LIST";
+pub const VIEW_PERM_LABELS: [&str; 5] = [
+    PERM_SLOWLOG,
+    PERM_CLIENT_LIST,
+    PERM_XINFO,
+    PERM_PUBSUB,
+    PERM_SEARCH,
+];
+
+/// A client ID no client has (`i64::MAX`): `CLIENT LIST ID` with it checks the ACL and
+/// returns no client's line, and needs no `+client|id` to learn the connection's own ID.
+const NO_CLIENT_ID: i64 = i64::MAX;
+
+/// What a failed view probe of `command` reads as, in redis-lens's own words (the
+/// server's text can name the ACL user). `NOPERM` is a denial; an unknown command, a
+/// missing module or any other failure turns the view off as skipped, with the reason.
+fn classify_view_probe(
+    label: &str,
+    command: &str,
+    r: Result<redis::Value, redis::RedisError>,
+) -> PermStatus {
+    match r {
+        Ok(_) => PermStatus::Allowed,
+        Err(e) if is_noperm(&e) => {
+            PermStatus::Denied(format!("NOPERM {command} is not allowed for this user"))
+        }
+        Err(e) if crate::live::is_unknown_command(&e) => {
+            if label == PERM_SEARCH {
+                PermStatus::Skipped("the Search module is not loaded".to_string())
+            } else {
+                PermStatus::Skipped(format!("the server does not support {command}"))
+            }
+        }
+        Err(_) => PermStatus::Skipped(format!("{command} could not be checked")),
+    }
+}
+
+/// Try one read-only command for each view that needs one and report which are
+/// allowed: `SLOWLOG LEN`, `CLIENT LIST ID <an id no client has>`, `XINFO HELP`,
+/// `PUBSUB NUMPAT` and `FT._LIST`.
+///
+/// Never fails as a whole, and never puts the server's error text in a status.
+pub async fn check_view_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Vec<PermCheck> {
+    let probes: [(&'static str, &str, redis::Cmd); 5] = [
+        (PERM_SLOWLOG, "SLOWLOG LEN", {
+            let mut c = redis::cmd("SLOWLOG");
+            c.arg("LEN");
+            c
+        }),
+        (PERM_CLIENT_LIST, "CLIENT LIST", {
+            let mut c = redis::cmd("CLIENT");
+            c.arg("LIST").arg("ID").arg(NO_CLIENT_ID);
+            c
+        }),
+        (PERM_XINFO, "XINFO", {
+            let mut c = redis::cmd("XINFO");
+            c.arg("HELP");
+            c
+        }),
+        (PERM_PUBSUB, "PUBSUB NUMPAT", {
+            let mut c = redis::cmd("PUBSUB");
+            c.arg("NUMPAT");
+            c
+        }),
+        (PERM_SEARCH, "FT._LIST", redis::cmd("FT._LIST")),
+    ];
+    let mut checks = Vec::with_capacity(probes.len());
+    for (label, command, cmd) in probes {
+        let r: Result<redis::Value, _> = cmd.query_async(conn).await;
+        checks.push(PermCheck {
+            label,
+            status: classify_view_probe(label, command, r),
+        });
+    }
+    checks
+}
+
+/// [`check_permissions`] followed by [`check_view_permissions`]: what the TUI checks on
+/// connect. The scan command and `conn test` use [`check_permissions`] alone.
+pub async fn check_all_permissions<C: ConnectionLike + Send>(conn: &mut C) -> PermissionReport {
+    let mut report = check_permissions(conn).await;
+    report.checks.extend(check_view_permissions(conn).await);
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_probes_read_in_redis_lens_words() {
+        let err = |kind, code: &'static str, detail: &str| {
+            Err(redis::RedisError::from((
+                redis::ErrorKind::Server(kind),
+                code,
+                detail.to_string(),
+            )))
+        };
+        let noperm = || {
+            err(
+                ServerErrorKind::NoPerm,
+                "NOPERM",
+                "User lens-ro has no permissions to run the 'slowlog|len' command",
+            )
+        };
+        assert_eq!(
+            classify_view_probe(PERM_SLOWLOG, "SLOWLOG LEN", Ok(redis::Value::Int(0))),
+            PermStatus::Allowed
+        );
+        let denied = classify_view_probe(PERM_SLOWLOG, "SLOWLOG LEN", noperm());
+        assert_eq!(
+            denied,
+            PermStatus::Denied("NOPERM SLOWLOG LEN is not allowed for this user".into())
+        );
+        // A missing module is unsupported, not denied.
+        let unknown = || {
+            err(
+                ServerErrorKind::ResponseError,
+                "ERR",
+                "unknown command 'FT._LIST', with args beginning with: ",
+            )
+        };
+        assert_eq!(
+            classify_view_probe(PERM_SEARCH, "FT._LIST", unknown()),
+            PermStatus::Skipped("the Search module is not loaded".into())
+        );
+        assert_eq!(
+            classify_view_probe(PERM_SEARCH, "FT._LIST", noperm()),
+            PermStatus::Denied("NOPERM FT._LIST is not allowed for this user".into())
+        );
+        assert_eq!(
+            classify_view_probe(PERM_XINFO, "XINFO", unknown()),
+            PermStatus::Skipped("the server does not support XINFO".into())
+        );
+        // Anything else: skipped, and the server's text is not kept.
+        let odd = classify_view_probe(
+            PERM_CLIENT_LIST,
+            "CLIENT LIST",
+            err(
+                ServerErrorKind::ResponseError,
+                "ERR",
+                "syntax error near lens-ro",
+            ),
+        );
+        assert_eq!(
+            odd,
+            PermStatus::Skipped("CLIENT LIST could not be checked".into())
+        );
+    }
 
     #[test]
     fn policy_parsing() {
