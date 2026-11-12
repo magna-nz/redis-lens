@@ -9,11 +9,14 @@ use crate::conn::docker::DiscoveredAuth;
 use crate::conn::parse::{AzureKind, ConnFormat, ParsedConnection, mask};
 use crate::conn::{ScanTarget, provider};
 use crate::format;
-use crate::model::{Auth, Env, PERM_LABELS, PERM_MEMORY, PERM_MEMORY_STATS, PermStatus};
+use crate::model::{
+    Auth, Env, PERM_LABELS, PERM_MEMORY, PERM_MEMORY_STATS, PermCheck, PermStatus,
+    PermissionReport, Profile,
+};
 use crate::tui::app::{AddState, App, ConnEntry, ConnSel, ConnStatus, DockerState, Source};
 
 use super::widgets::{
-    fit, pad_l, pad_r, pad_r_marquee, panel, rows, scroll_offset, split_cols, trunc,
+    fit, pad_l, pad_r, pad_r_marquee, panel, rows, scroll_offset, split_cols, trunc, width,
 };
 use super::{server_label, spinner, split_body, style};
 
@@ -22,27 +25,141 @@ struct Cols {
     env: usize,
     ep: usize,
     auth: usize,
+    writes: usize,
     status: usize,
     mem: usize,
 }
 
 fn cols(inner: usize) -> Cols {
-    let (name, env, auth, status, mem) = if inner >= 100 {
-        (22, 9, 14, 15, 7)
+    let (name, env, auth, writes, status, mem) = if inner >= 100 {
+        (22, 9, 14, 11, 15, 7)
     } else {
-        (18, 8, 10, 15, 7)
+        (18, 8, 9, 10, 14, 7)
     };
     let ep = inner
-        .saturating_sub(name + env + auth + status + mem)
+        .saturating_sub(name + env + auth + writes + status + mem)
         .max(8);
     Cols {
         name,
         env,
         ep,
         auth,
+        writes,
         status,
         mem,
     }
+}
+
+/// The WRITES column: `read-only` (amber) or `on` (red).
+fn writes_cell(p: &Profile) -> (&'static str, ratatui::style::Style) {
+    if p.is_read_only() {
+        ("read-only", style::amber())
+    } else {
+        ("on", style::warn())
+    }
+}
+
+/// The detail panel's Writes row: off or on, and why.
+fn writes_row(p: &Profile) -> Vec<Span<'static>> {
+    let (state, why) = match (p.read_only, p.env) {
+        (None, Env::Prod) => ("off", "production default"),
+        (None, _) => ("on", "default outside production"),
+        (Some(true), _) => ("off", "read_only = true"),
+        (Some(false), _) => ("on", "read_only = false"),
+    };
+    let s = if state == "off" {
+        style::amber()
+    } else {
+        style::warn()
+    };
+    let mut spans = kv("Writes", state.to_string(), s);
+    spans.push(Span::styled(format!(" ({why})"), style::dim()));
+    spans
+}
+
+/// The checks in display order with their status: every scan check (`PERM_LABELS`,
+/// `None` when it did not run), then the rest of the report (the view probes) in the
+/// order they ran.
+fn ordered_checks(r: &PermissionReport) -> Vec<(&'static str, Option<&PermStatus>)> {
+    let mut out: Vec<(&'static str, Option<&PermStatus>)> = PERM_LABELS
+        .iter()
+        .map(|l| {
+            (
+                *l,
+                r.checks.iter().find(|c| c.label == *l).map(|c| &c.status),
+            )
+        })
+        .collect();
+    out.extend(
+        r.checks
+            .iter()
+            .filter(|c| !PERM_LABELS.contains(&c.label))
+            .map(|c: &PermCheck| (c.label, Some(&c.status))),
+    );
+    out
+}
+
+/// The permission list, at most `max` lines `w` wide. One check per line while they
+/// fit (today's six scan checks do); when they don't, allowed checks next to each
+/// other share a line (`✓ SCAN · INFO`), and a denied or skipped one keeps its own
+/// line with its reason.
+fn perm_lines(r: &PermissionReport, w: usize, max: usize) -> Vec<Vec<Span<'static>>> {
+    let checks = ordered_checks(r);
+    let one = |(label, status): (&'static str, Option<&PermStatus>)| {
+        let (mark, mark_style, msg, msg_style) = match status {
+            Some(PermStatus::Allowed) => ("✓ ", style::ok(), String::new(), style::dim()),
+            // A view probe's NOPERM text names the user: say what it means instead.
+            Some(PermStatus::Denied(_)) if !PERM_LABELS.contains(&label) => (
+                "✗ ",
+                style::warn(),
+                "refused, view off".to_string(),
+                style::warn(),
+            ),
+            Some(PermStatus::Denied(m)) => ("✗ ", style::warn(), m.clone(), style::warn()),
+            Some(PermStatus::Skipped(m)) => ("– ", style::dim(), m.clone(), style::dim()),
+            None => ("– ", style::dim(), String::new(), style::dim()),
+        };
+        vec![
+            Span::styled(mark, mark_style),
+            Span::styled(pad_r(label, 14), style::fg()),
+            Span::styled(msg, msg_style),
+        ]
+    };
+    if checks.len() <= max {
+        return checks.into_iter().map(one).collect();
+    }
+    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    // The allowed labels of the line being filled, and its width so far.
+    let mut run: Vec<&str> = Vec::new();
+    let flush = |run: &mut Vec<&str>, out: &mut Vec<Vec<Span<'static>>>| {
+        if !run.is_empty() {
+            out.push(vec![
+                Span::styled("✓ ", style::ok()),
+                Span::styled(run.join(" · "), style::fg()),
+            ]);
+            run.clear();
+        }
+    };
+    for (label, status) in checks {
+        if status == Some(&PermStatus::Allowed) {
+            let joined = width(&run.join(" · ")) + 3 + width(label);
+            if !run.is_empty() && 2 + joined > w {
+                flush(&mut run, &mut out);
+            }
+            run.push(label);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(one((label, status)));
+        }
+    }
+    flush(&mut run, &mut out);
+    if out.len() > max {
+        out.truncate(max);
+        if let Some(last) = out.last_mut() {
+            last.push(Span::styled(" …", style::dim()));
+        }
+    }
+    out
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
@@ -87,6 +204,7 @@ fn entry_line(app: &App, e: &ConnEntry, c: &Cols) -> Line<'static> {
         }
     };
     let env = e.profile.env.label();
+    let (writes, writes_style) = writes_cell(&e.profile);
     let mem = e
         .server
         .as_ref()
@@ -101,6 +219,7 @@ fn entry_line(app: &App, e: &ConnEntry, c: &Cols) -> Line<'static> {
         Span::raw(" ".repeat(c.env.saturating_sub(env.len() + 2))),
         Span::styled(cell(&e.profile.endpoint.to_string(), c.ep), style::dim()),
         Span::styled(pad_r(auth_label(e), c.auth), style::fg()),
+        Span::styled(pad_r(writes, c.writes), writes_style),
         Span::styled(pad_r(st, c.status), st_style),
         Span::styled(format!("{} ", pad_l(&mem, c.mem - 1)), style::fg()),
     ])
@@ -117,6 +236,7 @@ fn table(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(pad_r("ENV", c.env), style::hd()),
         Span::styled(pad_r("ENDPOINT", c.ep), style::hd()),
         Span::styled(pad_r("AUTH", c.auth), style::hd()),
+        Span::styled(pad_r("WRITES", c.writes), style::hd()),
         Span::styled(pad_r("STATUS", c.status), style::hd()),
         Span::styled(format!("{} ", pad_l("MEM", c.mem - 1)), style::hd()),
     ]);
@@ -235,11 +355,6 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
             "token from the command, username in the OS keychain",
         ),
     };
-    let read_only = match (p.is_read_only(), p.env) {
-        (true, Env::Prod) => "yes (production profile)",
-        (true, _) => "yes",
-        (false, _) => "no",
-    };
     let left: Vec<Vec<Span<'static>>> = vec![
         vec![Span::styled(" CONNECTION", style::hd())],
         kv("Endpoint", endpoint, style::fg()),
@@ -251,37 +366,23 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
             if p.endpoint.tls { "on" } else { "off" }.into(),
             style::fg(),
         ),
-        kv("Read-only", read_only.into(), style::fg()),
+        writes_row(p),
     ];
 
     let mut right: Vec<Vec<Span<'static>>> =
         vec![vec![Span::styled("PERMISSION CHECK", style::hd())]];
-    for (i, label) in PERM_LABELS.iter().enumerate() {
-        let status = e
-            .perms
-            .as_ref()
-            .and_then(|r| r.checks.iter().find(|c| c.label == *label))
-            .map(|c| &c.status);
-        let (mark, mark_style, msg, msg_style) = match status {
-            Some(PermStatus::Allowed) => ("✓ ", style::ok(), String::new(), style::dim()),
-            Some(PermStatus::Denied(m)) => ("✗ ", style::warn(), m.clone(), style::warn()),
-            Some(PermStatus::Skipped(m)) => ("– ", style::dim(), m.clone(), style::dim()),
-            None => (
-                "– ",
-                style::dim(),
-                if i == 0 {
-                    "runs on connect".to_string()
-                } else {
-                    String::new()
-                },
-                style::dim(),
-            ),
-        };
-        right.push(vec![
-            Span::styled(mark, mark_style),
-            Span::styled(pad_r(label, 14), style::fg()),
-            Span::styled(msg, msg_style),
-        ]);
+    match &e.perms {
+        Some(r) => right.extend(perm_lines(r, rw, 6)),
+        // Not connected yet: the scan's checks, unrun.
+        None => {
+            for (i, label) in PERM_LABELS.iter().enumerate() {
+                right.push(vec![
+                    Span::styled("– ", style::dim()),
+                    Span::styled(pad_r(label, 14), style::fg()),
+                    Span::styled(if i == 0 { "runs on connect" } else { "" }, style::dim()),
+                ]);
+            }
+        }
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -328,7 +429,9 @@ fn note(app: &App, e: &ConnEntry, docker: Option<(&String, &String)>) -> Span<'s
             let only_stats = e.perms.as_ref().is_some_and(|p| {
                 p.checks
                     .iter()
-                    .filter(|c| matches!(c.status, PermStatus::Denied(_)))
+                    .filter(|c| {
+                        PERM_LABELS.contains(&c.label) && matches!(c.status, PermStatus::Denied(_))
+                    })
                     .all(|c| c.label == PERM_MEMORY_STATS)
             });
             return Span::styled(
@@ -343,6 +446,18 @@ fn note(app: &App, e: &ConnEntry, docker: Option<(&String, &String)>) -> Span<'s
             );
         }
         ConnStatus::Connected => {
+            // A view probe that failed turns its view off but leaves the scan whole.
+            let views_off = e.perms.as_ref().is_some_and(|p| {
+                p.checks
+                    .iter()
+                    .any(|c| !PERM_LABELS.contains(&c.label) && c.status != PermStatus::Allowed)
+            });
+            if views_off {
+                return Span::styled(
+                    " ✓ The scan has every permission it needs. Views whose check failed are off.",
+                    style::ok(),
+                );
+            }
             return Span::styled(" ✓ Every permission check passed.", style::ok());
         }
         _ => {}

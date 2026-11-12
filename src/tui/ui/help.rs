@@ -7,7 +7,7 @@ use ratatui::widgets::Clear;
 
 use super::style;
 use super::widgets::{pad_r, panel, rows, trunc, width};
-use crate::tui::app::View;
+use crate::tui::app::Screen;
 use crate::tui::keymap::{self, KeyHelp};
 
 /// Widest the overlay gets.
@@ -30,15 +30,15 @@ fn heading(text: &str, inner: usize) -> Line<'static> {
 }
 
 /// Draw the overlay centred in `area`, over whatever is already there.
-pub fn draw(frame: &mut Frame, area: Rect, view: View) {
+pub fn draw(frame: &mut Frame, area: Rect, screen: Screen) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Inner width is known only after the box is sized, so size from the area.
     let w = area.width.min(MAX_W);
     let inner = usize::from(w.saturating_sub(2));
     lines.push(heading("Everywhere", inner));
     lines.extend(keymap::global().iter().map(|h| entry(h, inner)));
-    lines.push(heading(view.title(), inner));
-    lines.extend(keymap::for_view(view).iter().map(|h| entry(h, inner)));
+    lines.push(heading(screen.title(), inner));
+    lines.extend(keymap::for_screen(screen).iter().map(|h| entry(h, inner)));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         trunc("? or esc closes", inner),
@@ -53,7 +53,7 @@ pub fn draw(frame: &mut Frame, area: Rect, view: View) {
         height: h,
     };
     frame.render_widget(Clear, rect);
-    let title = format!("Keys · {}", view.title());
+    let title = format!("Keys · {}", screen.title());
     let body = panel(frame, rect, &title, "");
     rows(frame, body, lines, None);
 }
@@ -64,45 +64,55 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn render(view: View, w: u16, h: u16) -> Terminal<TestBackend> {
+    fn render(screen: Screen, w: u16, h: u16) -> Terminal<TestBackend> {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| draw(f, f.area(), view)).unwrap();
+        t.draw(|f| draw(f, f.area(), screen)).unwrap();
         t
     }
 
     #[test]
     fn connections_80x24() {
-        insta::assert_snapshot!(render(View::Connections, 80, 24).backend());
+        insta::assert_snapshot!(render(Screen::Connections, 80, 24).backend());
     }
 
     #[test]
     fn patterns_80x24() {
-        insta::assert_snapshot!(render(View::Patterns, 80, 24).backend());
+        insta::assert_snapshot!(render(Screen::Patterns, 80, 24).backend());
     }
 
     #[test]
     fn ttl_80x24() {
-        insta::assert_snapshot!(render(View::Ttl, 80, 24).backend());
+        insta::assert_snapshot!(render(Screen::Ttl, 80, 24).backend());
     }
 
     #[test]
     fn diff_80x24() {
-        insta::assert_snapshot!(render(View::Diff, 80, 24).backend());
+        insta::assert_snapshot!(render(Screen::Diff, 80, 24).backend());
     }
 
     #[test]
     fn hot_keys_80x24() {
-        insta::assert_snapshot!(render(View::HotKeys, 80, 24).backend());
+        insta::assert_snapshot!(render(Screen::HotKeys, 80, 24).backend());
+    }
+
+    #[test]
+    fn key_list_80x24() {
+        insta::assert_snapshot!(render(Screen::KeyList, 80, 24).backend());
+    }
+
+    #[test]
+    fn server_overview_80x24() {
+        insta::assert_snapshot!(render(Screen::Overview, 80, 24).backend());
     }
 
     #[test]
     fn patterns_narrow_40x12() {
-        insta::assert_snapshot!(render(View::Patterns, 40, 12).backend());
+        insta::assert_snapshot!(render(Screen::Patterns, 40, 12).backend());
     }
 
     #[test]
     fn tiny_terminals_do_not_panic() {
-        for v in View::ALL {
+        for v in Screen::ALL {
             for (w, h) in [(20, 5), (40, 12), (1, 1), (0, 0), (3, 30), (200, 2)] {
                 render(v, w, h);
             }
