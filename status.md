@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** v0.2 done on main; waves 6-8 merged (PRs #10-#12); the quick wins (feature ideas 1-7) in progress; then v0.3 (cluster) or the bigger bets below
-**Last updated:** 2026-11-12 (Redis Insight parity: phase 1 built and verified on `claude/redis-insight-tui-features-60db8f`; not yet in a PR)
+**Last updated:** 2026-11-12 (Redis Insight parity: phase 1 built and re-verified on `claude/redis-insight-tui-features-60db8f`; PR to `main` next)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -362,6 +362,8 @@ A gap matrix against Redis Insight v3.8.0, with a three-phase roadmap, is in [do
   - B2 (merged `40eae26`): the Patterns VERDICT column, the key list (SCAN MATCH filtered by inference, paged with `n`, pipelined metadata), Big keys, Expiry and Recommendations (`src/analysis.rs`). New report field `key_sizes` (top 50 keys, bytes per TTL bucket), approved by the owner; older snapshots still load.
   - Merge fixes: `d094216` (tests), `da1c0aa` (the runner boxes `Msg`, for clippy).
   - Verifier V-B blocked on four points, all fixed in `dd7352e` and `de3d4f8`: Search resent a failed `FT._LIST` every tick; the Slow log lost the reason key names were off; some integration tests ran on Redis only (rule 5); spec and status were not updated (this change). Also fixed from its notes: the key list loaded pages without `n`, Streams retried refused commands every 5 s, two unchecked adds, stale replies, Pub/Sub's unused `tab`, a copy of the inference helpers, and an uncapped encoding check.
+  - Re-verification V-B2 blocked on three points, fixed in the next commit: Search showed "Reading…" forever after a failed first read (it now shows the failure and `r`); an `r` on Streams during a poll lost its reset of refused commands (it now reads once more when that poll answers); the spec's key bar sentence still had `tab Panel` on Streams, Pub/Sub and Search. Its non-blocking notes are open: Pub/Sub asks a refused `NUMSUB`/`NUMPAT` every poll; the spec's `key_sizes` fields omit `lfu_freq`; Pub/Sub keeps the first 1,000 channels in server order, not the top 1,000 by subscribers; the Slow log's `r` does not ask a refused `COMMAND INFO` again while Streams' does; a Streams poll that fails whole forgets the refusals it found.
+  - Demo: `docs/demo.gif` and `demo/gif-steps.json` now tour phase 1; the demo `lens` user has the phase 1 read commands.
   - Left as is, from V-B's notes: Recommendations are recomputed on each draw (cheap); at 80 columns VERDICT cuts long pattern names (owner to decide whether VERDICT should hide first).
   - Known flake: a test container's port is sometimes not mapped yet (`tests/common/mod.rs:114`); it passes on a rerun.
 - **Next:** a demo against `make demo-up`, then one PR to `main` for the owner to merge. Then phase 2 (values on screen).

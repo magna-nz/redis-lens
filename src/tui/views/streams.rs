@@ -83,6 +83,11 @@ pub struct StreamsState {
     last_sent: Option<Instant>,
     /// Optional commands the server refused, not asked again until `r`.
     refused: Refused,
+    /// What the request in flight was told to skip.
+    refused_sent: Refused,
+    /// `r` was pressed while a poll was in flight: that poll's answer skipped what `r`
+    /// asks again, so its refusals are not kept, and one more read follows it.
+    reread: bool,
 }
 
 /// The keys of the streams the scan found: keys of type stream among the examples of every
@@ -144,6 +149,8 @@ impl StreamsState {
             return;
         }
         let keys: Vec<String> = keys.into_iter().take(MAX_STREAMS).collect();
+        self.refused_sent = self.refused;
+        self.reread = false;
         self.pending = act.send(LiveRequest::Streams(Request::Info {
             keys,
             refused: self.refused,
@@ -206,7 +213,9 @@ impl ViewState for StreamsState {
         // refused (the ACL may have changed).
         self.off = None;
         self.refused = Refused::default();
-        if !self.in_flight(act) {
+        if self.in_flight(act) {
+            self.reread = true;
+        } else {
             self.fetch(act);
         }
     }
@@ -253,7 +262,7 @@ impl ViewState for StreamsState {
         }
     }
 
-    fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, _act: &mut Act<'_>) {
+    fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
         // Only the answer to the request in flight; an older one is stale.
         if self.pending != Some(id) {
             return;
@@ -261,7 +270,18 @@ impl ViewState for StreamsState {
         self.pending = None;
         match result {
             Ok(LiveReply::Streams(Reply::Info { streams, refused })) => {
-                self.refused = refused;
+                self.refused = if self.reread {
+                    // Keep only what this poll found refused; what it skipped is asked again.
+                    let sent = self.refused_sent;
+                    Refused {
+                        time: refused.time && !sent.time,
+                        groups: refused.groups && !sent.groups,
+                        consumers: refused.consumers && !sent.consumers,
+                        memory: refused.memory && !sent.memory,
+                    }
+                } else {
+                    refused
+                };
                 self.apply(streams);
             }
             Ok(_) => {}
@@ -271,6 +291,9 @@ impl ViewState for StreamsState {
             // `App` says the connection closed.
             Err(LiveError::Closed) => {}
             Err(LiveError::Failed(why)) => self.error = Some(why),
+        }
+        if self.reread && self.off.is_none() {
+            self.fetch(act);
         }
     }
 }
@@ -523,6 +546,43 @@ mod tests {
         app.handle_key(key(KeyCode::Char('p')));
         assert!(!app.views.streams.paused);
         assert!(tick(&mut app, t0, 60_100).is_some());
+    }
+
+    #[test]
+    fn r_during_a_poll_asks_again_for_what_was_refused() {
+        let (mut app, t0) = loaded();
+        // The next poll is told that XINFO GROUPS was refused.
+        app.views.streams.refused.groups = true;
+        let id = tick(&mut app, t0, 5_100).expect("poll");
+        // `r` while it is in flight sends nothing yet.
+        let effects = app.handle_key(key(KeyCode::Char('r')));
+        assert!(testing::requests(&effects).is_empty());
+        // That poll skipped GROUPS, so its answer still says refused.
+        let effects = testing::reply(
+            &mut app,
+            id,
+            Ok(LiveReply::Streams(Reply::Info {
+                streams: fetched(),
+                refused: Refused {
+                    groups: true,
+                    memory: true,
+                    ..Refused::default()
+                },
+            })),
+        );
+        // One more read follows at once, asking for GROUPS again; MEMORY USAGE, newly
+        // refused by that poll, stays skipped.
+        let reqs = testing::requests(&effects);
+        let [(_, LiveRequest::Streams(Request::Info { refused, .. }))] = &reqs[..] else {
+            panic!("expected one Info request, got {reqs:?}");
+        };
+        assert_eq!(
+            *refused,
+            Refused {
+                memory: true,
+                ..Refused::default()
+            }
+        );
     }
 
     #[test]

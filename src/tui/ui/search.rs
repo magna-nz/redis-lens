@@ -33,6 +33,14 @@ fn module(ctx: &Ctx<'_>) -> &'static str {
     }
 }
 
+/// `e` as a sentence: the error texts start in lower case.
+fn sentence(e: &str) -> String {
+    let mut c = e.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
+}
+
 /// Draws the screen `ctx.screen` of this view into `area`, the body between the
 /// header and the key bar.
 pub fn draw(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) {
@@ -61,6 +69,16 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) {
             )),
         ];
         notice_panels(frame, area, TITLE, "module missing", lines);
+        return;
+    }
+    if !state.loaded
+        && let Some(e) = &state.error
+    {
+        let lines = vec![
+            Line::from(Span::styled(format!(" ▲ {}.", sentence(e)), style::amber())),
+            Line::from(Span::styled(" Press r to read again.", style::dim())),
+        ];
+        notice_panels(frame, area, TITLE, "failed", lines);
         return;
     }
     if !state.loaded {

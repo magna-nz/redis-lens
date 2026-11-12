@@ -56,6 +56,10 @@ impl SearchState {
     fn fetch(&mut self, act: &mut Act<'_>) {
         self.pending = act.send(LiveRequest::Search(Request::Indexes));
         self.tried |= self.pending.is_some();
+        if self.pending.is_some() && !self.loaded {
+            // Nothing read yet: the screen says it is reading, not the last failure.
+            self.error = None;
+        }
     }
 
     fn in_flight(&mut self, act: &Act<'_>) -> bool {
@@ -306,9 +310,16 @@ mod tests {
             let effects = app.apply(Msg::TickAt(t0 + std::time::Duration::from_millis(100 * i)));
             assert!(testing::requests(&effects).is_empty(), "tick {i}");
         }
-        // `r` reads again.
+        // The screen says why and how to try again, not that it is still reading.
+        let screen = testing::render(&app, 80, 24).backend().to_string();
+        assert!(screen.contains("FT._LIST failed"), "{screen}");
+        assert!(screen.contains("Press r to read again"), "{screen}");
+        assert!(!screen.contains("Reading the indexes"), "{screen}");
+        // `r` reads again, and the screen says so.
         let effects = app.handle_key(key(KeyCode::Char('r')));
         assert_eq!(testing::requests(&effects).len(), 1);
+        let screen = testing::render(&app, 80, 24).backend().to_string();
+        assert!(screen.contains("Reading the indexes"), "{screen}");
     }
 
     #[test]
