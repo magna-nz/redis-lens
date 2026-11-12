@@ -1,5 +1,6 @@
 ---
 source: src/tui/views/pubsub.rs
+assertion_line: 708
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
@@ -19,10 +20,10 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│ Active channels                 0                                            │"
 "│ Pattern subscriptions           0  (PSUBSCRIBE, PUBSUB NUMPAT)               │"
 "│ Subscribers on listed channels  0  (direct SUBSCRIBE only)                   │"
-"│ Counts only: message payloads are never read.                                │"
+"│ Counts read no payloads. enter or s starts a live tail.                      │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   p Pause   r Refresh   0-6 View   ? Help   q Quit                     "
+" ↑↓ Move   enter Subscribe   space Pause   / Filter   0-6 View   ? Help   q Quit"

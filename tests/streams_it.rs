@@ -361,3 +361,95 @@ async fn a_user_who_may_not_run_xinfo_turns_the_view_off() {
         );
     }
 }
+
+// -----------------------------------------------------------------------------------
+// Entries (phase 2): `enter` reads them as the key detail does, with `XREVRANGE`.
+// -----------------------------------------------------------------------------------
+
+use redis_lens::live::values::{self, At, Items, Kind, Page};
+
+async fn entries_page(
+    conn: &mut MultiplexedConnection,
+    budget: &Budget,
+    at: Option<At>,
+) -> Result<Page, LiveError> {
+    let req = values::Request {
+        key: "big".into(),
+        kind: Kind::Stream,
+        at,
+        field_ttls: false,
+        size: None,
+    };
+    match values::run(conn, budget, req).await? {
+        values::Reply::Page(p) => Ok(p),
+        values::Reply::Gone => panic!("the stream is gone"),
+    }
+}
+
+fn ids(p: &Page) -> Vec<String> {
+    match &p.items {
+        Items::Stream(e) => e.iter().map(|e| e.id.clone()).collect(),
+        _ => panic!("not stream entries"),
+    }
+}
+
+#[tokio::test]
+async fn entries_read_newest_first_in_pages_of_100() {
+    for server in [common::redis().await, common::valkey().await] {
+        let mut admin = server.admin().await;
+        let mut pipe = redis::pipe();
+        for i in 1..=150u32 {
+            pipe.cmd("XADD")
+                .arg("big")
+                .arg(format!("{i}-0"))
+                .arg("n")
+                .arg(i)
+                .arg("payload")
+                .arg("hunter2-entry-value")
+                .ignore();
+        }
+        let () = pipe.query_async(&mut admin).await.unwrap();
+        let budget = Budget::new(None);
+        let first = entries_page(&mut admin, &budget, None)
+            .await
+            .expect("first");
+        // TYPE and XREVRANGE, pipelined.
+        assert_eq!(budget.taken(), 2);
+        assert_eq!(first.type_name.as_deref(), Some("stream"));
+        let want: Vec<String> = (51..=150).rev().map(|i| format!("{i}-0")).collect();
+        assert_eq!(ids(&first), want);
+        assert_eq!(first.next, Some(At::Before("51-0".into())));
+        let next = entries_page(&mut admin, &budget, first.next.clone())
+            .await
+            .expect("next");
+        assert_eq!(budget.taken(), 3);
+        let want: Vec<String> = (1..=50).rev().map(|i| format!("{i}-0")).collect();
+        assert_eq!(ids(&next), want);
+        assert_eq!(next.next, None);
+        // The values are held as Raw: Debug shows lengths only.
+        let shown = format!("{first:?} {next:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+    }
+}
+
+#[tokio::test]
+async fn a_user_without_xrevrange_is_refused_in_fixed_words() {
+    let args = ["--user", "zed-ro", "on", ">zed-pw", "~*", "+type", "+xinfo"];
+    for server in [
+        common::redis_with(&args).await,
+        common::valkey_with(&args).await,
+    ] {
+        let mut admin = server.admin().await;
+        let _: String = cmd(&mut admin, &["XADD", "big", "1-0", "a", "b"]).await;
+        let mut zed = server.admin_as("zed-ro", "zed-pw").await;
+        let err = entries_page(&mut zed, &Budget::new(None), None)
+            .await
+            .expect_err("denied");
+        assert_eq!(err, LiveError::Denied("XREVRANGE".into()));
+        let text = err.to_string();
+        assert!(
+            !text.contains("zed-ro") && !text.contains("NOPERM"),
+            "{text}"
+        );
+    }
+}

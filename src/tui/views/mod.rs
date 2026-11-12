@@ -57,6 +57,15 @@
 //!   ([`Ctx::off_reason`]), `App` draws the reason instead of the view and calls none of
 //!   the methods above for it. Without a session (nothing connected) it is the same.
 //!   Views are reset to `Default` on every new connect, and kept across a rescan.
+//! - **The Pub/Sub live tail.** Only [`pubsub::PubSubState`] subscribes. It asks with
+//!   [`Act::subscribe`] (or [`Act::stop_tail`]); `App` turns that into
+//!   `Effect::Subscribe` with the session's profile and where its credentials come
+//!   from, so a view never holds credentials. The tail's messages come back as
+//!   `Msg::TailReady`, `Msg::Tail` and `Msg::TailClosed`, which `App` passes, for the
+//!   current run only, to the explicit methods [`pubsub::PubSubState::tail_ready`],
+//!   [`pubsub::PubSubState::tail_batch`] and [`pubsub::PubSubState::tail_closed`]
+//!   whether the view is on screen or not; the state checks the tail id itself. A
+//!   rescan ends the tail ([`pubsub::PubSubState::end_tail`]).
 //!
 //! # Drawing
 //!
@@ -79,6 +88,7 @@ use std::time::Instant;
 
 use crossterm::event::KeyEvent;
 
+use crate::live::pubsub::Subscription;
 use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::{PermStatus, PermissionReport, Profile, ScanReport, ServerInfo, ServerMode};
 use crate::tui::clipboard::CopyText;
@@ -338,6 +348,15 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// What a view asked of the Pub/Sub live tail, for `App` to turn into an effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TailCmd {
+    /// Start tail `tail` on `to`, replacing any other.
+    Subscribe { tail: u64, to: Subscription },
+    /// End tail `tail`.
+    Stop { tail: u64 },
+}
+
 /// What a handler can do, besides reading the [`Ctx`] it derefs to.
 pub struct Act<'a> {
     ctx: Ctx<'a>,
@@ -346,6 +365,8 @@ pub struct Act<'a> {
     pending: &'a mut HashMap<ReqId, Owner>,
     notice: &'a mut Option<Notice>,
     effects: Vec<Effect>,
+    next_tail: &'a mut u64,
+    tail: Option<TailCmd>,
 }
 
 impl<'a> Deref for Act<'a> {
@@ -363,6 +384,7 @@ impl<'a> Act<'a> {
         next_req: &'a mut u64,
         pending: &'a mut HashMap<ReqId, Owner>,
         notice: &'a mut Option<Notice>,
+        next_tail: &'a mut u64,
     ) -> Self {
         Self {
             ctx,
@@ -371,11 +393,33 @@ impl<'a> Act<'a> {
             pending,
             notice,
             effects: Vec::new(),
+            next_tail,
+            tail: None,
         }
     }
 
-    pub(super) fn into_effects(self) -> Vec<Effect> {
-        self.effects
+    /// The effects asked for, and what was asked of the live tail.
+    pub(super) fn into_parts(self) -> (Vec<Effect>, Option<TailCmd>) {
+        (self.effects, self.tail)
+    }
+
+    /// Starts the Pub/Sub live tail on `to`, on a connection of its own (spec "5
+    /// Pub/Sub"), replacing the session's other tail if any. Returns the new tail's id,
+    /// which its `Msg::Tail*` messages carry. `None`, and nothing started, while the live
+    /// connection is not [`LiveState::Ready`] (the tail takes from its command budget).
+    pub fn subscribe(&mut self, to: Subscription) -> Option<u64> {
+        if !self.ctx.live_ready() {
+            return None;
+        }
+        let tail = *self.next_tail;
+        *self.next_tail += 1;
+        self.tail = Some(TailCmd::Subscribe { tail, to });
+        Some(tail)
+    }
+
+    /// Ends tail `tail` and drops its connection.
+    pub fn stop_tail(&mut self, tail: u64) {
+        self.tail = Some(TailCmd::Stop { tail });
     }
 
     /// Sends `req` on the session's live connection. The answer comes back to this

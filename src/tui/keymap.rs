@@ -70,14 +70,6 @@ const PANEL: KeyHelp = k(
     "Next or previous panel",
     true,
 );
-/// On Streams and Search: `tab` moves between the list and the selected row's details.
-const FOCUS: KeyHelp = k(
-    "tab shift-tab",
-    "tab",
-    "Details",
-    "Move between the list and the details",
-    true,
-);
 const COPY_PATTERN: KeyHelp = k(
     "y",
     "y",
@@ -273,11 +265,119 @@ static CLIENTS: [KeyHelp; 8] = [
 
 static SLOW_LOG: [KeyHelp; 6] = [MOVE, PAGE, ENDS, PANEL, PAUSE, REFRESH];
 
-static STREAMS: [KeyHelp; 6] = [MOVE, PAGE, ENDS, FOCUS, PAUSE, REFRESH];
+/// `f` on the screens that show a value: the key detail, stream entries, a Search result.
+const FORMAT: KeyHelp = k(
+    "f",
+    "f",
+    "Format",
+    "Show the value as text, hex, JSON or MessagePack",
+    true,
+);
+/// `y` on the screens that show a value.
+const COPY_VALUE: KeyHelp = k(
+    "y",
+    "y",
+    "Copy",
+    "Copy the selected value as shown to the clipboard",
+    false,
+);
 
-static PUBSUB: [KeyHelp; 5] = [MOVE, PAGE, ENDS, PAUSE, REFRESH];
+static STREAMS: [KeyHelp; 11] = [
+    k(
+        "↑↓ j k",
+        "↑↓",
+        "Move",
+        "Move the selection, or scroll the value",
+        true,
+    ),
+    PAGE,
+    ENDS,
+    k(
+        "tab shift-tab",
+        "tab",
+        "Details",
+        "Move between the list and the details, or the entries and the value",
+        true,
+    ),
+    k(
+        "enter",
+        "enter",
+        "Entries",
+        "List the selected stream's entries",
+        true,
+    ),
+    k("n", "n", "More", "Load 100 more entries", true),
+    FORMAT,
+    COPY_VALUE,
+    k("esc", "esc", "Back", "Go back to the stream list", true),
+    PAUSE,
+    k(
+        "r",
+        "r",
+        "Refresh",
+        "Refresh this panel now, or read the entries again",
+        true,
+    ),
+];
 
-static SEARCH: [KeyHelp; 5] = [MOVE, PAGE, ENDS, FOCUS, REFRESH];
+static PUBSUB: [KeyHelp; 11] = [
+    MOVE,
+    PAGE,
+    ENDS,
+    k(
+        "enter",
+        "enter",
+        "Subscribe",
+        "Subscribe to the selected channel",
+        true,
+    ),
+    k("s", "s", "Sub", "Subscribe to a channel or pattern", false),
+    k("space", "space", "Pause", "Pause or resume the tail", true),
+    k("c", "c", "Clear", "Clear the tail", false),
+    k("/", "/", "Filter", "Filter the tail", true),
+    k(
+        "esc",
+        "esc",
+        "Stop",
+        "Clear the filter, or stop the tail",
+        false,
+    ),
+    PAUSE,
+    REFRESH,
+];
+
+static SEARCH: [KeyHelp; 12] = [
+    k(
+        "↑↓ j k",
+        "↑↓",
+        "Move",
+        "Move the selection, or scroll the text",
+        true,
+    ),
+    PAGE,
+    ENDS,
+    k(
+        "tab shift-tab",
+        "tab",
+        "Details",
+        "Move between the list and the details, or the fields and the value",
+        true,
+    ),
+    k("/", "/", "Query", "Run a query on the selected index", true),
+    k("enter", "enter", "Open", "Open the selected result", true),
+    k("e", "e", "Explain", "Explain the query", true),
+    k("P", "P", "Profile", "Profile the query", true),
+    FORMAT,
+    COPY_VALUE,
+    k(
+        "esc",
+        "esc",
+        "Back",
+        "Go back to the indexes and results",
+        true,
+    ),
+    REFRESH,
+];
 
 static NODES: [KeyHelp; 7] = [
     MOVE,
@@ -334,8 +434,9 @@ fn find(screen: Screen, keys: &str) -> (&'static str, &'static str) {
 /// something to work on: a scan result on Analysis, a session on Server, Streams,
 /// Pub/Sub and Search. Without it they show how to get one.
 ///
-/// Snapshot on Patterns and Nodes, rescan on Patterns, and the page and copy keys everywhere,
-/// are left out because they do not fit in 80 columns; the overlay lists them.
+/// Snapshot on Patterns and Nodes, rescan on Patterns, the page and copy keys everywhere,
+/// and on Pub/Sub `s`, `c`, `esc`, `p` and `r`, are left out because they do not fit in
+/// 80 columns; the overlay lists them.
 pub fn footer(screen: Screen, ready: bool) -> Vec<(&'static str, &'static str)> {
     const MOVE: &str = "↑↓ j k";
     const TAB: &str = "tab shift-tab";
@@ -351,9 +452,9 @@ pub fn footer(screen: Screen, ready: bool) -> Vec<(&'static str, &'static str)> 
         Screen::Overview if ready => &[TAB, "p", "+ -", "r", "0-6", "?", "q ctrl-c"],
         Screen::Clients if ready => &[TAB, MOVE, "enter", "r", "0-6", "?", "q ctrl-c"],
         Screen::SlowLog if ready => &[TAB, MOVE, "p", "r", "0-6", "?", "q ctrl-c"],
-        Screen::Streams if ready => &[MOVE, TAB, "p", "r", "0-6", "?", "q ctrl-c"],
-        Screen::PubSub if ready => &[MOVE, "p", "r", "0-6", "?", "q ctrl-c"],
-        Screen::Search if ready => &[MOVE, TAB, "r", "0-6", "?", "q ctrl-c"],
+        Screen::Streams if ready => &[MOVE, TAB, "enter", "p", "0-6", "?", "q ctrl-c"],
+        Screen::PubSub if ready => &[MOVE, "enter", "space", "/", "0-6", "?", "q ctrl-c"],
+        Screen::Search if ready => &[MOVE, TAB, "/", "enter", "0-6", "?", "q ctrl-c"],
         Screen::Nodes if ready => &[MOVE, TAB, "enter", "r", "0-6", "?", "q ctrl-c"],
         s if s.view().panels().is_empty() => &["0-6", "a", "?", "q ctrl-c"],
         _ => &[TAB, "0-6", "a", "?", "q ctrl-c"],
@@ -488,6 +589,16 @@ mod tests {
             ["View", "Add", "Help", "Quit"]
         );
         assert_eq!(
+            names(Screen::Streams, true),
+            [
+                "Move", "Details", "Entries", "Pause", "View", "Help", "Quit"
+            ]
+        );
+        assert_eq!(
+            names(Screen::Search, true),
+            ["Move", "Details", "Query", "Open", "View", "Help", "Quit"]
+        );
+        assert_eq!(
             names(Screen::Overview, true),
             [
                 "Panel", "Pause", "Interval", "Refresh", "View", "Help", "Quit"
@@ -507,6 +618,18 @@ mod tests {
                 ]
             );
         }
+        assert_eq!(
+            names(Screen::PubSub, true),
+            [
+                "Move",
+                "Subscribe",
+                "Pause",
+                "Filter",
+                "View",
+                "Help",
+                "Quit"
+            ]
+        );
         assert_eq!(
             names(Screen::Nodes, true),
             [

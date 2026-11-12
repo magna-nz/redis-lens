@@ -41,7 +41,7 @@ const MAX_FILTER: usize = 64;
 #[path = "views/mod.rs"]
 pub mod views;
 
-use views::{Act, Ctx, LiveState, Owner, ViewState, Views};
+use views::{Act, Ctx, LiveState, Owner, TailCmd, ViewState, Views};
 
 /// The seven views, switched with `0` to `6`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +349,25 @@ pub enum Effect {
         req_id: crate::live::ReqId,
         req: crate::live::LiveRequest,
     },
+    /// Start the Pub/Sub live tail `tail` of session `id`'s run `scan` on `to`, on a
+    /// connection of its own to `profile`'s endpoint (`conn::open_subscriber`), taking
+    /// from that run's command budget. It replaces the session's other tail, if any.
+    /// Its messages come back as [`Msg::TailReady`], [`Msg::Tail`] and
+    /// [`Msg::TailClosed`]. A new connect or rescan of the session, and quitting, end it
+    /// too.
+    Subscribe {
+        id: ConnId,
+        scan: ScanId,
+        tail: u64,
+        profile: Profile,
+        secrets: SecretSource,
+        to: crate::live::pubsub::Subscription,
+    },
+    /// End session `id`'s live tail `tail` and drop its connection.
+    Unsubscribe {
+        id: ConnId,
+        tail: u64,
+    },
     Quit,
 }
 
@@ -435,6 +454,30 @@ pub enum Msg {
     LiveClosed {
         id: ConnId,
         scan: ScanId,
+        error: Option<String>,
+    },
+    /// The live tail `tail` of run `scan` is subscribed.
+    TailReady {
+        id: ConnId,
+        scan: ScanId,
+        tail: u64,
+    },
+    /// Messages of the live tail `tail`, oldest first, at most
+    /// [`crate::live::pubsub::TAIL_KEPT`]; `dropped` more arrived since the last batch
+    /// and were left out (the oldest of them).
+    Tail {
+        id: ConnId,
+        scan: ScanId,
+        tail: u64,
+        batch: Vec<crate::live::pubsub::TailMessage>,
+        dropped: u64,
+    },
+    /// The live tail `tail` has ended without being stopped: `error` says why, in
+    /// redis-lens's own words.
+    TailClosed {
+        id: ConnId,
+        scan: ScanId,
+        tail: u64,
         error: Option<String>,
     },
 }
@@ -698,6 +741,8 @@ pub struct App {
     /// when the live connection closes or a new run replaces it.
     live_pending: HashMap<ReqId, Owner>,
     next_req: u64,
+    /// The id of the next Pub/Sub live tail ([`views::Act::subscribe`]).
+    next_tail: u64,
     /// The view-state methods called, in order, so tests see a stub view's calls
     /// arrive: `(owner, "show" | "hide" | "key" | "tick" | "reply" | "refresh" |
     /// "paste" | "open")`.
@@ -770,6 +815,14 @@ fn copies(screen: Screen) -> bool {
     )
 }
 
+/// Where the credentials of `entry` come from, for a connect or a live tail.
+fn secret_source(entry: &ConnEntry) -> SecretSource {
+    match &entry.source {
+        Source::Saved => SecretSource::Keychain,
+        Source::Docker { credentials, .. } => SecretSource::Container(credentials.clone()),
+    }
+}
+
 fn plain_char(key: &KeyEvent) -> Option<char> {
     match key.code {
         KeyCode::Char(c)
@@ -829,6 +882,7 @@ impl App {
             next_scan: 1,
             live_pending: HashMap::new(),
             next_req: 1,
+            next_tail: 1,
             #[cfg(test)]
             calls: Vec::new(),
         };
@@ -1244,6 +1298,7 @@ impl App {
             views,
             notice,
             next_req,
+            next_tail,
             live_pending,
             tick,
             now,
@@ -1255,9 +1310,40 @@ impl App {
             .find(|e| e.id == s.id)
             .and_then(|e| e.perms.as_ref());
         let ctx = Ctx::new(screen, s, perms, *tick, *now, page, sel_ticks);
-        let mut act = Act::new(ctx, owner, next_req, live_pending, notice);
+        let mut act = Act::new(ctx, owner, next_req, live_pending, notice, next_tail);
         let r = f(views, &mut act);
-        Some((r, act.into_effects()))
+        let (mut effects, tail) = act.into_parts();
+        if let Some(cmd) = tail {
+            effects.extend(self.tail_effect(cmd));
+        }
+        Some((r, effects))
+    }
+
+    /// The effect for what a view asked of the live tail: the session's profile and
+    /// where its credentials come from are added here, so no view holds them.
+    fn tail_effect(&mut self, cmd: TailCmd) -> Option<Effect> {
+        let s = self.session.as_ref()?;
+        let (id, scan) = (s.id, s.scan);
+        match cmd {
+            TailCmd::Stop { tail } => Some(Effect::Unsubscribe { id, tail }),
+            TailCmd::Subscribe { tail, to } => {
+                let profile = s.profile.clone();
+                let Some(secrets) = self.entry(id).map(secret_source) else {
+                    self.views
+                        .pubsub
+                        .tail_closed(tail, Some("this connection is no longer listed".into()));
+                    return None;
+                };
+                Some(Effect::Subscribe {
+                    id,
+                    scan,
+                    tail,
+                    profile,
+                    secrets,
+                    to,
+                })
+            }
+        }
     }
 
     /// Calls `f`, the method named `what`, on the working view state of the screen on
@@ -1513,6 +1599,8 @@ impl App {
             s.live = LiveState::Waiting;
         }
         self.live_pending.clear();
+        // The live tail belongs to the replaced run: the runner drops it with it.
+        self.views.pubsub.end_tail();
         vec![Effect::Connect {
             id,
             scan,
@@ -1838,10 +1926,7 @@ impl App {
         entry.status = ConnStatus::Connecting;
         entry.error = None;
         let profile = entry.profile.clone();
-        let secrets = match &entry.source {
-            Source::Saved => SecretSource::Keychain,
-            Source::Docker { credentials, .. } => SecretSource::Container(credentials.clone()),
-        };
+        let secrets = secret_source(entry);
         let scan = self.next_scan;
         self.next_scan += 1;
         self.connect_started = self.now;
@@ -2351,6 +2436,32 @@ impl App {
                 }
                 if let Some(s) = self.session.as_mut() {
                     s.live = LiveState::Closed(error);
+                }
+            }
+            Msg::TailReady { id, scan, tail } => {
+                if self.is_session(id, scan) {
+                    self.views.pubsub.tail_ready(tail);
+                }
+            }
+            Msg::Tail {
+                id,
+                scan,
+                tail,
+                batch,
+                dropped,
+            } => {
+                if self.is_session(id, scan) {
+                    self.views.pubsub.tail_batch(tail, batch, dropped);
+                }
+            }
+            Msg::TailClosed {
+                id,
+                scan,
+                tail,
+                error,
+            } => {
+                if self.is_session(id, scan) {
+                    self.views.pubsub.tail_closed(tail, error);
                 }
             }
             Msg::ScanFailed { id, scan, error } => {
@@ -5484,6 +5595,10 @@ mod tests {
             expected.push((owner, "refresh"));
             expected.push((owner, "key"));
             assert_eq!(calls_since(&app, n), expected, "{c}");
+            if owner == Owner::PubSub {
+                // `s` opened the subscribe input there: close it.
+                app.handle_key(key(KeyCode::Esc));
+            }
         }
         // tab is the view's own on Streams, Pub/Sub and Search, App's on Server.
         let n = app.calls.len();
@@ -5791,6 +5906,7 @@ mod tests {
             "shift-tab" => vec![key(KeyCode::BackTab)],
             "ctrl-c" => vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
             "0-6" => ('0'..='6').map(ch).collect(),
+            "space" => vec![ch(' ')],
             t if t.chars().count() == 1 => vec![ch(t.chars().next().unwrap())],
             t => panic!("no key events for token {t:?}"),
         }
@@ -5812,6 +5928,7 @@ mod tests {
             KeyCode::BackTab => "shift-tab".into(),
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-c".into(),
             KeyCode::Char('0'..='6') => "0-6".into(),
+            KeyCode::Char(' ') => "space".into(),
             KeyCode::Char(c) => c.to_string(),
             other => format!("{other:?}"),
         }

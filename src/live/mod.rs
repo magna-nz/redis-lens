@@ -3,8 +3,9 @@
 //! per-view submodules belong to wave B.
 //!
 //! Contract: the types and signatures below are fixed. No request sends a write
-//! command. Only [`values`] reads values, in pages, held as [`crate::value::Raw`]
-//! (spec "Values").
+//! command. Only [`values`] (key values and stream entries, in pages), [`search`]
+//! (query results) and the Pub/Sub tail ([`pubsub`]) read values, held as
+//! [`crate::value::Raw`] (spec "Values").
 //!
 //! [`spawn`] starts one task per connected session. Requests arrive on a queue and each
 //! runs in a task of its own on a clone of the connection, so a slow lookup never holds

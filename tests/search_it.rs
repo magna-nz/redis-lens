@@ -1,5 +1,6 @@
 //! The Search view's live requests against Redis 8 (Search built in), valkey-search from
-//! the Valkey bundle, and servers without the module.
+//! the Valkey bundle, and servers without the module: the index list, and the queries
+//! (`FT.SEARCH`, `FT.EXPLAIN`, `FT.PROFILE`).
 //!
 //! The images are pinned to the tags these tests were checked with. Neither is in
 //! `tests/common`, so they are started here, the same way.
@@ -82,6 +83,7 @@ async fn cmd(conn: &mut MultiplexedConnection, args: &[&str]) {
 async fn indexes(conn: &mut MultiplexedConnection) -> Result<IndexList, LiveError> {
     match search::run(conn, &Budget::new(None), Request::Indexes).await? {
         Reply::Indexes(l) => Ok(l),
+        other => panic!("not an index list: {other:?}"),
     }
 }
 
@@ -330,5 +332,230 @@ async fn a_user_who_may_not_list_indexes_turns_the_view_off() {
         let err = indexes(&mut zed).await.expect_err("denied");
         assert_eq!(err, LiveError::Denied("FT._LIST".into()));
         assert!(!err.to_string().contains("zed-ro"));
+    }
+}
+
+// -----------------------------------------------------------------------------------
+// Queries (phase 2)
+// -----------------------------------------------------------------------------------
+
+use redis_lens::live::search::{Results, Text};
+
+fn req(cmd: &str, index: &str, query: &str) -> Request {
+    let (index, query) = (index.to_string(), query.to_string());
+    match cmd {
+        "search" => Request::Search { index, query },
+        "explain" => Request::Explain { index, query },
+        "profile" => Request::Profile { index, query },
+        _ => unreachable!(),
+    }
+}
+
+async fn query(
+    conn: &mut MultiplexedConnection,
+    budget: &Budget,
+    cmd: &str,
+    index: &str,
+    q: &str,
+) -> Result<Reply, LiveError> {
+    search::run(conn, budget, req(cmd, index, q)).await
+}
+
+fn results(r: Reply) -> Results {
+    match r {
+        Reply::Results(r) => r,
+        other => panic!("not results: {other:?}"),
+    }
+}
+
+fn field<'a>(r: &'a Results, key: &str, name: &str) -> &'a [u8] {
+    let d = r
+        .docs
+        .iter()
+        .find(|d| d.key == key)
+        .unwrap_or_else(|| panic!("no {key} in {r:?}"));
+    d.fields
+        .iter()
+        .find(|(n, _)| n.as_bytes() == name.as_bytes())
+        .map(|(_, v)| v.as_bytes())
+        .unwrap_or_else(|| panic!("no field {name} in {key}"))
+}
+
+async fn queries_on(server: Server) {
+    let mut conn = server.conn().await;
+    seed(&mut conn).await;
+    settled(&mut conn, &[("idx:products", 3), ("idx:sessions", 2)]).await;
+    let budget = Budget::new(None);
+
+    // A hash index: every field of each document, as the module returns them.
+    let r = results(
+        query(
+            &mut conn,
+            &budget,
+            "search",
+            "idx:products",
+            "@price:[0 100]",
+        )
+        .await
+        .expect("search"),
+    );
+    assert_eq!(budget.taken(), 1);
+    assert_eq!(r.total, 3);
+    let mut keys: Vec<_> = r.docs.iter().map(|d| d.key.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["product:1", "product:2", "product:3"]);
+    assert_eq!(field(&r, "product:2", "price"), b"20");
+    assert_eq!(field(&r, "product:2", "title"), b"red shoe");
+    assert!(r.took > std::time::Duration::ZERO);
+    // Values are held as Raw: Debug shows lengths only.
+    assert!(!format!("{r:?}").contains("red shoe"));
+
+    // A JSON index returns the document as the field `$`.
+    let r = results(
+        query(&mut conn, &budget, "search", "idx:sessions", "@user:{u1}")
+            .await
+            .expect("search"),
+    );
+    assert_eq!(r.total, 1);
+    let doc: serde_json::Value = serde_json::from_slice(field(&r, "session:1", "$")).unwrap();
+    assert_eq!(doc["user"]["id"], "u1");
+
+    // A query the module can't parse keeps its message, in redis-lens's frame.
+    let err = query(&mut conn, &budget, "search", "idx:products", "@price:[")
+        .await
+        .expect_err("syntax");
+    let LiveError::Failed(why) = &err else {
+        panic!("{err:?}");
+    };
+    assert!(why.starts_with("FT.SEARCH failed: "), "{why}");
+    assert!(why.len() > "FT.SEARCH failed: ".len(), "{why}");
+    assert!(
+        !why.contains("SEARCH_SYNTAX") && !why.contains("ERR "),
+        "{why}"
+    );
+    // An unknown index likewise.
+    let err = query(&mut conn, &budget, "search", "idx:nope", "@price:[0 1]")
+        .await
+        .expect_err("no index");
+    assert!(
+        matches!(&err, LiveError::Failed(w) if w.starts_with("FT.SEARCH failed: ")),
+        "{err:?}"
+    );
+
+    if server.valkey {
+        // valkey-search has neither FT.EXPLAIN nor FT.PROFILE, and no `*`.
+        for (cmd, name) in [("explain", "FT.EXPLAIN"), ("profile", "FT.PROFILE")] {
+            let err = query(&mut conn, &budget, cmd, "idx:products", "@price:[0 100]")
+                .await
+                .expect_err("unsupported");
+            assert_eq!(err, LiveError::Unsupported(name.into()));
+            assert_eq!(
+                err.to_string(),
+                format!("the server does not support {name}")
+            );
+        }
+        let err = query(&mut conn, &budget, "search", "idx:products", "*")
+            .await
+            .expect_err("valkey-search takes no `*`");
+        assert!(matches!(err, LiveError::Failed(_)), "{err:?}");
+    } else {
+        let all = results(
+            query(&mut conn, &budget, "search", "idx:products", "*")
+                .await
+                .expect("search *"),
+        );
+        assert_eq!(all.total, 3);
+        let Reply::Explain(plan) = query(
+            &mut conn,
+            &budget,
+            "explain",
+            "idx:products",
+            "@price:[0 100] shoe",
+        )
+        .await
+        .expect("explain") else {
+            panic!("not an explain");
+        };
+        let plan: &Text = &plan;
+        assert!(
+            plan.lines().iter().any(|l| l.contains("NUMERIC")),
+            "{:?}",
+            plan.lines()
+        );
+        assert!(!format!("{plan:?}").contains("NUMERIC"));
+        let Reply::Profile { results, profile } = query(
+            &mut conn,
+            &budget,
+            "profile",
+            "idx:products",
+            "@price:[0 15]",
+        )
+        .await
+        .expect("profile") else {
+            panic!("not a profile");
+        };
+        assert_eq!(results.total, 1);
+        assert_eq!(results.docs[0].key, "product:1");
+        assert!(
+            profile
+                .lines()
+                .iter()
+                .any(|l| l.contains("Total profile time")),
+            "{:?}",
+            profile.lines()
+        );
+    }
+}
+
+#[tokio::test]
+async fn redis_8_queries() {
+    queries_on(Server::start(REDIS8, &[]).await).await;
+}
+
+#[tokio::test]
+async fn valkey_search_queries() {
+    queries_on(Server::start(VALKEY_BUNDLE, &[]).await).await;
+}
+
+/// A user who may read indexes and not query them: fixed words, never the server's.
+#[tokio::test]
+async fn a_user_who_may_not_query_is_refused_in_fixed_words() {
+    let args = [
+        "--user",
+        "zed-ro",
+        "on",
+        ">zed-pw",
+        "~*",
+        "+ft._list",
+        "+ft.info",
+    ];
+    for image in [REDIS8, VALKEY_BUNDLE] {
+        let server = Server::start(image, &args).await;
+        let mut admin = server.conn().await;
+        seed(&mut admin).await;
+        let mut zed = server.conn_as("zed-ro", "zed-pw").await;
+        let budget = Budget::new(None);
+        let err = query(
+            &mut zed,
+            &budget,
+            "search",
+            "idx:products",
+            "@price:[0 100]",
+        )
+        .await
+        .expect_err("denied");
+        assert_eq!(err, LiveError::Denied("FT.SEARCH".into()));
+        let text = err.to_string();
+        assert_eq!(text, "the server refused FT.SEARCH for this user");
+        assert!(!format!("{err:?}").contains("zed-ro"));
+        assert_eq!(budget.taken(), 1);
+        if !server.valkey {
+            for (cmd, name) in [("explain", "FT.EXPLAIN"), ("profile", "FT.PROFILE")] {
+                let err = query(&mut zed, &budget, cmd, "idx:products", "*")
+                    .await
+                    .expect_err("denied");
+                assert_eq!(err, LiveError::Denied(name.into()));
+            }
+        }
     }
 }

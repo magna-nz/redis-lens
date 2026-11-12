@@ -1,32 +1,122 @@
 //! State of the Search view (spec "6 Search"). Owner: wave B. Drawn by `ui/search.rs`; its
 //! live requests are in `src/live/search.rs`.
 //!
-//! Phase 1 lists the indexes (`FT._LIST`, `FT.INFO`) and shows the schema of the selected
-//! one. No query is sent and nothing is created or dropped. The list is read on show and
-//! with `r`; it does not poll. See [`super`] for the interface `App` calls.
+//! Lists the indexes (`FT._LIST`, `FT.INFO`) and shows the schema of the selected one.
+//! The list is read on show and with `r`; it does not poll. On the selected index:
+//!
+//! - `/` opens a query input; `enter` runs `FT.SEARCH <index> <query> LIMIT 0 50` (an
+//!   empty query is `*`). The results replace the schema in the details pane while that
+//!   index is selected, and `tab` moves between the indexes and the results.
+//! - `enter` on a result opens its fields one level deeper, in the key detail's own
+//!   [`ValueState`]: `↑↓`, `tab`, `f` and `y` work as there. `esc` goes back.
+//! - `e` shows `FT.EXPLAIN` and `P` runs `FT.PROFILE`, one level deeper too, both for
+//!   the query last run (the one `/` starts from), on the selected index.
+//!
+//! Nothing is created or dropped. See [`super`] for the interface `App` calls. Results
+//! are held as [`Raw`](crate::value::Raw) and explain and profile text as [`Text`], so
+//! the derived `Debug` never shows a value.
 
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::streams::{list_move, off_text};
-use super::{Act, ViewState};
-use crate::live::search::{IndexInfo, IndexList, Reply, Request};
+use super::streams::{list_move, off_text, plain};
+use super::value::{Drawn, ValueState};
+use super::{Act, Input, ViewState};
+use crate::live::keys::KeyRow;
+use crate::live::search::{Doc, IndexInfo, IndexList, Reply, Request, Results, Text};
+use crate::live::values::{Field, Items};
 use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
+use crate::model::{KeyType, Ttl};
 
 /// Rows of the schema list in the details panel that fit at once.
 const SCHEMA_PAGE: usize = 4;
+/// Rows of the results list that `PgUp` and `PgDn` move by.
+const RESULTS_PAGE: usize = 5;
+/// The longest query the input takes, in characters.
+pub const MAX_QUERY: usize = 1_000;
 
 /// What `↑↓` moves.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Focus {
     #[default]
     Indexes,
-    /// The fields of the selected index.
+    /// The details pane: the schema of the selected index, or its results.
     Schema,
 }
 
-/// The indexes and the schema of the selected one.
+/// A query command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cmd {
+    Search,
+    Explain,
+    Profile,
+}
+
+impl Cmd {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Search => "FT.SEARCH",
+            Self::Explain => "FT.EXPLAIN",
+            Self::Profile => "FT.PROFILE",
+        }
+    }
+
+    /// The key that runs it.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Search => "/",
+            Self::Explain => "e",
+            Self::Profile => "P",
+        }
+    }
+}
+
+/// How far a query got.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome<T> {
+    Running,
+    Done(T),
+    /// Why it failed, as a sentence: redis-lens's own words, or for a query the server
+    /// could not run its message, escaped and cut (`live::search::query_error`).
+    Failed(String),
+}
+
+/// The results of the query last run, on the index it ran on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryRun {
+    pub index: String,
+    pub query: String,
+    /// `FT.SEARCH`, or `FT.PROFILE`, whose results show here too.
+    pub cmd: Cmd,
+    pub outcome: Outcome<Results>,
+}
+
+impl QueryRun {
+    /// The results, once they came.
+    pub fn results(&self) -> Option<&Results> {
+        match &self.outcome {
+            Outcome::Done(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
+/// One level below the indexes, over the whole body. `esc` goes back.
+#[derive(Debug)]
+pub enum Deeper {
+    /// A result's fields, in the key detail's state.
+    Document(Box<ValueState>),
+    /// `FT.EXPLAIN` or `FT.PROFILE` (`cmd`) of `query` on `index`.
+    Text {
+        cmd: Cmd,
+        index: String,
+        query: String,
+        text: Outcome<Text>,
+    },
+}
+
+/// The indexes, the schema of the selected one, and its queries.
 #[derive(Debug, Default)]
 pub struct SearchState {
     pub list: IndexList,
@@ -45,12 +135,51 @@ pub struct SearchState {
     /// A read went out since the view was last shown (or since `r`). A read that fails
     /// is not sent again on its own: the next show or `r` sends it.
     tried: bool,
+    /// The query input, while it is open.
+    pub input: Option<String>,
+    /// The query last run: what `/` starts from, and what `e` and `P` use.
+    pub last_query: Option<String>,
+    /// The results of the query last run (`FT.SEARCH` or `FT.PROFILE`).
+    pub results: Option<QueryRun>,
+    /// Selected row of the results.
+    pub result_sel: usize,
+    /// What is open one level deeper, if anything.
+    pub deeper: Option<Deeper>,
+    /// The first line of an explain or profile text shown.
+    pub text_scroll: usize,
+    /// Set by the draw, so the scroll keys know how far the text goes.
+    pub text_drawn: Drawn,
+    /// The query command in flight, if any: one at a time.
+    query_pending: Option<(ReqId, Cmd)>,
+    /// Query commands the server refused or lacks, with why: not sent again until `r`.
+    pub cmd_off: Vec<(Cmd, String)>,
+    /// The results' previews, kept between frames. `Debug` shows only counts.
+    pub memo: crate::value::Memo,
 }
 
 impl SearchState {
     /// The selected index.
     pub fn selected(&self) -> Option<&IndexInfo> {
         self.list.indexes.get(self.sel)
+    }
+
+    /// The query results of the selected index, when the query last run was on it.
+    pub fn shown_results(&self) -> Option<&QueryRun> {
+        let name = &self.selected()?.name;
+        self.results.as_ref().filter(|r| &r.index == name)
+    }
+
+    /// Why `cmd` is off, if the server refused it or lacks it.
+    pub fn off_reason(&self, cmd: Cmd) -> Option<&str> {
+        self.cmd_off
+            .iter()
+            .find(|(c, _)| *c == cmd)
+            .map(|(_, why)| why.as_str())
+    }
+
+    /// True while a query command is in flight.
+    pub fn is_running(&self) -> bool {
+        self.query_pending.is_some()
     }
 
     fn fetch(&mut self, act: &mut Act<'_>) {
@@ -72,6 +201,254 @@ impl SearchState {
             None => false,
         }
     }
+
+    /// Sends `cmd` with `query` on the selected index. False, with a notice, when it
+    /// can't be sent.
+    fn send_query(&mut self, cmd: Cmd, query: String, act: &mut Act<'_>) -> bool {
+        let Some(index) = self.selected().map(|i| i.name.clone()) else {
+            act.info("No index selected.");
+            return false;
+        };
+        if let Some(why) = self.off_reason(cmd) {
+            act.info(format!("{why} Press r to try again."));
+            return false;
+        }
+        let req = match cmd {
+            Cmd::Search => Request::Search {
+                index: index.clone(),
+                query: query.clone(),
+            },
+            Cmd::Explain => Request::Explain {
+                index: index.clone(),
+                query: query.clone(),
+            },
+            Cmd::Profile => Request::Profile {
+                index: index.clone(),
+                query: query.clone(),
+            },
+        };
+        let Some(id) = act.send(LiveRequest::Search(req)) else {
+            act.info("The live connection is not open, so the query can't run.");
+            return false;
+        };
+        self.query_pending = Some((id, cmd));
+        match cmd {
+            Cmd::Search | Cmd::Profile => {
+                self.results = Some(QueryRun {
+                    index: index.clone(),
+                    query: query.clone(),
+                    cmd,
+                    outcome: Outcome::Running,
+                });
+                self.result_sel = 0;
+                self.focus = Focus::Schema;
+            }
+            Cmd::Explain => {}
+        }
+        self.deeper = match cmd {
+            Cmd::Search => None,
+            Cmd::Explain | Cmd::Profile => Some(Deeper::Text {
+                cmd,
+                index,
+                query,
+                text: Outcome::Running,
+            }),
+        };
+        self.text_scroll = 0;
+        true
+    }
+
+    /// `e` or `P`: the query last run, on the selected index.
+    fn run_on_last(&mut self, cmd: Cmd, act: &mut Act<'_>) {
+        match self.last_query.clone() {
+            Some(q) => {
+                self.send_query(cmd, q, act);
+            }
+            None => act.info(format!(
+                "Run a query with / first: {} uses the query last run.",
+                cmd.key()
+            )),
+        }
+    }
+
+    /// `enter` on the results: open the selected one's fields.
+    fn open_result(&mut self, act: &mut Act<'_>) {
+        let Some(run) = self.shown_results() else {
+            act.info("Run a query with / first, then enter opens a result.");
+            return;
+        };
+        let Some(results) = run.results() else {
+            act.info("The query has no results to open.");
+            return;
+        };
+        let Some(doc) = results
+            .docs
+            .get(self.result_sel.min(results.docs.len().saturating_sub(1)))
+        else {
+            act.info("No documents match the query.");
+            return;
+        };
+        let state = document(doc, act.tick);
+        self.deeper = Some(Deeper::Document(Box::new(state)));
+    }
+
+    /// A key while the query input is open.
+    fn input_key(&mut self, key: KeyEvent, act: &mut Act<'_>) -> bool {
+        let Some(text) = self.input.as_mut() else {
+            return false;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.input = None,
+            KeyCode::Enter => {
+                let typed = std::mem::take(text);
+                self.input = None;
+                // An empty query matches every document.
+                let query = if typed.trim().is_empty() {
+                    "*".to_string()
+                } else {
+                    typed
+                };
+                self.last_query = Some(query.clone());
+                self.send_query(Cmd::Search, query, act);
+            }
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            KeyCode::Char('u') if ctrl => text.clear(),
+            KeyCode::Char(c) if plain(&key) && text.chars().count() < MAX_QUERY => text.push(c),
+            _ => {}
+        }
+        true
+    }
+
+    /// The move keys on an explain or profile text: scroll it.
+    fn scroll_key(&mut self, key: &KeyEvent) -> bool {
+        if !plain(key) {
+            return false;
+        }
+        let max = self.text_drawn.max_scroll();
+        let page = self.text_drawn.height();
+        let at = self.text_scroll.min(max);
+        self.text_scroll = match key.code {
+            KeyCode::Up | KeyCode::Char('k') => at.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => (at + 1).min(max),
+            KeyCode::PageUp => at.saturating_sub(page),
+            KeyCode::PageDown => (at + page).min(max),
+            KeyCode::Home | KeyCode::Char('g') => 0,
+            KeyCode::End | KeyCode::Char('G') => max,
+            _ => return false,
+        };
+        true
+    }
+
+    /// The answer to the query command in flight.
+    fn query_reply(&mut self, cmd: Cmd, result: Result<LiveReply, LiveError>) {
+        match result {
+            Ok(LiveReply::Search(Reply::Results(r))) => self.set_results(Outcome::Done(r)),
+            Ok(LiveReply::Search(Reply::Explain(t))) => self.set_text(cmd, Outcome::Done(t)),
+            Ok(LiveReply::Search(Reply::Profile { results, profile })) => {
+                self.set_results(Outcome::Done(results));
+                self.set_text(cmd, Outcome::Done(profile));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let why = failure_text(&e);
+                if matches!(e, LiveError::Denied(_) | LiveError::Unsupported(_))
+                    && self.off_reason(cmd).is_none()
+                {
+                    self.cmd_off.push((cmd, why.clone()));
+                }
+                if cmd != Cmd::Explain {
+                    self.set_results(Outcome::Failed(why.clone()));
+                }
+                self.set_text(cmd, Outcome::Failed(why));
+            }
+        }
+    }
+
+    fn set_results(&mut self, outcome: Outcome<Results>) {
+        if let Some(run) = self.results.as_mut() {
+            run.outcome = outcome;
+        }
+    }
+
+    /// Fills the explain or profile text, if it is still open.
+    fn set_text(&mut self, cmd: Cmd, outcome: Outcome<Text>) {
+        if let Some(Deeper::Text { cmd: c, text, .. }) = self.deeper.as_mut()
+            && *c == cmd
+        {
+            *text = outcome;
+        }
+    }
+}
+
+/// A result's fields in the key detail's state: a hash of what the module returned.
+fn document(doc: &Doc, tick: u64) -> ValueState {
+    let fields: Vec<Field> = doc
+        .fields
+        .iter()
+        .map(|(name, value)| Field {
+            name: name.clone(),
+            value: value.clone(),
+            ttl: None,
+        })
+        .collect();
+    let row = KeyRow {
+        key: doc.key.clone(),
+        key_type: KeyType::Hash,
+        ttl: Ttl::Persistent,
+        bytes: None,
+        encoding: None,
+        length: Some(fields.len() as u64),
+        freq: None,
+    };
+    ValueState::preloaded(row, Items::Hash(fields), tick)
+}
+
+/// Why a query command failed, as a sentence for the screen.
+pub fn failure_text(e: &LiveError) -> String {
+    match e {
+        LiveError::Closed => "The live connection is closed.".to_string(),
+        LiveError::Failed(why) => {
+            let mut c = why.chars();
+            let mut out: String = c
+                .next()
+                .map(|f| f.to_uppercase().chain(c).collect())
+                .unwrap_or_default();
+            if !out.ends_with(['.', '!', '?', '…']) {
+                out.push('.');
+            }
+            out
+        }
+        e => off_text(e),
+    }
+}
+
+#[cfg(test)]
+impl SearchState {
+    /// [`ViewState::on_paste`] without an [`Act`], which it does not use.
+    pub(crate) fn on_paste_for_test(&mut self, text: &str) {
+        paste_into(self.input.as_mut(), text);
+    }
+}
+
+/// Pasted text into the query input: one line, no control characters.
+fn paste_into(input: Option<&mut String>, text: &str) {
+    let Some(input) = input else {
+        return;
+    };
+    for c in text.chars() {
+        if input.chars().count() >= MAX_QUERY {
+            break;
+        }
+        // A pasted newline would end the query: it becomes a space.
+        match c {
+            '\n' | '\r' | '\t' => input.push(' '),
+            c if c.is_control() => {}
+            c => input.push(c),
+        }
+    }
 }
 
 impl ViewState for SearchState {
@@ -85,6 +462,13 @@ impl ViewState for SearchState {
     }
 
     fn on_tick(&mut self, _now: Instant, act: &mut Act<'_>) {
+        // A query that will never be answered (a rescan replaced the connection).
+        if let Some((id, cmd)) = self.query_pending
+            && !act.in_flight(id)
+        {
+            self.query_pending = None;
+            self.query_reply(cmd, Err(LiveError::Closed));
+        }
         // Not a polling view, but a read that was waiting for the live connection (the
         // view was shown before it opened) goes out as soon as it is ready. Once only:
         // a failed read waits for `r` or the next show.
@@ -102,40 +486,126 @@ impl ViewState for SearchState {
     fn refresh(&mut self, act: &mut Act<'_>) {
         self.off = None;
         self.no_module = false;
+        // The ACL may have changed, or a module been loaded.
+        self.cmd_off.clear();
         if !self.in_flight(act) {
             self.fetch(act);
         }
     }
 
+    fn input(&self) -> Option<Input> {
+        self.input.as_ref().map(|text| Input {
+            label: "/",
+            text: text.clone(),
+            hint: "   enter to run FT.SEARCH · esc to cancel",
+        })
+    }
+
+    fn on_paste(&mut self, text: &str, _act: &mut Act<'_>) {
+        paste_into(self.input.as_mut(), text);
+    }
+
     fn on_key(&mut self, key: KeyEvent, act: &mut Act<'_>) -> bool {
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            self.focus = match self.focus {
-                Focus::Indexes => Focus::Schema,
-                Focus::Schema => Focus::Indexes,
-            };
-            return true;
+        if self.input.is_some() {
+            return self.input_key(key, act);
+        }
+        // Keys that work the same one level deeper: they go back first.
+        match (key.code, plain(&key)) {
+            (KeyCode::Char('/'), true) => {
+                if self.selected().is_none() {
+                    act.info("No index selected.");
+                } else {
+                    self.deeper = None;
+                    self.input = Some(self.last_query.clone().unwrap_or_default());
+                }
+                return true;
+            }
+            (KeyCode::Char('e'), true) => {
+                self.run_on_last(Cmd::Explain, act);
+                return true;
+            }
+            (KeyCode::Char('P'), true) => {
+                self.run_on_last(Cmd::Profile, act);
+                return true;
+            }
+            (KeyCode::Esc, _) if self.deeper.is_some() => {
+                self.deeper = None;
+                return true;
+            }
+            _ => {}
+        }
+        match self.deeper.as_mut() {
+            Some(Deeper::Document(doc)) => {
+                // Everything is loaded: `n` has nothing to do here.
+                if matches!(key.code, KeyCode::Char('n')) {
+                    return false;
+                }
+                return doc.on_key(key, act);
+            }
+            Some(Deeper::Text { .. }) => {
+                if self.scroll_key(&key) {
+                    return true;
+                }
+                if matches!(key.code, KeyCode::Char('f' | 'y')) && plain(&key) {
+                    act.info("f and y work on a result's fields: press esc, then enter.");
+                    return true;
+                }
+                return false;
+            }
+            None => {}
+        }
+        match key.code {
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    Focus::Indexes => Focus::Schema,
+                    Focus::Schema => Focus::Indexes,
+                };
+                return true;
+            }
+            KeyCode::Enter => {
+                self.open_result(act);
+                return true;
+            }
+            KeyCode::Char('f' | 'y') if plain(&key) => {
+                act.info("Open a result with enter first: f and y work on its fields.");
+                return true;
+            }
+            _ => {}
         }
         let schema_len = self.selected().map_or(0, |i| i.schema.len());
-        let (cur, len, page) = match self.focus {
-            Focus::Indexes => (self.sel, self.list.indexes.len(), act.page),
-            Focus::Schema => (self.schema_sel, schema_len, SCHEMA_PAGE),
+        let results_len = self
+            .shown_results()
+            .and_then(QueryRun::results)
+            .map(|r| r.docs.len());
+        let (cur, len, page) = match (self.focus, results_len) {
+            (Focus::Indexes, _) => (self.sel, self.list.indexes.len(), act.page),
+            (Focus::Schema, Some(n)) => (self.result_sel, n, RESULTS_PAGE),
+            (Focus::Schema, None) => (self.schema_sel, schema_len, SCHEMA_PAGE),
         };
         let Some(to) = list_move(&key, cur, len, page) else {
             return false;
         };
-        match self.focus {
-            Focus::Indexes => {
+        match (self.focus, results_len) {
+            (Focus::Indexes, _) => {
                 if to != self.sel {
                     self.schema_sel = 0;
                 }
                 self.sel = to;
             }
-            Focus::Schema => self.schema_sel = to,
+            (Focus::Schema, Some(_)) => self.result_sel = to,
+            (Focus::Schema, None) => self.schema_sel = to,
         }
         true
     }
 
     fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, _act: &mut Act<'_>) {
+        if let Some((qid, cmd)) = self.query_pending
+            && qid == id
+        {
+            self.query_pending = None;
+            self.query_reply(cmd, result);
+            return;
+        }
         // Only the answer to the request in flight; an older one is stale.
         if self.pending != Some(id) {
             return;
@@ -391,5 +861,548 @@ mod tests {
             }),
         );
         insta::assert_snapshot!("names_only_80x24", testing::render(&app, 80, 24).backend());
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Queries (phase 2)
+    // ---------------------------------------------------------------------------------
+
+    use crate::live::search::{self as live_search, Doc};
+    use crate::tui::app::Effect;
+    use crate::tui::clipboard::CopyText;
+    use crate::value::Raw;
+    use crossterm::event::KeyModifiers;
+    use std::time::Duration;
+
+    const MARK: &str = "s3cr3t-d0c";
+
+    fn ch(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn type_text(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.handle_key(ch(c));
+        }
+    }
+
+    fn notice(app: &App) -> String {
+        app.notice
+            .as_ref()
+            .map(|n| n.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn text(app: &App, w: u16, h: u16) -> String {
+        let t = testing::render(app, w, h);
+        let b = t.backend().buffer();
+        let mut out = String::new();
+        for y in 0..b.area.height {
+            for x in 0..b.area.width {
+                out.push_str(b[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn search_requests(effects: &[Effect]) -> Vec<(ReqId, Request)> {
+        testing::requests(effects)
+            .into_iter()
+            .filter_map(|(id, r)| match r {
+                LiveRequest::Search(s) => Some((id, s)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn one(effects: &[Effect]) -> (ReqId, Request) {
+        let reqs = search_requests(effects);
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        reqs.into_iter().next().unwrap()
+    }
+
+    fn doc(key: &str, fields: &[(&str, &str)]) -> Doc {
+        Doc {
+            key: key.into(),
+            fields: fields
+                .iter()
+                .map(|(k, v)| (Raw::from(*k), Raw::from(*v)))
+                .collect(),
+        }
+    }
+
+    fn results() -> Results {
+        Results {
+            total: 1_204,
+            docs: vec![
+                doc(
+                    "product:1",
+                    &[("title", "red shoe"), ("price", "10"), ("tags", "a,b")],
+                ),
+                doc(
+                    "product:2",
+                    &[
+                        ("title", "blue shoe"),
+                        ("price", "20"),
+                        ("spec", r#"{"size":42,"colors":["blue","white"]}"#),
+                    ],
+                ),
+                doc("product:3", &[("title", "two\nlines")]),
+            ],
+            took: Duration::from_millis(3),
+        }
+    }
+
+    /// Loaded, `/`, `query` typed and run; the request it sent.
+    fn queried(query: &str) -> (App, ReqId, Request) {
+        let mut app = loaded(true);
+        app.handle_key(ch('/'));
+        type_text(&mut app, query);
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let (id, req) = one(&effects);
+        (app, id, req)
+    }
+
+    /// [`queried`] with [`results`] answered.
+    fn with_results() -> App {
+        let (mut app, id, _) = queried("@price:[0 100]");
+        testing::reply(
+            &mut app,
+            id,
+            Ok(LiveReply::Search(Reply::Results(results()))),
+        );
+        app
+    }
+
+    #[test]
+    fn slash_opens_the_input_and_enter_runs_ft_search_as_typed() {
+        let mut app = loaded(true);
+        app.handle_key(ch('/'));
+        let input = app.view_input().expect("the query input");
+        assert_eq!((input.label, input.text.as_str()), ("/", ""));
+        // Every key is text while it is open: digits, q, e and P included.
+        type_text(&mut app, "@title:(q1 eP) ");
+        assert_eq!(app.screen(), Screen::Search);
+        assert_eq!(app.view_input().unwrap().text, "@title:(q1 eP) ");
+        let (_, req) = one(&app.handle_key(key(KeyCode::Enter)));
+        assert_eq!(
+            req,
+            Request::Search {
+                index: "idx:products".into(),
+                query: "@title:(q1 eP) ".into(),
+            }
+        );
+        assert!(app.view_input().is_none());
+        // An empty query matches everything; `/` starts from the query last run.
+        app.handle_key(ch('/'));
+        assert_eq!(app.view_input().unwrap().text, "@title:(q1 eP) ");
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        let (_, req) = one(&app.handle_key(key(KeyCode::Enter)));
+        assert_eq!(
+            req,
+            Request::Search {
+                index: "idx:products".into(),
+                query: "*".into(),
+            }
+        );
+        // esc cancels without sending.
+        app.handle_key(ch('/'));
+        type_text(&mut app, "x");
+        assert!(search_requests(&app.handle_key(key(KeyCode::Esc))).is_empty());
+        assert!(app.view_input().is_none());
+    }
+
+    #[test]
+    fn a_pasted_query_is_one_line() {
+        let mut app = loaded(true);
+        app.handle_key(ch('/'));
+        app.views.search.on_paste_for_test("a\nb\x1bc");
+        assert_eq!(app.view_input().unwrap().text, "a bc");
+    }
+
+    #[test]
+    fn results_show_under_their_index() {
+        let mut app = with_results();
+        let s = &app.views.search;
+        assert_eq!(s.focus, Focus::Schema, "the results get the focus");
+        assert_eq!(s.shown_results().unwrap().results().unwrap().docs.len(), 3);
+        let all = text(&app, 80, 24);
+        assert!(all.contains("3 of 1,204 results · 3 ms"), "{all}");
+        assert!(all.contains("title=red shoe price=10"), "{all}");
+        insta::assert_snapshot!("results_80x24", testing::render(&app, 80, 24).backend());
+        insta::assert_snapshot!("results_120x36", testing::render(&app, 120, 36).backend());
+        // The move keys move the results; another index shows its schema.
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.views.search.result_sel, 2);
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(ch('j'));
+        assert!(app.views.search.shown_results().is_none());
+        assert!(text(&app, 80, 24).contains("FIELD"));
+        app.handle_key(ch('k'));
+        assert!(app.views.search.shown_results().is_some());
+    }
+
+    #[test]
+    fn enter_opens_a_result_and_f_y_esc_work_on_its_fields() {
+        let mut app = with_results();
+        app.handle_key(ch('j'));
+        app.handle_key(key(KeyCode::Enter));
+        let Some(Deeper::Document(d)) = &app.views.search.deeper else {
+            panic!("a document");
+        };
+        assert_eq!(d.row.as_ref().unwrap().key, "product:2");
+        assert_eq!(d.loaded(), 3);
+        insta::assert_snapshot!("document_80x24", testing::render(&app, 80, 24).backend());
+        insta::assert_snapshot!("document_120x36", testing::render(&app, 120, 36).backend());
+        // y copies the selected field's value as shown.
+        let effects = app.handle_key(ch('y'));
+        let copied: Vec<&CopyText> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Copy(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].as_str(), "blue shoe");
+        // The JSON field, as hex after f.
+        app.handle_key(key(KeyCode::End));
+        app.handle_key(ch('f'));
+        let Some(Deeper::Document(d)) = &app.views.search.deeper else {
+            panic!("a document");
+        };
+        assert_eq!(d.format, Some(crate::value::Format::MsgPack));
+        assert!(text(&app, 120, 36).contains("shown as MessagePack"));
+        // n has nothing to load here.
+        let before = format!("{:?}", app.views.search);
+        app.handle_key(ch('n'));
+        assert_eq!(format!("{:?}", app.views.search), before);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.views.search.deeper.is_none());
+        assert!(app.views.search.shown_results().is_some());
+        // With no query run, enter says so.
+        let mut fresh = loaded(true);
+        fresh.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            notice(&fresh),
+            "Run a query with / first, then enter opens a result."
+        );
+        fresh.handle_key(ch('y'));
+        assert_eq!(
+            notice(&fresh),
+            "Open a result with enter first: f and y work on its fields."
+        );
+    }
+
+    #[test]
+    fn e_explains_the_query_last_run() {
+        let mut app = loaded(true);
+        app.handle_key(ch('e'));
+        assert_eq!(
+            notice(&app),
+            "Run a query with / first: e uses the query last run."
+        );
+        let mut app = with_results();
+        let (id, req) = one(&app.handle_key(ch('e')));
+        assert_eq!(
+            req,
+            Request::Explain {
+                index: "idx:products".into(),
+                query: "@price:[0 100]".into(),
+            }
+        );
+        insta::assert_snapshot!(
+            "explain_waiting_80x24",
+            testing::render(&app, 80, 24).backend()
+        );
+        let plan = "INTERSECT {\n  NUMERIC {0.000000 <= @price <= 100.000000}\n  UNION {\n    shoe\n    +shoe(expanded)\n  }\n}\n";
+        let t = live_search::parse_explain(&redis::Value::BulkString(plan.as_bytes().to_vec()));
+        testing::reply(&mut app, id, Ok(LiveReply::Search(Reply::Explain(t))));
+        insta::assert_snapshot!("explain_80x24", testing::render(&app, 80, 24).backend());
+        insta::assert_snapshot!("explain_120x36", testing::render(&app, 120, 36).backend());
+        app.handle_key(ch('j'));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.views.search.deeper.is_none());
+    }
+
+    fn profile_value() -> redis::Value {
+        use redis::Value::{Array, BulkString as B, Int, SimpleString as S};
+        let b = |s: &str| B(s.as_bytes().to_vec());
+        Array(vec![
+            Array(vec![
+                Int(1),
+                b("product:1"),
+                Array(vec![b("title"), b("red shoe"), b("price"), b("10")]),
+            ]),
+            Array(vec![
+                S("Shards".into()),
+                Array(vec![Array(vec![
+                    S("Total profile time".into()),
+                    b("0.19"),
+                    S("Parsing time".into()),
+                    b("0.08"),
+                    S("Warning".into()),
+                    Array(vec![S("None".into())]),
+                    S("Iterators profile".into()),
+                    Array(vec![
+                        S("Type".into()),
+                        S("NUMERIC".into()),
+                        S("Term".into()),
+                        S("10 - 20".into()),
+                        S("Number of reading operations".into()),
+                        Int(1),
+                    ]),
+                    S("Result processors profile".into()),
+                    Array(vec![
+                        Array(vec![
+                            S("Type".into()),
+                            S("Index".into()),
+                            S("Time".into()),
+                            b("0.002"),
+                        ]),
+                        Array(vec![
+                            S("Type".into()),
+                            S("Sorter".into()),
+                            S("Time".into()),
+                            b("0.001"),
+                        ]),
+                    ]),
+                ])]),
+                S("Coordinator".into()),
+                Array(vec![]),
+            ]),
+        ])
+    }
+
+    #[test]
+    fn p_profiles_the_query_and_shows_its_results_too() {
+        let mut app = with_results();
+        let (id, req) = one(&app.handle_key(ch('P')));
+        assert_eq!(
+            req,
+            Request::Profile {
+                index: "idx:products".into(),
+                query: "@price:[0 100]".into(),
+            }
+        );
+        let (mut results, profile) = live_search::parse_profile(&profile_value()).unwrap();
+        results.took = Duration::from_millis(1);
+        testing::reply(
+            &mut app,
+            id,
+            Ok(LiveReply::Search(Reply::Profile { results, profile })),
+        );
+        insta::assert_snapshot!("profile_80x24", testing::render(&app, 80, 24).backend());
+        insta::assert_snapshot!("profile_120x36", testing::render(&app, 120, 36).backend());
+        let all = text(&app, 80, 24);
+        assert!(all.contains("Total profile time: 0.19"), "{all}");
+        assert!(all.contains("- Type: Index"), "{all}");
+        // Back on the indexes, the profile's results are shown.
+        app.handle_key(key(KeyCode::Esc));
+        let run = app.views.search.shown_results().unwrap();
+        assert_eq!(run.cmd, Cmd::Profile);
+        assert_eq!(run.results().unwrap().docs.len(), 1);
+        insta::assert_snapshot!(
+            "profile_results_80x24",
+            testing::render(&app, 80, 24).backend()
+        );
+    }
+
+    #[test]
+    fn a_module_without_explain_or_profile_says_so_and_is_not_asked_again() {
+        let mut app = with_results();
+        app.session
+            .as_mut()
+            .unwrap()
+            .server
+            .as_mut()
+            .unwrap()
+            .flavor = ServerFlavor::Valkey;
+        for (k, cmd) in [('e', "FT.EXPLAIN"), ('P', "FT.PROFILE")] {
+            let (id, _) = one(&app.handle_key(ch(k)));
+            testing::reply(&mut app, id, Err(LiveError::Unsupported(cmd.into())));
+            let all = text(&app, 80, 24);
+            let want = format!("The server does not support {cmd}.");
+            assert!(all.contains(&want), "{all}");
+            // Not sent again until r; the notice says why.
+            assert!(search_requests(&app.handle_key(ch(k))).is_empty());
+            assert_eq!(notice(&app), format!("{want} Press r to try again."));
+        }
+        app.handle_key(key(KeyCode::Esc));
+        // The profile failed, so the results say so; a new search brings them back.
+        let (id, _) = one(&app
+            .handle_key(ch('/'))
+            .into_iter()
+            .chain(app.handle_key(key(KeyCode::Enter)))
+            .collect::<Vec<_>>());
+        testing::reply(
+            &mut app,
+            id,
+            Ok(LiveReply::Search(Reply::Results(results()))),
+        );
+        let all = text(&app, 80, 24);
+        assert!(all.contains("/ query · enter open"), "{all}");
+        assert!(
+            !all.contains("e explain") && !all.contains("P profile"),
+            "{all}"
+        );
+        insta::assert_snapshot!(
+            "valkey_no_explain_80x24",
+            testing::render(&app, 80, 24).backend()
+        );
+        // r asks again.
+        app.handle_key(ch('r'));
+        assert!(app.views.search.cmd_off.is_empty());
+        assert_eq!(search_requests(&app.handle_key(ch('e'))).len(), 1);
+    }
+
+    #[test]
+    fn a_refused_query_says_so_in_fixed_words() {
+        let (mut app, id, _) = queried("*");
+        testing::reply(&mut app, id, Err(LiveError::Denied("FT.SEARCH".into())));
+        let all = text(&app, 80, 24);
+        assert!(
+            all.contains("The server refused FT.SEARCH for this user."),
+            "{all}"
+        );
+        assert!(!all.contains("NOPERM"));
+        insta::assert_snapshot!("refused_80x24", testing::render(&app, 80, 24).backend());
+        app.handle_key(ch('/'));
+        assert!(search_requests(&app.handle_key(key(KeyCode::Enter))).is_empty());
+        assert_eq!(
+            notice(&app),
+            "The server refused FT.SEARCH for this user. Press r to try again."
+        );
+    }
+
+    #[test]
+    fn a_syntax_error_shows_the_servers_message_escaped_and_cut() {
+        let (mut app, id, _) = queried("@price:[");
+        let long = format!(
+            "Syntax error at offset 7 near \x1b[2Jprice{}",
+            "x".repeat(400)
+        );
+        let wire = format!("-SEARCH_SYNTAX {long}\r\n");
+        let redis::Value::ServerError(e) = redis::parse_redis_value(wire.as_bytes()).unwrap()
+        else {
+            panic!("a server error");
+        };
+        let err = live_search::query_error("FT.SEARCH", &redis::RedisError::from(e));
+        let LiveError::Failed(why) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            why.starts_with("FT.SEARCH failed: Syntax error at offset 7 near \\x1b[2Jprice"),
+            "{why}"
+        );
+        let msg = why.trim_start_matches("FT.SEARCH failed: ");
+        assert_eq!(msg.chars().count(), live_search::QUERY_ERROR_CHARS);
+        assert!(msg.ends_with('…'));
+        testing::reply(&mut app, id, Err(err));
+        for (w, h) in [(80, 24), (120, 36)] {
+            let all = text(&app, w, h);
+            assert!(all.contains("FT.SEARCH failed: Syntax error"), "{all}");
+            assert!(!all.contains('\x1b'), "{all}");
+        }
+        insta::assert_snapshot!(
+            "syntax_error_80x24",
+            testing::render(&app, 80, 24).backend()
+        );
+    }
+
+    #[test]
+    fn escapes_in_results_are_drawn_never_the_raw_bytes() {
+        let (mut app, id, _) = queried("*");
+        let r = Results {
+            total: 1,
+            docs: vec![Doc {
+                key: "k\x1b[2Jey".into(),
+                fields: vec![
+                    (
+                        Raw::from("na\x1b[2Jme"),
+                        Raw::from("ok\x1b[2J\u{9b}31m done"),
+                    ),
+                    (
+                        Raw::from("bin"),
+                        Raw::new(vec![0x9b, 0x1b, b'[', b'2', b'J', 0xff]),
+                    ),
+                ],
+            }],
+            took: Duration::ZERO,
+        };
+        testing::reply(&mut app, id, Ok(LiveReply::Search(Reply::Results(r))));
+        let check = |app: &App| {
+            for (w, h) in [(80, 24), (120, 36)] {
+                let all = text(app, w, h);
+                assert!(all.contains("\\x1b[2J"), "{all}");
+                assert!(!all.contains('\x1b') && !all.contains('\u{9b}'), "{all}");
+            }
+        };
+        check(&app);
+        app.handle_key(key(KeyCode::Enter));
+        check(&app);
+        insta::assert_snapshot!(
+            "document_escapes_80x24",
+            testing::render(&app, 80, 24).backend()
+        );
+    }
+
+    /// Rule 1: results, documents and profile text show on screen and nowhere else.
+    #[test]
+    fn results_never_reach_debug_notices_or_snapshot_files() {
+        let (mut app, id, _) = queried("*");
+        let r = Results {
+            total: 1,
+            docs: vec![doc(
+                "product:9",
+                &[(MARK, MARK), ("$", &format!("{{\"k\":\"{MARK}\"}}"))],
+            )],
+            took: Duration::ZERO,
+        };
+        let reply = Ok(LiveReply::Search(Reply::Results(r)));
+        let msg = format!(
+            "{:?}",
+            Msg::Live {
+                id: app.session.as_ref().unwrap().id,
+                scan: app.session.as_ref().unwrap().scan,
+                req_id: id,
+                result: reply.clone(),
+            }
+        );
+        assert!(!crate::value::leaks(&msg, MARK), "{msg}");
+        testing::reply(&mut app, id, reply);
+        assert!(text(&app, 120, 36).contains(MARK));
+        let mut effects = app.handle_key(key(KeyCode::Enter));
+        for k in ['y', 'j', 'f', 'y'] {
+            effects.extend(app.handle_key(ch(k)));
+            assert!(
+                !crate::value::leaks(&notice(&app), MARK),
+                "{}",
+                notice(&app)
+            );
+        }
+        assert!(effects.iter().any(|e| matches!(e, Effect::Copy(_))));
+        // A profile that echoes the data.
+        let (pid, _) = one(&app.handle_key(ch('P')));
+        let profile = live_search::Text::new([format!("Term: {MARK}")]);
+        let reply = Ok(LiveReply::Search(Reply::Profile {
+            results: Results::default(),
+            profile,
+        }));
+        assert!(!crate::value::leaks(&format!("{reply:?}"), MARK));
+        testing::reply(&mut app, pid, reply);
+        assert!(text(&app, 120, 36).contains(MARK));
+        let debug = format!("{effects:?} {:?} {:?}", app.views, app.session);
+        assert!(!crate::value::leaks(&debug, MARK), "{debug}");
+        app.handle_key(ch('1'));
+        let effects = app.handle_key(ch('s'));
+        let [Effect::SaveSnapshot(report)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        assert!(!crate::value::leaks(
+            &serde_json::to_string(report).unwrap(),
+            MARK
+        ));
     }
 }

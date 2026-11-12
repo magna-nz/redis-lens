@@ -70,6 +70,34 @@ pub async fn connect(
     auth.open(&route, &profile.endpoint).await
 }
 
+/// Open the Pub/Sub live tail's own connection to the profile's endpoint (never a
+/// replica): like [`connect`], through the same route and credentials (SSH, TLS, token
+/// command and Entra ID included), but speaking RESP3, so `SUBSCRIBE` and `PSUBSCRIBE`
+/// work on a multiplexed connection. What the server pushes (messages, subscribe
+/// confirmations, and a `Disconnection` when the connection is lost) arrives on the
+/// returned receiver.
+///
+/// Errors never contain the password or token, as for [`connect`]. A server that refuses
+/// RESP3 fails with [`redis::ErrorKind::RESP3NotSupported`].
+pub async fn open_subscriber(
+    profile: &Profile,
+    secrets: &dyn SecretStore,
+) -> Result<
+    (
+        Connection,
+        tokio::sync::mpsc::UnboundedReceiver<redis::PushInfo>,
+    ),
+    ConnError,
+> {
+    let route = Route::for_profile(profile, secrets).await?;
+    let mut auth = ResolvedAuth::new(profile, secrets).await?;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    auth.settings = auth.settings.set_protocol(redis::ProtocolVersion::RESP3);
+    auth.config = auth.config.set_push_sender(tx);
+    let conn = auth.open(&route, &profile.endpoint).await?;
+    Ok((conn, rx))
+}
+
 /// How connections reach servers: directly, or through the profile's SSH bastion.
 pub enum Route {
     Direct,

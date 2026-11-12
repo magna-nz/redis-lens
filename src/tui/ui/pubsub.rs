@@ -1,23 +1,29 @@
 //! Draws [`PubSubState`]. Owner: wave B, with `views/pubsub.rs`.
 //!
-//! The active channels with how many clients subscribe to each, and the totals below.
-//! Counts only: no payload is ever read.
+//! Before any subscription: the active channels with how many clients subscribe to each,
+//! and the totals below. Once the live tail started: the channels on the left and the
+//! tail on the right (TIME · CHANNEL · MESSAGE), newest at the bottom. Every server
+//! string drawn here, channel names included, goes through [`value::escape`] or
+//! [`value::preview`].
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 
 use crate::format;
-use crate::live::pubsub::MAX_CHANNELS;
+use crate::live::pubsub::{MAX_CHANNELS, TAIL_KEPT};
 use crate::tui::app::views::Ctx;
-use crate::tui::app::views::pubsub::PubSubState;
+use crate::tui::app::views::pubsub::{PubSubState, Tail, TailRow, TailStatus};
+use crate::value;
 
 use super::streams::live_wait;
-use super::widgets::{bar, fit, pad_l, pad_r, panel, rows, scroll_offset};
+use super::widgets::{bar, fit, pad_l, pad_r, panel, rows, scroll_offset, width};
 use super::{notice_panels, split_body, style};
 
 const SUBS_W: usize = 6;
 const BAR_W: usize = 16;
+/// `HH:MM:SS.mmm`
+const TIME_W: usize = 12;
 
 /// Draws the screen `ctx.screen` of this view into `area`, the body between the
 /// header and the key bar.
@@ -29,6 +35,19 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
             style::amber(),
         ))];
         notice_panels(frame, area, TITLE, "off", lines);
+        return;
+    }
+    if state.tail.status != TailStatus::None {
+        // The channels on the left, the tail on the right.
+        let left = if area.width >= 120 {
+            36
+        } else {
+            (area.width * 2 / 7).clamp(20, 30)
+        };
+        let [chans, tail] =
+            Layout::horizontal([Constraint::Length(left), Constraint::Min(0)]).areas(area);
+        channels_narrow(frame, chans, state, ctx);
+        draw_tail(frame, tail, &state.tail);
         return;
     }
     if !state.loaded {
@@ -73,11 +92,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
         ));
     }
     rows(frame, inner, vec![Line::from(head)], None);
-    let body = Rect {
-        y: inner.y + 1,
-        height: inner.height.saturating_sub(1),
-        ..inner
-    };
+    let body = below_header(inner);
     let sel = state.sel.min(c.channels.len() - 1);
     let off = scroll_offset(sel, usize::from(body.height));
     let max = c
@@ -92,7 +107,13 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
         .skip(off)
         .take(usize::from(body.height))
         .map(|ch| {
-            let mut spans = fit(vec![Span::styled(format!(" {}", ch.name), style::fg())], kw);
+            let mut spans = fit(
+                vec![Span::styled(
+                    format!(" {}", value::escape(&ch.name)),
+                    style::fg(),
+                )],
+                kw,
+            );
             if let Some(n) = ch.subscribers {
                 let ratio = if max == 0 { 0.0 } else { n as f64 / max as f64 };
                 let (fill, track) = bar(ratio, BAR_W);
@@ -109,6 +130,273 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
         .collect();
     rows(frame, body, lines, Some(sel - off));
     totals(frame, detail, state);
+}
+
+/// `inner` without its first row (the column header).
+fn below_header(inner: Rect) -> Rect {
+    Rect {
+        y: inner.y + inner.height.min(1),
+        height: inner.height.saturating_sub(1),
+        ..inner
+    }
+}
+
+/// The channel list beside the tail: names and subscriber counts, no bars.
+fn channels_narrow(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
+    let c = &state.counts;
+    let mut right = String::new();
+    if state.paused {
+        right.push_str("paused · ");
+    }
+    if state.loaded {
+        right.push_str(&format::grouped(c.total_channels as u64));
+    }
+    let inner = panel(frame, area, "Channels", &right);
+    let w = usize::from(inner.width);
+    if !state.loaded || c.channels.is_empty() {
+        let text = if state.loaded {
+            " No active channels.".to_string()
+        } else {
+            format!(
+                " {}",
+                live_wait(ctx).unwrap_or_else(|| "Reading the channels…".into())
+            )
+        };
+        rows(
+            frame,
+            inner,
+            vec![Line::from(fit(vec![Span::styled(text, style::dim())], w))],
+            None,
+        );
+        return;
+    }
+    let has_counts = c.channels.iter().any(|ch| ch.subscribers.is_some());
+    let sw = if has_counts { SUBS_W + 1 } else { 0 };
+    let kw = w.saturating_sub(sw);
+    let mut head = vec![Span::styled(pad_r(" CHANNEL", kw), style::hd())];
+    if has_counts {
+        head.push(Span::styled(
+            format!(" {}", pad_l("SUBS", SUBS_W)),
+            style::hd(),
+        ));
+    }
+    rows(frame, inner, vec![Line::from(head)], None);
+    let body = below_header(inner);
+    let sel = state.sel.min(c.channels.len() - 1);
+    let off = scroll_offset(sel, usize::from(body.height));
+    let lines: Vec<Line<'static>> = c
+        .channels
+        .iter()
+        .skip(off)
+        .take(usize::from(body.height))
+        .map(|ch| {
+            let mut spans = fit(
+                vec![Span::styled(
+                    format!(" {}", value::escape(&ch.name)),
+                    style::fg(),
+                )],
+                kw,
+            );
+            if let Some(n) = ch.subscribers {
+                spans.push(Span::styled(
+                    format!(" {}", pad_l(&format::grouped(n), SUBS_W)),
+                    style::fgb(),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    rows(frame, body, lines, Some(sel - off));
+}
+
+/// `HH:MM:SS.mmm`, UTC, of a receive stamp.
+pub fn clock(at_unix_ms: i64) -> String {
+    let ms = at_unix_ms.rem_euclid(86_400_000);
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        ms / 3_600_000,
+        ms / 60_000 % 60,
+        ms / 1_000 % 60,
+        ms % 1_000
+    )
+}
+
+/// Messages per second: one decimal under 10, whole numbers above.
+fn rate(r: f64) -> String {
+    if r < 10.0 {
+        format!("{r:.1}")
+    } else {
+        format::grouped(r.round() as u64)
+    }
+}
+
+/// The tail panel's title and the text on the right of its top border:
+/// `Subscribed: <channel or pattern>` and `<rate> msg/s · <kept> kept (last 2,000)`.
+/// When the right side would be cut in a panel `panel_w` wide, its last parts are left
+/// out instead, the pause first kept.
+fn tail_title(t: &Tail, panel_w: usize) -> (String, String) {
+    let verb = match t.status {
+        TailStatus::Subscribing => "Subscribing",
+        TailStatus::Live => "Subscribed",
+        _ => "Stopped",
+    };
+    let what = t.to.as_ref().map_or_else(String::new, |to| {
+        let name = value::escape(to.name());
+        if to.is_pattern() {
+            format!("pattern {name}")
+        } else {
+            name
+        }
+    });
+    let mut right = Vec::new();
+    if t.paused() {
+        right.push(format!(
+            "paused · {} new",
+            format::grouped(t.new_while_paused)
+        ));
+    }
+    if t.status == TailStatus::Live {
+        right.push(format!("{} msg/s", rate(t.rate)));
+    }
+    let kept = format::grouped(t.rows.len() as u64);
+    right.push(format!(
+        "{kept} kept (last {})",
+        format::grouped(TAIL_KEPT as u64)
+    ));
+    let title = format!("{verb}: {what}");
+    // What `panel` leaves for the right side: see `widgets::panel`.
+    let room = panel_w
+        .saturating_sub(4)
+        .saturating_sub(width(&title) + 4)
+        .saturating_sub(3);
+    let mut text = right.join(" · ");
+    if width(&text) > room {
+        *right.last_mut().expect("kept") = format!("{kept} kept");
+        text = right.join(" · ");
+        while width(&text) > room && right.len() > 1 {
+            right.pop();
+            text = right.join(" · ");
+        }
+    }
+    (title, text)
+}
+
+/// `text` wrapped at spaces into lines at most `w` wide (a word longer than that is
+/// cut by the caller's `fit`).
+fn wrap(text: &str, w: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        if !line.is_empty() && width(&line) + 1 + width(word) > w {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    out.push(line);
+    out
+}
+
+fn draw_tail(frame: &mut Frame, area: Rect, t: &Tail) {
+    let (title, right) = tail_title(t, usize::from(area.width));
+    let inner = panel(frame, area, &title, &right);
+    let w = usize::from(inner.width);
+    let h = usize::from(inner.height);
+    if h == 0 {
+        return;
+    }
+    // Column widths: TIME, then CHANNEL, then the message takes the rest.
+    let cw = (w.saturating_sub(TIME_W + 3) / 4).clamp(8, 24);
+    let mw = w.saturating_sub(1 + TIME_W + 1 + cw + 1);
+    let mut lines = vec![Line::from(fit(
+        vec![Span::styled(
+            format!(
+                " {} {} MESSAGE",
+                pad_r("TIME (UTC)", TIME_W),
+                pad_r("CHANNEL", cw)
+            ),
+            style::hd(),
+        )],
+        w,
+    ))];
+
+    // What the tail says about itself, above the footnote.
+    let mut notes: Vec<Line<'static>> = Vec::new();
+    let shown_any = t.shown().next().is_some();
+    match &t.status {
+        TailStatus::Subscribing => notes.push(dim_line(
+            " Subscribing on a connection of its own…".into(),
+            w,
+        )),
+        TailStatus::Closed(why) => {
+            let text = format!("▲ The tail stopped: {why}.");
+            for (i, l) in wrap(&text, w.saturating_sub(3)).into_iter().enumerate() {
+                let indent = if i == 0 { " " } else { "   " };
+                notes.push(Line::from(fit(
+                    vec![Span::styled(format!("{indent}{l}"), style::amber())],
+                    w,
+                )));
+            }
+        }
+        TailStatus::Live if t.listed() == 0 => {
+            notes.push(dim_line(" Waiting for messages…".into(), w));
+        }
+        TailStatus::Stopped if t.listed() == 0 => notes.push(dim_line(
+            " The tail is stopped. enter or s subscribes again.".into(),
+            w,
+        )),
+        _ => {}
+    }
+    if !t.filter.is_empty() && !shown_any && t.listed() > 0 {
+        notes.push(dim_line(" No message matches the filter.".into(), w));
+    }
+
+    let mut foot = String::from(" ");
+    if !t.filter.is_empty() {
+        let n = t.shown().count();
+        foot.push_str(&format!(
+            "/ {} · {} of {} · ",
+            value::escape(&t.filter),
+            format::grouped(n as u64),
+            format::grouped(t.listed() as u64)
+        ));
+    }
+    if t.dropped > 0 {
+        foot.push_str(&format!(
+            "{} skipped, too many at once · ",
+            format::grouped(t.dropped)
+        ));
+    }
+    foot.push_str("Messages are shown, never saved.");
+
+    let room = h.saturating_sub(1 + notes.len() + 1);
+    let mut last: Vec<&TailRow> = t.shown().rev().take(room).collect();
+    last.reverse();
+    for r in last {
+        let ch = value::escape(&r.msg.channel);
+        lines.push(Line::from(fit(
+            vec![
+                Span::styled(format!(" {} ", clock(r.msg.at_unix_ms)), style::dim()),
+                Span::styled(pad_r(&ch, cw), style::fg()),
+                Span::raw(" "),
+                Span::styled(r.preview().to_string(), style::fgb()),
+            ],
+            1 + TIME_W + 1 + cw + 1 + mw,
+        )));
+    }
+    lines.extend(notes);
+    // The footnote sits on the last row.
+    while lines.len() + 1 < h {
+        lines.push(Line::default());
+    }
+    lines.push(dim_line(foot, w));
+    rows(frame, inner, lines, None);
+}
+
+fn dim_line(text: String, w: usize) -> Line<'static> {
+    Line::from(fit(vec![Span::styled(text, style::dim())], w))
 }
 
 fn totals(frame: &mut Frame, area: Rect, state: &PubSubState) {
@@ -150,16 +438,19 @@ fn totals(frame: &mut Frame, area: Rect, state: &PubSubState) {
     ];
     if let Some(ch) = c.channels.get(state.sel) {
         lines.push(Line::default());
-        lines.push(Line::from(vec![
-            label("Selected"),
-            Span::styled(ch.name.clone(), style::fg()),
-            Span::styled(
-                ch.subscribers.map_or_else(String::new, |n| {
-                    format!("  ·  {} subscribers", format::grouped(n))
-                }),
-                style::dim(),
-            ),
-        ]));
+        lines.push(Line::from(fit(
+            vec![
+                label("Selected"),
+                Span::styled(value::escape(&ch.name), style::fg()),
+                Span::styled(
+                    ch.subscribers.map_or_else(String::new, |n| {
+                        format!("  ·  {} subscribers", format::grouped(n))
+                    }),
+                    style::dim(),
+                ),
+            ],
+            w,
+        )));
     }
     for note in &c.notes {
         lines.push(Line::from(fit(
@@ -177,8 +468,35 @@ fn totals(frame: &mut Frame, area: Rect, state: &PubSubState) {
         )));
     }
     lines.push(Line::from(Span::styled(
-        " Counts only: message payloads are never read.",
+        " Counts read no payloads. enter or s starts a live tail.",
         style::dim(),
     )));
     rows(frame, inner, lines, None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clock_is_utc_with_milliseconds() {
+        assert_eq!(clock(0), "00:00:00.000");
+        // 2024-05-01 13:04:05.678 UTC
+        assert_eq!(clock(1_714_568_645_678), "13:04:05.678");
+        assert_eq!(clock(-1), "23:59:59.999");
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces() {
+        assert_eq!(wrap("a bb ccc", 4), ["a bb", "ccc"]);
+        assert_eq!(wrap("abcdef", 3), ["abcdef"]);
+        assert_eq!(wrap("", 3), [""]);
+    }
+
+    #[test]
+    fn rates_have_one_decimal_below_ten() {
+        assert_eq!(rate(0.0), "0.0");
+        assert_eq!(rate(3.24), "3.2");
+        assert_eq!(rate(1234.4), "1,234");
+    }
 }

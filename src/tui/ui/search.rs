@@ -1,22 +1,30 @@
 //! Draws [`SearchState`]. Owner: wave B, with `views/search.rs`.
 //!
-//! The indexes `FT._LIST` names, one row each, and the selected index's schema below.
-//! Figures the module does not return are left out, with the reason, never shown as
-//! errors.
+//! The indexes `FT._LIST` names, one row each, and the selected index's schema below,
+//! or the results of the query last run on it. Figures the module does not return are
+//! left out, with the reason, never shown as errors. One level deeper, over the whole
+//! body: a result's fields (the key detail's value panel), or the `FT.EXPLAIN` or
+//! `FT.PROFILE` text.
+//!
+//! Every server string is escaped before it is drawn: index names, prefixes, field
+//! names, keys, and (through the value renderer) values.
+
+use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use crate::format;
-use crate::live::search::{FieldInfo, IndexInfo};
+use crate::live::search::{Doc, FieldInfo, IndexInfo};
 use crate::model::ServerFlavor;
 use crate::tui::app::views::Ctx;
-use crate::tui::app::views::search::{Focus, SearchState};
+use crate::tui::app::views::search::{Cmd, Deeper, Focus, Outcome, QueryRun, SearchState};
+use crate::value::{self, escape};
 
 use super::streams::live_wait;
-use super::widgets::{fit, pad_l, pad_r, panel, rows, scroll_offset, trunc};
-use super::{notice_panels, split_body, style};
+use super::widgets::{fit, pad_l, pad_r, panel, rows, scroll_offset, trunc, width};
+use super::{notice_panels, spinner, split_body, style};
 
 const ON_W: usize = 5;
 const DOCS_W: usize = 7;
@@ -100,7 +108,15 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) {
         return;
     }
 
-    let (main, detail) = split_body(area);
+    if let Some(deeper) = &state.deeper {
+        draw_deeper(frame, area, state, deeper, ctx);
+        return;
+    }
+    let shown = state.shown_results();
+    let (main, detail) = match shown {
+        Some(_) => results_split(area, state.list.indexes.len()),
+        None => split_body(area),
+    };
     let list = &state.list;
     let cut = if list.total > list.indexes.len() {
         format!(" · first {} of {}", list.indexes.len(), list.total)
@@ -181,7 +197,315 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) {
             None,
         );
     }
-    detail_panel(frame, detail, state, name);
+    match shown {
+        Some(run) => results_panel(frame, detail, state, run, ctx),
+        None => detail_panel(frame, detail, state, name),
+    }
+}
+
+/// With results shown, the index list takes what it needs (at least 5 rows, at most
+/// half) and the results the rest.
+fn results_split(area: Rect, indexes: usize) -> (Rect, Rect) {
+    let h = usize::from(area.height);
+    let list_h = (indexes + 3).clamp(5, (h / 2).max(5)).min(h);
+    let list_h = u16::try_from(list_h).unwrap_or(area.height);
+    let main = Rect {
+        height: list_h,
+        ..area
+    };
+    let detail = Rect {
+        y: area.y + list_h,
+        height: area.height - list_h,
+        ..area
+    };
+    (main, detail)
+}
+
+/// `took` for the results line: `3 ms`, `<1 ms`.
+fn took_text(d: Duration) -> String {
+    match d.as_millis() {
+        0 => "<1 ms".to_string(),
+        n => format!("{} ms", format::grouped(n as u64)),
+    }
+}
+
+/// The query as typed, escaped, on one line.
+fn query_text(q: &str) -> String {
+    escape(q)
+}
+
+/// What the keys of the results do, leaving out the commands the server lacks.
+fn results_keys(state: &SearchState) -> String {
+    let mut parts = vec!["/ query", "enter open"];
+    if state.off_reason(Cmd::Explain).is_none() {
+        parts.push("e explain");
+    }
+    if state.off_reason(Cmd::Profile).is_none() {
+        parts.push("P profile");
+    }
+    parts.join(" · ")
+}
+
+/// A one-line preview of a result's first fields: `name=value name=value`.
+fn fields_preview(doc: &Doc, w: usize, memo: &value::Memo) -> String {
+    let mut out = String::new();
+    for (name, v) in doc.fields.iter().take(4) {
+        if width(&out) >= w {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&super::value::name_text(name.as_bytes()));
+        out.push('=');
+        out.push_str(&memo.preview(v, w.max(1)));
+    }
+    trunc(&out, w)
+}
+
+fn results_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &SearchState,
+    run: &QueryRun,
+    ctx: &Ctx<'_>,
+) {
+    let focused = state.focus == Focus::Schema;
+    let hint = if focused {
+        "↑↓ select · tab back"
+    } else {
+        "tab: results"
+    };
+    let what = if run.cmd == Cmd::Profile {
+        format!("Results · {} · FT.PROFILE", escape(&run.index))
+    } else {
+        format!("Results · {}", escape(&run.index))
+    };
+    let inner = panel(frame, area, &what, hint);
+    let w = usize::from(inner.width);
+    let h = usize::from(inner.height);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let q = query_text(&run.query);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let results = match &run.outcome {
+        Outcome::Running => {
+            lines.push(Line::from(fit(
+                vec![Span::styled(
+                    format!(" {} Running {} {q}…", spinner(ctx.tick), run.cmd.name()),
+                    style::dim(),
+                )],
+                w,
+            )));
+            rows(frame, inner, lines, None);
+            return;
+        }
+        Outcome::Failed(why) => {
+            lines.push(Line::from(fit(
+                vec![
+                    Span::styled(" query ", style::dim()),
+                    Span::styled(q, style::fg()),
+                ],
+                w,
+            )));
+            for l in wrap_text(&format!(" ✗ {why}"), w) {
+                lines.push(Line::from(fit(vec![Span::styled(l, style::warn())], w)));
+            }
+            lines.push(Line::from(fit(
+                vec![Span::styled(
+                    " Press / to change the query.".to_string(),
+                    style::dim(),
+                )],
+                w,
+            )));
+            rows(frame, inner, lines, None);
+            return;
+        }
+        Outcome::Done(r) => r,
+    };
+    let n = results.docs.len();
+    let count = if results.total as usize > n {
+        format!(
+            "{} of {} results",
+            format::grouped(n as u64),
+            format::grouped(results.total)
+        )
+    } else {
+        format!(
+            "{} result{}",
+            format::grouped(results.total),
+            if results.total == 1 { "" } else { "s" }
+        )
+    };
+    lines.push(Line::from(fit(
+        vec![
+            Span::styled(" query ", style::dim()),
+            Span::styled(q, style::fgb()),
+            Span::styled(
+                format!(" · {count} · {}", took_text(results.took)),
+                style::dim(),
+            ),
+        ],
+        w,
+    )));
+    let kw = (w * 35 / 100).clamp(10, 40);
+    let fw = w.saturating_sub(kw + 2);
+    lines.push(Line::from(vec![
+        Span::styled(pad_r(" KEY", kw + 1), style::hd()),
+        Span::styled(pad_r("FIELDS", fw), style::hd()),
+    ]));
+    let first = lines.len();
+    // One row at the bottom for the keys.
+    let room = h.saturating_sub(first + 1);
+    let sel = state.result_sel.min(n.saturating_sub(1));
+    let off = scroll_offset(sel, room);
+    if n == 0 {
+        lines.push(Line::from(Span::styled(
+            " No documents match the query.",
+            style::dim(),
+        )));
+    }
+    for d in results.docs.iter().skip(off).take(room) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                pad_r(&format!(" {}", trunc(&escape(&d.key), kw)), kw + 1),
+                style::fg(),
+            ),
+            Span::styled(pad_r(&fields_preview(d, fw, &state.memo), fw), style::dim()),
+        ]));
+    }
+    let selected = (focused && n > 0).then(|| sel - off + first);
+    let keys_row = Rect {
+        y: inner.y + inner.height - 1,
+        height: 1,
+        ..inner
+    };
+    let body = Rect {
+        height: inner.height - 1,
+        ..inner
+    };
+    rows(frame, body, lines, selected);
+    rows(
+        frame,
+        keys_row,
+        vec![Line::from(fit(
+            vec![Span::styled(
+                format!(" {}", results_keys(state)),
+                style::dim(),
+            )],
+            w,
+        ))],
+        None,
+    );
+}
+
+/// `text` in lines at most `w` cells wide, broken at spaces. Its leading spaces start
+/// the first line; the others are indented two more, past the `✗`.
+fn wrap_text(text: &str, w: usize) -> Vec<String> {
+    let body = text.trim_start_matches(' ');
+    let indent = " ".repeat(text.len() - body.len());
+    let more = format!("{indent}  ");
+    let mut out: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in body.split(' ') {
+        let lead = if out.is_empty() { &indent } else { &more };
+        let candidate = if line.is_empty() {
+            format!("{lead}{word}")
+        } else {
+            format!("{line} {word}")
+        };
+        if width(&candidate) > w && !line.is_empty() {
+            out.push(line);
+            line = format!("{more}{word}");
+        } else {
+            line = candidate;
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
+/// One level deeper, over the whole body: a result's fields, or an explain or profile.
+fn draw_deeper(frame: &mut Frame, area: Rect, state: &SearchState, deeper: &Deeper, ctx: &Ctx<'_>) {
+    match deeper {
+        Deeper::Document(doc) => {
+            let key = doc.row.as_ref().map_or("", |r| r.key.as_str());
+            let n = doc.loaded();
+            let mut right = Vec::new();
+            if let Some(raw) = doc.format_source() {
+                let d = doc.memo.decode(raw);
+                right.push(doc.shown_format(&d).label().to_string());
+            }
+            right.push(format!(
+                "{} field{}",
+                format::grouped(n as u64),
+                if n == 1 { "" } else { "s" }
+            ));
+            right.push("esc back".to_string());
+            let title = format!("Result · {}", escape(key));
+            super::value::draw_value_panel(frame, area, doc, ctx, &title, Some(&right.join(" · ")));
+        }
+        Deeper::Text {
+            cmd,
+            index,
+            query,
+            text,
+        } => {
+            let what = match cmd {
+                Cmd::Profile => "Profile",
+                _ => "Explain",
+            };
+            let title = format!("{what} · {}", escape(index));
+            let inner = panel(frame, area, &title, "↑↓ scroll · esc back");
+            let w = usize::from(inner.width);
+            if w == 0 || inner.height == 0 {
+                return;
+            }
+            let mut lines = vec![Line::from(fit(
+                vec![
+                    Span::styled(format!(" {} ", cmd.name()), style::dim()),
+                    Span::styled(query_text(query), style::fgb()),
+                ],
+                w,
+            ))];
+            match text {
+                Outcome::Running => {
+                    lines.push(Line::from(Span::styled(
+                        format!(" {} Waiting for the answer…", spinner(ctx.tick)),
+                        style::dim(),
+                    )));
+                    state.text_drawn.set(0, 0);
+                    rows(frame, inner, lines, None);
+                }
+                Outcome::Failed(why) => {
+                    for l in wrap_text(&format!(" ✗ {why}"), w) {
+                        lines.push(Line::from(fit(vec![Span::styled(l, style::warn())], w)));
+                    }
+                    state.text_drawn.set(0, 0);
+                    rows(frame, inner, lines, None);
+                }
+                Outcome::Done(t) => {
+                    let height = usize::from(inner.height).saturating_sub(1);
+                    state.text_drawn.set(t.len(), height);
+                    let max = t.len().saturating_sub(height);
+                    let off = state.text_scroll.min(max);
+                    if t.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            " The server returned nothing.",
+                            style::dim(),
+                        )));
+                    }
+                    lines.extend(t.lines().iter().skip(off).take(height).map(|l| {
+                        Line::from(fit(vec![Span::styled(format!(" {l}"), style::fg())], w))
+                    }));
+                    rows(frame, inner, lines, None);
+                }
+            }
+        }
+    }
 }
 
 fn progress_cell(i: &IndexInfo) -> (String, bool) {
@@ -196,13 +520,19 @@ fn progress_cell(i: &IndexInfo) -> (String, bool) {
 
 fn list_row(i: &IndexInfo, nw: usize, pw: usize, shown: [bool; 3]) -> Line<'static> {
     let dash = || "—".to_string();
-    let mut spans = fit(vec![Span::styled(format!(" {}", i.name), style::fg())], nw);
+    let mut spans = fit(
+        vec![Span::styled(format!(" {}", escape(&i.name)), style::fg())],
+        nw,
+    );
     spans.extend(fit(
-        vec![Span::styled(i.prefixes.join(", "), style::ph())],
+        vec![Span::styled(escape(&i.prefixes.join(", ")), style::ph())],
         pw,
     ));
     spans.push(Span::styled(
-        format!(" {}", pad_r(i.on.as_deref().unwrap_or("—"), ON_W - 1)),
+        format!(
+            " {}",
+            pad_r(&escape(i.on.as_deref().unwrap_or("—")), ON_W - 1)
+        ),
         style::dim(),
     ));
     spans.push(Span::styled(
@@ -274,9 +604,9 @@ fn detail_panel(frame: &mut Frame, area: Rect, state: &SearchState, module: &str
     let hint = if focused {
         "↑↓ select · tab back"
     } else {
-        "tab: schema"
+        "tab: schema · / query"
     };
-    let inner = panel(frame, area, &i.name, hint);
+    let inner = panel(frame, area, &escape(&i.name), hint);
     let w = usize::from(inner.width);
     let dash = || "—".to_string();
     let info_read = i.docs.is_some() || !i.schema.is_empty() || i.on.is_some();
@@ -293,13 +623,13 @@ fn detail_panel(frame: &mut Frame, area: Rect, state: &SearchState, module: &str
     lines.push(Line::from(fit(
         vec![
             Span::styled(" indexes ", style::dim()),
-            Span::styled(i.on.clone().unwrap_or_else(dash), style::fgb()),
+            Span::styled(i.on.as_deref().map_or_else(dash, escape), style::fgb()),
             Span::styled(" · prefixes ", style::dim()),
             Span::styled(
                 if i.prefixes.is_empty() {
                     "none (every key)".to_string()
                 } else {
-                    i.prefixes.join(", ")
+                    escape(&i.prefixes.join(", "))
                 },
                 style::ph(),
             ),
@@ -382,12 +712,12 @@ fn field_line(f: &FieldInfo, fw: usize) -> Line<'static> {
     let path = if f.identifier == f.name {
         String::new()
     } else {
-        f.identifier.clone()
+        escape(&f.identifier)
     };
     Line::from(vec![
-        Span::styled(pad_r(&format!(" {}", f.name), fw), style::fg()),
+        Span::styled(pad_r(&format!(" {}", escape(&f.name)), fw), style::fg()),
         Span::styled(pad_r(&trunc(&path, fw - 1), fw), style::ph()),
-        Span::styled(pad_r(&f.ty, 9), style::fgb()),
-        Span::styled(f.flags.join(" "), style::dim()),
+        Span::styled(pad_r(&escape(&f.ty), 9), style::fgb()),
+        Span::styled(escape(&f.flags.join(" ")), style::dim()),
     ])
 }
