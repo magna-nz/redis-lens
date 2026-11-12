@@ -72,9 +72,7 @@ fn perms_stats_denied() -> PermissionReport {
     let mut p = fixtures::perms_ok();
     p.checks.push(PermCheck {
         label: PERM_MEMORY_STATS,
-        status: PermStatus::Denied(
-            "NOPERM this user has no permissions to run the 'memory|stats' command".into(),
-        ),
+        status: PermStatus::Denied("NOPERM MEMORY STATS is not allowed for this user".into()),
     });
     p
 }

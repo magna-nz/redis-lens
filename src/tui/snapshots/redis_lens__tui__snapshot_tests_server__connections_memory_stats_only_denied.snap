@@ -34,7 +34,7 @@ expression: t.backend()
 "│ Auth        password or ACL user                                       ✓ MEMORY USAGE                                │"
 "│ Credential  OS keychain                                                ✓ OBJECT FREQ                                 │"
 "│ TLS         on                                                         ✓ INFO                                        │"
-"│ Writes      off (production default)                                   ✗ MEMORY STATS  NOPERM this user has no permi…│"
+"│ Writes      off (production default)                                   ✗ MEMORY STATS  NOPERM MEMORY STATS is not al…│"
 "│ ▲ MEMORY STATS is denied, so Patterns can't say how much of dataset.bytes the sample explains.                       │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 " ↑↓ Move   enter Connect   a Add   r Rescan Docker   0-6 View   ? Help   q Quit                                         "

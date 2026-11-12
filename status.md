@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** v0.2 done on main; waves 6-8 merged (PRs #10-#12); the quick wins (feature ideas 1-7) in progress; then v0.3 (cluster) or the bigger bets below
-**Last updated:** 2026-11-12 (Redis Insight parity: phases 1-3 approved, spec.md updated, TUI design mockup; nothing built yet)
+**Last updated:** 2026-11-12 (Redis Insight parity: phase 1 wave A built and verified; wave B, the views' contents, starting)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -346,7 +346,17 @@ A gap matrix against Redis Insight v3.8.0, with a three-phase roadmap, is in [do
   - the stale `MONITOR` "planned for v0.2" line is fixed;
   - CLAUDE.md rule 2 now says read-only profiles (the `prod` default) never write, and every write goes through the one write gate.
 - **TUI design mockup**, 14 screens: https://claude.ai/artifact/2RzWTZFKwJASgtX3phxKfG (private to the owner).
-- **Nothing is built.** Next: propose the phase 1 build wave (agents, models, file ownership) for approval. Phase 1 starts with the shared command limiter and the `View` and keymap changes, because every other view depends on them.
+- **Phase 1, wave A: done** (on branch `claude/redis-insight-tui-features-60db8f`, not yet in a PR):
+  - contract `26a34eb`: `Budget`, `live` request and reply types, the new `Effect` and `Msg` variants;
+  - A1 (merged `20e8084`): the shared command budget (`src/budget.rs`) used by the scan and the live views, the live connection kept open after a scan (`src/live/`), the five view probes (`conn::check_view_permissions`), and the runner wiring;
+  - A2 (merged `3f01132`): seven views with panels and drill-down, the `ViewState` interface (`src/tui/views/`), the key table, the header write state and the WRITES column;
+  - verified by V-A (approve, no blockers); then step 0 fixed what it noted:
+    - a scan's batch no longer waits its slot plus its round trip;
+    - pasted text's effects are run;
+    - a new connect forgets the last connect's checks, and the view on screen is told when a check turns it off or on;
+    - a refused scan check reads fixed text instead of the server's, which named the ACL user (rule 1; older than this work).
+  - Not done: the 5 view probes don't take from the budget (5 commands per connect), and the key bar shows the ready keys while a connect runs.
+- **Phase 1, wave B: next.** Server (B1), Patterns key list and Analysis (B2), Streams, Pub/Sub and Search (B3), each in its own session and worktree, then verifier V-B and one PR to `main`.
 - **Design corrections found while writing the spec:**
   - A stream doesn't store its `MAXLEN`, so Streams shows the age of the oldest entry and an `unbounded` verdict instead of a cap.
   - A pattern's glob can match keys of other patterns, so the key list and bulk actions keep only keys that infer to the selected pattern.

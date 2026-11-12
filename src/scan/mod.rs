@@ -1308,7 +1308,7 @@ mod tests {
         // Denied by the permission check: not sent, and the reason is kept.
         for (status, gap) in [
             (
-                PermStatus::Denied("NOPERM User lens-ro has no permissions".into()),
+                PermStatus::Denied("NOPERM MEMORY STATS is not allowed for this user".into()),
                 ContextGap::MemoryStatsDenied,
             ),
             (

@@ -139,10 +139,7 @@ pub fn perms_memory_denied() -> PermissionReport {
             check(PERM_TYPE_TTL, PermStatus::Allowed),
             check(
                 PERM_MEMORY,
-                PermStatus::Denied(
-                    "NOPERM User lens-limited has no permissions to run the 'memory|usage' command"
-                        .into(),
-                ),
+                PermStatus::Denied("NOPERM MEMORY USAGE is not allowed for this user".into()),
             ),
             check(
                 PERM_FREQ,
@@ -647,10 +644,7 @@ pub fn perms_freq_denied() -> PermissionReport {
     let mut p = perms_ok();
     for c in &mut p.checks {
         if c.label == PERM_FREQ {
-            c.status = PermStatus::Denied(
-                "NOPERM User lens-limited has no permissions to run the 'object|freq' command"
-                    .into(),
-            );
+            c.status = PermStatus::Denied("NOPERM OBJECT FREQ is not allowed for this user".into());
         }
     }
     p
@@ -674,10 +668,7 @@ pub fn perms_probes_off() -> PermissionReport {
     let mut p = perms_with_probes();
     for c in &mut p.checks {
         if c.label == PROBE_SLOWLOG {
-            c.status = PermStatus::Denied(
-                "NOPERM User lens-limited has no permissions to run the 'slowlog|len' command"
-                    .into(),
-            );
+            c.status = PermStatus::Denied("NOPERM SLOWLOG LEN is not allowed for this user".into());
         } else if c.label == PROBE_FT_LIST {
             c.status = PermStatus::Skipped("no Search module".into());
         }

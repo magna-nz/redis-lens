@@ -26,7 +26,7 @@ Until the write phase lands, redis-lens writes nothing to a server.
 
 ## Views
 
-The TUI has five views, switched with `0` to `4` (planned: seven views, see [Navigation](#navigation)). The keys are listed in [Keys](#keys) and in the `?` overlay; both, and the key bar at the bottom of the screen, come from one table in `src/tui/keymap.rs`. Every list view moves with `↑↓` (`j` `k`), `PgUp` `PgDn` (one page: as many rows as the list shows on screen, at least one; it stops at the first and last row) and `Home` `End` (`g` `G`). Narrow terminals never wrap: names are shortened with `…`. On the Patterns view, when the pattern column would get narrower than 12 cells, columns are hidden in this order: the share bar (the share percentage stays), then Δ, then the average size. Only when all three are hidden is a row too wide for the terminal cut at the right edge. Other views cut a row too wide at the right edge. On the selected row, text that doesn't fit its column scrolls across: it rests for 1 s, scrolls about 5 columns a second until its end is visible, holds 1 s and starts again. On the Patterns view only the name scrolls; the tree indent and the `▾`/`▸` mark stay in place. Selecting a different row, switching views or starting a new scan run restarts it; the same row moving to another position does not.
+The TUI has seven views, switched with `0` to `6`, some with panels ([Navigation](#navigation)). TTL, Diff and Hot keys, described below, are panels of 2 Analysis. What the other views and panels show is in [Browsing, server views and writes](#browsing-server-views-and-writes-planned); until it is built they say so. The keys are listed in [Keys](#keys) and in the `?` overlay; both, and the key bar at the bottom of the screen, come from one table in `src/tui/keymap.rs`. Every list view moves with `↑↓` (`j` `k`), `PgUp` `PgDn` (one page: as many rows as the list shows on screen, at least one; it stops at the first and last row) and `Home` `End` (`g` `G`). Narrow terminals never wrap: names are shortened with `…`. On the Patterns view, when the pattern column would get narrower than 12 cells, columns are hidden in this order: the share bar (the share percentage stays), then Δ, then the average size. Only when all three are hidden is a row too wide for the terminal cut at the right edge. Other views cut a row too wide at the right edge. On the selected row, text that doesn't fit its column scrolls across: it rests for 1 s, scrolls about 5 columns a second until its end is visible, holds 1 s and starts again. On the Patterns view only the name scrolls; the tree indent and the `▾`/`▸` mark stay in place. Selecting a different row, switching views or starting a new scan run restarts it; the same row moving to another position does not.
 
 ### 0 Connections
 - Lists saved profiles and the Redis or Valkey containers found in Docker.
@@ -249,13 +249,13 @@ The key bar shows the main keys of the current screen, from this table: Connecti
 
 ### Rescan
 
-`r` on views 1-4 scans the shown connection again as a new run, the same way `enter` connects it (same scan options, rate limit and read-only rules; the connection's current profile and credential source). It works when the scan has finished or failed. While a connect or scan is running it only says "A scan is already running"; with no connection yet it says to connect first. On Connections `r` still looks for Docker containers again.
+`r` on Patterns (its key list included) and on every panel of Analysis scans the shown connection again as a new run, the same way `enter` connects it (same scan options, rate limit and read-only rules; the connection's current profile and credential source). It works when the scan has finished or failed. While a connect or scan is running it only says "A scan is already running"; with no connection yet it says to connect first. On Connections `r` still looks for Docker containers again. On Server, Streams, Pub/Sub and Search `r` fetches the panel on screen again instead of scanning.
 
 A rescan keeps the view, the Patterns filter, collapsed groups, sort and selected row, and the TTL, Diff and Hot keys selections (moved to the last row if the new results are shorter). The previous results stay on every view, marked `rescanning · previous results` at the start of the panel title, until the new run's first partial results arrive. From then on Patterns shows the partial results (the selection follows its row) and TTL, Diff and Hot keys wait for the finished scan. If the rescan fails before any results of its own, the error is shown and the previous results stay, marked `rescan failed · previous results`. If it fails after partial results it behaves like any failed scan. While a rescan runs, `s` says to wait for it to finish; it never saves partial results and does not save the previous results again. Results, partials and progress of the replaced run are ignored. The one exception is the replaced run's snapshot lookup, which still fills in the Diff of its own report while that report is on screen. A slow keychain read during a rescan shows the keychain hint in the status line.
 
 ### Copy
 
-`y` copies the selected row's pattern: a group row copies its label, such as `user:{id}:*`; on Hot keys it copies the key name. `Y` copies the suggested command `redis-cli --scan --pattern "<glob>"` for that pattern (on Hot keys, the key's pattern), the same text as the `$` line in the detail panel. Key names are chosen by whoever writes keys, and no one quoting style is safe in every shell (POSIX shells, fish, PowerShell, cmd.exe), so the command is only offered when every character of the glob is an ASCII letter or digit or one of `_ : . / * ? { } [ ] @ # + = , ~ - |`, none of which is special inside double quotes in any of them. For any other pattern the detail panel's command line says there is no command (without the `$ ` prompt) and `Y` says why; `y` still copies the pattern. `y` never copies text with control characters (a pasted newline would run what follows it) and says so. Only on Patterns, TTL, Diff and Hot keys; never on Connections or in the add flow or filter input. With nothing selected it says so.
+`y` copies the selected row's pattern: a group row copies its label, such as `user:{id}:*`; on Hot keys it copies the key name. `Y` copies the suggested command `redis-cli --scan --pattern "<glob>"` for that pattern (on Hot keys, the key's pattern), the same text as the `$` line in the detail panel. Key names are chosen by whoever writes keys, and no one quoting style is safe in every shell (POSIX shells, fish, PowerShell, cmd.exe), so the command is only offered when every character of the glob is an ASCII letter or digit or one of `_ : . / * ? { } [ ] @ # + = , ~ - |`, none of which is special inside double quotes in any of them. For any other pattern the detail panel's command line says there is no command (without the `$ ` prompt) and `Y` says why; `y` still copies the pattern. `y` never copies text with control characters (a pasted newline would run what follows it) and says so. Only on Patterns, TTL, Diff and Hot keys, and on Big keys and the key list, where `y` copies the key name; never on Connections or in the add flow or filter input. With nothing selected it says so.
 
 Copying uses the OSC 52 terminal sequence (no clipboard library), written to the terminal between frames, so it also works over SSH. Terminals without OSC 52 (macOS Terminal.app, for one) ignore it, and the terminal never confirms a copy, so the notice says "Copied <pattern|key|command> to the clipboard (needs a terminal with OSC 52)". Text whose sequence would be over 100,000 bytes is not sent ("too long to copy"). A write error is shown as an error notice. Only a pattern name, a key name or that command can be copied (the `CopyText` type has no other constructor), so credentials, connection strings and profiles never reach the clipboard.
 
@@ -356,6 +356,8 @@ Before scanning, redis-lens probes each command it needs once: `SCAN`, `TYPE`/`P
 - no LFU policy or no `OBJECT FREQ` means no hot keys
 - no `MEMORY STATS` means the server context has no `dataset.bytes` figures, and the Patterns strip says so
 
+A refused check reads "NOPERM <command> is not allowed for this user", never the server's own text, which names the ACL user. A connect checks again and forgets the last connect's results.
+
 A minimal read-only ACL user:
 
 ```
@@ -418,7 +420,7 @@ Snapshots also hold the server context (`server_context`); snapshots written bef
 
 ## Browsing, server views and writes (planned)
 
-Nothing in this section is built yet. Each phase lands with its own spec change: that change moves its text into the sections above, and updates the key table and `src/tui/keymap.rs` together. The phases are listed under [Milestones](#milestones); the tag after each heading or item says which phase it belongs to. The screens are drawn in the TUI design artifact linked there.
+Built so far, from phase 1: [Navigation](#navigation) (without the command line), the [Shared command budget](#shared-command-budget-p1) and the probes in [Permission check, additions](#permission-check-additions). The views and panels here show that they are not built yet. Each phase lands with its own spec change: that change moves its text into the sections above, and updates the key table and `src/tui/keymap.rs` together. The phases are listed under [Milestones](#milestones); the tag after each heading or item says which phase it belongs to. The screens are drawn in the TUI design artifact linked there.
 
 ### Navigation
 
@@ -439,7 +441,7 @@ Nothing in this section is built yet. Each phase lands with its own spec change:
 
 ### Shared command budget (P1)
 
-- **One limiter for everything:** every command a view sends goes through the profile's command budget ([Scanning](#scanning), rule 2), not only scans. That includes polls, key lists, values, the command line and writes. There is one limiter per connected profile.
+- **One limiter for everything:** every command a view sends goes through the profile's command budget ([Scanning](#scanning), rule 2), not only scans. That includes polls, key lists, values, the command line and writes. There is one limiter per connected profile. Each command, or batch, books the next slot of the profile's time line before it is sent; after an idle gap a slot may start in the past by at most its own length (at least 10 ms), so idle time never builds a burst bigger than one batch, and a scan's batch takes the longer of its slot and its round trip, not both.
 - **Polling views** poll only while they are on screen, and `p` pauses them:
   - Server Overview: `INFO` every 2 s (`+` and `-` change it, 1 to 60 s)
   - Clients: every 5 s
@@ -657,7 +659,7 @@ A write is sent only when all three checks allow it.
 
 ### Permission check, additions
 
-- **P1 probes:** `SLOWLOG LEN`, `CLIENT LIST ID <own id>`, `XINFO HELP`, `PUBSUB NUMPAT`, `FT._LIST`.
+- **P1 probes:** `SLOWLOG LEN`, `CLIENT LIST ID 9223372036854775807` (an ID no client has, so it lists nothing), `XINFO HELP`, `PUBSUB NUMPAT`, `FT._LIST`. A refused probe turns its view off, never the connection: only the checks in [Permission check](#permission-check) make it limited. A missing Search module (an unknown `FT._LIST`) reads as skipped, not refused.
 - **P2 probes:** `COMMAND DOCS GET`.
 - **P3 probes:** `ACL DRYRUN`, where it is allowed.
 - **Turning off:** each missing permission turns off its view or panel, with the reason (rule 3).

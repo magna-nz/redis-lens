@@ -31,7 +31,7 @@ expression: t.backend()
 "│ CONNECTION                                                             PERMISSION CHECK                              │"
 "│ Endpoint    staging-cache.internal:6379                                ✓ SCAN                                        │"
 "│ Server      Redis 7.2.5 · standalone                                   ✓ TYPE · TTL                                  │"
-"│ Auth        password or ACL user                                       ✗ MEMORY USAGE  NOPERM User lens-limited has …│"
+"│ Auth        password or ACL user                                       ✗ MEMORY USAGE  NOPERM MEMORY USAGE is not al…│"
 "│ Credential  OS keychain                                                – OBJECT FREQ   eviction policy is not LFU    │"
 "│ TLS         off                                                        ✓ INFO                                        │"
 "│ Writes      on (default outside production)                            – MEMORY STATS                                │"

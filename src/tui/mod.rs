@@ -140,7 +140,7 @@ async fn event_loop(
         tokio::select! {
             incoming = rx.recv() => match incoming {
                 Some(Incoming::Input(Event::Key(k))) => pending = app.handle_key(k),
-                Some(Incoming::Input(Event::Paste(s))) => app.handle_paste(s),
+                Some(Incoming::Input(Event::Paste(s))) => pending = app.handle_paste(s),
                 Some(Incoming::Input(_)) => {}
                 Some(Incoming::InputFailed(e)) => bail!("could not read terminal input: {e}"),
                 Some(Incoming::Msg(m)) => pending = app.apply(m),

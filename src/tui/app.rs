@@ -1165,6 +1165,17 @@ impl App {
         let Some(owner) = self.active_owner() else {
             return Vec::new();
         };
+        self.view_call(owner, what, f)
+    }
+
+    /// Calls `f`, the method named `what`, on `owner`'s view state, whether or not it
+    /// is working now.
+    fn view_call(
+        &mut self,
+        owner: Owner,
+        what: &'static str,
+        f: impl FnOnce(&mut dyn ViewState, &mut Act<'_>),
+    ) -> Vec<Effect> {
         self.with_views(owner, what, |v, act| f(v.get_mut(owner), act))
             .map_or_else(Vec::new, |(_, e)| e)
     }
@@ -1449,15 +1460,17 @@ impl App {
         }
     }
 
-    pub fn handle_paste(&mut self, text: String) {
+    /// Pasted text, from a bracketed paste. Returns the effects to run, like
+    /// [`App::handle_key`].
+    pub fn handle_paste(&mut self, text: String) -> Vec<Effect> {
         // The help overlay ignores everything but its own keys.
         if self.help {
-            return;
+            return Vec::new();
         }
         let text = clean_paste(&text);
         if let Some(add) = &mut self.add {
             if add.saving {
-                return;
+                return Vec::new();
             }
             let target = add.password.as_mut().unwrap_or(&mut add.input);
             let room = MAX_INPUT.saturating_sub(target.len());
@@ -1469,16 +1482,15 @@ impl App {
             p.filter.extend(text.chars().take(room));
             p.sel = 0;
         } else if self.view_input().is_some() {
-            // The runtime has no effects to run after a paste; a view sends from its
-            // next tick instead.
-            let _ = self.on_active("paste", |v, act| v.on_paste(&text, act));
+            return self.on_active("paste", |v, act| v.on_paste(&text, act));
         } else if self.view == View::Connections {
-            // Already on Connections: no view to hide, so no effects.
-            let _ = self.start_add();
+            let out = self.start_add();
             if let Some(add) = &mut self.add {
                 add.input = text.chars().take(MAX_INPUT).collect();
             }
+            return out;
         }
+        Vec::new()
     }
 
     fn start_add(&mut self) -> Vec<Effect> {
@@ -1675,6 +1687,11 @@ impl App {
             return Vec::new();
         };
         let server = self.entry(id).and_then(|e| e.server.clone());
+        // A new connect checks permissions again; until then no view is off because of
+        // what the last connect found.
+        if let Some(e) = self.entry_mut(id) {
+            e.perms = None;
+        }
         self.session = Some(Session {
             id,
             scan,
@@ -1920,6 +1937,9 @@ impl App {
                 let limited = perms.checks.iter().any(|c| {
                     PERM_LABELS.contains(&c.label) && matches!(c.status, PermStatus::Denied(_))
                 });
+                // The checks can turn the view on screen off, or back on (a rescan
+                // after an ACL change): tell it, as if it was switched away or to.
+                let before = self.active_owner();
                 if let Some(e) = self.entry_mut(id) {
                     e.status = if limited {
                         ConnStatus::Limited
@@ -1934,6 +1954,17 @@ impl App {
                     s.server = server;
                     s.target = Some(target);
                     s.phase = Phase::Scanning;
+                }
+                let after = self.active_owner();
+                if before != after {
+                    let mut out = Vec::new();
+                    if let Some(o) = before {
+                        out.extend(self.view_call(o, "hide", |v, act| v.on_hide(act)));
+                    }
+                    if let Some(o) = after {
+                        out.extend(self.view_call(o, "show", |v, act| v.on_show(act)));
+                    }
+                    return out;
                 }
             }
             Msg::ConnectFailed { id, scan, error } => {
@@ -5260,6 +5291,52 @@ mod tests {
             app.handle_key(ch('r'))[..],
             [Effect::Connect { .. }]
         ));
+    }
+
+    #[test]
+    fn a_rescan_whose_probe_changes_tells_the_view_on_screen() {
+        let (mut app, id) = scanned_with(fixtures::report(true), fixtures::perms_ok());
+        show(&mut app, Screen::SlowLog);
+        assert_eq!(app.active_owner(), Some(Owner::Server));
+        let connected = |app: &mut App, perms| {
+            let _ = app.rescan();
+            let scan = scan_of(app);
+            let out = app.apply(Msg::Connected {
+                id,
+                scan,
+                server: Some(fixtures::report(true).server),
+                perms,
+                target: ScanTarget::Primary,
+            });
+            app.apply(Msg::ScanDone {
+                id,
+                scan,
+                report: fixtures::report(true),
+            });
+            out
+        };
+        // The ACL changed: SLOWLOG is refused now, so the view is hidden.
+        let n = app.calls.len();
+        connected(&mut app, fixtures::perms_probes_off());
+        assert_eq!(app.active_owner(), None);
+        assert_eq!(calls_since(&app, n), [(Owner::Server, "hide")]);
+        // And allowed again: shown again.
+        let n = app.calls.len();
+        connected(&mut app, fixtures::perms_ok());
+        assert_eq!(app.active_owner(), Some(Owner::Server));
+        assert_eq!(calls_since(&app, n), [(Owner::Server, "show")]);
+        // Unchanged: nobody is told.
+        let n = app.calls.len();
+        connected(&mut app, fixtures::perms_ok());
+        assert!(calls_since(&app, n).is_empty());
+    }
+
+    #[test]
+    fn a_new_connect_forgets_the_last_connects_checks() {
+        let (mut app, id) = scanned_with(fixtures::report(true), fixtures::perms_probes_off());
+        assert!(app.entry(id).unwrap().perms.is_some());
+        let _ = app.connect(id);
+        assert!(app.entry(id).unwrap().perms.is_none());
     }
 
     #[test]

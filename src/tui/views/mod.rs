@@ -28,7 +28,10 @@
 //!   comes on screen (a digit, `tab`, `enter` from Patterns), after the switch, so
 //!   `act.screen` is the screen now shown. [`ViewState::on_hide`] runs before it goes
 //!   away, so `act.screen` is still the screen being hidden. Moving between two panels
-//!   of the same view hides one and shows the other.
+//!   of the same view hides one and shows the other. When a connect's permission
+//!   checks turn the screen on show off, its view gets `on_hide`; when they turn it
+//!   back on (a rescan after an ACL change), `on_show`. A new connect forgets the last
+//!   connect's checks, so until its own arrive no view is off.
 //! - **Keys.** `App` handles the keys that work everywhere (`0-6`, `?`, `a`, `q`), `tab`
 //!   and `shift-tab` on Analysis and Server (the panels), `r` (rescan on Analysis,
 //!   [`ViewState::refresh`] on Server, Streams, Pub/Sub and Search) and `s` (snapshot,
@@ -170,7 +173,8 @@ pub trait ViewState: fmt::Debug {
         None
     }
 
-    /// Pasted text, only while [`ViewState::input`] is `Some`.
+    /// Pasted text, only while [`ViewState::input`] is `Some`. [`Act::send`] and
+    /// [`Act::copy`] work here as they do in [`ViewState::on_key`].
     fn on_paste(&mut self, _text: &str, _act: &mut Act<'_>) {}
 }
 

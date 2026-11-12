@@ -5,16 +5,20 @@
 //! and returns when that slot ends. A booking starts where the previous one ended, so
 //! bookings never overlap and the commands of every caller together stay at or below
 //! `per_sec` on average, however many callers there are. After an idle gap a booking may
-//! start at most [`MAX_BACKDATE`] in the past: idle time does not build up a burst.
+//! start at most its own length, or [`MAX_BACKDATE`] if that is longer, in the past:
+//! idle time does not build up a burst of more than one booking. A caller that sends a
+//! batch after each `take` and waits for the reply therefore takes the longer of the
+//! batch's slot and the round trip per batch, not the sum of the two.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::time::Instant;
 
-/// How far in the past a booking may start after an idle gap. Covers the time between
-/// a caller's last slot ending and its next `take`, so a steady caller is not slowed
-/// down by its own work between commands, without letting idle time add up.
+/// How far in the past a booking may start after an idle gap, at least: a booking may
+/// also start as far back as its own length. Covers the time between a caller's last
+/// slot ending and its next `take`, so a steady caller is not slowed down by its own
+/// work between commands (a round trip, say), without letting idle time add up.
 pub const MAX_BACKDATE: Duration = Duration::from_millis(10);
 
 /// Commands per second for one connected profile. Everything that sends commands for
@@ -70,11 +74,12 @@ impl Budget {
                 return;
             };
             let now = Instant::now();
+            let len = slot(n, rate);
             let earliest = now
-                .checked_sub(MAX_BACKDATE)
+                .checked_sub(len.max(MAX_BACKDATE))
                 .map_or(self.created, |t| t.max(self.created));
             let start = s.next.max(earliest);
-            let end = start + slot(n, rate);
+            let end = start + len;
             s.next = end;
             end
         };
@@ -179,6 +184,36 @@ mod tests {
         let took = t0.elapsed();
         assert!(took >= Duration::from_millis(990), "{took:?}");
         assert!(took <= Duration::from_secs(1), "{took:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_round_trip_after_each_batch_is_not_added_to_the_slot() {
+        // A scan's batch: take 2,000 at 5,000/s (a 400 ms slot), then send it and wait
+        // for the reply. Each batch takes the longer of the slot and the round trip.
+        for (rtt_ms, per_batch_ms) in [(100u64, 400u64), (500, 500)] {
+            let b = Budget::new(Some(5_000));
+            let t0 = Instant::now();
+            for _ in 0..10 {
+                b.take(2_000).await;
+                tokio::time::sleep(Duration::from_millis(rtt_ms)).await;
+            }
+            // The first slot can't start before creation, so it waits its full 400 ms.
+            let want = Duration::from_millis(400 + rtt_ms + 9 * per_batch_ms);
+            assert_eq!(t0.elapsed(), want, "rtt {rtt_ms} ms");
+            assert_eq!(b.taken(), 20_000);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn after_idle_a_big_batch_may_go_at_once_but_only_one() {
+        let b = Budget::new(Some(5_000));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let t0 = Instant::now();
+        b.take(2_000).await;
+        assert_eq!(t0.elapsed(), Duration::ZERO);
+        // The next one waits its whole slot: the idle minute is not a bigger burst.
+        b.take(2_000).await;
+        assert_eq!(t0.elapsed(), Duration::from_millis(400));
     }
 
     #[tokio::test(start_paused = true)]

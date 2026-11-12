@@ -471,6 +471,7 @@ pub async fn connect_for_scan(
     let fallback = |c, why: String| Ok((c, ScanTarget::PrimaryFallback(why)));
     let info = match info_replication(&mut primary).await {
         Ok(i) => i,
+        Err(e) if is_noperm(&e) => return fallback(primary, noperm_text("INFO replication")),
         Err(e) => return fallback(primary, format!("INFO replication: {}", server_message(&e))),
     };
     match parse_replication(&info) {
@@ -535,6 +536,13 @@ fn is_noperm(e: &redis::RedisError) -> bool {
     e.kind() == redis::ErrorKind::Server(ServerErrorKind::NoPerm)
 }
 
+/// What a check shows when the ACL refuses `command`. Fixed text: the server's own
+/// `NOPERM` message names the ACL user (CLAUDE.md rule 1).
+pub(crate) fn noperm_text(command: &str) -> String {
+    format!("NOPERM {command} is not allowed for this user")
+}
+
+/// The server's error text, for errors other than `NOPERM` (which names the user).
 fn server_message(e: &redis::RedisError) -> String {
     match (e.code(), e.detail()) {
         (Some(c), Some(d)) => format!("{c} {d}"),
@@ -545,11 +553,12 @@ fn server_message(e: &redis::RedisError) -> String {
 }
 
 /// `missing_key`: the probe key does not exist, so a plain `ERR` (such as
-/// `ERR no such key`) says the command ran.
-fn classify(r: Result<(), redis::RedisError>, missing_key: bool) -> PermStatus {
+/// `ERR no such key`) says the command ran. A `NOPERM` reads [`noperm_text`] for
+/// `command`, never the server's text.
+fn classify(command: &str, r: Result<(), redis::RedisError>, missing_key: bool) -> PermStatus {
     match r {
         Ok(()) => PermStatus::Allowed,
-        Err(e) if is_noperm(&e) => PermStatus::Denied(server_message(&e)),
+        Err(e) if is_noperm(&e) => PermStatus::Denied(noperm_text(command)),
         Err(e)
             if missing_key
                 && e.kind() == redis::ErrorKind::Server(ServerErrorKind::ResponseError)
@@ -587,7 +596,11 @@ pub async fn check_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Permis
             Some(k) => (PermStatus::Allowed, k, false),
             None => (PermStatus::Allowed, PROBE_KEY.as_bytes().to_vec(), true),
         },
-        Err(e) => (classify(Err(e), false), PROBE_KEY.as_bytes().to_vec(), true),
+        Err(e) => (
+            classify("SCAN", Err(e), false),
+            PROBE_KEY.as_bytes().to_vec(),
+            true,
+        ),
     };
 
     // TYPE and PTTL
@@ -595,9 +608,9 @@ pub async fn check_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Permis
     let type_ttl = match ty {
         Ok(_) => {
             let r: Result<i64, _> = redis::cmd("PTTL").arg(&probe_key).query_async(conn).await;
-            classify(r.map(|_| ()), missing)
+            classify("PTTL", r.map(|_| ()), missing)
         }
-        Err(e) => classify(Err(e), missing),
+        Err(e) => classify("TYPE", Err(e), missing),
     };
 
     // MEMORY USAGE
@@ -606,14 +619,14 @@ pub async fn check_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Permis
         .arg(&probe_key)
         .query_async(conn)
         .await;
-    let memory = classify(mem.map(|_| ()), missing);
+    let memory = classify("MEMORY USAGE", mem.map(|_| ()), missing);
 
     // INFO memory
     let info: Result<String, _> = redis::cmd("INFO").arg("memory").query_async(conn).await;
     let (info_status, policy) = match info {
         Ok(text) => (PermStatus::Allowed, Ok(policy_from_info(&text))),
         Err(e) => {
-            let status = classify(Err(e), false);
+            let status = classify("INFO", Err(e), false);
             let why = match &status {
                 PermStatus::Denied(m) => m.clone(),
                 _ => String::new(),
@@ -635,14 +648,15 @@ pub async fn check_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Permis
                 .arg(&probe_key)
                 .query_async(conn)
                 .await;
-            classify(r.map(|_| ()), missing)
+            classify("OBJECT FREQ", r.map(|_| ()), missing)
         }
     };
 
     // MEMORY STATS: no key involved, so any error other than NOPERM (an unknown
-    // command on a managed service, say) is a denial with the server's reason.
+    // command on a managed service, say) is a denial with the server's reason. A NOPERM
+    // reads fixed text, since the server's names the user.
     let stats: Result<redis::Value, _> = redis::cmd("MEMORY").arg("STATS").query_async(conn).await;
-    let memory_stats = classify(stats.map(|_| ()), false);
+    let memory_stats = classify("MEMORY STATS", stats.map(|_| ()), false);
 
     let mut statuses = [
         (PERM_SCAN, scan_status),
@@ -695,9 +709,7 @@ fn classify_view_probe(
 ) -> PermStatus {
     match r {
         Ok(_) => PermStatus::Allowed,
-        Err(e) if is_noperm(&e) => {
-            PermStatus::Denied(format!("NOPERM {command} is not allowed for this user"))
-        }
+        Err(e) if is_noperm(&e) => PermStatus::Denied(noperm_text(command)),
         Err(e) if crate::live::is_unknown_command(&e) => {
             if label == PERM_SEARCH {
                 PermStatus::Skipped("the Search module is not loaded".to_string())
@@ -1088,14 +1100,18 @@ mod tests {
             "denied",
             "User x has no permissions".to_string(),
         ));
-        assert!(matches!(classify(Err(noperm), true), PermStatus::Denied(_)));
+        // Fixed text: the server's names the ACL user.
+        assert_eq!(
+            classify("MEMORY USAGE", Err(noperm), true),
+            PermStatus::Denied("NOPERM MEMORY USAGE is not allowed for this user".into())
+        );
         let nokey = redis::RedisError::from((
             redis::ErrorKind::Server(ServerErrorKind::ResponseError),
             "ERR",
             "no such key".to_string(),
         ));
-        assert_eq!(classify(Err(nokey), true), PermStatus::Allowed);
-        assert_eq!(classify(Ok(()), false), PermStatus::Allowed);
+        assert_eq!(classify("TYPE", Err(nokey), true), PermStatus::Allowed);
+        assert_eq!(classify("SCAN", Ok(()), false), PermStatus::Allowed);
     }
 
     fn ep(host: &str, port: u16, tls: bool) -> Endpoint {
