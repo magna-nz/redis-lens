@@ -33,6 +33,7 @@ mod server;
 mod streams;
 pub mod style;
 mod ttl;
+mod value;
 pub mod widgets;
 
 use widgets::{bar, panel, rows, trunc, width};
@@ -120,6 +121,7 @@ fn view_state(frame: &mut Frame, area: Rect, app: &App, screen: Screen) {
     let v = &app.views;
     match owner {
         Owner::Keys => keys::draw(frame, area, &v.keys, &ctx),
+        Owner::Value => value::draw(frame, area, &v.value, &ctx),
         Owner::Analysis => {
             if report_or_wait(frame, area, app, title).is_some() {
                 analysis::draw(frame, area, &v.analysis, &ctx);

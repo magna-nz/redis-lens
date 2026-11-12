@@ -1,5 +1,6 @@
 ---
 source: src/tui/snapshot_tests.rs
+assertion_line: 1562
 expression: "render(&app, 120, 36).backend()"
 ---
 " redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC "
@@ -28,13 +29,13 @@ expression: "render(&app, 120, 36).backend()"
 "│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 "┌─ prod-cache-01 ─────────────────────────────────────────────────────────────────────────────── PROD · saved profile ─┐"
-"│ CONNECTION                                                             PERMISSION CHECK                              │"
-"│ Endpoint    prod-cache-01.internal:6380                                ✓ SCAN · TYPE · TTL · MEMORY USAGE            │"
-"│ Server      Redis 7.4.2 · standalone                                   ✓ OBJECT FREQ · INFO                          │"
-"│ Auth        password or ACL user                                       – MEMORY STATS                                │"
-"│ Credential  OS keychain                                                ✗ SLOWLOG       refused, view off             │"
-"│ TLS         on                                                         ✓ CLIENT LIST · XINFO · PUBSUB                │"
-"│ Writes      off (production default)                                   – FT._LIST      no Search module              │"
+"│ Endpoint    prod-cache-01.internal:6380                                PERMISSION CHECK                              │"
+"│ Server      Redis 7.4.2 · standalone                                   ✓ SCAN · TYPE · TTL · MEMORY USAGE            │"
+"│ Auth        password or ACL user                                       ✓ OBJECT FREQ · INFO                          │"
+"│ Credential  OS keychain                                                – MEMORY STATS                                │"
+"│ TLS         on                                                         ✗ SLOWLOG       refused, view off             │"
+"│ Writes      off (production default)                                   ✓ CLIENT LIST · XINFO · PUBSUB                │"
+"│ Values      shown on screen, never saved                               – FT._LIST      no Search module              │"
 "│ ✓ The scan has every permission it needs. Views whose check failed are off.                                          │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 " ↑↓ Move   enter Connect   a Add   r Rescan Docker   0-6 View   ? Help   q Quit                                         "

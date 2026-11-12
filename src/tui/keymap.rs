@@ -163,13 +163,20 @@ static PATTERNS: [KeyHelp; 12] = [
     SNAPSHOT,
 ];
 
-static KEY_LIST: [KeyHelp; 8] = [
+static KEY_LIST: [KeyHelp; 9] = [
     MOVE,
     PAGE,
     ENDS,
     k("/", "/", "Filter", "Filter the loaded keys by name", true),
     k("o", "o", "Sort", "Sort the loaded keys", true),
     k("n", "n", "More", "Load 1,000 more keys", true),
+    k(
+        "enter",
+        "enter",
+        "Open",
+        "Show the selected key and its value",
+        false,
+    ),
     COPY_KEY,
     k(
         "esc",
@@ -178,6 +185,41 @@ static KEY_LIST: [KeyHelp; 8] = [
         "Clear the filter, or go back to Patterns",
         true,
     ),
+];
+
+static KEY_DETAIL: [KeyHelp; 8] = [
+    k(
+        "↑↓ j k",
+        "↑↓",
+        "Move",
+        "Move the selection, or scroll the value",
+        true,
+    ),
+    PAGE,
+    ENDS,
+    k(
+        "tab shift-tab",
+        "tab",
+        "Value",
+        "Move between the items and the value",
+        true,
+    ),
+    k(
+        "f",
+        "f",
+        "Format",
+        "Show the value as text, hex, JSON or MessagePack",
+        true,
+    ),
+    k("n", "n", "More", "Load the next 100 items", true),
+    k(
+        "y",
+        "y",
+        "Copy",
+        "Copy the selected value as shown to the clipboard",
+        false,
+    ),
+    k("esc", "esc", "Back", "Go back to the key list", true),
 ];
 
 static TTL_DIFF: [KeyHelp; 8] = [
@@ -264,6 +306,7 @@ pub fn for_screen(screen: Screen) -> &'static [KeyHelp] {
         Screen::Connections => &CONNECTIONS,
         Screen::Patterns => &PATTERNS,
         Screen::KeyList => &KEY_LIST,
+        Screen::KeyDetail => &KEY_DETAIL,
         Screen::Ttl | Screen::Diff => &TTL_DIFF,
         Screen::HotKeys => &HOT,
         Screen::BigKeys => &BIG_KEYS,
@@ -300,6 +343,7 @@ pub fn footer(screen: Screen, ready: bool) -> Vec<(&'static str, &'static str)> 
         Screen::Connections => &[MOVE, "enter", "a", "r", "0-6", "?", "q ctrl-c"],
         Screen::Patterns => &[MOVE, "→ ← l h", "enter", "/", "o", "0-6", "?", "q ctrl-c"],
         Screen::KeyList => &[MOVE, "/", "o", "n", "esc", "0-6", "?", "q ctrl-c"],
+        Screen::KeyDetail => &[MOVE, TAB, "f", "n", "esc", "0-6", "?", "q ctrl-c"],
         Screen::Ttl | Screen::Diff | Screen::HotKeys | Screen::BigKeys if ready => {
             &[MOVE, TAB, "r", "s", "0-6", "?", "q ctrl-c"]
         }
@@ -455,6 +499,14 @@ mod tests {
                 "Move", "Filter", "Sort", "More", "Back", "View", "Help", "Quit"
             ]
         );
+        for ready in [false, true] {
+            assert_eq!(
+                names(Screen::KeyDetail, ready),
+                [
+                    "Move", "Value", "Format", "More", "Back", "View", "Help", "Quit"
+                ]
+            );
+        }
         assert_eq!(
             names(Screen::Nodes, true),
             [
@@ -464,13 +516,14 @@ mod tests {
     }
 
     /// `tab` is in the table exactly where it does something: on every panel of a view
-    /// with panels, and on Streams and Search, where it moves to the details.
+    /// with panels, on Streams and Search, where it moves to the details, and on the key
+    /// detail, where it moves to the value.
     #[test]
     fn tab_is_listed_on_every_panel() {
         for s in Screen::ALL {
             let listed = for_screen(s).iter().any(|h| h.keys == "tab shift-tab");
-            let expected =
-                !s.view().panels().is_empty() || matches!(s, Screen::Streams | Screen::Search);
+            let expected = !s.view().panels().is_empty()
+                || matches!(s, Screen::Streams | Screen::Search | Screen::KeyDetail);
             assert_eq!(listed, expected, "{}", s.title());
         }
     }

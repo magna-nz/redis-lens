@@ -5,8 +5,9 @@
 //! The list loads [`PAGE_KEYS`](crate::live::keys::PAGE_KEYS) keys of the pattern when
 //! it opens and as many more with each `n`. Only keys that infer to the pattern are
 //! listed. `/` filters the loaded keys by name, `o` sorts them, `y` copies the selected
-//! key name, `esc` clears the filter and then goes back to Patterns. `enter` on a key
-//! does nothing yet (phase 2). See [`super`] for the interface `App` calls.
+//! key name, `esc` clears the filter and then goes back to Patterns. `enter` on a key is
+//! left to `App`, which opens the selected key's detail ([`super::value`]). See
+//! [`super`] for the interface `App` calls.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -670,11 +671,23 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_a_key_does_nothing_yet() {
+    fn enter_opens_the_selected_key_and_esc_comes_back() {
         let mut app = loaded();
+        let selected = app.views.keys.selected().cloned().unwrap();
         let effects = app.handle_key(key(KeyCode::Enter));
-        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(app.screen(), Screen::KeyDetail);
+        assert_eq!(app.views.value.row.as_ref(), Some(&selected));
+        assert_eq!(testing::requests(&effects).len(), 1, "{effects:?}");
+        app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen(), Screen::KeyList);
+        assert_eq!(app.views.keys.rows.len(), 9);
+
+        // With no key loaded there is nothing to open.
+        let (mut app, _) = open("user:{id}:cart");
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert!(testing::requests(&effects).is_empty(), "{effects:?}");
+        assert_eq!(app.screen(), Screen::KeyList);
+        assert_eq!(notice(&app), "No key selected to open.");
     }
 
     #[test]

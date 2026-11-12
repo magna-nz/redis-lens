@@ -109,6 +109,9 @@ pub enum Screen {
     Patterns,
     /// The keys of one pattern, opened with `enter` on Patterns ([`views::keys`]).
     KeyList,
+    /// One key's metadata and value, opened with `enter` on the key list
+    /// ([`views::value`]).
+    KeyDetail,
     Ttl,
     Diff,
     HotKeys,
@@ -125,10 +128,11 @@ pub enum Screen {
 }
 
 impl Screen {
-    pub const ALL: [Screen; 15] = [
+    pub const ALL: [Screen; 16] = [
         Screen::Connections,
         Screen::Patterns,
         Screen::KeyList,
+        Screen::KeyDetail,
         Screen::Ttl,
         Screen::Diff,
         Screen::HotKeys,
@@ -147,7 +151,7 @@ impl Screen {
     pub fn view(self) -> View {
         match self {
             Self::Connections => View::Connections,
-            Self::Patterns | Self::KeyList => View::Patterns,
+            Self::Patterns | Self::KeyList | Self::KeyDetail => View::Patterns,
             Self::Ttl | Self::Diff | Self::HotKeys | Self::BigKeys | Self::Expiry | Self::Nodes => {
                 View::Analysis
             }
@@ -162,6 +166,7 @@ impl Screen {
     pub fn name(self) -> &'static str {
         match self {
             Self::KeyList => "Keys",
+            Self::KeyDetail => "Key",
             Self::Ttl => "TTL",
             Self::Diff => "Diff",
             Self::HotKeys => "Hot keys",
@@ -180,6 +185,7 @@ impl Screen {
     pub fn title(self) -> &'static str {
         match self {
             Self::KeyList => "Patterns · key list",
+            Self::KeyDetail => "Patterns · key detail",
             Self::Ttl => "Analysis · TTL",
             Self::Diff => "Analysis · Diff",
             Self::HotKeys => "Analysis · Hot keys",
@@ -206,6 +212,7 @@ impl Screen {
                 return None;
             }
             Self::KeyList => Owner::Keys,
+            Self::KeyDetail => Owner::Value,
             Self::BigKeys | Self::Expiry => Owner::Analysis,
             Self::Overview | Self::Clients | Self::SlowLog => Owner::Server,
             Self::Streams => Owner::Streams,
@@ -217,7 +224,8 @@ impl Screen {
     /// Screens that show the finished scan (and `r` rescans, `s` saves a snapshot):
     /// Patterns and every Analysis panel.
     pub fn is_scan_view(self) -> bool {
-        matches!(self.view(), View::Patterns | View::Analysis) && self != Self::KeyList
+        matches!(self.view(), View::Patterns | View::Analysis)
+            && !matches!(self, Self::KeyList | Self::KeyDetail)
     }
 
     /// Screens that work on the live connection (`r` refreshes the panel).
@@ -582,6 +590,10 @@ pub struct PatternsState {
     /// The key list of a pattern is open over the tree (`enter` on a pattern, `esc`
     /// back). Its state is in [`views::keys`].
     pub keys_open: bool,
+    /// The key detail of a listed key is open over the key list (`enter` on a key,
+    /// `esc` back to the list). Only with `keys_open`. Its state is in
+    /// [`views::value`].
+    pub detail_open: bool,
     /// `Some` while the view shows one cluster node's patterns (`enter` on 5 Nodes)
     /// instead of the merged ones; `esc` goes back. Cleared when the node is not in the
     /// report shown, or partial results (always merged) replace that report.
@@ -1138,6 +1150,9 @@ impl App {
         };
         match self.view {
             View::Connections => Screen::Connections,
+            View::Patterns if self.patterns.keys_open && self.patterns.detail_open => {
+                Screen::KeyDetail
+            }
             View::Patterns if self.patterns.keys_open => Screen::KeyList,
             View::Patterns => Screen::Patterns,
             View::Analysis => panel(self.analysis_panel),
@@ -1148,8 +1163,8 @@ impl App {
         }
     }
 
-    /// The screen `view` shows when switched to: its last panel, or the key list when
-    /// it was left open.
+    /// The screen `view` shows when switched to: its last panel, or the key list (or
+    /// the key detail over it) when it was left open.
     fn screen_of(&self, view: View) -> Screen {
         let panel = |i: usize| {
             let p = view.panels();
@@ -1158,6 +1173,9 @@ impl App {
         match view {
             View::Analysis => panel(self.analysis_panel),
             View::Server => panel(self.server_panel),
+            View::Patterns if self.patterns.keys_open && self.patterns.detail_open => {
+                Screen::KeyDetail
+            }
             View::Patterns if self.patterns.keys_open => Screen::KeyList,
             v => Screen::ALL
                 .into_iter()
@@ -1173,7 +1191,10 @@ impl App {
         match (view, at) {
             (View::Analysis, Some(i)) => self.analysis_panel = i,
             (View::Server, Some(i)) => self.server_panel = i,
-            (View::Patterns, _) => self.patterns.keys_open = screen == Screen::KeyList,
+            (View::Patterns, _) => {
+                self.patterns.keys_open = matches!(screen, Screen::KeyList | Screen::KeyDetail);
+                self.patterns.detail_open = screen == Screen::KeyDetail;
+            }
             _ => {}
         }
     }
@@ -1406,6 +1427,16 @@ impl App {
                     out.extend(self.switch(Screen::Patterns));
                     return out;
                 }
+                if !handled && screen == Screen::KeyList && key.code == KeyCode::Enter {
+                    let mut out = effects;
+                    out.extend(self.open_detail());
+                    return out;
+                }
+                if !handled && screen == Screen::KeyDetail && key.code == KeyCode::Esc {
+                    let mut out = effects;
+                    out.extend(self.switch(Screen::KeyList));
+                    return out;
+                }
                 effects
             }
         }
@@ -1579,6 +1610,7 @@ impl App {
         self.patterns.node = Some(NodeKey::of(n));
         self.patterns.sel = 0;
         self.patterns.keys_open = false;
+        self.patterns.detail_open = false;
         let out = self.switch(Screen::Patterns);
         self.rebuild_patterns(None);
         out
@@ -1930,6 +1962,23 @@ impl App {
             .with_views(Owner::Keys, "open", |v, act| v.keys.open(pattern, act))
             .map_or_else(Vec::new, |(_, e)| e);
         out.extend(self.switch(Screen::KeyList));
+        out
+    }
+
+    /// `enter` on the key list: the selected key's detail, one level down. With no key
+    /// selected it says so and stays.
+    fn open_detail(&mut self) -> Vec<Effect> {
+        let Some(row) = self.views.keys.selected().cloned() else {
+            self.set_info("No key selected to open.");
+            return Vec::new();
+        };
+        let pattern = self.views.keys.pattern.clone().unwrap_or_default();
+        let mut out = self
+            .with_views(Owner::Value, "open", |v, act| {
+                v.value.open(row, pattern, act)
+            })
+            .map_or_else(Vec::new, |(_, e)| e);
+        out.extend(self.switch(Screen::KeyDetail));
         out
     }
 

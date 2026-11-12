@@ -6,6 +6,7 @@
 //! | State | Draw | Screens |
 //! |---|---|---|
 //! | [`keys::KeysState`] | `ui/keys.rs` | Patterns › key list ([`Screen::KeyList`]) |
+//! | [`value::ValueState`] | `ui/value.rs` | Patterns › key detail ([`Screen::KeyDetail`]) |
 //! | [`analysis::AnalysisState`] | `ui/analysis.rs` | Analysis › Big keys, Expiry |
 //! | [`server::ServerState`] | `ui/server.rs` | Server › Overview, Clients, Slow log |
 //! | [`streams::StreamsState`] | `ui/streams.rs` | Streams |
@@ -38,7 +39,9 @@
 //!   Analysis only). Every other key goes to [`ViewState::on_key`] of the view on
 //!   screen; return `true` when it did something. On the key list an unhandled `esc`
 //!   goes back to Patterns, so handle `esc` yourself only to close something of your
-//!   own first (a filter). While [`ViewState::input`] is `Some` every key except
+//!   own first (a filter); on the key detail an unhandled `esc` goes back to the key
+//!   list, and an `enter` on the key list (which the key list leaves alone) opens the
+//!   selected key there. While [`ViewState::input`] is `Some` every key except
 //!   ctrl-c goes to `on_key` first, digits and `q` included, and pastes go to
 //!   [`ViewState::on_paste`].
 //! - **Ticks.** [`ViewState::on_tick`] runs about ten times a second, only for the view
@@ -88,6 +91,7 @@ pub mod pubsub;
 pub mod search;
 pub mod server;
 pub mod streams;
+pub mod value;
 
 /// Labels of the phase 1 view probes in [`PermissionReport::checks`], after the scan's
 /// own checks (`model::PERM_LABELS`). Only the scan's checks make a connection
@@ -117,11 +121,12 @@ pub const CLUSTER_OFF: &str = "Not available on a cluster yet: this view reads o
 
 /// The screens that read the live connection to one server: off on a cluster. The key
 /// list is one of them: it walks the keys with `SCAN`, which on a cluster covers one
-/// node.
+/// node; and so is the key detail, which reads its value over the same connection.
 pub fn reads_one_server(screen: Screen) -> bool {
     matches!(
         screen,
         Screen::KeyList
+            | Screen::KeyDetail
             | Screen::Overview
             | Screen::Clients
             | Screen::SlowLog
@@ -135,6 +140,7 @@ pub fn reads_one_server(screen: Screen) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Owner {
     Keys,
+    Value,
     Analysis,
     Server,
     Streams,
@@ -202,6 +208,7 @@ pub trait ViewState: fmt::Debug {
 #[derive(Debug, Default)]
 pub struct Views {
     pub keys: keys::KeysState,
+    pub value: value::ValueState,
     pub analysis: analysis::AnalysisState,
     pub server: server::ServerState,
     pub streams: streams::StreamsState,
@@ -213,6 +220,7 @@ impl Views {
     pub fn get(&self, owner: Owner) -> &dyn ViewState {
         match owner {
             Owner::Keys => &self.keys,
+            Owner::Value => &self.value,
             Owner::Analysis => &self.analysis,
             Owner::Server => &self.server,
             Owner::Streams => &self.streams,
@@ -224,6 +232,7 @@ impl Views {
     pub fn get_mut(&mut self, owner: Owner) -> &mut dyn ViewState {
         match owner {
             Owner::Keys => &mut self.keys,
+            Owner::Value => &mut self.value,
             Owner::Analysis => &mut self.analysis,
             Owner::Server => &mut self.server,
             Owner::Streams => &mut self.streams,
@@ -460,14 +469,43 @@ pub mod testing {
         app.apply(Msg::LiveReady { id, scan })
     }
 
+    /// A key of the key list, for [`show`] on the key detail.
+    pub fn key_row() -> crate::live::keys::KeyRow {
+        crate::live::keys::KeyRow {
+            key: "user:10293:cart".into(),
+            key_type: crate::model::KeyType::Hash,
+            ttl: crate::model::Ttl::Expires(std::time::Duration::from_secs(533_520)),
+            bytes: Some(3_174),
+            encoding: Some("listpack".into()),
+            length: Some(12),
+            freq: Some(14),
+        }
+    }
+
     /// Goes to `screen` with keys, as a user would: its view's digit, then `tab` to the
-    /// panel; for the key list, `enter` on the first pattern row of Patterns.
+    /// panel; for the key list, `enter` on the first pattern row of Patterns. For the
+    /// key detail, `enter` on the key list's selected key; when no key is loaded,
+    /// [`key_row`] is put into the list first.
     pub fn show(app: &mut App, screen: Screen) -> Vec<Effect> {
+        if screen == Screen::KeyDetail {
+            let mut out = Vec::new();
+            if app.screen() != Screen::KeyList {
+                out.extend(show(app, Screen::KeyList));
+            }
+            if app.views.keys.selected().is_none() {
+                app.views.keys.rows.push(key_row());
+            }
+            out.extend(app.handle_key(key(KeyCode::Enter)));
+            assert_eq!(app.screen(), screen);
+            return out;
+        }
         let mut out = app.handle_key(KeyEvent::new(
             KeyCode::Char(screen.view().digit()),
             KeyModifiers::NONE,
         ));
-        if screen == Screen::KeyList {
+        if screen == Screen::KeyList && app.screen() == Screen::KeyDetail {
+            out.extend(app.handle_key(key(KeyCode::Esc)));
+        } else if screen == Screen::KeyList && app.screen() == Screen::Patterns {
             let rows = app.pattern_rows();
             let first = rows
                 .iter()
