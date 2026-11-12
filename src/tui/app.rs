@@ -5454,10 +5454,11 @@ mod tests {
     fn replies_go_to_the_view_that_sent_them() {
         let mut app = views::testing::scanned();
         views::testing::live_ready(&mut app);
-        // The per-view request enums are empty until wave B, so fake two sent requests.
+        // Fake two sent requests. Patterns sends none of its own, so on it these are the
+        // only ones pending (a view that sends on show would take ReqId(1) itself).
         app.live_pending.insert(ReqId(1), Owner::Server);
         app.live_pending.insert(ReqId(2), Owner::Keys);
-        app.handle_key(ch('6'));
+        app.handle_key(ch('1'));
         let n = app.calls.len();
         live_err(&mut app, ReqId(2));
         live_err(&mut app, ReqId(1));

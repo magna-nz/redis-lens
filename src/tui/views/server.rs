@@ -904,7 +904,9 @@ mod tests {
     fn only_request(effects: &[Effect]) -> (ReqId, Request) {
         let reqs = testing::requests(effects);
         assert_eq!(reqs.len(), 1, "{effects:?}");
-        let (id, LiveRequest::Server(r)) = reqs.into_iter().next().unwrap();
+        let (id, LiveRequest::Server(r)) = reqs.into_iter().next().unwrap() else {
+            panic!("not a server request: {effects:?}");
+        };
         (id, r)
     }
 
@@ -913,7 +915,9 @@ mod tests {
         testing::requests(effects)
             .into_iter()
             .map(|(id, r)| {
-                let LiveRequest::Server(r) = r;
+                let LiveRequest::Server(r) = r else {
+                    panic!("not a server request: {r:?}");
+                };
                 (id, r)
             })
             .collect()
