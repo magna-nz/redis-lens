@@ -42,6 +42,9 @@ pub struct SearchState {
     /// Why the last read failed. The previous list stays.
     pub error: Option<String>,
     pending: Option<ReqId>,
+    /// A read went out since the view was last shown (or since `r`). A read that fails
+    /// is not sent again on its own: the next show or `r` sends it.
+    tried: bool,
 }
 
 impl SearchState {
@@ -52,6 +55,7 @@ impl SearchState {
 
     fn fetch(&mut self, act: &mut Act<'_>) {
         self.pending = act.send(LiveRequest::Search(Request::Indexes));
+        self.tried |= self.pending.is_some();
     }
 
     fn in_flight(&mut self, act: &Act<'_>) -> bool {
@@ -69,6 +73,8 @@ impl SearchState {
 impl ViewState for SearchState {
     fn on_show(&mut self, act: &mut Act<'_>) {
         // Read once; `r` reads again. A view that turned itself off waits for `r` too.
+        // After a failed read, showing the view again tries once more.
+        self.tried = false;
         if !self.loaded && self.off.is_none() && !self.no_module && !self.in_flight(act) {
             self.fetch(act);
         }
@@ -76,8 +82,10 @@ impl ViewState for SearchState {
 
     fn on_tick(&mut self, _now: Instant, act: &mut Act<'_>) {
         // Not a polling view, but a read that was waiting for the live connection (the
-        // view was shown before it opened) goes out as soon as it is ready.
+        // view was shown before it opened) goes out as soon as it is ready. Once only:
+        // a failed read waits for `r` or the next show.
         if !self.loaded
+            && !self.tried
             && self.off.is_none()
             && !self.no_module
             && act.live_ready()
@@ -124,9 +132,11 @@ impl ViewState for SearchState {
     }
 
     fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, _act: &mut Act<'_>) {
-        if self.pending == Some(id) {
-            self.pending = None;
+        // Only the answer to the request in flight; an older one is stale.
+        if self.pending != Some(id) {
+            return;
         }
+        self.pending = None;
         match result {
             Ok(LiveReply::Search(Reply::Indexes(list))) => {
                 let name = self.selected().map(|i| i.name.clone());
@@ -281,6 +291,24 @@ mod tests {
             Some("The server refused FT._LIST for this user.")
         );
         insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
+    }
+
+    #[test]
+    fn a_failed_first_read_is_not_sent_again_on_ticks() {
+        let (mut app, id) = shown();
+        answer(
+            &mut app,
+            id,
+            Err(LiveError::Failed("FT._LIST failed".into())),
+        );
+        let t0 = Instant::now();
+        for i in 0..20 {
+            let effects = app.apply(Msg::TickAt(t0 + std::time::Duration::from_millis(100 * i)));
+            assert!(testing::requests(&effects).is_empty(), "tick {i}");
+        }
+        // `r` reads again.
+        let effects = app.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(testing::requests(&effects).len(), 1);
     }
 
     #[test]

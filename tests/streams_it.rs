@@ -8,7 +8,8 @@ use redis::aio::MultiplexedConnection;
 use redis_lens::budget::Budget;
 use redis_lens::live::LiveError;
 use redis_lens::live::streams::{
-    self, Fetched, GroupInfo, LAGGING_LAG, Lag, MAX_STREAMS, Reply, Request, Verdict, verdicts,
+    self, Fetched, GroupInfo, LAGGING_LAG, Lag, MAX_STREAMS, Refused, Reply, Request, Verdict,
+    verdicts,
 };
 
 async fn run(
@@ -16,9 +17,19 @@ async fn run(
     budget: &Budget,
     keys: &[&str],
 ) -> Result<Vec<Fetched>, LiveError> {
+    Ok(run_with(conn, budget, keys, Refused::default()).await?.0)
+}
+
+/// [`run`], sending `refused` and returning what the server refused so far.
+async fn run_with(
+    conn: &mut MultiplexedConnection,
+    budget: &Budget,
+    keys: &[&str],
+    refused: Refused,
+) -> Result<(Vec<Fetched>, Refused), LiveError> {
     let keys = keys.iter().map(|k| (*k).to_string()).collect();
-    match streams::run(conn, budget, Request::Info { keys }).await? {
-        Reply::Info(list) => Ok(list),
+    match streams::run(conn, budget, Request::Info { keys, refused }).await? {
+        Reply::Info { streams, refused } => Ok((streams, refused)),
     }
 }
 
@@ -194,14 +205,15 @@ async fn redis_minor(conn: &mut MultiplexedConnection) -> u32 {
 
 #[tokio::test]
 async fn every_command_takes_from_the_budget() {
-    let server = common::redis().await;
-    let mut admin = server.admin().await;
-    seed(&mut admin).await;
-    let budget = Budget::new(None);
-    run(&mut admin, &budget, &["events"]).await.expect("run");
-    // TIME, then XINFO STREAM + XINFO GROUPS + MEMORY USAGE, then XINFO CONSUMERS for each
-    // of the two groups.
-    assert_eq!(budget.taken(), 1 + 3 + 2);
+    for server in [common::redis().await, common::valkey().await] {
+        let mut admin = server.admin().await;
+        seed(&mut admin).await;
+        let budget = Budget::new(None);
+        run(&mut admin, &budget, &["events"]).await.expect("run");
+        // TIME, then XINFO STREAM + XINFO GROUPS + MEMORY USAGE, then XINFO CONSUMERS for
+        // each of the two groups.
+        assert_eq!(budget.taken(), 1 + 3 + 2);
+    }
 }
 
 #[tokio::test]
@@ -237,20 +249,21 @@ async fn a_lagging_stream_is_flagged() {
 
 #[tokio::test]
 async fn at_most_the_first_streams_are_read() {
-    let server = common::redis().await;
-    let mut admin = server.admin().await;
-    let mut pipe = redis::pipe();
-    let names: Vec<String> = (0..MAX_STREAMS + 5).map(|i| format!("s{i:03}")).collect();
-    for n in &names {
-        pipe.cmd("XADD").arg(n).arg("*").arg("k").arg("v").ignore();
+    for server in [common::redis().await, common::valkey().await] {
+        let mut admin = server.admin().await;
+        let mut pipe = redis::pipe();
+        let names: Vec<String> = (0..MAX_STREAMS + 5).map(|i| format!("s{i:03}")).collect();
+        for n in &names {
+            pipe.cmd("XADD").arg(n).arg("*").arg("k").arg("v").ignore();
+        }
+        let _: () = pipe.query_async(&mut admin).await.unwrap();
+        let keys: Vec<&str> = names.iter().map(String::as_str).collect();
+        let list = run(&mut admin, &Budget::new(None), &keys)
+            .await
+            .expect("run");
+        assert_eq!(list.len(), MAX_STREAMS);
+        assert!(list.iter().all(|f| f.info.is_some()));
     }
-    let _: () = pipe.query_async(&mut admin).await.unwrap();
-    let keys: Vec<&str> = names.iter().map(String::as_str).collect();
-    let list = run(&mut admin, &Budget::new(None), &keys)
-        .await
-        .expect("run");
-    assert_eq!(list.len(), MAX_STREAMS);
-    assert!(list.iter().all(|f| f.info.is_some()));
 }
 
 /// An ACL user that may read the stream and its groups but not its consumers, the clock
@@ -273,9 +286,34 @@ async fn parts_the_user_may_not_read_are_left_out_with_fixed_notes() {
         let mut admin = server.admin().await;
         seed(&mut admin).await;
         let mut zed = server.admin_as("zed-ro", "zed-pw").await;
-        let list = run(&mut zed, &Budget::new(None), &["events"])
+        let (list, refused) = run_with(
+            &mut zed,
+            &Budget::new(None),
+            &["events"],
+            Refused::default(),
+        )
+        .await
+        .expect("run");
+        assert_eq!(
+            refused,
+            Refused {
+                time: true,
+                groups: false,
+                consumers: true,
+                memory: true,
+            }
+        );
+        // The next poll sends the refusals back: only XINFO STREAM and XINFO GROUPS go
+        // out, and the notes stay.
+        let budget = Budget::new(None);
+        let (again, _) = run_with(&mut zed, &budget, &["events"], refused)
             .await
-            .expect("run");
+            .expect("run again");
+        assert_eq!(budget.taken(), 2);
+        assert_eq!(
+            again[0].info.as_ref().unwrap().notes,
+            list[0].info.as_ref().unwrap().notes
+        );
         let info = list[0].info.as_ref().expect("events");
         assert_eq!(info.length, 6);
         assert_eq!(info.bytes, None);

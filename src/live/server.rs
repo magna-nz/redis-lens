@@ -395,7 +395,11 @@ pub fn key_positions(specs: &[KeySpec], args: &[Vec<u8>]) -> Vec<usize> {
             if !out.contains(&i_us) {
                 out.push(i_us);
             }
-            i += step;
+            // A step the server made huge must not wrap around.
+            match i.checked_add(step) {
+                Some(next) => i = next,
+                None => break,
+            }
         }
     }
     out.sort_unstable();

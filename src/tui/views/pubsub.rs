@@ -94,9 +94,11 @@ impl ViewState for PubSubState {
     }
 
     fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, _act: &mut Act<'_>) {
-        if self.pending == Some(id) {
-            self.pending = None;
+        // Only the answer to the request in flight; an older one is stale.
+        if self.pending != Some(id) {
+            return;
         }
+        self.pending = None;
         match result {
             Ok(LiveReply::PubSub(Reply::Counts(counts))) => {
                 // The selection stays on its channel when the list moves.

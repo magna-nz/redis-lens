@@ -117,6 +117,9 @@ pub struct KeysState {
     carry: Vec<String>,
     /// The `SCAN` came back to 0 and every key found is loaded.
     pub done: bool,
+    /// Pages answered so far. Only the first is loaded on its own; `n` loads the rest,
+    /// even when a page found no key of the pattern.
+    pub pages: u64,
     /// The page request in flight.
     loading: Option<ReqId>,
     /// Why the last page failed, in redis-lens's own words.
@@ -247,7 +250,7 @@ impl KeysState {
         if self.loading.is_some_and(|id| !act.in_flight(id)) {
             self.loading = None;
         }
-        let first = self.rows.is_empty() && !self.done && self.error.is_none();
+        let first = self.pages == 0 && !self.done && self.error.is_none();
         if first && self.loading.is_none() && act.live_ready() {
             self.load(act);
         }
@@ -260,6 +263,7 @@ impl KeysState {
                 self.rows.push(row);
             }
         }
+        self.pages += 1;
         self.cursor = page.cursor;
         self.carry = page.carry;
         self.done = self.cursor == 0 && self.carry.is_empty();
@@ -585,6 +589,22 @@ mod tests {
         let mut app = loaded();
         app.handle_key(key(KeyCode::Down));
         insta::assert_snapshot!(testing::render(&app, 120, 36).backend());
+    }
+
+    #[test]
+    fn a_page_with_no_key_of_the_pattern_waits_for_n() {
+        let (mut app, effects) = open("user:{id}:cart");
+        let (id, _) = page_request(&effects);
+        testing::reply(&mut app, id, page(Vec::new(), 77));
+        let t0 = std::time::Instant::now();
+        for i in 0..20 {
+            let effects = app.apply(crate::tui::app::Msg::TickAt(
+                t0 + std::time::Duration::from_millis(100 * i),
+            ));
+            assert!(testing::requests(&effects).is_empty(), "tick {i}");
+        }
+        let (_, req) = page_request(&app.handle_key(ch('n')));
+        assert!(matches!(req, Request::Page { cursor: 77, .. }));
     }
 
     #[test]

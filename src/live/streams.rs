@@ -35,14 +35,31 @@ pub const UNBOUNDED_LEN: u64 = 100_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
-    /// Reads the streams `keys` (the first [`MAX_STREAMS`]).
-    Info { keys: Vec<String> },
+    /// Reads the streams `keys` (the first [`MAX_STREAMS`]). Commands in `refused` are
+    /// not sent: the server refused them for this user before.
+    Info { keys: Vec<String>, refused: Refused },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reply {
-    /// One entry per requested key, in order.
-    Info(Vec<Fetched>),
+    /// One entry per requested key, in order, and every command refused so far (the
+    /// request's plus this poll's), for the view to send back with its next poll.
+    Info {
+        streams: Vec<Fetched>,
+        refused: Refused,
+    },
+}
+
+/// The optional commands of a poll that the server refused for this user (`NOPERM`).
+/// They are not asked again until the view is refreshed with `r`, so a refusal does
+/// not land in the ACL log every 5 s.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Refused {
+    /// `TIME`: ages use this computer's clock instead.
+    pub time: bool,
+    pub groups: bool,
+    pub consumers: bool,
+    pub memory: bool,
 }
 
 /// What reading one key gave.
@@ -170,25 +187,39 @@ pub fn verdicts(s: &StreamInfo) -> Vec<Verdict> {
 /// Runs one request. Every command goes through `budget`.
 pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply, LiveError> {
     match req {
-        Request::Info { keys } => {
-            let now_ms = server_time_ms(conn, budget).await?;
+        Request::Info { keys, mut refused } => {
+            let now_ms = server_time_ms(conn, budget, &mut refused).await?;
             let mut out = Vec::with_capacity(keys.len().min(MAX_STREAMS));
             for key in keys.into_iter().take(MAX_STREAMS) {
-                let info = fetch(conn, budget, &key, now_ms).await?;
+                let info = fetch(conn, budget, &key, now_ms, &mut refused).await?;
                 out.push(Fetched { key, info });
             }
-            Ok(Reply::Info(out))
+            Ok(Reply::Info {
+                streams: out,
+                refused,
+            })
         }
     }
 }
 
 /// The server's clock in Unix milliseconds (`TIME`), so ages compare IDs, which the server
-/// made, with the server's own clock. Falls back to ours when `TIME` is refused.
-async fn server_time_ms(conn: &mut Conn, budget: &Budget) -> Result<u64, LiveError> {
+/// made, with the server's own clock. Falls back to ours when `TIME` fails, and stops
+/// asking once it is refused.
+async fn server_time_ms(
+    conn: &mut Conn,
+    budget: &Budget,
+    refused: &mut Refused,
+) -> Result<u64, LiveError> {
+    if refused.time {
+        return Ok(local_time_ms());
+    }
     match query::<(u64, u64)>(conn, budget, "TIME", &redis::cmd("TIME")).await {
-        Ok((secs, micros)) => Ok(secs.saturating_mul(1000) + micros / 1000),
+        Ok((secs, micros)) => Ok(secs.saturating_mul(1000).saturating_add(micros / 1000)),
         Err(LiveError::Closed) => Err(LiveError::Closed),
-        Err(_) => Ok(local_time_ms()),
+        Err(e) => {
+            refused.time |= matches!(e, LiveError::Denied(_));
+            Ok(local_time_ms())
+        }
     }
 }
 
@@ -221,20 +252,34 @@ async fn fetch(
     budget: &Budget,
     key: &str,
     now_ms: u64,
+    refused: &mut Refused,
 ) -> Result<Option<StreamInfo>, LiveError> {
     let mut pipe = redis::pipe();
     pipe.ignore_errors();
     pipe.cmd("XINFO").arg("STREAM").arg(key);
-    pipe.cmd("XINFO").arg("GROUPS").arg(key);
-    pipe.cmd("MEMORY").arg("USAGE").arg(key);
-    let mut replies: Vec<RedisResult<Value>> =
-        query_pipe(conn, budget, "XINFO STREAM", &pipe).await?;
-    if replies.len() != 3 {
+    if !refused.groups {
+        pipe.cmd("XINFO").arg("GROUPS").arg(key);
+    }
+    if !refused.memory {
+        pipe.cmd("MEMORY").arg("USAGE").arg(key);
+    }
+    let want = 1 + usize::from(!refused.groups) + usize::from(!refused.memory);
+    let replies: Vec<RedisResult<Value>> = query_pipe(conn, budget, "XINFO STREAM", &pipe).await?;
+    if replies.len() != want {
         return Err(LiveError::Failed("XINFO STREAM failed".into()));
     }
-    let memory = replies.pop().expect("three replies");
-    let groups = replies.pop().expect("three replies");
-    let stream = replies.pop().expect("three replies");
+    let mut replies = replies.into_iter();
+    let stream = replies.next().expect("XINFO STREAM's reply");
+    let groups = if refused.groups {
+        Err(None)
+    } else {
+        replies.next().expect("XINFO GROUPS' reply").map_err(Some)
+    };
+    let memory = if refused.memory {
+        Err(None)
+    } else {
+        replies.next().expect("MEMORY USAGE's reply").map_err(Some)
+    };
 
     let stream = match stream {
         Ok(v) => v,
@@ -248,10 +293,16 @@ async fn fetch(
     let mut notes = Vec::new();
     let groups = match groups {
         Ok(v) => Some(v),
-        Err(e) => match failure("XINFO GROUPS", &e) {
+        // Refused before: not asked, still said.
+        Err(None) => {
+            notes.push(LiveError::Denied("XINFO GROUPS".into()).to_string());
+            None
+        }
+        Err(Some(e)) => match failure("XINFO GROUPS", &e) {
             Failure::Gone => return Ok(None),
             Failure::Error(LiveError::Closed) => return Err(LiveError::Closed),
             Failure::Error(err) => {
+                refused.groups |= matches!(err, LiveError::Denied(_));
                 notes.push(err.to_string());
                 None
             }
@@ -259,11 +310,18 @@ async fn fetch(
     };
     let bytes = match memory {
         Ok(v) => uint(&v),
-        Err(e) => {
+        Err(None) => {
+            notes.push(LiveError::Denied("MEMORY USAGE".into()).to_string());
+            None
+        }
+        Err(Some(e)) => {
             // Only worth saying when the user may not size keys; a vanished key is not.
             match error_for("MEMORY USAGE", &e) {
                 LiveError::Closed => return Err(LiveError::Closed),
-                denied @ LiveError::Denied(_) => notes.push(denied.to_string()),
+                denied @ LiveError::Denied(_) => {
+                    refused.memory = true;
+                    notes.push(denied.to_string());
+                }
                 _ => {}
             }
             None
@@ -275,7 +333,10 @@ async fn fetch(
     drop(stream);
 
     // Consumers: one `XINFO CONSUMERS` per group, pipelined.
-    if let Some(gs) = info.groups.as_mut().filter(|g| !g.is_empty()) {
+    if refused.consumers && info.groups.as_ref().is_some_and(|g| !g.is_empty()) {
+        info.notes
+            .push(LiveError::Denied("XINFO CONSUMERS".into()).to_string());
+    } else if let Some(gs) = info.groups.as_mut().filter(|g| !g.is_empty()) {
         let names = group_names(groups.as_ref());
         let mut pipe = redis::pipe();
         pipe.ignore_errors();
@@ -287,18 +348,21 @@ async fn fetch(
         }
         let replies: Vec<RedisResult<Value>> =
             query_pipe(conn, budget, "XINFO CONSUMERS", &pipe).await?;
-        let mut refused = None;
+        let mut refused_note = None;
         for (g, reply) in gs.iter_mut().zip(replies) {
             match reply {
                 Ok(v) => g.readers = Some(parse_consumers(&v)),
                 Err(e) => match failure("XINFO CONSUMERS", &e) {
                     Failure::Gone => return Ok(None),
                     Failure::Error(LiveError::Closed) => return Err(LiveError::Closed),
-                    Failure::Error(err) => refused = Some(err.to_string()),
+                    Failure::Error(err) => {
+                        refused.consumers |= matches!(err, LiveError::Denied(_));
+                        refused_note = Some(err.to_string());
+                    }
                 },
             }
         }
-        info.notes.extend(refused);
+        info.notes.extend(refused_note);
         if gs.len() > MAX_GROUPS {
             info.notes.push(format!(
                 "consumers are read for the first {MAX_GROUPS} groups"

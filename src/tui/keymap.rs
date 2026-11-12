@@ -70,6 +70,14 @@ const PANEL: KeyHelp = k(
     "Next or previous panel",
     true,
 );
+/// On Streams and Search: `tab` moves between the list and the selected row's details.
+const FOCUS: KeyHelp = k(
+    "tab shift-tab",
+    "tab",
+    "Details",
+    "Move between the list and the details",
+    true,
+);
 const COPY_PATTERN: KeyHelp = k(
     "y",
     "y",
@@ -215,9 +223,13 @@ static CLIENTS: [KeyHelp; 8] = [
     REFRESH,
 ];
 
-static POLLED_LIST: [KeyHelp; 6] = [MOVE, PAGE, ENDS, PANEL, PAUSE, REFRESH];
+static SLOW_LOG: [KeyHelp; 6] = [MOVE, PAGE, ENDS, PANEL, PAUSE, REFRESH];
 
-static SEARCH: [KeyHelp; 5] = [MOVE, PAGE, ENDS, PANEL, REFRESH];
+static STREAMS: [KeyHelp; 6] = [MOVE, PAGE, ENDS, FOCUS, PAUSE, REFRESH];
+
+static PUBSUB: [KeyHelp; 5] = [MOVE, PAGE, ENDS, PAUSE, REFRESH];
+
+static SEARCH: [KeyHelp; 5] = [MOVE, PAGE, ENDS, FOCUS, REFRESH];
 
 /// Keys that work in every view.
 pub fn global() -> &'static [KeyHelp] {
@@ -236,7 +248,9 @@ pub fn for_screen(screen: Screen) -> &'static [KeyHelp] {
         Screen::Expiry => &EXPIRY,
         Screen::Overview => &OVERVIEW,
         Screen::Clients => &CLIENTS,
-        Screen::SlowLog | Screen::Streams | Screen::PubSub => &POLLED_LIST,
+        Screen::SlowLog => &SLOW_LOG,
+        Screen::Streams => &STREAMS,
+        Screen::PubSub => &PUBSUB,
         Screen::Search => &SEARCH,
     }
 }
@@ -270,7 +284,8 @@ pub fn footer(screen: Screen, ready: bool) -> Vec<(&'static str, &'static str)> 
         Screen::Overview if ready => &[TAB, "p", "+ -", "r", "0-6", "?", "q ctrl-c"],
         Screen::Clients if ready => &[TAB, MOVE, "enter", "r", "0-6", "?", "q ctrl-c"],
         Screen::SlowLog if ready => &[TAB, MOVE, "p", "r", "0-6", "?", "q ctrl-c"],
-        Screen::Streams | Screen::PubSub if ready => &[MOVE, TAB, "p", "r", "0-6", "?", "q ctrl-c"],
+        Screen::Streams if ready => &[MOVE, TAB, "p", "r", "0-6", "?", "q ctrl-c"],
+        Screen::PubSub if ready => &[MOVE, "p", "r", "0-6", "?", "q ctrl-c"],
         Screen::Search if ready => &[MOVE, TAB, "r", "0-6", "?", "q ctrl-c"],
         s if s.view().panels().is_empty() => &["0-6", "a", "?", "q ctrl-c"],
         _ => &[TAB, "0-6", "a", "?", "q ctrl-c"],
@@ -419,13 +434,13 @@ mod tests {
     }
 
     /// `tab` is in the table exactly where it does something: on every panel of a view
-    /// with panels, and on the views that pass it to their state.
+    /// with panels, and on Streams and Search, where it moves to the details.
     #[test]
     fn tab_is_listed_on_every_panel() {
         for s in Screen::ALL {
             let listed = for_screen(s).iter().any(|h| h.keys == "tab shift-tab");
-            let expected = !s.view().panels().is_empty()
-                || matches!(s, Screen::Streams | Screen::PubSub | Screen::Search);
+            let expected =
+                !s.view().panels().is_empty() || matches!(s, Screen::Streams | Screen::Search);
             assert_eq!(listed, expected, "{}", s.title());
         }
     }

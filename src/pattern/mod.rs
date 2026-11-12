@@ -11,7 +11,7 @@ use crate::model::{KeySample, KeyType, PatternStats};
 const SEPARATORS: [char; 3] = [':', '/', '|'];
 
 /// Placeholders produced by [`pattern_for_key`] and by the cardinality collapse.
-const PLACEHOLDERS: [&str; 6] = ["{id}", "{uuid}", "{ulid}", "{hash}", "{ip}", "{var}"];
+pub(crate) const PLACEHOLDERS: [&str; 6] = ["{id}", "{uuid}", "{ulid}", "{hash}", "{ip}", "{var}"];
 
 /// Collapse threshold: this many distinct literals at one position become `{var}`.
 const COLLAPSE_THRESHOLD: usize = 20;
@@ -100,7 +100,7 @@ fn is_ulid(seg: &str) -> bool {
 }
 
 /// Split a pattern into alternating segments and single-character separators.
-fn tokens(pattern: &str) -> Vec<&str> {
+pub(crate) fn tokens(pattern: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0;
     for (i, c) in pattern.char_indices() {
@@ -114,7 +114,8 @@ fn tokens(pattern: &str) -> Vec<&str> {
     out
 }
 
-fn is_literal(token: &str) -> bool {
+/// A segment that is not empty and not a placeholder.
+pub(crate) fn is_literal(token: &str) -> bool {
     !token.is_empty() && !PLACEHOLDERS.contains(&token)
 }
 

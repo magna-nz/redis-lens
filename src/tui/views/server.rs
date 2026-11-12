@@ -847,12 +847,18 @@ impl SlowLog {
             }
             None => {}
         }
-        self.keys_note = r.keys_off.map(|e| {
-            if matches!(e, LiveError::Denied(_) | LiveError::Unsupported(_)) {
-                self.keys_wanted = false;
+        match r.keys_off {
+            Some(e) => {
+                if matches!(e, LiveError::Denied(_) | LiveError::Unsupported(_)) {
+                    self.keys_wanted = false;
+                }
+                self.keys_note = Some(format!("Key names are off: {e}."));
             }
-            format!("Key names are off: {e}.")
-        });
+            // Asked for and found: whatever stopped them before is over.
+            None if self.keys_wanted => self.keys_note = None,
+            // Not asked for, because they were refused: the reason stays on screen.
+            None => {}
+        }
         self.entries = r.entries;
         if let Some(i) = anchor.and_then(|id| self.entries.iter().position(|e| e.id == id)) {
             self.sel = i;
@@ -1354,6 +1360,17 @@ mod tests {
     }
 
     #[test]
+    fn a_group_is_flagged_from_one_hour_idle() {
+        for (idle, flagged) in [(IDLE_FLAG_SECS - 1, false), (IDLE_FLAG_SECS, true)] {
+            let groups = build_groups(&[conn(1, "10.0.1.5:1", "", ("redis-py", "5"), idle, "get")]);
+            assert!(
+                groups.iter().all(|g| g.flagged() == flagged),
+                "idle {idle}: {groups:?}"
+            );
+        }
+    }
+
+    #[test]
     fn clients_are_grouped_by_library_and_by_network() {
         let groups = build_groups(&fleet());
         let find = |k: GroupKey| groups.iter().find(|g| g.key == k).unwrap();
@@ -1622,12 +1639,35 @@ mod tests {
             }
         ));
 
-        // A failure that is not a refusal is asked again.
-        let mut reply = slow_reply(vec![]);
+        // The next answer, to a poll that asked for neither, keeps both reasons.
+        let mut reply = slow_reply(vec![entry(2, "GET", &[], 20_000)]);
         reply.config = None;
+        reply.keys_off = None;
+        answer(&mut app, id, Reply::SlowLog(Box::new(reply)));
+        let s = &state(&app).slow;
+        assert!(s.config_note.is_some());
+        assert_eq!(
+            s.keys_note.as_deref(),
+            Some("Key names are off: the server refused COMMAND INFO for this user.")
+        );
+    }
+
+    #[test]
+    fn a_failed_command_info_is_asked_again_and_clears_when_it_works() {
+        let t0 = Instant::now();
+        let (mut app, out) = app_at(t0, Screen::SlowLog);
+        let (id, _) = last_request(&out);
+        let mut reply = slow_reply(vec![entry(1, "GET", &[], 20_000)]);
         reply.keys_off = Some(LiveError::Failed("COMMAND INFO failed".into()));
         answer(&mut app, id, Reply::SlowLog(Box::new(reply)));
         assert!(state(&app).slow.keys_note.is_some());
+        let out = app.apply(Msg::TickAt(t0 + secs(10)));
+        let (id, req) = only_request(&out);
+        assert!(matches!(req, Request::SlowLog { keys: true, .. }));
+        let mut reply = slow_reply(vec![entry(1, "GET", &[], 20_000)]);
+        reply.keys_off = None;
+        answer(&mut app, id, Reply::SlowLog(Box::new(reply)));
+        assert!(state(&app).slow.keys_note.is_none());
     }
 
     #[test]

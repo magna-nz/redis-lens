@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{Act, ViewState};
 use crate::live::streams::{
-    ConsumerInfo, GroupInfo, MAX_STREAMS, Reply, Request, StreamInfo, Verdict, verdicts,
+    ConsumerInfo, GroupInfo, MAX_STREAMS, Refused, Reply, Request, StreamInfo, Verdict, verdicts,
 };
 use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::{KeyType, PatternStats, ScanReport};
@@ -81,6 +81,8 @@ pub struct StreamsState {
     pub error: Option<String>,
     pending: Option<ReqId>,
     last_sent: Option<Instant>,
+    /// Optional commands the server refused, not asked again until `r`.
+    refused: Refused,
 }
 
 /// The keys of the streams the scan found: keys of type stream among the examples of every
@@ -142,7 +144,10 @@ impl StreamsState {
             return;
         }
         let keys: Vec<String> = keys.into_iter().take(MAX_STREAMS).collect();
-        self.pending = act.send(LiveRequest::Streams(Request::Info { keys }));
+        self.pending = act.send(LiveRequest::Streams(Request::Info {
+            keys,
+            refused: self.refused,
+        }));
     }
 
     fn in_flight(&mut self, act: &Act<'_>) -> bool {
@@ -197,8 +202,10 @@ impl ViewState for StreamsState {
     }
 
     fn refresh(&mut self, act: &mut Act<'_>) {
-        // `r` tries again after the view turned itself off.
+        // `r` tries again after the view turned itself off, and asks again for what was
+        // refused (the ACL may have changed).
         self.off = None;
+        self.refused = Refused::default();
         if !self.in_flight(act) {
             self.fetch(act);
         }
@@ -247,11 +254,16 @@ impl ViewState for StreamsState {
     }
 
     fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, _act: &mut Act<'_>) {
-        if self.pending == Some(id) {
-            self.pending = None;
+        // Only the answer to the request in flight; an older one is stale.
+        if self.pending != Some(id) {
+            return;
         }
+        self.pending = None;
         match result {
-            Ok(LiveReply::Streams(Reply::Info(list))) => self.apply(list),
+            Ok(LiveReply::Streams(Reply::Info { streams, refused })) => {
+                self.refused = refused;
+                self.apply(streams);
+            }
             Ok(_) => {}
             Err(e @ (LiveError::Denied(_) | LiveError::Unsupported(_))) => {
                 self.off = Some(off_text(&e));
@@ -303,6 +315,14 @@ mod tests {
     use crate::live::streams::{Fetched, Lag};
     use crate::tui::app::{App, Effect, Msg, Screen};
     use crossterm::event::KeyCode;
+
+    /// A poll's answer with nothing refused.
+    fn poll_reply(streams: Vec<crate::live::streams::Fetched>) -> Reply {
+        Reply::Info {
+            streams,
+            refused: Refused::default(),
+        }
+    }
 
     fn stream_pattern(pattern: &str, examples: &[&str]) -> PatternStats {
         let mut p = crate::tui::fixtures::report(true).patterns[0].clone();
@@ -415,16 +435,12 @@ mod tests {
         let [(id, LiveRequest::Streams(Request::Info { .. }))] = &reqs[..] else {
             panic!("expected one Info request, got {reqs:?}");
         };
-        testing::reply(
-            &mut app,
-            *id,
-            Ok(LiveReply::Streams(Reply::Info(fetched()))),
-        );
+        testing::reply(&mut app, *id, Ok(LiveReply::Streams(poll_reply(fetched()))));
         (app, t0)
     }
 
     fn answer(app: &mut App, id: ReqId) {
-        testing::reply(app, id, Ok(LiveReply::Streams(Reply::Info(fetched()))));
+        testing::reply(app, id, Ok(LiveReply::Streams(poll_reply(fetched()))));
     }
 
     /// Ticks to `ms` after `t0`; the request that sent, if any.
@@ -462,7 +478,8 @@ mod tests {
         assert_eq!(
             reqs[0].1,
             LiveRequest::Streams(Request::Info {
-                keys: vec!["orders".into(), "events:1".into(), "events:2".into()]
+                keys: vec!["orders".into(), "events:1".into(), "events:2".into()],
+                refused: Refused::default(),
             })
         );
     }
@@ -558,7 +575,7 @@ mod tests {
         let mut list = fetched();
         list.swap(0, 1);
         let id = tick(&mut app, t0, 10_000).expect("a poll was sent");
-        testing::reply(&mut app, id, Ok(LiveReply::Streams(Reply::Info(list))));
+        testing::reply(&mut app, id, Ok(LiveReply::Streams(poll_reply(list))));
         assert_eq!(app.views.streams.selected().unwrap().key, "events:1");
         assert_eq!(app.views.streams.sel, 0);
     }

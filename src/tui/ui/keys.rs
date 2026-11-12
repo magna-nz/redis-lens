@@ -224,6 +224,8 @@ fn empty_lines(state: &KeysState, ctx: &Ctx<'_>) -> Vec<Line<'static>> {
         )
     } else if state.done {
         " No key of this pattern was found.".to_string()
+    } else if state.pages > 0 && !state.is_loading() {
+        " No key of this pattern in the part scanned so far. n scans further.".to_string()
     } else if !ctx.live_ready() {
         format!(" {} Waiting for the live connection…", spinner(ctx.tick))
     } else {
@@ -321,6 +323,8 @@ fn status(state: &KeysState) -> String {
         format!(" All {n} keys of this pattern are loaded.")
     } else if state.is_loading() {
         format!(" {n} keys loaded, loading more…")
+    } else if state.rows.is_empty() && state.pages > 0 {
+        " No keys found yet. n scans further.".to_string()
     } else if state.rows.is_empty() {
         " No keys loaded yet.".to_string()
     } else {

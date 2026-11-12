@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use crate::diff::ReportDiff;
 use crate::format;
 use crate::model::{KeyType, PatternStats, ScanReport};
-use crate::pattern::pattern_for_key;
+use crate::pattern::{PLACEHOLDERS, is_literal, pattern_for_key, tokens};
 use crate::verdict::{TtlVerdict, ttl_verdict};
 
 /// A key of at least this size is a big key.
@@ -26,33 +26,9 @@ pub const NEVER_EXPIRES_SHARE: f64 = 0.25;
 /// A pattern with one of these segments holds locks, which should always expire.
 pub const LOCK_SEGMENTS: [&str; 4] = ["lock", "locks", "mutex", "lease"];
 
-/// The placeholders pattern inference writes. `{var}` replaces a literal segment.
-const PLACEHOLDERS: [&str; 6] = ["{id}", "{uuid}", "{ulid}", "{hash}", "{ip}", "{var}"];
-/// The separators pattern inference splits on, besides `.`.
-const SEPARATORS: [char; 3] = [':', '/', '|'];
-
 // ---------------------------------------------------------------------------
 // Patterns and keys
 // ---------------------------------------------------------------------------
-
-/// Segments and separators as pattern inference splits them: on `:` `/` `|` and `.`.
-fn tokens(pattern: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for (i, c) in pattern.char_indices() {
-        if SEPARATORS.contains(&c) || c == '.' {
-            out.push(&pattern[start..i]);
-            out.push(&pattern[i..i + 1]);
-            start = i + 1;
-        }
-    }
-    out.push(&pattern[start..]);
-    out
-}
-
-fn is_literal(token: &str) -> bool {
-    !token.is_empty() && !PLACEHOLDERS.contains(&token)
-}
 
 /// True when `a` and `b` are the same pattern except where one has `{var}` and the
 /// other a literal segment: what pattern inference merges once a segment has 20
@@ -267,8 +243,13 @@ pub struct KeyFacts {
     pub encoding: Option<String>,
 }
 
+/// At most this many hash, set and sorted set patterns have their examples' encodings
+/// checked: the biggest ones, since `report.patterns` is sorted by memory.
+pub const MAX_ENCODING_PATTERNS: usize = 100;
+
 /// The keys whose encoding the encoding rule looks at: every big key, and the examples
-/// of each hash, set and sorted set pattern. At most `50 + 5 × patterns`, no repeats.
+/// of the first [`MAX_ENCODING_PATTERNS`] hash, set and sorted set patterns. At most
+/// `50 + 5 × 100`, no repeats.
 pub fn keys_to_check(report: &ScanReport) -> Vec<(String, KeyType)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -276,6 +257,7 @@ pub fn keys_to_check(report: &ScanReport) -> Vec<(String, KeyType)> {
         .patterns
         .iter()
         .filter(|p| p.key_type.and_then(past_compact_encoding).is_some())
+        .take(MAX_ENCODING_PATTERNS)
         .flat_map(|p| p.examples.iter());
     for k in report.big_keys().iter().chain(compact) {
         if seen.insert(k.key.as_str()) {
@@ -838,6 +820,23 @@ mod tests {
         ];
         let keys: Vec<String> = keys_to_check(&r).into_iter().map(|(k, _)| k).collect();
         assert_eq!(keys, ["blob:1", "cart:1", "cart:2"]);
+    }
+
+    #[test]
+    fn encodings_are_checked_for_the_biggest_patterns_only() {
+        let patterns = (0..MAX_ENCODING_PATTERNS + 20)
+            .map(|i| {
+                let mut p = stats(&format!("h{i}:{{id}}"), KeyType::Hash, 1, 0, 100);
+                p.examples = vec![key(&format!("h{i}:1"), KeyType::Hash, 10)];
+                p
+            })
+            .collect();
+        let keys = keys_to_check(&report(patterns));
+        assert_eq!(keys.len(), MAX_ENCODING_PATTERNS);
+        assert_eq!(
+            keys.last().unwrap().0,
+            format!("h{}:1", MAX_ENCODING_PATTERNS - 1)
+        );
     }
 
     #[test]

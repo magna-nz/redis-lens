@@ -216,7 +216,7 @@ The TUI has seven views, switched with `0` to `6`, some with panels ([Navigation
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel |
+| `tab` `shift-tab` | Move between the list and the details |
 | `p` | Pause or resume polling |
 | `r` | Refresh this panel now |
 
@@ -227,7 +227,6 @@ The TUI has seven views, switched with `0` to `6`, some with panels ([Navigation
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel |
 | `p` | Pause or resume polling |
 | `r` | Refresh this panel now |
 
@@ -238,7 +237,7 @@ The TUI has seven views, switched with `0` to `6`, some with panels ([Navigation
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel |
+| `tab` `shift-tab` | Move between the list and the details |
 | `r` | Refresh this panel now |
 
 The key bar shows the main keys of the current screen, from this table: Connections `↑↓ Move · enter Connect · a Add · r Rescan Docker · 0-6 View · ? Help · q Quit`; Patterns `↑↓ Move · →← Fold · enter Open · / Filter · o Sort · 0-6 View · ? Help · q Quit`; the key list `↑↓ Move · / Filter · o Sort · n More · esc Back · 0-6 View · ? Help · q Quit`; TTL, Diff, Hot keys and Big keys with a result `↑↓ Move · tab Panel · r Rescan · s Snapshot · 0-6 View · ? Help · q Quit`, Expiry with a result `tab Panel · r Rescan · s Snapshot · 0-6 View · ? Help · q Quit`, and the Analysis panels without one `tab Panel · 0-6 View · a Add · ? Help · q Quit`; once connected, Overview `tab Panel · p Pause · +- Interval · r Refresh · 0-6 View · ? Help · q Quit`, Clients `tab Panel · ↑↓ Move · enter List · r Refresh · 0-6 View · ? Help · q Quit`, Slow log `tab Panel · ↑↓ Move · p Pause · r Refresh · 0-6 View · ? Help · q Quit`, Streams and Pub/Sub `↑↓ Move · tab Panel · p Pause · r Refresh · 0-6 View · ? Help · q Quit` and Search `↑↓ Move · tab Panel · r Refresh · 0-6 View · ? Help · q Quit`; before that, the Server panels `tab Panel · 0-6 View · a Add · ? Help · q Quit` and Streams, Pub/Sub and Search `0-6 View · a Add · ? Help · q Quit`. Snapshot and rescan on Patterns, paging and copy are only in the `?` overlay, so the bar fits 80 columns. A notice or an input line replaces the bar while shown. A test checks that this table is exactly what `keymap::markdown()` renders.
