@@ -1,11 +1,11 @@
 ---
 source: src/tui/ui/help.rs
-expression: "render(View::Patterns, 80, 24).backend()"
+expression: "render(Screen::Patterns, 80, 24).backend()"
 ---
 "                                                                                "
 "       ┌─ Keys · Patterns ──────────────────────────────────────────────┐       "
 "       │Everywhere                                                      │       "
-"       │0-4            Switch view, 0 Connections to 4 Hot keys         │       "
+"       │0-6            Switch view, 0 Connections to 6 Search           │       "
 "       │?              Show or hide this key list                       │       "
 "       │a              Add a connection                                 │       "
 "       │q ctrl-c       Quit                                             │       "
@@ -14,7 +14,7 @@ expression: "render(View::Patterns, 80, 24).backend()"
 "       │PgUp PgDn      Move one page                                    │       "
 "       │Home End g G   Jump to the first or last row                    │       "
 "       │→ ← l h        Expand or collapse the selected group            │       "
-"       │enter          Expand or collapse                               │       "
+"       │enter          Fold a group, or list a pattern's keys           │       "
 "       │/              Filter patterns by name                          │       "
 "       │esc            Clear the filter                                 │       "
 "       │o              Sort by memory, keys, avg size, no-TTL % or name │       "
