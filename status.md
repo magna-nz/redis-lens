@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** v0.2 done on main; waves 6-8 merged (PRs #10-#12); the quick wins (feature ideas 1-7) in progress; then v0.3 (cluster) or the bigger bets below
-**Last updated:** 2026-11-11 (quick wins verified; PR #13)
+**Last updated:** 2026-11-12 (Redis Insight parity: phases 1-3 approved, spec.md updated, TUI design mockup; nothing built yet)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -330,3 +330,23 @@ Researched on 2026-11-11. Proposals only; nothing here is built. The full write-
 - ElastiCache Serverless blocks `MEMORY USAGE` and `OBJECT FREQ`.
 - The OSS clustering policy on Azure Managed Redis needs v0.3 cluster support.
 - `HEXPIRE` exists in Redis from 7.4 and in Valkey only from 9.0, so CI would need a newer Valkey to test it.
+
+### Redis Insight parity (researched 2026-11-12)
+
+A gap matrix against Redis Insight v3.8.0, with a three-phase roadmap, is in [docs/redisinsight-parity.md](docs/redisinsight-parity.md).
+
+**Approved by the owner on 2026-11-12:** all three phases ("we should do phase 1, 2 and 3"). The decisions:
+- **Values:** shown on screen for every profile, never saved.
+- **Writes:** allowed with the user's permission, as in Redis Insight. Three checks must all allow a write:
+  - the server ACL;
+  - the profile's `read_only` setting, a saved toggle (`w`, `conn set --writes`). It is on by default for `prod`, and turning it off there needs the profile name typed;
+  - a confirmation for each action: `y`/`n`, or a typed name on `prod`.
+- **Recorded:**
+  - spec.md has the non-goals rewritten, a new section "Browsing, server views and writes (planned)" and the milestones for phases 1-3;
+  - the stale `MONITOR` "planned for v0.2" line is fixed;
+  - CLAUDE.md rule 2 now says read-only profiles (the `prod` default) never write, and every write goes through the one write gate.
+- **TUI design mockup**, 14 screens: https://claude.ai/artifact/2RzWTZFKwJASgtX3phxKfG (private to the owner).
+- **Nothing is built.** Next: propose the phase 1 build wave (agents, models, file ownership) for approval. Phase 1 starts with the shared command limiter and the `View` and keymap changes, because every other view depends on them.
+- **Design corrections found while writing the spec:**
+  - A stream doesn't store its `MAXLEN`, so Streams shows the age of the oldest entry and an `unbounded` verdict instead of a cap.
+  - A pattern's glob can match keys of other patterns, so the key list and bulk actions keep only keys that infer to the selected pattern.

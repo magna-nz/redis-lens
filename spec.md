@@ -6,9 +6,17 @@ What redis-lens does and how it should behave. This is the source of truth: when
 
 A terminal UI that answers "what is using the memory in this Redis or Valkey, and is any of it a mistake?" It has to be safe to point at production and quick to point at a local container.
 
+Planned (see [Browsing, server views and writes](#browsing-server-views-and-writes-planned)): a one-stop shop for Redis and Valkey in the terminal, like Redis Insight. Browse keys and values, watch the server, streams, Pub/Sub and Search indexes, run commands, and change data, but only with your permission ([Write permissions](#write-permissions)).
+
 **Users:** backend developers and SREs who run Redis or Valkey as a cache, queue or session store.
 
-**Non-goals:** a general Redis client or key editor, a monitoring daemon, or anything that writes data. The one exception is a bulk `expire` command, planned for later, which stays opt-in and off on production profiles.
+**Non-goals:**
+- A monitoring daemon: nothing keeps running after you quit.
+- An AI assistant, or anything else that sends your data to a third party.
+- Managing Redis Data Integration pipelines.
+- A GUI, a web UI or a REST API.
+
+Until the write phase lands, redis-lens writes nothing to a server.
 
 ## Supported servers and platforms
 
@@ -18,7 +26,7 @@ A terminal UI that answers "what is using the memory in this Redis or Valkey, an
 
 ## Views
 
-The TUI has five views, switched with `0` to `4`. The keys are listed in [Keys](#keys) and in the `?` overlay; both, and the key bar at the bottom of the screen, come from one table in `src/tui/keymap.rs`. Every list view moves with `↑↓` (`j` `k`), `PgUp` `PgDn` (one page: as many rows as the list shows on screen, at least one; it stops at the first and last row) and `Home` `End` (`g` `G`). Narrow terminals never wrap: names are shortened with `…`. On the Patterns view, when the pattern column would get narrower than 12 cells, columns are hidden in this order: the share bar (the share percentage stays), then Δ, then the average size. Only when all three are hidden is a row too wide for the terminal cut at the right edge. Other views cut a row too wide at the right edge. On the selected row, text that doesn't fit its column scrolls across: it rests for 1 s, scrolls about 5 columns a second until its end is visible, holds 1 s and starts again. On the Patterns view only the name scrolls; the tree indent and the `▾`/`▸` mark stay in place. Selecting a different row, switching views or starting a new scan run restarts it; the same row moving to another position does not.
+The TUI has five views, switched with `0` to `4` (planned: seven views, see [Navigation](#navigation)). The keys are listed in [Keys](#keys) and in the `?` overlay; both, and the key bar at the bottom of the screen, come from one table in `src/tui/keymap.rs`. Every list view moves with `↑↓` (`j` `k`), `PgUp` `PgDn` (one page: as many rows as the list shows on screen, at least one; it stops at the first and last row) and `Home` `End` (`g` `G`). Narrow terminals never wrap: names are shortened with `…`. On the Patterns view, when the pattern column would get narrower than 12 cells, columns are hidden in this order: the share bar (the share percentage stays), then Δ, then the average size. Only when all three are hidden is a row too wide for the terminal cut at the right edge. Other views cut a row too wide at the right edge. On the selected row, text that doesn't fit its column scrolls across: it rests for 1 s, scrolls about 5 columns a second until its end is visible, holds 1 s and starts again. On the Patterns view only the name scrolls; the tree indent and the `▾`/`▸` mark stay in place. Selecting a different row, switching views or starting a new scan run restarts it; the same row moving to another position does not.
 
 ### 0 Connections
 - Lists saved profiles and the Redis or Valkey containers found in Docker.
@@ -56,7 +64,7 @@ The TUI has five views, switched with `0` to `4`. The keys are listed in [Keys](
 ### 4 Hot keys
 - Up to 50 sampled keys with an LFU counter (`OBJECT FREQ`) above 0, ranked by that counter, showing the key, pattern, type, counter and size. A node column comes with cluster support (v0.3).
 - Keys with a counter of at least 100 and a size of at least 10 MiB are flagged as hot and big.
-- Needs an LFU eviction policy. Without one, the view says so and offers an opt-in, time-limited `MONITOR` sample (planned for v0.2).
+- Needs an LFU eviction policy. Without one, the view says so. Planned: it offers a time-limited `MONITOR` sample from the Server view's Monitor panel (phase 2, see [3 Server](#3-server)). This was planned for v0.2 and not built.
 
 ### Keys
 
@@ -226,7 +234,7 @@ ElastiCache Serverless profiles also get the lower default command budget (see [
 
 ### Safety
 
-- Profiles with env `prod` are read-only by default. redis-lens never sends a write command, and the later `expire` command is refused on production profiles.
+- Profiles with env `prod` are read-only by default (`read_only` unset; `Profile::is_read_only`). Today redis-lens never sends a write command. From the write phase on, a write is sent only when all three [Write permissions](#write-permissions) checks allow it, and never on a read-only profile.
 - Scans can prefer replicas. It is opt-in per profile: `conn add --prefer-replica` sets `prefer_replica = true` in the config (absent when false). `conn::connect_for_scan` resolves the profile's credentials once (one keychain read, or one Entra ID token provider) and uses them for every connection it opens. It connects to the primary, reads `INFO replication` and, on `role:master`, takes the first `slaveN:…state=online` entry with a usable address: an IPv4 or IPv6 address other than `0.0.0.0` or `::`, or a host name, and a port other than 0. It connects to that candidate with the same credentials and TLS settings (the same trust roots, with the certificate checked against the announced host name) and verifies it (below); connecting and verifying share one 2 s timeout, and reading the keychain happens before it starts. On `role:slave` (or `role:replica`) the profile already points at a replica. The result is a `ScanTarget`: `Primary`, `Replica(endpoint)`, or `PrimaryFallback(reason)` when the replica could not be used or verified (the scan then runs on the primary). `scan` and `diff` print a `Target:` line for a replica or a fallback (`Target:  replica 10.0.1.21:6379`, `Target:  primary (replica unreachable: …)`); the TUI shows it in the header and the Connections detail panel, with the reason passed through the same masking as error messages. Endpoints with an IPv6 address are shown in brackets, `[::1]:6379`. A replica can lag, so counts and sizes may trail the primary slightly.
 - **Replica verification.** The address in `INFO replication` is whatever the replica announced, and anything may be listening there. redis-lens only scans a candidate it has checked against this primary (the replication ID is not secret, so a server built to imitate a replica can pass the check; it is then scanned without credentials, and its data is filed under the profile): the candidate's `INFO replication` must say `role:slave` (or `role:replica`) and its `master_replid` must equal the primary's. The steps:
   1. Read the primary's `master_replid`. Without one, nothing can be verified: fall back.
@@ -307,6 +315,262 @@ Snapshots also hold the server context (`server_context`); snapshots written bef
 
 **Trend.** `redis-lens trend <profile> [--pattern P] [--last N] [--json]` takes the newest N snapshots (default 7, at least 2) that share the newest snapshot's `MATCH` glob, and says how many with another glob were left out. For each pattern (only those containing P with `--pattern`) it shows estimated memory over time as a sparkline (`▁` to `█`, scaled from the series' smallest to its largest value; keys instead of memory unless every snapshot has sizes), the first and last value, and a least-squares growth rate per day, as a share of the pattern's mean and in bytes (or keys). A pattern missing from a snapshot is a gap (`·`), not a zero, and is left out of the fit. Partial scans are included and marked. Rows are sorted by growth per day, largest first. Reads local files only.
 
+## Browsing, server views and writes (planned)
+
+Nothing in this section is built yet. Each phase lands with its own spec change: that change moves its text into the sections above, and updates the key table and `src/tui/keymap.rs` together. The phases are listed under [Milestones](#milestones); the tag after each heading or item says which phase it belongs to. The screens are drawn in the TUI design artifact linked there.
+
+### Navigation
+
+- **Views (P1):** seven views, switched with `0` to `6`:
+  - 0 Connections
+  - 1 Patterns
+  - 2 Analysis, with the panels TTL, Diff, Hot keys, Big keys and Expiry (TTL, Diff and Hot keys keep their current screens)
+  - 3 Server, with the panels Overview, Clients, Slow log and Monitor
+  - 4 Streams
+  - 5 Pub/Sub
+  - 6 Search
+- **Panels and drill-down:** `tab` and `shift-tab` move between a view's panels. `enter` goes one level deeper, `esc` one level back. The tab bar marks the current view and shows the panel names on a second row. Below 100 columns, the tab bar shows only the digits of views other than the current one.
+- **Command line (P2):** `:` opens it from any view except the add flow, the filter input and an open dialog. See [Command line panel](#command-line-panel).
+- **Header:** the header shows the profile's write state:
+  - `read-only` (amber) on a read-only profile;
+  - `writes on` (red text) on another profile with writes on;
+  - `WRITES ON` (red badge) on a `prod` profile with writes on.
+
+### Shared command budget (P1)
+
+- **One limiter for everything:** every command a view sends goes through the profile's command budget ([Scanning](#scanning), rule 2), not only scans. That includes polls, key lists, values, the command line and writes. There is one limiter per connected profile.
+- **Polling views** poll only while they are on screen, and `p` pauses them:
+  - Server Overview: `INFO` every 2 s (`+` and `-` change it, 1 to 60 s)
+  - Clients: every 5 s
+  - Slow log: every 10 s
+  - Streams: `XINFO` every 5 s
+  - Pub/Sub counts: every 5 s
+- **Big keys are always read in pages:**
+  - `HSCAN`, `SSCAN` and `ZSCAN` with `COUNT 100`;
+  - `LRANGE`, `ZRANGE` and `XRANGE` 100 items at a time;
+  - `GETRANGE` for the first 64 KiB of a string, and `JSON.GET` capped at 64 KiB.
+
+  redis-lens never sends `KEYS`, `HGETALL`, `SMEMBERS`, `LRANGE 0 -1` or another whole-key read. A user can still type them on the command line.
+
+### Views
+
+#### 0 Connections, additions
+
+- **WRITES column (P1):** `read-only` or `on`. The detail panel adds two rows:
+  - **Writes:** off or on, and why (for example "production default");
+  - **Values:** "shown on screen, never saved" (P2).
+- **`w` (P3)** turns writes on or off for the selected profile and saves the change to the config file (`read_only = false` or `true`). See [Write permissions](#write-permissions).
+  - Docker containers have no saved profile, so `w` affects only the current session for them.
+  - It is the only setting the TUI writes to the config file outside the add flow.
+
+#### 1 Patterns, additions
+
+- **VERDICT column (P1):** the TTL verdict, plus `big key` and `leak?` (see [2 Analysis](#2-analysis)).
+- **`enter` on a pattern (P1)** opens its key list. On a group it still folds the group.
+- **`x` and `D` (P3):** bulk expire and bulk delete for every key of the pattern. See [Bulk actions](#bulk-actions).
+
+**Key list (P1).**
+- It sends `SCAN MATCH <glob>`, where the glob is the pattern with each placeholder replaced by `*`. It loads 1,000 matching keys at a time, and `n` loads 1,000 more.
+- A glob can match keys that infer to other patterns (`user:*:cart` matches `user:abc:cart`), so only keys that infer to the selected pattern are listed. The title shows how many are loaded and the pattern's estimated key count.
+- Each key shows:
+  - its type, TTL and size (`MEMORY USAGE`), and its encoding (`OBJECT ENCODING`);
+  - its length: `STRLEN`, `HLEN`, `LLEN`, `SCARD`, `ZCARD` or `XLEN`;
+  - its LFU counter (`OBJECT FREQ`), when the policy is LFU.
+
+  These are pipelined like a scan, so values aren't read.
+- `/` filters the loaded keys by name and `o` sorts them. `enter` opens a key. `N` adds a key (P3).
+
+**Key detail (P2).**
+- **Metadata** on the left: type, encoding, length, size, TTL, field TTLs, LFU counter, pattern and verdict.
+- **The value** on the right, read in pages ([Shared command budget](#shared-command-budget-p1)), for each type:
+  - string: the value;
+  - hash: fields;
+  - list: index and element;
+  - set: members;
+  - sorted set: members and scores;
+  - stream: entries, newest first;
+  - JSON: the document;
+  - vector set and array: elements.
+- **Field TTLs** come from `HTTL` (Redis 7.4 and later, Valkey 9.0 and later). Older servers hide the column.
+- **Formats:** each value's format is detected:
+  - JSON, MessagePack, UTF-8 text, otherwise hex;
+  - gzip, zlib, LZ4 frame and zstd are decompressed first, and the panel says so.
+
+  `f` picks a format: text, hex, JSON or MessagePack.
+- **Terminal safety:** control characters and escape sequences in a value are drawn as escapes (`\x1b`), never sent to the terminal raw.
+
+**Edits (P3), each through [Write permissions](#write-permissions):**
+- `e`: edit the selected field, element or value. A value over 4 KiB, or one with newlines, opens `$EDITOR` on a temporary file in a 0700 directory, which is deleted afterwards.
+- `+`: add a field, element or member.
+- `t`: set the TTL, with `EXPIRE` or `PERSIST`; with `HEXPIRE` or `HPERSIST` for a hash field.
+- `R`: rename, with `RENAMENX`. It never overwrites an existing key.
+- `d`: delete the selected field, element or member, with `HDEL`, `SREM`, `ZREM`, `XDEL`, or `LSET` to a unique marker then `LREM` for a list element.
+- `D`: delete the key, with `UNLINK`.
+
+A string edit is sent with `WATCH` and `MULTI`/`EXEC`, so it fails and says so instead of overwriting a value that changed since it was loaded.
+
+#### 2 Analysis
+
+The TTL, Diff and Hot keys panels are the current views of the same names.
+
+- **Big keys (P1):** the 50 biggest sampled keys across all patterns, with key, pattern, type, size, length and TTL. Length is read for those 50 only.
+- **Expiry (P1):** memory that will be freed by TTL within 1 h, 1 d, 7 d and 30 d, and memory that never expires. It is computed from the sampled `PTTL` and size, scaled like the estimates, and needs no new commands.
+- **Recommendations (P1):** a list under Big keys. It uses only data the scan already has, plus `OBJECT ENCODING`, never `CONFIG GET` (ElastiCache blocks it). The rules:
+  - a key of 64 MiB or more;
+  - a collection of 1,000,000 items or more;
+  - in a pattern, 5% or more of its hashes, sets or sorted sets past their compact encoding (`hashtable`, `skiplist`);
+  - a pattern whose segment is `lock`, `locks`, `mutex` or `lease` with keys that have no TTL (verdict `leak?`);
+  - the share of memory that never expires, when it is over 25%;
+  - every TTL verdict that isn't `ok`.
+
+#### 3 Server
+
+- **Overview (P1):**
+  - From `INFO`, each with a sparkline of the last 60 polls: ops/s, used memory against `maxmemory`, hit rate (keyspace hits / (hits + misses)), clients and blocked clients, network in and out, evicted and expired keys per second, CPU (user and sys), and fragmentation.
+  - A line with uptime, role, replicas, persistence and `maxmemory-policy`.
+- **Clients (P1):**
+  - `CLIENT LIST`, grouped by library (`lib-name` and `lib-ver`, Redis 7.2 and later; otherwise the client name, or "(no name)") and by address (/24 for IPv4). Each group shows connections, the oldest age, the longest idle time, the most common last command, and memory.
+  - A group with connections idle for an hour or more is flagged. `enter` lists a group's connections.
+  - `K` kills the selected connection with `CLIENT KILL ID` (P3, `@dangerous`).
+- **Slow log:**
+  - `SLOWLOG GET 128` (P1): time, duration, command name, key names (from the command's key specs) and client. Arguments other than keys arrive in P2, on screen only.
+  - Notes on known problems: `KEYS`; `FLUSHALL` and `FLUSHDB`; whole-key reads of a big key.
+  - The threshold and length come from `CONFIG GET slowlog-*` where it is allowed.
+  - `c` sets the threshold with `CONFIG SET` (P3, `@dangerous`), and `R` sends `SLOWLOG RESET` (P3, `@dangerous`).
+- **Monitor (P2):**
+  - `MONITOR` on a connection of its own. It stops after 30 s or 10,000 lines, whichever comes first, and the lines stay in memory only.
+  - It always asks first: `y`/`n`, or on a `prod` profile you type the profile name. Read-only profiles too, because `MONITOR` writes nothing but slows the server.
+  - Without an LFU policy, Hot keys can rank keys by how often they appear in the last Monitor run.
+
+#### 4 Streams
+
+- **Stream list (P1):** the streams the last scan found (type `stream`; a sampled scan may miss some, and the title says so). For each:
+  - from `XINFO STREAM`: length, size, the age of the oldest entry (from its ID), and the last ID;
+  - from `XINFO GROUPS`: groups, lag (Redis 7.0 and later), pending entries and the last delivered ID;
+  - from `XINFO CONSUMERS`: consumers, with pending entries, idle time, and inactive time (Redis 7.2 and later).
+- **Verdicts:**
+  - `stuck`: a consumer that holds pending entries has been idle 30 min or more;
+  - `lagging`: a group's lag is 1,000 or more;
+  - `no readers`: no consumer groups;
+  - `unbounded`: the oldest entry is over 30 days old and the stream holds 100,000 entries or more;
+  - `ok`.
+- **Entries (P2):** `enter` lists a stream's entries with `XREVRANGE … COUNT 100`.
+- **Writes (P3):**
+  - `c` claims a consumer's pending entries for another consumer (`XAUTOCLAIM`);
+  - `a` acknowledges the selected pending entry (`XACK`);
+  - `X` trims the stream with `XTRIM MAXLEN ~ N` or `MINID` (destructive).
+
+#### 5 Pub/Sub
+
+- **Counts (P1):** `PUBSUB CHANNELS` (the first 1,000), `PUBSUB NUMSUB` for each channel and `PUBSUB NUMPAT`. Payloads aren't read.
+- **Live tail (P2):**
+  - `enter` subscribes to the selected channel; `s` asks for a channel or pattern (`SUBSCRIBE` or `PSUBSCRIBE`). The subscription uses a connection of its own.
+  - The last 2,000 messages stay in memory, with the message rate. `space` pauses, `c` clears and `/` filters.
+- **Publish (P3):** `p` publishes a message with `PUBLISH`. It is not destructive.
+
+#### 6 Search
+
+- **Indexes (P1):** shown when `FT._LIST` works (Redis Search or valkey-search). Otherwise the view says the module is missing.
+  - Each index, from `FT.INFO`: what it indexes, its prefixes, documents, size, indexing progress and indexing failures.
+  - The schema of the selected index.
+  - Features the module lacks are turned off with a reason.
+- **Queries (P2):** `/` runs `FT.SEARCH … LIMIT 0 50`. `e` shows `FT.EXPLAIN`, `P` runs `FT.PROFILE`, `enter` opens a result document.
+- **Writes (P3):** `C` creates an index from a form (prefix and fields) with `FT.CREATE`. `D` drops one with `FT.DROPINDEX`, never with `DD`, so documents are kept.
+
+### Command line panel
+
+- **The panel (P2):** a panel at the bottom of the screen, over the view, which keeps running.
+  - Replies are drawn like `redis-cli`, with the time taken. A reply over 1 MiB is cut on screen.
+  - `↑↓` steps through the history, `tab` completes, `ctrl-l` clears and `esc` closes.
+- **Helper (P2):** from `COMMAND DOCS` (Redis 7.0 and later, and Valkey), it shows the summary, arguments, complexity and ACL categories. `tab` completes command names, subcommands and the key names already loaded. On older servers the helper is off.
+- **Read-only profiles:** before sending a command, redis-lens reads its flags (`COMMAND INFO`). On a read-only profile, a command without the `readonly` flag is not sent, and the panel says why.
+- **`@dangerous` commands** ask first on every profile, readonly ones (`KEYS`) included. See [Write permissions](#write-permissions).
+- **Refused commands:** commands that would change the panel's own connection are refused with a pointer to the right place:
+  - `SUBSCRIBE` and `PSUBSCRIBE`: use Pub/Sub;
+  - `MONITOR`: use the Monitor panel;
+  - `SELECT`: use the DB switch;
+  - `AUTH`, `HELLO`, `RESET`, `QUIT` and `CLIENT REPLY`: refused.
+- **Credentials (rule 1):** on screen and in the history, the panel masks:
+  - the password arguments of `ACL SETUSER` (`>`, `<`, `#` and `!` rules);
+  - `CONFIG SET requirepass` and `masterauth`;
+  - `MIGRATE … AUTH` and `AUTH2`.
+
+  The history keeps the masked text, in memory only, for the session.
+- **Writes (P3):** write commands follow [Write permissions](#write-permissions).
+
+### Values (P2)
+
+- **On screen only:** key values, field values, stream entries, Pub/Sub messages, Search results, Monitor lines and Slow log arguments are shown on screen. They are never written to snapshots, reports, logs, error text or `Debug` output.
+- **Clipboard:** a value reaches the clipboard only through `y` on that value, in the format shown. The [Copy](#copy) rule on control characters applies; switch to hex (`f`) to copy such a value.
+- **Code:** the `CopyText` type gains a value constructor, and nothing else changes.
+
+### Write permissions
+
+A write is sent only when all three checks allow it.
+
+1. **The server.** The connected user can only run what its ACL allows.
+   - A `NOPERM` turns that action off for the session, with the reason ("the server refused HSET for this user"), never the username.
+   - The permission check uses `ACL DRYRUN` where it is allowed (Redis 7.0 and later, `@admin`) to show which writes the user may send. Otherwise writes show as "checked by the server on use".
+2. **The profile.** `read_only` in the config file. Unset means read-only exactly when env is `prod`.
+   - Change it with `w` on Connections, `redis-lens conn set <name> --writes on|off`, or `conn add --writes on|off`.
+   - Turning writes on asks first. On a `prod` profile you must type the profile name: `conn set` reads it from the terminal, or `--confirm <name>` gives it, and `--yes` never replaces it. On other profiles it is `y`/`n`, and `--yes` skips the question.
+   - Turning writes off never asks.
+3. **The action.** Each write asks according to the table. A setting in the config file, `[settings] skip_non_prod_confirm = true`, turns off the `y`/`n` prompts on profiles that aren't `prod`. It never applies to `prod`, and never to a prompt where you type a name.
+
+| Action | Read-only profile | Writes on, not `prod` | Writes on, `prod` |
+|---|---|---|---|
+| Browse, view values, readonly commands | runs | runs | runs |
+| Edit, add, set a TTL, rename, publish, ack, claim, create an index | not sent | runs | asks `y`/`n` |
+| Delete a key, field or element, trim a stream, drop an index | not sent | asks `y`/`n` | type the key or index name |
+| Bulk expire or delete by pattern | not sent | dry run, then `y`/`n` | dry run, then type the pattern |
+| `@dangerous` commands (`FLUSHDB`, `CONFIG SET`, `CLIENT KILL`, `SLOWLOG RESET`, `KEYS` …) | readonly ones (`KEYS`) ask as in the next two columns; the rest are not sent | asks `y`/`n` | type the profile name |
+| `MONITOR` | asks (`prod`: type the name) | asks `y`/`n` | type the profile name |
+
+- **What counts as destructive or dangerous:** a write is destructive when it deletes or overwrites data:
+  - `DEL`, `UNLINK`, `HDEL`, `SREM`, `ZREM`, `LREM`, `XDEL`, `XTRIM`;
+  - `FLUSHDB`, `FLUSHALL`;
+  - `RENAME` onto an existing key;
+  - `FT.DROPINDEX`;
+  - and every command with the `@dangerous` ACL category, read from `COMMAND INFO`.
+- **Each prompt** names the profile and shows the exact command it will send.
+- **One gate:** every write goes through one write gate, which applies checks 2 and 3. Tests check that no write command reaches a read-only profile.
+
+### Bulk actions
+
+- **What they are (P3):** `x` sets a TTL on every key of a pattern, and `D` deletes them. `redis-lens expire` does the first from the command line.
+- **Dry run:** a `SCAN MATCH` counts the matching keys that infer to the pattern, and how many already have a TTL. Nothing is written until you confirm.
+- **Expire:**
+  - It sends `EXPIRE key seconds NX` (Redis 7.0 and later; on Redis 6.2, `x` is off with a reason).
+  - Only keys without a TTL change.
+  - The default TTL is 24 h, and the prompt can change it.
+- **Delete:** it sends `UNLINK`.
+- **Running it:**
+  - In pipelines of 500, within the command budget, with progress shown. `esc` stops after the current batch.
+  - Before the first write, the key names are written to `<data dir>/redis-lens/bulk/<profile dir>/<YYYYMMDDTHHMMSSZ>-<expire|delete>.txt` (mode 0600). For an expire, `PERSIST` on those keys undoes it.
+  - The file holds key names only.
+- **From the command line:**
+  ```
+  redis-lens expire <name> <pattern> --ttl DURATION [--apply] [--yes | --confirm PATTERN]
+  ```
+  Without `--apply` it is a dry run. With `--apply`, a `prod` profile needs `--confirm` with the exact pattern, and other profiles need `--yes` when there is no terminal. A read-only profile refuses with exit code 2.
+
+### Permission check, additions
+
+- **P1 probes:** `SLOWLOG LEN`, `CLIENT LIST ID <own id>`, `XINFO HELP`, `PUBSUB NUMPAT`, `FT._LIST`.
+- **P2 probes:** `COMMAND DOCS GET`.
+- **P3 probes:** `ACL DRYRUN`, where it is allowed.
+- **Turning off:** each missing permission turns off its view or panel, with the reason (rule 3).
+- **ACL user:** the minimal read-only user gains `+slowlog|get +slowlog|len +client|list +xinfo +pubsub|channels +pubsub|numsub +pubsub|numpat +ft._list +ft.info +command|docs +command|info`. For P2 it also needs the read commands for values: `+@read`, and `-keys` to block `KEYS`.
+
+### Server versions
+
+Features that need a newer server are turned off with a reason on older ones:
+- Redis 7.0: `EXPIRE NX`, `COMMAND DOCS`, consumer group lag, `ACL DRYRUN`
+- Redis 7.2: `lib-name` in `CLIENT LIST`, consumer inactive time
+- Redis 7.4 and Valkey 9.0: `HTTL`
+
+Redis 6.2 stays tested: it runs everything else.
+
 ## Quality bar
 
 - **Unit tests** sit next to the code. Parsers and pattern inference also get proptest.
@@ -325,4 +589,9 @@ Snapshots also hold the server context (`server_context`); snapshots written bef
 - **v0.2:** the TTL view, snapshots and the Diff view, the Hot keys view, Entra ID, preferring replicas.
 - **Quick wins (after v0.2):** `scan --check` with exit codes, Markdown, HTML and CSV reports, provider detection, the server context strip, token-command auth, snapshot retention, `snapshots`, `trend` and the Diff trend column, and `compare` for two standalone instances (planned for v0.3; it needs no change for cluster).
 - **v0.3:** cluster (scan each primary), a per-node view.
-- **Later:** native ElastiCache IAM (a token command covers it today), Sentinel, SSH tunnels, `expire --dry-run` for non-production profiles, and a MONITOR sampling fallback for hot keys.
+- **Phase 1, read-only views:** seven views and panels, the shared command budget, the key list of a pattern, Analysis (Big keys, Expiry, recommendations), Server (Overview, Clients, Slow log without arguments), Streams, Pub/Sub counts, Search indexes, the new permission probes.
+- **Phase 2, values on screen:** key values and formats, stream entries, the Pub/Sub live tail, Search queries, Slow log arguments, the Monitor panel, the command line for readonly commands.
+- **Phase 3, writes:** the write permission checks, `w` and `conn set --writes`, key edits, bulk expire and delete, `redis-lens expire`, stream claim, ack and trim, publish, index create and drop, kill client, slow log settings, write commands on the command line.
+- **Later:** native ElastiCache IAM (a token command covers it today), Sentinel, SSH tunnels.
+
+Phases 1 to 3 come from [docs/redisinsight-parity.md](docs/redisinsight-parity.md). Their order relative to v0.3 is not fixed. The mockups are in the TUI design artifact (https://claude.ai/artifact/2RzWTZFKwJASgtX3phxKfG).
