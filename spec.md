@@ -248,7 +248,7 @@ The key bar shows the main keys of the current screen, from this table: Connecti
 
 ### Rescan
 
-`r` on Patterns (its key list included) and on every panel of Analysis scans the shown connection again as a new run, the same way `enter` connects it (same scan options, rate limit and read-only rules; the connection's current profile and credential source). It works when the scan has finished or failed. While a connect or scan is running it only says "A scan is already running"; with no connection yet it says to connect first. On Connections `r` still looks for Docker containers again. On Server, Streams, Pub/Sub and Search `r` fetches the panel on screen again instead of scanning.
+`r` on Patterns and on every panel of Analysis scans the shown connection again as a new run, the same way `enter` connects it (same scan options, rate limit and read-only rules; the connection's current profile and credential source). It works when the scan has finished or failed. While a connect or scan is running it only says "A scan is already running"; with no connection yet it says to connect first. On Connections `r` still looks for Docker containers again. On Server, Streams, Pub/Sub and Search `r` fetches the panel on screen again instead of scanning. The key list has no `r`: go back to Patterns with `esc` to scan again.
 
 A rescan keeps the view, the Patterns filter, collapsed groups, sort and selected row, and the TTL, Diff and Hot keys selections (moved to the last row if the new results are shorter). The previous results stay on every view, marked `rescanning · previous results` at the start of the panel title, until the new run's first partial results arrive. From then on Patterns shows the partial results (the selection follows its row) and TTL, Diff and Hot keys wait for the finished scan. If the rescan fails before any results of its own, the error is shown and the previous results stay, marked `rescan failed · previous results`. If it fails after partial results it behaves like any failed scan. While a rescan runs, `s` says to wait for it to finish; it never saves partial results and does not save the previous results again. Results, partials and progress of the replaced run are ignored. The one exception is the replaced run's snapshot lookup, which still fills in the Diff of its own report while that report is on screen. A slow keychain read during a rescan shows the keychain hint in the status line.
 
@@ -409,7 +409,7 @@ redis-lens discover
 
 `redis-lens diff <profile>` first checks, before touching the server, that a baseline exists for the profile with no `MATCH` glob (the scan uses none), then scans, compares with that baseline (or with `--against <file>`), then saves the new scan. The Diff view uses the same baseline.
 
-Snapshots also hold the server context (`server_context`); snapshots written before it existed load without it.
+Snapshots also hold the server context (`server_context`); snapshots written before it existed load without it. A scan with sizes also writes `key_sizes` there and in `scan --json`: the 50 sampled keys with the largest `MEMORY USAGE` (key name, type, size, TTL; never values), and the sampled bytes per TTL bucket. They feed Big keys and Expiry. A scan without sizes writes no `key_sizes`, so its output is as before, and snapshots written before the field existed load without it.
 
 **Retention.** `scan --save --keep N` keeps the newest N snapshots of the profile, and `--keep-days D` deletes those older than D days. `N` is at least 1. Given both, a snapshot stays only when both allow it. The newest snapshot is never deleted. Snapshots dated after the current time (a clock that was ahead, or a file copied from another machine) are never deleted and take no keep slot, so the snapshot just saved always stays. Retention only touches files it would have written for that profile: regular files directly in the profile's directory, named exactly `YYYYMMDDTHHMMSSZ.json`, whose stored `profile` is the profile. Other files, corrupt files, other profiles' snapshots and symbolic links are left alone, and a profile directory that is a symbolic link is refused. Deleting snapshots touches local files only, never a server.
 
@@ -419,7 +419,7 @@ Snapshots also hold the server context (`server_context`); snapshots written bef
 
 ## Browsing, server views and writes (planned)
 
-Built so far, from phase 1: [Navigation](#navigation) (without the command line), the [Shared command budget](#shared-command-budget-p1) and the probes in [Permission check, additions](#permission-check-additions). The views and panels here show that they are not built yet. Each phase lands with its own spec change: that change moves its text into the sections above, and updates the key table and `src/tui/keymap.rs` together. The phases are listed under [Milestones](#milestones); the tag after each heading or item says which phase it belongs to. The screens are drawn in the TUI design artifact linked there.
+Phase 1 is built: [Navigation](#navigation) (without the command line), the [Shared command budget](#shared-command-budget-p1), the probes in [Permission check, additions](#permission-check-additions), and every item tagged P1 under [Views](#views-1). Items tagged P2 or P3 are not built; their panels (Monitor) say so. Each phase lands with its own spec change: that change moves its text into the sections above, and updates the key table and `src/tui/keymap.rs` together. The phases are listed under [Milestones](#milestones); the tag after each heading or item says which phase it belongs to. The screens are drawn in the TUI design artifact linked there.
 
 ### Navigation
 
@@ -467,12 +467,12 @@ Built so far, from phase 1: [Navigation](#navigation) (without the command line)
 
 #### 1 Patterns, additions
 
-- **VERDICT column (P1):** the TTL verdict, plus `big key` and `leak?` (see [2 Analysis](#2-analysis)).
+- **VERDICT column (P1):** one word per pattern, the most worrying first: `leak?` (a lock pattern with keys that have no TTL), `growing` and `mixed` (the TTL verdicts), `big key` (a sampled key of 64 MiB or more), `persistent`, `ok`. It is always shown. On narrow terminals the other columns hide first, in the order under [Views](#views), so at 80 columns the share bar is gone and long pattern names are cut with `…`.
 - **`enter` on a pattern (P1)** opens its key list. On a group it still folds the group.
 - **`x` and `D` (P3):** bulk expire and bulk delete for every key of the pattern. See [Bulk actions](#bulk-actions).
 
 **Key list (P1).**
-- It sends `SCAN MATCH <glob>`, where the glob is the pattern with each placeholder replaced by `*`. It loads 1,000 matching keys at a time, and `n` loads 1,000 more.
+- It sends `SCAN MATCH <glob>`, where the glob is the pattern with each placeholder replaced by `*` and glob characters in the literal parts escaped. Opening the list loads the first 1,000 keys of the pattern (at most 500 `SCAN` calls); `n` loads 1,000 more. Only the first page loads on its own: when a page finds no key of the pattern, the list says so and waits for `n`.
 - A glob can match keys that infer to other patterns (`user:*:cart` matches `user:abc:cart`), so only keys that infer to the selected pattern are listed. The title shows how many are loaded and the pattern's estimated key count.
 - Each key shows:
   - its type, TTL and size (`MEMORY USAGE`), and its encoding (`OBJECT ENCODING`);
@@ -480,7 +480,7 @@ Built so far, from phase 1: [Navigation](#navigation) (without the command line)
   - its LFU counter (`OBJECT FREQ`), when the policy is LFU.
 
   These are pipelined like a scan, so values aren't read.
-- `/` filters the loaded keys by name and `o` sorts them. `enter` opens a key. `N` adds a key (P3).
+- `/` filters the loaded keys by name and `o` sorts them: by size, length, TTL, LFU counter (under an LFU policy) or name. `y` copies the key name. `esc` clears the filter first, then goes back to Patterns. `enter` opens a key (P2). `N` adds a key (P3).
 
 **Key detail (P2).**
 - **Metadata** on the left: type, encoding, length, size, TTL, field TTLs, LFU counter, pattern and verdict.
@@ -515,29 +515,32 @@ A string edit is sent with `WATCH` and `MULTI`/`EXEC`, so it fails and says so i
 
 The TTL, Diff and Hot keys panels are the current views of the same names.
 
-- **Big keys (P1):** the 50 biggest sampled keys across all patterns, with key, pattern, type, size, length and TTL. Length is read for those 50 only.
+- **Big keys (P1):** the 50 biggest sampled keys across all patterns (from the report's `key_sizes`), with key, pattern, type, size, length and TTL. Length and encoding are read live for those 50 only, pipelined. `y` copies the key name.
 - **Expiry (P1):** memory that will be freed by TTL within 1 h, 1 d, 7 d and 30 d, and memory that never expires. It is computed from the sampled `PTTL` and size, scaled like the estimates, and needs no new commands.
 - **Recommendations (P1):** a list under Big keys. It uses only data the scan already has, plus `OBJECT ENCODING`, never `CONFIG GET` (ElastiCache blocks it). The rules:
   - a key of 64 MiB or more;
   - a collection of 1,000,000 items or more;
-  - in a pattern, 5% or more of its hashes, sets or sorted sets past their compact encoding (`hashtable`, `skiplist`);
+  - in a pattern, 5% or more of its hashes, sets or sorted sets past their compact encoding (`hashtable`, `skiplist`). The scan reads no encodings, so this checks the pattern's example keys (its largest), for the 100 biggest such patterns: it can overstate a pattern whose big keys are the exception;
   - a pattern whose segment is `lock`, `locks`, `mutex` or `lease` with keys that have no TTL (verdict `leak?`);
   - the share of memory that never expires, when it is over 25%;
   - every TTL verdict that isn't `ok`.
 
+  `big key` and the 64 MiB rule are about one key. The TTL panel's "Large" verdict (largest key 50 MiB, or average 10 MiB) is about a pattern and stays as it was.
+
 #### 3 Server
 
 - **Overview (P1):**
-  - From `INFO`, each with a sparkline of the last 60 polls: ops/s, used memory against `maxmemory`, hit rate (keyspace hits / (hits + misses)), clients and blocked clients, network in and out, evicted and expired keys per second, CPU (user and sys), and fragmentation.
+  - From `INFO`, each with a sparkline of the last 60 polls (as many as fit; 47 at 80 columns): ops/s, used memory against `maxmemory`, hit rate (keyspace hits / (hits + misses)), clients and blocked clients, network in and out, evicted and expired keys per second, CPU (user and sys), and fragmentation.
   - A line with uptime, role, replicas, persistence and `maxmemory-policy`.
+  - Rates come from the difference between two polls. They are left out after a restart, a counter reset or a long gap, never shown as a spike. `+` and `-` step the interval through 1, 2, 3, 5, 10, 15, 30 and 60 s.
 - **Clients (P1):**
-  - `CLIENT LIST`, grouped by library (`lib-name` and `lib-ver`, Redis 7.2 and later; otherwise the client name, or "(no name)") and by address (/24 for IPv4). Each group shows connections, the oldest age, the longest idle time, the most common last command, and memory.
+  - `CLIENT LIST`, grouped by library (`lib-name` and `lib-ver`, Redis 7.2 and later; otherwise the client name, or "(no name)") and by address (/24 for IPv4, /64 for IPv6). Both kinds of group are in one list, library groups first, with a BY column. Each group shows connections, the oldest age, the longest idle time, the most common last command, and memory. The `user=` field is dropped when the reply is read and never shown.
   - A group with connections idle for an hour or more is flagged. `enter` lists a group's connections.
   - `K` kills the selected connection with `CLIENT KILL ID` (P3, `@dangerous`).
 - **Slow log:**
-  - `SLOWLOG GET 128` (P1): time, duration, command name, key names (from the command's key specs) and client. Arguments other than keys arrive in P2, on screen only.
-  - Notes on known problems: `KEYS`; `FLUSHALL` and `FLUSHDB`; whole-key reads of a big key.
-  - The threshold and length come from `CONFIG GET slowlog-*` where it is allowed.
+  - `SLOWLOG GET 128` (P1): time (UTC), duration, command name, key names and client. Key names come from the command's key specs in `COMMAND INFO`, asked once per command name and kept for the session (before Redis 7.0, the first/last/step key positions, so commands with moving keys show fewer). `COMMAND GETKEYS` is never used: it would send the logged arguments back to the server. Arguments other than keys are dropped when the reply is read; they arrive in P2, on screen only.
+  - Notes on known problems: `KEYS`; `FLUSHALL` and `FLUSHDB`; whole-key reads (`HGETALL`, `SMEMBERS`, `LRANGE 0 -1` and the like). The slow log has no sizes, so a whole-key read is known by its shape; that it was slow is the hint that the key is big.
+  - The threshold and length come from `CONFIG GET slowlog-*` where it is allowed; otherwise the panel says they are unknown. When `COMMAND INFO` is refused the entries show without key names and say why. Neither is asked again in that session.
   - `c` sets the threshold with `CONFIG SET` (P3, `@dangerous`), and `R` sends `SLOWLOG RESET` (P3, `@dangerous`).
 - **Monitor (P2):**
   - `MONITOR` on a connection of its own. It stops after 30 s or 10,000 lines, whichever comes first, and the lines stay in memory only.
@@ -547,15 +550,17 @@ The TTL, Diff and Hot keys panels are the current views of the same names.
 #### 4 Streams
 
 - **Stream list (P1):** the streams the last scan found (type `stream`; a sampled scan may miss some, and the title says so). For each:
-  - from `XINFO STREAM`: length, size, the age of the oldest entry (from its ID), and the last ID;
+  - from `XINFO STREAM`: length, the age of the oldest entry (from its ID, against the server's `TIME`; this computer's clock when `TIME` is refused), and the last ID. Only entry IDs are kept: the first and last entries' fields are dropped when the reply is read. Size comes from `MEMORY USAGE` (`XINFO STREAM` has none) and is left out when that is refused;
   - from `XINFO GROUPS`: groups, lag (Redis 7.0 and later), pending entries and the last delivered ID;
   - from `XINFO CONSUMERS`: consumers, with pending entries, idle time, and inactive time (Redis 7.2 and later).
 - **Verdicts:**
-  - `stuck`: a consumer that holds pending entries has been idle 30 min or more;
+  - `stuck`: a consumer that holds pending entries has been idle 30 min or more (idle time; a consumer that keeps polling an empty stream resets it);
   - `lagging`: a group's lag is 1,000 or more;
   - `no readers`: no consumer groups;
   - `unbounded`: the oldest entry is over 30 days old and the stream holds 100,000 entries or more;
   - `ok`.
+
+  All that apply are computed; the list shows the first, in the order above, with `+` when there are more, and the details panel lists them all. `tab` moves between the list and the details (groups and consumers). At most 50 streams are read per poll. An optional command refused for this user (`TIME`, `XINFO GROUPS`, `XINFO CONSUMERS`, `MEMORY USAGE`) is left out with a note and not asked again until `r`.
 - **Entries (P2):** `enter` lists a stream's entries with `XREVRANGE … COUNT 100`.
 - **Writes (P3):**
   - `c` claims a consumer's pending entries for another consumer (`XAUTOCLAIM`);
@@ -564,7 +569,7 @@ The TTL, Diff and Hot keys panels are the current views of the same names.
 
 #### 5 Pub/Sub
 
-- **Counts (P1):** `PUBSUB CHANNELS` (the first 1,000), `PUBSUB NUMSUB` for each channel and `PUBSUB NUMPAT`. Payloads aren't read.
+- **Counts (P1):** `PUBSUB CHANNELS` (the first 1,000, most subscribers first; the title says how many there are), `PUBSUB NUMSUB` for each channel in batches of 100, and `PUBSUB NUMPAT`. Payloads aren't read. A refused `NUMSUB` or `NUMPAT` leaves its column out with a note.
 - **Live tail (P2):**
   - `enter` subscribes to the selected channel; `s` asks for a channel or pattern (`SUBSCRIBE` or `PSUBSCRIBE`). The subscription uses a connection of its own.
   - The last 2,000 messages stay in memory, with the message rate. `space` pauses, `c` clears and `/` filters.
@@ -575,7 +580,8 @@ The TTL, Diff and Hot keys panels are the current views of the same names.
 - **Indexes (P1):** shown when `FT._LIST` works (Redis Search or valkey-search). Otherwise the view says the module is missing.
   - Each index, from `FT.INFO`: what it indexes, its prefixes, documents, size, indexing progress and indexing failures.
   - The schema of the selected index.
-  - Features the module lacks are turned off with a reason.
+  - Features the module lacks are turned off with a reason. valkey-search reports no index size, so Size is left out on Valkey; it lists fields by name, Redis Search in creation order.
+  - The list is read when the view is shown and with `r`; it is not polled. A failed read is not retried on its own. `tab` moves between the indexes and the schema.
 - **Queries (P2):** `/` runs `FT.SEARCH … LIMIT 0 50`. `e` shows `FT.EXPLAIN`, `P` runs `FT.PROFILE`, `enter` opens a result document.
 - **Writes (P3):** `C` creates an index from a form (prefix and fields) with `FT.CREATE`. `D` drops one with `FT.DROPINDEX`, never with `DD`, so documents are kept.
 
@@ -662,7 +668,7 @@ A write is sent only when all three checks allow it.
 - **P2 probes:** `COMMAND DOCS GET`.
 - **P3 probes:** `ACL DRYRUN`, where it is allowed.
 - **Turning off:** each missing permission turns off its view or panel, with the reason (rule 3).
-- **ACL user:** the minimal read-only user gains `+slowlog|get +slowlog|len +client|list +xinfo +pubsub|channels +pubsub|numsub +pubsub|numpat +ft._list +ft.info +command|docs +command|info`. For P2 it also needs the read commands for values: `+@read`, and `-keys` to block `KEYS`.
+- **ACL user:** the minimal read-only user gains `+slowlog|get +slowlog|len +client|list +xinfo +pubsub|channels +pubsub|numsub +pubsub|numpat +ft._list +ft.info +command|docs +command|info +time +object|encoding +strlen +hlen +llen +scard +zcard +xlen`. `+config|get` shows the slow log's threshold, but it also lets the user read every setting, `requirepass` and `masterauth` included, so it is left out: without it the panel says the threshold is unknown. For P2 it also needs the read commands for values: `+@read`, and `-keys` to block `KEYS`.
 
 ### Server versions
 
@@ -691,7 +697,7 @@ Redis 6.2 stays tested: it runs everything else.
 - **v0.2:** the TTL view, snapshots and the Diff view, the Hot keys view, Entra ID, preferring replicas.
 - **Quick wins (after v0.2):** `scan --check` with exit codes, Markdown, HTML and CSV reports, provider detection, the server context strip, token-command auth, snapshot retention, `snapshots`, `trend` and the Diff trend column, and `compare` for two standalone instances (planned for v0.3; it needs no change for cluster).
 - **v0.3:** cluster (scan each primary), a per-node view.
-- **Phase 1, read-only views:** seven views and panels, the shared command budget, the key list of a pattern, Analysis (Big keys, Expiry, recommendations), Server (Overview, Clients, Slow log without arguments), Streams, Pub/Sub counts, Search indexes, the new permission probes.
+- **Phase 1, read-only views (built):** seven views and panels, the shared command budget, the key list of a pattern, Analysis (Big keys, Expiry, recommendations), Server (Overview, Clients, Slow log without arguments), Streams, Pub/Sub counts, Search indexes, the new permission probes.
 - **Phase 2, values on screen:** key values and formats, stream entries, the Pub/Sub live tail, Search queries, Slow log arguments, the Monitor panel, the command line for readonly commands.
 - **Phase 3, writes:** the write permission checks, `w` and `conn set --writes`, key edits, bulk expire and delete, `redis-lens expire`, stream claim, ack and trim, publish, index create and drop, kill client, slow log settings, write commands on the command line.
 - **Later:** native ElastiCache IAM (a token command covers it today), Sentinel, SSH tunnels.

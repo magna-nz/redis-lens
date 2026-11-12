@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** v0.2 done on main; waves 6-8 merged (PRs #10-#12); the quick wins (feature ideas 1-7) in progress; then v0.3 (cluster) or the bigger bets below
-**Last updated:** 2026-11-12 (Redis Insight parity: phase 1 wave A built and verified; wave B, the views' contents, starting)
+**Last updated:** 2026-11-12 (Redis Insight parity: phase 1 built and verified on `claude/redis-insight-tui-features-60db8f`; not yet in a PR)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -356,7 +356,15 @@ A gap matrix against Redis Insight v3.8.0, with a three-phase roadmap, is in [do
     - a new connect forgets the last connect's checks, and the view on screen is told when a check turns it off or on;
     - a refused scan check reads fixed text instead of the server's, which named the ACL user (rule 1; older than this work).
   - Not done: the 5 view probes don't take from the budget (5 commands per connect), and the key bar shows the ready keys while a connect runs.
-- **Phase 1, wave B: next.** Server (B1), Patterns key list and Analysis (B2), Streams, Pub/Sub and Search (B3), each in its own session and worktree, then verifier V-B and one PR to `main`.
+- **Phase 1, wave B: done** (same branch). Each piece ran as its own session in its own worktree, and was merged here:
+  - B1 (merged `7fc0aff`): Server Overview (INFO sparklines and rates), Clients (grouped by library and /24 or /64, idle flag, drill-down), Slow log (key names from `COMMAND INFO`, arguments dropped, notes, threshold from `CONFIG GET`).
+  - B3 (merged `897ba0e`): Streams (`XINFO` with stuck, lagging, no readers and unbounded), Pub/Sub counts, Search indexes and schema on Redis 8 and valkey-search.
+  - B2 (merged `40eae26`): the Patterns VERDICT column, the key list (SCAN MATCH filtered by inference, paged with `n`, pipelined metadata), Big keys, Expiry and Recommendations (`src/analysis.rs`). New report field `key_sizes` (top 50 keys, bytes per TTL bucket), approved by the owner; older snapshots still load.
+  - Merge fixes: `d094216` (tests), `da1c0aa` (the runner boxes `Msg`, for clippy).
+  - Verifier V-B blocked on four points, all fixed in `dd7352e` and `de3d4f8`: Search resent a failed `FT._LIST` every tick; the Slow log lost the reason key names were off; some integration tests ran on Redis only (rule 5); spec and status were not updated (this change). Also fixed from its notes: the key list loaded pages without `n`, Streams retried refused commands every 5 s, two unchecked adds, stale replies, Pub/Sub's unused `tab`, a copy of the inference helpers, and an uncapped encoding check.
+  - Left as is, from V-B's notes: Recommendations are recomputed on each draw (cheap); at 80 columns VERDICT cuts long pattern names (owner to decide whether VERDICT should hide first).
+  - Known flake: a test container's port is sometimes not mapped yet (`tests/common/mod.rs:114`); it passes on a rerun.
+- **Next:** a demo against `make demo-up`, then one PR to `main` for the owner to merge. Then phase 2 (values on screen).
 - **Design corrections found while writing the spec:**
   - A stream doesn't store its `MAXLEN`, so Streams shows the age of the oldest entry and an `unbounded` verdict instead of a cap.
   - A pattern's glob can match keys of other patterns, so the key list and bulk actions keep only keys that infer to the selected pattern.
