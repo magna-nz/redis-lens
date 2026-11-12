@@ -43,6 +43,7 @@ fn temp_config(port: u16) -> PathBuf {
         prefer_replica: false,
         provider: None,
         token_command: None,
+        ssh: None,
     };
     let path = temp_dir("diff-it-config").join("config.toml");
     Config {

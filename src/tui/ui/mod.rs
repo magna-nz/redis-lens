@@ -12,7 +12,7 @@ use ratatui::widgets::Block;
 use crate::conn::parse::mask;
 use crate::conn::{ScanTarget, provider};
 use crate::format;
-use crate::model::{PERM_MEMORY, ScanReport, ServerFlavor, ServerInfo};
+use crate::model::{NodeReport, NodeStatus, PERM_MEMORY, ScanReport, ServerFlavor, ServerInfo};
 
 use super::app::views::{Ctx, Owner};
 use super::app::{App, Phase, Screen, Session, View};
@@ -25,6 +25,7 @@ mod diff;
 pub mod help;
 mod hot;
 mod keys;
+mod nodes;
 mod patterns;
 mod pubsub;
 mod search;
@@ -61,9 +62,10 @@ fn screen(area: Rect, view: View) -> [Rect; 3] {
 }
 
 /// List rows a view without panels shows on a screen of `area`: what PgUp and PgDn
-/// move by. Every list view has the same layout: the main panel above the detail
-/// panel, its border, one header row, then the rows. On a view with panels the tab
-/// bar's second row takes one more, which `App` subtracts.
+/// move by. Every list view (Connections, Patterns, TTL, Diff, Hot keys, Big keys,
+/// Nodes) has the same layout: the main panel above the detail panel, its border, one
+/// header row, then the rows. On a view with panels the tab bar's second row takes one
+/// more, which `App` subtracts.
 pub fn list_rows(area: Rect) -> usize {
     let [_, body, _] = screen(area, View::Connections);
     let (main, _) = split_body(body);
@@ -80,6 +82,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Ttl => ttl::draw(frame, body, app),
         Screen::Diff => diff::draw(frame, body, app),
         Screen::HotKeys => hot::draw(frame, body, app),
+        Screen::Nodes => nodes::draw(frame, body, app),
         _ => view_state(frame, body, app, screen),
     }
     footer(frame, foot, app);
@@ -293,6 +296,31 @@ pub fn server_label(s: &ServerInfo) -> String {
     format!("{} {}", flavor(s.flavor), s.version)
 }
 
+/// The cluster summary cut to the header's room: whole when the status on the right
+/// still fits beside it, else cut to leave room for the status (when at least 18 cells
+/// are left for it), else cut to the line (the status gives way, as on any narrow
+/// header). `taken` is the rest of the left part, `right` the status's width.
+fn cluster_summary_fit(summary: &str, w: usize, taken: usize, right: usize) -> String {
+    // Two cells before the summary, two between the parts (see `justify`).
+    let beside = w.saturating_sub(taken + 2 + right + 2);
+    if width(summary) <= beside {
+        return summary.to_string();
+    }
+    if beside >= 18 {
+        return trunc(summary, beside);
+    }
+    trunc(summary, w.saturating_sub(taken + 3).max(8))
+}
+
+/// Whether a cluster scan lost a shard, to draw its summary in amber: the connect
+/// summary ([`ScanTarget::Cluster`]) says a node was unreachable or only the seed could
+/// be read, or the finished report has a node that is not `scanned`.
+pub fn cluster_degraded(summary: &str, nodes: Option<&[NodeReport]>) -> bool {
+    summary.contains("unreachable")
+        || summary.contains("seed node only")
+        || nodes.is_some_and(|n| n.iter().any(|n| n.status != NodeStatus::Scanned))
+}
+
 fn spans_width(spans: &[Span<'_>]) -> usize {
     spans.iter().map(|s| width(&s.content)).sum()
 }
@@ -340,32 +368,6 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Some(s) => {
             let p = &s.profile;
-            let mut left = vec![
-                brand,
-                Span::raw("  "),
-                Span::styled(format!(" {} ", p.env.label()), style::env_badge(p.env)),
-                Span::styled(format!("  {}", p.name), style::fgb()),
-                Span::styled(
-                    format!(
-                        "  {}",
-                        trunc(&p.endpoint.to_string(), if w >= 100 { 30 } else { 18 })
-                    ),
-                    style::dim(),
-                ),
-            ];
-            match &s.target {
-                Some(ScanTarget::Replica(ep)) => left.push(Span::styled(
-                    format!("  replica {}", trunc(&ep.to_string(), 24)),
-                    style::dim(),
-                )),
-                Some(ScanTarget::PrimaryFallback(_)) => left.push(Span::styled(
-                    "  primary (replica unreachable)",
-                    style::amber(),
-                )),
-                _ => {}
-            }
-            left.push(Span::raw("  "));
-            left.push(write_state(p));
             let right = match &s.phase {
                 Phase::Connecting => {
                     vec![Span::styled(format!("{spin} connecting…"), style::amber())]
@@ -386,6 +388,61 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
                 ],
                 Phase::Failed(_) => vec![Span::styled("✗ failed", style::warn())],
             };
+            let cluster = match &s.target {
+                Some(ScanTarget::Cluster(summary)) => Some(summary),
+                _ => None,
+            };
+            let mut left = vec![
+                brand,
+                Span::raw("  "),
+                Span::styled(format!(" {} ", p.env.label()), style::env_badge(p.env)),
+                Span::styled(format!("  {}", p.name), style::fgb()),
+            ];
+            let endpoint = Span::styled(
+                format!(
+                    "  {}",
+                    trunc(&p.endpoint.to_string(), if w >= 100 { 30 } else { 18 })
+                ),
+                style::dim(),
+            );
+            let write = [Span::raw("  "), write_state(p)];
+            let write_w = spans_width(&write);
+            // On a cluster the summary says more than the seed's address: the address
+            // shows only when the whole summary and the status still fit beside it.
+            let show_endpoint = cluster.is_none_or(|summary| {
+                let taken = spans_width(&left) + width(&endpoint.content) + write_w;
+                taken + 2 + width(summary) + 2 + spans_width(&right) <= w
+            });
+            if show_endpoint {
+                left.push(endpoint);
+            }
+            match &s.target {
+                Some(ScanTarget::Replica(ep)) => left.push(Span::styled(
+                    format!("  replica {}", trunc(&ep.to_string(), 24)),
+                    style::dim(),
+                )),
+                Some(ScanTarget::PrimaryFallback(_)) => left.push(Span::styled(
+                    "  primary (replica unreachable)",
+                    style::amber(),
+                )),
+                _ => {}
+            }
+            if let Some(summary) = cluster {
+                let nodes = s.report.as_ref().and_then(|r| r.nodes.as_deref());
+                let taken = spans_width(&left) + write_w;
+                left.push(Span::styled(
+                    format!(
+                        "  {}",
+                        cluster_summary_fit(summary, w, taken, spans_width(&right))
+                    ),
+                    if cluster_degraded(summary, nodes) {
+                        style::amber()
+                    } else {
+                        style::dim()
+                    },
+                ));
+            }
+            left.extend(write);
             (justify(left, right, w), server_line(app, s, w))
         }
     };
@@ -546,17 +603,37 @@ fn tabs(app: &App, w: usize) -> Line<'static> {
 /// highlighted, and the `tab` hint on the right.
 fn panel_tabs(app: &App, w: usize) -> Line<'static> {
     let current = app.screen();
-    let mut left = vec![Span::raw("    ")];
-    for (i, p) in app.view.panels().iter().enumerate() {
-        if i > 0 {
-            left.push(Span::styled("  ·  ", style::track()));
-        }
-        let s = if *p == current {
+    let panels = app.view.panels();
+    let style_of = |p: Screen| {
+        if p == current {
             style::title()
         } else {
             style::dim()
-        };
-        left.push(Span::styled(p.name(), s));
+        }
+    };
+    // Every panel name, spaced out when it fits, closer together when not; when even
+    // that is too wide, only the current panel and where it is in the cycle.
+    let names = |indent: &'static str, sep: &'static str| {
+        let mut out = vec![Span::raw(indent)];
+        for (i, p) in panels.iter().enumerate() {
+            if i > 0 {
+                out.push(Span::styled(sep, style::track()));
+            }
+            out.push(Span::styled(p.name(), style_of(*p)));
+        }
+        out
+    };
+    let mut left = names("    ", "  ·  ");
+    if spans_width(&left) > w {
+        left = names("  ", " · ");
+    }
+    if spans_width(&left) > w {
+        let at = panels.iter().position(|p| *p == current).unwrap_or(0);
+        left = vec![
+            Span::raw("  "),
+            Span::styled(current.name(), style::title()),
+            Span::styled(format!(" · {} of {}", at + 1, panels.len()), style::dim()),
+        ];
     }
     let right = vec![
         Span::styled("tab", style::key()),

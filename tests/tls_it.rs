@@ -185,11 +185,12 @@ fn profile(port: u16, prefer_replica: bool) -> Profile {
         prefer_replica,
         provider: None,
         token_command: None,
+        ssh: None,
     }
 }
 
 /// A connection through redis-lens itself, so through the roots under test.
-async fn lens(server: &TestServer) -> MultiplexedConnection {
+async fn lens(server: &TestServer) -> conn::Connection {
     conn::connect(&profile(server.port, false), &MemoryStore::default())
         .await
         .expect("TLS connection to a server signed by the trusted CA")
@@ -286,7 +287,7 @@ tls_test!(
             );
             let replica_info = info(&mut c).await;
             assert!(replica_info.contains("role:slave"), "valkey={valkey}");
-            let primary_info = info(&mut lens(&primary).await).await;
+            let primary_info = info(&mut lens(&primary).await.into_inner()).await;
             assert!(conn::master_replid(&primary_info).is_some());
             assert_eq!(
                 conn::master_replid(&replica_info),

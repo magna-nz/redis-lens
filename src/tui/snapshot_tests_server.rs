@@ -178,7 +178,7 @@ fn scanned(report: ScanReport, perms: PermissionReport) -> App {
     app.apply(Msg::ScanDone {
         id,
         scan: scan_of(&app),
-        report,
+        report: Box::new(report),
     });
     app
 }

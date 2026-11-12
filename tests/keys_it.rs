@@ -32,6 +32,7 @@ fn profile(port: u16, auth: Auth) -> Profile {
         prefer_replica: false,
         provider: None,
         token_command: None,
+        ssh: None,
     }
 }
 
@@ -39,6 +40,7 @@ async fn connect(server: &common::TestServer) -> MultiplexedConnection {
     conn::connect(&profile(server.port, Auth::None), &MemoryStore::default())
         .await
         .expect("connect")
+        .into_inner()
 }
 
 /// Connects as the ACL user `lens` with password `lens-pw`.
@@ -54,7 +56,10 @@ async fn connect_as_lens(server: &common::TestServer) -> MultiplexedConnection {
             },
         )
         .unwrap();
-    conn::connect(&p, &secrets).await.expect("connect as lens")
+    conn::connect(&p, &secrets)
+        .await
+        .expect("connect as lens")
+        .into_inner()
 }
 
 /// `lens` may do everything but `rules` (say `-memory`), on every key.

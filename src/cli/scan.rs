@@ -16,8 +16,9 @@ use crate::conn::{self, ScanTarget, provider};
 use crate::diff::{self, ReportDiff};
 use crate::format;
 use crate::model::{
-    Env, PERM_FREQ, PatternStats, PermStatus, PermissionReport, Profile, ScanReport,
+    Env, NodeReport, PERM_FREQ, PatternStats, PermStatus, PermissionReport, Profile, ScanReport,
 };
+use crate::report;
 use crate::scan::context::context_summary;
 use crate::scan::{self, ScanOptions, ScanProgress};
 use crate::secrets::{KeyringStore, SecretStore};
@@ -98,10 +99,13 @@ pub async fn scan_profile_with_target(
             profile_name
         )
     })?;
-    let (mut connection, target) = conn::connect_for_scan(profile, secrets).await?;
-    let perms = conn::check_permissions(&mut connection).await;
+    let mut targets = conn::cluster::connect_targets(profile, secrets).await?;
+    let target = targets.target();
+    let perms = targets.check_permissions().await;
     let opts = scan_options(profile, sample, match_glob, max_rate);
-    let report = scan::scan(&profile.name, &mut connection, &opts, &perms, progress).await?;
+    let report =
+        scan::cluster::scan_targets(&profile.name, &mut targets, &opts, &perms, progress, None)
+            .await?;
     Ok((report, perms, target))
 }
 
@@ -139,6 +143,7 @@ pub(crate) fn profile_in(env: crate::model::Env) -> Profile {
         prefer_replica: false,
         provider: None,
         token_command: None,
+        ssh: None,
     }
 }
 
@@ -320,6 +325,10 @@ pub fn render_table_for(
         lines.push(format!("Note:    {d}"));
     }
     lines.push(String::new());
+    if let Some(nodes) = &report.nodes {
+        lines.extend(nodes_table(nodes, width));
+        lines.push(String::new());
+    }
 
     let sizes = report.sizes_available;
     let total_bytes: u64 = report.patterns.iter().filter_map(|p| p.est_bytes).sum();
@@ -399,6 +408,69 @@ pub fn render_table_for(
         .map(|l| truncate(l.trim_end(), width))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The Nodes table of a cluster scan: a row per node, then each node's note (if any) under
+/// the table, wrapped to `width`.
+fn nodes_table(nodes: &[NodeReport], width: usize) -> Vec<String> {
+    let cells: Vec<[String; 8]> = nodes.iter().map(report::node_cells).collect();
+    let heads = &report::NODE_HEADS[..7];
+    let mut w = [0usize; 7];
+    for (i, h) in heads.iter().enumerate() {
+        w[i] = h.chars().count();
+        for c in &cells {
+            w[i] = w[i].max(c[i].chars().count());
+        }
+    }
+    let row = |c: &[&str]| -> String {
+        let mut out = String::new();
+        for (i, v) in c.iter().enumerate() {
+            if i > 0 {
+                out.push_str("  ");
+            }
+            if i < 4 {
+                out.push_str(&format!("{v:<wi$}", wi = w[i]));
+            } else {
+                out.push_str(&format!("{v:>wi$}", wi = w[i]));
+            }
+        }
+        out
+    };
+    let mut lines = vec![row(heads)];
+    for c in &cells {
+        lines.push(row(&c[..7].iter().map(String::as_str).collect::<Vec<_>>()));
+    }
+    for (n, c) in nodes.iter().zip(&cells) {
+        if let Some(note) = n.note.as_deref().filter(|n| !n.is_empty()) {
+            lines.extend(wrap_note(&format!("{}: {note}", c[1]), width));
+        }
+    }
+    lines
+}
+
+/// A `Note:    ` line for `text`, word-wrapped to `width` columns with the continuation
+/// lines under the text.
+pub(super) fn wrap_note(text: &str, width: usize) -> Vec<String> {
+    const LABEL: &str = "Note:    ";
+    let room = width.saturating_sub(LABEL.len()).max(1);
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(l) if l.chars().count() + 1 + word.chars().count() <= room => {
+                l.push(' ');
+                l.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let lead = if i == 0 { LABEL } else { "         " };
+            format!("{lead}{l}")
+        })
+        .collect()
 }
 
 pub async fn run(config: Option<PathBuf>, args: ScanArgs) -> anyhow::Result<()> {
@@ -527,7 +599,8 @@ async fn scan_and_print(
 
     let evals = check::evaluate_all(rules, &report, baseline.as_ref());
     if !rules.is_empty() {
-        let lines = check::render_lines(&evals, args.strict);
+        let mut lines = check::render_lines(&evals, args.strict);
+        lines.extend(check::coverage_line(&report));
         if stdout_taken {
             for l in lines {
                 eprintln!("{l}");
@@ -611,6 +684,7 @@ mod tests {
             match_glob: None,
             server_context: None,
             key_sizes: None,
+            nodes: None,
         }
     }
 
@@ -681,6 +755,41 @@ mod tests {
         );
         assert_eq!(o.sample_limit, 42);
         assert_eq!(o.match_glob.as_deref(), Some("user:*"));
+    }
+
+    #[test]
+    fn cluster_report_prints_target_and_nodes_table() {
+        let r = crate::report::fixtures::cluster_report();
+        let target = ScanTarget::Cluster("cluster · 3 shards · 1 unreachable".into());
+        insta::assert_snapshot!(render_table_for(&r, &perms(), &target, 100));
+    }
+
+    #[test]
+    fn nodes_table_fits_a_narrow_terminal() {
+        let r = crate::report::fixtures::cluster_report();
+        let t = render_table_for(&r, &perms(), &ScanTarget::Primary, 60);
+        assert!(t.contains("SLOTS"), "{t}");
+        for l in t.lines() {
+            assert!(l.chars().count() <= 60, "{l}");
+        }
+        // Failed and partial nodes stay visible, with their notes.
+        assert!(t.contains("failed") && t.contains("partial"), "{t}");
+        assert!(t.contains("could not be connected"), "{t}");
+    }
+
+    #[test]
+    fn standalone_report_has_no_nodes_table() {
+        let r = report(vec![pattern("a:{id}", 10, None)], false, "noeviction");
+        assert!(!render_table(&r, &perms(), 100).contains("SLOTS"));
+    }
+
+    #[test]
+    fn wrap_note_breaks_at_words_and_aligns() {
+        assert_eq!(
+            wrap_note("aaa bbb ccc ddd", 9 + 7),
+            ["Note:    aaa bbb", "         ccc ddd"]
+        );
+        assert_eq!(wrap_note("", 60), Vec::<String>::new());
     }
 
     #[test]
@@ -771,6 +880,7 @@ mod tests {
                 bytes: None,
                 ttl: crate::model::Ttl::Persistent,
                 lfu_freq: Some(200 - i),
+                node: None,
             })
             .collect();
         let t = render_table(&r, &perms(), 100);

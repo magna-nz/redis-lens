@@ -17,7 +17,7 @@ expression: t.backend()
 "│     u│→ ← l h        Expand or collapse the selected group            │ng    │"
 "└──────│enter          Fold a group, or list a pattern's keys           │──────┘"
 "┌─ cach│/              Filter patterns by name                          │3.6G ─┐"
-"│ SAMPL│esc            Clear the filter                                 │      │"
+"│ SAMPL│esc            Clear the filter, or show all nodes again        │      │"
 "│ cache│o              Sort by memory, keys, avg size, no-TTL % or name │      │"
 "│ cache│y              Copy the selected pattern to the clipboard       │      │"
 "│ cache│Y              Copy a redis-cli --scan command for the pattern  │      │"

@@ -1,0 +1,52 @@
+---
+source: src/tui/snapshot_tests_cluster.rs
+assertion_line: 233
+expression: snap
+---
+80x24:
+ redis-lens 0.1.0    PROD   prod-cache-01  cluster · 3 shards · 1 u…  read-only 
+ Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   
+  0   1   2 Analysis   3   4   5   6                                            
+    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  tab next panel 
+┌─ Nodes ─── 3 shards · 1 failed · 1 partial · slot order · enter shows a no… ─┐
+│ SLOTS        ENDPOINT         ROLE     STATUS      KEYS  SAMPLED   MEMORY    │
+│ 0-5460       10.0.1.11:6379   primary  scanned    3.17M      40K     5.9G    │
+│ 5461-10922   10.0.1.12:6379   primary  ▲ partial  2.77M     7.0K     5.2G    │
+│ 10923-16383  10.0.1.13:6379   primary  ✗ failed       —        —        —    │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌─ 10.0.1.11:6379 ───────────────────────────────────────── primary · scanned ─┐
+│ NODE                                                                         │
+│ ID        a1f3c9e27b4d6e8f0a2c4e6b8d0f1a3c5e7b9d21                           │
+│ Slots     0-5460 (5,461 slots)                                               │
+│ Server    Redis 7.4.2 · 3,168,000 keys · 5.9G used / 8.0G                    │
+│ Sampled   40,000 keys · 9 patterns                                           │
+│ enter shows this node's own patterns on 1 Patterns; esc there goes back.     │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ ↑↓ Move   tab Panel   enter Patterns   r Rescan   0-6 View   ? Help   q Quit   
+
+60x20:
+ redis-lens 0.1.0    PROD   prod-cache-01  cluster…  read-on
+ Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   
+  0   1   2 Analysis   3   4   5   6                        
+  TTL · Diff · Hot keys · Big keys · Expiry · Nodes         
+┌─ Nodes ─── 3 shards · 1 failed · 1 partial · slot orde… ─┐
+│ SLOTS        ENDPOINT         ROLE     STATUS      KEYS  │
+│ 0-5460       10.0.1.11:6379   primary  scanned    3.17M  │
+│ 5461-10922   10.0.1.12:6379   primary  ▲ partial  2.77M  │
+└──────────────────────────────────────────────────────────┘
+┌─ 10.0.1.11:6379 ───────────────────── primary · scanned ─┐
+│ NODE                                                     │
+│ ID        a1f3c9e27b4d6e8f0a2c4e6b8d0f1a3c5e7b9d21       │
+│ Slots     0-5460 (5,461 slots)                           │
+│ Server    Redis 7.4.2 · 3,168,000 keys · 5.9G used / 8.0G│
+│ Sampled   40,000 keys · 9 patterns                       │
+│ enter shows this node's own patterns on 1 Patterns; esc …│
+│                                                          │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+ ↑↓ Move   tab Panel   enter Patterns   r Rescan   0-6 View

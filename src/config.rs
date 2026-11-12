@@ -160,6 +160,7 @@ mod tests {
             prefer_replica: false,
             provider: None,
             token_command: None,
+            ssh: None,
         }
     }
 
@@ -270,6 +271,59 @@ mod tests {
         let p = c.get("x").unwrap();
         assert_eq!(p.provider, None);
         assert_eq!(p.token_command, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The bastion round-trips through the file with every field, and the file holds no
+    /// user: the SSH username lives in the keychain.
+    #[test]
+    fn ssh_tunnel_round_trip() {
+        use crate::model::SshTunnel;
+        let dir = temp_dir("ssh");
+        let path = dir.join("config.toml");
+        let mut full = profile("behind", 6379);
+        full.ssh = Some(SshTunnel {
+            host: "bastion.example.com".into(),
+            port: Some(2222),
+            identity_file: Some("/home/me/.ssh/id_ed25519".into()),
+            known_hosts_file: Some("/home/me/Library/Application Support/kh".into()),
+        });
+        let mut v6 = profile("v6", 6380);
+        v6.ssh = Some(SshTunnel {
+            host: "2001:db8::1".into(),
+            port: None,
+            identity_file: None,
+            known_hosts_file: None,
+        });
+        let mut c = Config::default();
+        c.add(full, false).unwrap();
+        c.add(v6, false).unwrap();
+        c.add(profile("plain", 1), false).unwrap();
+        c.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("[profile.ssh]").count(), 2, "{text}");
+        assert!(text.contains(r#"host = "bastion.example.com""#), "{text}");
+        assert!(text.contains("port = 2222"), "{text}");
+        assert!(
+            text.contains(r#"known_hosts_file = "/home/me/Library/Application Support/kh""#),
+            "{text}"
+        );
+        for word in ["user", "password", "secret"] {
+            assert!(!text.contains(word), "{word} in {text}");
+        }
+        let back = Config::load(&path).unwrap();
+        assert_eq!(back, c);
+        assert_eq!(back.get("plain").unwrap().ssh, None);
+        // Written by hand, with only the host.
+        std::fs::write(
+            &path,
+            "[[profile]]\nname = \"x\"\n[profile.endpoint]\nhost = \"10.0.0.5\"\nport = 6379\n[profile.ssh]\nhost = \"jump\"\n",
+        )
+        .unwrap();
+        let p = Config::load(&path).unwrap().get("x").unwrap().clone();
+        let t = p.ssh.unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("jump", None));
+        assert_eq!((t.identity_file, t.known_hosts_file), (None, None));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

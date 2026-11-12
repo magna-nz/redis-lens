@@ -87,6 +87,17 @@ fn dash() -> String {
 
 fn side_line(tag: &str, label: &str, s: &diff::CompareSummary) -> String {
     let fraction = s.sample_fraction.map_or_else(dash, format::percent);
+    let label = match s.shards {
+        None => label.to_string(),
+        Some(n) => {
+            let plural = if n == 1 { "" } else { "s" };
+            let unfinished = match s.shards_unfinished {
+                0 => String::new(),
+                u => format!(" · {u} not fully scanned"),
+            };
+            format!("{label} (cluster · {n} shard{plural}{unfinished})")
+        }
+    };
     let mut out = format!(
         "{tag}  {label}: sampled {} of {} keys ({fraction}) · {}",
         format::grouped(s.sampled_keys),
@@ -365,6 +376,7 @@ mod tests {
             match_glob: None,
             server_context: None,
             key_sizes: None,
+            nodes: None,
         }
     }
 
@@ -565,5 +577,28 @@ mod tests {
         let a = parse(&["--left-file", "a.json", "--right-file", "b.json"]);
         assert_eq!(a.left_file.as_deref(), Some(Path::new("a.json")));
         assert_eq!(a.right_file.as_deref(), Some(Path::new("b.json")));
+    }
+
+    #[test]
+    fn header_shows_the_cluster_shard_count() {
+        let (staging, mut prod) = staging_and_prod();
+        let mut cluster = crate::report::fixtures::cluster_report();
+        cluster.profile = "prod".into();
+        prod.nodes = cluster.nodes;
+        let c = diff::compare(&staging, &prod);
+        let t = render_compare(&c, "staging", "prod", 140);
+        let lines: Vec<&str> = t.lines().collect();
+        assert!(lines[0].starts_with("L  staging: sampled"), "{t}");
+        assert!(
+            lines[1].starts_with("R  prod (cluster · 3 shards · 2 not fully scanned): sampled"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn standalone_header_is_unchanged() {
+        let (staging, prod) = staging_and_prod();
+        let t = render_compare(&diff::compare(&staging, &prod), "staging", "prod", 140);
+        assert!(!t.contains("cluster"), "{t}");
     }
 }

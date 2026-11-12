@@ -359,6 +359,7 @@ mod tests {
                 bytes: Some(1024),
                 ttl: crate::model::Ttl::Persistent,
                 lfu_freq: None,
+                node: None,
             })
             .collect();
         p

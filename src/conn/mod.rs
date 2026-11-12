@@ -3,6 +3,7 @@
 //! Owner: connections.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use redis::aio::{ConnectionLike, MultiplexedConnection};
@@ -17,9 +18,11 @@ use crate::model::{
 };
 use crate::secrets::{SecretError, SecretStore};
 
+pub mod cluster;
 pub mod docker;
 pub mod parse;
 pub mod provider;
+pub mod ssh;
 mod tls;
 pub mod token;
 
@@ -42,6 +45,9 @@ pub enum ConnError {
     Redis(#[from] redis::RedisError),
     #[error("Docker: {0}")]
     Docker(String),
+    /// The SSH tunnel could not be opened. Never holds ssh's own output.
+    #[error(transparent)]
+    Ssh(#[from] ssh::SshError),
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -58,9 +64,194 @@ const PROBE_KEY: &str = "redis-lens:probe";
 pub async fn connect(
     profile: &Profile,
     secrets: &dyn SecretStore,
-) -> Result<MultiplexedConnection, ConnError> {
+) -> Result<Connection, ConnError> {
+    let route = Route::for_profile(profile, secrets).await?;
     let auth = ResolvedAuth::new(profile, secrets).await?;
-    auth.open(&profile.endpoint).await
+    auth.open(&route, &profile.endpoint).await
+}
+
+/// How connections reach servers: directly, or through the profile's SSH bastion.
+pub enum Route {
+    Direct,
+    /// Every endpoint, the profile's own and every announced node or replica, is reached
+    /// through a local forward over this bastion (see [`ssh`]).
+    Ssh(ssh::Bastion),
+}
+
+impl Route {
+    /// The route for `profile`: through its SSH bastion when it has one (reading the SSH
+    /// username from the keychain), otherwise direct. Starts no forward yet.
+    pub async fn for_profile(
+        profile: &Profile,
+        secrets: &dyn SecretStore,
+    ) -> Result<Arc<Self>, ConnError> {
+        Ok(Arc::new(match &profile.ssh {
+            None => Self::Direct,
+            Some(tunnel) => Self::Ssh(ssh::Bastion::new(profile, tunnel, secrets)?),
+        }))
+    }
+
+    /// The addresses to connect to for `ep`, fixed once, and whether `ep` counts as on
+    /// the same machine as whatever reaches it. Direct: `ep`'s host resolved here
+    /// ([`resolve`]). Through SSH: the local end of a forward to `ep` (started when
+    /// first needed), with `local` judged from the bastion's side.
+    async fn reach(&self, ep: &Endpoint) -> Result<Resolved, Unusable> {
+        match self {
+            Self::Direct => resolve(&ep.host, ep.port).await.map_err(Unusable::Resolve),
+            Self::Ssh(bastion) => bastion.reach(ep).await,
+        }
+    }
+
+    /// Whether `ep` is on the same machine as whatever reaches it, without starting a
+    /// forward: direct, `ep`'s host resolved here (a name that no longer resolves counts
+    /// as remote, which only restricts); through SSH, `ep`'s host is loopback by name, as
+    /// seen from the bastion. The same judgement as [`Self::reach`]'s `local`.
+    async fn is_local(&self, ep: &Endpoint) -> bool {
+        match self {
+            Self::Direct => resolve(&ep.host, ep.port).await.is_ok_and(|r| r.local),
+            Self::Ssh(_) => is_loopback_name(&ep.host),
+        }
+    }
+
+    fn is_ssh(&self) -> bool {
+        matches!(self, Self::Ssh(_))
+    }
+}
+
+/// A connection to one server, holding on to its [`Route`] so an SSH forward it goes
+/// through stays open while the connection is in use. Use it as a
+/// [`MultiplexedConnection`] (it derefs to one and implements [`ConnectionLike`]).
+#[derive(Clone)]
+pub struct Connection {
+    conn: MultiplexedConnection,
+    _route: Arc<Route>,
+    /// An `INFO server` reply this connection already received, kept to answer the next
+    /// `INFO server` instead of sending it again (see [`Self::keep_info_server`]).
+    /// Shared by clones; taken once.
+    info_server: Arc<std::sync::Mutex<Option<(std::time::Instant, redis::Value)>>>,
+}
+
+/// How long a kept `INFO server` reply may answer the next `INFO server`.
+const INFO_SERVER_REUSE: Duration = Duration::from_secs(10);
+
+impl Connection {
+    fn new(conn: MultiplexedConnection, route: &Arc<Route>) -> Self {
+        Self {
+            conn,
+            _route: Arc::clone(route),
+            info_server: Arc::default(),
+        }
+    }
+
+    /// Keep `reply`, an `INFO server` reply just read on this connection, so that the
+    /// next `INFO server` sent through it (within [`INFO_SERVER_REUSE`]) is answered
+    /// with it and not sent. Cluster detection reads `INFO server`, and the scan's first
+    /// command is `INFO server` again: this saves the server one command per scan.
+    fn keep_info_server(&self, reply: redis::Value) {
+        *self
+            .info_server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((std::time::Instant::now(), reply));
+    }
+
+    /// The kept reply, when `cmd` is `INFO server` and the reply is fresh (see
+    /// [`take_kept_info`]).
+    fn take_info_server(&self, cmd: &redis::Cmd) -> Option<redis::Value> {
+        let mut kept = self
+            .info_server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        take_kept_info(&mut kept, cmd, std::time::Instant::now())
+    }
+
+    /// The bare connection. Only for direct routes: through SSH the forward closes once
+    /// every [`Connection`] that uses it is dropped.
+    pub fn into_inner(self) -> MultiplexedConnection {
+        self.conn
+    }
+}
+
+/// Take the kept `INFO server` reply when `cmd` is `INFO server` and the reply is at
+/// most [`INFO_SERVER_REUSE`] old at `now`: it answers one command at most. A stale
+/// reply is dropped; any other command leaves a fresh one in place.
+fn take_kept_info(
+    kept: &mut Option<(std::time::Instant, redis::Value)>,
+    cmd: &redis::Cmd,
+    now: std::time::Instant,
+) -> Option<redis::Value> {
+    let at = kept.as_ref()?.0;
+    if now.saturating_duration_since(at) > INFO_SERVER_REUSE {
+        *kept = None;
+        return None;
+    }
+    if !is_info_server(cmd) {
+        return None;
+    }
+    kept.take().map(|(_, v)| v)
+}
+
+/// Says only which kind of route the connection uses: nothing about the server, the
+/// credentials or the forward.
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let route = match self._route.as_ref() {
+            Route::Direct => "direct",
+            Route::Ssh(_) => "ssh",
+        };
+        f.debug_struct("Connection").field("route", &route).finish()
+    }
+}
+
+impl std::ops::Deref for Connection {
+    type Target = MultiplexedConnection;
+    fn deref(&self) -> &MultiplexedConnection {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for Connection {
+    fn deref_mut(&mut self) -> &mut MultiplexedConnection {
+        &mut self.conn
+    }
+}
+
+/// `cmd` is exactly `INFO server` (any case).
+fn is_info_server(cmd: &redis::Cmd) -> bool {
+    let mut args = cmd.args_iter().map(|a| match a {
+        redis::Arg::Simple(b) => Some(b),
+        _ => None,
+    });
+    matches!(
+        (args.next(), args.next(), args.next()),
+        (Some(Some(a)), Some(Some(b)), None)
+            if a.eq_ignore_ascii_case(b"INFO") && b.eq_ignore_ascii_case(b"server")
+    )
+}
+
+impl ConnectionLike for Connection {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        cmd: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        if let Some(reply) = self.take_info_server(cmd) {
+            return Box::pin(async move { Ok(reply) });
+        }
+        self.conn.req_packed_command(cmd)
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        cmd: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        self.conn.req_packed_commands(cmd, offset, count)
+    }
+
+    fn get_db(&self) -> i64 {
+        self.conn.get_db()
+    }
 }
 
 /// Run the profile's token command (see [`token`]) on a blocking thread and return the
@@ -138,9 +329,19 @@ impl ResolvedAuth {
         })
     }
 
-    /// Connect to `ep` with these credentials, the endpoint's TLS setting and the database.
-    async fn open(&self, ep: &Endpoint) -> Result<MultiplexedConnection, ConnError> {
-        open(ep, self.settings.clone(), &self.config).await
+    /// Connect to `ep` over `route` with these credentials, the endpoint's TLS setting
+    /// and the database. Direct, redis-rs resolves the host; through SSH the connection
+    /// goes to the forward's local end, and TLS still checks `ep`'s host name.
+    async fn open(&self, route: &Arc<Route>, ep: &Endpoint) -> Result<Connection, ConnError> {
+        let c = match route.as_ref() {
+            Route::Direct => open(ep, self.settings.clone(), &self.config).await?,
+            Route::Ssh(_) => {
+                let reached = route.reach(ep).await.map_err(Unusable::into_conn_error)?;
+                let config = self.config.clone().set_dns_resolver(Pinned(reached.addrs));
+                open(ep, self.settings.clone(), &config).await?
+            }
+        };
+        Ok(Connection::new(c, route))
     }
 }
 
@@ -211,6 +412,9 @@ pub enum ScanTarget {
     Replica(Endpoint),
     /// `prefer_replica` was set but no replica could be used; the reason is shown.
     PrimaryFallback(String),
+    /// A cluster, one node per shard. Holds [`cluster::ClusterTargets::summary`]: fixed
+    /// text and counts only, never a server's reply.
+    Cluster(String),
 }
 
 impl std::fmt::Display for ScanTarget {
@@ -219,6 +423,7 @@ impl std::fmt::Display for ScanTarget {
             Self::Primary => write!(f, "primary"),
             Self::Replica(ep) => write!(f, "replica {ep}"),
             Self::PrimaryFallback(why) => write!(f, "primary (replica unreachable: {why})"),
+            Self::Cluster(summary) => write!(f, "{summary}"),
         }
     }
 }
@@ -274,7 +479,10 @@ pub fn parse_replication(info: &str) -> Replication {
 ///
 /// An IP address is returned in its normal form, without brackets; the unspecified
 /// addresses (`0.0.0.0`, `::`) are refused. Anything else must look like a host name:
-/// dot-separated labels of ASCII letters, digits, `-` and `_`.
+/// dot-separated labels of ASCII letters, digits, `-` and `_`, the last one not
+/// numeric. That refuses the shorthand address forms a resolver may accept (`127.1`,
+/// `0`, `2130706433`, `0x7f000001`): behind an SSH bastion they would reach the bastion
+/// itself without being recognised as loopback by name.
 fn replica_host(ip: &str) -> Option<String> {
     let ip = ip.trim();
     let bare = ip
@@ -289,7 +497,14 @@ fn replica_host(ip: &str) -> Option<String> {
             && l.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     };
-    (bare.len() <= 253 && bare.split('.').all(label_ok)).then(|| bare.to_string())
+    // No top-level domain is all digits (RFC 3696 §2), and `0x…` is a hex number.
+    let numeric = |l: &str| {
+        let hex = l.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("0x"))
+            && l[2..].bytes().all(|b| b.is_ascii_hexdigit());
+        hex || l.bytes().all(|b| b.is_ascii_digit())
+    };
+    let last = bare.rsplit('.').next().unwrap_or_default();
+    (bare.len() <= 253 && bare.split('.').all(label_ok) && !numeric(last)).then(|| bare.to_string())
 }
 
 /// Loopback by name alone: `localhost` (and `*.localhost`), `127.0.0.0/8`, `::1`, and
@@ -368,6 +583,23 @@ enum Unusable {
     Conn(ConnError),
 }
 
+impl Unusable {
+    /// For callers that need a [`ConnError`]: only [`Route::reach`]'s failures
+    /// (`Resolve`, `Conn`) are expected here; the others get a fixed text.
+    fn into_conn_error(self) -> ConnError {
+        match self {
+            Self::Conn(e) => e,
+            Self::Resolve(e) => ConnError::Redis(redis::RedisError::from(e)),
+            Self::NotAReplica => ConnError::Redis(redis::RedisError::from(std::io::Error::other(
+                "not a replica of this primary",
+            ))),
+            Self::WontSendCredentials => ConnError::Redis(redis::RedisError::from(
+                std::io::Error::other("credentials may not be sent to this address"),
+            )),
+        }
+    }
+}
+
 impl From<ConnError> for Unusable {
     fn from(e: ConnError) -> Self {
         Self::Conn(e)
@@ -396,14 +628,13 @@ async fn info_replication(c: &mut MultiplexedConnection) -> Result<String, redis
 /// connection, which is the one returned.
 async fn verified_replica(
     auth: &ResolvedAuth,
+    route: &Arc<Route>,
     db: u32,
     primary: &Endpoint,
     primary_replid: &str,
     ep: &Endpoint,
-) -> Result<MultiplexedConnection, Unusable> {
-    let candidate = resolve(&ep.host, ep.port)
-        .await
-        .map_err(Unusable::Resolve)?;
+) -> Result<Connection, Unusable> {
+    let candidate = route.reach(ep).await?;
     let pinned =
         |config: AsyncConnectionConfig| config.set_dns_resolver(Pinned(candidate.addrs.clone()));
 
@@ -417,7 +648,7 @@ async fn verified_replica(
                     .query_async::<()>(&mut probe)
                     .await?;
             }
-            return Ok(probe);
+            return Ok(Connection::new(probe, route));
         }
         Ok(_) => return Err(Unusable::NotAReplica),
         Err(e) if auth.sends_credentials && e.code() == Some("NOAUTH") => {}
@@ -425,18 +656,16 @@ async fn verified_replica(
     }
     drop(probe);
 
-    // A primary whose name no longer resolves counts as remote, which only restricts.
-    let primary_local = match resolve(&primary.host, primary.port).await {
-        Ok(r) => r.local,
-        Err(_) => false,
-    };
+    // Both judged the same way: from this machine when direct, from the bastion through
+    // SSH, where a forward's local end says nothing about where the server is.
+    let primary_local = route.is_local(primary).await;
     if !may_send_credentials(primary_local, candidate.local) {
         return Err(Unusable::WontSendCredentials);
     }
     let mut c = open(ep, auth.settings.clone(), &pinned(auth.config.clone())).await?;
     let info = info_replication(&mut c).await?;
     if is_replica_of(&info, primary_replid) {
-        Ok(c)
+        Ok(Connection::new(c, route))
     } else {
         Err(Unusable::NotAReplica)
     }
@@ -462,21 +691,44 @@ pub fn master_replid(info: &str) -> Option<String> {
 pub async fn connect_for_scan(
     profile: &Profile,
     secrets: &dyn SecretStore,
-) -> Result<(MultiplexedConnection, ScanTarget), ConnError> {
+) -> Result<(Connection, ScanTarget), ConnError> {
+    let route = Route::for_profile(profile, secrets).await?;
     let auth = ResolvedAuth::new(profile, secrets).await?;
-    let mut primary = auth.open(&profile.endpoint).await?;
+    connect_for_scan_with(profile, &route, &auth).await
+}
+
+/// [`connect_for_scan`] with the route and credentials already resolved, so a caller
+/// (cluster discovery) can reuse them for further connections.
+async fn connect_for_scan_with(
+    profile: &Profile,
+    route: &Arc<Route>,
+    auth: &ResolvedAuth,
+) -> Result<(Connection, ScanTarget), ConnError> {
+    let primary = auth.open(route, &profile.endpoint).await?;
     if !profile.prefer_replica {
         return Ok((primary, ScanTarget::Primary));
     }
-    let fallback = |c, why: String| Ok((c, ScanTarget::PrimaryFallback(why)));
+    Ok(replica_step(profile, route, auth, primary).await)
+}
+
+/// The `prefer_replica` step of [`connect_for_scan`] on an open connection to the
+/// profile's own server (`primary`), which it reuses: returned as is when it is already
+/// a replica, or as the fallback; otherwise the verified replica's connection.
+async fn replica_step(
+    profile: &Profile,
+    route: &Arc<Route>,
+    auth: &ResolvedAuth,
+    mut primary: Connection,
+) -> (Connection, ScanTarget) {
+    let fallback = |c, why: String| (c, ScanTarget::PrimaryFallback(why));
     let info = match info_replication(&mut primary).await {
         Ok(i) => i,
         Err(e) if is_noperm(&e) => return fallback(primary, noperm_text("INFO replication")),
         Err(e) => return fallback(primary, format!("INFO replication: {}", server_message(&e))),
     };
     match parse_replication(&info) {
-        Replication::Replica => Ok((primary, ScanTarget::Replica(profile.endpoint.clone()))),
-        Replication::Unknown => Ok((primary, ScanTarget::Primary)),
+        Replication::Replica => (primary, ScanTarget::Replica(profile.endpoint.clone())),
+        Replication::Unknown => (primary, ScanTarget::Primary),
         Replication::Master { online } => {
             let Some((host, port)) = online.into_iter().next() else {
                 return fallback(primary, "no online replica".to_string());
@@ -493,27 +745,39 @@ pub async fn connect_for_scan(
                 port,
                 tls: profile.endpoint.tls,
             };
-            let attempt = verified_replica(&auth, profile.db, &profile.endpoint, &replid, &ep);
+            // Through SSH the candidate's forward is started first, within ssh's own
+            // readiness limit, so the 2 s below covers the check, not ssh's login.
+            if route.is_ssh()
+                && let Err(why) = route.reach(&ep).await
+            {
+                return fallback(primary, unusable_reason(&ep, why, true));
+            }
+            let attempt =
+                verified_replica(auth, route, profile.db, &profile.endpoint, &replid, &ep);
             match tokio::time::timeout(REPLICA_TIMEOUT, attempt).await {
-                Ok(Ok(c)) => Ok((c, ScanTarget::Replica(ep))),
-                Ok(Err(Unusable::NotAReplica)) => fallback(
-                    primary,
-                    format!("replica at {ep} is not a replica of this primary"),
-                ),
-                Ok(Err(Unusable::WontSendCredentials)) => fallback(
-                    primary,
-                    format!(
-                        "replica at {ep} needs credentials to be verified and is a loopback \
-                         address that is not the primary's host"
-                    ),
-                ),
-                Ok(Err(Unusable::Resolve(e))) => {
-                    fallback(primary, format!("{ep}: could not resolve the host: {e}"))
-                }
-                Ok(Err(Unusable::Conn(e))) => fallback(primary, format!("{ep}: {e}")),
+                Ok(Ok(c)) => (c, ScanTarget::Replica(ep)),
+                Ok(Err(why)) => fallback(primary, unusable_reason(&ep, why, route.is_ssh())),
                 Err(_) => fallback(primary, format!("{ep}: timed out")),
             }
         }
+    }
+}
+
+/// The `PrimaryFallback` reason for a replica candidate at `ep` that can't be used.
+/// `ssh`: the route goes through a bastion, where loopback is judged.
+fn unusable_reason(ep: &Endpoint, why: Unusable, ssh: bool) -> String {
+    match why {
+        Unusable::NotAReplica => format!("replica at {ep} is not a replica of this primary"),
+        Unusable::WontSendCredentials if ssh => format!(
+            "replica at {ep} needs credentials to be verified and is a loopback address, as \
+             seen from the SSH bastion, that is not the primary's host"
+        ),
+        Unusable::WontSendCredentials => format!(
+            "replica at {ep} needs credentials to be verified and is a loopback address that \
+             is not the primary's host"
+        ),
+        Unusable::Resolve(e) => format!("{ep}: could not resolve the host: {e}"),
+        Unusable::Conn(e) => format!("{ep}: {e}"),
     }
 }
 
@@ -553,12 +817,14 @@ fn server_message(e: &redis::RedisError) -> String {
 }
 
 /// `missing_key`: the probe key does not exist, so a plain `ERR` (such as
-/// `ERR no such key`) says the command ran. A `NOPERM` reads [`noperm_text`] for
-/// `command`, never the server's text.
+/// `ERR no such key`) says the command ran, and so does a cluster redirect (see
+/// [`is_redirect`]). A `NOPERM` reads [`noperm_text`] for `command`, never the
+/// server's text.
 fn classify(command: &str, r: Result<(), redis::RedisError>, missing_key: bool) -> PermStatus {
     match r {
         Ok(()) => PermStatus::Allowed,
         Err(e) if is_noperm(&e) => PermStatus::Denied(noperm_text(command)),
+        Err(e) if missing_key && is_redirect(&e) => PermStatus::Allowed,
         Err(e)
             if missing_key
                 && e.kind() == redis::ErrorKind::Server(ServerErrorKind::ResponseError)
@@ -570,6 +836,16 @@ fn classify(command: &str, r: Result<(), redis::RedisError>, missing_key: bool) 
         }
         Err(e) => PermStatus::Denied(server_message(&e)),
     }
+}
+
+/// `MOVED` or `ASK`: on a cluster node that doesn't own the probe key's slot (an empty
+/// shard, say). Redis and Valkey check ACLs, key patterns included, before they
+/// redirect, so the reply says the command would have been allowed.
+fn is_redirect(e: &redis::RedisError) -> bool {
+    matches!(
+        e.kind(),
+        redis::ErrorKind::Server(ServerErrorKind::Moved | ServerErrorKind::Ask)
+    )
 }
 
 fn policy_from_info(info: &str) -> Option<String> {
@@ -605,12 +881,16 @@ pub async fn check_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Permis
 
     // TYPE and PTTL
     let ty: Result<String, _> = redis::cmd("TYPE").arg(&probe_key).query_async(conn).await;
-    let type_ttl = match ty {
-        Ok(_) => {
-            let r: Result<i64, _> = redis::cmd("PTTL").arg(&probe_key).query_async(conn).await;
-            classify("PTTL", r.map(|_| ()), missing)
-        }
-        Err(e) => classify("TYPE", Err(e), missing),
+    // A redirect says TYPE is allowed; PTTL still needs its own check.
+    let type_ran = match &ty {
+        Ok(_) => true,
+        Err(e) => missing && is_redirect(e),
+    };
+    let type_ttl = if type_ran {
+        let r: Result<i64, _> = redis::cmd("PTTL").arg(&probe_key).query_async(conn).await;
+        classify("PTTL", r.map(|_| ()), missing)
+    } else {
+        classify("TYPE", ty.map(|_| ()), missing)
     };
 
     // MEMORY USAGE
@@ -933,6 +1213,64 @@ mod tests {
         assert!(!may_send_credentials(false, true));
     }
 
+    /// Shorthand address forms are refused as announced hosts: behind a bastion, ssh
+    /// would read `127.1` as 127.0.0.1 there, while the name check sees a remote host.
+    #[test]
+    fn announced_hosts_in_shorthand_address_form_are_refused() {
+        for host in [
+            "127.1",
+            "127.0.1",
+            "0",
+            "2130706433",
+            "0x7f000001",
+            "0X7F.1",
+            "0X7F000001",
+            "a.0Xff",
+            "017700000001",
+            "10.1",
+            "host.123",
+            "a.0x",
+            "cache.0xdb",
+        ] {
+            assert_eq!(replica_host(host), None, "{host}");
+        }
+        for (host, want) in [
+            ("127.0.0.1", "127.0.0.1"),
+            ("[::1]", "::1"),
+            ("10.0.0.5", "10.0.0.5"),
+            ("redis-1.internal", "redis-1.internal"),
+            ("LOCALHOST", "LOCALHOST"),
+            ("cache.db0x", "cache.db0x"),
+            ("123.example", "123.example"),
+            ("node-0", "node-0"),
+        ] {
+            assert_eq!(replica_host(host).as_deref(), Some(want), "{host}");
+        }
+        for host in ["0.0.0.0", "::", "localhost.", "bad host", ""] {
+            assert_eq!(replica_host(host), None, "{host:?}");
+        }
+    }
+
+    /// Loopback by name ignores case and recognises IPv4-mapped loopback.
+    #[test]
+    fn loopback_by_name_ignores_case_and_sees_mapped_addresses() {
+        for host in [
+            "LOCALHOST",
+            "LocalHost",
+            "DB.LOCALHOST",
+            "localhost.",
+            "::ffff:127.0.0.1",
+            "::FFFF:127.0.0.9",
+            "0.0.0.0",
+            "::",
+        ] {
+            assert!(is_loopback_name(host), "{host}");
+        }
+        for host in ["::ffff:10.0.0.5", "localhost.example", "notlocalhost"] {
+            assert!(!is_loopback_name(host), "{host}");
+        }
+    }
+
     #[tokio::test]
     async fn resolution_decides_what_is_on_this_machine() {
         for host in [
@@ -970,6 +1308,460 @@ mod tests {
         }
     }
 
+    fn ssh_route(host: &str) -> Route {
+        let t = ssh::tests::tunnel(host);
+        let p = ssh::tests::profile(Some(t.clone()));
+        Route::Ssh(ssh::Bastion::new(&p, &t, &crate::secrets::MemoryStore::default()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_profile_with_a_bastion_gets_an_ssh_route() {
+        let store = crate::secrets::MemoryStore::default();
+        let direct = ssh::tests::profile(None);
+        let r = Route::for_profile(&direct, &store).await.unwrap();
+        assert!(matches!(r.as_ref(), Route::Direct));
+        let behind = ssh::tests::profile(Some(ssh::tests::tunnel("b.example")));
+        let r = Route::for_profile(&behind, &store).await.unwrap();
+        assert!(r.is_ssh());
+        // A bad bastion fails before anything is started or read.
+        let bad = ssh::tests::profile(Some(ssh::tests::tunnel("-oProxyCommand=x")));
+        let Err(e) = Route::for_profile(&bad, &store).await else {
+            panic!("expected an error");
+        };
+        assert!(
+            matches!(e, ConnError::Ssh(ssh::SshError::InvalidHost)),
+            "{e:?}"
+        );
+        let Err(e) = connect(&bad, &store).await else {
+            panic!("expected an error");
+        };
+        assert!(
+            matches!(e, ConnError::Ssh(ssh::SshError::InvalidHost)),
+            "{e:?}"
+        );
+    }
+
+    /// Behind a bastion, "on this machine" means on the bastion: judged from the host
+    /// name, never from the forward's 127.0.0.1.
+    #[tokio::test]
+    async fn behind_a_bastion_loopback_is_judged_from_the_bastion() {
+        let route = ssh_route("b.example");
+        for host in ["127.0.0.1", "localhost", "::1", "db.localhost"] {
+            assert!(route.is_local(&ep(host, 6379, false)).await, "{host}");
+        }
+        for host in ["10.0.0.5", "cache.internal", "2001:db8::5"] {
+            assert!(!route.is_local(&ep(host, 6379, false)).await, "{host}");
+        }
+        // Direct, the same names are judged here.
+        assert!(Route::Direct.is_local(&ep("127.0.0.1", 6379, false)).await);
+        assert!(!Route::Direct.is_local(&ep("10.0.0.5", 6379, false)).await);
+        assert!(
+            !Route::Direct
+                .is_local(&ep("nope.invalid", 6379, false))
+                .await
+        );
+    }
+
+    /// The trust rule behind a bastion: a primary at 10.0.0.5 that announces
+    /// 127.0.0.1 names the bastion itself, so the candidate gets no credentials; a
+    /// profile whose host is loopback on the bastion may send them to another loopback
+    /// address there.
+    #[tokio::test]
+    async fn behind_a_bastion_an_announced_loopback_gets_no_credentials() {
+        let route = ssh_route("b.example");
+        let candidate = route.is_local(&ep("127.0.0.1", 6380, false)).await;
+        let remote_primary = route.is_local(&ep("10.0.0.5", 6379, false)).await;
+        assert!(!may_send_credentials(remote_primary, candidate));
+        let primary_on_bastion = route.is_local(&ep("localhost", 6379, false)).await;
+        assert!(may_send_credentials(primary_on_bastion, candidate));
+        // A remote candidate is fine either way.
+        let remote = route.is_local(&ep("10.0.0.6", 6379, false)).await;
+        assert!(may_send_credentials(remote_primary, remote));
+        // Direct, a profile on 127.0.0.1 (a tunnel the user opened by hand) counts as on
+        // this machine: why `--ssh` is the way to reach a server through a bastion.
+        let own_tunnel = Route::Direct.is_local(&ep("127.0.0.1", 16379, false)).await;
+        assert!(may_send_credentials(own_tunnel, candidate));
+    }
+
+    #[test]
+    fn fallback_reasons_say_where_loopback_was_judged() {
+        let e = ep("127.0.0.1", 6380, false);
+        let ssh = unusable_reason(&e, Unusable::WontSendCredentials, true);
+        assert!(ssh.contains("as seen from the SSH bastion"), "{ssh}");
+        let direct = unusable_reason(&e, Unusable::WontSendCredentials, false);
+        assert!(!direct.contains("bastion"), "{direct}");
+        assert_eq!(
+            unusable_reason(&e, Unusable::NotAReplica, true),
+            "replica at 127.0.0.1:6380 is not a replica of this primary"
+        );
+        let tunnel = unusable_reason(&e, ssh::SshError::Auth.into(), true);
+        assert!(
+            tunnel.starts_with("127.0.0.1:6380: the SSH bastion refused"),
+            "{tunnel}"
+        );
+    }
+
+    /// Every connection a profile opens goes through its route: the primary
+    /// ([`ResolvedAuth::open`], so `connect`), the scan connect, and the replica check.
+    /// The fake ssh accepts and closes, so each attempt fails, but at the forward.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connections_go_through_the_route() {
+        use crate::secrets::MemoryStore;
+        let fake = ssh::tests::fake::Fake::new("route");
+        let route = Arc::new(Route::Ssh(fake.bastion("listen", None, ssh::READY_TIMEOUT)));
+        // A name that only the bastion could resolve.
+        let mut p = ssh::tests::profile(None);
+        p.endpoint = ep("redis.invalid", 6379, false);
+        let auth = ResolvedAuth::new(&p, &MemoryStore::default())
+            .await
+            .unwrap();
+
+        let e = auth.open(&route, &p.endpoint).await.unwrap_err();
+        assert!(!matches!(e, ConnError::Ssh(_)), "{e:?}");
+        let pids = fake.starts();
+        assert_eq!(pids.len(), 1);
+        assert!(
+            fake.argv(pids[0])
+                .iter()
+                .any(|a| a.ends_with(":redis.invalid:6379")),
+            "{:?}",
+            fake.argv(pids[0])
+        );
+        // The readiness probe, then the connection itself.
+        assert!(fake.accepts(pids[0]) >= 2);
+
+        let before = fake.accepts(pids[0]);
+        assert!(connect_for_scan_with(&p, &route, &auth).await.is_err());
+        assert_eq!(fake.starts().len(), 1, "the forward is reused");
+        assert!(fake.accepts(pids[0]) > before);
+
+        let candidate = ep("replica.invalid", 6380, false);
+        let r = verified_replica(&auth, &route, 0, &p.endpoint, "id", &candidate).await;
+        assert!(matches!(r, Err(Unusable::Conn(ConnError::Redis(_)))));
+        let pids = fake.starts();
+        assert_eq!(pids.len(), 2);
+        assert!(
+            fake.argv(pids[1])
+                .iter()
+                .any(|a| a.ends_with(":replica.invalid:6380"))
+        );
+        assert!(fake.accepts(pids[1]) >= 2);
+    }
+
+    /// A minimal RESP server for tests: answers `INFO <section>` from `info` (an empty
+    /// text for a section it doesn't have), a command `X` with the raw RESP in an
+    /// `info` entry named `reply:X` when there is one, and `+OK` to anything else, and
+    /// records every connection and command.
+    struct FakeServer {
+        addr: SocketAddr,
+        connections: Arc<std::sync::atomic::AtomicUsize>,
+        commands: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeServer {
+        async fn start(info: &[(&str, String)]) -> Self {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let info: Arc<Vec<(String, String)>> = Arc::new(
+                info.iter()
+                    .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+                    .collect(),
+            );
+            let (conns, cmds) = (Arc::clone(&connections), Arc::clone(&commands));
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (cmds, info) = (Arc::clone(&cmds), Arc::clone(&info));
+                    tokio::spawn(async move {
+                        let mut s = tokio::io::BufReader::new(stream);
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            if s.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let Some(n) = line.trim().strip_prefix('*') else {
+                                return;
+                            };
+                            let mut args = Vec::new();
+                            for _ in 0..n.parse::<usize>().unwrap_or(0) {
+                                line.clear();
+                                s.read_line(&mut line).await.unwrap();
+                                let len: usize = line.trim()[1..].parse().unwrap();
+                                let mut buf = vec![0; len + 2];
+                                s.read_exact(&mut buf).await.unwrap();
+                                args.push(String::from_utf8_lossy(&buf[..len]).into_owned());
+                            }
+                            cmds.lock().unwrap().push(args.join(" "));
+                            let reply = if args[0].eq_ignore_ascii_case("INFO") {
+                                let section = args.get(1).map(|a| a.to_ascii_lowercase());
+                                let text = info
+                                    .iter()
+                                    .find(|(k, _)| Some(k) == section.as_ref())
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or_default();
+                                format!("${}\r\n{text}\r\n", text.len())
+                            } else {
+                                let key = format!("reply:{}", args[0].to_ascii_lowercase());
+                                info.iter()
+                                    .find(|(k, _)| *k == key)
+                                    .map_or_else(|| "+OK\r\n".to_string(), |(_, v)| v.clone())
+                            };
+                            if s.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                addr,
+                connections,
+                commands,
+            }
+        }
+
+        fn connections(&self) -> usize {
+            self.connections.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn count(&self, cmd: &str) -> usize {
+            let cmds = self.commands.lock().unwrap();
+            cmds.iter().filter(|c| c.eq_ignore_ascii_case(cmd)).count()
+        }
+    }
+
+    const STANDALONE: &str = "# Server\r\nredis_version:7.4.0\r\nredis_mode:standalone\r\n";
+
+    /// A primary at a fake server announcing one online replica at `replica_port`, and
+    /// that replica.
+    async fn fake_pair() -> (FakeServer, FakeServer) {
+        let replica = FakeServer::start(&[
+            ("server", STANDALONE.to_string()),
+            (
+                "replication",
+                "role:slave\r\nmaster_host:127.0.0.1\r\nmaster_replid:abc123\r\n".into(),
+            ),
+        ])
+        .await;
+        let primary = FakeServer::start(&[
+            ("server", STANDALONE.to_string()),
+            (
+                "replication",
+                format!(
+                    "role:master\r\nslave0:ip=127.0.0.1,port={},state=online,offset=1,lag=0\r\nmaster_replid:abc123\r\n",
+                    replica.addr.port()
+                ),
+            ),
+        ])
+        .await;
+        (primary, replica)
+    }
+
+    fn fake_profile(port: u16, prefer_replica: bool) -> Profile {
+        let mut p = ssh::tests::profile(None);
+        p.endpoint = ep("127.0.0.1", port, false);
+        p.prefer_replica = prefer_replica;
+        p
+    }
+
+    #[test]
+    fn a_kept_info_server_reply_answers_one_info_server_while_fresh() {
+        use std::time::Instant;
+        let now = Instant::now();
+        let reply = redis::Value::BulkString(b"redis_version:7.4.0".to_vec());
+        let info = |section: &str| redis::cmd("INFO").arg(section).clone();
+        let mut kept = Some((now, reply.clone()));
+        // Other commands pass through and leave it.
+        assert_eq!(take_kept_info(&mut kept, &info("memory"), now), None);
+        assert_eq!(take_kept_info(&mut kept, &redis::cmd("INFO"), now), None);
+        assert_eq!(
+            take_kept_info(&mut kept, redis::cmd("INFO").arg("server").arg("x"), now),
+            None
+        );
+        assert_eq!(take_kept_info(&mut kept, &redis::cmd("PING"), now), None);
+        assert!(kept.is_some());
+        // One INFO server, in any case, gets it; the next goes to the server.
+        let later = now + INFO_SERVER_REUSE;
+        assert_eq!(
+            take_kept_info(&mut kept, redis::cmd("info").arg("SERVER"), later),
+            Some(reply.clone())
+        );
+        assert_eq!(take_kept_info(&mut kept, &info("server"), later), None);
+        // Too old: dropped, and the command goes to the server.
+        let mut stale = Some((now, reply));
+        let too_late = now + INFO_SERVER_REUSE + Duration::from_millis(1);
+        assert_eq!(take_kept_info(&mut stale, &info("server"), too_late), None);
+        assert!(stale.is_none());
+    }
+
+    /// Through a real connection: the kept reply is answered without reaching the
+    /// server, once, and only for `INFO server`.
+    #[tokio::test]
+    async fn a_connection_answers_the_kept_info_server_without_sending_it() {
+        let server = FakeServer::start(&[("server", STANDALONE.to_string())]).await;
+        let p = fake_profile(server.addr.port(), false);
+        let mut c = connect(&p, &crate::secrets::MemoryStore::default())
+            .await
+            .unwrap();
+        c.keep_info_server(redis::Value::BulkString(b"kept".to_vec()));
+        let clone = c.clone();
+        let first: String = redis::cmd("INFO")
+            .arg("memory")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(first, "");
+        let kept: String = redis::cmd("INFO")
+            .arg("server")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(kept, "kept");
+        assert_eq!(server.count("INFO server"), 0);
+        // Taken: a clone shares it, so it is gone there too.
+        let mut clone = clone;
+        let fresh: String = redis::cmd("INFO")
+            .arg("server")
+            .query_async(&mut clone)
+            .await
+            .unwrap();
+        assert_eq!(fresh, STANDALONE);
+        assert_eq!(server.count("INFO server"), 1);
+    }
+
+    /// A standalone `prefer_replica` scan through `connect_targets` connects to the
+    /// primary once (the replica step reuses the seed), and the `INFO server` it reads
+    /// to tell a cluster apart is the scan's own.
+    #[tokio::test]
+    async fn connect_targets_opens_a_standalone_primary_once() {
+        use crate::secrets::MemoryStore;
+        let (primary, replica) = fake_pair().await;
+        let p = fake_profile(primary.addr.port(), true);
+        let targets = cluster::connect_targets(&p, &MemoryStore::default())
+            .await
+            .unwrap();
+        let cluster::ScanTargets::Single { target, .. } = &targets else {
+            panic!("a standalone server was taken for a cluster");
+        };
+        assert_eq!(
+            target,
+            &ScanTarget::Replica(ep("127.0.0.1", replica.addr.port(), false))
+        );
+        assert_eq!(primary.connections(), 1, "{:?}", primary.commands);
+        assert_eq!(primary.count("INFO server"), 1);
+        assert_eq!(primary.count("INFO replication"), 1);
+
+        // Scanned on the seed itself: its first INFO server is answered from detection.
+        let (primary, _replica) = fake_pair().await;
+        let p = fake_profile(primary.addr.port(), false);
+        let mut targets = cluster::connect_targets(&p, &MemoryStore::default())
+            .await
+            .unwrap();
+        let cluster::ScanTargets::Single { conn, target } = &mut targets else {
+            panic!("a standalone server was taken for a cluster");
+        };
+        assert_eq!(target, &ScanTarget::Primary);
+        let info: String = redis::cmd("INFO")
+            .arg("server")
+            .query_async(conn)
+            .await
+            .unwrap();
+        assert_eq!(info, STANDALONE);
+        assert_eq!(primary.connections(), 1);
+        assert_eq!(
+            primary.count("INFO server"),
+            1,
+            "detection and the scan's, once"
+        );
+    }
+
+    /// Behind SSH, the replica's forward is started before the 2 s replica timeout:
+    /// with a bastion that takes longer than that to log in, the replica is still used.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slow_replica_forward_is_started_before_the_replica_timeout() {
+        use crate::secrets::MemoryStore;
+        // A fake ssh that waits `delay` before it listens, then proxies every
+        // connection to the `-L` target.
+        const SLOW_PROXY: &str = r#"
+use strict; use warnings; use IO::Socket::INET; use IO::Select;
+my $delay = shift @ARGV;
+my ($spec) = map { $ARGV[$_ + 1] } grep { $ARGV[$_] eq '-L' } 0 .. $#ARGV;
+my (undef, $port, $th, $tp) = split /:/, $spec;
+select(undef, undef, undef, $delay);
+my $l = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => $port, Listen => 16, ReuseAddr => 1) or exit 255;
+$SIG{CHLD} = 'IGNORE';
+while (my $c = $l->accept) {
+  my $pid = fork();
+  if (defined $pid && $pid == 0) {
+    my $up = IO::Socket::INET->new(PeerAddr => $th, PeerPort => $tp) or exit 0;
+    my $sel = IO::Select->new($c, $up);
+    while (my @r = $sel->can_read) {
+      for my $fh (@r) {
+        my $n = sysread($fh, my $buf, 65536);
+        exit 0 unless $n;
+        syswrite($fh == $c ? $up : $c, $buf) or exit 0;
+      }
+    }
+    exit 0;
+  }
+  close $c;
+}
+"#;
+        let dir = std::env::temp_dir().join(format!(
+            "redis-lens-slow-ssh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("slow-ssh.pl");
+        std::fs::write(&script, SLOW_PROXY).unwrap();
+        let delay = REPLICA_TIMEOUT + Duration::from_millis(500);
+
+        let (primary, replica) = fake_pair().await;
+        let p = fake_profile(primary.addr.port(), true);
+        let t = ssh::tests::tunnel("b.example");
+        let bastion = ssh::Bastion::new(
+            &ssh::tests::profile(Some(t.clone())),
+            &t,
+            &MemoryStore::default(),
+        )
+        .unwrap()
+        .with_launcher(
+            vec![
+                "perl".into(),
+                script.clone().into(),
+                format!("{}", delay.as_secs_f64()).into(),
+            ],
+            ssh::READY_TIMEOUT,
+        );
+        let route = Arc::new(Route::Ssh(bastion));
+        let auth = ResolvedAuth::new(&p, &MemoryStore::default())
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let (c, target) = connect_for_scan_with(&p, &route, &auth).await.unwrap();
+        assert_eq!(
+            target,
+            ScanTarget::Replica(ep("127.0.0.1", replica.addr.port(), false)),
+            "the replica's forward was cut short by the replica timeout"
+        );
+        // Both forwards really took longer than the replica timeout to start.
+        assert!(started.elapsed() >= delay * 2);
+        assert!(replica.count("INFO replication") >= 1);
+        drop(c);
+        drop(route);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn pinned_resolver_ignores_the_name() {
         use redis::io::AsyncDNSResolver;
@@ -998,6 +1790,10 @@ mod tests {
             ScanTarget::PrimaryFallback("timed out".into()).to_string(),
             "primary (replica unreachable: timed out)"
         );
+        assert_eq!(
+            ScanTarget::Cluster("cluster · 3 shards".into()).to_string(),
+            "cluster · 3 shards"
+        );
     }
 
     #[cfg(unix)]
@@ -1012,6 +1808,7 @@ mod tests {
             prefer_replica: false,
             provider: None,
             token_command: Some(cmd.iter().map(|s| s.to_string()).collect()),
+            ssh: None,
         }
     }
 
@@ -1112,6 +1909,68 @@ mod tests {
         ));
         assert_eq!(classify("TYPE", Err(nokey), true), PermStatus::Allowed);
         assert_eq!(classify("SCAN", Ok(()), false), PermStatus::Allowed);
+    }
+
+    /// An empty shard that doesn't own the probe key's slot answers `MOVED` to every
+    /// key command. That is not a denial: the ACL check comes before the redirect.
+    #[test]
+    fn a_redirect_on_the_missing_probe_key_is_allowed() {
+        let moved = || {
+            redis::RedisError::from((
+                redis::ErrorKind::Server(ServerErrorKind::Moved),
+                "MOVED",
+                "2115 127.0.0.1:7000".to_string(),
+            ))
+        };
+        let ask = redis::RedisError::from((
+            redis::ErrorKind::Server(ServerErrorKind::Ask),
+            "ASK",
+            "2115 127.0.0.1:7000".to_string(),
+        ));
+        assert_eq!(classify("TYPE", Err(moved()), true), PermStatus::Allowed);
+        assert_eq!(classify("TYPE", Err(ask), true), PermStatus::Allowed);
+        // On a real key (one SCAN returned), a redirect proves nothing.
+        assert!(matches!(
+            classify("TYPE", Err(moved()), false),
+            PermStatus::Denied(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_empty_shard_that_redirects_the_probe_key_allows_sizes() {
+        let moved = "-MOVED 2115 127.0.0.1:7000\r\n".to_string();
+        let server = FakeServer::start(&[
+            ("reply:scan", "*2\r\n$1\r\n0\r\n*0\r\n".into()),
+            ("reply:type", moved.clone()),
+            ("reply:pttl", moved.clone()),
+            ("reply:memory", moved),
+        ])
+        .await;
+        let client = redis::Client::open(format!("redis://{}", server.addr)).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let report = check_permissions(&mut conn).await;
+        assert!(report.allowed(PERM_TYPE_TTL), "{report:?}");
+        assert!(report.allowed(PERM_MEMORY), "{report:?}");
+        // TYPE redirected, so PTTL was still checked on its own.
+        assert_eq!(server.count("PTTL redis-lens:probe"), 1);
+    }
+
+    /// TYPE redirects but PTTL is denied: the pair is denied.
+    #[tokio::test]
+    async fn a_redirected_type_does_not_vouch_for_pttl() {
+        let server = FakeServer::start(&[
+            ("reply:scan", "*2\r\n$1\r\n0\r\n*0\r\n".into()),
+            ("reply:type", "-MOVED 2115 127.0.0.1:7000\r\n".into()),
+            (
+                "reply:pttl",
+                "-NOPERM this user has no permissions to run the 'pttl' command\r\n".into(),
+            ),
+        ])
+        .await;
+        let client = redis::Client::open(format!("redis://{}", server.addr)).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let report = check_permissions(&mut conn).await;
+        assert!(!report.allowed(PERM_TYPE_TTL), "{report:?}");
     }
 
     fn ep(host: &str, port: u16, tls: bool) -> Endpoint {

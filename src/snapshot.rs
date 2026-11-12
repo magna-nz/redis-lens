@@ -582,7 +582,7 @@ pub fn trend(reports: &[ScanReport]) -> Trend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ServerFlavor, ServerInfo, ServerMode};
+    use crate::model::{PatternStats, ServerFlavor, ServerInfo, ServerMode};
 
     fn temp_dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("redis-lens-snap-{}-{tag}", std::process::id()));
@@ -612,6 +612,7 @@ mod tests {
             match_glob: None,
             server_context: None,
             key_sizes: None,
+            nodes: None,
         }
     }
 
@@ -685,6 +686,71 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cluster report with per-node pattern rows and a hot key tagged with its node.
+    fn cluster_report_with_patterns() -> ScanReport {
+        use crate::model::{KeySample, KeyType, Ttl};
+        let mut r = crate::report::fixtures::cluster_report();
+        r.profile = "cl".into();
+        let rows = r.patterns.clone();
+        for n in r.nodes.as_mut().unwrap() {
+            n.patterns = rows
+                .iter()
+                .map(|p| PatternStats {
+                    examples: Vec::new(),
+                    ..p.clone()
+                })
+                .collect();
+        }
+        r.hot_keys = vec![KeySample {
+            key: "session:abc".into(),
+            key_type: KeyType::Hash,
+            bytes: Some(10),
+            ttl: Ttl::Persistent,
+            lfu_freq: Some(7),
+            node: Some(1),
+        }];
+        r
+    }
+
+    #[test]
+    fn cluster_report_round_trips_through_save_and_load() {
+        let dir = temp_dir("cluster-rt");
+        let r = cluster_report_with_patterns();
+        let path = save(&dir, &r).unwrap();
+        let back = load(&path).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(back.nodes.as_ref().unwrap().len(), 3);
+        assert_eq!(back.hot_keys[0].node, Some(1));
+        assert!(!back.nodes.as_ref().unwrap()[0].patterns.is_empty());
+        // It also comes back through the lookups the diff and --check use.
+        let found = latest_before(&dir, "cl", r.taken_at_unix + 1, None).unwrap();
+        assert_eq!(found.unwrap(), r);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshots_from_before_v03_have_no_nodes() {
+        let dir = temp_dir("pre-v03");
+        let r = report("old", 100);
+        let mut value = serde_json::to_value(&r).unwrap();
+        // The file as v0.2 wrote it: no `nodes` key at all.
+        assert!(value.as_object_mut().unwrap().remove("nodes").is_none());
+        let path = profile_dir(&dir, "old").join(format!("{}.json", timestamp_name(100)));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+        let back = load(&path).unwrap();
+        assert_eq!(back.nodes, None);
+        assert_eq!(back, r);
+        assert_eq!(list(&dir, "old").unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standalone_snapshot_writes_no_nodes_key() {
+        let text = serde_json::to_string(&report("p", 1)).unwrap();
+        assert!(!text.contains("nodes"), "{text}");
     }
 
     #[test]

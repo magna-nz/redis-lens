@@ -1,5 +1,6 @@
 ---
 source: src/tui/ui/help.rs
+assertion_line: 80
 expression: "render(Screen::Patterns, 80, 24).backend()"
 ---
 "                                                                                "
@@ -16,7 +17,7 @@ expression: "render(Screen::Patterns, 80, 24).backend()"
 "       │→ ← l h        Expand or collapse the selected group            │       "
 "       │enter          Fold a group, or list a pattern's keys           │       "
 "       │/              Filter patterns by name                          │       "
-"       │esc            Clear the filter                                 │       "
+"       │esc            Clear the filter, or show all nodes again        │       "
 "       │o              Sort by memory, keys, avg size, no-TTL % or name │       "
 "       │y              Copy the selected pattern to the clipboard       │       "
 "       │Y              Copy a redis-cli --scan command for the pattern  │       "

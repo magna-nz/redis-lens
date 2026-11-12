@@ -143,7 +143,13 @@ static PATTERNS: [KeyHelp; 12] = [
         true,
     ),
     k("/", "/", "Filter", "Filter patterns by name", true),
-    k("esc", "esc", "Clear", "Clear the filter", false),
+    k(
+        "esc",
+        "esc",
+        "Clear",
+        "Clear the filter, or show all nodes again",
+        false,
+    ),
     k(
         "o",
         "o",
@@ -231,6 +237,22 @@ static PUBSUB: [KeyHelp; 5] = [MOVE, PAGE, ENDS, PAUSE, REFRESH];
 
 static SEARCH: [KeyHelp; 5] = [MOVE, PAGE, ENDS, FOCUS, REFRESH];
 
+static NODES: [KeyHelp; 7] = [
+    MOVE,
+    PAGE,
+    ENDS,
+    PANEL,
+    k(
+        "enter",
+        "enter",
+        "Patterns",
+        "Show the selected node's patterns on 1 Patterns",
+        true,
+    ),
+    RESCAN,
+    SNAPSHOT,
+];
+
 /// Keys that work in every view.
 pub fn global() -> &'static [KeyHelp] {
     &GLOBAL
@@ -252,6 +274,7 @@ pub fn for_screen(screen: Screen) -> &'static [KeyHelp] {
         Screen::Streams => &STREAMS,
         Screen::PubSub => &PUBSUB,
         Screen::Search => &SEARCH,
+        Screen::Nodes => &NODES,
     }
 }
 
@@ -268,7 +291,7 @@ fn find(screen: Screen, keys: &str) -> (&'static str, &'static str) {
 /// something to work on: a scan result on Analysis, a session on Server, Streams,
 /// Pub/Sub and Search. Without it they show how to get one.
 ///
-/// Snapshot on Patterns, rescan on Patterns, and the page and copy keys everywhere,
+/// Snapshot on Patterns and Nodes, rescan on Patterns, and the page and copy keys everywhere,
 /// are left out because they do not fit in 80 columns; the overlay lists them.
 pub fn footer(screen: Screen, ready: bool) -> Vec<(&'static str, &'static str)> {
     const MOVE: &str = "↑↓ j k";
@@ -287,6 +310,7 @@ pub fn footer(screen: Screen, ready: bool) -> Vec<(&'static str, &'static str)> 
         Screen::Streams if ready => &[MOVE, TAB, "p", "r", "0-6", "?", "q ctrl-c"],
         Screen::PubSub if ready => &[MOVE, "p", "r", "0-6", "?", "q ctrl-c"],
         Screen::Search if ready => &[MOVE, TAB, "r", "0-6", "?", "q ctrl-c"],
+        Screen::Nodes if ready => &[MOVE, TAB, "enter", "r", "0-6", "?", "q ctrl-c"],
         s if s.view().panels().is_empty() => &["0-6", "a", "?", "q ctrl-c"],
         _ => &[TAB, "0-6", "a", "?", "q ctrl-c"],
     };
@@ -429,6 +453,12 @@ mod tests {
             names(Screen::KeyList, true),
             [
                 "Move", "Filter", "Sort", "More", "Back", "View", "Help", "Quit"
+            ]
+        );
+        assert_eq!(
+            names(Screen::Nodes, true),
+            [
+                "Move", "Panel", "Patterns", "Rescan", "View", "Help", "Quit"
             ]
         );
     }

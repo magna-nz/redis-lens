@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::DiffArgs;
-use super::scan::{scan_profile_with_target, target_line, truncate, with_progress};
+use super::scan::{scan_profile_with_target, target_line, truncate, with_progress, wrap_note};
 use crate::config::Config;
 use crate::diff::{self, Cause, PatternDiff, ReportDiff};
 use crate::format;
@@ -37,6 +37,19 @@ pub async fn diff_profile(
     dir: &Path,
     progress: Option<&watch::Sender<ScanProgress>>,
 ) -> anyhow::Result<(ReportDiff, ScanReport)> {
+    let (d, _, new) = diff_profile_with_baseline(config_path, secrets, args, dir, progress).await?;
+    Ok((d, new))
+}
+
+/// [`diff_profile`], also returning the baseline report that was diffed against, so the
+/// caller can compare the two scans' node sets (see [`diff::node_set_note`]).
+pub async fn diff_profile_with_baseline(
+    config_path: &Path,
+    secrets: &dyn SecretStore,
+    args: &DiffArgs,
+    dir: &Path,
+    progress: Option<&watch::Sender<ScanProgress>>,
+) -> anyhow::Result<(ReportDiff, ScanReport, ScanReport)> {
     // Fail before touching the server when there is nothing to compare with.
     let against = match &args.against {
         Some(path) => Some(snapshot::load(path)?),
@@ -74,7 +87,7 @@ pub async fn diff_profile(
     }
     let path = snapshot::save(dir, &new)?;
     eprintln!("Saved snapshot {}", path.display());
-    Ok((result, new))
+    Ok((result, before, new))
 }
 
 fn cause_words(c: Cause) -> &'static str {
@@ -91,6 +104,12 @@ fn signed(n: i64, fmt: impl Fn(u64) -> String) -> String {
 
 /// The diff as plain text that fits `width` columns (at least 60).
 pub fn render_diff(d: &ReportDiff, width: usize) -> String {
+    render_diff_noted(d, None, width)
+}
+
+/// [`render_diff`] with `nodes_note` (see [`diff::node_set_note`]) as a `Note:` line before
+/// the pattern table.
+pub fn render_diff_noted(d: &ReportDiff, nodes_note: Option<&str>, width: usize) -> String {
     let width = width.max(MIN_WIDTH);
     let sizes = d.patterns.iter().all(|p| p.delta_bytes.is_some());
     let mut lines = vec![
@@ -109,6 +128,9 @@ pub fn render_diff(d: &ReportDiff, width: usize) -> String {
             )
         ),
     ];
+    if let Some(note) = nodes_note {
+        lines.extend(wrap_note(note, width));
+    }
     if !sizes {
         lines.push("Note:    sizes unavailable: comparing key counts".to_string());
     }
@@ -214,10 +236,10 @@ pub async fn run(config: Option<PathBuf>, args: DiffArgs) -> anyhow::Result<()> 
     let secrets = KeyringStore;
     let result = with_progress(|tx| {
         let (path, secrets, args, dir) = (&path, &secrets, &args, &dir);
-        async move { diff_profile(path, secrets, args, dir, tx.as_ref()).await }
+        async move { diff_profile_with_baseline(path, secrets, args, dir, tx.as_ref()).await }
     })
     .await;
-    let (d, _) = result?;
+    let (d, before, after) = result?;
     if args.json {
         println!(
             "{}",
@@ -227,7 +249,8 @@ pub async fn run(config: Option<PathBuf>, args: DiffArgs) -> anyhow::Result<()> 
         let width = crossterm::terminal::size()
             .map(|(c, _)| c as usize)
             .unwrap_or(DEFAULT_WIDTH);
-        println!("{}", render_diff(&d, width));
+        let note = diff::node_set_note(&before, &after);
+        println!("{}", render_diff_noted(&d, note, width));
     }
     Ok(())
 }
@@ -415,6 +438,7 @@ mod tests {
             match_glob: Some("user:*".into()),
             server_context: None,
             key_sizes: None,
+            nodes: None,
         };
         snapshot::save(&dir, &report).unwrap();
         let args = DiffArgs {
@@ -465,5 +489,28 @@ mod tests {
             no_snapshot("prod").to_string(),
             "no snapshot for prod; run `redis-lens scan prod --save` first"
         );
+    }
+
+    #[test]
+    fn nodes_note_goes_before_the_pattern_table() {
+        let t = render_diff_noted(&sample(), Some(diff::NODES_DIFFER_NOTE), 100);
+        let lines: Vec<&str> = t.lines().collect();
+        let note = lines.iter().position(|l| l.starts_with("Note:")).unwrap();
+        let head = lines.iter().position(|l| l.starts_with("PATTERN")).unwrap();
+        assert!(note < head, "{t}");
+        assert!(t.contains("different nodes"), "{t}");
+        // Wrapped, not cut, on a narrow terminal.
+        let narrow = render_diff_noted(&sample(), Some(diff::NODES_DIFFER_NOTE), 60);
+        assert!(narrow.contains("merged rows"), "{narrow}");
+        assert!(narrow.lines().all(|l| l.chars().count() <= 60), "{narrow}");
+    }
+
+    #[test]
+    fn no_nodes_note_without_one() {
+        assert_eq!(
+            render_diff(&sample(), 100),
+            render_diff_noted(&sample(), None, 100)
+        );
+        assert!(!render_diff(&sample(), 100).contains("different nodes"));
     }
 }

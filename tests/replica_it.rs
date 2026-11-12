@@ -107,6 +107,7 @@ fn profile(port: u16, prefer_replica: bool) -> Profile {
         prefer_replica,
         provider: None,
         token_command: None,
+        ssh: None,
     }
 }
 

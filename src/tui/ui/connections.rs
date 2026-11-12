@@ -18,7 +18,7 @@ use crate::tui::app::{AddState, App, ConnEntry, ConnSel, ConnStatus, DockerState
 use super::widgets::{
     fit, pad_l, pad_r, pad_r_marquee, panel, rows, scroll_offset, split_cols, trunc, width,
 };
-use super::{server_label, spinner, split_body, style};
+use super::{cluster_degraded, server_label, spinner, split_body, style};
 
 struct Cols {
     name: usize,
@@ -328,15 +328,33 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
         endpoint.push_str(&format!(" · db {}", p.db));
     }
     match &e.target {
-        None | Some(ScanTarget::Primary) => {}
+        // A cluster's summary goes on the Server line, which has the room for it.
+        None | Some(ScanTarget::Primary | ScanTarget::Cluster(_)) => {}
         Some(t) => endpoint.push_str(&format!(" · scanning {t}")),
     }
-    let server = match &e.server {
-        Some(s) => (
+    let server = match (&e.server, &e.target) {
+        (Some(s), Some(ScanTarget::Cluster(summary))) => {
+            // The finished report of this entry, when it is the one on screen.
+            let nodes = app
+                .session
+                .as_ref()
+                .filter(|s| s.id == e.id)
+                .and_then(|s| s.report.as_ref())
+                .and_then(|r| r.nodes.as_deref());
+            (
+                format!("{} · {summary}", server_label(s)),
+                if cluster_degraded(summary, nodes) {
+                    style::amber()
+                } else {
+                    style::fg()
+                },
+            )
+        }
+        (Some(s), _) => (
             format!("{} · {}", server_label(s), mode(s.mode)),
             style::fg(),
         ),
-        None => ("not connected yet".to_string(), style::dim()),
+        (None, _) => ("not connected yet".to_string(), style::dim()),
     };
     let (auth, cred) = match (docker.map(|(_, _, auth)| auth), p.auth) {
         (Some(DiscoveredAuth::Password), _) => {

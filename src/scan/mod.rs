@@ -2,6 +2,7 @@
 //!
 //! Owner: scanner.
 
+pub mod cluster;
 pub mod context;
 
 use std::collections::HashSet;
@@ -86,6 +87,9 @@ pub enum ScanError {
     Redis(#[from] redis::RedisError),
     #[error("unexpected reply from the server: {0}")]
     Protocol(String),
+    /// A cluster scan where no node could be scanned at all; each node's note says why.
+    #[error("no node of the cluster could be scanned")]
+    NoNodes,
 }
 
 /// Read `INFO server`, `INFO memory` and `DBSIZE`, with no command budget.
@@ -236,20 +240,58 @@ pub async fn sample_keys_detailed_with_budget<C: ConnectionLike + Send>(
     progress: Option<&watch::Sender<ScanProgress>>,
     budget: &Budget,
 ) -> Result<SampleOutcome, ScanError> {
-    sample_inner(conn, opts, with_sizes, with_freq, progress, None, budget).await
+    let publish = progress.map(watch_progress);
+    let (outcome, failure) = sample_inner(
+        conn,
+        opts,
+        with_sizes,
+        with_freq,
+        publish.as_ref().map(|f| f as &ProgressFn<'_>),
+        None,
+        budget,
+    )
+    .await;
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(outcome),
+    }
 }
 
-/// [`sample_keys_detailed`], also publishing partial pattern stats to `partial` (throttled)
-/// after each batch. Aggregating sends nothing to the server.
+/// Reports `(keys sampled, done)` while sampling.
+pub(crate) type ProgressFn<'a> = dyn Fn(u64, bool) + Sync + 'a;
+
+/// Progress for one server on `tx`: sets `sampled` and `done`, and keeps whatever
+/// target the caller set, including 0 for an empty database.
+fn watch_progress(tx: &watch::Sender<ScanProgress>) -> impl Fn(u64, bool) + Sync + '_ {
+    move |sampled, done| {
+        tx.send_modify(|p| {
+            p.sampled = sampled;
+            p.done = done;
+        });
+    }
+}
+
+/// Called after each batch with the samples so far and the keys looked up so far that
+/// still existed (the estimator's denominator). Sends nothing to the server.
+pub(crate) trait PartialHook: Send {
+    fn after_batch(&mut self, samples: &[KeySample], keys_present: u64, now: Instant);
+}
+
+/// [`sample_keys_detailed`], also calling `partial` after each batch (to publish partial
+/// pattern stats, throttled). Aggregating sends nothing to the server.
+///
+/// A failed `SCAN` or batch ends the walk: the outcome then holds what was sampled
+/// before it, with `keys_seen` counting only the keys looked up (or skipped as not
+/// UTF-8), `complete` false, and no final `done` progress; the error comes second.
 async fn sample_inner<C: ConnectionLike + Send>(
     conn: &mut C,
     opts: &ScanOptions,
     with_sizes: bool,
     with_freq: bool,
-    progress: Option<&watch::Sender<ScanProgress>>,
-    mut partial: Option<&mut PartialSink<'_>>,
+    progress: Option<&ProgressFn<'_>>,
+    mut partial: Option<&mut (dyn PartialHook + '_)>,
     budget: &Budget,
-) -> Result<SampleOutcome, ScanError> {
+) -> (SampleOutcome, Option<ScanError>) {
     let limit = usize::try_from(opts.sample_limit).unwrap_or(usize::MAX);
     let batch_size = opts.batch_size.max(1);
     let mut seen: HashSet<String> = HashSet::new();
@@ -264,16 +306,23 @@ async fn sample_inner<C: ConnectionLike + Send>(
     let mut samples: Vec<KeySample> = Vec::new();
     // Keys looked up that no longer existed.
     let mut vanished: u64 = 0;
+    // Keys sent TYPE/PTTL in a batch that answered.
+    let mut answered: u64 = 0;
     let mut cursor: u64 = 0;
 
-    // Keeps whatever target the caller set, including 0 for an empty database.
     let publish = |sampled: usize, done: bool| {
-        if let Some(tx) = progress {
-            tx.send_modify(|p| {
-                p.sampled = sampled as u64;
-                p.done = done;
-            });
+        if let Some(f) = progress {
+            f(sampled as u64, done);
         }
+    };
+    let stopped = |samples: Vec<KeySample>, answered: u64, skipped: usize, vanished, e| {
+        let outcome = SampleOutcome {
+            samples,
+            keys_seen: answered + skipped as u64,
+            vanished,
+            complete: false,
+        };
+        (outcome, Some(e))
     };
 
     while seen.len() < limit {
@@ -283,7 +332,10 @@ async fn sample_inner<C: ConnectionLike + Send>(
             cmd.arg("MATCH").arg(glob);
         }
         budget.take(1).await;
-        let (next, keys): (u64, Vec<Vec<u8>>) = cmd.query_async(conn).await?;
+        let (next, keys): (u64, Vec<Vec<u8>>) = match cmd.query_async(conn).await {
+            Ok(r) => r,
+            Err(e) => return stopped(samples, answered, skipped.len(), vanished, e.into()),
+        };
         cursor = next;
         reached_end = cursor == 0;
 
@@ -309,14 +361,26 @@ async fn sample_inner<C: ConnectionLike + Send>(
         {
             let n = pending.len().min(batch_size);
             let batch: Vec<String> = pending.drain(..n).collect();
-            let batch_out =
-                fetch_batch(conn, &batch, with_sizes, with_freq, &mut samples, budget).await?;
+            let batch_out = match fetch_batch(
+                conn,
+                &batch,
+                with_sizes,
+                with_freq,
+                &mut samples,
+                budget,
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => return stopped(samples, answered, skipped.len(), vanished, e),
+            };
             vanished += batch_out.vanished;
+            answered += batch.len() as u64;
             if let Some(sink) = partial.as_deref_mut() {
                 // Keys looked up so far that still existed; `pending` hasn't been looked up.
                 let looked_up = (seen.len() - pending.len() + skipped.len()) as u64;
                 let present = looked_up.saturating_sub(vanished);
-                sink.maybe_publish(&samples, present, Instant::now());
+                sink.after_batch(&samples, present, Instant::now());
             }
             publish(samples.len(), false);
         }
@@ -326,12 +390,13 @@ async fn sample_inner<C: ConnectionLike + Send>(
         }
     }
     publish(samples.len(), true);
-    Ok(SampleOutcome {
+    let outcome = SampleOutcome {
         samples,
         keys_seen: (seen.len() + skipped.len()) as u64,
         vanished,
         complete: reached_end && !dropped,
-    })
+    };
+    (outcome, None)
 }
 
 /// What [`fetch_batch`] did.
@@ -419,6 +484,7 @@ async fn fetch_batch<C: ConnectionLike + Send>(
             bytes,
             ttl,
             lfu_freq,
+            node: None,
         });
     }
     Ok(BatchOutcome { vanished })
@@ -521,6 +587,12 @@ struct PartialSink<'a> {
     throttle: Throttle,
 }
 
+impl PartialHook for PartialSink<'_> {
+    fn after_batch(&mut self, samples: &[KeySample], keys_present: u64, now: Instant) {
+        self.maybe_publish(samples, keys_present, now);
+    }
+}
+
 impl PartialSink<'_> {
     /// Aggregate `samples` and publish them, unless the throttle says wait or there is
     /// nothing to show yet. `keys_present` is the estimator's denominator so far.
@@ -592,20 +664,10 @@ pub async fn scan_with_budget<C: ConnectionLike + Send>(
     budget: &Budget,
 ) -> Result<ScanReport, ScanError> {
     let server = server_info_with_budget(conn, budget).await?;
-    // A few read-only commands; any part that fails is left out, never the scan.
-    let server_context = context::read(conn, opts.db, perms, budget).await;
     let with_sizes = perms.allowed(PERM_MEMORY);
-    let with_freq = perms.allowed(PERM_FREQ) && server.lfu_enabled();
     let target = opts.sample_limit.min(server.total_keys);
     let has_match = opts.match_glob.is_some();
 
-    if let Some(tx) = progress {
-        tx.send_replace(ScanProgress {
-            sampled: 0,
-            target,
-            done: false,
-        });
-    }
     let mut sink = partial.map(|tx| PartialSink {
         tx,
         total_keys: server.total_keys,
@@ -614,22 +676,33 @@ pub async fn scan_with_budget<C: ConnectionLike + Send>(
         sizes_available: with_sizes,
         throttle: Throttle::default(),
     });
-    let outcome = sample_inner(
+    let publish = progress.map(watch_progress);
+    let begin = || {
+        if let Some(tx) = progress {
+            tx.send_replace(ScanProgress {
+                sampled: 0,
+                target,
+                done: false,
+            });
+        }
+    };
+    let node = sample_server(
         conn,
+        &server,
         opts,
-        with_sizes,
-        with_freq,
-        progress,
-        sink.as_mut(),
+        perms,
+        &begin,
+        publish.as_ref().map(|f| f as &ProgressFn<'_>),
+        sink.as_mut().map(|s| s as &mut dyn PartialHook),
         budget,
     )
-    .await?;
-    let scale = estimate_scale(
-        server.total_keys,
-        outcome.keys_present(),
-        outcome.complete,
-        has_match,
-    );
+    .await;
+    if let Some(e) = node.error {
+        return Err(e);
+    }
+    let scale = node.scale(server.total_keys, has_match);
+    let server_context = node.context;
+    let outcome = node.outcome;
     // With MATCH the walk only looks at matching keys, so it never saw the whole database.
     let complete = outcome.complete && !has_match;
     let samples = outcome.samples;
@@ -658,6 +731,7 @@ pub async fn scan_with_budget<C: ConnectionLike + Send>(
                 ttl_bytes: ttl_bytes(&samples),
             })
         }),
+        nodes: None,
     })
 }
 
@@ -700,6 +774,64 @@ pub fn ttl_bytes(samples: &[KeySample]) -> [u64; 7] {
     out
 }
 
+/// What sampling one server gave: [`scan_with_partial`] and every node of a cluster scan
+/// ([`cluster::scan_cluster`]) go through [`sample_server`].
+pub(crate) struct ServerSample {
+    /// The server context (see [`context`]).
+    pub context: crate::model::ServerContext,
+    /// What was sampled; on `error`, what was sampled before it.
+    pub outcome: SampleOutcome,
+    /// `MEMORY USAGE` was sent.
+    pub with_sizes: bool,
+    /// The walk stopped early on this error.
+    pub error: Option<ScanError>,
+}
+
+impl ServerSample {
+    /// [`estimate_scale`] for this server's outcome and `DBSIZE`.
+    pub fn scale(&self, total_keys: u64, has_match: bool) -> f64 {
+        estimate_scale(
+            total_keys,
+            self.outcome.keys_present(),
+            self.outcome.complete,
+            has_match,
+        )
+    }
+}
+
+/// Read the server context, then sample, on one server whose `INFO` and `DBSIZE` are
+/// `server`, taking every command from `budget`. A cluster scan gives each node a
+/// [`Budget`] of its own at the full `opts.max_commands_per_sec`: the command budget is
+/// per server. `perms` decides whether sizes, LFU counters and
+/// `MEMORY STATS` are asked for. `begin` runs after the context is read and before the
+/// first `SCAN`. Never fails as a whole: an error mid-walk is kept in
+/// [`ServerSample::error`] with what was sampled before it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn sample_server<C: ConnectionLike + Send>(
+    conn: &mut C,
+    server: &ServerInfo,
+    opts: &ScanOptions,
+    perms: &PermissionReport,
+    begin: &(dyn Fn() + Sync),
+    progress: Option<&ProgressFn<'_>>,
+    partial: Option<&mut (dyn PartialHook + '_)>,
+    budget: &Budget,
+) -> ServerSample {
+    // A few read-only commands; any part that fails is left out, never the scan.
+    let context = context::read(conn, opts.db, perms, budget).await;
+    let with_sizes = perms.allowed(PERM_MEMORY);
+    let with_freq = perms.allowed(PERM_FREQ) && server.lfu_enabled();
+    begin();
+    let (outcome, error) =
+        sample_inner(conn, opts, with_sizes, with_freq, progress, partial, budget).await;
+    ServerSample {
+        context,
+        outcome,
+        with_sizes,
+        error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,6 +843,7 @@ mod tests {
             bytes: None,
             ttl: Ttl::Persistent,
             lfu_freq: freq,
+            node: None,
         }
     }
 
@@ -832,6 +965,7 @@ mod tests {
             prefer_replica: false,
             provider: None,
             token_command: None,
+            ssh: None,
         };
         assert_eq!(ScanOptions::for_profile(&p).max_commands_per_sec, None);
         p.env = Env::Prod;
@@ -866,6 +1000,7 @@ mod tests {
             prefer_replica: false,
             provider: Some(Provider::ElasticacheServerless),
             token_command: None,
+            ssh: None,
         };
         for env in [Env::Prod, Env::Stage, Env::Other, Env::Local] {
             p.env = env;
@@ -936,7 +1071,7 @@ mod tests {
 
     /// A keyspace held in memory, answering the commands the scanner sends. Any other
     /// command (`KEYS`, a write) panics.
-    mod fake {
+    pub(super) mod fake {
         use std::collections::HashMap;
         use std::sync::Arc;
 
@@ -982,6 +1117,8 @@ mod tests {
             pub duplicates: bool,
             /// How many times each key was sent `TYPE`.
             pub type_calls: HashMap<Vec<u8>, usize>,
+            /// Refuse `INFO server` (for a node that fails before sampling).
+            pub fail_info: bool,
             scans: usize,
         }
 
@@ -999,6 +1136,7 @@ mod tests {
                     fail_scan: None,
                     duplicates: false,
                     type_calls: HashMap::new(),
+                    fail_info: false,
                     scans: 0,
                 }
             }
@@ -1032,6 +1170,9 @@ mod tests {
                     redis::parse_redis_value(b"-NOPERM no permissions to access a key\r\n").unwrap()
                 };
                 match name.as_str() {
+                    "INFO" if text("server") && self.fail_info => {
+                        redis::parse_redis_value(b"-ERR unavailable\r\n").unwrap()
+                    }
                     "INFO" if text("server") => {
                         Value::BulkString(super::REDIS_SERVER.as_bytes().to_vec())
                     }
@@ -1631,6 +1772,55 @@ mod tests {
         assert!(matches!(err, ScanError::Redis(_)), "{err}");
         // The last partial stays in the channel; the caller (the TUI) drops it.
         assert!(rx.borrow().as_ref().unwrap().sampled < 500);
+    }
+
+    /// The routine every server's scan goes through (standalone, and each node of a
+    /// cluster) keeps what it sampled before a failure, and counts only the keys it
+    /// looked up.
+    #[test]
+    fn a_failed_walk_keeps_what_it_sampled() {
+        let keys = keyspace(1_000, |i| {
+            if i % 10 == 0 {
+                Fate::Gone
+            } else {
+                Fate::Present
+            }
+        });
+        let mut server = fake::Server::new(keys, 100);
+        server.fail_scan = Some(2);
+        let budget = Budget::new(None);
+        let (outcome, error) = run(sample_inner(
+            &mut server,
+            &opts(10_000, 50),
+            true,
+            false,
+            None,
+            None,
+            &budget,
+        ));
+        assert!(matches!(error, Some(ScanError::Redis(_))));
+        assert!(!outcome.complete);
+        assert_eq!(outcome.keys_seen, 200);
+        assert_eq!(outcome.vanished, 20);
+        assert_eq!(outcome.samples.len(), 180);
+        // The same through sample_server, with the context read first.
+        let mut server = fake::Server::new(server.keys, 100);
+        server.fail_scan = Some(2);
+        let info = run(server_info(&mut server)).unwrap();
+        let s = run(sample_server(
+            &mut server,
+            &info,
+            &opts(10_000, 50),
+            &perms_all(),
+            &|| {},
+            None,
+            None,
+            &Budget::new(None),
+        ));
+        assert!(s.error.is_some());
+        assert_eq!(s.outcome.samples.len(), 180);
+        assert!(s.with_sizes);
+        assert!(s.context.keyspace.is_some());
     }
 
     #[test]

@@ -1,11 +1,12 @@
 ---
 source: src/tui/snapshot_tests.rs
+assertion_line: 606
 expression: t.backend()
 ---
 " redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC "
 " Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                           "
 "  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
-"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry                                                    tab next panel "
+"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes                                          tab next panel "
 "┌─ TTL ───────────────────────────────────────────────────────────────────────────────── 11 patterns · riskiest first ─┐"
 "│ PATTERN                                       KEYS  NO TTL   none <1m  <1h  <1d  <7d  <30d >30d VERDICT              │"
 "│ tmp:import:{ulid}                              48K  ▲ 100%   ███  ·    ·    ·    ·    ·    ·    persistent · growing │"

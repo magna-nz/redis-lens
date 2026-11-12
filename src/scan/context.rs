@@ -869,6 +869,7 @@ mod tests {
             match_glob: None,
             server_context: ctx,
             key_sizes: None,
+            nodes: None,
         }
     }
 

@@ -77,7 +77,7 @@ use std::time::Instant;
 use crossterm::event::KeyEvent;
 
 use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
-use crate::model::{PermStatus, PermissionReport, Profile, ScanReport, ServerInfo};
+use crate::model::{PermStatus, PermissionReport, Profile, ScanReport, ServerInfo, ServerMode};
 use crate::tui::clipboard::CopyText;
 
 use super::{Effect, Notice, Screen, Session, copy_checked};
@@ -109,6 +109,26 @@ pub fn probe_of(screen: Screen) -> Option<&'static str> {
         Screen::Search => Some(PROBE_FT_LIST),
         _ => None,
     }
+}
+
+/// Why a live view is off on a cluster.
+pub const CLUSTER_OFF: &str = "Not available on a cluster yet: this view reads one server, \
+     and a cluster spreads its keys, clients and channels over its nodes.";
+
+/// The screens that read the live connection to one server: off on a cluster. The key
+/// list is one of them: it walks the keys with `SCAN`, which on a cluster covers one
+/// node.
+pub fn reads_one_server(screen: Screen) -> bool {
+    matches!(
+        screen,
+        Screen::KeyList
+            | Screen::Overview
+            | Screen::Clients
+            | Screen::SlowLog
+            | Screen::Streams
+            | Screen::PubSub
+            | Screen::Search
+    )
 }
 
 /// Which view state a screen, or a live request, belongs to.
@@ -293,6 +313,11 @@ impl<'a> Ctx<'a> {
     /// or not checked (yet). Never the server's own error text, which can name the
     /// ACL user.
     pub fn off_reason(&self) -> Option<String> {
+        if reads_one_server(self.screen)
+            && self.server().is_some_and(|s| s.mode == ServerMode::Cluster)
+        {
+            return Some(CLUSTER_OFF.to_string());
+        }
         let label = probe_of(self.screen)?;
         match self.check(label)? {
             PermStatus::Allowed => None,
@@ -421,7 +446,11 @@ pub mod testing {
             perms: fixtures::perms_with_probes(),
             target: ScanTarget::Primary,
         });
-        app.apply(Msg::ScanDone { id, scan, report });
+        app.apply(Msg::ScanDone {
+            id,
+            scan,
+            report: Box::new(report),
+        });
         app
     }
 

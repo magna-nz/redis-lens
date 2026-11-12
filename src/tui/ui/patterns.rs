@@ -36,12 +36,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|r| row_summary(app, patterns, *r))
         .collect();
+    // One node's rows: the diff and the server context are of the whole cluster.
+    let narrowed = app.narrowed_node().is_some();
     // Changes only for a finished scan: a snapshot diff is of the final report.
     let diff = app
         .session
         .as_ref()
         .and_then(|s| s.diff())
-        .filter(|_| data.partial.is_none());
+        .filter(|_| data.partial.is_none() && !narrowed);
     let changes: Option<Vec<Option<Change>>> = diff.map(|d| {
         rows_
             .iter()
@@ -65,12 +67,13 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     // The server context of a finished report (also one kept during a rescan), on the
     // table's bottom border so it takes no list row.
     if data.partial.is_none()
+        && !narrowed
         && let Some(report) = app.session.as_ref().and_then(|s| s.report.as_ref())
     {
         context_strip(frame, main, report);
     }
     match summaries.get(sel) {
-        Some((s, _, _)) => detail_panel(frame, detail, s, data.sizes_available),
+        Some((s, _, _)) => detail_panel(frame, detail, s, data.sizes_available, narrowed),
         None => {
             let inner = panel(frame, detail, "No match", "");
             let text = if !app.patterns.filter.is_empty() {
@@ -80,6 +83,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                 )
             } else if data.partial.is_some() {
                 " No keys sampled yet.".to_string()
+            } else if narrowed {
+                " No keys were sampled on this node. Press esc to see every node.".to_string()
             } else {
                 " No keys were sampled.".to_string()
             };
@@ -390,8 +395,16 @@ fn table(
             format::grouped(p.target)
         );
     }
+    // Narrowed to one node: the title says which, first, so it is never cut.
+    let title = match app.narrowed_node() {
+        Some((_, n)) => {
+            right = format!("esc for all nodes · {right}");
+            format!("Patterns · node {}", n.endpoint)
+        }
+        None => "Patterns".to_string(),
+    };
     let right = mark_previous(app, &right);
-    let inner = panel(frame, area, "Patterns", &right);
+    let inner = panel(frame, area, &title, &right);
     let c = cols(usize::from(inner.width), changes.is_some());
     // ▼ beside the sorted column, ▲ for name (A to Z).
     let arrow = |s: SortBy| (sort == s).then_some(if s.ascending() { "▲" } else { "▼" });
@@ -594,7 +607,8 @@ fn verdict_line(s: &Summary) -> Span<'static> {
     }
 }
 
-fn detail_panel(frame: &mut Frame, area: Rect, s: &Summary, sizes: bool) {
+/// `narrowed`: the rows are one cluster node's, which hold no example keys.
+fn detail_panel(frame: &mut Frame, area: Rect, s: &Summary, sizes: bool, narrowed: bool) {
     let dash = || "—".to_string();
     let mut right_title = format!(
         "{} · {} {}",
@@ -615,6 +629,12 @@ fn detail_panel(frame: &mut Frame, area: Rect, s: &Summary, sizes: bool) {
         Span::styled(pad_l("SIZE", NUM_W), style::hd()),
         Span::styled("   TTL", style::hd()),
     ]];
+    if narrowed && s.examples.is_empty() {
+        left.push(vec![Span::styled(
+            " Example keys are on the merged rows: esc shows every node.",
+            style::dim(),
+        )]);
+    }
     for e in s.examples.iter().take(5) {
         let (ttl, ttl_style) = match e.ttl {
             Ttl::Persistent => (
