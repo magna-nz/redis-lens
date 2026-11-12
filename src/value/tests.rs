@@ -929,3 +929,25 @@ proptest! {
         let _ = decode(&raw);
     }
 }
+
+/// A map whose key is a map whose key is a map …: each level used to escape the whole
+/// key again, so 40 levels in about 80 bytes drew gigabytes. A key is escaped once now.
+#[test]
+fn nested_map_keys_stay_small() {
+    let mut v = rmpv::Value::Nil;
+    for _ in 0..40 {
+        v = rmpv::Value::Map(vec![(v, rmpv::Value::Nil)]);
+    }
+    let mut bytes = Vec::new();
+    rmpv::encode::write_value(&mut bytes, &v).unwrap();
+    assert!(bytes.len() < 100);
+    let d = decode(&bytes);
+    assert_eq!(d.detected, Format::MsgPack);
+    let started = std::time::Instant::now();
+    let copied = copy_text(&d, Format::MsgPack).unwrap();
+    assert!(copied.len() < 200, "{} bytes", copied.len());
+    assert!(preview(&bytes, 80).chars().count() <= 80);
+    let r = render(&d, Format::MsgPack, 80);
+    assert!(r.lines().len() < 50);
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}

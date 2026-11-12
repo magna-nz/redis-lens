@@ -68,12 +68,14 @@ impl Drawn {
         self.height.store(height, Ordering::Relaxed);
     }
 
-    fn max_scroll(&self) -> usize {
+    /// How far the drawn text can scroll: its lines past the height.
+    pub fn max_scroll(&self) -> usize {
         let lines = self.lines.load(Ordering::Relaxed);
         lines.saturating_sub(self.height.load(Ordering::Relaxed))
     }
 
-    fn height(&self) -> usize {
+    /// The height drawn, at least 1: what PgUp and PgDn scroll by.
+    pub fn height(&self) -> usize {
         self.height.load(Ordering::Relaxed).max(1)
     }
 }
@@ -120,6 +122,8 @@ pub struct ValueState {
     pub scroll: usize,
     seen: Seen,
     pub drawn: Drawn,
+    /// Decoded, rendered and previewed values kept between frames.
+    pub memo: value::Memo,
 }
 
 impl ValueState {
@@ -137,6 +141,18 @@ impl ValueState {
             sel_since: act.tick,
             ..Self::default()
         };
+    }
+
+    /// A value another view has read already, shown with this screen's value pane:
+    /// a Search result's fields as `Items::Hash`. Nothing more is loaded (`n` says so).
+    pub fn preloaded(row: KeyRow, items: Items, tick: u64) -> Self {
+        Self {
+            row: Some(row),
+            items: Some(items),
+            pages: 1,
+            sel_since: tick,
+            ..Self::default()
+        }
     }
 
     /// The type the value is read as: the first page's `TYPE`, else the key list's.
@@ -377,7 +393,7 @@ impl ValueState {
             act.info("Nothing selected to copy.");
             return;
         };
-        let d = value::decode(raw.as_bytes());
+        let d = self.memo.decode(raw);
         match value::copy_text(&d, self.shown_format(&d)) {
             Ok(text) => act.copy(CopyText::value(&text)),
             Err(CopyRefusal::ControlCharacters) => act.info(COPY_REFUSED),
@@ -433,7 +449,7 @@ impl ViewState for ValueState {
                     Some(raw) => {
                         let from = self
                             .format
-                            .unwrap_or_else(|| value::decode(raw.as_bytes()).detected);
+                            .unwrap_or_else(|| self.memo.decode(raw).detected);
                         let to = from.next();
                         self.format = Some(to);
                         self.scroll = 0;
@@ -1090,14 +1106,14 @@ mod tests {
                 result: reply.clone(),
             }
         );
-        assert!(!msg.contains(MARK), "{msg}");
+        assert!(!value::leaks(&msg, MARK), "{msg}");
         testing::reply(&mut app, id, reply);
         assert!(text(&testing::render(&app, 120, 36)).contains(MARK));
         app.handle_key(key(KeyCode::Down));
         let effects = app.handle_key(ch('y'));
         let debug = format!("{effects:?} {:?} {:?}", app.views, app.session);
-        assert!(!debug.contains(MARK), "{debug}");
-        assert!(!notice(&app).contains(MARK), "{}", notice(&app));
+        assert!(!value::leaks(&debug, MARK), "{debug}");
+        assert!(!value::leaks(&notice(&app), MARK), "{}", notice(&app));
         assert!(effects.iter().any(|e| matches!(e, Effect::Copy(_))));
 
         // A string too, then a snapshot file from Patterns.
@@ -1109,7 +1125,7 @@ mod tests {
             len: Some(12),
         };
         testing::reply(&mut app, id, page(Some("string"), items, None));
-        assert!(!format!("{:?}", app.views).contains(MARK));
+        assert!(!value::leaks(&format!("{:?}", app.views), MARK));
         app.handle_key(key(KeyCode::Esc));
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen(), Screen::Patterns);
@@ -1118,7 +1134,72 @@ mod tests {
             panic!("{effects:?}");
         };
         let json = serde_json::to_string(report).unwrap();
-        assert!(!json.contains(MARK));
-        assert!(!format!("{effects:?}").contains(MARK));
+        assert!(!value::leaks(&json, MARK));
+        assert!(!value::leaks(&format!("{effects:?}"), MARK));
+    }
+    /// Terminal safety: what the server names (the key, a stream entry id, the `TYPE`
+    /// reply) is escaped like a value, bidi controls included, which ratatui would
+    /// otherwise draw as they are.
+    #[test]
+    fn names_from_the_server_are_escaped() {
+        let evil = "user:\u{1b}[31mx\u{202e}gpj.exe:cart";
+        let r = row(evil, KeyType::Stream, Some(1), Some(80));
+        let (mut app, id, _) = open(r);
+        let items = Items::Stream(vec![Entry {
+            id: "1-0\u{2066}\u{7}".into(),
+            fields: vec![(Raw::from("f\u{202e}"), Raw::from("v"))],
+        }]);
+        testing::reply(&mut app, id, page(Some("str\u{202e}eam"), items, None));
+        for (w, h) in [(80, 24), (120, 36)] {
+            let all = text(&testing::render(&app, w, h));
+            for bad in ['\u{1b}', '\u{7}', '\u{202e}', '\u{2066}'] {
+                assert!(!all.contains(bad), "{w}x{h}: {bad:?} drawn:\n{all}");
+            }
+            assert!(all.contains("\\x1b[31m") || all.contains("\\x1b"), "{all}");
+            assert!(all.contains("\\u{202e}"), "{all}");
+        }
+    }
+
+    /// A rendered line that fills the pane is drawn whole: the value is wrapped one
+    /// column narrower than the pane, for the space each line starts with.
+    #[test]
+    fn a_full_width_line_is_not_cut() {
+        let r = row("user:9:cart", KeyType::String, Some(400), Some(480));
+        let (mut app, id, _) = open(r);
+        let long: String = (0..400)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let items = Items::String {
+            value: Raw::from(long.as_str()),
+            len: Some(400),
+        };
+        testing::reply(&mut app, id, page(Some("string"), items, None));
+        for (w, h) in [(80, 24), (120, 36)] {
+            let all = text(&testing::render(&app, w, h));
+            let shown: String = all
+                .lines()
+                .map(|l| l.replace('│', " "))
+                .flat_map(|l| l.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+                .filter(|t| t.chars().all(|c| c.is_ascii_lowercase()) && t.len() > 10)
+                .collect::<String>();
+            assert!(
+                long.starts_with(&shown),
+                "{w}x{h}: a character was cut:\n{all}"
+            );
+            assert!(shown.len() > 200, "{w}x{h}:\n{all}");
+        }
+    }
+
+    /// The leak checks catch a value printed as bytes, not only as text.
+    #[test]
+    fn the_leak_check_sees_bytes() {
+        assert!(value::leaks(
+            &format!("{:?}", MARK.as_bytes().to_vec()),
+            MARK
+        ));
+        assert!(value::leaks(&format!("{:?}", MARK.as_bytes()), MARK));
+        let hex: String = MARK.bytes().map(|b| format!("{b:02x}")).collect();
+        assert!(value::leaks(&hex, MARK));
+        assert!(!value::leaks("Raw(<12 bytes>)", MARK));
     }
 }

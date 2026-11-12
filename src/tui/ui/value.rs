@@ -231,7 +231,7 @@ fn title_right(state: &ValueState, ctx: &Ctx<'_>) -> String {
         parts.push(format!("{} loading", spinner(ctx.tick)));
     }
     if let Some(raw) = state.format_source() {
-        let d = value::decode(raw.as_bytes());
+        let d = state.memo.decode(raw);
         parts.push(state.shown_format(&d).label().to_string());
     }
     match &state.items {
@@ -258,12 +258,23 @@ fn title_right(state: &ValueState, ctx: &Ctx<'_>) -> String {
 
 fn value_panel(frame: &mut Frame, area: Rect, state: &ValueState, ctx: &Ctx<'_>) {
     let kind = state.kind();
-    let inner = panel(
-        frame,
-        area,
-        panel_title(kind.as_ref()),
-        &title_right(state, ctx),
-    );
+    draw_value_panel(frame, area, state, ctx, panel_title(kind.as_ref()), None);
+}
+
+/// The key detail's right-hand panel on its own, for the views that embed a value:
+/// the entries of a stream on 4 Streams and a Search document's fields. `title` goes on
+/// the left of the border; `right` on the right, or with `None` what the key detail
+/// shows there (loading, format, items loaded, the command).
+pub fn draw_value_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &ValueState,
+    ctx: &Ctx<'_>,
+    title: &str,
+    right: Option<&str>,
+) {
+    let right = right.map_or_else(|| title_right(state, ctx), str::to_string);
+    let inner = panel(frame, area, title, &right);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -398,9 +409,9 @@ fn value_pane(
     raw: &Raw,
     notes: Vec<String>,
 ) {
-    let w = usize::from(area.width);
-    let d = value::decode(raw.as_bytes());
-    let r = value::render(&d, state.shown_format(&d), w.max(1));
+    // One column less than the pane: `scrolled` starts each line with a space.
+    let w = usize::from(area.width).saturating_sub(1).max(1);
+    let (d, r) = state.memo.render(raw, |d| state.shown_format(d), w);
     let mut head = header(label, raw, state, &r, &d);
     head.extend(notes);
     let body: Vec<String> = r.lines().to_vec();
@@ -476,11 +487,11 @@ fn collection(frame: &mut Frame, area: Rect, state: &ValueState, items: &Items) 
     match items {
         Items::Stream(entries) => {
             let e = &entries[sel];
-            let w = iw.saturating_sub(2).max(1);
+            // `scrolled` adds a space and each field's lines two more.
+            let w = iw.saturating_sub(3).max(1);
             let mut body = Vec::new();
             for (name, v) in &e.fields {
-                let d = value::decode(v.as_bytes());
-                let r = value::render(&d, state.shown_format(&d), w);
+                let (_, r) = state.memo.render(v, |d| state.shown_format(d), w);
                 body.push(name_text(name.as_bytes()));
                 body.extend(r.lines().iter().map(|l| format!("  {l}")));
             }
@@ -502,10 +513,9 @@ fn collection(frame: &mut Frame, area: Rect, state: &ValueState, items: &Items) 
             let label = match items {
                 Items::Hash(f) => name_text(f[sel].name.as_bytes()),
                 Items::List(_) => format!("#{sel}"),
-                Items::ZSet(m) => format!(
-                    "member · score {}",
-                    value::preview(m[sel].score.as_bytes(), 24)
-                ),
+                Items::ZSet(m) => {
+                    format!("member · score {}", state.memo.preview(&m[sel].score, 24))
+                }
                 Items::Vector(_) => "element".to_string(),
                 _ => "member".to_string(),
             };
@@ -584,7 +594,7 @@ fn list_rows(
                         sp(),
                         cell(trunc(&name_text(f.name.as_bytes()), fw), fw),
                         sp(),
-                        cell(value::preview(f.value.as_bytes(), vw), vw),
+                        cell(state.memo.preview(&f.value, vw), vw),
                     ];
                     if ttl {
                         let t = match f.ttl {
@@ -612,7 +622,7 @@ fn list_rows(
                         sp(),
                         Span::styled(pad_l(&i.to_string(), iw_), style::dim()),
                         sp(),
-                        cell(value::preview(e.as_bytes(), ew), ew),
+                        cell(state.memo.preview(e, ew), ew),
                     ]
                 })
                 .collect();
@@ -629,7 +639,7 @@ fn list_rows(
                 .iter()
                 .skip(off)
                 .take(n)
-                .map(|m| vec![sp(), cell(value::preview(m.as_bytes(), w), w)])
+                .map(|m| vec![sp(), cell(state.memo.preview(m, w), w)])
                 .collect();
             (head, rows)
         }
@@ -643,10 +653,10 @@ fn list_rows(
                 .map(|m| {
                     vec![
                         sp(),
-                        cell(value::preview(m.member.as_bytes(), mw), mw),
+                        cell(state.memo.preview(&m.member, mw), mw),
                         sp(),
                         Span::styled(
-                            pad_l(&value::preview(m.score.as_bytes(), SCORE_W), SCORE_W),
+                            pad_l(&state.memo.preview(&m.score, SCORE_W), SCORE_W),
                             style::fg(),
                         ),
                     ]
@@ -672,11 +682,7 @@ fn list_rows(
                         .fields
                         .iter()
                         .map(|(k, v)| {
-                            format!(
-                                "{}={}",
-                                name_text(k.as_bytes()),
-                                value::preview(v.as_bytes(), fw)
-                            )
+                            format!("{}={}", name_text(k.as_bytes()), state.memo.preview(v, fw))
                         })
                         .collect();
                     vec![

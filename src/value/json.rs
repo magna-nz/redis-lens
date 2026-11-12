@@ -232,6 +232,13 @@ fn push_float(f: f64, finite_json: String, out: &mut String) {
 /// - a map key that is not a string as a string of its compact JSON;
 /// - NaN and the infinities as the strings `NaN`, `Infinity`, `-Infinity`.
 pub(super) fn msgpack_to_json(v: &rmpv::Value, out: &mut String, limit: usize) {
+    to_json(v, out, limit, false);
+}
+
+/// [`msgpack_to_json`]. `in_key` is set inside a map key that is not a string, which is
+/// drawn as a string of its own compact JSON: a container key inside it becomes `"…"`,
+/// so a key is escaped once, never once per level (each level would double its size).
+fn to_json(v: &rmpv::Value, out: &mut String, limit: usize, in_key: bool) {
     use rmpv::Value;
     if out.len() > limit {
         return;
@@ -266,7 +273,7 @@ pub(super) fn msgpack_to_json(v: &rmpv::Value, out: &mut String, limit: usize) {
                 if k > 0 {
                     out.push(',');
                 }
-                msgpack_to_json(item, out, limit);
+                to_json(item, out, limit, in_key);
             }
             out.push(']');
         }
@@ -281,16 +288,17 @@ pub(super) fn msgpack_to_json(v: &rmpv::Value, out: &mut String, limit: usize) {
                 }
                 match key {
                     Value::String(s) if s.as_str().is_some() => {
-                        msgpack_to_json(key, out, limit);
+                        to_json(key, out, limit, in_key);
                     }
+                    Value::Array(_) | Value::Map(_) if in_key => out.push_str("\"…\""),
                     _ => {
                         let mut key_text = String::new();
-                        msgpack_to_json(key, &mut key_text, limit);
+                        to_json(key, &mut key_text, limit.saturating_sub(out.len()), true);
                         push_json_string(&key_text, out);
                     }
                 }
                 out.push(':');
-                msgpack_to_json(val, out, limit);
+                to_json(val, out, limit, in_key);
             }
             out.push('}');
         }

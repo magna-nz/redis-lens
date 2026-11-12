@@ -24,10 +24,23 @@ use std::fmt::Write as _;
 mod compress;
 mod json;
 mod lines;
+mod memo;
 #[cfg(test)]
 mod tests;
 
+/// Test helper: `text` (some `Debug`, notice or snapshot output) holds `mark` in any
+/// form a value could leak in: as text, as the decimal list a derived `Debug` of its
+/// bytes prints, or as hex digits.
+#[cfg(test)]
+pub(crate) fn leaks(text: &str, mark: &str) -> bool {
+    let b = mark.as_bytes();
+    let decimal = b.iter().map(u8::to_string).collect::<Vec<_>>().join(", ");
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    text.contains(mark) || text.contains(&decimal) || text.contains(&hex)
+}
+
 use lines::Sink;
+pub use memo::Memo;
 
 /// The most bytes a decompression produces. Anything past it is dropped and
 /// [`Decoded::truncated`] is set, so a small compressed value can't fill memory.
@@ -47,48 +60,74 @@ pub const MAX_ESCAPE_WIDTH: usize = 8;
 /// Its `Debug` prints the length only (`Raw(<12 bytes>)`), so a value never reaches
 /// `Debug` output, logs or test failure messages by accident. It has no `Serialize` on
 /// purpose: values never go into snapshots or reports. Keep both that way.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct Raw(Vec<u8>);
+#[derive(Clone, Default)]
+pub struct Raw {
+    bytes: Vec<u8>,
+    /// Tells this value apart for [`Memo`]: set once when it is made, never 0 for a
+    /// value made from bytes, kept by clones. A `Raw` never changes after it is made,
+    /// so the same id always means the same bytes.
+    id: u64,
+}
+
+/// The next [`Raw`] id. Starts at 1: 0 is the empty `Raw::default()`.
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Raw {
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+        Self {
+            bytes,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.bytes.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.bytes.is_empty()
+    }
+
+    /// See [`Memo`].
+    fn id(&self) -> u64 {
+        self.id
     }
 }
 
+/// Equal when the bytes are: the id only names one copy for [`Memo`].
+impl PartialEq for Raw {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for Raw {}
+
 impl From<Vec<u8>> for Raw {
     fn from(b: Vec<u8>) -> Self {
-        Self(b)
+        Self::new(b)
     }
 }
 
 impl From<&[u8]> for Raw {
     fn from(b: &[u8]) -> Self {
-        Self(b.to_vec())
+        Self::new(b.to_vec())
     }
 }
 
 impl From<&str> for Raw {
     fn from(s: &str) -> Self {
-        Self(s.as_bytes().to_vec())
+        Self::new(s.as_bytes().to_vec())
     }
 }
 
 impl fmt::Debug for Raw {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Raw(<{} bytes>)", self.0.len())
+        write!(f, "Raw(<{} bytes>)", self.bytes.len())
     }
 }
 
