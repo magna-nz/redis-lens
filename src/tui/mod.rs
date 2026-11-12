@@ -56,11 +56,12 @@ use clipboard::CopyText;
 
 const TICK: Duration = Duration::from_millis(100);
 
-/// What arrives on the event loop's channel.
+/// What arrives on the event loop's channel. `Msg` is boxed: a scan report makes it far
+/// bigger than an input event.
 enum Incoming {
     Input(Event),
     InputFailed(String),
-    Msg(Msg),
+    Msg(Box<Msg>),
 }
 
 type Tx = mpsc::UnboundedSender<Incoming>;
@@ -143,7 +144,7 @@ async fn event_loop(
                 Some(Incoming::Input(Event::Paste(s))) => pending = app.handle_paste(s),
                 Some(Incoming::Input(_)) => {}
                 Some(Incoming::InputFailed(e)) => bail!("could not read terminal input: {e}"),
-                Some(Incoming::Msg(m)) => pending = app.apply(m),
+                Some(Incoming::Msg(m)) => pending = app.apply(*m),
                 None => return Ok(()),
             },
             _ = tick.tick() => pending = app.apply(Msg::TickAt(std::time::Instant::now())),
@@ -244,7 +245,7 @@ fn start_live(
 }
 
 fn send(tx: &Tx, msg: Msg) -> bool {
-    tx.send(Incoming::Msg(msg)).is_ok()
+    tx.send(Incoming::Msg(Box::new(msg))).is_ok()
 }
 
 /// Write `text` to the terminal output `out` as an OSC 52 sequence and flush. The
@@ -818,12 +819,12 @@ mod tests {
 
         let (mut last_progress, mut last_partial) = (None, None);
         while let Ok(incoming) = rx.try_recv() {
-            match incoming {
-                Incoming::Msg(Msg::ScanProgress { id, scan, progress }) => {
+            match msg_of(incoming) {
+                Msg::ScanProgress { id, scan, progress } => {
                     assert_eq!((id, scan), (7, 70));
                     last_progress = Some(progress);
                 }
-                Incoming::Msg(Msg::ScanPartial { id, scan, partial }) => {
+                Msg::ScanPartial { id, scan, partial } => {
                     assert_eq!((id, scan), (7, 70));
                     last_partial = Some(partial);
                 }
@@ -885,10 +886,7 @@ mod tests {
         let mut out = Vec::new();
         // Every sender is gone once scan_and_report returns: this ends.
         while let Some(incoming) = rx.recv().await {
-            let Incoming::Msg(msg) = incoming else {
-                panic!("not a message");
-            };
-            out.push(msg);
+            out.push(msg_of(incoming));
         }
         out
     }
@@ -966,12 +964,12 @@ mod tests {
             .expect("no progress")
             .expect("channel closed");
         assert!(matches!(
-            first,
-            Incoming::Msg(Msg::ScanProgress {
+            msg_of(first),
+            Msg::ScanProgress {
                 id: 4,
                 scan: 40,
                 ..
-            })
+            }
         ));
         let (ptx, partial_tx) = keep_rx.await.unwrap();
 
@@ -1086,15 +1084,23 @@ mod tests {
         live::LiveRequest::Server(live::server::Request::Ping)
     }
 
+    /// The message in `incoming`, which must be one.
+    fn msg_of(incoming: Incoming) -> Msg {
+        match incoming {
+            Incoming::Msg(m) => *m,
+            _ => panic!("not a message"),
+        }
+    }
+
     /// The next message, which must be `Msg::Live` answered with `Closed`.
     fn expect_closed(rx: &mut mpsc::UnboundedReceiver<Incoming>) -> (ConnId, ScanId, u64) {
-        match rx.try_recv() {
-            Ok(Incoming::Msg(Msg::Live {
+        match rx.try_recv().map(msg_of) {
+            Ok(Msg::Live {
                 id,
                 scan,
                 req_id,
                 result: Err(LiveError::Closed),
-            })) => (id, scan, req_id.0),
+            }) => (id, scan, req_id.0),
             _ => panic!("expected Msg::Live with Err(Closed)"),
         }
     }
@@ -1158,7 +1164,7 @@ mod tests {
 
         let (handle, mut queue) = LiveHandle::detached();
         assert!(install_live(&runner.live, 1, 10, &runner.tx, || handle));
-        let Ok(Incoming::Msg(Msg::LiveReady { id: 1, scan: 10 })) = rx.try_recv() else {
+        let Ok(Msg::LiveReady { id: 1, scan: 10 }) = rx.try_recv().map(msg_of) else {
             panic!("no LiveReady");
         };
         // Only once per session.
@@ -1221,7 +1227,7 @@ mod tests {
     fn a_copy_that_cannot_be_written_becomes_an_error_message() {
         let (mut runner, mut rx) = runner();
         assert!(!runner.run(Effect::Copy(CopyText::key("user:1")), &mut Broken));
-        let Ok(Incoming::Msg(Msg::CopyFailed(e))) = rx.try_recv() else {
+        let Ok(Msg::CopyFailed(e)) = rx.try_recv().map(msg_of) else {
             panic!("no CopyFailed");
         };
         assert_eq!(e, "broken pipe");
@@ -1230,7 +1236,7 @@ mod tests {
         let big = CopyText::key(&"k".repeat(clipboard::MAX_OSC52_BYTES));
         runner.run(Effect::Copy(big), &mut out);
         assert!(out.bytes.is_empty());
-        let Ok(Incoming::Msg(Msg::CopyFailed(e))) = rx.try_recv() else {
+        let Ok(Msg::CopyFailed(e)) = rx.try_recv().map(msg_of) else {
             panic!("no CopyFailed");
         };
         assert_eq!(e, "the key is too long to copy");
