@@ -26,6 +26,7 @@ use tokio::task::JoinSet;
 
 use crate::budget::Budget;
 
+pub mod command;
 pub mod keys;
 pub mod pubsub;
 pub mod search;

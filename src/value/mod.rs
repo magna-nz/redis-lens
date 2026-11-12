@@ -547,7 +547,7 @@ fn push_escaped(c: char, out: &mut String) {
 
 /// The Unicode bidirectional formatting characters, which can reorder what a terminal
 /// draws around them.
-fn is_bidi_control(c: char) -> bool {
+pub(crate) fn is_bidi_control(c: char) -> bool {
     matches!(
         c,
         '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
