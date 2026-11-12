@@ -237,11 +237,20 @@ impl Subscription {
     }
 }
 
+/// Characters of a message's one-line preview.
+pub const PREVIEW_CHARS: usize = 300;
+/// The bytes of a payload a [`TailMessage`] keeps once its preview is made: up to 4,000
+/// messages are held, and only the preview is drawn.
+pub const PAYLOAD_KEPT: usize = 4096;
+
 /// One message the tail received.
 ///
 /// The payload is a value ([`Raw`]: its `Debug` shows only the length). The channel and
 /// pattern are names, like the channel names of the counts; they are drawn escaped.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// [`TailMessage::new`] makes the preview and cuts the payload to [`PAYLOAD_KEPT`] where
+/// the message is read (in the tail's own task), so a batch waiting for the screen
+/// holds no more than that per message. `Debug` shows neither.
+#[derive(Clone, PartialEq, Eq)]
 pub struct TailMessage {
     /// When redis-lens received it: UTC, milliseconds since the Unix epoch.
     pub at_unix_ms: i64,
@@ -249,7 +258,47 @@ pub struct TailMessage {
     pub channel: String,
     /// The pattern it matched, for a `PSUBSCRIBE`.
     pub pattern: Option<String>,
+    /// The start of the payload, at most [`PAYLOAD_KEPT`] bytes.
     pub payload: Raw,
+    /// The payload on one line, made from all of it ([`crate::value::preview`]:
+    /// terminal safe).
+    preview: String,
+}
+
+impl TailMessage {
+    pub fn new(
+        at_unix_ms: i64,
+        channel: String,
+        pattern: Option<String>,
+        payload: Vec<u8>,
+    ) -> Self {
+        let preview = crate::value::preview(&payload, PREVIEW_CHARS);
+        let mut payload = payload;
+        payload.truncate(PAYLOAD_KEPT);
+        Self {
+            at_unix_ms,
+            channel,
+            pattern,
+            payload: Raw::new(payload),
+            preview,
+        }
+    }
+
+    /// The payload on one line, escaped.
+    pub fn preview(&self) -> &str {
+        &self.preview
+    }
+}
+
+impl std::fmt::Debug for TailMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TailMessage")
+            .field("at_unix_ms", &self.at_unix_ms)
+            .field("channel", &self.channel)
+            .field("pattern", &self.pattern)
+            .field("payload", &self.payload)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What one push of the subscriber connection means for the tail.
@@ -281,12 +330,12 @@ pub fn parse_push(push: PushInfo, at_unix_ms: i64) -> Push {
     let (Some(channel), Some(payload)) = (channel.and_then(bytes), payload.and_then(bytes)) else {
         return Push::Other;
     };
-    Push::Message(TailMessage {
+    Push::Message(TailMessage::new(
         at_unix_ms,
-        channel: name(channel),
-        pattern: pattern.and_then(bytes).map(name),
-        payload: Raw::new(payload),
-    })
+        name(channel),
+        pattern.and_then(bytes).map(name),
+        payload,
+    ))
 }
 
 /// Sends `SUBSCRIBE` or `PSUBSCRIBE` for `to` on `conn`, a connection from
@@ -364,12 +413,7 @@ mod tests {
         );
         assert_eq!(
             m,
-            Push::Message(TailMessage {
-                at_unix_ms: 7,
-                channel: "news".into(),
-                pattern: None,
-                payload: Raw::new(vec![0, 0xff]),
-            })
+            Push::Message(TailMessage::new(7, "news".into(), None, vec![0, 0xff]))
         );
         let p = parse_push(
             push(PushKind::PMessage, vec![b("n*"), b("news"), b("hi")]),

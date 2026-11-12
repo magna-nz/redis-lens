@@ -205,6 +205,15 @@ impl SearchState {
     /// Sends `cmd` with `query` on the selected index. False, with a notice, when it
     /// can't be sent.
     fn send_query(&mut self, cmd: Cmd, query: String, act: &mut Act<'_>) -> bool {
+        // One query at a time: a second one would make the first one's answer stale and
+        // leave its pane "Running" for good.
+        if let Some((_, running)) = self.query_pending {
+            act.info(format!(
+                "{} is still running: wait for its answer.",
+                running.name()
+            ));
+            return false;
+        }
         let Some(index) = self.selected().map(|i| i.name.clone()) else {
             act.info("No index selected.");
             return false;
@@ -985,7 +994,7 @@ mod tests {
         type_text(&mut app, "@title:(q1 eP) ");
         assert_eq!(app.screen(), Screen::Search);
         assert_eq!(app.view_input().unwrap().text, "@title:(q1 eP) ");
-        let (_, req) = one(&app.handle_key(key(KeyCode::Enter)));
+        let (id, req) = one(&app.handle_key(key(KeyCode::Enter)));
         assert_eq!(
             req,
             Request::Search {
@@ -994,6 +1003,11 @@ mod tests {
             }
         );
         assert!(app.view_input().is_none());
+        testing::reply(
+            &mut app,
+            id,
+            Ok(LiveReply::Search(Reply::Results(results()))),
+        );
         // An empty query matches everything; `/` starts from the query last run.
         app.handle_key(ch('/'));
         assert_eq!(app.view_input().unwrap().text, "@title:(q1 eP) ");
@@ -1124,6 +1138,27 @@ mod tests {
         app.handle_key(ch('j'));
         app.handle_key(key(KeyCode::Esc));
         assert!(app.views.search.deeper.is_none());
+    }
+
+    /// One query at a time: `e` or `P` while one runs says so and sends nothing, and the
+    /// running query's answer is still shown.
+    #[test]
+    fn a_second_query_waits_for_the_first() {
+        let mut app = with_results();
+        let (id, _) = one(&app.handle_key(ch('e')));
+        for k in ['e', 'P'] {
+            let effects = app.handle_key(ch(k));
+            assert!(testing::requests(&effects).is_empty(), "{k}: {effects:?}");
+            assert_eq!(
+                notice(&app),
+                "FT.EXPLAIN is still running: wait for its answer."
+            );
+        }
+        let t = live_search::parse_explain(&redis::Value::BulkString(b"UNION {\n}\n".to_vec()));
+        testing::reply(&mut app, id, Ok(LiveReply::Search(Reply::Explain(t))));
+        assert!(!app.views.search.is_running());
+        let (_, req) = one(&app.handle_key(ch('P')));
+        assert!(matches!(req, Request::Profile { .. }), "{req:?}");
     }
 
     fn profile_value() -> redis::Value {

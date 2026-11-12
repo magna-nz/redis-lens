@@ -1637,12 +1637,7 @@ mod tests {
     }
 
     fn tail_msg(i: usize) -> TailMessage {
-        TailMessage {
-            at_unix_ms: i as i64,
-            channel: "news".into(),
-            pattern: None,
-            payload: crate::value::Raw::new(format!("m{i}").into_bytes()),
-        }
+        TailMessage::new(i as i64, "news".into(), None, format!("m{i}").into_bytes())
     }
 
     fn message_push(i: usize) -> redis::PushInfo {

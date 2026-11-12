@@ -23,14 +23,12 @@ use super::streams::{list_move, off_text, plain};
 use super::{Act, Input, ViewState};
 use crate::live::pubsub::{Counts, Reply, Request, Subscription, TAIL_KEPT, TailMessage};
 use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
-use crate::value;
 
 /// How often the counts are polled while the view is shown (spec "Shared command budget").
 pub const POLL: Duration = Duration::from_secs(5);
 /// The message rate is counted over this window.
 pub const RATE_WINDOW: Duration = Duration::from_secs(5);
-/// Characters of a message's one-line preview, made once when it arrives.
-pub const PREVIEW_CHARS: usize = 300;
+pub use crate::live::pubsub::{PAYLOAD_KEPT, PREVIEW_CHARS};
 /// The longest text the `s` and `/` inputs take.
 const MAX_INPUT: usize = 256;
 
@@ -107,37 +105,25 @@ pub struct Tail {
 }
 
 /// One message as the tail shows it: the message, and its one-line preview made once,
-/// when it arrived ([`value::preview`]: terminal safe). Its `Debug` shows neither the
+/// when it arrived ([`crate::value::preview`]: terminal safe). Its `Debug` shows neither the
 /// payload nor the preview.
-/// The bytes of a payload a [`TailRow`] keeps after its preview is made.
-pub const PAYLOAD_KEPT: usize = 4096;
-
 pub struct TailRow {
     pub msg: TailMessage,
-    preview: String,
-    /// `preview` in lower case, for the filter.
+    /// The preview in lower case, for the filter.
     lower: String,
 }
 
 impl TailRow {
-    pub fn new(mut msg: TailMessage) -> Self {
-        let preview = value::preview(msg.payload.as_bytes(), PREVIEW_CHARS);
-        // Only the preview is drawn: up to 4,000 messages are held, so a large payload
-        // keeps only its start.
-        if msg.payload.len() > PAYLOAD_KEPT {
-            msg.payload = value::Raw::new(msg.payload.as_bytes()[..PAYLOAD_KEPT].to_vec());
-        }
-        let lower = preview.to_lowercase();
-        Self {
-            msg,
-            preview,
-            lower,
-        }
+    pub fn new(msg: TailMessage) -> Self {
+        // The preview was made where the message was read (`TailMessage::new`), off the
+        // screen's thread.
+        let lower = msg.preview().to_lowercase();
+        Self { msg, lower }
     }
 
     /// The payload on one line, escaped.
     pub fn preview(&self) -> &str {
-        &self.preview
+        self.msg.preview()
     }
 
     /// True when `filter`, already in lower case, is in the channel or the preview.
@@ -154,7 +140,7 @@ impl fmt::Debug for TailRow {
             .field("msg", &self.msg)
             .field(
                 "preview",
-                &format_args!("<{} chars>", self.preview.chars().count()),
+                &format_args!("<{} chars>", self.preview().chars().count()),
             )
             .finish()
     }
@@ -536,7 +522,7 @@ mod tests {
     use super::*;
     use crate::live::pubsub::Channel;
     use crate::tui::app::{App, Effect, Msg, Screen, SecretSource};
-    use crate::value::Raw;
+    use crate::value;
 
     fn channel(name: &str, subscribers: u64) -> Channel {
         Channel {
@@ -743,12 +729,7 @@ mod tests {
     }
 
     fn msg(at_unix_ms: i64, channel: &str, payload: &[u8]) -> TailMessage {
-        TailMessage {
-            at_unix_ms,
-            channel: channel.into(),
-            pattern: None,
-            payload: Raw::new(payload.to_vec()),
-        }
+        TailMessage::new(at_unix_ms, channel.into(), None, payload.to_vec())
     }
 
     /// The subscribe among `effects`: its tail id and what it subscribes to.
@@ -1212,12 +1193,7 @@ mod tests {
     #[test]
     fn a_large_payload_keeps_only_its_start() {
         let big = vec![b'a'; 1 << 20];
-        let row = TailRow::new(TailMessage {
-            at_unix_ms: 0,
-            channel: "c".into(),
-            pattern: None,
-            payload: value::Raw::new(big),
-        });
+        let row = TailRow::new(TailMessage::new(0, "c".into(), None, big));
         assert_eq!(row.msg.payload.len(), PAYLOAD_KEPT);
         assert!(row.preview().starts_with("aaaa"));
     }
