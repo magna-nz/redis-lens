@@ -88,6 +88,19 @@ fn lens(allowed: &[&'static str]) -> Vec<&'static str> {
     v
 }
 
+/// The major version the server reports (Valkey reports 7, as a Redis 7.2 stand-in).
+async fn major_version(conn: &mut MultiplexedConnection) -> u64 {
+    let text: String = redis::cmd("INFO")
+        .arg("server")
+        .query_async(conn)
+        .await
+        .unwrap();
+    text.lines()
+        .find_map(|l| l.strip_prefix("redis_version:"))
+        .and_then(|v| v.split('.').next()?.trim().parse().ok())
+        .expect("redis_version")
+}
+
 fn assert_no_secret(text: &str) {
     for secret in ["lens-pw", "lens", "default"] {
         assert!(!text.contains(secret), "{secret:?} in {text:?}");
@@ -303,6 +316,10 @@ async fn slow_log_has_key_names_but_never_arguments() {
         cmd(&mut admin, &["ZADD", "z", "1", "m"]).await;
         cmd(&mut admin, &["ZUNIONSTORE", "zd", "2", "z", "z2"]).await;
 
+        // Before 7.0 there are no key specs: only the legacy first/last/step triple, so
+        // commands whose keys move (EVAL, ZUNIONSTORE) show the keys it can place, and
+        // XINFO is not a container.
+        let specs = major_version(&mut admin).await >= 7;
         let budget = Budget::new(None);
         let r = slowlog(&mut admin, &budget, Default::default(), true, true)
             .await
@@ -318,8 +335,12 @@ async fn slow_log_has_key_names_but_never_arguments() {
         assert_eq!(by("MGET").keys, ["ma", "mb", "mc"], "{kind}");
         assert_eq!(by("HGETALL").keys, ["cart:7"], "{kind}");
         assert!(by("HGETALL").whole_key_read, "{kind}");
-        assert_eq!(by("EVAL").keys, ["ek1", "ek2"], "{kind}");
-        assert_eq!(by("XINFO STREAM").keys, ["orders"], "{kind}");
+        if specs {
+            assert_eq!(by("EVAL").keys, ["ek1", "ek2"], "{kind}");
+            assert_eq!(by("XINFO STREAM").keys, ["orders"], "{kind}");
+        } else {
+            assert_eq!(by("XINFO").keys, ["orders"], "{kind}");
+        }
         assert_eq!(by("XADD").keys, ["orders"], "{kind}");
         assert_eq!(by("LRANGE").keys, ["q"], "{kind}");
         assert!(by("LRANGE").whole_key_read, "{kind}");
@@ -327,7 +348,12 @@ async fn slow_log_has_key_names_but_never_arguments() {
             by("KEYS").keys.is_empty(),
             "{kind}: KEYS has a pattern, not a key"
         );
-        assert_eq!(by("ZUNIONSTORE").keys, ["zd", "z", "z2"], "{kind}");
+        let zunion = by("ZUNIONSTORE").keys.clone();
+        if specs {
+            assert_eq!(zunion, ["zd", "z", "z2"], "{kind}");
+        } else {
+            assert_eq!(zunion, ["zd"], "{kind}");
+        }
         assert!(!by("SET").whole_key_read);
         assert!(by("SET").client.starts_with("127.0.0.1:") || by("SET").client.contains(':'));
         assert!(by("SET").unix > 1_600_000_000, "{kind}");
@@ -351,22 +377,29 @@ async fn slow_log_has_key_names_but_never_arguments() {
         assert_eq!((cfg.threshold_micros, cfg.max_len), (0, 128), "{kind}");
 
         // The commands learned come back, containers included.
-        for name in [
-            "set",
-            "mget",
-            "eval",
-            "xinfo",
-            "xinfo|stream",
-            "zunionstore",
-            "keys",
-        ] {
+        let learned: &[&str] = if specs {
+            &[
+                "set",
+                "mget",
+                "eval",
+                "xinfo",
+                "xinfo|stream",
+                "zunionstore",
+                "keys",
+            ]
+        } else {
+            &["set", "mget", "eval", "xinfo", "zunionstore", "keys"]
+        };
+        for name in learned.iter().copied() {
             assert!(
                 r.learned.contains_key(name),
                 "{kind}: {name} not in {:?}",
                 r.learned.keys()
             );
         }
-        assert_eq!(r.learned["xinfo"], CommandKeys::Container, "{kind}");
+        if specs {
+            assert_eq!(r.learned["xinfo"], CommandKeys::Container, "{kind}");
+        }
         // Commands: SLOWLOG GET, CONFIG GET, and one or two COMMAND INFO.
         assert!(
             (3..=4).contains(&budget.taken()),
@@ -382,7 +415,7 @@ async fn slow_log_has_key_names_but_never_arguments() {
             .await
             .expect("SLOWLOG again");
         assert!(
-            second.learned.contains_key("slowlog|get"),
+            second.learned.contains_key("command"),
             "{kind}: {:?}",
             second.learned.keys()
         );
@@ -523,6 +556,11 @@ async fn a_user_without_config_get_still_sees_the_slow_log() {
 
 #[tokio::test]
 async fn a_user_without_command_info_sees_entries_without_key_names() {
+    // The rules `+config|get` and the lack of `+command|info` need Redis 7's ACL
+    // subcommands.
+    if major_version(&mut common::redis().await.admin().await).await < 7 {
+        return;
+    }
     for valkey in [false, true] {
         let server = common::server_with(valkey, &lens(&["+slowlog|get", "+config|get"])).await;
         let mut admin = server.admin().await;
@@ -541,7 +579,8 @@ async fn a_user_without_command_info_sees_entries_without_key_names() {
         assert_eq!(
             r.keys_off,
             Some(LiveError::Denied("COMMAND INFO".into())),
-            "valkey={valkey}"
+            "valkey={valkey}: {:?}",
+            r.keys_off
         );
         assert!(r.config.unwrap().is_ok(), "valkey={valkey}");
         let set = r

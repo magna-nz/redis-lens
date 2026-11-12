@@ -774,9 +774,8 @@ async fn command_info(
 
 async fn slow_config(conn: &mut Conn, budget: &Budget) -> Result<SlowConfig, LiveError> {
     let mut c = redis::cmd("CONFIG");
-    c.arg("GET")
-        .arg("slowlog-log-slower-than")
-        .arg("slowlog-max-len");
+    // One pattern: Redis before 7.0 takes a single parameter or pattern.
+    c.arg("GET").arg("slowlog-*");
     let v: Value = query(conn, budget, "CONFIG GET", &c).await?;
     parse_slow_config(&v).ok_or_else(|| LiveError::Failed("CONFIG GET failed".to_string()))
 }
