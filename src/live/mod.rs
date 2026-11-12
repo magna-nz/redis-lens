@@ -210,9 +210,8 @@ async fn serve(
     loop {
         tokio::select! {
             next = rx.recv() => {
-                let Some((id, req)) = next else {
-                    return None;
-                };
+                // The handle was dropped: closed on purpose.
+                let (id, req) = next?;
                 let mut conn = conn.clone();
                 let budget = Arc::clone(&budget);
                 let task = tasks.spawn(async move { run(&mut conn, &budget, req).await });
