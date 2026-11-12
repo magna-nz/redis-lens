@@ -1,4 +1,4 @@
 user default off
 user admin on >admin-demo-only ~* &* +@all
-user lens on >lens-demo-only ~* resetchannels -@all +ping +hello +auth +client|setinfo +client|setname +select +info +dbsize +scan +type +ttl +pttl +memory|usage +object|freq
+user lens on >lens-demo-only ~* resetchannels -@all +ping +hello +auth +client|setinfo +client|setname +select +info +dbsize +scan +type +ttl +pttl +memory|usage +object|freq +slowlog|get +slowlog|len +client|list +xinfo +pubsub|channels +pubsub|numsub +pubsub|numpat +command|docs +command|info +time +object|encoding +strlen +hlen +llen +scard +zcard +xlen
 user lens-limited on >limited-demo-only ~* resetchannels -@all +ping +hello +auth +client|setinfo +client|setname +select +info +dbsize +scan +type +ttl +pttl

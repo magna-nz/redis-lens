@@ -668,7 +668,7 @@ A write is sent only when all three checks allow it.
 - **P2 probes:** `COMMAND DOCS GET`.
 - **P3 probes:** `ACL DRYRUN`, where it is allowed.
 - **Turning off:** each missing permission turns off its view or panel, with the reason (rule 3).
-- **ACL user:** the minimal read-only user gains `+slowlog|get +slowlog|len +client|list +xinfo +pubsub|channels +pubsub|numsub +pubsub|numpat +ft._list +ft.info +command|docs +command|info +time +object|encoding +strlen +hlen +llen +scard +zcard +xlen`. `+config|get` shows the slow log's threshold, but it also lets the user read every setting, `requirepass` and `masterauth` included, so it is left out: without it the panel says the threshold is unknown. For P2 it also needs the read commands for values: `+@read`, and `-keys` to block `KEYS`.
+- **ACL user:** the minimal read-only user gains `+slowlog|get +slowlog|len +client|list +xinfo +pubsub|channels +pubsub|numsub +pubsub|numpat +command|docs +command|info +time +object|encoding +strlen +hlen +llen +scard +zcard +xlen`. Give `+ft._list +ft.info` only on a server with the Search module: a server without it refuses the whole rule, and an ACL file with it does not load. `+config|get` shows the slow log's threshold, but it also lets the user read every setting, `requirepass` and `masterauth` included, so it is left out: without it the panel says the threshold is unknown. For P2 it also needs the read commands for values: `+@read`, and `-keys` to block `KEYS`.
 
 ### Server versions
 
