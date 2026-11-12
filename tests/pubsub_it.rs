@@ -73,41 +73,43 @@ async fn counts_with_real_subscribers() {
 
 #[tokio::test]
 async fn only_the_first_1000_channels_are_listed() {
-    let server = common::redis().await;
-    let client = redis::Client::open(server.url()).unwrap();
-    let mut admin = server.admin().await;
-    let mut ps = client.get_async_pubsub().await.unwrap();
-    let names: Vec<String> = (0..MAX_CHANNELS + 100)
-        .map(|i| format!("ch{i:04}"))
-        .collect();
-    ps.subscribe(&names).await.unwrap();
-    let budget = Budget::new(None);
-    let end = Instant::now() + Duration::from_secs(10);
-    let c = loop {
-        let c = counts(&mut admin, &budget).await.unwrap();
-        if c.total_channels == names.len() || Instant::now() > end {
-            break c;
-        }
-        sleep(Duration::from_millis(50)).await;
-    };
-    assert_eq!(c.total_channels, MAX_CHANNELS + 100);
-    assert_eq!(c.channels.len(), MAX_CHANNELS);
-    assert!(c.channels.iter().all(|ch| ch.subscribers == Some(1)));
-    drop(ps);
+    for server in [common::redis().await, common::valkey().await] {
+        let client = redis::Client::open(server.url()).unwrap();
+        let mut admin = server.admin().await;
+        let mut ps = client.get_async_pubsub().await.unwrap();
+        let names: Vec<String> = (0..MAX_CHANNELS + 100)
+            .map(|i| format!("ch{i:04}"))
+            .collect();
+        ps.subscribe(&names).await.unwrap();
+        let budget = Budget::new(None);
+        let end = Instant::now() + Duration::from_secs(10);
+        let c = loop {
+            let c = counts(&mut admin, &budget).await.unwrap();
+            if c.total_channels == names.len() || Instant::now() > end {
+                break c;
+            }
+            sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(c.total_channels, MAX_CHANNELS + 100);
+        assert_eq!(c.channels.len(), MAX_CHANNELS);
+        assert!(c.channels.iter().all(|ch| ch.subscribers == Some(1)));
+        drop(ps);
+    }
 }
 
 #[tokio::test]
 async fn every_command_takes_from_the_budget() {
-    let server = common::redis().await;
-    let client = redis::Client::open(server.url()).unwrap();
-    let mut admin = server.admin().await;
-    let mut ps = client.get_async_pubsub().await.unwrap();
-    ps.subscribe("a").await.unwrap();
-    counts_until(&mut admin, |c| c.total_channels == 1).await;
-    let budget = Budget::new(None);
-    counts(&mut admin, &budget).await.unwrap();
-    // CHANNELS and NUMPAT, then one NUMSUB for the one batch of channels.
-    assert_eq!(budget.taken(), 3);
+    for server in [common::redis().await, common::valkey().await] {
+        let client = redis::Client::open(server.url()).unwrap();
+        let mut admin = server.admin().await;
+        let mut ps = client.get_async_pubsub().await.unwrap();
+        ps.subscribe("a").await.unwrap();
+        counts_until(&mut admin, |c| c.total_channels == 1).await;
+        let budget = Budget::new(None);
+        counts(&mut admin, &budget).await.unwrap();
+        // CHANNELS and NUMPAT, then one NUMSUB for the one batch of channels.
+        assert_eq!(budget.taken(), 3);
+    }
 }
 
 #[tokio::test]
@@ -150,11 +152,15 @@ async fn counts_the_user_may_not_read_are_left_out_with_fixed_notes() {
 #[tokio::test]
 async fn a_user_who_may_not_list_channels_turns_the_view_off() {
     let args = ["--user", "zed-ro", "on", ">zed-pw", "~*", "+ping"];
-    let server = common::redis_with(&args).await;
-    let mut zed = server.admin_as("zed-ro", "zed-pw").await;
-    let err = counts(&mut zed, &Budget::new(None))
-        .await
-        .expect_err("denied");
-    assert_eq!(err, LiveError::Denied("PUBSUB CHANNELS".into()));
-    assert!(!err.to_string().contains("zed-ro"));
+    for server in [
+        common::redis_with(&args).await,
+        common::valkey_with(&args).await,
+    ] {
+        let mut zed = server.admin_as("zed-ro", "zed-pw").await;
+        let err = counts(&mut zed, &Budget::new(None))
+            .await
+            .expect_err("denied");
+        assert_eq!(err, LiveError::Denied("PUBSUB CHANNELS".into()));
+        assert!(!err.to_string().contains("zed-ro"));
+    }
 }

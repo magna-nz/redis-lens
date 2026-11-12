@@ -161,32 +161,40 @@ async fn info_is_read_and_rates_come_from_two_polls() {
 
 #[tokio::test]
 async fn info_shows_a_memory_limit_and_a_policy() {
-    let server =
-        common::redis_with(&["--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lfu"]).await;
-    let mut admin = server.admin().await;
-    let (_, s) = info(&mut admin, &Budget::new(None)).await;
-    assert_eq!(s.maxmemory, Some(64 * 1024 * 1024));
-    assert_eq!(s.policy.as_deref(), Some("allkeys-lfu"));
+    for valkey in [false, true] {
+        let args = ["--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lfu"];
+        let server = common::server_with(valkey, &args).await;
+        let mut admin = server.admin().await;
+        let (_, s) = info(&mut admin, &Budget::new(None)).await;
+        assert_eq!(s.maxmemory, Some(64 * 1024 * 1024));
+        assert_eq!(s.policy.as_deref(), Some("allkeys-lfu"));
+    }
 }
 
 #[tokio::test]
 async fn info_reads_a_replica_as_a_replica() {
-    let primary = common::redis().await;
-    let replica = common::replica_of(&primary, false, None).await;
-    let mut conn = replica.admin().await;
-    let mut tries = 0;
-    loop {
-        let (_, s) = info(&mut conn, &Budget::new(None)).await;
-        if s.link_up == Some(true) {
-            assert_eq!(s.role, Some(Role::Replica));
-            break;
+    for valkey in [false, true] {
+        let primary = if valkey {
+            common::valkey().await
+        } else {
+            common::redis().await
+        };
+        let replica = common::replica_of(&primary, valkey, None).await;
+        let mut conn = replica.admin().await;
+        let mut tries = 0;
+        loop {
+            let (_, s) = info(&mut conn, &Budget::new(None)).await;
+            if s.link_up == Some(true) {
+                assert_eq!(s.role, Some(Role::Replica));
+                break;
+            }
+            tries += 1;
+            assert!(tries < 50, "the replica never linked up");
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        tries += 1;
-        assert!(tries < 50, "the replica never linked up");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (_, s) = info(&mut primary.admin().await, &Budget::new(None)).await;
+        assert_eq!(s.replicas, Some(1));
     }
-    let (_, s) = info(&mut primary.admin().await, &Budget::new(None)).await;
-    assert_eq!(s.replicas, Some(1));
 }
 
 #[tokio::test]
@@ -254,21 +262,23 @@ async fn client_list_groups_by_library_name_and_network() {
 
 #[tokio::test]
 async fn client_list_never_carries_the_user() {
-    let server = common::redis_with(&lens(&["+client|list", "+client|setname"])).await;
-    let mut conn = connect_as(&server, "lens", "lens-pw").await;
-    let list = clients(&mut conn, &Budget::new(None))
-        .await
-        .expect("CLIENT LIST");
-    assert!(!list.is_empty());
-    assert_no_secret(&format!("{list:?}"));
-    // The raw text does have it; the parser is what drops it.
-    let raw: String = redis::cmd("CLIENT")
-        .arg("LIST")
-        .query_async(&mut conn)
-        .await
-        .unwrap();
-    assert!(raw.contains("user=lens"));
-    assert_no_secret(&format!("{:?}", parse_client_list(&raw)));
+    for valkey in [false, true] {
+        let server = common::server_with(valkey, &lens(&["+client|list", "+client|setname"])).await;
+        let mut conn = connect_as(&server, "lens", "lens-pw").await;
+        let list = clients(&mut conn, &Budget::new(None))
+            .await
+            .expect("CLIENT LIST");
+        assert!(!list.is_empty());
+        assert_no_secret(&format!("{list:?}"));
+        // The raw text does have it; the parser is what drops it.
+        let raw: String = redis::cmd("CLIENT")
+            .arg("LIST")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(raw.contains("user=lens"));
+        assert_no_secret(&format!("{:?}", parse_client_list(&raw)));
+    }
 }
 
 /// A connection named `name` that says nothing about its library (the client library
@@ -433,29 +443,30 @@ async fn slow_log_has_key_names_but_never_arguments() {
 
 #[tokio::test]
 async fn slow_log_cuts_long_commands_without_taking_the_marker_for_a_key() {
-    let server = common::redis().await;
-    let mut admin = server.admin().await;
-    log_everything(&mut admin).await;
-    let names: Vec<String> = (0..60).map(|i| format!("del{i}")).collect();
-    let mut c = redis::cmd("DEL");
-    for n in &names {
-        c.arg(n.as_str());
+    for (_, server) in servers().await {
+        let mut admin = server.admin().await;
+        log_everything(&mut admin).await;
+        let names: Vec<String> = (0..60).map(|i| format!("del{i}")).collect();
+        let mut c = redis::cmd("DEL");
+        for n in &names {
+            c.arg(n.as_str());
+        }
+        let _: i64 = c.query_async(&mut admin).await.unwrap();
+        let r = slowlog(
+            &mut admin,
+            &Budget::new(None),
+            Default::default(),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        let del = r.entries.iter().find(|e| e.command == "DEL").unwrap();
+        assert_eq!(del.keys.len(), 8);
+        assert_eq!(del.keys[0], "del0");
+        assert!(del.more_keys > 0 && del.more_keys <= 60 - 8);
+        assert!(!del.keys.iter().any(|k| k.contains("more arguments")));
     }
-    let _: i64 = c.query_async(&mut admin).await.unwrap();
-    let r = slowlog(
-        &mut admin,
-        &Budget::new(None),
-        Default::default(),
-        false,
-        true,
-    )
-    .await
-    .unwrap();
-    let del = r.entries.iter().find(|e| e.command == "DEL").unwrap();
-    assert_eq!(del.keys.len(), 8);
-    assert_eq!(del.keys[0], "del0");
-    assert!(del.more_keys > 0 && del.more_keys <= 60 - 8);
-    assert!(!del.keys.iter().any(|k| k.contains("more arguments")));
 }
 
 // -- limited users ------------------------------------------------------------
@@ -649,18 +660,19 @@ async fn the_live_task_answers_server_requests() {
 
 #[tokio::test]
 async fn polls_respect_the_command_rate() {
-    // 20 commands a second: ten INFOs take about half a second, not a few milliseconds.
-    let server = common::redis().await;
-    let mut conn = server.admin().await;
-    let budget = Budget::new(Some(20));
-    let t0 = tokio::time::Instant::now();
-    for _ in 0..11 {
-        info(&mut conn, &budget).await;
+    for (_, server) in servers().await {
+        // 20 commands a second: ten INFOs take about half a second, not a few milliseconds.
+        let mut conn = server.admin().await;
+        let budget = Budget::new(Some(20));
+        let t0 = tokio::time::Instant::now();
+        for _ in 0..11 {
+            info(&mut conn, &budget).await;
+        }
+        assert!(
+            t0.elapsed() >= Duration::from_millis(400),
+            "{:?}",
+            t0.elapsed()
+        );
+        assert_eq!(budget.taken(), 11);
     }
-    assert!(
-        t0.elapsed() >= Duration::from_millis(400),
-        "{:?}",
-        t0.elapsed()
-    );
-    assert_eq!(budget.taken(), 11);
 }

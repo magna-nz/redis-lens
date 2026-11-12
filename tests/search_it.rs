@@ -282,15 +282,17 @@ async fn a_server_without_the_module_says_unsupported() {
 
 #[tokio::test]
 async fn every_command_takes_from_the_budget() {
-    let server = Server::start(REDIS8, &[]).await;
-    let mut conn = server.conn().await;
-    seed(&mut conn).await;
-    let budget = Budget::new(None);
-    search::run(&mut conn, &budget, Request::Indexes)
-        .await
-        .expect("run");
-    // FT._LIST, then FT.INFO for each of the two indexes.
-    assert_eq!(budget.taken(), 3);
+    for image in [REDIS8, VALKEY_BUNDLE] {
+        let server = Server::start(image, &[]).await;
+        let mut conn = server.conn().await;
+        seed(&mut conn).await;
+        let budget = Budget::new(None);
+        search::run(&mut conn, &budget, Request::Indexes)
+            .await
+            .expect("run");
+        // FT._LIST, then FT.INFO for each of the two indexes.
+        assert_eq!(budget.taken(), 3);
+    }
 }
 
 /// A user who may list indexes and not read them still sees the names, with a fixed note.
@@ -321,10 +323,12 @@ async fn indexes_the_user_may_not_read_keep_their_names() {
 
 #[tokio::test]
 async fn a_user_who_may_not_list_indexes_turns_the_view_off() {
-    let args = ["--user", "zed-ro", "on", ">zed-pw", "~*", "+ping"];
-    let server = Server::start(REDIS8, &args).await;
-    let mut zed = server.conn_as("zed-ro", "zed-pw").await;
-    let err = indexes(&mut zed).await.expect_err("denied");
-    assert_eq!(err, LiveError::Denied("FT._LIST".into()));
-    assert!(!err.to_string().contains("zed-ro"));
+    for image in [REDIS8, VALKEY_BUNDLE] {
+        let args = ["--user", "zed-ro", "on", ">zed-pw", "~*", "+ping"];
+        let server = Server::start(image, &args).await;
+        let mut zed = server.conn_as("zed-ro", "zed-pw").await;
+        let err = indexes(&mut zed).await.expect_err("denied");
+        assert_eq!(err, LiveError::Denied("FT._LIST".into()));
+        assert!(!err.to_string().contains("zed-ro"));
+    }
 }
