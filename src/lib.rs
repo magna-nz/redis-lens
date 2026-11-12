@@ -15,6 +15,7 @@
 //! - [`cli`]: command-line entry points.
 //! - [`tui`]: the terminal UI.
 
+pub mod analysis;
 pub mod budget;
 pub mod check;
 pub mod cli;
