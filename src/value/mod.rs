@@ -19,6 +19,15 @@
 //! cells; [`copy_text`] is what `y` copies.
 
 use std::fmt;
+use std::fmt::Write as _;
+
+mod compress;
+mod json;
+mod lines;
+#[cfg(test)]
+mod tests;
+
+use lines::Sink;
 
 /// The most bytes a decompression produces. Anything past it is dropped and
 /// [`Decoded::truncated`] is set, so a small compressed value can't fill memory.
@@ -27,6 +36,11 @@ pub const MAX_DECOMPRESSED: usize = 1024 * 1024;
 /// The most lines [`render`] returns. Past it the last line says how many were left
 /// out.
 pub const MAX_LINES: usize = 10_000;
+
+/// The widest escape [`escape`] draws one character as (`\u{202e}`). A line from
+/// [`render`] is at most `max(width, MAX_ESCAPE_WIDTH)` columns wide: an escape is never
+/// split across lines, so one wider than `width` gets a line of its own.
+pub const MAX_ESCAPE_WIDTH: usize = 8;
 
 /// A value read from the server: bytes, shown on screen and nowhere else.
 ///
@@ -165,18 +179,64 @@ impl fmt::Debug for Decoded {
 
 /// Undoes compression and detects the format (spec "Formats"): gzip, zlib, LZ4 frame and
 /// zstd first; then JSON, MessagePack, UTF-8 text, otherwise hex.
+///
+/// Only one layer of compression is undone. Bytes that start with a compression's
+/// magic but do not decompress are kept as they are, with `compression: None`.
+/// Detection: JSON when the bytes (trimmed of ASCII whitespace) are one complete JSON
+/// object or array (a bare number, string or word is text); MessagePack when they are
+/// not UTF-8 and are exactly one MessagePack map or array; text when they are UTF-8
+/// (when decompression was cut, an incomplete character at the end is allowed);
+/// otherwise hex.
 pub fn decode(raw: &[u8]) -> Decoded {
-    // Contract placeholder: no decompression yet; text when UTF-8, else hex.
+    let (compression, bytes, truncated) = match compress::decompress(raw) {
+        Some((c, bytes, truncated)) => (Some(c), bytes, truncated),
+        None => (None, raw.to_vec(), false),
+    };
+    let detected = detect(&bytes, truncated);
     Decoded {
-        compression: None,
-        truncated: false,
-        detected: if std::str::from_utf8(raw).is_ok() {
-            Format::Text
-        } else {
-            Format::Hex
-        },
-        bytes: raw.to_vec(),
+        compression,
+        truncated,
+        detected,
+        bytes,
     }
+}
+
+fn detect(bytes: &[u8], truncated: bool) -> Format {
+    match std::str::from_utf8(bytes) {
+        Ok(s) if json::is_json_document(s) => Format::Json,
+        Ok(_) => Format::Text,
+        Err(_) if json::is_msgpack_container(bytes) => Format::MsgPack,
+        // Cut in the middle of a character by the decompression cap.
+        Err(e) if truncated && e.error_len().is_none() => Format::Text,
+        Err(_) => Format::Hex,
+    }
+}
+
+/// The format `d` is drawn or copied in when `format` is asked for, and the note when
+/// that is not `format`. Text and hex always work; JSON needs one complete JSON value
+/// (any, not only an object or array), MessagePack exactly one MessagePack value.
+fn resolve(d: &Decoded, format: Format) -> (Format, Option<&'static str>) {
+    let utf8 = std::str::from_utf8(&d.bytes).ok();
+    let ok = match format {
+        Format::Text | Format::Hex => true,
+        Format::Json => utf8.is_some_and(json::is_json),
+        Format::MsgPack => json::msgpack_value(&d.bytes).is_some(),
+    };
+    if ok {
+        return (format, None);
+    }
+    let note = match (format, utf8.is_some()) {
+        (Format::Json, true) => "not valid JSON, shown as text",
+        (Format::Json, false) => "not valid JSON, shown as hex",
+        (_, true) => "not valid MessagePack, shown as text",
+        (_, false) => "not valid MessagePack, shown as hex",
+    };
+    let used = if utf8.is_some() {
+        Format::Text
+    } else {
+        Format::Hex
+    };
+    (used, Some(note))
 }
 
 /// A value drawn in one format: lines that are safe to draw. `Debug` leaves them out.
@@ -217,32 +277,146 @@ impl fmt::Debug for Rendered {
 ///
 /// When `d` isn't valid in `format` (JSON asked for bytes that are not JSON, say), it
 /// is drawn as text if it is UTF-8, else as hex, and [`Rendered::note`] says so.
+///
+/// Every line has gone through [`escape`], and is at most `max(width,`
+/// [`MAX_ESCAPE_WIDTH`]`)` columns wide. Hex of an empty value has no lines.
 pub fn render(d: &Decoded, format: Format, width: usize) -> Rendered {
-    // Contract placeholder.
-    let _ = (format, width);
-    let lines = match std::str::from_utf8(&d.bytes) {
-        Ok(s) => s.split('\n').map(escape).collect(),
-        Err(_) => vec![d.bytes.iter().map(|b| format!("{b:02x}")).collect()],
-    };
-    Rendered {
-        format: d.detected,
-        note: None,
-        lines,
+    let (used, note) = resolve(d, format);
+    let mut sink = Sink::new(width);
+    match used {
+        Format::Text => {
+            for line in d.bytes.split(|&b| b == b'\n') {
+                sink.bytes(line);
+                sink.break_line();
+            }
+        }
+        Format::Hex => {
+            let n = lines::hex_bytes_per_line(width);
+            for (k, chunk) in d.bytes.chunks(n).enumerate() {
+                sink.str(&lines::hex_line(k * n, chunk, n));
+                sink.break_line();
+            }
+        }
+        Format::Json => {
+            // `resolve` checked it is UTF-8 JSON.
+            let s = std::str::from_utf8(&d.bytes).unwrap_or("");
+            pretty_lines(s, &mut sink);
+        }
+        Format::MsgPack => {
+            if let Some(v) = json::msgpack_value(&d.bytes) {
+                let mut s = String::new();
+                json::msgpack_to_json(&v, &mut s, usize::MAX);
+                pretty_lines(&s, &mut sink);
+            }
+        }
     }
+    Rendered {
+        format: used,
+        note,
+        lines: sink.finish(),
+    }
+}
+
+/// Pretty JSON into `sink`, a line per line, with two-space indents.
+fn pretty_lines(json_text: &str, sink: &mut Sink) {
+    struct Pretty<'a>(&'a mut Sink);
+    impl json::JsonOut for Pretty<'_> {
+        fn text(&mut self, s: &str) {
+            self.0.str(s);
+        }
+        fn newline(&mut self, depth: usize) {
+            self.0.break_line();
+            self.0.spaces(2 * depth);
+        }
+    }
+    json::reformat(json_text, true, &mut Pretty(sink));
+    sink.break_line();
+}
+
+/// Compact one-line JSON for `json_text`, cut once longer than `limit` bytes.
+fn compact_json(json_text: &str, limit: usize) -> String {
+    let mut out = json::Compact {
+        out: String::new(),
+        limit,
+    };
+    json::reformat(json_text, false, &mut out);
+    out.out
+}
+
+/// Compact one-line JSON for a MessagePack value, cut once longer than `limit` bytes.
+fn compact_msgpack(bytes: &[u8], limit: usize) -> Option<String> {
+    let v = json::msgpack_value(bytes)?;
+    let mut s = String::new();
+    json::msgpack_to_json(&v, &mut s, limit);
+    // Through the reformatter for the same escapes as JSON gets.
+    Some(compact_json(&s, limit))
+}
+
+fn hex_digits(bytes: &[u8], sep: &str) -> String {
+    let mut s = String::with_capacity(bytes.len() * (2 + sep.len()));
+    for (k, b) in bytes.iter().enumerate() {
+        if k > 0 {
+            s.push_str(sep);
+        }
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// One line for a list cell: the value in its detected format, compact (JSON and
 /// MessagePack on one line, text with newlines as `\n`, hex as pairs of digits), at
 /// most `max_chars` characters with `…` at the end when cut. Terminal safe.
+///
+/// Text and hex convert only as much of the value as fits; JSON is still checked
+/// whole, to detect it.
 pub fn preview(raw: &[u8], max_chars: usize) -> String {
-    // Contract placeholder.
-    let s = escape(&String::from_utf8_lossy(raw));
-    if s.chars().count() <= max_chars {
-        return s;
+    if max_chars == 0 {
+        return String::new();
     }
-    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-    out.push('…');
-    out
+    let d = decode(raw);
+    // Enough input or output bytes for more than `max_chars` characters: a character
+    // is at most 4 bytes, and every byte of input gives at least a character.
+    let limit = max_chars.saturating_add(1).saturating_mul(4);
+    let s = match d.detected {
+        Format::Json => escape(&compact_json(
+            std::str::from_utf8(&d.bytes).unwrap_or(""),
+            limit,
+        )),
+        Format::MsgPack => escape(&compact_msgpack(&d.bytes, limit).unwrap_or_default()),
+        Format::Text => {
+            let prefix = &d.bytes[..d.bytes.len().min(limit)];
+            let mut s = String::new();
+            for chunk in prefix.utf8_chunks() {
+                for c in chunk.valid().chars() {
+                    match escaped_len(c) {
+                        Some(_) => push_escaped(c, &mut s),
+                        None => s.push(c),
+                    }
+                }
+                for b in chunk.invalid() {
+                    let _ = write!(s, "\\x{b:02x}");
+                }
+            }
+            s
+        }
+        Format::Hex => {
+            let n = d.bytes.len().min(max_chars / 3 + 2);
+            hex_digits(&d.bytes[..n], " ")
+        }
+    };
+    cut(s, max_chars)
+}
+
+/// `s` cut to `max_chars` characters, the last one `…` when it was cut.
+fn cut(s: String, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        None => s,
+        Some(_) => {
+            let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+            out.push('…');
+            out
+        }
+    }
 }
 
 /// Why `y` can't copy a value as shown.
@@ -260,13 +434,23 @@ pub enum CopyRefusal {
 ///   characters inside strings);
 ///
 /// falling back the way [`render`] does when `d` isn't valid in `format`.
+///
+/// Text that is not valid UTF-8 is refused too (as [`CopyRefusal::ControlCharacters`]):
+/// it could only be copied with its escapes, which is not the value. What is returned
+/// never has a control character or a bidirectional control.
 pub fn copy_text(d: &Decoded, format: Format) -> Result<String, CopyRefusal> {
-    // Contract placeholder.
-    let _ = format;
-    match std::str::from_utf8(&d.bytes) {
-        Ok(s) if !s.chars().any(char::is_control) => Ok(s.to_string()),
-        Ok(_) => Err(CopyRefusal::ControlCharacters),
-        Err(_) => Ok(d.bytes.iter().map(|b| format!("{b:02x}")).collect()),
+    let (used, _) = resolve(d, format);
+    match used {
+        Format::Text => match std::str::from_utf8(&d.bytes) {
+            Ok(s) if !s.chars().any(|c| c.is_control() || is_bidi_control(c)) => Ok(s.to_string()),
+            _ => Err(CopyRefusal::ControlCharacters),
+        },
+        Format::Hex => Ok(hex_digits(&d.bytes, "")),
+        Format::Json => Ok(compact_json(
+            std::str::from_utf8(&d.bytes).unwrap_or(""),
+            usize::MAX,
+        )),
+        Format::MsgPack => Ok(compact_msgpack(&d.bytes, usize::MAX).unwrap_or_default()),
     }
 }
 
@@ -278,20 +462,48 @@ pub fn copy_text(d: &Decoded, format: Format) -> Result<String, CopyRefusal> {
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        match c {
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 || c == '\x7f' => {
-                out.push_str(&format!("\\x{:02x}", c as u32));
-            }
-            c if ('\u{80}'..='\u{9f}').contains(&c) || is_bidi_control(c) => {
-                out.push_str(&format!("\\u{{{:x}}}", c as u32));
-            }
-            c => out.push(c),
+        match escaped_len(c) {
+            Some(_) => push_escaped(c, &mut out),
+            None => out.push(c),
         }
     }
     out
+}
+
+/// How long `c`'s escape is, or `None` when [`escape`] keeps it as it is. Escapes are
+/// ASCII, so this is also their width.
+fn escaped_len(c: char) -> Option<usize> {
+    match c {
+        '\t' | '\n' | '\r' => Some(2),
+        c if (c as u32) < 0x20 || c == '\x7f' => Some(4),
+        c if ('\u{80}'..='\u{9f}').contains(&c) || is_bidi_control(c) => {
+            // `\u{` + hex digits + `}`
+            let digits = if (c as u32) < 0x100 {
+                2
+            } else if (c as u32) < 0x1000 {
+                3
+            } else {
+                4
+            };
+            Some(4 + digits)
+        }
+        _ => None,
+    }
+}
+
+/// Pushes the escape for `c`, which [`escaped_len`] said has one.
+fn push_escaped(c: char, out: &mut String) {
+    match c {
+        '\t' => out.push_str("\\t"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        c if (c as u32) < 0x20 || c == '\x7f' => {
+            let _ = write!(out, "\\x{:02x}", c as u32);
+        }
+        c => {
+            let _ = write!(out, "\\u{{{:x}}}", c as u32);
+        }
+    }
 }
 
 /// The Unicode bidirectional formatting characters, which can reorder what a terminal
@@ -301,27 +513,4 @@ fn is_bidi_control(c: char) -> bool {
         c,
         '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn raw_debug_never_shows_the_value() {
-        let r = Raw::from("s3cret-value");
-        assert_eq!(format!("{r:?}"), "Raw(<12 bytes>)");
-        let d = decode(r.as_bytes());
-        assert!(!format!("{d:?}").contains("s3cret"));
-        assert!(!format!("{:?}", render(&d, Format::Text, 80)).contains("s3cret"));
-    }
-
-    #[test]
-    fn escape_draws_controls_as_escapes() {
-        assert_eq!(escape("a\x1b[2Jb"), "a\\x1b[2Jb");
-        assert_eq!(escape("l1\nl2\tx\r"), "l1\\nl2\\tx\\r");
-        assert_eq!(escape("\u{9b}31m"), "\\u{9b}31m");
-        assert_eq!(escape("ab\u{202e}cd"), "ab\\u{202e}cd");
-        assert_eq!(escape("plain \\ text é"), "plain \\ text é");
-    }
 }

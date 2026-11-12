@@ -315,5 +315,20 @@ mod tests {
         assert_eq!(CopyText::pattern("a:{id}").what(), "pattern");
         assert_eq!(CopyText::pattern("a:{id}").as_str(), "a:{id}");
         assert_eq!(CopyText::key("a:1").what(), "key");
+        assert_eq!(CopyText::value("x").what(), "value");
+        assert_eq!(CopyText::value("x").as_str(), "x");
+    }
+
+    #[test]
+    fn debug_never_shows_the_text() {
+        for t in [
+            CopyText::value("s3cret"),
+            CopyText::key("s3cret"),
+            CopyText::pattern("s3cret"),
+        ] {
+            let dbg = format!("{t:?}");
+            assert!(!dbg.contains("s3cret"));
+            assert!(dbg.contains("len: 6"));
+        }
     }
 }
