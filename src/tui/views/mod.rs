@@ -89,18 +89,12 @@ pub mod streams;
 /// Labels of the phase 1 view probes in [`PermissionReport::checks`], after the scan's
 /// own checks (`model::PERM_LABELS`). Only the scan's checks make a connection
 /// `Limited`; a denied or skipped probe turns its view off ([`Ctx::off_reason`]).
-pub const PROBE_SLOWLOG: &str = "SLOWLOG";
-pub const PROBE_CLIENT_LIST: &str = "CLIENT LIST";
-pub const PROBE_XINFO: &str = "XINFO";
-pub const PROBE_PUBSUB: &str = "PUBSUB";
-pub const PROBE_FT_LIST: &str = "FT._LIST";
-pub const PROBE_LABELS: [&str; 5] = [
-    PROBE_SLOWLOG,
-    PROBE_CLIENT_LIST,
-    PROBE_XINFO,
-    PROBE_PUBSUB,
-    PROBE_FT_LIST,
-];
+/// They are the labels `conn::check_view_permissions` uses, re-exported here.
+pub use crate::conn::{
+    PERM_CLIENT_LIST as PROBE_CLIENT_LIST, PERM_PUBSUB as PROBE_PUBSUB,
+    PERM_SEARCH as PROBE_FT_LIST, PERM_SLOWLOG as PROBE_SLOWLOG, PERM_XINFO as PROBE_XINFO,
+    VIEW_PERM_LABELS as PROBE_LABELS,
+};
 
 /// The probe a screen needs, if any.
 pub fn probe_of(screen: Screen) -> Option<&'static str> {
