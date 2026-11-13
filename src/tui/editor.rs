@@ -227,6 +227,7 @@ pub fn run(job: &EditorJob, out: &mut impl Write) -> Result<Raw, String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn base() -> PathBuf {
         let d = std::env::temp_dir().join(format!("redis-lens-editor-test-{}", std::process::id()));
         fs::create_dir_all(&d).unwrap();
