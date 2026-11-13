@@ -134,7 +134,11 @@ pub fn decide(profile: &Profile, settings: &Settings, kind: Kind, name: &str) ->
     match kind {
         Kind::Edit if prod => Decision::Ask,
         Kind::Edit => Decision::Run,
-        Kind::Destructive | Kind::Bulk if prod => Decision::Type(name.to_string()),
+        Kind::Destructive | Kind::Bulk if prod => Decision::Type(if name.is_empty() {
+            profile.name.clone()
+        } else {
+            name.to_string()
+        }),
         Kind::Destructive if skip => Decision::Run,
         Kind::Destructive | Kind::Bulk => Decision::Ask,
         Kind::Dangerous if prod => Decision::Type(profile.name.clone()),
@@ -424,10 +428,11 @@ pub enum WriteOp {
 /// Commands that delete or overwrite data (spec "What counts as destructive or
 /// dangerous"), lower-case as `COMMAND INFO` names them. `RENAME` may overwrite a key,
 /// so it counts; `RENAMENX` never does.
-pub const DESTRUCTIVE: [&str; 13] = [
+pub const DESTRUCTIVE: [&str; 39] = [
     "del",
     "unlink",
     "hdel",
+    "hgetdel",
     "srem",
     "zrem",
     "lrem",
@@ -438,7 +443,55 @@ pub const DESTRUCTIVE: [&str; 13] = [
     "rename",
     "ft.dropindex",
     "ft._dropindexifx",
+    "getdel",
+    "ltrim",
+    "lpop",
+    "rpop",
+    "lmpop",
+    "spop",
+    "zpopmin",
+    "zpopmax",
+    "zmpop",
+    "zremrangebyrank",
+    "zremrangebyscore",
+    "zremrangebylex",
+    "rpoplpush",
+    "lmove",
+    "smove",
+    "move",
+    "copy",
+    "restore",
+    "bitop",
+    "sinterstore",
+    "sunionstore",
+    "sdiffstore",
+    "zinterstore",
+    "zunionstore",
+    "zdiffstore",
 ];
+
+/// Commands that write a destination they overwrite or delete keys and elements
+/// besides those on [`DESTRUCTIVE`]: `ZRANGESTORE`, `GEO*` with `STORE`, `SORT … STORE`,
+/// and a TTL that is not in the future (`EXPIRE k 0` deletes `k`).
+fn destructive_by_arguments(args: &[Vec<u8>], name: &str) -> bool {
+    let has = |w: &str| {
+        args.iter()
+            .skip(1)
+            .any(|a| a.eq_ignore_ascii_case(w.as_bytes()))
+    };
+    match name {
+        "zrangestore" => true,
+        "sort" | "georadius" | "georadiusbymember" => has("store") || has("storedist"),
+        "geosearchstore" => true,
+        "expire" | "pexpire" => args
+            .get(2)
+            .and_then(|a| std::str::from_utf8(a).ok())
+            .and_then(|a| a.trim().parse::<i64>().ok())
+            .is_none_or(|n| n <= 0),
+        "expireat" | "pexpireat" => true,
+        _ => false,
+    }
+}
 
 /// The kind of a command typed on the command line: `@dangerous` from `COMMAND INFO`
 /// (the subcommand's entry for a container command), then the destructive list, then
@@ -451,7 +504,9 @@ pub fn command_kind(args: &[Vec<u8>], info: &CommandInfo) -> Kind {
         .unwrap_or(info);
     if cmd.in_category("@dangerous") || info.in_category("@dangerous") {
         Kind::Dangerous
-    } else if DESTRUCTIVE.contains(&info.name.as_str()) {
+    } else if DESTRUCTIVE.contains(&info.name.as_str())
+        || destructive_by_arguments(args, &info.name)
+    {
         Kind::Destructive
     } else {
         Kind::Edit
@@ -625,11 +680,12 @@ impl WriteOp {
             Bulk { pattern, .. } => pattern.clone(),
             ClientKill { id } => id.to_string(),
             SlowlogConfig(_) | SlowlogReset => String::new(),
-            Command { args, .. } => args
-                .as_slice()
-                .get(1)
-                .map(|a| String::from_utf8_lossy(a).into_owned())
-                .unwrap_or_default(),
+            // The key, for a command with only one; otherwise nothing, and the
+            // profile's name is typed instead (`DEL a b c`, `DEL ""`).
+            Command { args, .. } => match args.as_slice() {
+                [_, key] if !key.is_empty() => String::from_utf8_lossy(key).into_owned(),
+                _ => String::new(),
+            },
         }
     }
 
@@ -1263,6 +1319,60 @@ mod tests {
                 &info("flushdb", &["@write", "@dangerous"])
             ),
             Kind::Dangerous
+        );
+        // Commands that delete keys or elements, or overwrite a destination.
+        for line in [
+            "LTRIM l 0 1",
+            "LPOP l",
+            "SPOP s",
+            "ZPOPMIN z",
+            "ZREMRANGEBYSCORE z 0 1",
+            "GETDEL k",
+            "SINTERSTORE d a b",
+            "ZRANGESTORE d z 0 -1",
+            "SORT l STORE d",
+            "EXPIRE k 0",
+            "EXPIRE k -5",
+            "PEXPIRE k soon",
+            "EXPIREAT k 1",
+        ] {
+            let name = line.split(' ').next().unwrap().to_ascii_lowercase();
+            assert_eq!(
+                command_kind(&args(line), &info(&name, &["@write"])),
+                Kind::Destructive,
+                "{line}"
+            );
+        }
+        for line in ["EXPIRE k 60", "SORT l", "LPUSH l a"] {
+            let name = line.split(' ').next().unwrap().to_ascii_lowercase();
+            assert_eq!(
+                command_kind(&args(line), &info(&name, &["@write"])),
+                Kind::Edit,
+                "{line}"
+            );
+        }
+        // On prod the key is typed for one key; the profile's name for several or none.
+        let prod = profile(Env::Prod, Some(false));
+        let del = |line: &str| WriteOp::Command {
+            args: Args::new(args(line)),
+            info: info("del", &["@write", "@keyspace"]),
+        };
+        let none = Refusals::default();
+        assert_eq!(
+            decide_op(&del("DEL a"), &prod, &ON, &none),
+            Decision::Type("a".into())
+        );
+        assert_eq!(
+            decide_op(&del("DEL a b c"), &prod, &ON, &none),
+            Decision::Type("p1".into())
+        );
+        let empty = WriteOp::Command {
+            args: Args::new(vec![b"DEL".to_vec(), Vec::new()]),
+            info: info("del", &["@write", "@keyspace"]),
+        };
+        assert_eq!(
+            decide_op(&empty, &prod, &ON, &none),
+            Decision::Type("p1".into())
         );
         let config = CommandInfo {
             subcommands: vec![info("config|set", &["@admin", "@dangerous"])],

@@ -831,7 +831,9 @@ The TTL, Diff, Hot keys and Nodes panels are the earlier views of the same names
   - `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE` and the unsubscribes: use Pub/Sub;
   - `MONITOR`: use the Monitor panel;
   - `SELECT`: it would switch the database under every view;
-  - `AUTH`, `HELLO`, `RESET`, `QUIT` and `CLIENT REPLY`: refused;
+  - `AUTH`, `HELLO`, `RESET`, `QUIT`, `CLIENT REPLY`, `SETNAME`, `SETINFO`, `TRACKING`, `CACHING`, `NO-TOUCH` and `NO-EVICT`: refused;
+  - `MULTI`, `EXEC`, `DISCARD`, `WATCH` and `UNWATCH`: a transaction or a watch left open would queue or abort every view's commands and redis-lens's own edits, so they are refused, writes on included;
+  - `SYNC`, `PSYNC`, `READONLY` and `READWRITE`: they would turn the connection into a replica link or switch its cluster mode;
   - `POST` and `HOST:`, which Redis flags readonly: they are its guard against HTTP sent to it, and close the connection.
 - **Credentials (rule 1):** on screen and in the history, the panel masks, while the line is typed too:
   - the password arguments of `ACL SETUSER` (`>`, `<`, `#` and `!` rules);
@@ -865,13 +867,16 @@ A write is sent only when all three checks allow it.
 |---|---|---|---|
 | Browse, view values, readonly commands | runs | runs | runs |
 | Edit, add, set a TTL, rename, publish, ack, claim, create an index | not sent | runs | asks `y`/`n` |
-| Delete a key, field or element, trim a stream, drop an index | not sent | asks `y`/`n` | type the key or index name |
+| Delete a key, field or element, trim a stream, drop an index | not sent | asks `y`/`n` | type the key or index name (a destructive command typed on the command line: its key when it names exactly one, otherwise the profile name) |
 | Bulk expire or delete by pattern | not sent | dry run, then `y`/`n` | dry run, then type the pattern |
 | `@dangerous` commands (`FLUSHDB`, `CONFIG SET`, `CLIENT KILL`, `SLOWLOG RESET`, `KEYS` …) | readonly ones (`KEYS`) ask as in the next two columns; the rest are not sent | asks `y`/`n` | type the profile name |
 | `MONITOR` | asks (`prod`: type the name) | asks `y`/`n` | type the profile name |
 
 - **What counts as destructive or dangerous:** a write is destructive when it deletes or overwrites data:
-  - `DEL`, `UNLINK`, `HDEL`, `SREM`, `ZREM`, `LREM`, `XDEL`, `XTRIM`;
+  - `DEL`, `UNLINK`, `HDEL`, `HGETDEL`, `SREM`, `ZREM`, `LREM`, `XDEL`, `XTRIM`, `GETDEL`, `LTRIM`;
+  - the pops, `LPOP`, `RPOP`, `LMPOP`, `SPOP`, `ZPOPMIN`, `ZPOPMAX`, `ZMPOP`, and `ZREMRANGEBYRANK|SCORE|LEX`;
+  - commands that move a value or overwrite a destination: `RPOPLPUSH`, `LMOVE`, `SMOVE`, `MOVE`, `COPY`, `RESTORE`, `BITOP`, the `*STORE` commands (`SINTERSTORE`, `ZRANGESTORE`, `GEOSEARCHSTORE` …), and `SORT`, `GEORADIUS` and `GEORADIUSBYMEMBER` with `STORE`;
+  - `EXPIRE` and `PEXPIRE` with a time that is not positive (or not a number), which delete the key, and `EXPIREAT` and `PEXPIREAT` always (the time may be past);
   - `FLUSHDB`, `FLUSHALL`;
   - `RENAME` onto an existing key;
   - `FT.DROPINDEX`;

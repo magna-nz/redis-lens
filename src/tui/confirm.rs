@@ -219,9 +219,16 @@ pub fn refusals_of(perms: &PermissionReport) -> Refusals {
 
 impl App {
     /// Opens the question for a view's write ([`super::views::Act::write`]).
-    pub(super) fn ask_write(&mut self, ask: WriteAsk) {
+    pub(super) fn ask_write(&mut self, ask: WriteAsk) -> Vec<Effect> {
+        // A question is open already (another view's, a bulk run's): this one is not
+        // asked, and its view hears so. Answers go only to the question shown.
+        if self.confirm.is_some() {
+            let why = "Not sent: answer the open question first.".to_string();
+            self.set_error(why.clone());
+            return self.write_failed(ask.id, ask.owner, why);
+        }
         let Some(s) = self.session.as_ref() else {
-            return;
+            return Vec::new();
         };
         let expect = match &ask.decision {
             Decision::Type(name) => Expect::Type(name.clone()),
@@ -238,6 +245,7 @@ impl App {
             profile: s.profile.name.clone(),
             prod: s.profile.env == Env::Prod,
         });
+        Vec::new()
     }
 
     /// Closes the question without an answer: the live connection went, or a new run
@@ -566,6 +574,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_second_write_never_replaces_the_open_question() {
+        let mut app = app_with(Env::Local, None);
+        let (first, _) = write(&mut app, unlink());
+        let other = WriteOp::Unlink {
+            key: "other".into(),
+        };
+        let (_, effects) = write(&mut app, other);
+        assert!(writes(&effects).is_empty());
+        let n = app.notice.as_ref().unwrap();
+        assert!(n.error && n.text.contains("open question"), "{}", n.text);
+        let c = app.confirm.as_ref().expect("the first question");
+        assert!(
+            c.lines()
+                .iter()
+                .any(|l| l == "Sends: UNLINK user:10293:cart")
+        );
+        // y answers the first question, and only that one is sent.
+        let effects = app.handle_key(ch('y'));
+        assert_eq!(
+            writes(&effects),
+            vec![(first.unwrap(), "UNLINK".to_string())]
+        );
     }
 
     #[test]

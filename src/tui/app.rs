@@ -1456,7 +1456,7 @@ impl App {
             effects.extend(self.tail_effect(cmd));
         }
         if let Some(ask) = ask {
-            self.ask_write(ask);
+            effects.extend(self.ask_write(ask));
         }
         effects.extend(self.after_key_edits());
         Some((r, effects))

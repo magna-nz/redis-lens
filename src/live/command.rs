@@ -316,10 +316,27 @@ pub fn refused(args: &[Vec<u8>]) -> Option<&'static str> {
         // it, and POST closes the connection every view shares.
         "post" | "host:" => "Not sent: it would close the connection every view shares.",
         "select" => "Not sent here: SELECT would switch the database under every view.",
-        "auth" | "hello" | "reset" | "quit" => {
+        // A transaction or WATCH left open would queue, or abort, every view's
+        // commands and redis-lens's own edits; SYNC turns the connection into a replica
+        // link; READONLY/READWRITE switch its cluster mode.
+        "auth" | "hello" | "reset" | "quit" | "multi" | "exec" | "discard" | "watch"
+        | "unwatch" | "sync" | "psync" | "readonly" | "readwrite" => {
             "Not sent: it would change the connection every view shares."
         }
-        "client" if sub.as_deref() == Some("reply") => {
+        "client"
+            if matches!(
+                sub.as_deref(),
+                Some(
+                    "reply"
+                        | "setname"
+                        | "setinfo"
+                        | "tracking"
+                        | "caching"
+                        | "no-touch"
+                        | "no-evict"
+                )
+            ) =>
+        {
             "Not sent: it would change the connection every view shares."
         }
         _ => return None,
@@ -493,6 +510,23 @@ mod tests {
         );
         assert!(refused(&words(&["CLIENT", "REPLY", "OFF"])).is_some());
         assert!(refused(&words(&["CLIENT", "LIST"])).is_none());
+        for w in [
+            &["MULTI"][..],
+            &["exec"],
+            &["DISCARD"],
+            &["WATCH", "k"],
+            &["UNWATCH"],
+            &["SYNC"],
+            &["PSYNC", "?", "-1"],
+            &["READONLY"],
+            &["READWRITE"],
+            &["CLIENT", "SETNAME", "x"],
+            &["client", "tracking", "on"],
+            &["CLIENT", "NO-EVICT", "on"],
+        ] {
+            let why = refused(&words(w)).unwrap_or_else(|| panic!("{w:?}"));
+            assert!(why.contains("connection every view shares"), "{w:?}");
+        }
         assert!(refused(&words(&["GET", "k"])).is_none());
         assert!(refused(&words(&["POST"])).is_some());
         assert!(refused(&words(&["Host:"])).is_some());

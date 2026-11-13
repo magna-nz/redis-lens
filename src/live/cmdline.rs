@@ -1354,6 +1354,13 @@ mod tests {
             ("SELECT 1", None, Err("SELECT")),
             ("AUTH pw", None, Err("connection every view shares")),
             ("HELLO 3", None, Err("connection every view shares")),
+            ("MULTI", None, Err("connection every view shares")),
+            ("WATCH k", None, Err("connection every view shares")),
+            (
+                "CLIENT SETNAME x",
+                None,
+                Err("connection every view shares"),
+            ),
             ("RESET", None, Err("connection every view shares")),
             ("QUIT", None, Err("connection every view shares")),
             (

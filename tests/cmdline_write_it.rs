@@ -197,11 +197,29 @@ async fn scripts_are_never_a_write(server: &common::TestServer) {
     assert_eq!(n, 0);
 }
 
+/// A transaction or a watch would hold the connection every view shares: refused
+/// before its flags are read, writes on included.
+async fn transactions_are_refused(server: &common::TestServer) {
+    let mut c = server.admin().await;
+    for line in ["MULTI", "EXEC", "WATCH k", "UNWATCH", "CLIENT SETNAME x"] {
+        match gated(&mut c, line).await {
+            Err(Gate::Refuse(why)) => {
+                assert!(
+                    why.contains("connection every view shares"),
+                    "{line}: {why}"
+                )
+            }
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn on_redis() {
     let server = common::redis().await;
     no_write_is_granted_on_a_read_only_profile(&server).await;
     scripts_are_never_a_write(&server).await;
+    transactions_are_refused(&server).await;
     writes_run_through_the_gate(&server).await;
 }
 
@@ -210,5 +228,6 @@ async fn on_valkey() {
     let server = common::valkey().await;
     no_write_is_granted_on_a_read_only_profile(&server).await;
     scripts_are_never_a_write(&server).await;
+    transactions_are_refused(&server).await;
     writes_run_through_the_gate(&server).await;
 }

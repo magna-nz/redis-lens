@@ -342,7 +342,14 @@ impl App {
                     self.set_info("Dry run stopped. Nothing was sent.");
                 }
             }
-            Stage::Asking { .. } => {}
+            // The question is the app's dialog, which gets keys first; without it (closed
+            // elsewhere) esc still ends the run, never stuck.
+            Stage::Asking { .. } => {
+                if key.code == KeyCode::Esc && self.confirm.is_none() {
+                    self.bulk = None;
+                    self.set_info("Bulk action cancelled. Nothing was sent.");
+                }
+            }
             Stage::Running(r) => {
                 if key.code == KeyCode::Esc {
                     r.stopping = true;
@@ -477,6 +484,13 @@ impl App {
             });
             self.set_info(text);
             return Vec::new();
+        }
+        // Another question is open: never replace it.
+        if self.confirm.is_some() {
+            return self.bulk_end_error(
+                "Not started: answer the open question first, then press the key again."
+                    .to_string(),
+            );
         }
         let op = WriteOp::Bulk {
             pattern: b.pattern.clone(),
@@ -1058,6 +1072,44 @@ mod tests {
         assert!(e.is_empty());
         assert!(app.bulk.is_none() && app.confirm.is_none());
         assert_eq!(app.notice.as_ref().unwrap().text, CANCELLED);
+    }
+
+    #[test]
+    fn esc_ends_a_run_whose_question_was_closed_elsewhere() {
+        let mut app = app_with(Env::Local, None);
+        dry_run_expire(&mut app);
+        assert!(app.confirm.take().is_some());
+        let e = app.handle_key(key(KeyCode::Esc));
+        assert!(e.is_empty());
+        assert!(app.bulk.is_none());
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("Nothing was sent")
+        );
+    }
+
+    #[test]
+    fn the_run_never_asks_over_an_open_question() {
+        // Another question, opened while the dry run counted.
+        let mut other = app_with(Env::Local, None);
+        dry_run_expire(&mut other);
+        let open = other.confirm.take().unwrap();
+
+        let mut app = app_with(Env::Local, None);
+        app.handle_key(ch('x'));
+        let e = app.handle_key(key(KeyCode::Enter));
+        let s = steps(&e);
+        app.confirm = Some(open.clone());
+        let e = testing::reply(&mut app, s[0].0, counted(Walk::Done, 500, 100));
+        assert!(steps(&e).is_empty() && writes(&e) == 0, "{e:?}");
+        assert!(app.bulk.is_none());
+        let n = app.notice.as_ref().unwrap();
+        assert!(n.error && n.text.contains("open question"), "{}", n.text);
+        // The open question is untouched: still the other run's.
+        assert_eq!(app.confirm.as_ref(), Some(&open));
     }
 
     #[test]

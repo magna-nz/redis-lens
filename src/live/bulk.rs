@@ -849,14 +849,20 @@ mod tests {
     fn the_key_file_is_named_by_profile_time_and_action() {
         let dir = Path::new("/d");
         let f = KeyFile::new(dir, "Prod Cache", &BulkAction::Delete, 0);
-        let p = f.path().to_string_lossy().into_owned();
-        assert!(p.starts_with("/d/prod_cache-"), "{p}");
-        assert!(p.ends_with("/19700101T000000Z-delete.txt"), "{p}");
+        // Compared by component, so the test holds with Windows' separator too.
+        let parts = |p: &Path| {
+            p.iter()
+                .map(|c| c.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let p = parts(f.path());
+        assert_eq!(p.len(), 4, "{p:?}");
+        assert!(p[2].starts_with("prod_cache-"), "{p:?}");
+        assert_eq!(p[3], "19700101T000000Z-delete.txt");
         let f = KeyFile::new(dir, "p", &BulkAction::Expire { seconds: 9 }, 86_400);
-        assert!(
-            f.path()
-                .to_string_lossy()
-                .ends_with("/19700102T000000Z-expire.txt")
+        assert_eq!(
+            parts(f.path()).last().unwrap(),
+            "19700102T000000Z-expire.txt"
         );
         assert!(!f.created());
     }
