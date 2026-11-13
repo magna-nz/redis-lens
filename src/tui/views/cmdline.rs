@@ -30,10 +30,11 @@ use super::{Act, Input, LiveState, Owner, ViewState};
 use crate::live::cmdline::{self, Args, CommandInfo, Docs, Gate, Output, Reply, Request};
 use crate::live::command::{self, MASK, Secret};
 use crate::live::keys::KeyRow;
-use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
+use crate::live::{CANCELLED, LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::{Env, ServerMode};
 use crate::tui::app::{App, Effect};
 use crate::value;
+use crate::write::{Decision, WriteOp};
 
 /// The longest input line, in characters.
 pub const MAX_INPUT: usize = 8_192;
@@ -242,6 +243,8 @@ enum Pending {
     },
     /// Sent as request `id`.
     Run { id: ReqId, entry: u64 },
+    /// A write handed to the write gate as request `id`: asking, or sent.
+    Write { id: ReqId, entry: u64 },
 }
 
 /// A readonly `@dangerous` command waiting for `y`, or for the profile name.
@@ -735,6 +738,31 @@ impl CmdlineState {
     fn decide(&mut self, args: Args, info: Option<CommandInfo>, entry: u64, act: &mut Act<'_>) {
         match cmdline::gate(args.as_slice(), info.as_ref()) {
             Gate::Refuse(why) => self.set_body(entry, Body::Note(why)),
+            Gate::Write => {
+                let Some(info) = info else {
+                    return;
+                };
+                let op = WriteOp::Command { args, info };
+                // The read-only reason, or a command the server refused, in the panel.
+                if let Decision::Refuse(why) = act.write_decision(&op) {
+                    self.set_body(entry, Body::Note(why));
+                    return;
+                }
+                match act.write(op) {
+                    Some(id) => {
+                        self.pending = Some(Pending::Write { id, entry });
+                        self.set_body(entry, Body::Waiting);
+                    }
+                    None => self.set_body(
+                        entry,
+                        Body::Failed(
+                            "Not sent: the live connection is not ready, or another write \
+                             is waiting for an answer."
+                                .into(),
+                        ),
+                    ),
+                }
+            }
             Gate::Send => {
                 let Some(info) = info else {
                     return;
@@ -892,8 +920,8 @@ impl CmdlineState {
         let toks = tokens(&self.input);
         let Some(first) = toks.first() else {
             return vec![(
-                "Readonly commands only. tab completes, ↑↓ steps through the history, \
-                 ctrl-l clears."
+                "Writes go through the write gate. tab completes, ↑↓ history, ctrl-l \
+                 clears."
                     .into(),
                 false,
             )];
@@ -925,6 +953,7 @@ impl CmdlineState {
         let verdict = match cmdline::gate(&words, Some(info)) {
             Gate::Send => ("readonly".to_string(), false),
             Gate::Ask => ("readonly, asks first (@dangerous)".to_string(), true),
+            Gate::Write => ("writes: through the write gate".to_string(), true),
             Gate::Refuse(_)
                 if !cmd.has_flag("readonly")
                     && cmd.name == info.name
@@ -1044,6 +1073,16 @@ impl CmdlineState {
     /// Requests that will never be answered (the live connection closed, a rescan
     /// replaced it) are forgotten, and the command waiting on one says so.
     fn forget_lost(&mut self, act: &Act<'_>) {
+        // A write is the app's request, not in `asked`.
+        if let Some(Pending::Write { id, entry }) = self.pending.clone()
+            && !act.in_flight(id)
+        {
+            self.pending = None;
+            self.set_body(
+                entry,
+                Body::Failed("No answer: the live connection closed before the reply came.".into()),
+            );
+        }
         let lost: Vec<ReqId> = self
             .asked
             .keys()
@@ -1056,11 +1095,11 @@ impl CmdlineState {
                 self.names = Names::NotAsked;
             }
             let entry = match &self.pending {
-                Some(Pending::Info { id: p, entry, .. } | Pending::Run { id: p, entry })
-                    if *p == id =>
-                {
-                    Some(*entry)
-                }
+                Some(
+                    Pending::Info { id: p, entry, .. }
+                    | Pending::Run { id: p, entry }
+                    | Pending::Write { id: p, entry },
+                ) if *p == id => Some(*entry),
                 _ => None,
             };
             if let Some(entry) = entry {
@@ -1082,6 +1121,20 @@ impl ViewState for CmdlineState {
     }
 
     fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
+        if let Some(Pending::Write { id: p, entry }) = self.pending.clone()
+            && p == id
+        {
+            self.pending = None;
+            let body = match result {
+                Ok(LiveReply::Write(crate::live::write::Reply::Ran(out))) => Body::Out(out),
+                Ok(_) => Body::Failed("the reply came back in an unexpected shape".into()),
+                Err(LiveError::Failed(s)) if s == CANCELLED => Body::Note(s),
+                Err(e) => Body::Failed(e.to_string()),
+            };
+            self.set_body(entry, body);
+            self.scroll.set(0);
+            return;
+        }
         self.answer(id, result, act);
     }
 }
@@ -1399,16 +1452,185 @@ mod tests {
     fn a_write_is_refused_without_being_sent() {
         let mut app = opened();
         let set = info("set", &["write", "denyoom"], &["@write", "@string"]);
-        let after = enter_with(&mut app, "SET k v", Some(set));
-        assert!(after.is_empty(), "{after:?}");
+        let after = enter_all(&mut app, "SET k v", Some(set));
+        assert!(writes(&after).is_empty(), "{after:?}");
         let all = text(&app, 120, 36);
-        assert!(all.contains("SET is not a readonly command"), "{all}");
-        // Also on a profile that is not read-only: phase 2 sends no writes.
-        app.session.as_mut().unwrap().profile.read_only = Some(false);
-        app.session.as_mut().unwrap().profile.env = Env::Local;
-        type_text(&mut app, "SET k v");
-        let r = reqs(&app.handle_key(key(KeyCode::Enter)));
-        assert!(r.is_empty(), "{r:?}");
+        assert!(all.contains("prod-cache-01 is read-only"), "{all}");
+        assert!(app.confirm.is_none());
+    }
+
+    /// Like [`enter_with`], but every effect that followed, writes included.
+    fn enter_all(app: &mut App, line: &str, info: Option<CommandInfo>) -> Vec<Effect> {
+        let mut effects = type_text(app, line);
+        effects.extend(app.handle_key(key(KeyCode::Enter)));
+        let mut after = Vec::new();
+        for (id, r) in reqs(&effects) {
+            match r {
+                Request::Info { .. } => after.extend(reply(app, id, Reply::Info(info.clone()))),
+                Request::Docs { .. } => after.extend(reply(app, id, Reply::Docs(None))),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        after
+    }
+
+    fn writes(effects: &[Effect]) -> Vec<(ReqId, WriteOp)> {
+        testing::requests(effects)
+            .into_iter()
+            .filter_map(|(id, r)| match r {
+                LiveRequest::Write(p) => Some((id, p.op().clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn writable(app: &mut App, env: Env) {
+        let s = app.session.as_mut().unwrap();
+        s.profile.env = env;
+        s.profile.read_only = Some(false);
+    }
+
+    fn set_info() -> CommandInfo {
+        info(
+            "set",
+            &["write", "denyoom"],
+            &["@write", "@string", "@slow"],
+        )
+    }
+
+    fn del_info() -> CommandInfo {
+        info("del", &["write"], &["@keyspace", "@write", "@slow"])
+    }
+
+    fn flushdb_info() -> CommandInfo {
+        info(
+            "flushdb",
+            &["write"],
+            &["@keyspace", "@write", "@slow", "@dangerous"],
+        )
+    }
+
+    fn config_info() -> CommandInfo {
+        let mut c = info("config", &[], &["@slow"]);
+        c.subcommands = vec![info(
+            "config|set",
+            &["admin", "noscript", "loading", "stale"],
+            &["@admin", "@slow", "@dangerous"],
+        )];
+        c
+    }
+
+    fn eval_info() -> CommandInfo {
+        info(
+            "eval",
+            &["noscript", "stale", "skip_monitor"],
+            &["@slow", "@scripting"],
+        )
+    }
+
+    #[test]
+    fn on_a_read_only_profile_no_write_reaches_the_connection() {
+        for (line, i) in [
+            ("SET k v", set_info()),
+            ("DEL k", del_info()),
+            ("FLUSHDB", flushdb_info()),
+            ("CONFIG SET maxmemory-policy allkeys-lfu", config_info()),
+            ("EVAL \"return 1\" 0", eval_info()),
+        ] {
+            for ro in [(Env::Prod, None), (Env::Local, Some(true))] {
+                let mut app = opened();
+                let s = app.session.as_mut().unwrap();
+                s.profile.env = ro.0;
+                s.profile.read_only = ro.1;
+                let mut e = enter_all(&mut app, line, Some(i.clone()));
+                for k in ["y", "prod-cache-01"] {
+                    e.extend(type_text(&mut app, k));
+                    e.extend(app.handle_key(key(KeyCode::Enter)));
+                }
+                assert!(writes(&e).is_empty(), "{line}: {e:?}");
+                assert!(app.confirm.is_none(), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_write_goes_through_the_write_gate() {
+        let mut app = opened();
+        writable(&mut app, Env::Local);
+        // An edit runs at once outside prod.
+        let e = enter_all(&mut app, "SET k v", Some(set_info()));
+        let w = writes(&e);
+        assert_eq!(w.len(), 1, "{e:?}");
+        let WriteOp::Command { args, .. } = &w[0].1 else {
+            panic!("{w:?}")
+        };
+        assert_eq!(
+            args.as_slice(),
+            [b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()]
+        );
+        // Its reply is drawn like a readonly command's.
+        testing::reply(
+            &mut app,
+            w[0].0,
+            Ok(LiveReply::Write(crate::live::write::Reply::Ran(
+                Output::of(&redis::Value::Okay, std::time::Duration::from_millis(3)),
+            ))),
+        );
+        assert!(text(&app, 120, 36).contains("OK"));
+
+        // A delete asks y/n; n draws the cancel.
+        let e = enter_all(&mut app, "DEL k", Some(del_info()));
+        assert!(writes(&e).is_empty());
+        let lines = app.confirm.as_ref().expect("a delete asks").lines();
+        assert!(lines.iter().any(|l| l == "Sends: DEL k"), "{lines:?}");
+        app.handle_key(ch('n'));
+        assert!(text(&app, 120, 36).contains(CANCELLED));
+        // FLUSHDB (dangerous) asks y/n here, and y sends it.
+        enter_all(&mut app, "FLUSHDB", Some(flushdb_info()));
+        assert!(app.confirm.is_some());
+        assert_eq!(writes(&app.handle_key(ch('y'))).len(), 1);
+    }
+
+    #[test]
+    fn on_prod_a_dangerous_write_needs_the_profile_name() {
+        let mut app = opened();
+        writable(&mut app, Env::Prod);
+        enter_all(&mut app, "FLUSHDB", Some(flushdb_info()));
+        assert!(writes(&app.handle_key(ch('y'))).is_empty());
+        app.handle_key(key(KeyCode::Backspace));
+        type_text(&mut app, "prod-cache-01");
+        assert_eq!(writes(&app.handle_key(key(KeyCode::Enter))).len(), 1);
+    }
+
+    #[test]
+    fn scripts_stay_refused_with_writes_on() {
+        let mut app = opened();
+        writable(&mut app, Env::Local);
+        let e = enter_all(&mut app, "EVAL \"return 1\" 0", Some(eval_info()));
+        assert!(writes(&e).is_empty());
+        assert!(app.confirm.is_none());
+        assert!(text(&app, 120, 36).contains("runs a script"));
+    }
+
+    #[test]
+    fn a_masked_write_is_masked_in_the_question_and_the_history() {
+        let mut app = opened();
+        writable(&mut app, Env::Local);
+        let line = format!("CONFIG SET requirepass {MARK}");
+        enter_all(&mut app, &line, Some(config_info()));
+        let c = app.confirm.as_ref().expect("CONFIG SET is dangerous: asks");
+        assert!(
+            c.lines()
+                .iter()
+                .any(|l| l == "Sends: CONFIG SET requirepass ***"),
+            "{:?}",
+            c.lines()
+        );
+        let all = text(&app, 120, 36);
+        assert!(!value::leaks(&all, MARK), "{all}");
+        assert!(!format!("{:?}", app.confirm).contains(MARK));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.views.cmdline.history(), ["CONFIG SET requirepass ***"]);
     }
 
     #[test]
@@ -1529,10 +1751,8 @@ mod tests {
         }
         assert_eq!(app.views.cmdline.history(), ["ACL SETUSER u >***"]);
         let all = text(&app, 120, 36);
-        assert!(
-            all.contains("ACL SETUSER is not a readonly command"),
-            "{all}"
-        );
+        // A write, refused on this read-only profile.
+        assert!(all.contains("prod-cache-01 is read-only"), "{all}");
         assert!(!value::leaks(&all, MARK), "{all}");
         // ↑ brings back the masked line, not the password.
         app.handle_key(key(KeyCode::Up));

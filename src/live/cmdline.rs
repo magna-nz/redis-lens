@@ -153,6 +153,9 @@ pub enum Gate {
     Send,
     /// A readonly `@dangerous` command (`KEYS`): sent only once the user confirms.
     Ask,
+    /// A command that writes: sent only through the write gate (spec "Write
+    /// permissions"), as [`crate::write::WriteOp::Command`].
+    Write,
     /// Not sent. Holds why, in redis-lens's own words, safe to draw.
     Refuse(String),
 }
@@ -174,10 +177,13 @@ pub fn typed_name(args: &[Vec<u8>]) -> String {
 /// 2. an unknown command or subcommand;
 /// 3. a command that blocks (the `blocking` flag, or `@blocking` before Redis 7):
 ///    `XREAD` only with `BLOCK`;
-/// 4. a command without the `readonly` flag, on every profile: phase 2 sends no
-///    writes;
-/// 5. a readonly `@dangerous` command asks first;
-/// 6. everything else is sent.
+/// 4. scripts and functions, module internals, module commands not known to only read,
+///    and containers whose subcommands' flags the server doesn't list, on every
+///    profile, writes on or off;
+/// 5. a command without the `readonly` flag is a write: [`Gate::Write`], which only
+///    the write gate sends;
+/// 6. a readonly `@dangerous` command asks first;
+/// 7. everything else is sent.
 pub fn gate(args: &[Vec<u8>], info: Option<&CommandInfo>) -> Gate {
     let Some(first) = args.first() else {
         return Gate::Refuse("Nothing to send.".into());
@@ -281,11 +287,7 @@ pub fn gate(args: &[Vec<u8>], info: Option<&CommandInfo>) -> Gate {
         ));
     }
     if !cmd.has_flag("readonly") {
-        return Gate::Refuse(format!(
-            "Not sent: {} is not a readonly command. The command line sends readonly \
-             commands only.",
-            cmd.display()
-        ));
+        return Gate::Write;
     }
     // Servers before 6.0 have no ACL categories: KEYS asks there too.
     if cmd.in_category("@dangerous")
@@ -514,7 +516,9 @@ pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply
             match gate(args.as_slice(), Some(&info)) {
                 Gate::Send => {}
                 Gate::Ask if confirmed => {}
-                Gate::Ask | Gate::Refuse(_) => return Err(LiveError::Failed(NOT_SENT.into())),
+                Gate::Ask | Gate::Write | Gate::Refuse(_) => {
+                    return Err(LiveError::Failed(NOT_SENT.into()));
+                }
             }
             let name = sent_name(args.as_slice(), &info);
             let mut c = redis::Cmd::new();
@@ -1325,7 +1329,8 @@ mod tests {
         let table: Vec<(&str, Option<&CommandInfo>, Result<Gate, &str>)> = vec![
             ("GET k", Some(&get), Ok(Gate::Send)),
             ("get k", Some(&get), Ok(Gate::Send)),
-            ("SET k v", Some(&set), Err("not a readonly command")),
+            // Writes go to the write gate (phase 3).
+            ("SET k v", Some(&set), Ok(Gate::Write)),
             ("KEYS *", Some(&keys), Ok(Gate::Ask)),
             ("BLPOP q 0", Some(&blpop), Err("can block")),
             ("XREAD BLOCK 0 STREAMS s $", Some(&xread), Err("can block")),
@@ -1335,13 +1340,11 @@ mod tests {
                 Some(&xread62),
                 Err("can block"),
             ),
-            ("PING", Some(&ping), Err("PING is not a readonly command")),
-            ("INFO", Some(&info_cmd), Err("not a readonly command")),
-            (
-                "CONFIG GET maxmemory",
-                Some(&config),
-                Err("CONFIG GET is not"),
-            ),
+            // No readonly flag: a write as far as the gate knows (the owner's open
+            // question about an allow-list for these is in status.md).
+            ("PING", Some(&ping), Ok(Gate::Write)),
+            ("INFO", Some(&info_cmd), Ok(Gate::Write)),
+            ("CONFIG GET maxmemory", Some(&config), Ok(Gate::Write)),
             ("CONFIG", Some(&config), Err("needs a subcommand")),
             ("CONFIG NOPE", Some(&config), Err("no command CONFIG NOPE")),
             ("OBJECT ENCODING k", Some(&object), Ok(Gate::Send)),

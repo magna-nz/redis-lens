@@ -637,9 +637,16 @@ impl WriteOp {
     /// name, a `FT.CREATE` without fields. `None` when it is well formed.
     pub fn invalid(&self) -> Option<String> {
         match self {
-            WriteOp::Command { args, .. } if args.is_empty() => Some("Nothing to send.".into()),
-            WriteOp::Command { args, .. } if command::refused(args.as_slice()).is_some() => {
-                command::refused(args.as_slice()).map(str::to_string)
+            // Only what the command line's own gate calls a write: scripts, unlisted
+            // module commands, blocking and connection commands stay refused here too.
+            WriteOp::Command { args, info } => {
+                match crate::live::cmdline::gate(args.as_slice(), Some(info)) {
+                    crate::live::cmdline::Gate::Write => None,
+                    crate::live::cmdline::Gate::Refuse(why) => Some(why),
+                    crate::live::cmdline::Gate::Send | crate::live::cmdline::Gate::Ask => {
+                        Some("Not sent: a readonly command is not sent as a write.".into())
+                    }
+                }
             }
             WriteOp::FtCreate { fields, .. } if fields.is_empty() => {
                 Some("Not sent: an index needs at least one field.".into())
