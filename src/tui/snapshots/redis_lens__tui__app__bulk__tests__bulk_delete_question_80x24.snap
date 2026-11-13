@@ -1,0 +1,28 @@
+---
+source: src/tui/bulk.rs
+expression: t.backend()
+---
+" redis-lens 0.1.0    LOCAL   prod-cache-01  prod-cache-01.int…  writes on       "
+" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
+"  0   1 Patterns   2   3   4   5   6                                            "
+"┌─ Patterns ────────────────────────────────── 11 patterns · sorted by memory ─┐"
+"│ PATTERN         TYPE       KEYS   MEMORY▼     %      AVG  NO TTL  VERDICT    │"
+"│   session:{uui… string    1.84M     6.1G    46%     3.5K      0%  ok         │"
+"│ ▾ cache:*       string    1.34M     3.6G    27%     2.8K     10%  mixed      │"
+"│ ┌─ Delete every key of the pattern ──────────────────────── prod-cache-01 ─┐ │"
+"│ │ Pattern user:{id}:cart                                                   │ │"
+"│ │ Dry run: 3,120 keys of the pattern will be deleted with UNLINK.          │ │"
+"│ │ 2 other keys matched the glob but belong to other patterns: left alone.  │ │"
+"│ │ This can't be undone.                                                    │ │"
+"└─│                                                                          │─┘"
+"┌─│ Sends: UNLINK <key>  for each key of SCAN MATCH user:*:cart, 500 at a ti │─┐"
+"│ │ me                                                                       │ │"
+"│ │                                                                          │ │"
+"│ │                                                                          │ │"
+"│ │ y Delete   n Cancel                                                      │ │"
+"│ └──────────────────────────────────────────────────────────────────────────┘ │"
+"│ user:500917:cart         2.6K   4d 02h   ▅▅▅  ·    ▁▁▁  ▁▁▁  ███  ·    ·     │"
+"│ ▲ 31% never expire while the rest do. A write path probably skips EXPIRE.    │"
+"│ $ redis-cli --scan --pattern "user:*:cart"                                   │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" y Delete   n Cancel                                                            "

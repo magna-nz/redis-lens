@@ -103,6 +103,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &KeysState, ctx: &Ctx<'_>) {
         rows(frame, body, lines, Some(sel - off));
     }
     detail_panel(frame, detail, state);
+    if let Some(form) = &state.form {
+        super::value::draw_form(frame, area, form);
+    }
 }
 
 fn title_right(state: &KeysState, ctx: &Ctx<'_>, pattern: &str, shown: usize) -> String {

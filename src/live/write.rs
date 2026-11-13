@@ -70,9 +70,7 @@ pub async fn run(conn: &mut Conn, budget: &Budget, permit: Permit) -> Result<Rep
                 .arg(key)
                 .arg(0)
                 .arg(i64::try_from(n).unwrap_or(i64::MAX) - 1);
-            let (_, len, now): (Value, i64, Vec<u8>) = send_pipe(conn, budget, "WATCH", &check)
-                .await
-                .and_then(|v: Value| redis::from_redis_value(v).map_err(|_| incomplete()))?;
+            let (_, len, now): (Value, i64, Vec<u8>) = watched(conn, budget, &check).await?;
             if usize::try_from(len).ok() != Some(n) || (n > 0 && now != old.as_bytes()) {
                 unwatch(conn, budget).await;
                 return Ok(Reply::Changed);
@@ -92,9 +90,7 @@ pub async fn run(conn: &mut Conn, budget: &Budget, permit: Permit) -> Result<Rep
                 .cmd("LINDEX")
                 .arg(key)
                 .arg(*index);
-            let (_, now): (Value, Option<Vec<u8>>) = send_pipe(conn, budget, "WATCH", &check)
-                .await
-                .and_then(|v: Value| redis::from_redis_value(v).map_err(|_| incomplete()))?;
+            let (_, now): (Value, Option<Vec<u8>>) = watched(conn, budget, &check).await?;
             if now.as_deref() != Some(old.as_bytes()) {
                 unwatch(conn, budget).await;
                 return Ok(Reply::Changed);
@@ -104,17 +100,11 @@ pub async fn run(conn: &mut Conn, budget: &Budget, permit: Permit) -> Result<Rep
         WriteOp::NewKey {
             value: NewKey::String(_),
             ..
-        } => match single(conn, budget, &name, op).await? {
-            Reply::Text(_) | Reply::Ok => Ok(Reply::Ok),
-            // `SET … NX` answers nil when the key exists.
-            _ => Ok(Reply::Exists),
-        },
+        } => Ok(set_nx_reply(&send_one(conn, budget, &name, op).await?)),
         WriteOp::NewKey { key, .. } => {
             let mut check = redis::pipe();
             check.cmd("WATCH").arg(key).cmd("EXISTS").arg(key);
-            let (_, exists): (Value, i64) = send_pipe(conn, budget, "WATCH", &check)
-                .await
-                .and_then(|v: Value| redis::from_redis_value(v).map_err(|_| incomplete()))?;
+            let (_, exists): (Value, i64) = watched(conn, budget, &check).await?;
             if exists != 0 {
                 unwatch(conn, budget).await;
                 return Ok(Reply::Exists);
@@ -206,6 +196,22 @@ async fn send_pipe(
         .map_err(|e| write_error(name, &e))
 }
 
+/// Sends `WATCH key` and the check read after it, and reads them. When that fails
+/// (the key holds another type now, say) the connection stops watching.
+async fn watched<T: redis::FromRedisValue>(
+    conn: &mut Conn,
+    budget: &Budget,
+    check: &redis::Pipeline,
+) -> Result<T, LiveError> {
+    let r = send_pipe(conn, budget, "WATCH", check)
+        .await
+        .and_then(|v: Value| redis::from_redis_value(v).map_err(|_| incomplete()));
+    if r.is_err() {
+        unwatch(conn, budget).await;
+    }
+    r
+}
+
 /// Sends `UNWATCH`, after a check found the value changed. A failure is ignored: the
 /// next `EXEC` or the connection's next `WATCH` clears it anyway.
 async fn unwatch(conn: &mut Conn, budget: &Budget) {
@@ -271,6 +277,14 @@ async fn transaction(
             None => Ok(Reply::Ok),
         },
         other => Ok(reply_of(&other)),
+    }
+}
+
+/// `SET key value NX`: `OK` when it was set, nil when the key exists.
+fn set_nx_reply(v: &Value) -> Reply {
+    match v {
+        Value::Nil => Reply::Exists,
+        _ => Reply::Ok,
     }
 }
 
@@ -371,6 +385,12 @@ mod tests {
             }
         );
         assert!(!format!("{r:?}").contains("secret"));
+    }
+
+    #[test]
+    fn set_nx_says_when_the_key_exists() {
+        assert_eq!(set_nx_reply(&Value::Nil), Reply::Exists);
+        assert_eq!(set_nx_reply(&Value::Okay), Reply::Ok);
     }
 
     #[test]

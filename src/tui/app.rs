@@ -45,6 +45,15 @@ pub mod views;
 #[path = "confirm.rs"]
 pub mod confirm;
 
+/// `x` and `D` on Patterns: bulk expire and delete, the dry run and the run.
+#[path = "bulk.rs"]
+pub mod bulk;
+
+/// What the key detail's and key list's edits ask of `App`: going back after `D`, the
+/// new key after `N`, `$EDITOR`.
+#[path = "key_edits.rs"]
+mod key_edits;
+
 use views::{Act, Ctx, LiveState, Owner, TailCmd, ViewState, Views};
 
 /// The seven views, switched with `0` to `6`.
@@ -408,12 +417,20 @@ pub enum Effect {
         name: String,
         on: bool,
     },
+    /// Edit a value in `$EDITOR` on a temporary file ([`crate::tui::editor`]), out of
+    /// the TUI until it exits. Answered with [`Msg::Edited`].
+    Editor(crate::tui::editor::EditorJob),
     Quit,
 }
 
 /// Results coming back from the runtime.
 #[derive(Debug)]
 pub enum Msg {
+    /// [`Effect::Editor`] ended: the edited value, or why not. Values: on screen only.
+    Edited {
+        job: u64,
+        result: Result<crate::value::Raw, String>,
+    },
     /// [`Effect::SetWrites`] saved the profile.
     WritesSaved {
         name: String,
@@ -825,6 +842,9 @@ pub struct App {
     /// The write gate's question on screen, if any. While it is open every key goes to
     /// it.
     pub confirm: Option<confirm::Confirm>,
+    /// The bulk action's dialog (`x` or `D` on Patterns), if open. While it is open
+    /// every key goes to it, after the confirm dialog.
+    pub bulk: Option<bulk::Bulk>,
     /// Writes sent and not answered yet, with their command names: a `NOPERM` answer
     /// adds the name to the session's refusals.
     live_writes: HashMap<ReqId, String>,
@@ -970,6 +990,7 @@ impl App {
             next_tail: 1,
             settings: crate::write::Settings::default(),
             confirm: None,
+            bulk: None,
             live_writes: HashMap::new(),
             #[cfg(test)]
             calls: Vec::new(),
@@ -1437,6 +1458,7 @@ impl App {
         if let Some(ask) = ask {
             self.ask_write(ask);
         }
+        effects.extend(self.after_key_edits());
         Some((r, effects))
     }
 
@@ -1601,6 +1623,10 @@ impl App {
         if self.confirm.is_some() {
             return self.confirm_key(key);
         }
+        // So does a bulk action's dialog (bulk.rs).
+        if self.bulk.is_some() {
+            return self.bulk_key(key);
+        }
         // The command line panel takes every key while it is open (views/cmdline.rs).
         if self.views.cmdline.open {
             return self.cmdline_key(key);
@@ -1746,6 +1772,7 @@ impl App {
         self.live_pending.clear();
         self.live_writes.clear();
         self.confirm = None;
+        self.bulk = None;
         // The live tail belongs to the replaced run: the runner drops it with it.
         self.views.pubsub.end_tail();
         // So does a Monitor run.
@@ -1871,6 +1898,10 @@ impl App {
         }
         if self.confirm.is_some() {
             self.confirm_paste(&text);
+            return Vec::new();
+        }
+        if self.bulk.is_some() {
+            self.bulk_paste(&text);
             return Vec::new();
         }
         if self.views.cmdline.open {
@@ -2124,6 +2155,7 @@ impl App {
         self.live_pending.clear();
         self.live_writes.clear();
         self.confirm = None;
+        self.bulk = None;
         self.view = View::Patterns;
         vec![Effect::Connect {
             id,
@@ -2185,14 +2217,6 @@ impl App {
             (_, Some('D')) => return self.bulk_start(true),
             _ => {}
         }
-        Vec::new()
-    }
-
-    /// `x` (expire) or `D` (`delete`) on Patterns: bulk actions (spec "Bulk actions").
-    /// Part 3 builds them; until then they say so.
-    fn bulk_start(&mut self, delete: bool) -> Vec<Effect> {
-        let _ = delete;
-        self.set_info("Bulk actions are not built yet.");
         Vec::new()
     }
 
@@ -2356,6 +2380,7 @@ impl App {
                     self.notice = None;
                 }
             }
+            Msg::Edited { job, result } => return self.edited(job, result),
             Msg::WritesSaved { name, on } => self.writes_saved(&name, on),
             Msg::WritesFailed { name, on, error } => self.writes_failed(&name, on, &error),
             Msg::DockerFound(found) => self.set_docker(found),
@@ -2591,6 +2616,10 @@ impl App {
                 if !self.is_session(id, scan) {
                     return Vec::new();
                 }
+                // A bulk action's step goes to its dialog (bulk.rs).
+                if self.bulk_waits_for(req_id) {
+                    return self.bulk_reply(req_id, result);
+                }
                 // Back to the view that sent it; an id no view waits for any more (its
                 // connection closed in between) is dropped.
                 let Some(owner) = self.live_pending.remove(&req_id) else {
@@ -2615,6 +2644,7 @@ impl App {
                 self.live_pending.clear();
                 self.live_writes.clear();
                 self.close_write_question();
+                self.bulk_closed();
                 if let Some(e) = &error {
                     self.set_error(format!(
                         "The live connection closed: {e}. The server views stop until the next scan."

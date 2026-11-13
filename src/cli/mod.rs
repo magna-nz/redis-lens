@@ -9,6 +9,7 @@ use crate::model::{Env, Provider};
 pub mod compare;
 pub mod conn;
 pub mod diff;
+pub mod expire;
 pub mod scan;
 pub mod snapshots;
 pub mod trend;
@@ -75,6 +76,8 @@ pub enum Command {
     Trend(TrendArgs),
     /// Compare the patterns of two connections, e.g. staging and prod.
     Compare(CompareArgs),
+    /// Set a TTL on every key of a pattern that has none. A dry run unless --apply.
+    Expire(expire::ExpireArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -367,6 +370,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Snapshots(cmd) => snapshots::run(config, cmd).await,
         Command::Trend(args) => trend::run(config, args).await,
         Command::Compare(args) => compare::run(config, args).await,
+        Command::Expire(args) => expire::run(config, args).await,
     }
 }
 

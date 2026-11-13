@@ -28,6 +28,9 @@ pub enum ConfirmFor {
     },
     /// `w` on Connections: turning writes on for entry `id`.
     WritesOn { id: ConnId },
+    /// `x` or `D` on Patterns, after the dry run (`super::bulk`): `summary` says what
+    /// it found, as lines safe to draw.
+    Bulk { op: WriteOp, summary: Vec<String> },
 }
 
 /// What answers the question.
@@ -55,7 +58,7 @@ impl Confirm {
     /// The dialog's title: what will happen.
     pub fn title(&self) -> String {
         match &self.what {
-            ConfirmFor::Write { op, .. } => op_title(op).to_string(),
+            ConfirmFor::Write { op, .. } | ConfirmFor::Bulk { op, .. } => op_title(op).to_string(),
             ConfirmFor::WritesOn { .. } => {
                 format!("Turn on writes for {}", crate::value::escape(&self.profile))
             }
@@ -79,6 +82,21 @@ impl Confirm {
                 out.push(String::new());
                 out.push(format!("Sends: {}", op.shown()));
             }
+            ConfirmFor::Bulk { op, summary } => {
+                if let Some(what) = op_target(op) {
+                    out.push(what);
+                }
+                out.extend(summary.iter().cloned());
+                out.push(match op {
+                    WriteOp::Bulk {
+                        action: crate::write::BulkAction::Expire { .. },
+                        ..
+                    } => "PERSIST on the keys in the key file undoes it.".to_string(),
+                    _ => "This can't be undone.".to_string(),
+                });
+                out.push(String::new());
+                out.push(format!("Sends: {}", op.shown()));
+            }
             ConfirmFor::WritesOn { .. } => {
                 if self.prod {
                     out.push("This is a PROD profile. With writes on, key edits,".to_string());
@@ -98,6 +116,7 @@ impl Confirm {
                 crate::value::escape(name),
                 match self.what {
                     ConfirmFor::Write { .. } => "send it",
+                    ConfirmFor::Bulk { .. } => "start",
                     ConfirmFor::WritesOn { .. } => "turn writes on",
                 }
             )),
@@ -109,6 +128,15 @@ impl Confirm {
     pub fn keys(&self) -> Vec<(&'static str, &'static str)> {
         let go = match &self.what {
             ConfirmFor::Write { op, .. } => op_verb(op),
+            ConfirmFor::Bulk {
+                op:
+                    WriteOp::Bulk {
+                        action: crate::write::BulkAction::Expire { .. },
+                        ..
+                    },
+                ..
+            } => "Set TTLs",
+            ConfirmFor::Bulk { op, .. } => op_verb(op),
             ConfirmFor::WritesOn { .. } => "Turn on",
         };
         match self.expect {
@@ -310,6 +338,7 @@ impl App {
                     }
                 }
             }
+            ConfirmFor::Bulk { op, .. } => self.bulk_answer(op, answer),
             ConfirmFor::WritesOn { id } => match answer {
                 None => {
                     self.set_info("Cancelled: writes stay off.");

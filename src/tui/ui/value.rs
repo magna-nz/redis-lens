@@ -10,11 +10,12 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Clear;
 
 use crate::format;
 use crate::live::values::{Items, JSON_MAX_SIZE, JSON_SHOWN, Kind, MAX_ITEMS, STRING_BYTES};
 use crate::model::Ttl;
-use crate::tui::app::views::value::{Focus, ValueState};
+use crate::tui::app::views::value::{Focus, Form, ValueState};
 use crate::tui::app::views::{Ctx, LiveState};
 use crate::value::{self, Raw};
 use crate::verdict::{PatternVerdict, pattern_verdict};
@@ -37,6 +38,105 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &ValueState, ctx: &Ctx<'_>) {
     .areas(area);
     meta(frame, left, state, ctx);
     value_panel(frame, right, state, ctx);
+    if let Some(form) = &state.form {
+        draw_form(frame, area, form);
+    }
+}
+
+/// Widest an edit form gets.
+const FORM_W: u16 = 72;
+
+/// An edit form ([`Form`]) in a box over `area`, near its bottom: each field with its
+/// label, the one typed in marked with `›` and a cursor; then the notes, the last
+/// error and the keys. Every text is escaped; a long one shows its end while typed in,
+/// its start otherwise.
+pub fn draw_form(frame: &mut Frame, area: Rect, form: &Form) {
+    let w = area.width.min(FORM_W);
+    let inner = usize::from(w.saturating_sub(2));
+    let label_w = form
+        .fields
+        .iter()
+        .map(|f| width(f.label))
+        .max()
+        .unwrap_or(0)
+        + 1;
+    // " label › text▏ "
+    let room = inner.saturating_sub(label_w + 5).max(4);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, f) in form.fields.iter().enumerate() {
+        let active = i == form.at;
+        let shown = f.shown();
+        let text = if f.is_choice() && active {
+            format!("‹ {shown} ›")
+        } else if active && width(&shown) > room {
+            let chars: Vec<char> = shown.chars().collect();
+            let mut keep = String::from("…");
+            let mut start = chars.len();
+            while start > 0 && width(&keep) + super::widgets::char_width(chars[start - 1]) < room {
+                start -= 1;
+                keep.insert(1, chars[start]);
+            }
+            keep
+        } else {
+            trunc(&shown, room)
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!(" {}", pad_r(f.label, label_w)),
+                if active { style::key() } else { style::dim() },
+            ),
+            Span::styled(if active { "› " } else { "  " }, style::amber()),
+            Span::styled(text, if active { style::fgb() } else { style::fg() }),
+        ];
+        if active && !f.is_choice() {
+            spans.push(Span::styled("▏", style::amber()));
+        }
+        lines.push(Line::from(fit(spans, inner)));
+    }
+    lines.push(Line::from(""));
+    for n in &form.notes {
+        for l in wrap(&format!(" {n}"), inner) {
+            lines.push(Line::from(fit(vec![Span::styled(l, style::dim())], inner)));
+        }
+    }
+    if let Some(e) = &form.error {
+        for l in wrap(&format!(" ✗ {e}"), inner) {
+            lines.push(Line::from(fit(vec![Span::styled(l, style::warn())], inner)));
+        }
+    }
+    let last = form.at + 1 >= form.fields.len();
+    let mut keys = vec![Span::raw(" ")];
+    let mut pairs = Vec::new();
+    if form.fields.len() > 1 {
+        pairs.push(("tab", "Next field"));
+    }
+    pairs.push(("enter", if last { "Send" } else { "Next" }));
+    pairs.push(("esc", "Cancel"));
+    for (k, l) in pairs {
+        keys.push(Span::styled(k, style::key()));
+        keys.push(Span::styled(format!(" {l}   "), style::dim()));
+    }
+    lines.push(Line::from(fit(keys, inner)));
+
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y
+            + area
+                .height
+                .saturating_sub(h + 1)
+                .min(area.height.saturating_sub(h)),
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, rect);
+    let title = trunc(
+        &form.title,
+        inner.saturating_sub(width(&form.right) + 6).max(8),
+    );
+    let right = trunc(&form.right, inner.saturating_sub(width(&title) + 6));
+    let body = panel(frame, rect, &title, &right);
+    rows(frame, body, lines, None);
 }
 
 /// A server string or name, safe to draw on one line: invalid UTF-8 as `\xNN`.

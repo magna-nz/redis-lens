@@ -2,10 +2,11 @@
 //! or look things up (spec "Browsing, server views and writes"). Owner: wave A1; the
 //! per-view submodules belong to wave B.
 //!
-//! Contract: the types and signatures below are fixed. Only [`LiveRequest::Write`]
-//! sends a write, and it carries a [`crate::write::Permit`], which only the write gate
-//! makes ([`write`]). Only [`values`] (key values and stream entries, in pages), [`search`]
-//! (query results) and the Pub/Sub tail ([`pubsub`]) read values, held as
+//! Contract: the types and signatures below are fixed. Only [`LiveRequest::Write`] and
+//! a batch of [`LiveRequest::Bulk`] send writes, and each carries a
+//! [`crate::write::Permit`], which only the write gate makes ([`write`], [`bulk`]).
+//! Only [`values`] (key values and stream entries, in pages), [`search`] (query
+//! results) and the Pub/Sub tail ([`pubsub`]) read values, held as
 //! [`crate::value::Raw`] (spec "Values"); the command line ([`cmdline`]) holds its
 //! replies as [`cmdline::Output`], redacted the same way.
 //!
@@ -29,6 +30,7 @@ use tokio::task::JoinSet;
 
 use crate::budget::Budget;
 
+pub mod bulk;
 pub mod cmdline;
 pub mod command;
 pub mod keys;
@@ -61,6 +63,9 @@ pub enum LiveRequest {
     Command(cmdline::Request),
     /// A write the gate let through (spec "Write permissions").
     Write(crate::write::Permit),
+    /// A step of a bulk action (spec "Bulk actions"): the dry run, or a batch of a
+    /// bulk op the gate let through.
+    Bulk(bulk::Request),
 }
 
 /// The answer to a [`LiveRequest`], from the same group.
@@ -74,6 +79,7 @@ pub enum LiveReply {
     Value(values::Reply),
     Command(cmdline::Reply),
     Write(write::Reply),
+    Bulk(bulk::Reply),
 }
 
 /// Why a request failed. The text is always redis-lens's own fixed wording, never the
@@ -114,6 +120,7 @@ pub async fn run(
         LiveRequest::Value(r) => values::run(conn, budget, r).await.map(LiveReply::Value),
         LiveRequest::Command(r) => cmdline::run(conn, budget, r).await.map(LiveReply::Command),
         LiveRequest::Write(p) => write::run(conn, budget, p).await.map(LiveReply::Write),
+        LiveRequest::Bulk(r) => bulk::run(conn, budget, r).await.map(LiveReply::Bulk),
     }
 }
 
