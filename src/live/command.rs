@@ -312,6 +312,9 @@ pub fn refused(args: &[Vec<u8>]) -> Option<&'static str> {
         "subscribe" | "psubscribe" | "ssubscribe" | "unsubscribe" | "punsubscribe"
         | "sunsubscribe" => "Not sent here: use Pub/Sub (5) to subscribe.",
         "monitor" => "Not sent here: use the Monitor panel in Server (3).",
+        // Redis flags these readonly; they are its guard against HTTP requests sent to
+        // it, and POST closes the connection every view shares.
+        "post" | "host:" => "Not sent: it would close the connection every view shares.",
         "select" => "Not sent here: SELECT would switch the database under every view.",
         "auth" | "hello" | "reset" | "quit" => {
             "Not sent: it would change the connection every view shares."
@@ -491,6 +494,8 @@ mod tests {
         assert!(refused(&words(&["CLIENT", "REPLY", "OFF"])).is_some());
         assert!(refused(&words(&["CLIENT", "LIST"])).is_none());
         assert!(refused(&words(&["GET", "k"])).is_none());
+        assert!(refused(&words(&["POST"])).is_some());
+        assert!(refused(&words(&["Host:"])).is_some());
     }
 
     #[test]
