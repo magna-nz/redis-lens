@@ -202,6 +202,50 @@ async fn a_write_is_refused_and_never_sent(server: &common::TestServer) {
     assert_eq!(g, Gate::Send);
 }
 
+/// A script runs commands the gate never sees (the phase 2 verifier reset the slow
+/// log with `EVAL_RO`): refused, and never sent even when the runner is asked. MEMORY
+/// PURGE is refused too, on Redis 6.2 as on 7 (6.2 flags MEMORY readonly).
+async fn scripts_are_refused_and_never_sent(server: &common::TestServer) {
+    let mut admin = server.admin().await;
+    let _: () = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("slowlog-log-slower-than")
+        .arg("0")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    let _: Option<String> = redis::cmd("GET")
+        .arg("x")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    let len = || async {
+        let mut a = server.admin().await;
+        redis::cmd("SLOWLOG")
+            .arg("LEN")
+            .query_async::<i64>(&mut a)
+            .await
+            .unwrap()
+    };
+    let before = len().await;
+    assert!(before > 0);
+    let mut c = server.admin().await;
+    let line = "EVAL_RO \"return redis.call('slowlog','reset')\" 0";
+    let (g, i) = decide(&mut c, line).await;
+    assert!(matches!(g, Gate::Refuse(_)), "{g:?}");
+    if let Some(i) = i {
+        assert_eq!(
+            send(&mut c, line, i, true).await.unwrap_err(),
+            LiveError::Failed(NOT_SENT.into())
+        );
+    }
+    assert!(len().await >= before, "the slow log was reset");
+    let (g, _) = decide(&mut c, "MEMORY PURGE").await;
+    assert!(matches!(g, Gate::Refuse(_)), "{g:?}");
+    let (g, _) = decide(&mut c, "MEMORY USAGE x").await;
+    assert_eq!(g, Gate::Send);
+}
+
 async fn keys_asks_first(server: &common::TestServer) {
     let mut admin = server.admin().await;
     let _: () = redis::cmd("SET")
@@ -308,6 +352,7 @@ async fn the_helper_reads_command_docs(server: &common::TestServer) {
 async fn all(server: common::TestServer) {
     readonly_get_returns_the_value_with_a_time(&server).await;
     a_write_is_refused_and_never_sent(&server).await;
+    scripts_are_refused_and_never_sent(&server).await;
     keys_asks_first(&server).await;
     noperm_gives_the_fixed_text(&server).await;
     the_helper_reads_command_docs(&server).await;

@@ -198,7 +198,63 @@ pub fn gate(args: &[Vec<u8>], info: Option<&CommandInfo>) -> Gate {
     {
         return Gate::Refuse(NOT_SENT.into());
     }
+    // A script or function runs commands of its own, which this gate never sees:
+    // `EVAL_RO` is flagged readonly but could reset the slow log, run KEYS without the
+    // question, or loop until someone sends SCRIPT KILL.
+    // Judged by the command's own name: `config` for `config|get`.
+    let base = info.name.split('|').next().unwrap_or("");
+    if info.in_category("@scripting") || SCRIPTING.contains(&base) {
+        return Gate::Refuse(format!(
+            "Not sent: {} runs a script, whose commands the command line can't check.",
+            info.display()
+        ));
+    }
+    // Module internals (`_FT.DEBUG`) are flagged readonly but change state or hang.
+    if base.starts_with('_') {
+        return Gate::Refuse(format!(
+            "Not sent: {} is a module's internal command.",
+            info.display()
+        ));
+    }
+    // Module commands (`FT.CONFIG`, `FT.ALIASADD`, `GRAPH.CONFIG` …) are often flagged
+    // readonly though they change state, and list no subcommands: only the ones known
+    // to read are sent.
+    if base.contains('.') && !MODULE_READS.contains(&base) {
+        return Gate::Refuse(format!(
+            "Not sent: {} is a module command the command line doesn't know to only read.",
+            info.display()
+        ));
+    }
     let cmd = if info.subcommands.is_empty() {
+        // Before Redis 7.0 a container command such as MEMORY lists no subcommands and
+        // its flags cover them all (6.2 flags MEMORY readonly, MEMORY PURGE included):
+        // only the subcommands known to read are sent.
+        if let Some(subs) = OLD_READONLY_SUBCOMMANDS
+            .iter()
+            .find(|(c, _)| *c == info.name)
+            .map(|(_, subs)| *subs)
+        {
+            let sub = args
+                .get(1)
+                .map(|s| String::from_utf8_lossy(s).to_ascii_lowercase());
+            if !sub.as_deref().is_some_and(|s| subs.contains(&s)) {
+                let mut name = info.display();
+                if let Some(s) = args.get(1) {
+                    name.push(' ');
+                    command::push_word(&s.to_ascii_uppercase(), &mut name);
+                }
+                return Gate::Refuse(format!(
+                    "Not sent: this server doesn't list {name}'s flags, and it is not one \
+                     of the subcommands known to only read ({}).",
+                    subs.join(", ").to_ascii_uppercase()
+                ));
+            }
+        } else if CONTAINERS.contains(&info.name.as_str()) {
+            return Gate::Refuse(format!(
+                "Not sent: this server doesn't list the flags of {}'s subcommands.",
+                info.display()
+            ));
+        }
         info
     } else {
         let Some(sub) = args.get(1) else {
@@ -231,11 +287,107 @@ pub fn gate(args: &[Vec<u8>], info: Option<&CommandInfo>) -> Gate {
             cmd.display()
         ));
     }
-    if cmd.in_category("@dangerous") {
+    // Servers before 6.0 have no ACL categories: KEYS asks there too.
+    if cmd.in_category("@dangerous")
+        || matches!(cmd.name.as_str(), "keys" | "sort_ro" | "ft.tagvals")
+    {
         return Gate::Ask;
     }
     Gate::Send
 }
+
+/// Module commands known to only read (the rest are refused, see [`gate`]): RedisJSON,
+/// RediSearch, TimeSeries, the probabilistic types and RedisGraph's read-only query.
+const MODULE_READS: &[&str] = &[
+    "json.get",
+    "json.mget",
+    "json.type",
+    "json.strlen",
+    "json.arrlen",
+    "json.arrindex",
+    "json.objkeys",
+    "json.objlen",
+    "json.resp",
+    "ft.search",
+    "ft.aggregate",
+    "ft.info",
+    "ft.explain",
+    "ft.explaincli",
+    "ft.profile",
+    "ft._list",
+    "ft.tagvals",
+    "ft.spellcheck",
+    "ft.syndump",
+    "ft.dictdump",
+    "ft.sugget",
+    "ft.suglen",
+    "ts.get",
+    "ts.mget",
+    "ts.range",
+    "ts.revrange",
+    "ts.mrange",
+    "ts.mrevrange",
+    "ts.info",
+    "ts.queryindex",
+    "bf.exists",
+    "bf.mexists",
+    "bf.info",
+    "bf.card",
+    "cf.exists",
+    "cf.mexists",
+    "cf.count",
+    "cf.info",
+    "cms.query",
+    "cms.info",
+    "topk.query",
+    "topk.list",
+    "topk.info",
+    "tdigest.min",
+    "tdigest.max",
+    "tdigest.quantile",
+    "tdigest.cdf",
+    "tdigest.rank",
+    "tdigest.revrank",
+    "tdigest.byrank",
+    "tdigest.byrevrank",
+    "tdigest.trimmed_mean",
+    "tdigest.info",
+    "graph.ro_query",
+    "graph.explain",
+    "graph.list",
+];
+
+/// Scripts and functions, refused whatever their flags (see [`gate`]).
+const SCRIPTING: &[&str] = &[
+    "eval",
+    "eval_ro",
+    "evalsha",
+    "evalsha_ro",
+    "fcall",
+    "fcall_ro",
+    "script",
+    "function",
+];
+
+/// Container commands whose subcommands a server before 7.0 doesn't list, with the
+/// subcommands known to only read. Other containers there are refused.
+const OLD_READONLY_SUBCOMMANDS: &[(&str, &[&str])] = &[
+    (
+        "memory",
+        &["usage", "stats", "doctor", "malloc-stats", "help"],
+    ),
+    (
+        "object",
+        &["encoding", "freq", "idletime", "refcount", "help"],
+    ),
+    ("xinfo", &["stream", "groups", "consumers", "help"]),
+];
+
+/// Container commands (they have subcommands from Redis 7.0).
+const CONTAINERS: &[&str] = &[
+    "acl", "client", "cluster", "command", "config", "debug", "function", "latency", "module",
+    "pubsub", "script", "slowlog", "xgroup", "sentinel",
+];
 
 /// Whether `cmd` would block. `XREAD` has the flag but blocks only with `BLOCK`.
 fn blocks(args: &[Vec<u8>], cmd: &CommandInfo) -> bool {
@@ -417,6 +569,10 @@ pub fn run_error(name: &str, e: &RedisError) -> Result<String, LiveError> {
 
 /// `(error) CODE detail`, escaped and cut.
 fn error_line(code: &str, detail: &str) -> String {
+    // A NOPERM inside a reply (a transaction's, a script's) names the user: fixed text.
+    if code.eq_ignore_ascii_case("NOPERM") {
+        return "(error) NOPERM the server refused this for this user".to_string();
+    }
     let msg = value::escape(format!("{code} {detail}").trim());
     let msg = if msg.is_empty() {
         "the command failed".to_string()
@@ -826,6 +982,107 @@ mod tests {
 
     fn lines(v: &Value) -> Vec<String> {
         format_reply(v).0
+    }
+
+    /// A script or function runs commands the gate never sees: refused whatever its
+    /// flags, with or without ACL categories (found by the phase 2 verifier: EVAL_RO
+    /// reset the slow log and ran KEYS without the question).
+    #[test]
+    fn scripts_and_module_internals_are_never_sent() {
+        let ro = &["readonly", "noscript", "stale"];
+        for (line, name, cats) in [
+            (
+                "EVAL_RO \"return redis.call('slowlog','reset')\" 0",
+                "eval_ro",
+                &["@slow", "@scripting"][..],
+            ),
+            ("evalsha_ro abc 0", "evalsha_ro", &[][..]),
+            ("FCALL_RO f 0", "fcall_ro", &["@scripting"][..]),
+            ("_FT.DEBUG x", "_ft.debug", &[][..]),
+            ("search.CLUSTERINFO", "search.clusterinfo", &[][..]),
+        ] {
+            let g = gate(&args(line), Some(&info(name, ro, cats)));
+            assert!(matches!(g, Gate::Refuse(_)), "{line}: {g:?}");
+        }
+    }
+
+    /// Module commands flagged readonly that change state (found on Redis Stack 6.2 and
+    /// 7.2: FT.CONFIG SET, FT.ALIASADD, FT.DICTADD, GRAPH.CONFIG SET, FT.DEBUG) are not
+    /// sent; known module reads are.
+    #[test]
+    fn only_known_module_reads_are_sent() {
+        let ro = &["readonly"];
+        for (line, name) in [
+            ("FT.CONFIG SET MAXEXPANSIONS 7", "ft.config"),
+            ("FT.ALIASADD a idx", "ft.aliasadd"),
+            ("FT._ALIASADDIFNX a idx", "ft._aliasaddifnx"),
+            ("FT.DICTADD d w", "ft.dictadd"),
+            ("FT.DEBUG GC_FORCEINVOKE idx", "ft.debug"),
+            ("FT.CURSOR DEL idx 1", "ft.cursor"),
+            ("GRAPH.CONFIG SET RESULTSET_SIZE 5", "graph.config"),
+            ("CF.COMPACT k", "cf.compact"),
+            ("search.CLUSTERINFO", "search.clusterinfo"),
+            ("timeseries.CLUSTERSET x", "timeseries.clusterset"),
+        ] {
+            let g = gate(&args(line), Some(&info(name, ro, &[])));
+            assert!(matches!(g, Gate::Refuse(_)), "{line}: {g:?}");
+        }
+        for (line, name) in [("FT.SEARCH idx *", "ft.search"), ("JSON.GET k", "json.get")] {
+            assert_eq!(
+                gate(&args(line), Some(&info(name, ro, &["@read"]))),
+                Gate::Send,
+                "{line}"
+            );
+        }
+    }
+
+    /// SORT_RO and FT.TAGVALS ask on a server without ACL categories, like KEYS (Redis
+    /// Stack 6.2 and 7.2 give module commands none).
+    #[test]
+    fn sort_ro_asks_without_categories() {
+        let s = info("sort_ro", &["readonly", "movablekeys"], &[]);
+        assert_eq!(gate(&args("SORT_RO k"), Some(&s)), Gate::Ask);
+        let t = info("ft.tagvals", &["readonly"], &[]);
+        assert_eq!(gate(&args("FT.TAGVALS idx tag"), Some(&t)), Gate::Ask);
+    }
+
+    /// Before Redis 7.0 a container lists no subcommands and its own flags cover them
+    /// all: 6.2 flags MEMORY readonly, MEMORY PURGE included.
+    #[test]
+    fn an_old_server_sends_only_known_reading_subcommands() {
+        let memory = info("memory", &["readonly", "random"], &["@read", "@slow"]);
+        assert_eq!(gate(&args("MEMORY USAGE k"), Some(&memory)), Gate::Send);
+        for line in ["MEMORY PURGE", "MEMORY", "memory Purge"] {
+            assert!(
+                matches!(gate(&args(line), Some(&memory)), Gate::Refuse(_)),
+                "{line}"
+            );
+        }
+        let object = info("object", &["readonly"], &[]);
+        assert_eq!(gate(&args("OBJECT ENCODING k"), Some(&object)), Gate::Send);
+        let client = info("client", &["readonly"], &[]);
+        assert!(matches!(
+            gate(&args("CLIENT LIST"), Some(&client)),
+            Gate::Refuse(_)
+        ));
+    }
+
+    /// KEYS asks on a server with no ACL categories (before 6.0) too.
+    #[test]
+    fn keys_asks_without_categories() {
+        let keys = info("keys", &["readonly", "sort_for_script"], &[]);
+        assert_eq!(gate(&args("KEYS *"), Some(&keys)), Gate::Ask);
+    }
+
+    /// A NOPERM inside a reply names the user: fixed text.
+    #[test]
+    fn a_nested_noperm_is_fixed_text() {
+        let line = error_line(
+            "NOPERM",
+            "User bob has no permissions to run the 'get' command",
+        );
+        assert!(!line.contains("bob"), "{line}");
+        assert!(line.contains("refused"), "{line}");
     }
 
     fn info(name: &str, flags: &[&str], cats: &[&str]) -> CommandInfo {

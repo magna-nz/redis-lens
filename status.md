@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** Redis Insight parity phase 2 (values on screen), in one PR: [#16](https://github.com/magna-nz/redis-lens/pull/16), branch `phase2/values-on-screen`. Phase 1 merged to main (#15).
-**Last updated:** 2026-11-14 (phase 2: all four parts built, in #16)
+**Current milestone:** Redis Insight parity phase 2 (values on screen): merged to main as [#16](https://github.com/magna-nz/redis-lens/pull/16) at `8bb87d8`, before the command line's review fixes; those are in [#17](https://github.com/magna-nz/redis-lens/pull/17) (branch `phase2/command-line-gate-fixes`). Phase 1 merged to main (#15).
+**Last updated:** 2026-11-14 (phase 2 merged as #16; command line gate fixes in #17, verified)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -424,14 +424,14 @@ A gap matrix against Redis Insight v3.8.0, with a three-phase roadmap, is in [do
 
 ## Phase 2 (2026-11-13): values on screen
 
-Built unattended on `phase2/values-on-screen`, one PR for the whole phase ([#16](https://github.com/magna-nz/redis-lens/pull/16)), one or more commits per part. Not merged: the owner merges. Nothing in phase 2 sends a write command.
+Built unattended on `phase2/values-on-screen`, one PR for the whole phase ([#16](https://github.com/magna-nz/redis-lens/pull/16), merged by the owner at `8bb87d8`), one or more commits per part. The command line's review fixes (`febdd28`, `caba882` and the `FT.TAGVALS` commit) came after that merge and are in [#17](https://github.com/magna-nz/redis-lens/pull/17); until it is merged, main's command line sends `EVAL_RO` scripts and state-changing module commands. Nothing in phase 2 sends a write command.
 
 | Part | Content | Commits | State |
 |---|---|---|---|
 | 1 | Value renderer (`src/value/`: text, hex, JSON, MessagePack; gzip, zlib, lz4, zstd capped at 1 MiB; terminal safety), Key detail (`src/live/values.rs`, `views/value.rs`), `f`, `y`, `CopyText::value` | `3dad809` `cd7d27b` `960ff78` `60192fe` `60fa334`, verifier fixes `bb9b3e8` | **done**, verified (the verifier blocked on a MessagePack size blow-up and a cut column; both fixed, with tests) |
 | 2 | Stream entries, Pub/Sub live tail (own RESP3 connection), Search queries (`FT.SEARCH`, `FT.EXPLAIN`, `FT.PROFILE`) | `2272334` (shared masking, `src/live/command.rs`), `e514253`, verifier fixes `55ccddc` | **done**, verified (OK, no blockers; its two should-fixes are fixed: one Search query at a time, tail previews made off the UI thread) |
-| 3 | Slow log arguments (masked, on screen only), Monitor panel (own connection, asks first, 30 s or 10,000 lines), Hot keys from the last Monitor run | one commit with part 4 (they share the wiring files) | **done**; tests on Redis, Valkey and Redis 6.2 |
-| 4 | Command line panel: `:`, readonly commands only (`COMMAND INFO` flags), `@dangerous` asks, refusals point elsewhere, credentials masked in input and history, `COMMAND DOCS` helper, `tab` completion | one commit with part 3 | **done**; tests on Redis, Valkey and Redis 6.2 |
+| 3 | Slow log arguments (masked, on screen only), Monitor panel (own connection, asks first, 30 s or 10,000 lines), Hot keys from the last Monitor run | `47167e0` with part 4 (they share the wiring files), clippy fix `8bb87d8`, review fixes in the next commit | **done**, verified (see part 4); tests on Redis, Valkey and Redis 6.2 |
+| 4 | Command line panel: `:`, readonly commands only (`COMMAND INFO` flags), `@dangerous` asks, refusals point elsewhere, credentials masked in input and history, `COMMAND DOCS` helper, `tab` completion | `47167e0` with part 3, review fixes in the next commit | **done**. The verifier blocked on `EVAL_RO`/`EVALSHA_RO`/`FCALL_RO`: flagged readonly, but a script ran `SLOWLOG RESET`, `KEYS` without the question, or looped (BUSY). Fixed: scripts and functions are never sent; also module internals, unknown subcommands of a container on servers before 7.0 (6.2 sent `MEMORY PURGE`), `KEYS` asks without ACL categories, more settings masked (Valkey `primaryauth`/`primaryuser`, TLS key passphrases, sentinel passwords), a nested NOPERM is fixed text, the helper's categories escaped. Its re-check blocked on module commands flagged readonly that change state (`FT.CONFIG SET`, `FT.ALIASADD`, `FT.DICTADD`, `GRAPH.CONFIG SET` on Redis Stack 6.2 and 7.2): only module commands on a list of known reads are sent now; `POST` and `HOST:` (flagged readonly on 6.2, they close the connection) are refused; `SORT_RO` asks without categories. Re-check of `caba882`: **OK** (every readonly command of Redis Stack 6.2 and 7.2, redis:8 with search and valkey-bundle 9.1.3 checked against the gate); from its notes `FT.TAGVALS` now asks without categories too |
 
 ### Decisions taken alone (phase 2)
 
@@ -456,6 +456,8 @@ Built unattended on `phase2/values-on-screen`, one PR for the whole phase ([#16]
 - **The strict readonly rule refuses `INFO`, `PING`, `TIME`, `CLIENT LIST`, `CONFIG GET`, `SLOWLOG GET`, `PUBSUB …` and `COMMAND …`** on the command line, because they lack the `readonly` flag. Should a short allow-list of harmless commands be sent? Owner to decide.
 - Parts 3 and 4 are one commit: both edit the same wiring files (`app.rs`, `keymap.rs`, `views/mod.rs`, `ui/mod.rs`, `live/mod.rs`, spec.md), and splitting their hunks did not give a commit that builds.
 - Not tested against real servers: MONITOR through an SSH tunnel and over direct TLS (coded, unit-tested only); the command line through a full TUI session (the live path has integration tests); RESP3 reply shapes on the command line (unit tests; the live connection is RESP2).
+- **The command line reads a reply whole** before cutting it at 1 MiB on screen, so `HGETALL` or `LRANGE 0 -1` on a big key, or `SCAN … COUNT 100000000`, can take a lot of memory here and time on the server (redis-rs reads a reply in one piece). The spec lets a user type them; a size check before such reads is for the owner to decide.
+- From the part 3-4 verifier's notes, left as they are: a misaligned `CONFIG SET maxmemory requirepass pw` shows `pw` (the server rejects that line); the helper sends the first typed word in `COMMAND INFO`/`COMMAND DOCS` (a password typed as the first word would go there); `PFCOUNT` is flagged readonly but may rewrite its key's cache; the Monitor prompt on `prod` draws pasted text as typed; errors opening the Monitor (like Pub/Sub's) are masked like connect errors; a Monitor line is read whole before it is cut to 1 KiB; the 4 MiB output cap counts text, not per-line overhead; `FT.AGGREGATE … WITHCURSOR` leaves a cursor that expires on its own (`FT.CURSOR` is refused).
 - The `?` overlay does not list the command line panel's own keys (they are in the spec's key table).
 
 - **Auto-fix could not be turned on** for #16: the app's permission check refused `set_monitor`. CI was checked by hand instead.
