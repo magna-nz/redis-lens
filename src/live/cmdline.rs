@@ -288,7 +288,9 @@ pub fn gate(args: &[Vec<u8>], info: Option<&CommandInfo>) -> Gate {
         ));
     }
     // Servers before 6.0 have no ACL categories: KEYS asks there too.
-    if cmd.in_category("@dangerous") || matches!(cmd.name.as_str(), "keys" | "sort_ro") {
+    if cmd.in_category("@dangerous")
+        || matches!(cmd.name.as_str(), "keys" | "sort_ro" | "ft.tagvals")
+    {
         return Gate::Ask;
     }
     Gate::Send
@@ -1024,11 +1026,14 @@ mod tests {
         }
     }
 
-    /// SORT_RO asks on a server without ACL categories, like KEYS.
+    /// SORT_RO and FT.TAGVALS ask on a server without ACL categories, like KEYS (Redis
+    /// Stack 6.2 and 7.2 give module commands none).
     #[test]
     fn sort_ro_asks_without_categories() {
         let s = info("sort_ro", &["readonly", "movablekeys"], &[]);
         assert_eq!(gate(&args("SORT_RO k"), Some(&s)), Gate::Ask);
+        let t = info("ft.tagvals", &["readonly"], &[]);
+        assert_eq!(gate(&args("FT.TAGVALS idx tag"), Some(&t)), Gate::Ask);
     }
 
     /// Before Redis 7.0 a container lists no subcommands and its own flags cover them
