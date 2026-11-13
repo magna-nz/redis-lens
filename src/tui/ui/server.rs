@@ -683,7 +683,7 @@ fn monitor_right(m: &Monitor, ctx: &Ctx<'_>) -> String {
     } else if m.running() && !m.ready {
         "starting…".to_string()
     } else if m.running() {
-        let left = m.left(ctx.now).map_or(MAX_TIME, |d| d).as_secs();
+        let left = m.left(ctx.now).unwrap_or(MAX_TIME).as_secs();
         format!("running · {lines} lines · {left} s left · UTC")
     } else if m.stopped.is_some() {
         format!("stopped · {lines} lines kept · UTC")
