@@ -147,9 +147,12 @@ pub enum Secret {
 /// - `AUTH`: every argument;
 /// - `HELLO … AUTH <user> <pass>` and `… SETNAME`-free forms: the two after `AUTH`;
 /// - `ACL SETUSER`: rules starting `>`, `<`, `#` or `!`;
-/// - `CONFIG SET`: the value after `requirepass`, `masterauth` or `masteruser`;
+/// - `CONFIG SET`: the value after `requirepass`, `masterauth`, `masteruser`, Valkey's
+///   `primaryauth` and `primaryuser`, `tls-key-file-pass`, `tls-client-key-file-pass`,
+///   `sentinel-pass` or `sentinel-user`;
 /// - `MIGRATE … AUTH <pass>` and `… AUTH2 <user> <pass>`;
-/// - `SENTINEL SET … auth-pass|auth-user <value>` and `SENTINEL CONFIG SET` the same.
+/// - `SENTINEL SET … auth-pass|auth-user <value>`, and `SENTINEL CONFIG SET
+///   sentinel-pass|sentinel-user <value>`.
 pub fn secrets(args: &[Vec<u8>]) -> Vec<Option<Secret>> {
     let mut out = vec![None; args.len()];
     let is = |i: usize, w: &str| {
@@ -181,9 +184,19 @@ pub fn secrets(args: &[Vec<u8>]) -> Vec<Option<Secret>> {
     } else if is(0, "config") && is(1, "set") {
         let mut i = 2;
         while i < args.len() {
-            if ["requirepass", "masterauth", "masteruser"]
-                .iter()
-                .any(|p| is(i, p))
+            if [
+                "requirepass",
+                "masterauth",
+                "masteruser",
+                "primaryauth",
+                "primaryuser",
+                "tls-key-file-pass",
+                "tls-client-key-file-pass",
+                "sentinel-pass",
+                "sentinel-user",
+            ]
+            .iter()
+            .any(|p| is(i, p))
             {
                 mark(i + 1, Secret::Whole);
             }
@@ -200,7 +213,10 @@ pub fn secrets(args: &[Vec<u8>]) -> Vec<Option<Secret>> {
         }
     } else if is(0, "sentinel") {
         for i in 1..args.len() {
-            if is(i, "auth-pass") || is(i, "auth-user") {
+            if ["auth-pass", "auth-user", "sentinel-pass", "sentinel-user"]
+                .iter()
+                .any(|w| is(i, w))
+            {
                 mark(i + 1, Secret::Whole);
             }
         }
@@ -296,6 +312,9 @@ pub fn refused(args: &[Vec<u8>]) -> Option<&'static str> {
         "subscribe" | "psubscribe" | "ssubscribe" | "unsubscribe" | "punsubscribe"
         | "sunsubscribe" => "Not sent here: use Pub/Sub (5) to subscribe.",
         "monitor" => "Not sent here: use the Monitor panel in Server (3).",
+        // Redis flags these readonly; they are its guard against HTTP requests sent to
+        // it, and POST closes the connection every view shares.
+        "post" | "host:" => "Not sent: it would close the connection every view shares.",
         "select" => "Not sent here: SELECT would switch the database under every view.",
         "auth" | "hello" | "reset" | "quit" => {
             "Not sent: it would change the connection every view shares."
@@ -410,6 +429,22 @@ mod tests {
                 "SENTINEL SET m auth-pass s3cret",
                 "SENTINEL SET m auth-pass ***",
             ),
+            (
+                "CONFIG SET primaryauth s3cret primaryuser bob",
+                "CONFIG SET primaryauth *** primaryuser ***",
+            ),
+            (
+                "config set tls-key-file-pass s3cret",
+                "config set tls-key-file-pass ***",
+            ),
+            (
+                "CONFIG SET tls-client-key-file-pass s3cret",
+                "CONFIG SET tls-client-key-file-pass ***",
+            ),
+            (
+                "SENTINEL CONFIG SET sentinel-pass s3cret",
+                "SENTINEL CONFIG SET sentinel-pass ***",
+            ),
             ("GET s3cret", "GET s3cret"),
         ];
         for (typed, shown) in cases {
@@ -459,6 +494,8 @@ mod tests {
         assert!(refused(&words(&["CLIENT", "REPLY", "OFF"])).is_some());
         assert!(refused(&words(&["CLIENT", "LIST"])).is_none());
         assert!(refused(&words(&["GET", "k"])).is_none());
+        assert!(refused(&words(&["POST"])).is_some());
+        assert!(refused(&words(&["Host:"])).is_some());
     }
 
     #[test]
