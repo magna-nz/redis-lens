@@ -2,7 +2,7 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** Redis Insight parity phase 3 (writes), in one PR: [#18](https://github.com/magna-nz/redis-lens/pull/18), branch `claude/insight-phase3-e6291e`. It contains [#17](https://github.com/magna-nz/redis-lens/pull/17) (command-line gate fixes), which should be merged first. Phase 2 merged to main (#16).
+**Current milestone:** Redis Insight parity phase 3 (writes), in one PR: [#18](https://github.com/magna-nz/redis-lens/pull/18), branch `claude/insight-phase3-e6291e`. Phase 2 merged to main (#16), and its command-line gate fixes (#17).
 **Last updated:** 2026-11-14 (phase 3: all five parts built, in #18; verifier pending)
 
 ## Overnight run (2026-11-10): approvals and plan
@@ -470,7 +470,7 @@ Built unattended on `phase2/values-on-screen`, one PR for the whole phase ([#16]
 
 ## Phase 3 (2026-11-14): writes
 
-Built unattended on `claude/insight-phase3-e6291e`, one PR for the phase ([#18](https://github.com/magna-nz/redis-lens/pull/18)). Not merged: the owner merges, after #17, which this branch contains (merged in before Part 5 because both edit the command-line files).
+Built unattended on `claude/insight-phase3-e6291e`, one PR for the phase ([#18](https://github.com/magna-nz/redis-lens/pull/18)). Not merged: the owner merges. #17 (command-line gate fixes) was merged into this branch before Part 5, since both edit the command-line files, and is now on main too.
 
 | Part | Content | Commits | State |
 |---|---|---|---|
