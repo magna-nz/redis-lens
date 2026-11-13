@@ -5,7 +5,8 @@
 //! Contract: the types and signatures below are fixed. No request sends a write
 //! command. Only [`values`] (key values and stream entries, in pages), [`search`]
 //! (query results) and the Pub/Sub tail ([`pubsub`]) read values, held as
-//! [`crate::value::Raw`] (spec "Values").
+//! [`crate::value::Raw`] (spec "Values"); the command line ([`cmdline`]) holds its
+//! replies as [`cmdline::Output`], redacted the same way.
 //!
 //! [`spawn`] starts one task per connected session. Requests arrive on a queue and each
 //! runs in a task of its own on a clone of the connection, so a slow lookup never holds
@@ -27,8 +28,10 @@ use tokio::task::JoinSet;
 
 use crate::budget::Budget;
 
+pub mod cmdline;
 pub mod command;
 pub mod keys;
+pub mod monitor;
 pub mod pubsub;
 pub mod search;
 pub mod server;
@@ -52,6 +55,8 @@ pub enum LiveRequest {
     Search(search::Request),
     /// A page of a key's value, for the key detail screen.
     Value(values::Request),
+    /// The command line panel: a command's flags and docs, and the typed command.
+    Command(cmdline::Request),
 }
 
 /// The answer to a [`LiveRequest`], from the same group.
@@ -63,6 +68,7 @@ pub enum LiveReply {
     PubSub(pubsub::Reply),
     Search(search::Reply),
     Value(values::Reply),
+    Command(cmdline::Reply),
 }
 
 /// Why a request failed. The text is always redis-lens's own fixed wording, never the
@@ -97,6 +103,7 @@ pub async fn run(
         LiveRequest::PubSub(r) => pubsub::run(conn, budget, r).await.map(LiveReply::PubSub),
         LiveRequest::Search(r) => search::run(conn, budget, r).await.map(LiveReply::Search),
         LiveRequest::Value(r) => values::run(conn, budget, r).await.map(LiveReply::Value),
+        LiveRequest::Command(r) => cmdline::run(conn, budget, r).await.map(LiveReply::Command),
     }
 }
 

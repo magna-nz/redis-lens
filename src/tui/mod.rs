@@ -16,7 +16,8 @@
 //!
 //! The Pub/Sub live tail ([`Effect::Subscribe`]) runs on a connection of its own, kept
 //! in the current [`LiveSession`] next to the live task, so a new connect, a rescan or
-//! quitting drops it with the session; it takes from the session's budget too.
+//! quitting drops it with the session; it takes from the session's budget too. A Monitor
+//! run ([`Effect::Monitor`]) is kept the same way.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Write, stdout};
@@ -193,6 +194,9 @@ struct LiveSession {
     /// The Pub/Sub live tail, if one runs: dropping it aborts the task and drops its
     /// connection.
     tail: Option<TailTask>,
+    /// The Monitor run, if one runs: dropping it aborts the task and drops its
+    /// connection, which ends `MONITOR`.
+    monitor: Option<TailTask>,
 }
 
 impl LiveSession {
@@ -203,6 +207,7 @@ impl LiveSession {
             handle: None,
             budget: None,
             tail: None,
+            monitor: None,
         }
     }
 }
@@ -408,6 +413,46 @@ impl Runner {
         });
     }
 
+    /// Starts Monitor run `run` of session `(id, scan)`, replacing (and so dropping) the
+    /// session's other run. When the session is not current or has no budget, answers
+    /// [`Msg::MonitorClosed`] at once.
+    fn monitor(&self, id: ConnId, scan: ScanId, run: u64, profile: Profile, secrets: SecretSource) {
+        let mut guard = lock(&self.live);
+        let found = guard
+            .as_mut()
+            .filter(|s| s.id == id && s.scan == scan)
+            .and_then(|s| s.budget.clone().map(|b| (s, b)));
+        let Some((s, budget)) = found else {
+            drop(guard);
+            send(
+                &self.tx,
+                Msg::MonitorClosed {
+                    id,
+                    scan,
+                    run,
+                    end: Err(LiveError::Closed.to_string()),
+                },
+            );
+            return;
+        };
+        s.monitor = None;
+        let tx = self.tx.clone();
+        s.monitor = Some(TailTask {
+            tail: run,
+            _task: AbortOnDrop(tokio::spawn(run_monitor(
+                TailRun {
+                    id,
+                    scan,
+                    tail: run,
+                },
+                profile,
+                secrets,
+                budget,
+                tx,
+            ))),
+        });
+    }
+
     /// Returns true when the app should quit. `out` is the terminal's output, for
     /// effects that write to the terminal itself.
     fn run(&mut self, effect: Effect, out: &mut impl Write) -> bool {
@@ -426,6 +471,21 @@ impl Runner {
                 secrets,
                 to,
             } => self.subscribe(id, scan, tail, profile, secrets, to),
+            Effect::Monitor {
+                id,
+                scan,
+                run,
+                profile,
+                secrets,
+            } => self.monitor(id, scan, run, profile, secrets),
+            Effect::StopMonitor { id, run } => {
+                if let Some(s) = lock(&self.live).as_mut()
+                    && s.id == id
+                    && s.monitor.as_ref().is_some_and(|t| t.tail == run)
+                {
+                    s.monitor = None;
+                }
+            }
             Effect::Unsubscribe { id, tail } => {
                 if let Some(s) = lock(&self.live).as_mut()
                     && s.id == id
@@ -831,6 +891,66 @@ async fn run_tail(
     drop(conn);
     if sent {
         closed(live::CONNECTION_LOST.to_string());
+    }
+}
+
+/// One Monitor run, from connecting to its end: `conn::open_monitor` (one `MONITOR` from
+/// the budget for its check, one for the run), then the lines in batches
+/// (`live::monitor::forward`) until a limit or the connection's end. Every message about
+/// it is [`Msg::MonitorReady`], [`Msg::MonitorLines`] or [`Msg::MonitorClosed`]. A
+/// refusal is said in fixed words (`live::error_for`): never the server's text, which can
+/// name the user. Aborting the task drops the connection and sends nothing more.
+async fn run_monitor(
+    run: TailRun,
+    profile: Profile,
+    secrets: SecretSource,
+    budget: Arc<Budget>,
+    tx: Tx,
+) {
+    let TailRun {
+        id,
+        scan,
+        tail: run,
+    } = run;
+    let closed = |end: Result<live::monitor::End, String>| {
+        send(&tx, Msg::MonitorClosed { id, scan, run, end });
+    };
+    let (store, secret) = store_for(&profile, secrets);
+    let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
+    let opened = conn::open_monitor(&profile, store.as_ref(), &budget).await;
+    drop(store);
+    let mut mon = match opened {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => return closed(Err(live::error_for("MONITOR", &e).to_string())),
+        Err(e) => return closed(Err(clean(e.to_string()))),
+    };
+    if !send(
+        &tx,
+        Msg::MonitorReady {
+            id,
+            scan,
+            run,
+            at_unix_ms: unix_ms_now(),
+        },
+    ) {
+        return;
+    }
+    let end = live::monitor::forward(&mut mon.lines, live::monitor::Limits::default(), |lines| {
+        send(
+            &tx,
+            Msg::MonitorLines {
+                id,
+                scan,
+                run,
+                lines,
+            },
+        )
+    })
+    .await;
+    // Closed before saying so, so the server stops feeding it at once.
+    drop(mon);
+    if end != live::monitor::End::Gone {
+        closed(Ok(end));
     }
 }
 

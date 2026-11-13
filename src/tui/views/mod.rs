@@ -8,7 +8,7 @@
 //! | [`keys::KeysState`] | `ui/keys.rs` | Patterns › key list ([`Screen::KeyList`]) |
 //! | [`value::ValueState`] | `ui/value.rs` | Patterns › key detail ([`Screen::KeyDetail`]) |
 //! | [`analysis::AnalysisState`] | `ui/analysis.rs` | Analysis › Big keys, Expiry |
-//! | [`server::ServerState`] | `ui/server.rs` | Server › Overview, Clients, Slow log |
+//! | [`server::ServerState`] | `ui/server.rs` | Server › Overview, Clients, Slow log, Monitor |
 //! | [`streams::StreamsState`] | `ui/streams.rs` | Streams |
 //! | [`pubsub::PubSubState`] | `ui/pubsub.rs` | Pub/Sub |
 //! | [`search::SearchState`] | `ui/search.rs` | Search |
@@ -96,6 +96,7 @@ use crate::tui::clipboard::CopyText;
 use super::{Effect, Notice, Screen, Session, copy_checked};
 
 pub mod analysis;
+pub mod cmdline;
 pub mod keys;
 pub mod pubsub;
 pub mod search;
@@ -140,6 +141,7 @@ pub fn reads_one_server(screen: Screen) -> bool {
             | Screen::Overview
             | Screen::Clients
             | Screen::SlowLog
+            | Screen::Monitor
             | Screen::Streams
             | Screen::PubSub
             | Screen::Search
@@ -156,6 +158,8 @@ pub enum Owner {
     Streams,
     PubSub,
     Search,
+    /// The command line panel, which is not a screen (`cmdline.rs`).
+    Cmdline,
 }
 
 /// The session's live connection (spec "Browsing, server views and writes").
@@ -224,6 +228,7 @@ pub struct Views {
     pub streams: streams::StreamsState,
     pub pubsub: pubsub::PubSubState,
     pub search: search::SearchState,
+    pub cmdline: cmdline::CmdlineState,
 }
 
 impl Views {
@@ -236,6 +241,7 @@ impl Views {
             Owner::Streams => &self.streams,
             Owner::PubSub => &self.pubsub,
             Owner::Search => &self.search,
+            Owner::Cmdline => &self.cmdline,
         }
     }
 
@@ -248,6 +254,7 @@ impl Views {
             Owner::Streams => &mut self.streams,
             Owner::PubSub => &mut self.pubsub,
             Owner::Search => &mut self.search,
+            Owner::Cmdline => &mut self.cmdline,
         }
     }
 }
@@ -348,13 +355,18 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// What a view asked of the Pub/Sub live tail, for `App` to turn into an effect.
+/// What a view asked of the Pub/Sub live tail or of a Monitor run, both on connections
+/// of their own, for `App` to turn into an effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TailCmd {
     /// Start tail `tail` on `to`, replacing any other.
     Subscribe { tail: u64, to: Subscription },
     /// End tail `tail`.
     Stop { tail: u64 },
+    /// Start Monitor run `run`, replacing any other.
+    Monitor { run: u64 },
+    /// End Monitor run `run`.
+    StopMonitor { run: u64 },
 }
 
 /// What a handler can do, besides reading the [`Ctx`] it derefs to.
@@ -420,6 +432,26 @@ impl<'a> Act<'a> {
     /// Ends tail `tail` and drops its connection.
     pub fn stop_tail(&mut self, tail: u64) {
         self.tail = Some(TailCmd::Stop { tail });
+    }
+
+    /// Starts a Monitor run (spec "Monitor (P2)") on a connection of its own, replacing
+    /// the session's other run. Only the Server view's Monitor panel calls it, and only
+    /// after asking. Returns the run's id, which its `Msg::Monitor*` messages carry.
+    /// `None`, and nothing started, while the live connection is not
+    /// [`LiveState::Ready`] (`MONITOR` takes from its command budget).
+    pub fn monitor(&mut self) -> Option<u64> {
+        if !self.ctx.live_ready() {
+            return None;
+        }
+        let run = *self.next_tail;
+        *self.next_tail += 1;
+        self.tail = Some(TailCmd::Monitor { run });
+        Some(run)
+    }
+
+    /// Ends Monitor run `run` and drops its connection.
+    pub fn stop_monitor(&mut self, run: u64) {
+        self.tail = Some(TailCmd::StopMonitor { run });
     }
 
     /// Sends `req` on the session's live connection. The answer comes back to this

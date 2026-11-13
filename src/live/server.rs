@@ -7,8 +7,11 @@
 //! - [`Request::SlowLog`]: `SLOWLOG GET 128`, then `CONFIG GET slowlog-*` where it is
 //!   allowed, then `COMMAND INFO` for the command names not seen before. The key names of
 //!   an entry come from the command's key specs ([`CommandKeys`]) applied to the logged
-//!   arguments. The arguments themselves are dropped inside [`run`]: nothing that leaves
-//!   this module holds one (they are P2, on screen only).
+//!   arguments. The arguments themselves (P2, on screen only) leave this module only as
+//!   one line with the credentials masked ([`crate::live::command::masked_line`]), held
+//!   in a [`Raw`] whose `Debug` shows its length ([`SlowEntry::args`]).
+//! - [`Request::CommandKeys`]: `COMMAND INFO` for the given names alone, for the Hot keys
+//!   ranking from a Monitor run (spec "4 Hot keys"), which shares the slow log's cache.
 //!
 //! Why `COMMAND INFO` and not `COMMAND GETKEYS`: it costs one command per new command name
 //! (the view keeps the answers, so a steady log costs none), it is in the minimal ACL
@@ -24,6 +27,7 @@ use redis::Value;
 
 use super::{Conn, LiveError, query};
 use crate::budget::Budget;
+use crate::value::Raw;
 
 /// How many slow log entries one poll asks for.
 pub const SLOWLOG_ENTRIES: u32 = 128;
@@ -52,6 +56,9 @@ pub enum Request {
         /// Also look up key names. False once `COMMAND INFO` was refused.
         keys: bool,
     },
+    /// `COMMAND INFO` for these lowercase names (`get`, `xinfo|stream`), at most
+    /// [`MAX_NAMES_PER_INFO`] of them.
+    CommandKeys { names: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +73,8 @@ pub enum Reply {
     /// The connections `CLIENT LIST` showed, without their users.
     Clients(Vec<ClientConn>),
     SlowLog(Box<SlowLogReply>),
+    /// What `COMMAND INFO` said about each name asked for.
+    CommandKeys(HashMap<String, CommandKeys>),
 }
 
 /// Runs one request. Every command goes through `budget`.
@@ -96,6 +105,16 @@ pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply
         } => slowlog(conn, budget, specs, config, keys)
             .await
             .map(|r| Reply::SlowLog(Box::new(r))),
+        Request::CommandKeys { mut names } => {
+            names.retain(|n| is_command_name(n));
+            names.truncate(MAX_NAMES_PER_INFO);
+            if names.is_empty() {
+                return Ok(Reply::CommandKeys(HashMap::new()));
+            }
+            command_info(conn, budget, &names)
+                .await
+                .map(|found| Reply::CommandKeys(found.into_iter().collect()))
+        }
     }
 }
 
@@ -509,7 +528,8 @@ fn legacy(a: &[Value]) -> Option<KeySpec> {
 // SLOWLOG
 // ---------------------------------------------------------------------------
 
-/// One slow log entry, as the screen shows it: no arguments, only key names.
+/// One slow log entry, as the screen shows it: key names, and the arguments only as a
+/// masked line that `Debug` does not print.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlowEntry {
     pub id: u64,
@@ -526,6 +546,13 @@ pub struct SlowEntry {
     pub client_name: String,
     /// A read of a whole key: `HGETALL`, `LRANGE key 0 -1`, `GET`, and so on.
     pub whole_key_read: bool,
+    /// The command and its arguments as one line, credentials masked
+    /// ([`crate::live::command::masked_line`]): safe to draw, on screen only. Its
+    /// `Debug` shows the length alone, and it is never saved.
+    pub args: Raw,
+    /// How many arguments the server left out (its last argument said
+    /// `... (N more arguments)`); 0 when it kept them all.
+    pub args_cut: u64,
 }
 
 /// The server's `slowlog-log-slower-than` and `slowlog-max-len`.
@@ -608,14 +635,25 @@ fn parse_slowlog(v: &Value) -> Vec<RawSlow> {
 }
 
 /// The slow log cuts a long command to 32 arguments, the last being
-/// `... (N more arguments)`. That one is not a key.
-fn drop_cut_marker(args: &mut Vec<Vec<u8>>) {
-    if args.len() >= 32
-        && args
-            .last()
-            .is_some_and(|a| a.starts_with(b"... (") && a.ends_with(b" more arguments)"))
+/// `... (N more arguments)`. That one is not a key: it is taken off, and N returned
+/// (0 when there was none).
+fn drop_cut_marker(args: &mut Vec<Vec<u8>>) -> u64 {
+    let marker = |a: &[u8]| {
+        let n = a
+            .strip_prefix(b"... (")?
+            .strip_suffix(b" more arguments)")?;
+        std::str::from_utf8(n).ok()?.parse::<u64>().ok()
+    };
+    match args
+        .last()
+        .filter(|_| args.len() >= 32)
+        .and_then(|a| marker(a))
     {
-        args.pop();
+        Some(n) => {
+            args.pop();
+            n
+        }
+        None => 0,
     }
 }
 
@@ -652,7 +690,7 @@ fn is_whole_key_read(args: &[Vec<u8>]) -> bool {
 
 fn entry_from(raw: RawSlow, known: &HashMap<String, CommandKeys>) -> SlowEntry {
     let mut args = raw.args;
-    drop_cut_marker(&mut args);
+    let args_cut = drop_cut_marker(&mut args);
     let container = args
         .first()
         .is_some_and(|a| known.get(&lower(a)) == Some(&CommandKeys::Container));
@@ -683,8 +721,50 @@ fn entry_from(raw: RawSlow, known: &HashMap<String, CommandKeys>) -> SlowEntry {
         client: raw.addr,
         client_name: raw.name,
         whole_key_read: is_whole_key_read(&args),
+        args: Raw::new(super::command::masked_line(&args).into_bytes()),
+        args_cut,
     }
-    // `args` is dropped here, with the values in it.
+    // `args` is dropped here: only the masked line is kept.
+}
+
+/// A name that may be sent to `COMMAND INFO`: printable ASCII, no spaces.
+fn is_command_name(n: &str) -> bool {
+    !n.is_empty() && n.len() <= 64 && n.chars().all(|c| c.is_ascii_graphic())
+}
+
+/// The positions of the key names in `args` (0 is the command name), from what `known`
+/// says about the command. `None` when that is not known: the command (or a container's
+/// subcommand) was not looked up, or the server does not know it.
+pub fn keys_in(known: &HashMap<String, CommandKeys>, args: &[Vec<u8>]) -> Option<Vec<usize>> {
+    match known.get(&spec_name(known, args)?)? {
+        CommandKeys::Specs(specs) => Some(key_positions(specs, args)),
+        CommandKeys::Container | CommandKeys::Unknown => None,
+    }
+}
+
+/// The names `COMMAND INFO` should be asked about so [`keys_in`] can place the keys of
+/// every command in `commands`: their lowercase names not in `known`, and, for the
+/// containers `known` has, `name|sub`. At most [`MAX_NAMES_PER_INFO`]; ask again with
+/// what came back for the rest.
+pub fn names_to_learn<'a>(
+    known: &HashMap<String, CommandKeys>,
+    commands: impl IntoIterator<Item = &'a [Vec<u8>]>,
+) -> Vec<String> {
+    let mut wanted: Vec<String> = Vec::new();
+    for args in commands {
+        let Some(name) = spec_name(known, args) else {
+            continue;
+        };
+        // A container whose subcommand is missing has nothing more to learn.
+        if !known.contains_key(&name)
+            && !wanted.contains(&name)
+            && wanted.len() < MAX_NAMES_PER_INFO
+            && is_command_name(&name)
+        {
+            wanted.push(name);
+        }
+    }
+    wanted
 }
 
 async fn slowlog(
@@ -725,7 +805,7 @@ async fn slowlog(
                 if !known.contains_key(&name)
                     && !wanted.contains(&name)
                     && wanted.len() < MAX_NAMES_PER_INFO
-                    && name.chars().all(|c| c.is_ascii_graphic())
+                    && is_command_name(&name)
                 {
                     wanted.push(name);
                 }
@@ -1282,6 +1362,71 @@ id=4 addr=127.0.0.1:50390 laddr=127.0.0.1:6379 fd=9 name= age=2 idle=0 flags=N d
         assert_eq!(e.keys[0], "k1");
         assert_eq!(e.more_keys, 31 - MAX_KEYS_PER_ENTRY);
         assert!(!e.keys.iter().any(|k| k.contains("more arguments")));
+        // The marker is not an argument either: it becomes the count.
+        assert_eq!(e.args_cut, 40);
+        let line = String::from_utf8(e.args.as_bytes().to_vec()).unwrap();
+        assert!(
+            line.starts_with("DEL k1 k2 ") && line.ends_with(" k31"),
+            "{line}"
+        );
+        assert!(!line.contains("more arguments"), "{line}");
+    }
+
+    #[test]
+    fn slow_log_arguments_are_kept_masked_and_never_in_debug() {
+        const MARK: &str = "hunter2-slow-secret";
+        let reply = arr(vec![
+            raw_entry(4, &["CONFIG", "SET", "requirepass", MARK]),
+            raw_entry(3, &["AUTH", "lens", MARK]),
+            raw_entry(2, &["ACL", "SETUSER", "bob", "on", &format!(">{MARK}")]),
+            raw_entry(1, &["SET", "k", MARK]),
+        ]);
+        let known = HashMap::new();
+        let entries: Vec<SlowEntry> = parse_slowlog(&reply)
+            .into_iter()
+            .map(|r| entry_from(r, &known))
+            .collect();
+        let line = |i: usize| String::from_utf8(entries[i].args.as_bytes().to_vec()).unwrap();
+        assert_eq!(line(0), "CONFIG SET requirepass ***");
+        assert_eq!(line(1), "AUTH *** ***");
+        assert_eq!(line(2), "ACL SETUSER bob on >***");
+        // A value that is no credential is shown: on screen only.
+        assert_eq!(line(3), format!("SET k {MARK}"));
+        assert_eq!(entries[3].args_cut, 0);
+        let shown = format!("{entries:?}");
+        assert!(!crate::value::leaks(&shown, MARK), "{shown}");
+        // A line from the server that is not safe to draw is escaped by the masker.
+        let raws = parse_slowlog(&arr(vec![raw_entry(1, &["SET", "k", "a\u{1b}[2Jb"])]));
+        let e = entry_from(raws.into_iter().next().unwrap(), &known);
+        let l = String::from_utf8(e.args.as_bytes().to_vec()).unwrap();
+        assert!(!l.chars().any(char::is_control), "{l:?}");
+    }
+
+    #[test]
+    fn keys_in_and_names_to_learn_share_the_cache() {
+        let mut known = HashMap::new();
+        let a = args(&["GET", "user:1"]);
+        let x = args(&["XINFO", "STREAM", "orders"]);
+        let lists: Vec<&[Vec<u8>]> = vec![&a, &x, &a];
+        assert_eq!(names_to_learn(&known, lists.clone()), ["get", "xinfo"]);
+        assert_eq!(keys_in(&known, &a), None);
+        known.insert(
+            "get".to_string(),
+            parse_command_info(&command_info(1, 1, 1, vec![range_spec(1, 0, 1, 0)], vec![])),
+        );
+        known.insert("xinfo".to_string(), CommandKeys::Container);
+        assert_eq!(keys_in(&known, &a), Some(vec![1]));
+        assert_eq!(names_to_learn(&known, lists.clone()), ["xinfo|stream"]);
+        known.insert(
+            "xinfo|stream".to_string(),
+            parse_command_info(&command_info(2, 2, 1, vec![range_spec(2, 0, 1, 0)], vec![])),
+        );
+        assert!(names_to_learn(&known, lists).is_empty());
+        assert_eq!(keys_in(&known, &x), Some(vec![2]));
+        known.insert("gone".to_string(), CommandKeys::Unknown);
+        assert_eq!(keys_in(&known, &args(&["GONE", "k"])), None);
+        // Odd names are never asked about.
+        assert!(names_to_learn(&HashMap::new(), [&args(&["a b"])[..]]).is_empty());
     }
 
     #[test]

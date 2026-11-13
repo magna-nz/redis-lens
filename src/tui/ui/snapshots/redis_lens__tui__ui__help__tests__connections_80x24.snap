@@ -1,5 +1,6 @@
 ---
 source: src/tui/ui/help.rs
+assertion_line: 75
 expression: "render(Screen::Connections, 80, 24).backend()"
 ---
 "                                                                                "
@@ -11,6 +12,7 @@ expression: "render(Screen::Connections, 80, 24).backend()"
 "       │0-6            Switch view, 0 Connections to 6 Search           │       "
 "       │?              Show or hide this key list                       │       "
 "       │a              Add a connection                                 │       "
+"       │:              Open the command line for readonly commands      │       "
 "       │q ctrl-c       Quit                                             │       "
 "       │Connections                                                     │       "
 "       │↑↓ j k         Move the selection                               │       "
@@ -21,7 +23,6 @@ expression: "render(Screen::Connections, 80, 24).backend()"
 "       │                                                                │       "
 "       │? or esc closes                                                 │       "
 "       └────────────────────────────────────────────────────────────────┘       "
-"                                                                                "
 "                                                                                "
 "                                                                                "
 "                                                                                "

@@ -1,11 +1,12 @@
 ---
 source: src/tui/views/server.rs
+assertion_line: 2272
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
 " Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
 "  0   1   2   3 Server   4   5   6                                              "
-"    Overview  ·  Clients  ·  Slow log                            tab next panel "
+"    Overview  ·  Clients  ·  Slow log  ·  Monitor                tab next panel "
 "┌─ Overview ────────────────────────────────────────────── paused · r fetches ─┐"
 "│ ▲ The last poll failed: INFO failed. Showing the last data.                  │"
 "│ ops/s     180/s              ·▃█▁                                            │"

@@ -52,7 +52,57 @@ const HELP: KeyHelp = k("?", "?", "Help", "Show or hide this key list", true);
 const ADD: KeyHelp = k("a", "a", "Add", "Add a connection", true);
 const QUIT: KeyHelp = k("q ctrl-c", "q", "Quit", "Quit", true);
 
-static GLOBAL: [KeyHelp; 4] = [VIEW_KEYS, HELP, ADD, QUIT];
+const COMMAND_LINE_KEY: KeyHelp = k(
+    ":",
+    ":",
+    "Command",
+    "Open the command line for readonly commands",
+    false,
+);
+
+static GLOBAL: [KeyHelp; 5] = [VIEW_KEYS, HELP, ADD, COMMAND_LINE_KEY, QUIT];
+
+/// The keys of the command line panel while it is open (`:`). Its input line replaces
+/// the footer, so none of them is in a footer.
+static COMMAND_LINE: [KeyHelp; 7] = [
+    k(
+        "enter",
+        "enter",
+        "Run",
+        "Run the command (readonly commands only)",
+        false,
+    ),
+    k(
+        "↑↓",
+        "↑↓",
+        "History",
+        "Step through this session's commands",
+        false,
+    ),
+    k(
+        "tab",
+        "tab",
+        "Complete",
+        "Complete a command, subcommand or loaded key name",
+        false,
+    ),
+    k("PgUp PgDn", "PgUp", "Scroll", "Scroll the output", false),
+    k("ctrl-l", "ctrl-l", "Clear", "Clear the output", false),
+    k(
+        "ctrl-u",
+        "ctrl-u",
+        "Clear line",
+        "Clear the input line",
+        false,
+    ),
+    k(
+        "esc",
+        "esc",
+        "Close",
+        "Close the command line, or cancel a question",
+        false,
+    ),
+];
 
 const MOVE: KeyHelp = k("↑↓ j k", "↑↓", "Move", "Move the selection", true);
 const PAGE: KeyHelp = k("PgUp PgDn", "PgUp", "Page", "Move one page", false);
@@ -265,6 +315,21 @@ static CLIENTS: [KeyHelp; 8] = [
 
 static SLOW_LOG: [KeyHelp; 6] = [MOVE, PAGE, ENDS, PANEL, PAUSE, REFRESH];
 
+static MONITOR: [KeyHelp; 6] = [
+    k("↑↓ j k", "↑↓", "Scroll", "Scroll the lines", true),
+    PAGE,
+    ENDS,
+    PANEL,
+    k(
+        "enter",
+        "enter",
+        "Start",
+        "Start MONITOR after asking; it stops after 30 s or 10,000 lines",
+        true,
+    ),
+    k("esc", "esc", "Stop", "Stop MONITOR now", true),
+];
+
 /// `f` on the screens that show a value: the key detail, stream entries, a Search result.
 const FORMAT: KeyHelp = k(
     "f",
@@ -400,6 +465,11 @@ pub fn global() -> &'static [KeyHelp] {
     &GLOBAL
 }
 
+/// Keys of the command line panel while it is open.
+pub fn command_line() -> &'static [KeyHelp] {
+    &COMMAND_LINE
+}
+
 /// Keys of one screen, not counting [`global`].
 pub fn for_screen(screen: Screen) -> &'static [KeyHelp] {
     match screen {
@@ -414,6 +484,7 @@ pub fn for_screen(screen: Screen) -> &'static [KeyHelp] {
         Screen::Overview => &OVERVIEW,
         Screen::Clients => &CLIENTS,
         Screen::SlowLog => &SLOW_LOG,
+        Screen::Monitor => &MONITOR,
         Screen::Streams => &STREAMS,
         Screen::PubSub => &PUBSUB,
         Screen::Search => &SEARCH,
@@ -452,6 +523,7 @@ pub fn footer(screen: Screen, ready: bool) -> Vec<(&'static str, &'static str)> 
         Screen::Overview if ready => &[TAB, "p", "+ -", "r", "0-6", "?", "q ctrl-c"],
         Screen::Clients if ready => &[TAB, MOVE, "enter", "r", "0-6", "?", "q ctrl-c"],
         Screen::SlowLog if ready => &[TAB, MOVE, "p", "r", "0-6", "?", "q ctrl-c"],
+        Screen::Monitor if ready => &[TAB, "enter", "esc", MOVE, "0-6", "?", "q ctrl-c"],
         Screen::Streams if ready => &[MOVE, TAB, "enter", "p", "0-6", "?", "q ctrl-c"],
         Screen::PubSub if ready => &[MOVE, "enter", "space", "/", "0-6", "?", "q ctrl-c"],
         Screen::Search if ready => &[MOVE, TAB, "/", "enter", "0-6", "?", "q ctrl-c"],
@@ -492,6 +564,8 @@ pub fn markdown() -> String {
         out.push_str(&format!("\n#### {}\n\n", s.title()));
         table(&mut out, for_screen(s));
     }
+    out.push_str("\n#### Command line panel · keys\n\n");
+    table(&mut out, command_line());
     out
 }
 
@@ -631,6 +705,14 @@ mod tests {
             ]
         );
         assert_eq!(
+            names(Screen::Monitor, true),
+            ["Panel", "Start", "Stop", "Scroll", "View", "Help", "Quit"]
+        );
+        assert_eq!(
+            names(Screen::Monitor, false),
+            ["Panel", "View", "Add", "Help", "Quit"]
+        );
+        assert_eq!(
             names(Screen::Nodes, true),
             [
                 "Move", "Panel", "Patterns", "Rescan", "View", "Help", "Quit"
@@ -668,5 +750,17 @@ mod tests {
             assert!(md.contains(&format!("#### {}\n", v.title())));
         }
         assert!(md.contains("| `?` |"));
+    }
+
+    #[test]
+    fn command_line_keys_are_listed_once() {
+        let mut seen = std::collections::HashSet::new();
+        for h in command_line() {
+            for t in h.keys.split_whitespace() {
+                assert!(seen.insert(t), "{t:?} is bound twice on the command line");
+            }
+        }
+        assert!(markdown().contains("#### Command line panel · keys\n"));
+        assert!(global().iter().any(|h| h.keys == ":"));
     }
 }

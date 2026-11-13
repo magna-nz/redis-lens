@@ -1,8 +1,8 @@
 ---
 source: src/tui/ui/help.rs
+assertion_line: 85
 expression: "render(Screen::Ttl, 80, 24).backend()"
 ---
-"                                                                                "
 "                                                                                "
 "                                                                                "
 "       ┌─ Keys · Analysis · TTL ────────────────────────────────────────┐       "
@@ -10,6 +10,7 @@ expression: "render(Screen::Ttl, 80, 24).backend()"
 "       │0-6            Switch view, 0 Connections to 6 Search           │       "
 "       │?              Show or hide this key list                       │       "
 "       │a              Add a connection                                 │       "
+"       │:              Open the command line for readonly commands      │       "
 "       │q ctrl-c       Quit                                             │       "
 "       │Analysis · TTL                                                  │       "
 "       │↑↓ j k         Move the selection                               │       "

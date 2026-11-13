@@ -1,8 +1,8 @@
 ---
 source: src/tui/ui/help.rs
+assertion_line: 105
 expression: "render(Screen::Overview, 80, 24).backend()"
 ---
-"                                                                                "
 "                                                                                "
 "                                                                                "
 "                                                                                "
@@ -12,6 +12,7 @@ expression: "render(Screen::Overview, 80, 24).backend()"
 "       │0-6            Switch view, 0 Connections to 6 Search           │       "
 "       │?              Show or hide this key list                       │       "
 "       │a              Add a connection                                 │       "
+"       │:              Open the command line for readonly commands      │       "
 "       │q ctrl-c       Quit                                             │       "
 "       │Server · Overview                                               │       "
 "       │tab shift-tab  Next or previous panel                           │       "

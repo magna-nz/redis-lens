@@ -1,4 +1,5 @@
-//! View 4: the keys with the highest LFU counters (`OBJECT FREQ`).
+//! View 4: the keys with the highest LFU counters (`OBJECT FREQ`). Without any, the keys
+//! named most often by the last Monitor run of the session ([`monitor_ranking`]).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -8,6 +9,8 @@ use crate::format;
 use crate::model::{KeySample, NodeReport, ScanReport, Ttl};
 use crate::pattern::pattern_for_key;
 use crate::tui::app::App;
+use crate::tui::app::views::server::MonitorHot;
+use crate::value::escape;
 
 use super::widgets::{
     bar, fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset, trunc,
@@ -60,6 +63,10 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let Some((_, report)) = report_or_wait(frame, area, app, "Hot keys") else {
         return;
     };
+    if let Some(hot) = app.monitor_hot_keys() {
+        monitor_ranking(frame, area, app, hot);
+        return;
+    }
     if let Some(reason) = app.hot_keys_reason() {
         let mut lines = vec![Line::from(Span::styled(
             " No hot keys to show.",
@@ -70,6 +77,15 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                 .split_inclusive(". ")
                 .map(|s| Line::from(Span::styled(format!(" {}", s.trim_end()), style::dim()))),
         );
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            if app.views.server.monitor.ranking_pending() {
+                " Ranking the keys of the last MONITOR run…"
+            } else {
+                " Or rank keys by how often MONITOR sees them: Server (3) › Monitor."
+            },
+            style::dim(),
+        )));
         let right = mark_previous(app, &policy(report));
         notice_panels(frame, area, "Hot keys", &right, lines);
         return;
@@ -219,6 +235,149 @@ fn detail_panel(frame: &mut Frame, area: Rect, k: &KeySample, node: Option<Strin
         )));
     }
     rows(frame, inner, lines, None);
+}
+
+const COUNT_W: usize = 8;
+const SHARE_W: usize = 7;
+
+/// `once`, `twice`, `3 times`.
+fn times(n: u64) -> String {
+    match n {
+        1 => "once".to_string(),
+        2 => "twice".to_string(),
+        n => format!("{} times", format::grouped(n)),
+    }
+}
+
+/// `from MONITOR, 30 s, 8,412 lines, at 13:04 UTC`.
+fn monitor_source(hot: &MonitorHot) -> String {
+    let s = hot.at_unix.rem_euclid(86_400);
+    format!(
+        "from MONITOR, {} s, {} lines, at {:02}:{:02} UTC",
+        hot.secs,
+        format::grouped(hot.ranking.lines),
+        s / 3600,
+        (s % 3600) / 60
+    )
+}
+
+/// Hot keys ranked from the last Monitor run (spec "4 Hot keys"): key, pattern, how
+/// often the run's lines name it. Never saved: it lives in the Server view's state.
+fn monitor_ranking(frame: &mut Frame, area: Rect, app: &App, hot: &MonitorHot) {
+    let (main, detail) = split_body(area);
+    let keys = &hot.ranking.keys;
+    let sel = app.sel.hot.min(keys.len().saturating_sub(1));
+    let right = mark_previous(app, &monitor_source(hot));
+    let inner = panel(frame, main, "Hot keys", &right);
+    let w = usize::from(inner.width);
+    let kw = w.saturating_sub(PATTERN_W + COUNT_W + SHARE_W + 2).max(12);
+    let head = Line::from(fit(
+        vec![Span::styled(
+            format!(
+                "{}{}{}{}",
+                pad_r(" KEY", kw),
+                pad_r("PATTERN", PATTERN_W),
+                pad_l("COUNT", COUNT_W),
+                pad_l("LINES", SHARE_W),
+            ),
+            style::hd(),
+        )],
+        w,
+    ));
+    rows(frame, inner, vec![head], None);
+    let body = Rect {
+        y: inner.y + 1,
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let total = hot.ranking.lines.max(1);
+    let off = scroll_offset(sel, usize::from(body.height));
+    let mut lines: Vec<Line<'static>> = keys
+        .iter()
+        .skip(off)
+        .take(usize::from(body.height))
+        .enumerate()
+        .map(|(i, (k, n))| {
+            let key = vec![Span::styled(format!(" {}", escape(k)), style::fg())];
+            let mut spans = if off + i == sel {
+                marquee_spans(key, kw.saturating_sub(1), app.sel_ticks())
+            } else {
+                fit(key, kw.saturating_sub(1))
+            };
+            spans.push(Span::raw(" "));
+            spans.extend(fit(
+                pattern_spans(&escape(&pattern_for_key(k)), style::dim(), style::ph()),
+                PATTERN_W - 1,
+            ));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                pad_l(&format::grouped(*n), COUNT_W),
+                style::fgb(),
+            ));
+            spans.push(Span::styled(
+                pad_l(&format::percent(*n as f64 / total as f64), SHARE_W),
+                style::dim(),
+            ));
+            Line::from(fit(spans, w))
+        })
+        .collect();
+    if keys.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " The last MONITOR run named no keys.",
+            style::dim(),
+        )));
+    }
+    rows(frame, body, lines, (!keys.is_empty()).then(|| sel - off));
+
+    let dinner = panel(frame, detail, "From MONITOR", "");
+    let dw = usize::from(dinner.width);
+    let note = |t: String| Line::from(fit(vec![Span::styled(t, style::dim())], dw));
+    let mut dl = Vec::new();
+    if let Some((k, n)) = keys.get(sel) {
+        dl.push(Line::from(fit(
+            vec![
+                Span::styled(format!(" {}", escape(k)), style::fgb()),
+                Span::styled(
+                    format!(
+                        " · named {} in {} lines",
+                        times(*n),
+                        format::grouped(hot.ranking.lines)
+                    ),
+                    style::dim(),
+                ),
+            ],
+            dw,
+        )));
+    }
+    dl.push(Line::default());
+    dl.push(note(
+        " Ranked by how often the last MONITOR run named each key, because the scan".into(),
+    ));
+    dl.push(note(
+        " has no LFU counters: a short sample, not the server's own counters.".into(),
+    ));
+    if hot.ranking.unknown > 0 {
+        let n = hot.ranking.unknown;
+        let (lines, verb) = if n == 1 {
+            ("line", "has")
+        } else {
+            ("lines", "have")
+        };
+        dl.push(Line::from(fit(
+            vec![Span::styled(
+                format!(
+                    " ▲ {} {lines} {verb} a command whose keys are unknown.",
+                    format::grouped(n)
+                ),
+                style::amber(),
+            )],
+            dw,
+        )));
+        if let Some(why) = &hot.keys_note {
+            dl.push(note(format!("   {why}")));
+        }
+    }
+    rows(frame, dinner, dl, None);
 }
 
 #[cfg(test)]
