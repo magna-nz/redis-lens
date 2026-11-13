@@ -9,6 +9,9 @@
 //!   also while another view is shown. The last [`TAIL_KEPT`] stay in memory, never
 //!   saved. `space` pauses what is shown, `c` clears, `/` filters, `esc` clears the
 //!   filter or stops the tail.
+//! - **Publish (P3):** `P` opens a form for a channel (the selected one to start with)
+//!   and a message, and sends `PUBLISH` through [`Act::write`], the one gate. The
+//!   message is a value: it is drawn in the form and nowhere else.
 //!
 //! See [`super`] for the interface `App` calls.
 
@@ -19,10 +22,14 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
 
+use super::streams::form::{self, Field, Form, Step, write_failed, write_off};
 use super::streams::{list_move, off_text, plain};
 use super::{Act, Input, ViewState};
 use crate::live::pubsub::{Counts, Reply, Request, Subscription, TAIL_KEPT, TailMessage};
+use crate::live::write::Reply as WriteReply;
 use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
+use crate::value::Raw;
+use crate::write::WriteOp;
 
 /// How often the counts are polled while the view is shown (spec "Shared command budget").
 pub const POLL: Duration = Duration::from_secs(5);
@@ -49,6 +56,22 @@ pub struct PubSubState {
     pending: Option<ReqId>,
     last_sent: Option<Instant>,
     editing: Option<Editing>,
+    /// The publish form (`P`), while it is open.
+    pub publish: Option<Form>,
+    /// The `PUBLISH` in flight.
+    write: Option<ReqId>,
+}
+
+/// The `PUBLISH` of the publish form.
+pub fn publish_op(form: &Form) -> Result<WriteOp, String> {
+    let channel = form.value("channel");
+    if channel.is_empty() {
+        return Err("Type the channel to publish to.".into());
+    }
+    Ok(WriteOp::Publish {
+        channel: channel.to_string(),
+        message: Raw::from(form.raw("message")),
+    })
 }
 
 /// The text input open on the view.
@@ -214,6 +237,59 @@ impl Tail {
 }
 
 impl PubSubState {
+    /// The `PUBLISH` the form sends as filled now, as the prompt shows it, or what is
+    /// wrong: for the form's "Sends:" line. On screen only: it holds the message.
+    pub fn form_sends(&self) -> Option<Result<String, String>> {
+        self.publish
+            .as_ref()
+            .map(|f| publish_op(f).map(|op| op.shown()))
+    }
+
+    /// `P`: opens the publish form, on the selected channel.
+    fn open_publish(&mut self, act: &mut Act<'_>) {
+        let channel = self
+            .counts
+            .channels
+            .get(self.sel)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let sample = WriteOp::Publish {
+            channel: "c".into(),
+            message: Raw::from(""),
+        };
+        if write_off(act, &sample) {
+            return;
+        }
+        let mut f = Form::new(
+            "Publish a message",
+            vec!["PUBLISH sends the message to the channel's subscribers now.".to_string()],
+            vec![
+                Field::text("channel", "the channel; the selected one to start with").with(channel),
+                Field::text("message", "the message, as typed; it is shown here only"),
+            ],
+        );
+        f.focus = 1;
+        self.publish = Some(f);
+    }
+
+    /// A key while the publish form is open.
+    fn publish_key(&mut self, key: KeyEvent, act: &mut Act<'_>) {
+        let Some(f) = self.publish.as_mut() else {
+            return;
+        };
+        match f.key(key) {
+            Step::Typed => {}
+            Step::Cancel => self.publish = None,
+            Step::Submit => match publish_op(f) {
+                Err(why) => act.error(why),
+                Ok(op) => {
+                    self.publish = None;
+                    self.write = act.write(op);
+                }
+            },
+        }
+    }
+
     fn fetch(&mut self, act: &mut Act<'_>) {
         self.last_sent = act.now;
         self.pending = act.send(LiveRequest::PubSub(Request::Counts));
@@ -400,6 +476,9 @@ impl ViewState for PubSubState {
     }
 
     fn input(&self) -> Option<Input> {
+        if let Some(f) = &self.publish {
+            return f.input();
+        }
         match self.editing.as_ref()? {
             Editing::Subscribe(text) => Some(Input {
                 label: "s",
@@ -415,6 +494,10 @@ impl ViewState for PubSubState {
     }
 
     fn on_paste(&mut self, text: &str, _act: &mut Act<'_>) {
+        if let Some(f) = self.publish.as_mut() {
+            f.paste(text);
+            return;
+        }
         match self.editing.as_mut() {
             Some(Editing::Subscribe(t)) => push_text(t, text),
             Some(Editing::Filter) => push_text(&mut self.tail.filter, text),
@@ -423,6 +506,10 @@ impl ViewState for PubSubState {
     }
 
     fn on_key(&mut self, key: KeyEvent, act: &mut Act<'_>) -> bool {
+        if self.publish.is_some() {
+            self.publish_key(key, act);
+            return true;
+        }
         if self.editing.is_some() {
             self.edit_key(key, act);
             return true;
@@ -431,6 +518,10 @@ impl ViewState for PubSubState {
             return false;
         }
         match key.code {
+            KeyCode::Char('P') => {
+                self.open_publish(act);
+                return true;
+            }
             KeyCode::Char('p') => {
                 self.paused = !self.paused;
                 if self.paused {
@@ -488,7 +579,19 @@ impl ViewState for PubSubState {
         true
     }
 
-    fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, _act: &mut Act<'_>) {
+    fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
+        if self.write == Some(id) {
+            self.write = None;
+            match result {
+                Ok(LiveReply::Write(WriteReply::Int(n))) => act.info(format!(
+                    "Published to {}.",
+                    form::count(n, "subscriber", "subscribers")
+                )),
+                Ok(_) => act.info("Published."),
+                Err(e) => write_failed(act, &e),
+            }
+            return;
+        }
         // Only the answer to the request in flight; an older one is stale.
         if self.pending != Some(id) {
             return;
@@ -1196,5 +1299,108 @@ mod tests {
         let row = TailRow::new(TailMessage::new(0, "c".into(), None, big));
         assert_eq!(row.msg.payload.len(), PAYLOAD_KEPT);
         assert!(row.preview().starts_with("aaaa"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Publish (P3)
+    // -----------------------------------------------------------------------
+
+    use super::super::streams::form::testing::{
+        READ_ONLY, answer_anything, press, set_profile, writes,
+    };
+    use crate::live::write::Reply as WriteReply;
+    use crate::model::Env;
+    use crate::tui::app::confirm::Expect;
+
+    fn notice(app: &App) -> String {
+        app.notice
+            .as_ref()
+            .map(|n| n.text.clone())
+            .unwrap_or_default()
+    }
+
+    const MESSAGE: &str = "made-up order 4711";
+
+    #[test]
+    fn p_publishes_to_the_selected_channel_at_once_outside_prod() {
+        let (mut app, _) = loaded();
+        set_profile(&mut app, Env::Local, None);
+        app.handle_key(ch('j'));
+        assert!(app.handle_key(ch('P')).is_empty());
+        let f = app.views.pubsub.publish.as_ref().expect("the form");
+        assert_eq!(f.value("channel"), "orders:us");
+        // The message has the focus, and every key is text: p does not pause.
+        type_text(&mut app, MESSAGE);
+        assert!(!app.views.pubsub.paused);
+        insta::assert_snapshot!(
+            "publish_form_80x24",
+            testing::render(&app, 80, 24).backend()
+        );
+        assert!(!format!("{:?}", app.views).contains(MESSAGE));
+        let e = press(&mut app, KeyCode::Enter);
+        assert!(app.confirm.is_none());
+        assert_eq!(
+            writes(&e),
+            vec![WriteOp::Publish {
+                channel: "orders:us".into(),
+                message: Raw::from(MESSAGE),
+            }]
+        );
+        assert!(app.views.pubsub.publish.is_none());
+        let (id, _) = testing::requests(&e)[0].clone();
+        testing::reply(&mut app, id, Ok(LiveReply::Write(WriteReply::Int(3))));
+        assert_eq!(notice(&app), "Published to 3 subscribers.");
+        let (id, _) = {
+            app.handle_key(ch('P'));
+            type_text(&mut app, "x");
+            testing::requests(&press(&mut app, KeyCode::Enter))[0].clone()
+        };
+        testing::reply(&mut app, id, Ok(LiveReply::Write(WriteReply::Int(1))));
+        assert_eq!(notice(&app), "Published to 1 subscriber.");
+    }
+
+    #[test]
+    fn publish_asks_y_n_on_prod_and_needs_a_channel() {
+        let (mut app, _) = loaded();
+        set_profile(&mut app, Env::Prod, Some(false));
+        app.handle_key(ch('P'));
+        // Shift-tab back to the channel, cleared: nothing to send.
+        press(&mut app, KeyCode::BackTab);
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('u'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        press(&mut app, KeyCode::Enter);
+        let e = press(&mut app, KeyCode::Enter);
+        assert!(writes(&e).is_empty());
+        assert_eq!(notice(&app), "Type the channel to publish to.");
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "news");
+        press(&mut app, KeyCode::Tab);
+        app.handle_paste("\nhi there".into());
+        let f = app.views.pubsub.publish.as_ref().unwrap();
+        assert_eq!((f.value("channel"), f.raw("message")), ("news", "hi there"));
+        let e = press(&mut app, KeyCode::Enter);
+        assert!(writes(&e).is_empty());
+        assert_eq!(app.confirm.as_ref().unwrap().expect, Expect::YesNo);
+        assert_eq!(writes(&app.handle_key(ch('y'))).len(), 1);
+        // esc closes the form without sending.
+        app.handle_key(ch('P'));
+        let e = press(&mut app, KeyCode::Esc);
+        assert!(writes(&e).is_empty() && app.views.pubsub.publish.is_none());
+    }
+
+    #[test]
+    fn no_publish_reaches_a_read_only_profile() {
+        for (env, ro) in READ_ONLY {
+            let (mut app, _) = loaded();
+            set_profile(&mut app, env, ro);
+            let mut e = app.handle_key(ch('P'));
+            assert!(app.views.pubsub.publish.is_none());
+            assert!(notice(&app).contains("read-only"), "{}", notice(&app));
+            e.extend(type_text(&mut app, "hello"));
+            e.extend(answer_anything(&mut app));
+            assert!(writes(&e).is_empty(), "{env:?} {ro:?}");
+        }
     }
 }

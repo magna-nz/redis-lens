@@ -13,13 +13,17 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::format;
+use ratatui::widgets::Clear;
+
 use crate::live::streams::{ConsumerInfo, GroupInfo, Lag, StreamInfo, Verdict};
+use crate::model::Env;
+use crate::tui::app::views::streams::form::Form;
 use crate::tui::app::views::streams::{DetailRow, Focus, StreamRow, StreamsState};
 use crate::tui::app::views::{Ctx, LiveState};
 
 use crate::value::escape;
 
-use super::widgets::{fit, pad_l, pad_r, panel, rows, scroll_offset, trunc};
+use super::widgets::{char_width, fit, pad_l, pad_r, panel, rows, scroll_offset, trunc, width};
 use super::{notice_panels, split_body, style};
 
 const LEN_W: usize = 6;
@@ -181,6 +185,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &StreamsState, ctx: &Ctx<'_>) 
         );
     }
     detail_panel(frame, detail, state);
+    if let (Some(open), Some(sends)) = (&state.form, state.form_sends()) {
+        draw_form(frame, area, open.form(), &sends, ctx);
+    }
 }
 
 fn key_width(inner: usize, wide: bool) -> usize {
@@ -282,7 +289,7 @@ fn detail_panel(frame: &mut Frame, area: Rect, state: &StreamsState) {
     };
     let focused = state.focus == Focus::Detail;
     let hint = if focused {
-        "↑↓ select · tab back"
+        "↑↓ select · A pending · tab back"
     } else {
         "tab: groups · enter: entries"
     };
@@ -355,6 +362,15 @@ fn detail_panel(frame: &mut Frame, area: Rect, state: &StreamsState) {
             ),
         ]),
     ];
+    if let Some(why) = state.shown_pending().and_then(|p| p.error.as_ref()) {
+        lines.push(Line::from(fit(
+            vec![Span::styled(
+                format!(" ▲ Pending entries: {why}."),
+                style::amber(),
+            )],
+            w,
+        )));
+    }
     if all.is_empty() {
         let text = match &info.groups {
             None => " XINFO GROUPS is not available for this user.",
@@ -382,6 +398,18 @@ fn detail_line(row: &DetailRow<'_>, nw: usize) -> Line<'static> {
     let dash = || "—".to_string();
     match row {
         DetailRow::Group(g) => Line::from(group_spans(g, nw)),
+        DetailRow::Pending(_, e) => Line::from(vec![
+            Span::styled(
+                pad_r(&format!("       · {}", escape(&e.id)), nw),
+                style::dim(),
+            ),
+            Span::styled(
+                format!(" {}", pad_l(&format!("×{}", e.deliveries), PEND_W)),
+                style::dim(),
+            ),
+            Span::styled(format!(" {}", pad_l(&age(e.idle_ms), AGE_W)), style::fg()),
+            Span::styled(format!(" {}", escape(&e.consumer)), style::dim()),
+        ]),
         DetailRow::Consumer(_, c) => {
             let idle_st = if c.pending > 0 && c.idle_ms >= crate::live::streams::STUCK_IDLE_MS {
                 style::warn()
@@ -442,4 +470,144 @@ fn left_out(info: &StreamInfo) -> Vec<String> {
     }
     out.extend(info.notes.iter().cloned());
     out
+}
+
+/// Widest a form gets.
+const FORM_W: u16 = 76;
+
+/// `text` cut into lines of at most `w` columns.
+fn wrap(text: &str, w: usize) -> Vec<String> {
+    let w = w.max(1);
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for ch in text.chars() {
+        if width(&line) + char_width(ch) > w {
+            out.push(std::mem::take(&mut line));
+        }
+        line.push(ch);
+    }
+    out.push(line);
+    out
+}
+
+/// The last `w` columns of `s`, starting with `…` when cut: the end of what is typed
+/// stays in sight.
+fn tail(s: &str, w: usize) -> String {
+    if width(s) <= w {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut keep = Vec::new();
+    let mut used = 1;
+    for c in chars.iter().rev() {
+        if used + char_width(*c) > w {
+            break;
+        }
+        used += char_width(*c);
+        keep.push(*c);
+    }
+    keep.reverse();
+    let mut out = String::from("…");
+    out.extend(keep);
+    out
+}
+
+/// Draws the form of a write action (`views::streams::form`) centred in `area`, like
+/// the write gate's question: the profile on the right of its title, the fields, the
+/// focused field's help, and the exact command it will send (`sends`), or what is
+/// wrong with what is typed. Everything typed is escaped. Shared by the Server,
+/// Streams, Pub/Sub and Search views.
+pub(super) fn draw_form(
+    frame: &mut Frame,
+    area: Rect,
+    form: &Form,
+    sends: &Result<String, String>,
+    ctx: &Ctx<'_>,
+) {
+    let w = area.width.min(FORM_W);
+    let inner = usize::from(w.saturating_sub(4));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for about in &form.about {
+        for part in wrap(about, inner) {
+            lines.push(Line::from(Span::styled(format!(" {part}"), style::fg())));
+        }
+    }
+    if !form.about.is_empty() {
+        lines.push(Line::from(""));
+    }
+    let lw = form
+        .fields
+        .iter()
+        .map(|f| width(f.label))
+        .max()
+        .unwrap_or(0);
+    for (i, f) in form.fields.iter().enumerate() {
+        let focused = i == form.focus;
+        let mut spans = vec![
+            Span::styled(if focused { " › " } else { "   " }, style::amber()),
+            Span::styled(
+                pad_r(f.label, lw),
+                if focused { style::fgb() } else { style::dim() },
+            ),
+            Span::raw("  "),
+        ];
+        if f.is_choice() {
+            for o in f.options {
+                let st = if *o == f.text {
+                    style::key()
+                } else {
+                    style::dim()
+                };
+                spans.push(Span::styled(format!(" {o} "), st));
+                spans.push(Span::raw(" "));
+            }
+        } else {
+            let room = inner.saturating_sub(3 + lw + 2 + 1);
+            spans.push(Span::styled(tail(&escape(&f.text), room), style::fgb()));
+            if focused {
+                spans.push(Span::styled("▏", style::amber()));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    if let Some(help) = form.focused().map(|f| f.help).filter(|h| !h.is_empty()) {
+        for part in wrap(help, inner.saturating_sub(3)) {
+            lines.push(Line::from(Span::styled(format!("   {part}"), style::dim())));
+        }
+    }
+    lines.push(Line::from(""));
+    match sends {
+        Ok(line) => {
+            for part in wrap(&format!("Sends: {line}"), inner) {
+                lines.push(Line::from(Span::styled(format!(" {part}"), style::fgb())));
+            }
+        }
+        Err(why) => {
+            for part in wrap(&format!("▲ {why}"), inner) {
+                lines.push(Line::from(Span::styled(format!(" {part}"), style::amber())));
+            }
+        }
+    }
+
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, rect);
+    let profile = ctx.profile();
+    let right = format!(
+        "{}{}",
+        escape(&profile.name),
+        if profile.env == Env::Prod {
+            " · PROD"
+        } else {
+            ""
+        }
+    );
+    let title = trunc(&form.title, inner.saturating_sub(width(&right) + 2));
+    let body = panel(frame, rect, &title, &right);
+    rows(frame, body, lines, None);
 }

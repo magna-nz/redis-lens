@@ -20,6 +20,12 @@
 //! memory, for the session. When it ends, the keys its lines name are ranked for Hot
 //! keys ([`Monitor::ranking`]), placed by the key specs the Slow log learns too (one
 //! cache, [`SlowLog`]); commands not in it are asked with `COMMAND INFO`.
+//!
+//! Writes (P3), each through [`Act::write`], the one gate, all `@dangerous`: `K` on a
+//! group's connections kills the selected one (`CLIENT KILL ID`), but not the
+//! connection redis-lens reads the list with ([`is_own`]); `c` on the Slow log opens a
+//! form for `slowlog-log-slower-than` and `slowlog-max-len` (`CONFIG SET`, one setting
+//! per write); `R` sends `SLOWLOG RESET`. The panel reads again after each.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv6Addr};
@@ -32,10 +38,13 @@ use crate::live::server::{
     ClientConn, CommandKeys, InfoSample, Reply, Request, SlowConfig, SlowEntry, SlowLogReply,
     names_to_learn,
 };
+use crate::live::write::Reply as WriteReply;
 use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::Env;
 use crate::tui::app::Screen;
+use crate::write::{SlowlogSetting, WriteOp};
 
+use super::streams::form::{Field, Form, Step, write_failed, write_off};
 use super::{Act, Input, ViewState};
 
 /// Polls kept for the sparklines.
@@ -89,6 +98,12 @@ pub struct ServerState {
     pub clients: Clients,
     pub slow: SlowLog,
     pub monitor: Monitor,
+    /// The slow log settings form (`c`), while it is open.
+    pub form: Option<Form>,
+    /// The write in flight, if any.
+    write: Option<(ReqId, Sent)>,
+    /// The second setting of the form, sent once the first one went through.
+    then: Option<WriteOp>,
 }
 
 impl Default for ServerState {
@@ -100,11 +115,185 @@ impl Default for ServerState {
             clients: Clients::default(),
             slow: SlowLog::default(),
             monitor: Monitor::default(),
+            form: None,
+            write: None,
+            then: None,
         }
     }
 }
 
+/// A write of this view in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    Kill(u64),
+    Config,
+    Reset,
+}
+
+/// True for the connection redis-lens read the list with: its last command is the
+/// `CLIENT LIST` itself (`client|list`; `client` before Redis 7.0), and it was not idle.
+/// redis-lens sets no client name, so this is all the list tells; another client that
+/// ran `CLIENT LIST` in the same second looks the same, and is refused too.
+pub fn is_own(c: &ClientConn) -> bool {
+    matches!(c.cmd.as_str(), "client|list" | "client") && c.idle == 0
+}
+
+/// The `CONFIG SET`s of the slow log form, threshold first: only the settings typed
+/// different from `known` (all typed ones when the settings are unknown).
+pub fn slowlog_ops(form: &Form, known: Option<SlowConfig>) -> Result<Vec<WriteOp>, String> {
+    let mut out = Vec::new();
+    let t = form.value("threshold µs");
+    if !t.is_empty() {
+        let n = t
+            .parse::<i64>()
+            .ok()
+            .filter(|n| *n >= -1)
+            .ok_or_else(|| "The threshold is a whole number of µs, -1 or more.".to_string())?;
+        if known.is_none_or(|k| k.threshold_micros != n) {
+            out.push(WriteOp::SlowlogConfig(SlowlogSetting::Threshold(n)));
+        }
+    }
+    let m = form.value("max length");
+    if !m.is_empty() {
+        let n = m
+            .parse::<u64>()
+            .map_err(|_| "The length is a whole number of entries.".to_string())?;
+        if known.is_none_or(|k| k.max_len != n) {
+            out.push(WriteOp::SlowlogConfig(SlowlogSetting::MaxLen(n)));
+        }
+    }
+    if out.is_empty() {
+        return Err("Change the threshold or the length first.".into());
+    }
+    Ok(out)
+}
+
 impl ServerState {
+    /// The `CONFIG SET`s the form sends as filled now, as the prompt shows them, or
+    /// what is wrong: for the form's "Sends:" line.
+    pub fn form_sends(&self) -> Option<Result<String, String>> {
+        let f = self.form.as_ref()?;
+        Some(slowlog_ops(f, self.slow.config).map(|ops| {
+            ops.iter()
+                .map(WriteOp::shown)
+                .collect::<Vec<_>>()
+                .join("; ")
+        }))
+    }
+
+    /// `K`: kills the selected connection of the open group.
+    fn kill(&mut self, act: &mut Act<'_>) {
+        if self.clients.drill.is_none() {
+            act.info("Press enter to list the group's connections, then K kills the selected one.");
+            return;
+        }
+        let Some(c) = self.clients.selected_conn() else {
+            act.info("No connection selected.");
+            return;
+        };
+        let id = c.id;
+        if is_own(c) {
+            act.error(
+                "Not sent: this looks like redis-lens's own connection (it was running CLIENT LIST).",
+            );
+            return;
+        }
+        self.send_write(WriteOp::ClientKill { id }, Sent::Kill(id), act);
+    }
+
+    /// `c` on the Slow log: opens the settings form.
+    fn open_slowlog_form(&mut self, act: &mut Act<'_>) {
+        let sample = WriteOp::SlowlogConfig(SlowlogSetting::Threshold(0));
+        if write_off(act, &sample) {
+            return;
+        }
+        let known = self.slow.config;
+        let about = vec![match known {
+            Some(_) => "The slow log's settings now are filled in. Change one or both.".to_string(),
+            None => "The settings now are unknown. Fill in the ones to change.".to_string(),
+        }];
+        self.form = Some(Form::new(
+            "Slow log settings",
+            about,
+            vec![
+                Field::text(
+                    "threshold µs",
+                    "slowlog-log-slower-than: -1 turns the log off, 0 logs every command",
+                )
+                .with(known.map_or_else(String::new, |k| k.threshold_micros.to_string())),
+                Field::text(
+                    "max length",
+                    "slowlog-max-len: the most entries the log keeps",
+                )
+                .with(known.map_or_else(String::new, |k| k.max_len.to_string())),
+            ],
+        ));
+    }
+
+    /// A key while the form is open.
+    fn form_key(&mut self, key: KeyEvent, act: &mut Act<'_>) {
+        let Some(f) = self.form.as_mut() else {
+            return;
+        };
+        match f.key(key) {
+            Step::Typed => {}
+            Step::Cancel => self.form = None,
+            Step::Submit => match slowlog_ops(f, self.slow.config) {
+                Err(why) => act.error(why),
+                Ok(mut ops) => {
+                    self.form = None;
+                    let first = ops.remove(0);
+                    self.then = ops.pop();
+                    self.send_write(first, Sent::Config, act);
+                }
+            },
+        }
+    }
+
+    fn send_write(&mut self, op: WriteOp, sent: Sent, act: &mut Act<'_>) {
+        match act.write(op) {
+            Some(id) => self.write = Some((id, sent)),
+            None => self.then = None,
+        }
+    }
+
+    /// The answer to the write in flight; the panel reads again after it.
+    fn write_reply(&mut self, sent: Sent, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
+        let reply = match result {
+            Ok(LiveReply::Write(r)) => r,
+            Ok(_) => return,
+            Err(e) => {
+                self.then = None;
+                write_failed(act, &e);
+                return;
+            }
+        };
+        let panel = match sent {
+            Sent::Kill(id) => {
+                act.info(match reply {
+                    WriteReply::Int(0) => format!("Connection {id} was already gone."),
+                    _ => format!("Killed connection {id}."),
+                });
+                Panel::Clients
+            }
+            Sent::Config => {
+                if let Some(next) = self.then.take() {
+                    self.send_write(next, Sent::Config, act);
+                    return;
+                }
+                act.info("Slow log settings changed.");
+                Panel::SlowLog
+            }
+            Sent::Reset => {
+                act.info("Slow log reset.");
+                Panel::SlowLog
+            }
+        };
+        if !self.poll(panel).busy(act) {
+            self.send(panel, act);
+        }
+    }
+
     /// How often the Overview polls.
     pub fn interval(&self) -> Duration {
         Duration::from_secs(INTERVALS[self.interval])
@@ -267,6 +456,10 @@ impl ViewState for ServerState {
     }
 
     fn on_key(&mut self, key: KeyEvent, act: &mut Act<'_>) -> bool {
+        if self.form.is_some() {
+            self.form_key(key, act);
+            return true;
+        }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -300,6 +493,18 @@ impl ViewState for ServerState {
                 self.change_interval(false, act);
                 true
             }
+            (Panel::Clients, KeyCode::Char('K')) => {
+                self.kill(act);
+                true
+            }
+            (Panel::SlowLog, KeyCode::Char('c')) => {
+                self.open_slowlog_form(act);
+                true
+            }
+            (Panel::SlowLog, KeyCode::Char('R')) => {
+                self.send_write(WriteOp::SlowlogReset, Sent::Reset, act);
+                true
+            }
             (Panel::Clients, _) => self.clients.key(key, act.page),
             (Panel::SlowLog, _) => self.slow.key(key, act.page),
             _ => false,
@@ -307,10 +512,17 @@ impl ViewState for ServerState {
     }
 
     fn input(&self) -> Option<Input> {
-        self.monitor_input()
+        match &self.form {
+            Some(f) => f.input(),
+            None => self.monitor_input(),
+        }
     }
 
     fn on_paste(&mut self, text: &str, _act: &mut Act<'_>) {
+        if let Some(f) = self.form.as_mut() {
+            f.paste(text);
+            return;
+        }
         if let Some(Prompt::TypeName(t)) = self.monitor.prompt.as_mut() {
             let room = MAX_TYPED.saturating_sub(t.chars().count());
             t.extend(text.chars().filter(|c| !c.is_control()).take(room));
@@ -318,6 +530,13 @@ impl ViewState for ServerState {
     }
 
     fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
+        if let Some((wid, sent)) = self.write
+            && wid == id
+        {
+            self.write = None;
+            self.write_reply(sent, result, act);
+            return;
+        }
         let Some(panel) = Panel::ALL
             .into_iter()
             .find(|p| self.poll(*p).in_flight == Some(id))
@@ -2451,6 +2670,287 @@ mod tests {
             app.handle_key(key(KeyCode::Enter));
             for (w, h) in [(80, 24), (40, 12), (20, 6), (10, 3), (1, 1), (200, 60)] {
                 let _ = testing::render(&app, w, h);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Writes (P3)
+    // -----------------------------------------------------------------------
+
+    use super::super::streams::form::testing::{
+        READ_ONLY, answer_anything, press, set_profile, type_text, writes,
+    };
+    use crate::live::write::Reply as WriteReply;
+    use crate::model::Env;
+    use crate::tui::app::confirm::Expect;
+
+    /// On Clients with [`fleet`] listed, the profile set to `env` and `read_only`.
+    fn on_clients(env: Env, read_only: Option<bool>) -> App {
+        let (mut app, out) = app_at(Instant::now(), Screen::Clients);
+        let (id, _) = last_request(&out);
+        answer(&mut app, id, Reply::Clients(fleet()));
+        set_profile(&mut app, env, read_only);
+        app
+    }
+
+    /// Opens the group labelled `label` and selects its connection `conn`.
+    fn open_conn(app: &mut App, label: &str, conn: u64) {
+        let g = state(app)
+            .clients
+            .groups
+            .iter()
+            .position(|g| g.key.label() == label)
+            .expect("the group");
+        app.views.server.clients.sel = g;
+        app.handle_key(key(KeyCode::Enter));
+        let at = state(app)
+            .clients
+            .open_conns()
+            .iter()
+            .position(|c| c.id == conn)
+            .expect("the connection");
+        app.views.server.clients.conn_sel = at;
+    }
+
+    /// On the Slow log with its settings known (10 ms, 128 entries).
+    fn on_slow_log(env: Env, read_only: Option<bool>) -> App {
+        let (mut app, out) = app_at(Instant::now(), Screen::SlowLog);
+        let (id, _) = last_request(&out);
+        answer(
+            &mut app,
+            id,
+            Reply::SlowLog(Box::new(slow_reply(vec![entry(1, "GET", &["k"], 12_000)]))),
+        );
+        set_profile(&mut app, env, read_only);
+        app
+    }
+
+    fn notice(app: &App) -> String {
+        app.notice
+            .as_ref()
+            .map(|n| n.text.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn k_kills_the_selected_connection_after_asking_and_reads_again() {
+        let mut app = on_clients(Env::Local, None);
+        // On the groups, K says how to get to a connection.
+        assert!(writes(&app.handle_key(ch('K'))).is_empty());
+        assert!(notice(&app).contains("Press enter"), "{}", notice(&app));
+        open_conn(&mut app, "redis-py 5.0.1", 2);
+        let e = app.handle_key(ch('K'));
+        assert!(writes(&e).is_empty());
+        let c = app.confirm.as_ref().expect("a question");
+        assert_eq!(c.expect, Expect::YesNo);
+        assert!(c.lines().iter().any(|l| l == "Sends: CLIENT KILL ID 2"));
+        let e = app.handle_key(ch('y'));
+        assert_eq!(writes(&e), vec![WriteOp::ClientKill { id: 2 }]);
+        let (id, _) = testing::requests(&e)[0].clone();
+        let e = testing::reply(&mut app, id, Ok(LiveReply::Write(WriteReply::Int(1))));
+        assert_eq!(notice(&app), "Killed connection 2.");
+        assert!(matches!(server_requests(&e)[..], [(_, Request::Clients)]));
+    }
+
+    #[test]
+    fn k_on_prod_asks_for_the_profile_name() {
+        let mut app = on_clients(Env::Prod, Some(false));
+        open_conn(&mut app, "redis-py 5.0.1", 3);
+        app.handle_key(ch('K'));
+        assert_eq!(
+            app.confirm.as_ref().unwrap().expect,
+            Expect::Type("prod-cache-01".into())
+        );
+        assert!(writes(&app.handle_key(ch('y'))).is_empty());
+        press(&mut app, KeyCode::Backspace);
+        type_text(&mut app, "prod-cache-01");
+        let e = press(&mut app, KeyCode::Enter);
+        assert_eq!(writes(&e), vec![WriteOp::ClientKill { id: 3 }]);
+    }
+
+    #[test]
+    fn k_refuses_redis_lens_own_connection() {
+        let mut app = on_clients(Env::Local, None);
+        // Connection 7 ran the CLIENT LIST itself.
+        assert!(is_own(&fleet()[6]));
+        assert!(!is_own(&fleet()[0]), "idle 0, but another command");
+        open_conn(&mut app, "127.0.0.0/24", 7);
+        let e = app.handle_key(ch('K'));
+        assert!(writes(&e).is_empty());
+        assert!(app.confirm.is_none());
+        assert!(notice(&app).contains("redis-lens's own connection"));
+    }
+
+    #[test]
+    fn a_failed_or_cancelled_kill_says_why_and_reads_nothing() {
+        let mut app = on_clients(Env::Local, None);
+        open_conn(&mut app, "redis-py 5.0.1", 2);
+        app.handle_key(ch('K'));
+        let e = app.handle_key(ch('n'));
+        assert!(writes(&e).is_empty() && testing::requests(&e).is_empty());
+        assert_eq!(notice(&app), crate::live::CANCELLED);
+        app.handle_key(ch('K'));
+        let e = app.handle_key(ch('y'));
+        let (id, _) = testing::requests(&e)[0].clone();
+        let e = testing::reply(
+            &mut app,
+            id,
+            Err(LiveError::Failed(
+                "CLIENT KILL failed: no such client".into(),
+            )),
+        );
+        assert!(testing::requests(&e).is_empty());
+        assert_eq!(notice(&app), "CLIENT KILL failed: no such client.");
+    }
+
+    #[test]
+    fn c_on_the_slow_log_sets_the_threshold_then_the_length() {
+        let mut app = on_slow_log(Env::Local, None);
+        app.handle_key(ch('c'));
+        let f = state(&app).form.as_ref().expect("the form");
+        assert_eq!(f.value("threshold µs"), "10000");
+        assert_eq!(f.value("max length"), "128");
+        // Unchanged, it sends nothing.
+        press(&mut app, KeyCode::Enter);
+        let e = press(&mut app, KeyCode::Enter);
+        assert!(writes(&e).is_empty());
+        assert_eq!(notice(&app), "Change the threshold or the length first.");
+        // A threshold of 5 ms and 256 entries.
+        press(&mut app, KeyCode::Tab);
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_text(&mut app, "5000");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        type_text(&mut app, "56");
+        assert_eq!(
+            state(&app).form.as_ref().unwrap().value("max length"),
+            "156"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_text(&mut app, "256");
+        insta::assert_snapshot!(
+            "slowlog_form_80x24",
+            testing::render(&app, 80, 24).backend()
+        );
+        let e = press(&mut app, KeyCode::Enter);
+        assert!(writes(&e).is_empty());
+        assert!(state(&app).form.is_none());
+        assert_eq!(app.confirm.as_ref().unwrap().expect, Expect::YesNo);
+        let e = app.handle_key(ch('y'));
+        assert_eq!(
+            writes(&e),
+            vec![WriteOp::SlowlogConfig(SlowlogSetting::Threshold(5000))]
+        );
+        let (id, _) = testing::requests(&e)[0].clone();
+        // The second asks too, once the first went through.
+        testing::reply(&mut app, id, Ok(LiveReply::Write(WriteReply::Ok)));
+        let e = app.handle_key(ch('y'));
+        assert_eq!(
+            writes(&e),
+            vec![WriteOp::SlowlogConfig(SlowlogSetting::MaxLen(256))]
+        );
+        let (id, _) = testing::requests(&e)[0].clone();
+        let e = testing::reply(&mut app, id, Ok(LiveReply::Write(WriteReply::Ok)));
+        assert_eq!(notice(&app), "Slow log settings changed.");
+        assert!(matches!(
+            server_requests(&e)[..],
+            [(_, Request::SlowLog { config: true, .. })]
+        ));
+    }
+
+    #[test]
+    fn the_slow_log_form_checks_what_is_typed() {
+        let mut f = Form::new(
+            "t",
+            vec![],
+            vec![
+                Field::text("threshold µs", ""),
+                Field::text("max length", ""),
+            ],
+        );
+        let known = Some(SlowConfig {
+            threshold_micros: 10,
+            max_len: 128,
+        });
+        f.fields[0].text = "-2".into();
+        assert!(slowlog_ops(&f, known).is_err());
+        f.fields[0].text = "abc".into();
+        assert!(slowlog_ops(&f, known).is_err());
+        f.fields[0].text = "-1".into();
+        assert_eq!(
+            slowlog_ops(&f, known),
+            Ok(vec![WriteOp::SlowlogConfig(SlowlogSetting::Threshold(-1))])
+        );
+        f.fields[1].text = "x".into();
+        assert!(slowlog_ops(&f, known).is_err());
+        // Unknown settings: what is typed is sent.
+        f.fields[0].text = "10".into();
+        f.fields[1].text = "128".into();
+        assert!(slowlog_ops(&f, known).is_err());
+        assert_eq!(slowlog_ops(&f, None).map(|v| v.len()), Ok(2));
+    }
+
+    #[test]
+    fn dangerous_slow_log_writes_ask_for_the_profile_name_on_prod() {
+        let mut app = on_slow_log(Env::Prod, Some(false));
+        app.handle_key(ch('R'));
+        assert_eq!(
+            app.confirm.as_ref().unwrap().expect,
+            Expect::Type("prod-cache-01".into())
+        );
+        app.handle_paste("prod-cache-01".into());
+        let e = press(&mut app, KeyCode::Enter);
+        assert_eq!(writes(&e), vec![WriteOp::SlowlogReset]);
+        let (id, _) = testing::requests(&e)[0].clone();
+        let e = testing::reply(&mut app, id, Ok(LiveReply::Write(WriteReply::Ok)));
+        assert_eq!(notice(&app), "Slow log reset.");
+        assert!(matches!(
+            server_requests(&e)[..],
+            [(_, Request::SlowLog { .. })]
+        ));
+
+        app.handle_key(ch('c'));
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "0");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.confirm.as_ref().unwrap().expect,
+            Expect::Type("prod-cache-01".into())
+        );
+    }
+
+    #[test]
+    fn r_resets_the_slow_log_after_y_outside_prod() {
+        let mut app = on_slow_log(Env::Stage, Some(false));
+        let e = app.handle_key(ch('R'));
+        assert!(writes(&e).is_empty());
+        assert_eq!(app.confirm.as_ref().unwrap().expect, Expect::YesNo);
+        assert_eq!(
+            writes(&app.handle_key(ch('y'))),
+            vec![WriteOp::SlowlogReset]
+        );
+    }
+
+    #[test]
+    fn no_write_reaches_a_read_only_profile_from_the_server_view() {
+        for (env, ro) in READ_ONLY {
+            let mut app = on_clients(env, ro);
+            open_conn(&mut app, "redis-py 5.0.1", 2);
+            let mut e = app.handle_key(ch('K'));
+            assert!(app.confirm.is_none());
+            assert!(notice(&app).contains("read-only"), "{}", notice(&app));
+            e.extend(answer_anything(&mut app));
+            assert!(writes(&e).is_empty(), "K {env:?} {ro:?}");
+
+            for k in ['c', 'R'] {
+                let mut app = on_slow_log(env, ro);
+                let mut e = app.handle_key(ch(k));
+                assert!(app.confirm.is_none() && state(&app).form.is_none());
+                assert!(notice(&app).contains("read-only"), "{}", notice(&app));
+                e.extend(answer_anything(&mut app));
+                assert!(writes(&e).is_empty(), "{k} {env:?} {ro:?}");
             }
         }
     }

@@ -1,4 +1,5 @@
-//! Live requests for the streams view. Owner: wave B. Phase 1: no writes, no values.
+//! Live requests for the streams view. Owner: wave B. Reads only: the writes of the view
+//! (`XAUTOCLAIM`, `XACK`, `XTRIM`) go through the write gate ([`crate::live::write`]).
 //!
 //! One request reads `XINFO STREAM`, `XINFO GROUPS` and `XINFO CONSUMERS` for a list of
 //! stream keys. It reads entry IDs only: `XINFO STREAM` (without `FULL`) answers with the
@@ -24,6 +25,9 @@ pub const MAX_STREAMS: usize = 50;
 /// The most groups of one stream whose consumers are read.
 pub const MAX_GROUPS: usize = 25;
 
+/// The most pending entries [`Request::Pending`] lists.
+pub const MAX_PENDING: usize = 100;
+
 /// `stuck`: a consumer holding pending entries has been idle this long (30 min).
 pub const STUCK_IDLE_MS: u64 = 30 * 60 * 1000;
 /// `lagging`: a group's lag is at least this many entries.
@@ -38,6 +42,17 @@ pub enum Request {
     /// Reads the streams `keys` (the first [`MAX_STREAMS`]). Commands in `refused` are
     /// not sent: the server refused them for this user before.
     Info { keys: Vec<String>, refused: Refused },
+    /// Reads the stream `key` as [`Request::Info`] does, and the first [`MAX_PENDING`]
+    /// pending entries of its group `group` (of `consumer` only, when given) with
+    /// `XPENDING key group - + 100 [consumer]`, into [`StreamInfo::pending`]. Answered
+    /// with [`Reply::Info`] for that one key. `XPENDING` gives IDs, consumers, idle times
+    /// and delivery counts: no entry value.
+    Pending {
+        key: String,
+        group: String,
+        consumer: Option<String>,
+        refused: Refused,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,6 +106,31 @@ pub struct StreamInfo {
     pub groups: Option<Vec<GroupInfo>>,
     /// Why parts are missing, in redis-lens's own words ([`LiveError`]'s texts).
     pub notes: Vec<String>,
+    /// The pending entries [`Request::Pending`] asked for; `None` from a poll.
+    pub pending: Option<Pending>,
+}
+
+/// The pending entries of one group, or of one of its consumers (`XPENDING`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pending {
+    pub group: String,
+    /// `None`: every consumer of the group.
+    pub consumer: Option<String>,
+    /// At most [`MAX_PENDING`], oldest ID first.
+    pub entries: Vec<PendingEntry>,
+    /// Why they could not be read, in redis-lens's own words.
+    pub error: Option<String>,
+}
+
+/// One pending entry: delivered to `consumer` and not acknowledged yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEntry {
+    pub id: String,
+    pub consumer: String,
+    /// Milliseconds since it was last delivered.
+    pub idle_ms: u64,
+    /// How many times it was delivered.
+    pub deliveries: u64,
 }
 
 /// The lag of a consumer group (Redis 7.0 and later).
@@ -199,7 +239,72 @@ pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply
                 refused,
             })
         }
+        Request::Pending {
+            key,
+            group,
+            consumer,
+            mut refused,
+        } => {
+            let now_ms = server_time_ms(conn, budget, &mut refused).await?;
+            let mut info = fetch(conn, budget, &key, now_ms, &mut refused).await?;
+            if let Some(info) = info.as_mut() {
+                info.pending = Some(pending(conn, budget, &key, group, consumer).await?);
+            }
+            Ok(Reply::Info {
+                streams: vec![Fetched { key, info }],
+                refused,
+            })
+        }
     }
+}
+
+/// `XPENDING key group - + 100 [consumer]`. A refusal or a missing group is said in
+/// [`Pending::error`]; only a closed connection fails the request.
+async fn pending(
+    conn: &mut Conn,
+    budget: &Budget,
+    key: &str,
+    group: String,
+    consumer: Option<String>,
+) -> Result<Pending, LiveError> {
+    let mut c = redis::cmd("XPENDING");
+    c.arg(key).arg(&group).arg("-").arg("+").arg(MAX_PENDING);
+    if let Some(name) = &consumer {
+        c.arg(name);
+    }
+    let (entries, error) = match query::<Value>(conn, budget, "XPENDING", &c).await {
+        Ok(v) => (parse_pending(&v), None),
+        Err(LiveError::Closed) => return Err(LiveError::Closed),
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    };
+    Ok(Pending {
+        group,
+        consumer,
+        entries,
+        error,
+    })
+}
+
+/// Reads the reply of the extended `XPENDING`: `[[id, consumer, idle, deliveries] …]`.
+pub fn parse_pending(v: &Value) -> Vec<PendingEntry> {
+    let Value::Array(items) = v else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|e| {
+            let Value::Array(parts) = e else {
+                return None;
+            };
+            Some(PendingEntry {
+                id: text(parts.first()?)?,
+                consumer: parts.get(1).and_then(text).unwrap_or_default(),
+                idle_ms: parts.get(2).and_then(uint).unwrap_or(0),
+                deliveries: parts.get(3).and_then(uint).unwrap_or(0),
+            })
+        })
+        .take(MAX_PENDING)
+        .collect()
 }
 
 /// The server's clock in Unix milliseconds (`TIME`), so ages compare IDs, which the server
@@ -479,6 +584,7 @@ pub fn parse_stream(
         entries_added: get("entries-added").and_then(uint),
         groups: groups.map(parse_groups),
         notes: Vec::new(),
+        pending: None,
     }
 }
 
@@ -705,7 +811,45 @@ mod tests {
             entries_added: None,
             groups,
             notes: Vec::new(),
+            pending: None,
         }
+    }
+
+    #[test]
+    fn pending_entries_keep_ids_consumers_and_counts() {
+        let v = Value::Array(vec![
+            Value::Array(vec![
+                b("1700000000000-0"),
+                b("b-1"),
+                Value::Int(2_700_000),
+                Value::Int(3),
+            ]),
+            Value::Array(vec![
+                b("1700000000001-0"),
+                b("b-2"),
+                Value::Int(5),
+                Value::Int(1),
+            ]),
+            Value::Nil,
+        ]);
+        assert_eq!(
+            parse_pending(&v),
+            vec![
+                PendingEntry {
+                    id: "1700000000000-0".into(),
+                    consumer: "b-1".into(),
+                    idle_ms: 2_700_000,
+                    deliveries: 3,
+                },
+                PendingEntry {
+                    id: "1700000000001-0".into(),
+                    consumer: "b-2".into(),
+                    idle_ms: 5,
+                    deliveries: 1,
+                },
+            ]
+        );
+        assert!(parse_pending(&Value::Nil).is_empty());
     }
 
     fn grp(lag: Lag, readers: Option<Vec<ConsumerInfo>>) -> GroupInfo {
