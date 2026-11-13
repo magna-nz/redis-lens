@@ -163,6 +163,28 @@ pub enum ConnCommand {
         /// Profile name.
         name: String,
     },
+    /// Change a saved connection. Only `--writes` for now.
+    Set {
+        /// Profile name.
+        name: String,
+        /// Turn writes on or off (`read_only` in the config file). Turning them on asks
+        /// first; on a prod profile you type the profile name.
+        #[arg(long, value_enum)]
+        writes: WritesArg,
+        /// The profile name, given instead of typing it when writes are turned on.
+        #[arg(long, value_name = "NAME")]
+        confirm: Option<String>,
+        /// Turn writes on without asking. Never enough on a prod profile: give --confirm.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// `--writes on|off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WritesArg {
+    On,
+    Off,
 }
 
 #[derive(Debug, Args)]
@@ -199,9 +221,17 @@ pub struct ConnAddArgs {
     /// through a shell.
     #[arg(last = true, value_name = "TOKEN_COMMAND")]
     pub token_command: Vec<String>,
-    /// Save a token command without asking first.
+    /// Answer yes to the questions: saving a token command, and turning writes on for a
+    /// profile that isn't prod.
     #[arg(long)]
     pub yes: bool,
+    /// Writes on or off. Unset, a prod profile is read-only and the others are not.
+    /// Turning writes on for a prod profile needs --confirm with its name.
+    #[arg(long, value_enum)]
+    pub writes: Option<WritesArg>,
+    /// The profile name, given instead of typing it when writes are turned on.
+    #[arg(long, value_name = "NAME")]
+    pub confirm: Option<String>,
     /// Reach the server, and its cluster nodes and replicas, through an SSH bastion:
     /// `[USER@]HOST[:PORT]`, or a `Host` alias from ~/.ssh/config. Uses the system ssh
     /// with strict host-key checking; the username goes to the OS keychain.

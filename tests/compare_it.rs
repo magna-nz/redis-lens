@@ -55,6 +55,7 @@ fn temp_config(staging_port: u16, prod_port: u16) -> PathBuf {
             profile("staging", Env::Stage, staging_port),
             profile("prod", Env::Prod, prod_port),
         ],
+        ..Default::default()
     }
     .save(&path)
     .unwrap();

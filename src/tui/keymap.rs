@@ -52,13 +52,7 @@ const HELP: KeyHelp = k("?", "?", "Help", "Show or hide this key list", true);
 const ADD: KeyHelp = k("a", "a", "Add", "Add a connection", true);
 const QUIT: KeyHelp = k("q ctrl-c", "q", "Quit", "Quit", true);
 
-const COMMAND_LINE_KEY: KeyHelp = k(
-    ":",
-    ":",
-    "Command",
-    "Open the command line for readonly commands",
-    false,
-);
+const COMMAND_LINE_KEY: KeyHelp = k(":", ":", "Command", "Open the command line", false);
 
 static GLOBAL: [KeyHelp; 5] = [VIEW_KEYS, HELP, ADD, COMMAND_LINE_KEY, QUIT];
 
@@ -69,7 +63,7 @@ static COMMAND_LINE: [KeyHelp; 7] = [
         "enter",
         "enter",
         "Run",
-        "Run the command (readonly commands only)",
+        "Run the command (writes go through the write gate)",
         false,
     ),
     k(
@@ -152,7 +146,7 @@ const SNAPSHOT: KeyHelp = k("s", "s", "Snapshot", "Save a scan snapshot file", t
 const REFRESH: KeyHelp = k("r", "r", "Refresh", "Refresh this panel now", true);
 const PAUSE: KeyHelp = k("p", "p", "Pause", "Pause or resume polling", true);
 
-static CONNECTIONS: [KeyHelp; 5] = [
+static CONNECTIONS: [KeyHelp; 6] = [
     MOVE,
     PAGE,
     ENDS,
@@ -164,9 +158,16 @@ static CONNECTIONS: [KeyHelp; 5] = [
         "Look for Docker containers again",
         true,
     ),
+    k(
+        "w",
+        "w",
+        "Writes",
+        "Turn writes on or off for the selected profile",
+        false,
+    ),
 ];
 
-static PATTERNS: [KeyHelp; 12] = [
+static PATTERNS: [KeyHelp; 14] = [
     MOVE,
     PAGE,
     ENDS,
@@ -203,9 +204,17 @@ static PATTERNS: [KeyHelp; 12] = [
     COPY_CMD,
     RESCAN,
     SNAPSHOT,
+    k(
+        "x",
+        "x",
+        "Expire",
+        "Set a TTL on every key of the pattern",
+        false,
+    ),
+    k("D", "D", "Delete", "Delete every key of the pattern", false),
 ];
 
-static KEY_LIST: [KeyHelp; 9] = [
+static KEY_LIST: [KeyHelp; 10] = [
     MOVE,
     PAGE,
     ENDS,
@@ -227,9 +236,10 @@ static KEY_LIST: [KeyHelp; 9] = [
         "Clear the filter, or go back to Patterns",
         true,
     ),
+    k("N", "N", "New key", "Add a key", false),
 ];
 
-static KEY_DETAIL: [KeyHelp; 8] = [
+static KEY_DETAIL: [KeyHelp; 14] = [
     k(
         "↑↓ j k",
         "↑↓",
@@ -262,6 +272,30 @@ static KEY_DETAIL: [KeyHelp; 8] = [
         false,
     ),
     k("esc", "esc", "Back", "Go back to the key list", true),
+    k(
+        "e",
+        "e",
+        "Edit",
+        "Edit the selected field, element or value",
+        false,
+    ),
+    k("+", "+", "Add", "Add a field, element or member", false),
+    k("t", "t", "TTL", "Set or remove the TTL", false),
+    k(
+        "R",
+        "R",
+        "Rename",
+        "Rename the key (never overwrites one)",
+        false,
+    ),
+    k(
+        "d",
+        "d",
+        "Delete item",
+        "Delete the selected field, element or member",
+        false,
+    ),
+    k("D", "D", "Delete key", "Delete the key", false),
 ];
 
 static TTL_DIFF: [KeyHelp; 8] = [
@@ -296,7 +330,7 @@ static OVERVIEW: [KeyHelp; 4] = [
     REFRESH,
 ];
 
-static CLIENTS: [KeyHelp; 8] = [
+static CLIENTS: [KeyHelp; 9] = [
     MOVE,
     PAGE,
     ENDS,
@@ -311,9 +345,25 @@ static CLIENTS: [KeyHelp; 8] = [
     k("esc", "esc", "Back", "Back to the groups", false),
     PAUSE,
     REFRESH,
+    k("K", "K", "Kill", "Kill the selected connection", false),
 ];
 
-static SLOW_LOG: [KeyHelp; 6] = [MOVE, PAGE, ENDS, PANEL, PAUSE, REFRESH];
+static SLOW_LOG: [KeyHelp; 8] = [
+    MOVE,
+    PAGE,
+    ENDS,
+    PANEL,
+    PAUSE,
+    REFRESH,
+    k(
+        "c",
+        "c",
+        "Threshold",
+        "Change the slow log threshold or length",
+        false,
+    ),
+    k("R", "R", "Reset", "Reset the slow log", false),
+];
 
 static MONITOR: [KeyHelp; 6] = [
     k("↑↓ j k", "↑↓", "Scroll", "Scroll the lines", true),
@@ -347,7 +397,7 @@ const COPY_VALUE: KeyHelp = k(
     false,
 );
 
-static STREAMS: [KeyHelp; 11] = [
+static STREAMS: [KeyHelp; 14] = [
     k(
         "↑↓ j k",
         "↑↓",
@@ -383,9 +433,24 @@ static STREAMS: [KeyHelp; 11] = [
         "Refresh this panel now, or read the entries again",
         true,
     ),
+    k(
+        "c",
+        "c",
+        "Claim",
+        "Claim a consumer's pending entries for another consumer",
+        false,
+    ),
+    k(
+        "A",
+        "A",
+        "Ack",
+        "Acknowledge the selected pending entry",
+        false,
+    ),
+    k("X", "X", "Trim", "Trim the stream", false),
 ];
 
-static PUBSUB: [KeyHelp; 11] = [
+static PUBSUB: [KeyHelp; 12] = [
     MOVE,
     PAGE,
     ENDS,
@@ -409,9 +474,10 @@ static PUBSUB: [KeyHelp; 11] = [
     ),
     PAUSE,
     REFRESH,
+    k("P", "P", "Publish", "Publish a message", false),
 ];
 
-static SEARCH: [KeyHelp; 12] = [
+static SEARCH: [KeyHelp; 14] = [
     k(
         "↑↓ j k",
         "↑↓",
@@ -442,6 +508,14 @@ static SEARCH: [KeyHelp; 12] = [
         true,
     ),
     REFRESH,
+    k("C", "C", "Create", "Create an index", false),
+    k(
+        "D",
+        "D",
+        "Drop",
+        "Drop the selected index (its documents stay)",
+        false,
+    ),
 ];
 
 static NODES: [KeyHelp; 7] = [

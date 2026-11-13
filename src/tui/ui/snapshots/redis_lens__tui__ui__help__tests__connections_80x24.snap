@@ -1,18 +1,18 @@
 ---
 source: src/tui/ui/help.rs
-assertion_line: 75
+assertion_line: 71
 expression: "render(Screen::Connections, 80, 24).backend()"
 ---
 "                                                                                "
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"       ┌─ Keys · Connections ───────────────────────────────────────────┐       "
+"       ┌─ Keys · Connections ───────────────────────── ? or esc closes ─┐       "
 "       │Everywhere                                                      │       "
 "       │0-6            Switch view, 0 Connections to 6 Search           │       "
 "       │?              Show or hide this key list                       │       "
 "       │a              Add a connection                                 │       "
-"       │:              Open the command line for readonly commands      │       "
+"       │:              Open the command line                            │       "
 "       │q ctrl-c       Quit                                             │       "
 "       │Connections                                                     │       "
 "       │↑↓ j k         Move the selection                               │       "
@@ -20,9 +20,9 @@ expression: "render(Screen::Connections, 80, 24).backend()"
 "       │Home End g G   Jump to the first or last row                    │       "
 "       │enter          Connect and scan                                 │       "
 "       │r              Look for Docker containers again                 │       "
-"       │                                                                │       "
-"       │? or esc closes                                                 │       "
+"       │w              Turn writes on or off for the selected profile   │       "
 "       └────────────────────────────────────────────────────────────────┘       "
+"                                                                                "
 "                                                                                "
 "                                                                                "
 "                                                                                "

@@ -59,13 +59,31 @@ fn writes_cell(p: &Profile) -> (&'static str, ratatui::style::Style) {
     }
 }
 
-/// The detail panel's Writes row: off or on, and why.
-fn writes_row(p: &Profile) -> Vec<Span<'static>> {
+/// The detail panel's Writes row: off or on, and why. With writes on and an `ACL
+/// DRYRUN` answer in `perms`, it counts the writes the server refuses this user.
+fn writes_row(p: &Profile, perms: Option<&PermissionReport>) -> Vec<Span<'static>> {
     let (state, why) = match (p.read_only, p.env) {
         (None, Env::Prod) => ("off", "production default"),
         (None, _) => ("on", "default outside production"),
         (Some(true), _) => ("off", "read_only = true"),
         (Some(false), _) => ("on", "read_only = false"),
+    };
+    let refused = perms.map_or(0, |r| {
+        r.checks
+            .iter()
+            .filter(|c| {
+                c.label != crate::conn::PERM_ACL_DRYRUN
+                    && crate::conn::is_write_probe(c.label)
+                    && matches!(c.status, PermStatus::Denied(_))
+            })
+            .count()
+    });
+    let refused_why;
+    let why = if state == "on" && refused > 0 {
+        refused_why = format!("{refused} refused by the server");
+        refused_why.as_str()
+    } else {
+        why
     };
     let s = if state == "off" {
         style::amber()
@@ -93,7 +111,7 @@ fn ordered_checks(r: &PermissionReport) -> Vec<(&'static str, Option<&PermStatus
     out.extend(
         r.checks
             .iter()
-            .filter(|c| !PERM_LABELS.contains(&c.label))
+            .filter(|c| !PERM_LABELS.contains(&c.label) && !crate::conn::is_write_probe(c.label))
             .map(|c: &PermCheck| (c.label, Some(&c.status))),
     );
     out
@@ -385,7 +403,7 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
             if p.endpoint.tls { "on" } else { "off" }.into(),
             style::fg(),
         ),
-        writes_row(p),
+        writes_row(p, e.perms.as_ref()),
         kv("Values", "shown on screen, never saved".into(), style::fg()),
     ];
 
@@ -686,4 +704,39 @@ fn parsed_panel(frame: &mut Frame, area: Rect, app: &App, add: &AddState, p: &Pa
         Span::styled(mask(add.input.trim()), style::cmd()),
     ]));
     rows(frame, inner, lines, None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(spans: &[Span<'_>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn the_writes_row_counts_what_the_server_refuses() {
+        let mut p = crate::tui::fixtures::profiles().remove(2);
+        p.read_only = None;
+        let mut perms = crate::tui::fixtures::perms_with_probes();
+        assert!(text(&writes_row(&p, Some(&perms))).ends_with("on (default outside production)"));
+        for (label, status) in [
+            (crate::conn::PERM_ACL_DRYRUN, PermStatus::Allowed),
+            ("write HSET", PermStatus::Denied("NOPERM".into())),
+            ("write UNLINK", PermStatus::Denied("NOPERM".into())),
+            ("write SET", PermStatus::Allowed),
+        ] {
+            perms.checks.push(PermCheck { label, status });
+        }
+        assert!(text(&writes_row(&p, Some(&perms))).ends_with("on (2 refused by the server)"));
+        // Off says why it is off, whatever the server allows.
+        p.read_only = Some(true);
+        assert!(text(&writes_row(&p, Some(&perms))).ends_with("off (read_only = true)"));
+        // The write probes stay out of the permission list.
+        assert!(
+            ordered_checks(&perms)
+                .iter()
+                .all(|(l, _)| !crate::conn::is_write_probe(l))
+        );
+    }
 }

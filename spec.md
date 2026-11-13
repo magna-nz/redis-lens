@@ -114,7 +114,7 @@ A panel of 2 Analysis, after Expiry.
 | `0-6` | Switch view, 0 Connections to 6 Search |
 | `?` | Show or hide this key list |
 | `a` | Add a connection |
-| `:` | Open the command line for readonly commands |
+| `:` | Open the command line |
 | `q` `ctrl-c` | Quit |
 
 #### Connections
@@ -126,6 +126,7 @@ A panel of 2 Analysis, after Expiry.
 | `Home` `End` `g` `G` | Jump to the first or last row |
 | `enter` | Connect and scan |
 | `r` | Look for Docker containers again |
+| `w` | Turn writes on or off for the selected profile |
 
 #### Patterns
 
@@ -143,6 +144,8 @@ A panel of 2 Analysis, after Expiry.
 | `Y` | Copy a redis-cli --scan command for the pattern |
 | `r` | Scan again, keeping old results meanwhile |
 | `s` | Save a scan snapshot file |
+| `x` | Set a TTL on every key of the pattern |
+| `D` | Delete every key of the pattern |
 
 #### Patterns · key list
 
@@ -157,6 +160,7 @@ A panel of 2 Analysis, after Expiry.
 | `enter` | Show the selected key and its value |
 | `y` | Copy the selected key name to the clipboard |
 | `esc` | Clear the filter, or go back to Patterns |
+| `N` | Add a key |
 
 #### Patterns · key detail
 
@@ -170,6 +174,12 @@ A panel of 2 Analysis, after Expiry.
 | `n` | Load the next 100 items |
 | `y` | Copy the selected value as shown to the clipboard |
 | `esc` | Go back to the key list |
+| `e` | Edit the selected field, element or value |
+| `+` | Add a field, element or member |
+| `t` | Set or remove the TTL |
+| `R` | Rename the key (never overwrites one) |
+| `d` | Delete the selected field, element or member |
+| `D` | Delete the key |
 
 #### Analysis · TTL
 
@@ -263,6 +273,7 @@ A panel of 2 Analysis, after Expiry.
 | `esc` | Back to the groups |
 | `p` | Pause or resume polling |
 | `r` | Refresh this panel now |
+| `K` | Kill the selected connection |
 
 #### Server · Slow log
 
@@ -274,6 +285,8 @@ A panel of 2 Analysis, after Expiry.
 | `tab` `shift-tab` | Next or previous panel |
 | `p` | Pause or resume polling |
 | `r` | Refresh this panel now |
+| `c` | Change the slow log threshold or length |
+| `R` | Reset the slow log |
 
 #### Server · Monitor
 
@@ -301,6 +314,9 @@ A panel of 2 Analysis, after Expiry.
 | `esc` | Go back to the stream list |
 | `p` | Pause or resume polling |
 | `r` | Refresh this panel now, or read the entries again |
+| `c` | Claim a consumer's pending entries for another consumer |
+| `A` | Acknowledge the selected pending entry |
+| `X` | Trim the stream |
 
 #### Pub/Sub
 
@@ -317,6 +333,7 @@ A panel of 2 Analysis, after Expiry.
 | `esc` | Clear the filter, or stop the tail |
 | `p` | Pause or resume polling |
 | `r` | Refresh this panel now |
+| `P` | Publish a message |
 
 #### Search
 
@@ -334,12 +351,14 @@ A panel of 2 Analysis, after Expiry.
 | `y` | Copy the selected value as shown to the clipboard |
 | `esc` | Go back to the indexes and results |
 | `r` | Refresh this panel now |
+| `C` | Create an index |
+| `D` | Drop the selected index (its documents stay) |
 
 #### Command line panel · keys
 
 | Keys | Action |
 |---|---|
-| `enter` | Run the command (readonly commands only) |
+| `enter` | Run the command (writes go through the write gate) |
 | `↑↓` | Step through this session's commands |
 | `tab` | Complete a command, subcommand or loaded key name |
 | `PgUp` `PgDn` | Scroll the output |
@@ -577,7 +596,8 @@ Lists running containers whose image is redis, valkey, redis-stack or bitnami/re
 
 ```
 redis-lens                         open the TUI
-redis-lens conn add <name> --url <url> [--env prod|stage|local|other] [--password-stdin | --ask-password] [--entra] [--prefer-replica] [--provider P] [--ssh [USER@]HOST[:PORT] [--ssh-identity FILE] [--ssh-known-hosts FILE]] [--force] [--yes] [-- TOKEN_COMMAND...]
+redis-lens conn add <name> --url <url> [--env prod|stage|local|other] [--password-stdin | --ask-password] [--entra] [--prefer-replica] [--provider P] [--ssh [USER@]HOST[:PORT] [--ssh-identity FILE] [--ssh-known-hosts FILE]] [--force] [--yes] [--writes on|off [--confirm NAME]] [-- TOKEN_COMMAND...]
+redis-lens conn set <name> --writes on|off [--confirm NAME] [--yes]
 redis-lens conn list | remove <name> | test <name>
 redis-lens scan <name> [--sample N] [--match GLOB] [--max-rate N] [--save [--keep N] [--keep-days D]] [--json]
                 [--check RULE]... [--rules FILE] [--strict]
@@ -668,6 +688,8 @@ Phase 1 is built: [Navigation](#navigation), the [Shared command budget](#shared
   - **Writes:** off or on, and why (for example "production default");
   - **Values:** "shown on screen, never saved" (built with the [Key detail](#key-detail)).
 - **`w` (P3)** turns writes on or off for the selected profile and saves the change to the config file (`read_only = false` or `true`). See [Write permissions](#write-permissions).
+  - Turning writes on asks first, as in [Write permissions](#write-permissions) check 2: `y`/`n`, or type the profile name on `prod`. `skip_non_prod_confirm` does not apply to it. The change applies once the config file has it.
+  - Turning writes off never asks and applies at once, before the config file is saved; a failed save says so.
   - Docker containers have no saved profile, so `w` affects only the current session for them.
   - It is the only setting the TUI writes to the config file outside the add flow.
 
@@ -825,11 +847,14 @@ A write is sent only when all three checks allow it.
 1. **The server.** The connected user can only run what its ACL allows.
    - A `NOPERM` turns that action off for the session, with the reason ("the server refused HSET for this user"), never the username.
    - The permission check uses `ACL DRYRUN` where it is allowed (Redis 7.0 and later, `@admin`) to show which writes the user may send. Otherwise writes show as "checked by the server on use".
+   - A write `ACL DRYRUN` says is refused is off from the connect on, with the same reason. The Writes row on 0 Connections counts them ("2 refused by the server"). A write refused only for the probe's key or channel reads as "checked by the server on use", since the real key may be allowed.
 2. **The profile.** `read_only` in the config file. Unset means read-only exactly when env is `prod`.
    - Change it with `w` on Connections, `redis-lens conn set <name> --writes on|off`, or `conn add --writes on|off`.
-   - Turning writes on asks first. On a `prod` profile you must type the profile name: `conn set` reads it from the terminal, or `--confirm <name>` gives it, and `--yes` never replaces it. On other profiles it is `y`/`n`, and `--yes` skips the question.
+   - Turning writes on asks first. On a `prod` profile you must type the profile name: `conn set` reads it from the terminal, or `--confirm <name>` gives it, and `--yes` never replaces it. On other profiles it is `y`/`n`, and `--yes` (or `--confirm` with the name) skips the question. With no terminal and no answer given, it refuses and says which flag to pass.
+   - It asks only when the profile is read-only now: `conn set --writes on` on a profile with writes on, and `conn add --writes on` on a profile that isn't `prod`, don't ask.
    - Turning writes off never asks.
-3. **The action.** Each write asks according to the table. A setting in the config file, `[settings] skip_non_prod_confirm = true`, turns off the `y`/`n` prompts on profiles that aren't `prod`. It never applies to `prod`, and never to a prompt where you type a name.
+   - Only `read_only` changes in the config file; nothing about credentials is touched.
+3. **The action.** Each write asks according to the table. A setting in the config file, `[settings] skip_non_prod_confirm = true`, turns off the `y`/`n` prompts on profiles that aren't `prod`. It never applies to `prod`, to bulk actions, or to a prompt where you type a name.
 
 | Action | Read-only profile | Writes on, not `prod` | Writes on, `prod` |
 |---|---|---|---|
@@ -846,7 +871,7 @@ A write is sent only when all three checks allow it.
   - `RENAME` onto an existing key;
   - `FT.DROPINDEX`;
   - and every command with the `@dangerous` ACL category, read from `COMMAND INFO`.
-- **Each prompt** names the profile and shows the exact command it will send.
+- **Each prompt** names the profile and shows the exact command it will send, as one line with credentials masked and control characters escaped. It says when a write can't be undone. `y` sends, `n` or `esc` cancels; a typed name is sent with `enter`, and a name that doesn't match sends nothing. Values in a prompt stay on screen only, like every value.
 - **One gate:** every write goes through one write gate, which applies checks 2 and 3. Tests check that no write command reaches a read-only profile.
 
 ### Bulk actions

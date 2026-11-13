@@ -2,8 +2,9 @@
 //! or look things up (spec "Browsing, server views and writes"). Owner: wave A1; the
 //! per-view submodules belong to wave B.
 //!
-//! Contract: the types and signatures below are fixed. No request sends a write
-//! command. Only [`values`] (key values and stream entries, in pages), [`search`]
+//! Contract: the types and signatures below are fixed. Only [`LiveRequest::Write`]
+//! sends a write, and it carries a [`crate::write::Permit`], which only the write gate
+//! makes ([`write`]). Only [`values`] (key values and stream entries, in pages), [`search`]
 //! (query results) and the Pub/Sub tail ([`pubsub`]) read values, held as
 //! [`crate::value::Raw`] (spec "Values"); the command line ([`cmdline`]) holds its
 //! replies as [`cmdline::Output`], redacted the same way.
@@ -37,6 +38,7 @@ pub mod search;
 pub mod server;
 pub mod streams;
 pub mod values;
+pub mod write;
 
 /// The connection type the live task uses. It is cheap to clone.
 pub type Conn = MultiplexedConnection;
@@ -57,6 +59,8 @@ pub enum LiveRequest {
     Value(values::Request),
     /// The command line panel: a command's flags and docs, and the typed command.
     Command(cmdline::Request),
+    /// A write the gate let through (spec "Write permissions").
+    Write(crate::write::Permit),
 }
 
 /// The answer to a [`LiveRequest`], from the same group.
@@ -69,6 +73,7 @@ pub enum LiveReply {
     Search(search::Reply),
     Value(values::Reply),
     Command(cmdline::Reply),
+    Write(write::Reply),
 }
 
 /// Why a request failed. The text is always redis-lens's own fixed wording, never the
@@ -89,6 +94,10 @@ pub enum LiveError {
     Closed,
 }
 
+/// What a write's view hears when its question was answered no
+/// ([`LiveError::Failed`] with this text): nothing was sent.
+pub const CANCELLED: &str = "Cancelled: nothing was sent.";
+
 /// Runs one request: the dispatcher to the per-view `run` functions. Every command goes
 /// through `budget`.
 pub async fn run(
@@ -104,6 +113,7 @@ pub async fn run(
         LiveRequest::Search(r) => search::run(conn, budget, r).await.map(LiveReply::Search),
         LiveRequest::Value(r) => values::run(conn, budget, r).await.map(LiveReply::Value),
         LiveRequest::Command(r) => cmdline::run(conn, budget, r).await.map(LiveReply::Command),
+        LiveRequest::Write(p) => write::run(conn, budget, p).await.map(LiveReply::Write),
     }
 }
 

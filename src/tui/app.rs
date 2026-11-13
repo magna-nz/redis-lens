@@ -41,6 +41,10 @@ const MAX_FILTER: usize = 64;
 #[path = "views/mod.rs"]
 pub mod views;
 
+/// The one confirmation dialog of the write gate, and `w` on Connections.
+#[path = "confirm.rs"]
+pub mod confirm;
+
 use views::{Act, Ctx, LiveState, Owner, TailCmd, ViewState, Views};
 
 /// The seven views, switched with `0` to `6`.
@@ -397,12 +401,30 @@ pub enum Effect {
         id: ConnId,
         run: u64,
     },
+    /// Turn writes on or off for the saved profile `name`: `read_only` in the config
+    /// file, and nothing else ([`crate::config::Config::set_writes`]). Answered with
+    /// [`Msg::WritesSaved`] or [`Msg::WritesFailed`].
+    SetWrites {
+        name: String,
+        on: bool,
+    },
     Quit,
 }
 
 /// Results coming back from the runtime.
 #[derive(Debug)]
 pub enum Msg {
+    /// [`Effect::SetWrites`] saved the profile.
+    WritesSaved {
+        name: String,
+        on: bool,
+    },
+    /// [`Effect::SetWrites`] could not save it: why.
+    WritesFailed {
+        name: String,
+        on: bool,
+        error: String,
+    },
     Tick,
     /// A tick that also carries the time, so the app can tell how long a connect has taken.
     TickAt(Instant),
@@ -584,6 +606,10 @@ pub struct Session {
     pub rescan: bool,
     /// This run's live connection, for the views that poll or look things up.
     pub live: LiveState,
+    /// The write commands the server refused for this user, from `ACL DRYRUN` on
+    /// connect and every `NOPERM` since: those actions are off (spec "Write
+    /// permissions", check 1).
+    pub refusals: crate::write::Refusals,
 }
 
 impl Session {
@@ -794,6 +820,14 @@ pub struct App {
     next_req: u64,
     /// The id of the next Pub/Sub live tail ([`views::Act::subscribe`]).
     next_tail: u64,
+    /// `[settings]` from the config file.
+    pub settings: crate::write::Settings,
+    /// The write gate's question on screen, if any. While it is open every key goes to
+    /// it.
+    pub confirm: Option<confirm::Confirm>,
+    /// Writes sent and not answered yet, with their command names: a `NOPERM` answer
+    /// adds the name to the session's refusals.
+    live_writes: HashMap<ReqId, String>,
     /// The view-state methods called, in order, so tests see a stub view's calls
     /// arrive: `(owner, "show" | "hide" | "key" | "tick" | "reply" | "refresh" |
     /// "paste" | "open")`.
@@ -934,6 +968,9 @@ impl App {
             live_pending: HashMap::new(),
             next_req: 1,
             next_tail: 1,
+            settings: crate::write::Settings::default(),
+            confirm: None,
+            live_writes: HashMap::new(),
             #[cfg(test)]
             calls: Vec::new(),
         };
@@ -1336,6 +1373,7 @@ impl App {
             self.now,
             self.page(),
             self.sel_ticks(),
+            &self.settings,
         ))
     }
 
@@ -1370,6 +1408,8 @@ impl App {
             next_req,
             next_tail,
             live_pending,
+            live_writes,
+            settings,
             tick,
             now,
             ..
@@ -1379,12 +1419,23 @@ impl App {
             .iter()
             .find(|e| e.id == s.id)
             .and_then(|e| e.perms.as_ref());
-        let ctx = Ctx::new(screen, s, perms, *tick, *now, page, sel_ticks);
-        let mut act = Act::new(ctx, owner, next_req, live_pending, notice, next_tail);
+        let ctx = Ctx::new(screen, s, perms, *tick, *now, page, sel_ticks, settings);
+        let mut act = Act::new(
+            ctx,
+            owner,
+            next_req,
+            live_pending,
+            notice,
+            next_tail,
+            live_writes,
+        );
         let r = f(views, &mut act);
-        let (mut effects, tail) = act.into_parts();
+        let (mut effects, tail, ask) = act.into_parts();
         if let Some(cmd) = tail {
             effects.extend(self.tail_effect(cmd));
+        }
+        if let Some(ask) = ask {
+            self.ask_write(ask);
         }
         Some((r, effects))
     }
@@ -1546,6 +1597,10 @@ impl App {
         if self.notice.as_ref().is_some_and(|n| n.error) {
             self.notice = None;
         }
+        // The write gate's question takes every key while it is open (confirm.rs).
+        if self.confirm.is_some() {
+            return self.confirm_key(key);
+        }
         // The command line panel takes every key while it is open (views/cmdline.rs).
         if self.views.cmdline.open {
             return self.cmdline_key(key);
@@ -1689,6 +1744,8 @@ impl App {
             s.live = LiveState::Waiting;
         }
         self.live_pending.clear();
+        self.live_writes.clear();
+        self.confirm = None;
         // The live tail belongs to the replaced run: the runner drops it with it.
         self.views.pubsub.end_tail();
         // So does a Monitor run.
@@ -1810,6 +1867,10 @@ impl App {
     pub fn handle_paste(&mut self, text: String) -> Vec<Effect> {
         // The help overlay ignores everything but its own keys.
         if self.help {
+            return Vec::new();
+        }
+        if self.confirm.is_some() {
+            self.confirm_paste(&text);
             return Vec::new();
         }
         if self.views.cmdline.open {
@@ -1988,11 +2049,11 @@ impl App {
                 ConnSel::Add => return self.start_add(),
                 ConnSel::Entry(id) => return self.connect(id),
             },
-            _ => {
-                if plain_char(&key) == Some('r') {
-                    return self.rescan_docker();
-                }
-            }
+            _ => match plain_char(&key) {
+                Some('r') => return self.rescan_docker(),
+                Some('w') => return self.toggle_writes(),
+                _ => {}
+            },
         }
         Vec::new()
     }
@@ -2053,6 +2114,7 @@ impl App {
             previous: None,
             rescan: false,
             live: LiveState::Waiting,
+            refusals: crate::write::Refusals::default(),
         });
         self.patterns = PatternsState::default();
         self.sel = ViewSel::default();
@@ -2060,6 +2122,8 @@ impl App {
         // shown from them, so none is told it is hidden.
         self.views = Views::default();
         self.live_pending.clear();
+        self.live_writes.clear();
+        self.confirm = None;
         self.view = View::Patterns;
         vec![Effect::Connect {
             id,
@@ -2117,8 +2181,18 @@ impl App {
             }
             (KeyCode::Esc, _) if self.patterns.node.is_some() => return self.leave_node(),
             (_, Some('o')) => self.cycle_sort(),
+            (_, Some('x')) => return self.bulk_start(false),
+            (_, Some('D')) => return self.bulk_start(true),
             _ => {}
         }
+        Vec::new()
+    }
+
+    /// `x` (expire) or `D` (`delete`) on Patterns: bulk actions (spec "Bulk actions").
+    /// Part 3 builds them; until then they say so.
+    fn bulk_start(&mut self, delete: bool) -> Vec<Effect> {
+        let _ = delete;
+        self.set_info("Bulk actions are not built yet.");
         Vec::new()
     }
 
@@ -2282,6 +2356,8 @@ impl App {
                     self.notice = None;
                 }
             }
+            Msg::WritesSaved { name, on } => self.writes_saved(&name, on),
+            Msg::WritesFailed { name, on, error } => self.writes_failed(&name, on, &error),
             Msg::DockerFound(found) => self.set_docker(found),
             Msg::DockerFailed(_) => {
                 self.set_docker(Vec::new());
@@ -2316,10 +2392,16 @@ impl App {
                     e.perms = Some(perms);
                     e.target = Some(target.clone());
                 }
+                let refusals = self
+                    .entry(id)
+                    .and_then(|e| e.perms.as_ref())
+                    .map(confirm::refusals_of)
+                    .unwrap_or_default();
                 if let Some(s) = self.session.as_mut() {
                     s.server = server;
                     s.target = Some(target);
                     s.phase = Phase::Scanning;
+                    s.refusals = refusals;
                 }
                 let after = self.active_owner();
                 if before != after {
@@ -2514,6 +2596,12 @@ impl App {
                 let Some(owner) = self.live_pending.remove(&req_id) else {
                     return Vec::new();
                 };
+                if let Some(name) = self.live_writes.remove(&req_id)
+                    && let Err(crate::live::LiveError::Denied(_)) = &result
+                    && let Some(s) = self.session.as_mut()
+                {
+                    s.refusals.add(&name);
+                }
                 return self
                     .with_views(owner, "reply", |v, act| {
                         v.get_mut(owner).on_reply(req_id, result, act)
@@ -2525,6 +2613,8 @@ impl App {
                     return Vec::new();
                 }
                 self.live_pending.clear();
+                self.live_writes.clear();
+                self.close_write_question();
                 if let Some(e) = &error {
                     self.set_error(format!(
                         "The live connection closed: {e}. The server views stop until the next scan."
@@ -6030,6 +6120,7 @@ mod tests {
                 &app.docker,
                 app.session.as_ref().map(|s| (s.scan, s.phase.clone())),
                 &app.views,
+                &app.confirm,
             )
         )
     }

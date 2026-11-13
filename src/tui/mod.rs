@@ -122,7 +122,11 @@ async fn event_loop(
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut app = match loaded {
-        Ok(cfg) => App::new(cfg.profiles),
+        Ok(cfg) => {
+            let mut app = App::new(cfg.profiles);
+            app.settings = cfg.settings;
+            app
+        }
         Err(e) => {
             let mut app = App::new(Vec::new());
             app.set_error(conn::parse::mask(&e.to_string()));
@@ -528,6 +532,20 @@ impl Runner {
                     Arc::clone(&self.live),
                 )));
             }
+            Effect::SetWrites { name, on } => {
+                let path = self.path.clone();
+                tokio::task::spawn_blocking(move || {
+                    let msg = match save_writes(&path, &name, on) {
+                        Ok(()) => Msg::WritesSaved { name, on },
+                        Err(e) => Msg::WritesFailed {
+                            name,
+                            on,
+                            error: e.to_string(),
+                        },
+                    };
+                    send(&tx, msg);
+                });
+            }
             Effect::SaveConnection {
                 profile,
                 credentials,
@@ -611,6 +629,15 @@ fn load_trend(dir: &Path, report: &ScanReport) -> Result<snapshot::Trend, snapsh
     )?;
     reports.push(report.clone());
     Ok(snapshot::trend(&reports))
+}
+
+/// `w` on Connections: `read_only` of profile `name` in the config file, and nothing
+/// else (spec "0 Connections, additions").
+fn save_writes(path: &Path, name: &str, on: bool) -> anyhow::Result<()> {
+    let mut config = Config::load(path)?;
+    config.set_writes(name, on)?;
+    config.save(path)?;
+    Ok(())
 }
 
 /// Save a new profile the way `conn add` does: credentials to the keychain first, so

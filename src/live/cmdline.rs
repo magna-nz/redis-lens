@@ -296,6 +296,16 @@ impl Output {
         &self.lines
     }
 
+    /// One error line (from [`run_error`]), as the reply.
+    pub fn error_line(line: String, took: Duration) -> Self {
+        Self {
+            lines: vec![line],
+            cut: false,
+            error: true,
+            took,
+        }
+    }
+
     /// `v` formatted by [`format_reply`].
     pub fn of(v: &Value, took: Duration) -> Self {
         let (lines, cut) = format_reply(v);

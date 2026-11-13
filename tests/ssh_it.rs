@@ -287,6 +287,8 @@ fn add_args(name: &str, url: &str, ssh: &str, w: &World) -> ConnAddArgs {
         provider: None,
         token_command: Vec::new(),
         yes: false,
+        writes: None,
+        confirm: None,
         ssh: Some(ssh.into()),
         ssh_identity: Some(w.key.private.clone()),
         ssh_known_hosts: Some(w.known_hosts.clone()),
