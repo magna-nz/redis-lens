@@ -1,9 +1,11 @@
-//! Draws [`ServerState`]: the Overview, Clients and Slow log panels. Owner: wave B, with
-//! `views/server.rs`.
+//! Draws [`ServerState`]: the Overview, Clients, Slow log and Monitor panels. Owner: wave
+//! B, with `views/server.rs`.
 //!
 //! Every line is cut with `…` to the width of its panel, so nothing wraps at 80 columns.
 //! Text from the server (names, keys, addresses) was cleaned of control characters when
-//! it was parsed.
+//! it was parsed. Commands (Slow log arguments, Monitor lines) are drawn as
+//! `live::command::masked_line` writes them, credentials masked, and through
+//! `value::escape`.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -11,16 +13,18 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::format;
+use crate::live::monitor::{Entry, MAX_LINES, MAX_TIME};
 use crate::live::server::{InfoSample, Role, SlowEntry};
 use crate::snapshot::format_utc;
 use crate::tui::app::Screen;
 use crate::tui::app::views::server::{
-    CLIENTS_EVERY, Clients, Group, HISTORY, IDLE_FLAG_SECS, Metric, Overview, Poll, SLOWLOG_EVERY,
-    ServerState, SlowLog, lib_label, note_of, sparkline,
+    CLIENTS_EVERY, Clients, Group, HISTORY, IDLE_FLAG_SECS, Metric, Monitor, Overview, Poll,
+    Prompt, SLOWLOG_EVERY, ServerState, SlowLog, lib_label, note_of, sparkline,
 };
 use crate::tui::app::views::{Ctx, LiveState};
+use crate::value::escape;
 
-use super::widgets::{fit, pad_l, pad_r, panel, rows, scroll_offset};
+use super::widgets::{fit, pad_l, pad_r, panel, rows, scroll_offset, trunc};
 use super::{notice_panels, style, utc_time};
 
 const LABEL_W: usize = 11;
@@ -33,6 +37,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
         Screen::Overview => overview(frame, area, state, ctx),
         Screen::Clients => clients(frame, area, state, ctx),
         Screen::SlowLog => slow_log(frame, area, state, ctx),
+        Screen::Monitor => monitor(frame, area, &state.monitor, ctx),
         _ => super::not_built(frame, area, ctx.screen.name(), ctx),
     }
 }
@@ -522,7 +527,7 @@ fn slow_log(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
     if gate(frame, area, "Slow log", &s.poll, ctx) {
         return;
     }
-    let [main, detail] = Layout::vertical([Constraint::Min(0), Constraint::Length(6)]).areas(area);
+    let [main, detail] = Layout::vertical([Constraint::Min(0), Constraint::Length(7)]).areas(area);
     let right = right_title(
         state,
         &secs(SLOWLOG_EVERY),
@@ -625,6 +630,7 @@ fn entry_panel(frame: &mut Frame, area: Rect, s: &SlowLog) {
             ],
             w,
         )),
+        Line::from(fit(args_spans(label("args"), e), w)),
         Line::from(fit(vec![label("keys"), Span::styled(keys, style::fg())], w)),
         Line::from(fit(
             vec![label("client"), Span::styled(client, style::fg())],
@@ -636,6 +642,217 @@ fn entry_panel(frame: &mut Frame, area: Rect, s: &SlowLog) {
             vec![Span::styled(format!(" ▲ {}", n.text()), style::amber())],
             w,
         )));
+    }
+    rows(frame, inner, lines, None);
+}
+
+/// The `args` line of a slow log entry: the command line as the masker wrote it, and how
+/// many arguments the server left out.
+fn args_spans(label: Span<'static>, e: &SlowEntry) -> Vec<Span<'static>> {
+    let line = escape(&String::from_utf8_lossy(e.args.as_bytes()));
+    let mut spans = vec![label, Span::styled(line, style::fg())];
+    if e.args_cut > 0 {
+        spans.push(Span::styled(
+            format!(" … {} more arguments", format::grouped(e.args_cut)),
+            style::dim(),
+        ));
+    }
+    spans
+}
+
+// ---------------------------------------------------------------------------
+// Monitor
+// ---------------------------------------------------------------------------
+
+const M_TIME_W: usize = 13;
+const M_DB_W: usize = 4;
+const M_CLIENT_W: usize = 22;
+
+/// `13:04:05.123` (UTC) for a line, `—` when its time is unreadable.
+fn line_time(e: &Entry) -> String {
+    e.unix().map_or_else(
+        || "—".to_string(),
+        |u| format!("{}.{:03}", utc_time(u), e.millis()),
+    )
+}
+
+fn monitor_right(m: &Monitor, ctx: &Ctx<'_>) -> String {
+    let lines = format::grouped(m.lines.len() as u64);
+    if m.prompt.is_some() {
+        "asking first".to_string()
+    } else if m.running() && !m.ready {
+        "starting…".to_string()
+    } else if m.running() {
+        let left = m.left(ctx.now).unwrap_or(MAX_TIME).as_secs();
+        format!("running · {lines} lines · {left} s left · UTC")
+    } else if m.stopped.is_some() {
+        format!("stopped · {lines} lines kept · UTC")
+    } else {
+        "not started".to_string()
+    }
+}
+
+fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
+    let [main, detail] = Layout::vertical([Constraint::Min(0), Constraint::Length(5)]).areas(area);
+    let inner = panel(frame, main, "Monitor", &monitor_right(m, ctx));
+    let w = usize::from(inner.width);
+    let text = |t: String, st: Style| Line::from(fit(vec![Span::styled(t, st)], w));
+    if let Some(p) = &m.prompt {
+        let profile = &ctx.profile().name;
+        let mut lines = vec![
+            Line::default(),
+            text(format!(" Send MONITOR to {profile}?"), style::fgb()),
+            Line::default(),
+            text(
+                " MONITOR runs on a connection of its own, and the server copies every".to_string(),
+                style::fg(),
+            ),
+            text(
+                " command it runs to it. That slows a busy server.".to_string(),
+                style::fg(),
+            ),
+            text(
+                format!(
+                    " It stops after {} s or {} lines, or with esc. The lines stay in memory.",
+                    MAX_TIME.as_secs(),
+                    format::grouped(MAX_LINES as u64)
+                ),
+                style::dim(),
+            ),
+            Line::default(),
+        ];
+        lines.push(match p {
+            Prompt::YesNo => text(" y starts it, n cancels.".to_string(), style::amber()),
+            Prompt::TypeName(_) => text(
+                format!(" A production profile: type {profile}, then enter. esc cancels."),
+                style::amber(),
+            ),
+        });
+        rows(frame, inner, lines, None);
+        panel(frame, detail, "Line", "");
+        return;
+    }
+    let status = if let Some(why) = crate::conn::monitor_unsupported(ctx.profile()) {
+        text(format!(" ▲ {why}"), style::amber())
+    } else if let Some(stop) = &m.stopped {
+        let st = if matches!(
+            stop,
+            crate::tui::app::views::server::Stop::Failed(_)
+                | crate::tui::app::views::server::Stop::Lost
+        ) {
+            style::amber()
+        } else {
+            style::dim()
+        };
+        let mut t = format!(" {}", stop.text());
+        if m.ranking().is_some() && ctx.report().is_some_and(|r| r.hot_keys.is_empty()) {
+            t.push_str(" Hot keys (2) ranks its keys.");
+        }
+        text(t, st)
+    } else if m.running() {
+        text(" esc stops it.".to_string(), style::dim())
+    } else {
+        text(
+            " enter starts MONITOR, after asking. It shows every command the server runs."
+                .to_string(),
+            style::dim(),
+        )
+    };
+    let cw = w.saturating_sub(1 + M_TIME_W + M_DB_W + M_CLIENT_W).max(8);
+    let head = Line::from(fit(
+        vec![Span::styled(
+            format!(
+                " {}{}{}{}",
+                pad_r("TIME", M_TIME_W),
+                pad_r("DB", M_DB_W),
+                pad_r("CLIENT", M_CLIENT_W),
+                pad_r("COMMAND", cw),
+            ),
+            style::hd(),
+        )],
+        w,
+    ));
+    let mut lines = vec![status, head];
+    let body_h = usize::from(inner.height).saturating_sub(lines.len());
+    let off = scroll_offset(m.sel, body_h);
+    lines.extend(m.lines.iter().skip(off).take(body_h).map(|e| {
+        Line::from(fit(
+            vec![
+                Span::styled(format!(" {}", pad_r(&line_time(e), M_TIME_W)), style::dim()),
+                Span::styled(pad_r(&escape(&e.line.db), M_DB_W), style::dim()),
+                Span::styled(
+                    pad_r(&trunc(&escape(&e.line.client), M_CLIENT_W - 1), M_CLIENT_W),
+                    style::dim(),
+                ),
+                Span::styled(escape(&e.command_line()), style::fg()),
+            ],
+            w,
+        ))
+    }));
+    let selected = (!m.lines.is_empty()).then(|| m.sel.saturating_sub(off) + 2);
+    if m.lines.is_empty() && (m.running() || m.stopped.is_some()) {
+        let t = if m.running() {
+            " No lines yet."
+        } else {
+            " No lines."
+        };
+        lines.push(text(t.to_string(), style::dim()));
+    }
+    rows(frame, inner, lines, selected);
+    line_panel(frame, detail, m.selected());
+}
+
+/// The selected line in full, as far as two rows take it.
+fn line_panel(frame: &mut Frame, area: Rect, e: Option<&Entry>) {
+    let inner = panel(frame, area, "Line", "");
+    let w = usize::from(inner.width);
+    let Some(e) = e else {
+        return;
+    };
+    let when = e.unix().map_or_else(|| "—".to_string(), format_utc);
+    let first = Line::from(fit(
+        vec![
+            Span::styled(" ", style::dim()),
+            Span::styled(when, style::fg()),
+            Span::styled(" · db ", style::dim()),
+            Span::styled(escape(&e.line.db), style::fg()),
+            Span::styled(" · client ", style::dim()),
+            Span::styled(escape(&e.line.client), style::fg()),
+        ],
+        w,
+    ));
+    let mut cmd = escape(&e.command_line());
+    if e.cut > 0 {
+        cmd.push_str(&format!(
+            " … {} more arguments not kept",
+            format::grouped(e.cut)
+        ));
+    }
+    let room = w.saturating_sub(1).max(1);
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut lines = vec![first];
+    let mut rest: &[char] = &chars;
+    for row in 0..2 {
+        if rest.is_empty() {
+            break;
+        }
+        let mut take = 0;
+        let mut used = 0;
+        while take < rest.len() {
+            let cw = super::widgets::width(&rest[take].to_string());
+            if used + cw > room {
+                break;
+            }
+            used += cw;
+            take += 1;
+        }
+        take = take.max(1);
+        let mut part: String = rest[..take].iter().collect();
+        rest = &rest[take..];
+        if row == 1 && !rest.is_empty() {
+            part = trunc(&format!("{part}…"), room);
+        }
+        lines.push(Line::from(Span::styled(format!(" {part}"), style::fg())));
     }
     rows(frame, inner, lines, None);
 }

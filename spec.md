@@ -48,6 +48,32 @@ The TUI has seven views, switched with `0` to `6`, some with panels ([Navigation
 - **Narrowed to a node.** On a cluster scan, `enter` on the [Nodes](#nodes) panel shows that node's own patterns (estimated for that node alone) instead of the merged ones, from the top row. The title reads `Patterns · node <address>` and the right side starts with `esc for all nodes`. Sort, filter, folding, copy and the detail panel work as usual, except that there is no Δ column and no context strip (the snapshot diff and the server figures are of the whole cluster), and the detail panel has no example keys (they are kept on the merged rows) and says so. `esc` clears a filter first; with no filter it goes back to the merged patterns, keeping the selected pattern selected, and back to the Nodes panel. The narrowing lasts across views and across a rescan whose report has the same node (same node ID and address); it ends when partial results of a rescan come in (they are merged), when the new report lacks the node, and on a new connect. `s` saves the whole report.
 - **Context strip.** For a finished scan, the table's bottom border shows the server's exact figures beside the estimates: how much of `MEMORY STATS` `dataset.bytes` the sample's estimated memory explains; the exact key count and the share with a TTL (`INFO keyspace`); the number of big keys from `INFO keysizes` (strings of 1 MiB or more, collections of 65,536 items or more); "no MEMORY STATS" with the reason when it is missing; and "▲ possible sampling bias" when the sample disagrees sharply with `INFO keysizes`. It is cut with `…` on narrow terminals and is absent while partial results show. The sampling-bias warning has two triggers, and neither applies with `MATCH`: the histogram counts strings of 1 MiB or more but no sampled string or mixed-type pattern is that large (`MEMORY USAGE` is never below a string's length); or a type's share of keys differs by 20 points or more between the histogram and the sample (at least 100 keys on each side, mixed-type patterns at most 10% of the sample). `redis-lens scan` prints the same figures as text lines.
 
+### Key detail
+
+`enter` on a key of the [key list](#1-patterns-additions) opens it, one level below the key list on 1 Patterns (`Patterns · key detail`). With no key selected it says so. `esc` goes back to the key list. Switching views and coming back to 1 Patterns shows it again. Opening the same key again keeps what it loaded; another key starts afresh. A new connect closes it. Like the key list it reads one server, so it is off on a cluster ([Navigation](#navigation)).
+
+- **Metadata** on the left comes from the key list's row, so it costs no command: type, encoding, length (bytes for a string; fields, items, members or entries for the others), size, TTL, field TTLs (for a hash on a server with `HTTL`: how many of the loaded fields have one), LFU counter (under an LFU policy), pattern, and the pattern's verdict as the VERDICT column of 1 Patterns gives it.
+- **The value** on the right is read in pages through the [command budget](#shared-command-budget-p1). The first page loads when the screen shows; `n` loads the next. The title says how many items are loaded of the key's length. At most 10,000 items are held; past that `n` says so. These are the only commands sent:
+  - every first page: `TYPE`, pipelined with that page's commands for the type the key list saw. `none` means the key is gone: "The key no longer exists." The type `TYPE` returns is the one read; it may differ from the key list's;
+  - string: `STRLEN` and `GETRANGE key 0 65535`. A longer string shows its first 64 KiB, and the title says of how much;
+  - hash: `HSCAN key cursor COUNT 100`, then `HTTL key FIELDS n …` for that page's fields;
+  - list: `LRANGE key i i+99`, with each element's index;
+  - set: `SSCAN key cursor COUNT 100`;
+  - sorted set: `ZRANGE key i i+99 WITHSCORES`, members and scores;
+  - stream: `XREVRANGE key + - COUNT 100`, newest first, then `XREVRANGE key (<last id> - COUNT 100`;
+  - JSON (`ReJSON-RL`): `JSON.GET key`, only when the key list's size (`MEMORY USAGE`) is known and at most 256 KiB. The document is shown up to 64 KiB, and the panel says when it is cut. Without a known size, or above 256 KiB, it is not read and the panel says why;
+  - vector set: `VRANDMEMBER key 100`, 100 random elements. A vector set can't be read in pages, and the panel says so;
+  - any other type: only the metadata, and "redis-lens does not read values of type <type>".
+
+  A field or member that `HSCAN` or `SSCAN` returns twice is listed once.
+- **Field TTLs** are read only on Redis 7.4 and later and Valkey 9.0 and later, from the version read on connect. On older servers the TTL column and the Field TTL row are hidden and `HTTL` is never sent. When `HTTL` is refused or unknown, field TTLs are off for the rest of the session, with a note.
+- **Layout:** a collection lists its items (field, value and TTL for a hash; index and element; member; member and score; entry ID and its fields), each value shortened to one line. Below a divider, the selected item's value is shown in full. Its header gives the name, the format, the size and "auto-detected" or "shown as <format>", and "decompressed from gzip" (or zlib, LZ4, zstd), "truncated at 1 MiB" or the renderer's own note when they apply. A stream entry lists each field name with its value. A string or a JSON document shows just its value.
+- **Focus:** `tab` moves between the items and the value. The move keys move the selection, or scroll the value when it has the focus. A string or a document always scrolls.
+- **Formats:** `f` shows the value in the next format (text, hex, JSON, MessagePack, then text again), starting from the detected one, and says so ("Shown as hex."). It holds for every item of the key until another key is opened. Detection is in [Values](#values).
+- **Copy:** `y` copies the selected value in the format shown. Text with control characters, a newline included, is not copied: "The value has control characters, so it is not copied: press f for hex, then y." A stream entry has several fields, so it is not copied.
+- **Refusals** (rule 3): a read the server refuses is turned off, and the panel says so in redis-lens's own words ("Can't read the value: the server refused HSCAN for this user."), never with the server's text or the username. `n` does not send it again. A refused `STRLEN` only leaves the length out. Any other failure shows its reason, and `n` tries again. `r` does nothing here.
+- **Terminal safety:** everything from the server drawn here (values, field names, members, entry IDs, the type name, the key name in the title) shows control characters and escape sequences as escapes (`\x1b`), never raw.
+
 ### 2 TTL
 - Patterns ranked by TTL risk:
   - **mixed** means most keys expire but some don't, which is probably a bug
@@ -65,7 +91,8 @@ The TUI has seven views, switched with `0` to `6`, some with panels ([Navigation
 ### 4 Hot keys
 - Up to 50 sampled keys with an LFU counter (`OBJECT FREQ`) above 0, ranked by that counter, showing the key, pattern, type, counter and size. On a cluster scan they are the top 50 across the cluster, and a NODE column after the key shows the address of the node each key was sampled on (cut with `…` to 15 cells); the detail panel names it in full. A standalone scan keeps the columns above.
 - Keys with a counter of at least 100 and a size of at least 10 MiB are flagged as hot and big.
-- Needs an LFU eviction policy. Without one, the view says so. Planned: it offers a time-limited `MONITOR` sample from the Server view's Monitor panel (phase 2, see [3 Server](#3-server)). This was planned for v0.2 and not built.
+- Needs an LFU eviction policy. Without one, the view says so, and points to the Server view's Monitor panel.
+- **From MONITOR (P2):** when the scan has no hot keys (no LFU counters, or `OBJECT FREQ` refused) and a Monitor run has ended in this session, the view ranks up to 50 keys by how often the last run's lines name them: key, pattern, count, and the share of the run's lines. The title says where the ranking came from, such as `from MONITOR, 30 s, 8,412 lines, at 13:04 UTC`. Key positions come from the key specs the Slow log uses (one cache per session); the commands not in it are asked with `COMMAND INFO` through the command budget when the run ends, at most 64 names a request. Lines whose command's keys can't be placed (`COMMAND INFO` refused, a command the server does not know) are counted and named in the detail panel. `y` and `Y` copy as on the LFU ranking. The ranking is never saved: it is not part of the scan, so neither `s` nor a report holds it.
 
 ### Nodes
 
@@ -87,6 +114,7 @@ A panel of 2 Analysis, after Expiry.
 | `0-6` | Switch view, 0 Connections to 6 Search |
 | `?` | Show or hide this key list |
 | `a` | Add a connection |
+| `:` | Open the command line for readonly commands |
 | `q` `ctrl-c` | Quit |
 
 #### Connections
@@ -126,8 +154,22 @@ A panel of 2 Analysis, after Expiry.
 | `/` | Filter the loaded keys by name |
 | `o` | Sort the loaded keys |
 | `n` | Load 1,000 more keys |
+| `enter` | Show the selected key and its value |
 | `y` | Copy the selected key name to the clipboard |
 | `esc` | Clear the filter, or go back to Patterns |
+
+#### Patterns · key detail
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection, or scroll the value |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Move between the items and the value |
+| `f` | Show the value as text, hex, JSON or MessagePack |
+| `n` | Load the next 100 items |
+| `y` | Copy the selected value as shown to the clipboard |
+| `esc` | Go back to the key list |
 
 #### Analysis · TTL
 
@@ -233,16 +275,32 @@ A panel of 2 Analysis, after Expiry.
 | `p` | Pause or resume polling |
 | `r` | Refresh this panel now |
 
+#### Server · Monitor
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Scroll the lines |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel |
+| `enter` | Start MONITOR after asking; it stops after 30 s or 10,000 lines |
+| `esc` | Stop MONITOR now |
+
 #### Streams
 
 | Keys | Action |
 |---|---|
-| `↑↓` `j` `k` | Move the selection |
+| `↑↓` `j` `k` | Move the selection, or scroll the value |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Move between the list and the details |
+| `tab` `shift-tab` | Move between the list and the details, or the entries and the value |
+| `enter` | List the selected stream's entries |
+| `n` | Load 100 more entries |
+| `f` | Show the value as text, hex, JSON or MessagePack |
+| `y` | Copy the selected value as shown to the clipboard |
+| `esc` | Go back to the stream list |
 | `p` | Pause or resume polling |
-| `r` | Refresh this panel now |
+| `r` | Refresh this panel now, or read the entries again |
 
 #### Pub/Sub
 
@@ -251,6 +309,12 @@ A panel of 2 Analysis, after Expiry.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
+| `enter` | Subscribe to the selected channel |
+| `s` | Subscribe to a channel or pattern |
+| `space` | Pause or resume the tail |
+| `c` | Clear the tail |
+| `/` | Filter the tail |
+| `esc` | Clear the filter, or stop the tail |
 | `p` | Pause or resume polling |
 | `r` | Refresh this panel now |
 
@@ -258,29 +322,56 @@ A panel of 2 Analysis, after Expiry.
 
 | Keys | Action |
 |---|---|
-| `↑↓` `j` `k` | Move the selection |
+| `↑↓` `j` `k` | Move the selection, or scroll the text |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Move between the list and the details |
+| `tab` `shift-tab` | Move between the list and the details, or the fields and the value |
+| `/` | Run a query on the selected index |
+| `enter` | Open the selected result |
+| `e` | Explain the query |
+| `P` | Profile the query |
+| `f` | Show the value as text, hex, JSON or MessagePack |
+| `y` | Copy the selected value as shown to the clipboard |
+| `esc` | Go back to the indexes and results |
 | `r` | Refresh this panel now |
 
-The key bar shows the main keys of the current screen, from this table: Connections `↑↓ Move · enter Connect · a Add · r Rescan Docker · 0-6 View · ? Help · q Quit`; Patterns `↑↓ Move · →← Fold · enter Open · / Filter · o Sort · 0-6 View · ? Help · q Quit`; the key list `↑↓ Move · / Filter · o Sort · n More · esc Back · 0-6 View · ? Help · q Quit`; TTL, Diff, Hot keys and Big keys with a result `↑↓ Move · tab Panel · r Rescan · s Snapshot · 0-6 View · ? Help · q Quit`, Expiry with a result `tab Panel · r Rescan · s Snapshot · 0-6 View · ? Help · q Quit`, Nodes with a result `↑↓ Move · tab Panel · enter Patterns · r Rescan · 0-6 View · ? Help · q Quit`, and the Analysis panels without one `tab Panel · 0-6 View · a Add · ? Help · q Quit`; once connected, Overview `tab Panel · p Pause · +- Interval · r Refresh · 0-6 View · ? Help · q Quit`, Clients `tab Panel · ↑↓ Move · enter List · r Refresh · 0-6 View · ? Help · q Quit`, Slow log `tab Panel · ↑↓ Move · p Pause · r Refresh · 0-6 View · ? Help · q Quit`, Streams `↑↓ Move · tab Details · p Pause · r Refresh · 0-6 View · ? Help · q Quit`, Pub/Sub `↑↓ Move · p Pause · r Refresh · 0-6 View · ? Help · q Quit` and Search `↑↓ Move · tab Details · r Refresh · 0-6 View · ? Help · q Quit`; before that, the Server panels `tab Panel · 0-6 View · a Add · ? Help · q Quit` and Streams, Pub/Sub and Search `0-6 View · a Add · ? Help · q Quit`. Snapshot and rescan on Patterns, snapshot on Nodes, paging and copy are only in the `?` overlay, so the bar fits 80 columns. A notice or an input line replaces the bar while shown. A test checks that this table is exactly what `keymap::markdown()` renders.
+#### Command line panel · keys
+
+| Keys | Action |
+|---|---|
+| `enter` | Run the command (readonly commands only) |
+| `↑↓` | Step through this session's commands |
+| `tab` | Complete a command, subcommand or loaded key name |
+| `PgUp` `PgDn` | Scroll the output |
+| `ctrl-l` | Clear the output |
+| `ctrl-u` | Clear the input line |
+| `esc` | Close the command line, or cancel a question |
+
+The key bar shows the main keys of the current screen, from this table: Connections `↑↓ Move · enter Connect · a Add · r Rescan Docker · 0-6 View · ? Help · q Quit`; Patterns `↑↓ Move · →← Fold · enter Open · / Filter · o Sort · 0-6 View · ? Help · q Quit`; the key list `↑↓ Move · / Filter · o Sort · n More · esc Back · 0-6 View · ? Help · q Quit`; the key detail `↑↓ Move · tab Value · f Format · n More · esc Back · 0-6 View · ? Help · q Quit`; TTL, Diff, Hot keys and Big keys with a result `↑↓ Move · tab Panel · r Rescan · s Snapshot · 0-6 View · ? Help · q Quit`, Expiry with a result `tab Panel · r Rescan · s Snapshot · 0-6 View · ? Help · q Quit`, Nodes with a result `↑↓ Move · tab Panel · enter Patterns · r Rescan · 0-6 View · ? Help · q Quit`, and the Analysis panels without one `tab Panel · 0-6 View · a Add · ? Help · q Quit`; once connected, Overview `tab Panel · p Pause · +- Interval · r Refresh · 0-6 View · ? Help · q Quit`, Clients `tab Panel · ↑↓ Move · enter List · r Refresh · 0-6 View · ? Help · q Quit`, Slow log `tab Panel · ↑↓ Move · p Pause · r Refresh · 0-6 View · ? Help · q Quit`, Monitor `tab Panel · enter Start · esc Stop · ↑↓ Scroll · 0-6 View · ? Help · q Quit`, Streams `↑↓ Move · tab Details · enter Entries · p Pause · 0-6 View · ? Help · q Quit`, Pub/Sub `↑↓ Move · enter Subscribe · space Pause · / Filter · 0-6 View · ? Help · q Quit` and Search `↑↓ Move · tab Details · / Query · enter Open · 0-6 View · ? Help · q Quit`; before that, the Server panels `tab Panel · 0-6 View · a Add · ? Help · q Quit` and Streams, Pub/Sub and Search `0-6 View · a Add · ? Help · q Quit`. Snapshot and rescan on Patterns, snapshot on Nodes, `enter` on the key list, `r` on Streams and Search, `s`, `c`, `esc`, `p` and `r` on Pub/Sub, the keys of a stream's entries and of Search's results (`n`, `f`, `e`, `P`, `esc`), paging and copy, and `:` (the command line), are only in the `?` overlay, so the bar fits 80 columns; the bar on Streams and Search is the same with the entries, a result, or an explain or profile open. A notice or an input line replaces the bar while shown; while the command line is open, its input line does. A test checks that this table is exactly what `keymap::markdown()` renders.
 
 ### Help overlay
 
-`?` opens a centred overlay titled "Keys · <view>" that lists the keys that work everywhere and the current view's keys. `?` or `esc` closes it; `q` and ctrl-c still quit; every other key is ignored while it is open. On small terminals it shrinks to the screen and cuts text with `…`. In the add flow and the filter input every key is text, `?`, `y`, `Y` and `r` included.
+`?` opens a centred overlay titled "Keys · <view>" that lists the keys that work everywhere and the current view's keys. `?` or `esc` closes it; `q` and ctrl-c still quit; every other key is ignored while it is open. On small terminals it shrinks to the screen and cuts text with `…`. In the add flow, the filter input, the Search query input and the Pub/Sub inputs (`s` and `/`) every key is text, `?`, `y`, `Y` and `r` included.
 
 ### Rescan
 
-`r` on Patterns and on every panel of Analysis (Nodes included) scans the shown connection again as a new run, the same way `enter` connects it (same scan options, rate limit and read-only rules; the connection's current profile and credential source). It works when the scan has finished or failed. While a connect or scan is running it only says "A scan is already running"; with no connection yet it says to connect first. On Connections `r` still looks for Docker containers again. On Server, Streams, Pub/Sub and Search `r` fetches the panel on screen again instead of scanning. The key list has no `r`: go back to Patterns with `esc` to scan again. A rescan of a cluster connects and discovers its shards again.
+`r` on Patterns and on every panel of Analysis (Nodes included) scans the shown connection again as a new run, the same way `enter` connects it (same scan options, rate limit and read-only rules; the connection's current profile and credential source). It works when the scan has finished or failed. While a connect or scan is running it only says "A scan is already running"; with no connection yet it says to connect first. On Connections `r` still looks for Docker containers again. On Server, Streams, Pub/Sub and Search `r` fetches the panel on screen again instead of scanning; with a stream's entries open it reads them again from the newest, and on Search it also asks again for query commands that were refused. The key list and the key detail have no `r`: go back to Patterns with `esc` to scan again. A rescan of a cluster connects and discovers its shards again.
 
 A rescan keeps the view, the Patterns filter, collapsed groups, sort, selected row and node narrowing (see [1 Patterns](#1-patterns)), and the TTL, Diff, Hot keys and Nodes selections (moved to the last row if the new results are shorter). A rescan of a cluster connects and discovers its shards again. The previous results stay on every view, marked `rescanning · previous results` at the start of the panel title, until the new run's first partial results arrive. From then on Patterns shows the partial results (the selection follows its row) and TTL, Diff and Hot keys wait for the finished scan. If the rescan fails before any results of its own, the error is shown and the previous results stay, marked `rescan failed · previous results`. If it fails after partial results it behaves like any failed scan. While a rescan runs, `s` says to wait for it to finish; it never saves partial results and does not save the previous results again. Results, partials and progress of the replaced run are ignored. The one exception is the replaced run's snapshot lookup, which still fills in the Diff of its own report while that report is on screen. A slow keychain read during a rescan shows the keychain hint in the status line.
 
 ### Copy
 
-`y` copies the selected row's pattern: a group row copies its label, such as `user:{id}:*`; on Hot keys it copies the key name. `Y` copies the suggested command `redis-cli --scan --pattern "<glob>"` for that pattern (on Hot keys, the key's pattern), the same text as the `$` line in the detail panel. Key names are chosen by whoever writes keys, and no one quoting style is safe in every shell (POSIX shells, fish, PowerShell, cmd.exe), so the command is only offered when every character of the glob is an ASCII letter or digit or one of `_ : . / * ? { } [ ] @ # + = , ~ - |`, none of which is special inside double quotes in any of them. For any other pattern the detail panel's command line says there is no command (without the `$ ` prompt) and `Y` says why; `y` still copies the pattern. `y` never copies text with control characters (a pasted newline would run what follows it) and says so. Only on Patterns, TTL, Diff and Hot keys, and on Big keys and the key list, where `y` copies the key name; never on Connections or Nodes, or in the add flow or filter input. With nothing selected it says so.
+`y` copies the selected row's pattern: a group row copies its label, such as `user:{id}:*`; on Hot keys it copies the key name. `Y` copies the suggested command `redis-cli --scan --pattern "<glob>"` for that pattern (on Hot keys, the key's pattern), the same text as the `$` line in the detail panel. Key names are chosen by whoever writes keys, and no one quoting style is safe in every shell (POSIX shells, fish, PowerShell, cmd.exe), so the command is only offered when every character of the glob is an ASCII letter or digit or one of `_ : . / * ? { } [ ] @ # + = , ~ - |`, none of which is special inside double quotes in any of them. For any other pattern the detail panel's command line says there is no command (without the `$ ` prompt) and `Y` says why; `y` still copies the pattern. `y` never copies text with control characters (a pasted newline would run what follows it) and says so. Only on Patterns, TTL, Diff and Hot keys, on Big keys and the key list, where `y` copies the key name, and on the key detail, a stream's entries and a Search result, where it copies the selected value ([Values](#values)); never on Connections or Nodes, or in the add flow or filter input. With nothing selected it says so.
 
-Copying uses the OSC 52 terminal sequence (no clipboard library), written to the terminal between frames, so it also works over SSH. Terminals without OSC 52 (macOS Terminal.app, for one) ignore it, and the terminal never confirms a copy, so the notice says "Copied <pattern|key|command> to the clipboard (needs a terminal with OSC 52)". Text whose sequence would be over 100,000 bytes is not sent ("too long to copy"). A write error is shown as an error notice. Only a pattern name, a key name or that command can be copied (the `CopyText` type has no other constructor), so credentials, connection strings and profiles never reach the clipboard.
+Copying uses the OSC 52 terminal sequence (no clipboard library), written to the terminal between frames, so it also works over SSH. Terminals without OSC 52 (macOS Terminal.app, for one) ignore it, and the terminal never confirms a copy, so the notice says "Copied <pattern|key|command> to the clipboard (needs a terminal with OSC 52)". Text whose sequence would be over 100,000 bytes is not sent ("too long to copy"). A write error is shown as an error notice. Only a pattern name, a key name, that command or a value as shown on the key detail can be copied (the `CopyText` type has no other constructor), so credentials, connection strings and profiles never reach the clipboard.
+
+### Values
+
+- **One renderer** draws every value. Each value's format is detected: JSON, MessagePack, UTF-8 text, otherwise hex. gzip, zlib, LZ4 frame and zstd are decompressed first, up to 1 MiB, and the panel says so.
+- **On screen only:** key values, stream entries on [4 Streams](#4-streams), Search results ([6 Search](#6-search)) and Pub/Sub messages ([5 Pub/Sub](#5-pubsub)) are shown on screen. They are never written to snapshots, reports, logs, error text or `Debug` output: a value is held in a type whose `Debug` shows only its length.
+- **Clipboard:** a value reaches the clipboard only through `y` on that value on the [Key detail](#key-detail), on a stream's entries or on a Search result, in the format shown. The [Copy](#copy) rule on control characters applies; switch to hex (`f`) to copy such a value.
+- **Code:** `CopyText` has a value constructor, `CopyText::value`, and nothing else changed.
+- **Terminal safety:** control characters and escape sequences in a value are drawn as escapes (`\x1b`), never sent to the terminal raw. On 4 Streams and 6 Search so is every other text from the server: keys, index, group and consumer names, entry IDs, and the explain and profile text. On 5 Pub/Sub so are channel names and patterns.
 
 ## Scanning
 
@@ -532,7 +623,7 @@ A snapshot of a cluster scan (`s` in the TUI or `scan --save`) also holds the no
 
 ## Browsing, server views and writes (planned)
 
-Phase 1 is built: [Navigation](#navigation) (without the command line), the [Shared command budget](#shared-command-budget-p1), the probes in [Permission check, additions](#permission-check-additions), and every item tagged P1 under [Views](#views-1). Items tagged P2 or P3 are not built; their panels (Monitor) say so. Each phase lands with its own spec change: that change moves its text into the sections above, and updates the key table and `src/tui/keymap.rs` together. The phases are listed under [Milestones](#milestones); the tag after each heading or item says which phase it belongs to. The screens are drawn in the TUI design artifact linked there.
+Phase 1 is built: [Navigation](#navigation), the [Shared command budget](#shared-command-budget-p1), the probes in [Permission check, additions](#permission-check-additions), and every item tagged P1 under [Views](#views-1). Of phase 2, the [Key detail](#key-detail) and the value renderer ([Values](#values)) are built, with the Values row on Connections, and so are the stream entries on [4 Streams](#4-streams), the live tail on [5 Pub/Sub](#5-pubsub), the queries on [6 Search](#6-search), the Slow log arguments and the Monitor panel on [3 Server](#3-server), with the Hot keys ranking from Monitor, and the [Command line panel](#command-line-panel) for readonly commands. The other items tagged P2, and every item tagged P3, are not built. Each phase lands with its own spec change: that change moves its text into the sections above, and updates the key table and `src/tui/keymap.rs` together. The phases are listed under [Milestones](#milestones); the tag after each heading or item says which phase it belongs to. The screens are drawn in the TUI design artifact linked there.
 
 ### Navigation
 
@@ -545,8 +636,8 @@ Phase 1 is built: [Navigation](#navigation) (without the command line), the [Sha
   - 5 Pub/Sub
   - 6 Search
 - **Panels and drill-down:** `tab` and `shift-tab` move between a view's panels. `enter` goes one level deeper, `esc` one level back. The tab bar marks the current view and shows the panel names on a second row. Below 100 columns, the tab bar shows only the digits of views other than the current one. When the panel names don't fit spaced out, they sit closer together; when even that is too wide, the second row shows only the current panel and its place, such as `Nodes · 6 of 6`.
-- **Clusters:** the views that read one server over the live connection (the key list, 3 Server, 4 Streams, 5 Pub/Sub and 6 Search) are off on a cluster and say "Not available on a cluster yet: this view reads one server, and a cluster spreads its keys, clients and channels over its nodes." A cluster connect opens no live connection and runs no view probes. Patterns and every Analysis panel work on the merged results; Big keys and Expiry cover every node's samples, and each big key carries its node.
-- **Command line (P2):** `:` opens it from any view except the add flow, the filter input and an open dialog. See [Command line panel](#command-line-panel).
+- **Clusters:** the views that read one server over the live connection (the key list and the key detail, 3 Server, 4 Streams, 5 Pub/Sub and 6 Search) are off on a cluster and say "Not available on a cluster yet: this view reads one server, and a cluster spreads its keys, clients and channels over its nodes." A cluster connect opens no live connection and runs no view probes. Patterns and every Analysis panel work on the merged results; Big keys and Expiry cover every node's samples, and each big key carries its node.
+- **Command line (P2):** `:` opens it from any view except the add flow, a filter or query input and an open dialog (the `?` overlay), where it is text. It is off before the live connection is ready and on a cluster, and says why. See [Command line panel](#command-line-panel).
 - **Header:** the header shows the profile's write state:
   - `read-only` (amber) on a read-only profile;
   - `writes on` (red text) on another profile with writes on;
@@ -564,7 +655,8 @@ Phase 1 is built: [Navigation](#navigation) (without the command line), the [Sha
 - **Big keys are always read in pages:**
   - `HSCAN`, `SSCAN` and `ZSCAN` with `COUNT 100`;
   - `LRANGE`, `ZRANGE` and `XRANGE` 100 items at a time;
-  - `GETRANGE` for the first 64 KiB of a string, and `JSON.GET` capped at 64 KiB.
+  - `GETRANGE` for the first 64 KiB of a string, and `JSON.GET` only for a document of at most 256 KiB, shown up to 64 KiB;
+  - `VRANDMEMBER` for 100 random elements of a vector set, which has no pages.
 
   redis-lens never sends `KEYS`, `HGETALL`, `SMEMBERS`, `LRANGE 0 -1` or another whole-key read. A user can still type them on the command line.
 
@@ -574,7 +666,7 @@ Phase 1 is built: [Navigation](#navigation) (without the command line), the [Sha
 
 - **WRITES column (P1):** `read-only` or `on`. The detail panel adds two rows:
   - **Writes:** off or on, and why (for example "production default");
-  - **Values:** "shown on screen, never saved" (P2).
+  - **Values:** "shown on screen, never saved" (built with the [Key detail](#key-detail)).
 - **`w` (P3)** turns writes on or off for the selected profile and saves the change to the config file (`read_only = false` or `true`). See [Write permissions](#write-permissions).
   - Docker containers have no saved profile, so `w` affects only the current session for them.
   - It is the only setting the TUI writes to the config file outside the add flow.
@@ -594,28 +686,9 @@ Phase 1 is built: [Navigation](#navigation) (without the command line), the [Sha
   - its LFU counter (`OBJECT FREQ`), when the policy is LFU.
 
   These are pipelined like a scan, so values aren't read.
-- `/` filters the loaded keys by name and `o` sorts them: by size, length, TTL, LFU counter (under an LFU policy) or name. `y` copies the key name. `esc` clears the filter first, then goes back to Patterns. `enter` opens a key (P2). `N` adds a key (P3).
+- `/` filters the loaded keys by name and `o` sorts them: by size, length, TTL, LFU counter (under an LFU policy) or name. `y` copies the key name. `esc` clears the filter first, then goes back to Patterns. `enter` opens the selected key's [Key detail](#key-detail). `N` adds a key (P3).
 
-**Key detail (P2).**
-- **Metadata** on the left: type, encoding, length, size, TTL, field TTLs, LFU counter, pattern and verdict.
-- **The value** on the right, read in pages ([Shared command budget](#shared-command-budget-p1)), for each type:
-  - string: the value;
-  - hash: fields;
-  - list: index and element;
-  - set: members;
-  - sorted set: members and scores;
-  - stream: entries, newest first;
-  - JSON: the document;
-  - vector set and array: elements.
-- **Field TTLs** come from `HTTL` (Redis 7.4 and later, Valkey 9.0 and later). Older servers hide the column.
-- **Formats:** each value's format is detected:
-  - JSON, MessagePack, UTF-8 text, otherwise hex;
-  - gzip, zlib, LZ4 frame and zstd are decompressed first, and the panel says so.
-
-  `f` picks a format: text, hex, JSON or MessagePack.
-- **Terminal safety:** control characters and escape sequences in a value are drawn as escapes (`\x1b`), never sent to the terminal raw.
-
-**Edits (P3), each through [Write permissions](#write-permissions):**
+**Edits on the [Key detail](#key-detail) (P3), each through [Write permissions](#write-permissions):**
 - `e`: edit the selected field, element or value. A value over 4 KiB, or one with newlines, opens `$EDITOR` on a temporary file in a 0700 directory, which is deleted afterwards.
 - `+`: add a field, element or member.
 - `t`: set the TTL, with `EXPIRE` or `PERSIST`; with `HEXPIRE` or `HPERSIST` for a hash field.
@@ -652,14 +725,16 @@ The TTL, Diff, Hot keys and Nodes panels are the earlier views of the same names
   - A group with connections idle for an hour or more is flagged. `enter` lists a group's connections.
   - `K` kills the selected connection with `CLIENT KILL ID` (P3, `@dangerous`).
 - **Slow log:**
-  - `SLOWLOG GET 128` (P1): time (UTC), duration, command name, key names and client. Key names come from the command's key specs in `COMMAND INFO`, asked once per command name and kept for the session (before Redis 7.0, the first/last/step key positions, so commands with moving keys show fewer). `COMMAND GETKEYS` is never used: it would send the logged arguments back to the server. Arguments other than keys are dropped when the reply is read; they arrive in P2, on screen only.
+  - `SLOWLOG GET 128` (P1): time (UTC), duration, command name, key names and client. Key names come from the command's key specs in `COMMAND INFO`, asked once per command name and kept for the session (before Redis 7.0, the first/last/step key positions, so commands with moving keys show fewer). `COMMAND GETKEYS` is never used: it would send the logged arguments back to the server. The arguments (P2) are kept only as one line with the credentials masked (`AUTH`, `HELLO … AUTH`, `ACL SETUSER` rules starting `>`, `<`, `#` or `!`, `CONFIG SET requirepass`/`masterauth`/`masteruser`, `MIGRATE … AUTH`/`AUTH2`; the server may already have written some as `(redacted)`), drawn escaped on the `args` line of the selected entry's panel, on screen only. When the server cut a long command to 32 arguments, its marker is not shown as an argument or a key: the line ends with `… N more arguments`.
   - Notes on known problems: `KEYS`; `FLUSHALL` and `FLUSHDB`; whole-key reads (`HGETALL`, `SMEMBERS`, `LRANGE 0 -1` and the like). The slow log has no sizes, so a whole-key read is known by its shape; that it was slow is the hint that the key is big.
   - The threshold and length come from `CONFIG GET slowlog-*` where it is allowed; otherwise the panel says they are unknown. When `COMMAND INFO` is refused the entries show without key names and say why. Neither is asked again in that session.
   - `c` sets the threshold with `CONFIG SET` (P3, `@dangerous`), and `R` sends `SLOWLOG RESET` (P3, `@dangerous`).
 - **Monitor (P2):**
-  - `MONITOR` on a connection of its own. It stops after 30 s or 10,000 lines, whichever comes first, and the lines stay in memory only.
-  - It always asks first: `y`/`n`, or on a `prod` profile you type the profile name. Read-only profiles too, because `MONITOR` writes nothing but slows the server.
-  - Without an LFU policy, Hot keys can rank keys by how often they appear in the last Monitor run.
+  - `MONITOR` on a connection of its own, through the profile's route and credentials (TLS, token command and SSH tunnels). redis-rs reads `MONITOR` lines only on a connection that resolves the host itself and has no credentials provider, so the panel is off, with the reason, through an SSH tunnel with TLS and with Entra ID. redis-rs also swallows the server's answer to `MONITOR`, so the permission is checked first with one `MONITOR` on an ordinary connection that is closed at once; each of the two takes one command from the budget. A user without `+monitor` gets "the server refused MONITOR for this user", never the username or the server's text.
+  - It stops after 30 s or 10,000 lines, whichever comes first, on `esc`, and with the session: a rescan, the live connection closing, connecting elsewhere or quitting. The lines stay in memory only, for the session.
+  - It always asks first: `y`/`n`, or on a `prod` profile you type the profile name. Read-only profiles too, because `MONITOR` writes nothing but slows the server. The panel names the profile and says why while it asks.
+  - Each line shows its time (UTC, from the line's own timestamp), database, client and the command as one line, credentials masked as on the Slow log, escaped; newest at the bottom. The selection follows the newest line until you move it, and `End` follows again. The title says whether it runs, how many lines it kept and the time left. A line longer than 1 KiB keeps its arguments up to there and says how many it left out.
+  - Without an LFU policy, Hot keys can rank keys by how often they appear in the last Monitor run ([4 Hot keys](#4-hot-keys)).
 
 #### 4 Streams
 
@@ -675,7 +750,11 @@ The TTL, Diff, Hot keys and Nodes panels are the earlier views of the same names
   - `ok`.
 
   All that apply are computed; the list shows the first, in the order above, with `+` when there are more, and the details panel lists them all. `tab` moves between the list and the details (groups and consumers). At most 50 streams are read per poll. An optional command refused for this user (`TIME`, `XINFO GROUPS`, `XINFO CONSUMERS`, `MEMORY USAGE`) is left out with a note and not asked again until `r`. An `r` pressed while a poll is in flight reads once more as soon as that poll answers, asking again for what was refused.
-- **Entries (P2):** `enter` lists a stream's entries with `XREVRANGE … COUNT 100`.
+- **Entries (P2):** `enter` lists the selected stream's entries, one level below the list (`Entries · <key>` over the whole body). `esc` goes back to the list.
+  - They are read like a stream on the [Key detail](#key-detail), through the [command budget](#shared-command-budget-p1): the first page `TYPE` and `XREVRANGE key + - COUNT 100`, newest first; `n` the next 100 with `XREVRANGE key (<last id> - COUNT 100`. At most 10,000 are held. The title says how many are loaded of the stream's length.
+  - They are drawn and work as on the Key detail: the entries above a divider, each entry's fields shown one line each, and the selected entry's fields in full below it. `tab` moves between the entries and the value, `f` changes the format, and `y` does not copy an entry, since it has several fields. A refused `XREVRANGE` says so in redis-lens's own words and `n` does not send it again.
+  - The `XINFO` poll stops while the entries are shown; back on the list it reads at once when a poll is due. `p` still pauses or resumes it. `r` reads the entries again from the newest.
+  - Switching views and coming back shows the entries again. `enter` on the same stream again keeps what it loaded; another stream starts afresh. A stream gone since the scan has no entries to list, and `enter` says so.
 - **Writes (P3):**
   - `c` claims a consumer's pending entries for another consumer (`XAUTOCLAIM`);
   - `a` acknowledges the selected pending entry (`XACK`);
@@ -685,8 +764,15 @@ The TTL, Diff, Hot keys and Nodes panels are the earlier views of the same names
 
 - **Counts (P1):** `PUBSUB CHANNELS` (the first 1,000, most subscribers first; the title says how many there are), `PUBSUB NUMSUB` for each channel in batches of 100, and `PUBSUB NUMPAT`. Payloads aren't read. A refused `NUMSUB` or `NUMPAT` leaves its column out with a note.
 - **Live tail (P2):**
-  - `enter` subscribes to the selected channel; `s` asks for a channel or pattern (`SUBSCRIBE` or `PSUBSCRIBE`). The subscription uses a connection of its own.
-  - The last 2,000 messages stay in memory, with the message rate. `space` pauses, `c` clears and `/` filters.
+  - **Subscribing:** `enter` subscribes to the selected channel. `s` asks for a channel or pattern: text with `*`, `?` or `[` in it is sent with `PSUBSCRIBE`, any other with `SUBSCRIBE`; `enter` subscribes, `esc` cancels. Subscribing is not a write, so read-only profiles subscribe too.
+  - **Its own connection:** opened like the session's (same route, SSH tunnel, TLS, token command or Entra ID, and credentials from the same place), but speaking RESP3, and always to the profile's own endpoint, not the replica a `prefer_replica` scan reads. The `SUBSCRIBE` or `PSUBSCRIBE` takes one command from the session's [command budget](#shared-command-budget-p1).
+  - **One tail at a time:** a new subscription replaces the last one, drops its connection and starts with an empty list. The tail keeps running while another view is shown. It ends with `esc` (when no filter is set), a new subscription, a new connect or a rescan of the session, and quitting. Messages of a tail that ended, or of a replaced run, are ignored.
+  - **Messages** reach the view in batches at most every 100 ms, each stamped with the time redis-lens received it. A batch holds at most 2,000; when more arrived, the oldest are skipped and the footnote counts them. The last 2,000 stay in memory, newest at the bottom, as TIME (`HH:MM:SS.mmm`, UTC, when received), CHANNEL and MESSAGE (the value on one line; see [Values](#values)).
+  - **Title:** `Subscribed: <channel or pattern> · <rate> msg/s · <kept> kept (last 2,000)`, with `pattern` before a pattern. When it doesn't fit, `(last 2,000)` goes first, then the parts from the right. The rate is messages per second over the last 5 s while the view is on screen (over at least 1 s); messages that arrived while another view was shown are kept but not counted. The footnote says "Messages are shown, never saved."
+  - **Keys:** `space` pauses: the list shown stays as it was while messages still arrive and are kept, and the title says `paused · N new`; `space` again shows them. `c` clears the list (the tail keeps running). `/` filters what is shown by channel or message (case-insensitive, on the message's one-line form); `esc` clears the filter. `p` still pauses polling the counts.
+  - **Layout:** once a tail started, the channels are on the left, narrower and without the bars, and the tail on the right. At 80 columns the channel list is 22 columns wide.
+  - **Refusals** (rule 3), in redis-lens's own words, never the server's text or the username: "the server refused SUBSCRIBE on that channel for this user" (no `+subscribe`, or channel rules that leave the channel out, such as `resetchannels`), "the server refused PSUBSCRIBE on that pattern for this user", "the server refused RESP3 (HELLO 3), which the live tail needs to receive messages" and "the server refused HELLO for this user". A connection that can't be opened says why as a connect error does, and a lost one says "the connection to the server was lost". The tail stops and says so; `enter` or `s` subscribes again.
+  - **Terminal safety:** channel names, patterns and messages are drawn with control characters as escapes, in the channel list too.
 - **Publish (P3):** `p` publishes a message with `PUBLISH`. It is not destructive.
 
 #### 6 Search
@@ -696,35 +782,41 @@ The TTL, Diff, Hot keys and Nodes panels are the earlier views of the same names
   - The schema of the selected index.
   - Features the module lacks are turned off with a reason. valkey-search reports no index size, so Size is left out on Valkey; it lists fields by name, Redis Search in creation order.
   - The list is read when the view is shown and with `r`; it is not polled. A failed read is not retried on its own: before any list has been read the view shows the failure and `r`; after one, it keeps the last list and says the new read failed. `tab` moves between the indexes and the schema.
-- **Queries (P2):** `/` runs `FT.SEARCH … LIMIT 0 50`. `e` shows `FT.EXPLAIN`, `P` runs `FT.PROFILE`, `enter` opens a result document.
+- **Queries (P2):** on the selected index, through the [command budget](#shared-command-budget-p1), one command at a time:
+  - `/` opens a query input, which starts from the query last run. `enter` sends `FT.SEARCH <index> <query> LIMIT 0 50`, the query as one argument, as typed; an empty query is `*`. `esc` closes the input without sending. Every key is text in it; a pasted newline becomes a space. valkey-search does not take `*`: it needs a field filter, such as `@price:[-inf +inf]`, and says so in its message.
+  - The results replace the schema in the details pane while their index is selected, and get the focus (`tab` goes back to the indexes). The pane says the query, how many documents match (`3 of 1,204 results`) and the time the command took. Each of the up to 50 results shows its key and its first fields as `name=value`, each value shortened by the value renderer. A JSON index returns the document as one field, `$`.
+  - `enter` opens the selected result one level deeper (`Result · <key>`), drawn and working as a hash on the [Key detail](#key-detail): its fields above, the selected one's value below, `tab`, `f` and `y` as there. `esc` goes back to the results.
+  - `e` shows `FT.EXPLAIN <index> <query>`, the plan one line per line, and `P` runs `FT.PROFILE <index> SEARCH QUERY <query> LIMIT 0 50`. Both use the query last run, on the selected index; with none run yet they say to press `/` first. They open one level deeper, scroll with the move keys, and `esc` goes back. The profile is drawn as an indented tree of the reply (`name: value` per field, `- ` before each item of a list), and its results replace the results in the details pane.
+  - Errors: a refused command says "The server refused FT.SEARCH for this user." (or `FT.EXPLAIN`, `FT.PROFILE`) and an unknown one "The server does not support FT.EXPLAIN." valkey-search has neither `FT.EXPLAIN` nor `FT.PROFILE`. Either way the command is not sent again until `r`, `e` or `P` says why, and the results pane leaves it out of its keys. Any other error from the server about the query (a syntax error, an unknown index) shows the server's message, because it describes the query and not the user: without its leading upper-case code, escaped and cut at 200 characters. This is the one place server error text is shown, and only for these three commands.
 - **Writes (P3):** `C` creates an index from a form (prefix and fields) with `FT.CREATE`. `D` drops one with `FT.DROPINDEX`, never with `DD`, so documents are kept.
 
 ### Command line panel
 
-- **The panel (P2):** a panel at the bottom of the screen, over the view, which keeps running.
-  - Replies are drawn like `redis-cli`, with the time taken. A reply over 1 MiB is cut on screen.
-  - `↑↓` steps through the history, `tab` completes, `ctrl-l` clears and `esc` closes.
-- **Helper (P2):** from `COMMAND DOCS` (Redis 7.0 and later, and Valkey), it shows the summary, arguments, complexity and ACL categories. `tab` completes command names, subcommands and the key names already loaded. On older servers the helper is off.
-- **Read-only profiles:** before sending a command, redis-lens reads its flags (`COMMAND INFO`). On a read-only profile, a command without the `readonly` flag is not sent, and the panel says why.
-- **`@dangerous` commands** ask first on every profile, readonly ones (`KEYS`) included. See [Write permissions](#write-permissions).
-- **Refused commands:** commands that would change the panel's own connection are refused with a pointer to the right place:
-  - `SUBSCRIBE` and `PSUBSCRIBE`: use Pub/Sub;
+- **The panel (P2):** `:` opens a panel at the bottom of the screen, over the view, which keeps running (its polls go on). It is off, and `:` says why, before the live connection is ready, after it closed, and on a cluster. While it is open every key is text for it (digits, `q` and `?` included) and its input line replaces the key bar; `esc` closes it, keeping the line, the output and the history. Its keys are under [Command line panel · keys](#command-line-panel--keys) in the key table.
+  - One command at a time, through the [command budget](#shared-command-budget-p1); `enter` while one runs says to wait. The line is split like `redis-cli` (quotes and `\xHH` escapes); a line that does not split says why.
+  - Replies are drawn like `redis-cli`: `(integer) 5`, `(nil)`, strings quoted (`"a\nb"`), status replies bare (`OK`), arrays numbered `1) …` with nested ones indented under their number, and over RESP3 sets `1~ …`, maps `1# key => value`, `(double) 1.5`, `(true)`, `(big number) …`. Every string is escaped as in [Values](#values). Each reply shows the time the command took (the wait for the budget not included), as `(0.42 ms)`. A reply over 1 MiB is cut on screen, and its last line says so.
+  - Errors: a refused command says "the server refused GET for this user", never the server's text, which names the user; an unknown one "the server does not support …". Any other error from the server is about the command typed and is shown as `redis-cli` does, `(error) ERR syntax error`, escaped and cut at 200 characters.
+  - `↑↓` steps through the history, `tab` completes, `PgUp` and `PgDn` scroll the output, `ctrl-l` clears it, `ctrl-u` clears the line and `esc` closes. The cursor stays at the end of the line: typing adds there and backspace takes the last character.
+  - The output keeps the last 100 commands and at most 4 MiB of replies; the oldest go first.
+- **Helper (P2):** from `COMMAND DOCS <name>` (Redis 7.0 and later, and Valkey), read once a name when its first word is typed out: the command's arguments and complexity on one line, its summary, whether it is sent (readonly, asks first, or not sent here) and its ACL categories on the next. On older servers the helper is off and says so once in the output. `tab` completes command names (from `COMMAND LIST`, asked once a session when the panel first opens; on Redis 6.2, which lacks it, only the names already looked up), subcommands (from `COMMAND INFO`) and the key names the key list has loaded, quoted when they need it. Pressing `tab` again goes to the next match.
+- **Readonly commands only:** before sending a command, redis-lens reads its flags and ACL categories with `COMMAND INFO <name>` (once a name a session; for a container command such as `CONFIG`, the subcommand's). Phase 2 sends no writes: on every profile, a command without the `readonly` flag is not sent, and the panel says why ("SET is not a readonly command"). So `INFO`, `PING`, `CLIENT LIST` and `CONFIG GET`, which lack the flag, are not sent either. A command that blocks (the `blocking` flag, or `@blocking` before Redis 7.0: `BLPOP`, `XREAD … BLOCK`) is not sent, since it would hold the connection every view shares; `XREAD` without `BLOCK` is. An unknown command says so. When `COMMAND INFO` itself is refused, nothing is sent. The check runs again where the command is sent.
+- **`@dangerous` commands** ask first on every profile, readonly ones (`KEYS`) included: the panel shows the command and the profile, and sends it on `y` (`n` or `esc` cancel), or on a `prod` profile once the profile name is typed exactly and `enter` pressed. See [Write permissions](#write-permissions).
+- **Refused commands:** commands that would change the panel's own connection are refused with a pointer to the right place, without reading their flags:
+  - `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE` and the unsubscribes: use Pub/Sub;
   - `MONITOR`: use the Monitor panel;
-  - `SELECT`: use the DB switch;
+  - `SELECT`: it would switch the database under every view;
   - `AUTH`, `HELLO`, `RESET`, `QUIT` and `CLIENT REPLY`: refused.
-- **Credentials (rule 1):** on screen and in the history, the panel masks:
+- **Credentials (rule 1):** on screen and in the history, the panel masks, while the line is typed too:
   - the password arguments of `ACL SETUSER` (`>`, `<`, `#` and `!` rules);
-  - `CONFIG SET requirepass` and `masterauth`;
-  - `MIGRATE … AUTH` and `AUTH2`.
+  - `CONFIG SET requirepass`, `masterauth` and `masteruser`;
+  - `AUTH`, `HELLO … AUTH`, `MIGRATE … AUTH` and `AUTH2`.
 
-  The history keeps the masked text, in memory only, for the session.
+  The history keeps the masked text, in memory only, for the session; `↑` brings back the masked text. Command lines and replies never go to snapshots, reports, logs, error text or `Debug` output.
 - **Writes (P3):** write commands follow [Write permissions](#write-permissions).
 
 ### Values (P2)
 
-- **On screen only:** key values, field values, stream entries, Pub/Sub messages, Search results, Monitor lines and Slow log arguments are shown on screen. They are never written to snapshots, reports, logs, error text or `Debug` output.
-- **Clipboard:** a value reaches the clipboard only through `y` on that value, in the format shown. The [Copy](#copy) rule on control characters applies; switch to hex (`f`) to copy such a value.
-- **Code:** the `CopyText` type gains a value constructor, and nothing else changes.
+- **Other values:** Monitor lines and Slow log arguments follow the rules for key values in [Values](#values): one renderer, on screen only, never in snapshots, reports, logs, error text or `Debug` output, and the clipboard only through `y` in the format shown. Built: both are drawn as one line written by the command masker (credentials as `***`, control and bidi characters as `\xHH`) and escaped; a Monitor line has its credentials masked as it arrives, so the password is never held. Neither has a `y` yet.
 
 ### Write permissions
 
@@ -782,7 +874,7 @@ A write is sent only when all three checks allow it.
 - **P2 probes:** `COMMAND DOCS GET`.
 - **P3 probes:** `ACL DRYRUN`, where it is allowed.
 - **Turning off:** each missing permission turns off its view or panel, with the reason (rule 3).
-- **ACL user:** the minimal read-only user gains `+slowlog|get +slowlog|len +client|list +xinfo +pubsub|channels +pubsub|numsub +pubsub|numpat +command|docs +command|info +time +object|encoding +strlen +hlen +llen +scard +zcard +xlen`. Give `+ft._list +ft.info` only on a server with the Search module: a server without it refuses the whole rule, and an ACL file with it does not load. `+config|get` shows the slow log's threshold, but it also lets the user read every setting, `requirepass` and `masterauth` included, so it is left out: without it the panel says the threshold is unknown. For P2 it also needs the read commands for values: `+@read`, and `-keys` to block `KEYS`.
+- **ACL user:** the minimal read-only user gains `+slowlog|get +slowlog|len +client|list +xinfo +pubsub|channels +pubsub|numsub +pubsub|numpat +command|docs +command|info +time +object|encoding +strlen +hlen +llen +scard +zcard +xlen`. Stream entries need `+type +xrevrange`, both in the `+@read` below. Give `+ft._list +ft.info`, and for queries `+ft.search +ft.explain +ft.profile`, only on a server with the Search module: a server without it refuses the whole rule, and an ACL file with it does not load. `+config|get` shows the slow log's threshold, but it also lets the user read every setting, `requirepass` and `masterauth` included, so it is left out: without it the panel says the threshold is unknown. For P2 it also needs the read commands for values: `+@read`, and `-keys` to block `KEYS`. The Pub/Sub live tail needs `+subscribe +psubscribe` and channels it may subscribe to: `&*` or `allchannels` in place of `resetchannels`, or `&<pattern>` for some (a `PSUBSCRIBE` pattern is checked against them as it is written). The Monitor panel needs `+monitor`; it is left out of the minimal user, because every command the server runs, other users' values included, goes to whoever runs `MONITOR`.
 
 ### Server versions
 
@@ -812,8 +904,8 @@ Redis 6.2 stays tested: it runs everything else.
 - **Quick wins (after v0.2):** `scan --check` with exit codes, Markdown, HTML and CSV reports, provider detection, the server context strip, token-command auth, snapshot retention, `snapshots`, `trend` and the Diff trend column, and `compare` for two standalone instances.
 - **v0.3:** cluster (scan each primary, or a verified replica per shard), the Nodes view (now the Nodes panel of 2 Analysis), cluster-aware reports, snapshots, `diff` and `compare`, and SSH tunnels through a bastion.
 - **Phase 1, read-only views (built):** seven views and panels, the shared command budget, the key list of a pattern, Analysis (Big keys, Expiry, recommendations), Server (Overview, Clients, Slow log without arguments), Streams, Pub/Sub counts, Search indexes, the new permission probes. On a cluster the views that read one server (the key list, Server, Streams, Pub/Sub and Search) are off and say why.
-- **Phase 2, values on screen:** key values and formats, stream entries, the Pub/Sub live tail, Search queries, Slow log arguments, the Monitor panel, the command line for readonly commands.
+- **Phase 2, values on screen:** key values and formats (built: the key detail and the value renderer), stream entries, the Pub/Sub live tail (built), Search queries, Slow log arguments and the Monitor panel (built), the command line for readonly commands (built).
 - **Phase 3, writes:** the write permission checks, `w` and `conn set --writes`, key edits, bulk expire and delete, `redis-lens expire`, stream claim, ack and trim, publish, index create and drop, kill client, slow log settings, write commands on the command line.
-- **Later:** native ElastiCache IAM (a token command covers it today), Sentinel, a per-slot view, Entra managed identity, `expire --dry-run` for non-production profiles, a MONITOR sampling fallback for hot keys, and the live views on a cluster (one node at a time, or merged over the nodes).
+- **Later:** native ElastiCache IAM (a token command covers it today), Sentinel, a per-slot view, Entra managed identity, `expire --dry-run` for non-production profiles, and the live views on a cluster (one node at a time, or merged over the nodes).
 
 Phases 1 to 3 come from [docs/redisinsight-parity.md](docs/redisinsight-parity.md). The mockups are in the TUI design artifact (https://claude.ai/artifact/2RzWTZFKwJASgtX3phxKfG).

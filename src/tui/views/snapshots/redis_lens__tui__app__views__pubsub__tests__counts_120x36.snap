@@ -1,5 +1,6 @@
 ---
 source: src/tui/views/pubsub.rs
+assertion_line: 676
 expression: "testing::render(&app, 120, 36).backend()"
 ---
 " redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC "
@@ -33,8 +34,8 @@ expression: "testing::render(&app, 120, 36).backend()"
 "│ Subscribers on listed channels  19  (direct SUBSCRIBE only)                                                          │"
 "│                                                                                                                      │"
 "│ Selected                        orders:eu  ·  12 subscribers                                                         │"
-"│ Counts only: message payloads are never read.                                                                        │"
+"│ Counts read no payloads. enter or s starts a live tail.                                                              │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   p Pause   r Refresh   0-6 View   ? Help   q Quit                                                             "
+" ↑↓ Move   enter Subscribe   space Pause   / Filter   0-6 View   ? Help   q Quit                                        "

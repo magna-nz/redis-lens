@@ -373,8 +373,9 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
             "token from the command, username in the OS keychain",
         ),
     };
+    // Seven rows beside the permission check: no heading (the panel title names the
+    // connection), so the Values row fits.
     let left: Vec<Vec<Span<'static>>> = vec![
-        vec![Span::styled(" CONNECTION", style::hd())],
         kv("Endpoint", endpoint, style::fg()),
         kv("Server", server.0, server.1),
         kv("Auth", auth.into(), style::fg()),
@@ -385,6 +386,7 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
             style::fg(),
         ),
         writes_row(p),
+        kv("Values", "shown on screen, never saved".into(), style::fg()),
     ];
 
     let mut right: Vec<Vec<Span<'static>>> =

@@ -6,8 +6,9 @@
 //! | State | Draw | Screens |
 //! |---|---|---|
 //! | [`keys::KeysState`] | `ui/keys.rs` | Patterns › key list ([`Screen::KeyList`]) |
+//! | [`value::ValueState`] | `ui/value.rs` | Patterns › key detail ([`Screen::KeyDetail`]) |
 //! | [`analysis::AnalysisState`] | `ui/analysis.rs` | Analysis › Big keys, Expiry |
-//! | [`server::ServerState`] | `ui/server.rs` | Server › Overview, Clients, Slow log |
+//! | [`server::ServerState`] | `ui/server.rs` | Server › Overview, Clients, Slow log, Monitor |
 //! | [`streams::StreamsState`] | `ui/streams.rs` | Streams |
 //! | [`pubsub::PubSubState`] | `ui/pubsub.rs` | Pub/Sub |
 //! | [`search::SearchState`] | `ui/search.rs` | Search |
@@ -38,7 +39,9 @@
 //!   Analysis only). Every other key goes to [`ViewState::on_key`] of the view on
 //!   screen; return `true` when it did something. On the key list an unhandled `esc`
 //!   goes back to Patterns, so handle `esc` yourself only to close something of your
-//!   own first (a filter). While [`ViewState::input`] is `Some` every key except
+//!   own first (a filter); on the key detail an unhandled `esc` goes back to the key
+//!   list, and an `enter` on the key list (which the key list leaves alone) opens the
+//!   selected key there. While [`ViewState::input`] is `Some` every key except
 //!   ctrl-c goes to `on_key` first, digits and `q` included, and pastes go to
 //!   [`ViewState::on_paste`].
 //! - **Ticks.** [`ViewState::on_tick`] runs about ten times a second, only for the view
@@ -54,6 +57,15 @@
 //!   ([`Ctx::off_reason`]), `App` draws the reason instead of the view and calls none of
 //!   the methods above for it. Without a session (nothing connected) it is the same.
 //!   Views are reset to `Default` on every new connect, and kept across a rescan.
+//! - **The Pub/Sub live tail.** Only [`pubsub::PubSubState`] subscribes. It asks with
+//!   [`Act::subscribe`] (or [`Act::stop_tail`]); `App` turns that into
+//!   `Effect::Subscribe` with the session's profile and where its credentials come
+//!   from, so a view never holds credentials. The tail's messages come back as
+//!   `Msg::TailReady`, `Msg::Tail` and `Msg::TailClosed`, which `App` passes, for the
+//!   current run only, to the explicit methods [`pubsub::PubSubState::tail_ready`],
+//!   [`pubsub::PubSubState::tail_batch`] and [`pubsub::PubSubState::tail_closed`]
+//!   whether the view is on screen or not; the state checks the tail id itself. A
+//!   rescan ends the tail ([`pubsub::PubSubState::end_tail`]).
 //!
 //! # Drawing
 //!
@@ -76,6 +88,7 @@ use std::time::Instant;
 
 use crossterm::event::KeyEvent;
 
+use crate::live::pubsub::Subscription;
 use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::{PermStatus, PermissionReport, Profile, ScanReport, ServerInfo, ServerMode};
 use crate::tui::clipboard::CopyText;
@@ -83,11 +96,13 @@ use crate::tui::clipboard::CopyText;
 use super::{Effect, Notice, Screen, Session, copy_checked};
 
 pub mod analysis;
+pub mod cmdline;
 pub mod keys;
 pub mod pubsub;
 pub mod search;
 pub mod server;
 pub mod streams;
+pub mod value;
 
 /// Labels of the phase 1 view probes in [`PermissionReport::checks`], after the scan's
 /// own checks (`model::PERM_LABELS`). Only the scan's checks make a connection
@@ -117,14 +132,16 @@ pub const CLUSTER_OFF: &str = "Not available on a cluster yet: this view reads o
 
 /// The screens that read the live connection to one server: off on a cluster. The key
 /// list is one of them: it walks the keys with `SCAN`, which on a cluster covers one
-/// node.
+/// node; and so is the key detail, which reads its value over the same connection.
 pub fn reads_one_server(screen: Screen) -> bool {
     matches!(
         screen,
         Screen::KeyList
+            | Screen::KeyDetail
             | Screen::Overview
             | Screen::Clients
             | Screen::SlowLog
+            | Screen::Monitor
             | Screen::Streams
             | Screen::PubSub
             | Screen::Search
@@ -135,11 +152,14 @@ pub fn reads_one_server(screen: Screen) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Owner {
     Keys,
+    Value,
     Analysis,
     Server,
     Streams,
     PubSub,
     Search,
+    /// The command line panel, which is not a screen (`cmdline.rs`).
+    Cmdline,
 }
 
 /// The session's live connection (spec "Browsing, server views and writes").
@@ -202,33 +222,39 @@ pub trait ViewState: fmt::Debug {
 #[derive(Debug, Default)]
 pub struct Views {
     pub keys: keys::KeysState,
+    pub value: value::ValueState,
     pub analysis: analysis::AnalysisState,
     pub server: server::ServerState,
     pub streams: streams::StreamsState,
     pub pubsub: pubsub::PubSubState,
     pub search: search::SearchState,
+    pub cmdline: cmdline::CmdlineState,
 }
 
 impl Views {
     pub fn get(&self, owner: Owner) -> &dyn ViewState {
         match owner {
             Owner::Keys => &self.keys,
+            Owner::Value => &self.value,
             Owner::Analysis => &self.analysis,
             Owner::Server => &self.server,
             Owner::Streams => &self.streams,
             Owner::PubSub => &self.pubsub,
             Owner::Search => &self.search,
+            Owner::Cmdline => &self.cmdline,
         }
     }
 
     pub fn get_mut(&mut self, owner: Owner) -> &mut dyn ViewState {
         match owner {
             Owner::Keys => &mut self.keys,
+            Owner::Value => &mut self.value,
             Owner::Analysis => &mut self.analysis,
             Owner::Server => &mut self.server,
             Owner::Streams => &mut self.streams,
             Owner::PubSub => &mut self.pubsub,
             Owner::Search => &mut self.search,
+            Owner::Cmdline => &mut self.cmdline,
         }
     }
 }
@@ -329,6 +355,20 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// What a view asked of the Pub/Sub live tail or of a Monitor run, both on connections
+/// of their own, for `App` to turn into an effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TailCmd {
+    /// Start tail `tail` on `to`, replacing any other.
+    Subscribe { tail: u64, to: Subscription },
+    /// End tail `tail`.
+    Stop { tail: u64 },
+    /// Start Monitor run `run`, replacing any other.
+    Monitor { run: u64 },
+    /// End Monitor run `run`.
+    StopMonitor { run: u64 },
+}
+
 /// What a handler can do, besides reading the [`Ctx`] it derefs to.
 pub struct Act<'a> {
     ctx: Ctx<'a>,
@@ -337,6 +377,8 @@ pub struct Act<'a> {
     pending: &'a mut HashMap<ReqId, Owner>,
     notice: &'a mut Option<Notice>,
     effects: Vec<Effect>,
+    next_tail: &'a mut u64,
+    tail: Option<TailCmd>,
 }
 
 impl<'a> Deref for Act<'a> {
@@ -354,6 +396,7 @@ impl<'a> Act<'a> {
         next_req: &'a mut u64,
         pending: &'a mut HashMap<ReqId, Owner>,
         notice: &'a mut Option<Notice>,
+        next_tail: &'a mut u64,
     ) -> Self {
         Self {
             ctx,
@@ -362,11 +405,53 @@ impl<'a> Act<'a> {
             pending,
             notice,
             effects: Vec::new(),
+            next_tail,
+            tail: None,
         }
     }
 
-    pub(super) fn into_effects(self) -> Vec<Effect> {
-        self.effects
+    /// The effects asked for, and what was asked of the live tail.
+    pub(super) fn into_parts(self) -> (Vec<Effect>, Option<TailCmd>) {
+        (self.effects, self.tail)
+    }
+
+    /// Starts the Pub/Sub live tail on `to`, on a connection of its own (spec "5
+    /// Pub/Sub"), replacing the session's other tail if any. Returns the new tail's id,
+    /// which its `Msg::Tail*` messages carry. `None`, and nothing started, while the live
+    /// connection is not [`LiveState::Ready`] (the tail takes from its command budget).
+    pub fn subscribe(&mut self, to: Subscription) -> Option<u64> {
+        if !self.ctx.live_ready() {
+            return None;
+        }
+        let tail = *self.next_tail;
+        *self.next_tail += 1;
+        self.tail = Some(TailCmd::Subscribe { tail, to });
+        Some(tail)
+    }
+
+    /// Ends tail `tail` and drops its connection.
+    pub fn stop_tail(&mut self, tail: u64) {
+        self.tail = Some(TailCmd::Stop { tail });
+    }
+
+    /// Starts a Monitor run (spec "Monitor (P2)") on a connection of its own, replacing
+    /// the session's other run. Only the Server view's Monitor panel calls it, and only
+    /// after asking. Returns the run's id, which its `Msg::Monitor*` messages carry.
+    /// `None`, and nothing started, while the live connection is not
+    /// [`LiveState::Ready`] (`MONITOR` takes from its command budget).
+    pub fn monitor(&mut self) -> Option<u64> {
+        if !self.ctx.live_ready() {
+            return None;
+        }
+        let run = *self.next_tail;
+        *self.next_tail += 1;
+        self.tail = Some(TailCmd::Monitor { run });
+        Some(run)
+    }
+
+    /// Ends Monitor run `run` and drops its connection.
+    pub fn stop_monitor(&mut self, run: u64) {
+        self.tail = Some(TailCmd::StopMonitor { run });
     }
 
     /// Sends `req` on the session's live connection. The answer comes back to this
@@ -460,14 +545,43 @@ pub mod testing {
         app.apply(Msg::LiveReady { id, scan })
     }
 
+    /// A key of the key list, for [`show`] on the key detail.
+    pub fn key_row() -> crate::live::keys::KeyRow {
+        crate::live::keys::KeyRow {
+            key: "user:10293:cart".into(),
+            key_type: crate::model::KeyType::Hash,
+            ttl: crate::model::Ttl::Expires(std::time::Duration::from_secs(533_520)),
+            bytes: Some(3_174),
+            encoding: Some("listpack".into()),
+            length: Some(12),
+            freq: Some(14),
+        }
+    }
+
     /// Goes to `screen` with keys, as a user would: its view's digit, then `tab` to the
-    /// panel; for the key list, `enter` on the first pattern row of Patterns.
+    /// panel; for the key list, `enter` on the first pattern row of Patterns. For the
+    /// key detail, `enter` on the key list's selected key; when no key is loaded,
+    /// [`key_row`] is put into the list first.
     pub fn show(app: &mut App, screen: Screen) -> Vec<Effect> {
+        if screen == Screen::KeyDetail {
+            let mut out = Vec::new();
+            if app.screen() != Screen::KeyList {
+                out.extend(show(app, Screen::KeyList));
+            }
+            if app.views.keys.selected().is_none() {
+                app.views.keys.rows.push(key_row());
+            }
+            out.extend(app.handle_key(key(KeyCode::Enter)));
+            assert_eq!(app.screen(), screen);
+            return out;
+        }
         let mut out = app.handle_key(KeyEvent::new(
             KeyCode::Char(screen.view().digit()),
             KeyModifiers::NONE,
         ));
-        if screen == Screen::KeyList {
+        if screen == Screen::KeyList && app.screen() == Screen::KeyDetail {
+            out.extend(app.handle_key(key(KeyCode::Esc)));
+        } else if screen == Screen::KeyList && app.screen() == Screen::Patterns {
             let rows = app.pattern_rows();
             let first = rows
                 .iter()

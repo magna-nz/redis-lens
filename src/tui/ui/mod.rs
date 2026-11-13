@@ -19,6 +19,7 @@ use super::app::{App, Phase, Screen, Session, View};
 use super::keymap;
 
 mod analysis;
+mod cmdline;
 mod connections;
 mod delta;
 mod diff;
@@ -33,6 +34,7 @@ mod server;
 mod streams;
 pub mod style;
 mod ttl;
+mod value;
 pub mod widgets;
 
 use widgets::{bar, panel, rows, trunc, width};
@@ -85,6 +87,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Nodes => nodes::draw(frame, body, app),
         _ => view_state(frame, body, app, screen),
     }
+    if app.views.cmdline.open
+        && let Some(ctx) = app.ctx()
+    {
+        cmdline::draw(frame, body, &app.views.cmdline, &ctx);
+    }
     footer(frame, foot, app);
     if app.help {
         help::draw(frame, frame.area(), screen);
@@ -120,6 +127,7 @@ fn view_state(frame: &mut Frame, area: Rect, app: &App, screen: Screen) {
     let v = &app.views;
     match owner {
         Owner::Keys => keys::draw(frame, area, &v.keys, &ctx),
+        Owner::Value => value::draw(frame, area, &v.value, &ctx),
         Owner::Analysis => {
             if report_or_wait(frame, area, app, title).is_some() {
                 analysis::draw(frame, area, &v.analysis, &ctx);
@@ -129,6 +137,8 @@ fn view_state(frame: &mut Frame, area: Rect, app: &App, screen: Screen) {
         Owner::Streams => streams::draw(frame, area, &v.streams, &ctx),
         Owner::PubSub => pubsub::draw(frame, area, &v.pubsub, &ctx),
         Owner::Search => search::draw(frame, area, &v.search, &ctx),
+        // Not a screen: drawn over the body by `draw`.
+        Owner::Cmdline => {}
     }
 }
 
@@ -690,6 +700,8 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
             "   type to filter patterns · enter to apply · esc to clear",
             w,
         )
+    } else if let Some(input) = app.cmdline_input() {
+        input_line(input.label, input.text, input.hint, w)
     } else if let Some(input) = app.view_input() {
         input_line(input.label, input.text, input.hint, w)
     } else if let Some(n) = &app.notice {

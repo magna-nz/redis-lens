@@ -1,5 +1,6 @@
 ---
 source: src/tui/snapshot_tests.rs
+assertion_line: 312
 expression: t.backend()
 ---
 " redis-lens 0.1.0    STAGE   staging-cache  staging-cache.internal:6379  writes on                           ⠋ scanning "
@@ -28,13 +29,13 @@ expression: t.backend()
 "│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 "┌─ staging-cache ────────────────────────────────────────────────────────────────────────────── STAGE · saved profile ─┐"
-"│ CONNECTION                                                             PERMISSION CHECK                              │"
-"│ Endpoint    staging-cache.internal:6379                                ✓ SCAN                                        │"
-"│ Server      Redis 7.2.5 · standalone                                   ✓ TYPE · TTL                                  │"
-"│ Auth        password or ACL user                                       ✗ MEMORY USAGE  NOPERM MEMORY USAGE is not al…│"
-"│ Credential  OS keychain                                                – OBJECT FREQ   eviction policy is not LFU    │"
-"│ TLS         off                                                        ✓ INFO                                        │"
-"│ Writes      on (default outside production)                            – MEMORY STATS                                │"
+"│ Endpoint    staging-cache.internal:6379                                PERMISSION CHECK                              │"
+"│ Server      Redis 7.2.5 · standalone                                   ✓ SCAN                                        │"
+"│ Auth        password or ACL user                                       ✓ TYPE · TTL                                  │"
+"│ Credential  OS keychain                                                ✗ MEMORY USAGE  NOPERM MEMORY USAGE is not al…│"
+"│ TLS         off                                                        – OBJECT FREQ   eviction policy is not LFU    │"
+"│ Writes      on (default outside production)                            ✓ INFO                                        │"
+"│ Values      shown on screen, never saved                               – MEMORY STATS                                │"
 "│ ▲ This user can't run MEMORY USAGE, so Patterns shows counts but no sizes.                                           │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 " ↑↓ Move   enter Connect   a Add   r Rescan Docker   0-6 View   ? Help   q Quit                                         "

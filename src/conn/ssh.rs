@@ -1189,9 +1189,23 @@ while (my $conn = $l->accept) { open(my $x, '>>', "$dir/accepts-$$"); print $x "
         let fake = fake::Fake::new("cancel");
         let b = fake.bastion("hang", None, READY_TIMEOUT);
         let target = ep("10.0.0.5", 6379);
-        let r = tokio::time::timeout(Duration::from_millis(300), b.reach(&target)).await;
-        assert!(r.is_err());
+        let mut reach = Box::pin(b.reach(&target));
+        // Wait for ssh to have started (a loaded CI runner can take more than a few
+        // hundred ms), then abandon the start by dropping it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while fake.starts().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "ssh never started");
+            tokio::select! {
+                r = &mut reach => panic!("the hanging bastion answered (ok: {})", r.is_ok()),
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+        drop(reach);
         let pid = fake.starts()[0];
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while fake::alive(pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(!fake::alive(pid), "the abandoned ssh is still running");
     }
 

@@ -41,7 +41,7 @@ const MAX_FILTER: usize = 64;
 #[path = "views/mod.rs"]
 pub mod views;
 
-use views::{Act, Ctx, LiveState, Owner, ViewState, Views};
+use views::{Act, Ctx, LiveState, Owner, TailCmd, ViewState, Views};
 
 /// The seven views, switched with `0` to `6`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +95,12 @@ impl View {
                 Screen::Expiry,
                 Screen::Nodes,
             ],
-            Self::Server => &[Screen::Overview, Screen::Clients, Screen::SlowLog],
+            Self::Server => &[
+                Screen::Overview,
+                Screen::Clients,
+                Screen::SlowLog,
+                Screen::Monitor,
+            ],
             _ => &[],
         }
     }
@@ -109,6 +114,9 @@ pub enum Screen {
     Patterns,
     /// The keys of one pattern, opened with `enter` on Patterns ([`views::keys`]).
     KeyList,
+    /// One key's metadata and value, opened with `enter` on the key list
+    /// ([`views::value`]).
+    KeyDetail,
     Ttl,
     Diff,
     HotKeys,
@@ -119,16 +127,19 @@ pub enum Screen {
     Overview,
     Clients,
     SlowLog,
+    /// A time-limited `MONITOR` run ([`views::server`]).
+    Monitor,
     Streams,
     PubSub,
     Search,
 }
 
 impl Screen {
-    pub const ALL: [Screen; 15] = [
+    pub const ALL: [Screen; 17] = [
         Screen::Connections,
         Screen::Patterns,
         Screen::KeyList,
+        Screen::KeyDetail,
         Screen::Ttl,
         Screen::Diff,
         Screen::HotKeys,
@@ -138,6 +149,7 @@ impl Screen {
         Screen::Overview,
         Screen::Clients,
         Screen::SlowLog,
+        Screen::Monitor,
         Screen::Streams,
         Screen::PubSub,
         Screen::Search,
@@ -147,11 +159,11 @@ impl Screen {
     pub fn view(self) -> View {
         match self {
             Self::Connections => View::Connections,
-            Self::Patterns | Self::KeyList => View::Patterns,
+            Self::Patterns | Self::KeyList | Self::KeyDetail => View::Patterns,
             Self::Ttl | Self::Diff | Self::HotKeys | Self::BigKeys | Self::Expiry | Self::Nodes => {
                 View::Analysis
             }
-            Self::Overview | Self::Clients | Self::SlowLog => View::Server,
+            Self::Overview | Self::Clients | Self::SlowLog | Self::Monitor => View::Server,
             Self::Streams => View::Streams,
             Self::PubSub => View::PubSub,
             Self::Search => View::Search,
@@ -162,6 +174,7 @@ impl Screen {
     pub fn name(self) -> &'static str {
         match self {
             Self::KeyList => "Keys",
+            Self::KeyDetail => "Key",
             Self::Ttl => "TTL",
             Self::Diff => "Diff",
             Self::HotKeys => "Hot keys",
@@ -171,6 +184,7 @@ impl Screen {
             Self::Overview => "Overview",
             Self::Clients => "Clients",
             Self::SlowLog => "Slow log",
+            Self::Monitor => "Monitor",
             other => other.view().title(),
         }
     }
@@ -180,6 +194,7 @@ impl Screen {
     pub fn title(self) -> &'static str {
         match self {
             Self::KeyList => "Patterns · key list",
+            Self::KeyDetail => "Patterns · key detail",
             Self::Ttl => "Analysis · TTL",
             Self::Diff => "Analysis · Diff",
             Self::HotKeys => "Analysis · Hot keys",
@@ -189,6 +204,7 @@ impl Screen {
             Self::Overview => "Server · Overview",
             Self::Clients => "Server · Clients",
             Self::SlowLog => "Server · Slow log",
+            Self::Monitor => "Server · Monitor",
             other => other.view().title(),
         }
     }
@@ -206,8 +222,9 @@ impl Screen {
                 return None;
             }
             Self::KeyList => Owner::Keys,
+            Self::KeyDetail => Owner::Value,
             Self::BigKeys | Self::Expiry => Owner::Analysis,
-            Self::Overview | Self::Clients | Self::SlowLog => Owner::Server,
+            Self::Overview | Self::Clients | Self::SlowLog | Self::Monitor => Owner::Server,
             Self::Streams => Owner::Streams,
             Self::PubSub => Owner::PubSub,
             Self::Search => Owner::Search,
@@ -217,7 +234,8 @@ impl Screen {
     /// Screens that show the finished scan (and `r` rescans, `s` saves a snapshot):
     /// Patterns and every Analysis panel.
     pub fn is_scan_view(self) -> bool {
-        matches!(self.view(), View::Patterns | View::Analysis) && self != Self::KeyList
+        matches!(self.view(), View::Patterns | View::Analysis)
+            && !matches!(self, Self::KeyList | Self::KeyDetail)
     }
 
     /// Screens that work on the live connection (`r` refreshes the panel).
@@ -341,6 +359,44 @@ pub enum Effect {
         req_id: crate::live::ReqId,
         req: crate::live::LiveRequest,
     },
+    /// Start the Pub/Sub live tail `tail` of session `id`'s run `scan` on `to`, on a
+    /// connection of its own to `profile`'s endpoint (`conn::open_subscriber`), taking
+    /// from that run's command budget. It replaces the session's other tail, if any.
+    /// Its messages come back as [`Msg::TailReady`], [`Msg::Tail`] and
+    /// [`Msg::TailClosed`]. A new connect or rescan of the session, and quitting, end it
+    /// too.
+    Subscribe {
+        id: ConnId,
+        scan: ScanId,
+        tail: u64,
+        profile: Profile,
+        secrets: SecretSource,
+        to: crate::live::pubsub::Subscription,
+    },
+    /// End session `id`'s live tail `tail` and drop its connection.
+    Unsubscribe {
+        id: ConnId,
+        tail: u64,
+    },
+    /// Start the Monitor run `run` of session `id`'s run `scan`: `MONITOR` on a
+    /// connection of its own to `profile`'s endpoint (`conn::open_monitor`), taking from
+    /// that run's command budget, replacing the session's other Monitor run if any. Its
+    /// messages come back as [`Msg::MonitorReady`], [`Msg::MonitorLines`] and
+    /// [`Msg::MonitorClosed`]. It ends by itself after `crate::live::monitor::Limits`;
+    /// [`Effect::StopMonitor`], a new connect or rescan of the session, and quitting end
+    /// it too.
+    Monitor {
+        id: ConnId,
+        scan: ScanId,
+        run: u64,
+        profile: Profile,
+        secrets: SecretSource,
+    },
+    /// End session `id`'s Monitor run `run` and drop its connection.
+    StopMonitor {
+        id: ConnId,
+        run: u64,
+    },
     Quit,
 }
 
@@ -428,6 +484,52 @@ pub enum Msg {
         id: ConnId,
         scan: ScanId,
         error: Option<String>,
+    },
+    /// The live tail `tail` of run `scan` is subscribed.
+    TailReady {
+        id: ConnId,
+        scan: ScanId,
+        tail: u64,
+    },
+    /// Messages of the live tail `tail`, oldest first, at most
+    /// [`crate::live::pubsub::TAIL_KEPT`]; `dropped` more arrived since the last batch
+    /// and were left out (the oldest of them).
+    Tail {
+        id: ConnId,
+        scan: ScanId,
+        tail: u64,
+        batch: Vec<crate::live::pubsub::TailMessage>,
+        dropped: u64,
+    },
+    /// The live tail `tail` has ended without being stopped: `error` says why, in
+    /// redis-lens's own words.
+    TailClosed {
+        id: ConnId,
+        scan: ScanId,
+        tail: u64,
+        error: Option<String>,
+    },
+    /// The Monitor run `run` of run `scan` has started, at `at_unix_ms` (UTC).
+    MonitorReady {
+        id: ConnId,
+        scan: ScanId,
+        run: u64,
+        at_unix_ms: i64,
+    },
+    /// Lines of the Monitor run `run`, oldest first. Values: on screen only.
+    MonitorLines {
+        id: ConnId,
+        scan: ScanId,
+        run: u64,
+        lines: Vec<crate::live::monitor::Entry>,
+    },
+    /// The Monitor run `run` has ended without being stopped: how, or why it could not
+    /// start, in redis-lens's own words.
+    MonitorClosed {
+        id: ConnId,
+        scan: ScanId,
+        run: u64,
+        end: Result<crate::live::monitor::End, String>,
     },
 }
 
@@ -582,6 +684,10 @@ pub struct PatternsState {
     /// The key list of a pattern is open over the tree (`enter` on a pattern, `esc`
     /// back). Its state is in [`views::keys`].
     pub keys_open: bool,
+    /// The key detail of a listed key is open over the key list (`enter` on a key,
+    /// `esc` back to the list). Only with `keys_open`. Its state is in
+    /// [`views::value`].
+    pub detail_open: bool,
     /// `Some` while the view shows one cluster node's patterns (`enter` on 5 Nodes)
     /// instead of the merged ones; `esc` goes back. Cleared when the node is not in the
     /// report shown, or partial results (always merged) replace that report.
@@ -686,6 +792,8 @@ pub struct App {
     /// when the live connection closes or a new run replaces it.
     live_pending: HashMap<ReqId, Owner>,
     next_req: u64,
+    /// The id of the next Pub/Sub live tail ([`views::Act::subscribe`]).
+    next_tail: u64,
     /// The view-state methods called, in order, so tests see a stub view's calls
     /// arrive: `(owner, "show" | "hide" | "key" | "tick" | "reply" | "refresh" |
     /// "paste" | "open")`.
@@ -758,6 +866,14 @@ fn copies(screen: Screen) -> bool {
     )
 }
 
+/// Where the credentials of `entry` come from, for a connect or a live tail.
+fn secret_source(entry: &ConnEntry) -> SecretSource {
+    match &entry.source {
+        Source::Saved => SecretSource::Keychain,
+        Source::Docker { credentials, .. } => SecretSource::Container(credentials.clone()),
+    }
+}
+
 fn plain_char(key: &KeyEvent) -> Option<char> {
     match key.code {
         KeyCode::Char(c)
@@ -817,6 +933,7 @@ impl App {
             next_scan: 1,
             live_pending: HashMap::new(),
             next_req: 1,
+            next_tail: 1,
             #[cfg(test)]
             calls: Vec::new(),
         };
@@ -1107,11 +1224,27 @@ impl App {
         Some(p.pattern.clone())
     }
 
-    /// The name of the selected hot key.
+    /// The name of the selected hot key, from the scan or, without LFU counters there,
+    /// from the last Monitor run.
     fn selected_hot_key(&self) -> Option<String> {
         let keys = &self.report()?.hot_keys;
+        if keys.is_empty() {
+            let ranked = &self.monitor_hot_keys()?.ranking.keys;
+            let (k, _) = ranked.get(self.sel.hot.min(ranked.len().saturating_sub(1)))?;
+            return Some(k.clone());
+        }
         let k = keys.get(self.sel.hot.min(keys.len().saturating_sub(1)))?;
         Some(k.key.clone())
+    }
+
+    /// The Hot keys ranking of the last Monitor run in this session, when the scan has
+    /// no hot keys of its own (spec "4 Hot keys"). Never saved: it is not in the report.
+    pub fn monitor_hot_keys(&self) -> Option<&views::server::MonitorHot> {
+        let r = self.report()?;
+        if !r.hot_keys.is_empty() {
+            return None;
+        }
+        self.views.server.monitor.ranking()
     }
 
     /// The number of rows of the TTL, Diff, Hot keys and Nodes panels; 0 for other
@@ -1120,7 +1253,10 @@ impl App {
         match screen {
             Screen::Ttl => self.report().map_or(0, |r| r.patterns.len()),
             Screen::Diff => self.diff().map_or(0, |d| d.patterns.len()),
-            Screen::HotKeys => self.report().map_or(0, |r| r.hot_keys.len()),
+            Screen::HotKeys => match self.monitor_hot_keys() {
+                Some(m) => m.ranking.keys.len(),
+                None => self.report().map_or(0, |r| r.hot_keys.len()),
+            },
             Screen::Nodes => self.nodes().map_or(0, <[NodeReport]>::len),
             _ => 0,
         }
@@ -1138,6 +1274,9 @@ impl App {
         };
         match self.view {
             View::Connections => Screen::Connections,
+            View::Patterns if self.patterns.keys_open && self.patterns.detail_open => {
+                Screen::KeyDetail
+            }
             View::Patterns if self.patterns.keys_open => Screen::KeyList,
             View::Patterns => Screen::Patterns,
             View::Analysis => panel(self.analysis_panel),
@@ -1148,8 +1287,8 @@ impl App {
         }
     }
 
-    /// The screen `view` shows when switched to: its last panel, or the key list when
-    /// it was left open.
+    /// The screen `view` shows when switched to: its last panel, or the key list (or
+    /// the key detail over it) when it was left open.
     fn screen_of(&self, view: View) -> Screen {
         let panel = |i: usize| {
             let p = view.panels();
@@ -1158,6 +1297,9 @@ impl App {
         match view {
             View::Analysis => panel(self.analysis_panel),
             View::Server => panel(self.server_panel),
+            View::Patterns if self.patterns.keys_open && self.patterns.detail_open => {
+                Screen::KeyDetail
+            }
             View::Patterns if self.patterns.keys_open => Screen::KeyList,
             v => Screen::ALL
                 .into_iter()
@@ -1173,7 +1315,10 @@ impl App {
         match (view, at) {
             (View::Analysis, Some(i)) => self.analysis_panel = i,
             (View::Server, Some(i)) => self.server_panel = i,
-            (View::Patterns, _) => self.patterns.keys_open = screen == Screen::KeyList,
+            (View::Patterns, _) => {
+                self.patterns.keys_open = matches!(screen, Screen::KeyList | Screen::KeyDetail);
+                self.patterns.detail_open = screen == Screen::KeyDetail;
+            }
             _ => {}
         }
     }
@@ -1223,6 +1368,7 @@ impl App {
             views,
             notice,
             next_req,
+            next_tail,
             live_pending,
             tick,
             now,
@@ -1234,9 +1380,55 @@ impl App {
             .find(|e| e.id == s.id)
             .and_then(|e| e.perms.as_ref());
         let ctx = Ctx::new(screen, s, perms, *tick, *now, page, sel_ticks);
-        let mut act = Act::new(ctx, owner, next_req, live_pending, notice);
+        let mut act = Act::new(ctx, owner, next_req, live_pending, notice, next_tail);
         let r = f(views, &mut act);
-        Some((r, act.into_effects()))
+        let (mut effects, tail) = act.into_parts();
+        if let Some(cmd) = tail {
+            effects.extend(self.tail_effect(cmd));
+        }
+        Some((r, effects))
+    }
+
+    /// The effect for what a view asked of the live tail: the session's profile and
+    /// where its credentials come from are added here, so no view holds them.
+    fn tail_effect(&mut self, cmd: TailCmd) -> Option<Effect> {
+        let s = self.session.as_ref()?;
+        let (id, scan) = (s.id, s.scan);
+        match cmd {
+            TailCmd::Stop { tail } => Some(Effect::Unsubscribe { id, tail }),
+            TailCmd::StopMonitor { run } => Some(Effect::StopMonitor { id, run }),
+            TailCmd::Monitor { run } => {
+                let profile = s.profile.clone();
+                let Some(secrets) = self.entry(id).map(secret_source) else {
+                    self.views.server.end_monitor(views::server::Stop::Unlisted);
+                    return None;
+                };
+                Some(Effect::Monitor {
+                    id,
+                    scan,
+                    run,
+                    profile,
+                    secrets,
+                })
+            }
+            TailCmd::Subscribe { tail, to } => {
+                let profile = s.profile.clone();
+                let Some(secrets) = self.entry(id).map(secret_source) else {
+                    self.views
+                        .pubsub
+                        .tail_closed(tail, Some("this connection is no longer listed".into()));
+                    return None;
+                };
+                Some(Effect::Subscribe {
+                    id,
+                    scan,
+                    tail,
+                    profile,
+                    secrets,
+                    to,
+                })
+            }
+        }
     }
 
     /// Calls `f`, the method named `what`, on the working view state of the screen on
@@ -1354,6 +1546,10 @@ impl App {
         if self.notice.as_ref().is_some_and(|n| n.error) {
             self.notice = None;
         }
+        // The command line panel takes every key while it is open (views/cmdline.rs).
+        if self.views.cmdline.open {
+            return self.cmdline_key(key);
+        }
         if self.add.is_some() {
             return self.add_key(key);
         }
@@ -1368,6 +1564,7 @@ impl App {
         }
         match plain_char(&key) {
             Some('q') => return vec![Effect::Quit],
+            Some(':') => return self.open_cmdline(),
             Some(c @ '0'..='6') => {
                 let view = View::ALL[c as usize - '0' as usize];
                 return self.switch(self.screen_of(view));
@@ -1404,6 +1601,16 @@ impl App {
                 if !handled && screen == Screen::KeyList && key.code == KeyCode::Esc {
                     let mut out = effects;
                     out.extend(self.switch(Screen::Patterns));
+                    return out;
+                }
+                if !handled && screen == Screen::KeyList && key.code == KeyCode::Enter {
+                    let mut out = effects;
+                    out.extend(self.open_detail());
+                    return out;
+                }
+                if !handled && screen == Screen::KeyDetail && key.code == KeyCode::Esc {
+                    let mut out = effects;
+                    out.extend(self.switch(Screen::KeyList));
                     return out;
                 }
                 effects
@@ -1482,6 +1689,10 @@ impl App {
             s.live = LiveState::Waiting;
         }
         self.live_pending.clear();
+        // The live tail belongs to the replaced run: the runner drops it with it.
+        self.views.pubsub.end_tail();
+        // So does a Monitor run.
+        self.views.server.end_monitor(views::server::Stop::Rescan);
         vec![Effect::Connect {
             id,
             scan,
@@ -1579,6 +1790,7 @@ impl App {
         self.patterns.node = Some(NodeKey::of(n));
         self.patterns.sel = 0;
         self.patterns.keys_open = false;
+        self.patterns.detail_open = false;
         let out = self.switch(Screen::Patterns);
         self.rebuild_patterns(None);
         out
@@ -1599,6 +1811,9 @@ impl App {
         // The help overlay ignores everything but its own keys.
         if self.help {
             return Vec::new();
+        }
+        if self.views.cmdline.open {
+            return self.cmdline_paste(&text);
         }
         let text = clean_paste(&text);
         if let Some(add) = &mut self.add {
@@ -1806,10 +2021,7 @@ impl App {
         entry.status = ConnStatus::Connecting;
         entry.error = None;
         let profile = entry.profile.clone();
-        let secrets = match &entry.source {
-            Source::Saved => SecretSource::Keychain,
-            Source::Docker { credentials, .. } => SecretSource::Container(credentials.clone()),
-        };
+        let secrets = secret_source(entry);
         let scan = self.next_scan;
         self.next_scan += 1;
         self.connect_started = self.now;
@@ -1933,6 +2145,23 @@ impl App {
         out
     }
 
+    /// `enter` on the key list: the selected key's detail, one level down. With no key
+    /// selected it says so and stays.
+    fn open_detail(&mut self) -> Vec<Effect> {
+        let Some(row) = self.views.keys.selected().cloned() else {
+            self.set_info("No key selected to open.");
+            return Vec::new();
+        };
+        let pattern = self.views.keys.pattern.clone().unwrap_or_default();
+        let mut out = self
+            .with_views(Owner::Value, "open", |v, act| {
+                v.value.open(row, pattern, act)
+            })
+            .map_or_else(Vec::new, |(_, e)| e);
+        out.extend(self.switch(Screen::KeyDetail));
+        out
+    }
+
     /// `o`: the next sort (see [`SortBy::next`]). The selected row stays selected.
     fn cycle_sort(&mut self) {
         let sizes = self.pattern_data().is_none_or(|d| d.sizes_available);
@@ -2039,6 +2268,7 @@ impl App {
                 let mut out = self.apply_inner(Msg::Tick);
                 // Only the view on screen polls.
                 out.extend(self.on_active("tick", |v, act| v.on_tick(now, act)));
+                out.extend(self.cmdline_tick(now));
                 return out;
             }
             Msg::Tick => {
@@ -2302,6 +2532,76 @@ impl App {
                 }
                 if let Some(s) = self.session.as_mut() {
                     s.live = LiveState::Closed(error);
+                }
+                // A Monitor run stops with the live connection (spec "Monitor (P2)").
+                if let Some(run) = self.views.server.end_monitor(views::server::Stop::Closed) {
+                    return vec![Effect::StopMonitor { id, run }];
+                }
+            }
+            Msg::MonitorReady {
+                id,
+                scan,
+                run,
+                at_unix_ms,
+            } => {
+                if !self.is_session(id, scan) {
+                    return Vec::new();
+                }
+                return self
+                    .with_views(Owner::Server, "monitor_ready", |v, act| {
+                        v.server.monitor_ready(run, at_unix_ms, act)
+                    })
+                    .map_or_else(Vec::new, |(_, e)| e);
+            }
+            Msg::MonitorLines {
+                id,
+                scan,
+                run,
+                lines,
+            } => {
+                if !self.is_session(id, scan) {
+                    return Vec::new();
+                }
+                return self
+                    .with_views(Owner::Server, "monitor_lines", |v, act| {
+                        v.server.monitor_lines(run, lines, act)
+                    })
+                    .map_or_else(Vec::new, |(_, e)| e);
+            }
+            Msg::MonitorClosed { id, scan, run, end } => {
+                if !self.is_session(id, scan) {
+                    return Vec::new();
+                }
+                return self
+                    .with_views(Owner::Server, "monitor_closed", |v, act| {
+                        v.server.monitor_closed(run, end, act)
+                    })
+                    .map_or_else(Vec::new, |(_, e)| e);
+            }
+            Msg::TailReady { id, scan, tail } => {
+                if self.is_session(id, scan) {
+                    self.views.pubsub.tail_ready(tail);
+                }
+            }
+            Msg::Tail {
+                id,
+                scan,
+                tail,
+                batch,
+                dropped,
+            } => {
+                if self.is_session(id, scan) {
+                    self.views.pubsub.tail_batch(tail, batch, dropped);
+                }
+            }
+            Msg::TailClosed {
+                id,
+                scan,
+                tail,
+                error,
+            } => {
+                if self.is_session(id, scan) {
+                    self.views.pubsub.tail_closed(tail, error);
                 }
             }
             Msg::ScanFailed { id, scan, error } => {
@@ -3024,12 +3324,16 @@ mod tests {
         app.handle_key(ch('3'));
         assert_eq!(app.screen(), Screen::Overview);
         app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.screen(), Screen::Monitor);
+        app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.screen(), Screen::SlowLog);
         app.handle_key(ch('2'));
         assert_eq!(app.screen(), Screen::Nodes);
         app.handle_key(ch('3'));
         assert_eq!(app.screen(), Screen::SlowLog);
-        // Server has no Monitor panel in phase 1.
+        // Monitor is Server's fourth panel, and tab wraps around after it.
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.screen(), Screen::Monitor);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.screen(), Screen::Overview);
         // Views without panels pass tab on to their state; on the rest it does nothing.
@@ -5435,6 +5739,10 @@ mod tests {
             expected.push((owner, "refresh"));
             expected.push((owner, "key"));
             assert_eq!(calls_since(&app, n), expected, "{c}");
+            if owner == Owner::PubSub {
+                // `s` opened the subscribe input there: close it.
+                app.handle_key(key(KeyCode::Esc));
+            }
         }
         // tab is the view's own on Streams, Pub/Sub and Search, App's on Server.
         let n = app.calls.len();
@@ -5523,9 +5831,9 @@ mod tests {
             app.notice.clone().unwrap().text,
             "The server refused SLOWLOG for this user, so this view is off."
         );
-        // Leaving it tells nobody; the Overview next to it works.
+        // Leaving it tells nobody; the Monitor panel next to it works.
         app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.screen(), Screen::Overview);
+        assert_eq!(app.screen(), Screen::Monitor);
         assert_eq!(calls_since(&app, n), [(Owner::Server, "show")]);
         show(&mut app, Screen::Search);
         assert_eq!(app.active_owner(), None);
@@ -5742,6 +6050,7 @@ mod tests {
             "shift-tab" => vec![key(KeyCode::BackTab)],
             "ctrl-c" => vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
             "0-6" => ('0'..='6').map(ch).collect(),
+            "space" => vec![ch(' ')],
             t if t.chars().count() == 1 => vec![ch(t.chars().next().unwrap())],
             t => panic!("no key events for token {t:?}"),
         }
@@ -5763,6 +6072,7 @@ mod tests {
             KeyCode::BackTab => "shift-tab".into(),
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-c".into(),
             KeyCode::Char('0'..='6') => "0-6".into(),
+            KeyCode::Char(' ') => "space".into(),
             KeyCode::Char(c) => c.to_string(),
             other => format!("{other:?}"),
         }

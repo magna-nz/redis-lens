@@ -466,6 +466,61 @@ async fn slow_log_cuts_long_commands_without_taking_the_marker_for_a_key() {
         assert_eq!(del.keys[0], "del0");
         assert!(del.more_keys > 0 && del.more_keys <= 60 - 8);
         assert!(!del.keys.iter().any(|k| k.contains("more arguments")));
+        // The server's cut marker becomes the count, not an argument.
+        assert!(del.args_cut > 0 && del.args_cut <= 60, "{}", del.args_cut);
+        let line = String::from_utf8(del.args.as_bytes().to_vec()).unwrap();
+        assert!(line.starts_with("DEL del0 del1 "), "{line}");
+        assert!(!line.contains("more arguments"), "{line}");
+    }
+}
+
+#[tokio::test]
+async fn slow_log_arguments_come_back_masked_and_never_in_debug() {
+    const PASS: &str = "s3cret-slow-pw";
+    for (kind, server) in servers().await {
+        let mut admin = server.admin().await;
+        log_everything(&mut admin).await;
+        cmd(&mut admin, &["SET", "plain:key", "visible-value"]).await;
+        cmd(
+            &mut admin,
+            &["ACL", "SETUSER", "slow-tmp", "on", &format!(">{PASS}")],
+        )
+        .await;
+        cmd(&mut admin, &["CONFIG", "SET", "masterauth", PASS]).await;
+        let r = slowlog(
+            &mut admin,
+            &Budget::new(None),
+            Default::default(),
+            false,
+            true,
+        )
+        .await
+        .expect("SLOWLOG");
+        let lines: Vec<String> = r
+            .entries
+            .iter()
+            .map(|e| String::from_utf8(e.args.as_bytes().to_vec()).unwrap())
+            .collect();
+        assert!(
+            lines.iter().any(|l| l == "SET plain:key visible-value"),
+            "{kind}: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("ACL SETUSER")),
+            "{kind}: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("CONFIG SET masterauth")),
+            "{kind}: {lines:?}"
+        );
+        for l in &lines {
+            assert!(!l.contains(PASS), "{kind}: {l}");
+        }
+        let shown = format!("{r:?}");
+        assert!(
+            !shown.contains(PASS) && !shown.contains("visible-value"),
+            "{kind}: {shown}"
+        );
     }
 }
 

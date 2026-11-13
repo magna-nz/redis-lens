@@ -132,9 +132,10 @@ fn go(app: &mut App, c: char) {
     super::app::views::testing::show(app, LEGACY[c as usize - '0' as usize]);
 }
 
-/// Goes to `screen`, unless it is the key list and there is no pattern to open.
+/// Goes to `screen`, unless it is the key list (or the key detail over it) and there is
+/// no pattern to open.
 fn show(app: &mut App, screen: Screen) -> bool {
-    if screen == Screen::KeyList && app.pattern_rows().is_empty() {
+    if matches!(screen, Screen::KeyList | Screen::KeyDetail) && app.pattern_rows().is_empty() {
         return false;
     }
     super::app::views::testing::show(app, screen);

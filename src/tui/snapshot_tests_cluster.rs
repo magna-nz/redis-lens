@@ -441,7 +441,7 @@ fn every_cluster_screen_at_every_size_does_not_panic() {
     apps.push(cluster_scanned(none, HEALTHY).0);
     for app in &mut apps {
         for screen in Screen::ALL {
-            if screen == Screen::KeyList {
+            if matches!(screen, Screen::KeyList | Screen::KeyDetail) {
                 continue;
             }
             show(app, screen);
@@ -500,6 +500,7 @@ fn live_views_are_off_on_a_cluster_and_send_nothing() {
     let (mut app, _) = cluster_scanned(fixtures::cluster_report(), HEALTHY);
     for screen in [
         Screen::KeyList,
+        Screen::KeyDetail,
         Screen::Overview,
         Screen::Clients,
         Screen::SlowLog,

@@ -2,19 +2,28 @@
 //! `ui/streams.rs`; its live requests are in `src/live/streams.rs`.
 //!
 //! Lists the streams the last scan found and polls `XINFO` for them every 5 s while the
-//! view is shown (`p` pauses). Reads entry IDs only, never entry values (spec "Values"
-//! is phase 2). See [`super`] for the interface `App` calls.
+//! view is shown (`p` pauses). The poll reads entry IDs only. See [`super`] for the
+//! interface `App` calls.
+//!
+//! `enter` lists the selected stream's entries, one level deeper: a
+//! [`ValueState`](super::value::ValueState), the key detail's own state, reads them in
+//! pages of 100 with `XREVRANGE` (the key detail's `LiveRequest::Value`, no command of
+//! its own) and `ui/value.rs` draws them, so `↑↓`, `tab`, `n`, `f` and `y` work as on
+//! the key detail. `esc` goes back to the list. While the entries are shown the `XINFO`
+//! poll stops; back on the list it reads at once when a poll is due.
 
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use super::value::ValueState;
 use super::{Act, ViewState};
+use crate::live::keys::KeyRow;
 use crate::live::streams::{
     ConsumerInfo, GroupInfo, MAX_STREAMS, Refused, Reply, Request, StreamInfo, Verdict, verdicts,
 };
 use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
-use crate::model::{KeyType, PatternStats, ScanReport};
+use crate::model::{KeyType, PatternStats, ScanReport, Ttl};
 
 /// How often `XINFO` is polled while the view is shown (spec "Shared command budget").
 pub const POLL: Duration = Duration::from_secs(5);
@@ -88,6 +97,12 @@ pub struct StreamsState {
     /// `r` was pressed while a poll was in flight: that poll's answer skipped what `r`
     /// asks again, so its refusals are not kept, and one more read follows it.
     reread: bool,
+    /// The entries of the stream last opened with `enter`, kept after `esc` so that
+    /// opening it again shows what was loaded. Values are [`Raw`](crate::value::Raw):
+    /// its `Debug` shows lengths only.
+    pub entries: Option<Box<ValueState>>,
+    /// The entries are on screen instead of the list.
+    pub entries_open: bool,
 }
 
 /// The keys of the streams the scan found: keys of type stream among the examples of every
@@ -132,6 +147,42 @@ impl StreamsState {
             .and_then(|r| r.info.as_ref())
             .map(detail_rows)
             .unwrap_or_default()
+    }
+
+    /// The entries on screen, if they are.
+    pub fn shown_entries(&self) -> Option<&ValueState> {
+        self.entries.as_deref().filter(|_| self.entries_open)
+    }
+
+    /// `enter`: list the selected stream's entries. The stream opened last keeps what
+    /// it loaded; another starts afresh.
+    fn open_entries(&mut self, act: &mut Act<'_>) {
+        let Some(row) = self.selected() else {
+            act.info("No stream selected.");
+            return;
+        };
+        let Some(info) = &row.info else {
+            act.info("The key is gone, or no longer a stream. Rescan to update the list.");
+            return;
+        };
+        let key_row = stream_row(&row.key, info);
+        let entries = self.entries.get_or_insert_with(Box::default);
+        entries.open(key_row, String::new(), act);
+        self.entries_open = true;
+        entries.on_show(act);
+    }
+
+    /// `r` with the entries open: read them again from the newest.
+    fn reload_entries(&mut self, act: &mut Act<'_>) {
+        let Some(entries) = self.entries.as_mut() else {
+            return;
+        };
+        let Some(row) = entries.row.take() else {
+            return;
+        };
+        **entries = ValueState::default();
+        entries.open(row, String::new(), act);
+        entries.on_show(act);
     }
 
     fn fetch(&mut self, act: &mut Act<'_>) {
@@ -191,14 +242,37 @@ impl StreamsState {
     }
 }
 
+/// The key list's row for a stream of this view, for the entries: only the key, the
+/// type and the length are used.
+fn stream_row(key: &str, info: &StreamInfo) -> KeyRow {
+    KeyRow {
+        key: key.to_string(),
+        key_type: KeyType::Stream,
+        ttl: Ttl::Persistent,
+        bytes: info.bytes,
+        encoding: None,
+        length: Some(info.length),
+        freq: None,
+    }
+}
+
 impl ViewState for StreamsState {
     fn on_show(&mut self, act: &mut Act<'_>) {
+        if let Some(entries) = self.entries.as_mut().filter(|_| self.entries_open) {
+            entries.on_show(act);
+            return;
+        }
         if self.off.is_none() && !self.in_flight(act) && (!self.paused || !self.loaded) {
             self.fetch(act);
         }
     }
 
     fn on_tick(&mut self, now: Instant, act: &mut Act<'_>) {
+        if let Some(entries) = self.entries.as_mut().filter(|_| self.entries_open) {
+            // No XINFO poll while the entries are shown.
+            entries.on_tick(now, act);
+            return;
+        }
         if self.off.is_some() || self.paused || !act.live_ready() || self.in_flight(act) {
             return;
         }
@@ -209,6 +283,10 @@ impl ViewState for StreamsState {
     }
 
     fn refresh(&mut self, act: &mut Act<'_>) {
+        if self.entries_open {
+            self.reload_entries(act);
+            return;
+        }
         // `r` tries again after the view turned itself off, and asks again for what was
         // refused (the ACL may have changed).
         self.off = None;
@@ -221,7 +299,35 @@ impl ViewState for StreamsState {
     }
 
     fn on_key(&mut self, key: KeyEvent, act: &mut Act<'_>) -> bool {
+        if self.entries_open {
+            if key.code == KeyCode::Esc {
+                self.entries_open = false;
+                return true;
+            }
+            if let (KeyCode::Char('p'), true) = (key.code, plain(&key)) {
+                // Pausing still works; the poll waits for the list anyway.
+                self.paused = !self.paused;
+                act.info(if self.paused {
+                    "Polling paused. It stops while the entries are shown anyway."
+                } else {
+                    "Polling resumed: the list reads again when you go back to it."
+                });
+                return true;
+            }
+            return match self.entries.as_mut() {
+                Some(entries) => entries.on_key(key, act),
+                None => false,
+            };
+        }
         match key.code {
+            KeyCode::Enter => {
+                self.open_entries(act);
+                true
+            }
+            KeyCode::Char('n' | 'f' | 'y') if plain(&key) => {
+                act.info("Press enter to list the selected stream's entries first.");
+                true
+            }
             KeyCode::Char('p') if plain(&key) => {
                 self.paused = !self.paused;
                 if self.paused {
@@ -263,8 +369,12 @@ impl ViewState for StreamsState {
     }
 
     fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
-        // Only the answer to the request in flight; an older one is stale.
+        // Only the answer to the request in flight; an older one is stale. Any other is
+        // a page of entries, or stale too (the entries state checks).
         if self.pending != Some(id) {
+            if let Some(entries) = self.entries.as_mut() {
+                entries.on_reply(id, result, act);
+            }
             return;
         }
         self.pending = None;
@@ -731,5 +841,313 @@ mod tests {
         let (app, _) = loaded();
         let shown = format!("{:?}", app.views.streams);
         assert!(!shown.contains("hunter2"));
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Entries (phase 2)
+    // ---------------------------------------------------------------------------------
+
+    use crate::live::values::{
+        At, Entry, Items, Kind, Page, Reply as ValueReply, Request as ValueRequest,
+    };
+    use crate::value::Raw;
+
+    const MARK: &str = "s3cr3t-d0c";
+
+    fn ch(c: char) -> crossterm::event::KeyEvent {
+        key(KeyCode::Char(c))
+    }
+
+    fn value_requests(effects: &[Effect]) -> Vec<(ReqId, ValueRequest)> {
+        testing::requests(effects)
+            .into_iter()
+            .filter_map(|(id, r)| match r {
+                LiveRequest::Value(v) => Some((id, v)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn entry(id: &str, fields: &[(&str, &str)]) -> Entry {
+        Entry {
+            id: id.into(),
+            fields: fields
+                .iter()
+                .map(|(k, v)| (Raw::from(*k), Raw::from(*v)))
+                .collect(),
+        }
+    }
+
+    fn entries_page(
+        entries: Vec<Entry>,
+        next: Option<At>,
+        first: bool,
+    ) -> Result<LiveReply, LiveError> {
+        Ok(LiveReply::Value(ValueReply::Page(Page {
+            type_name: first.then(|| "stream".to_string()),
+            items: Items::Stream(entries),
+            next,
+            refused: Vec::new(),
+        })))
+    }
+
+    fn orders_entries() -> Vec<Entry> {
+        vec![
+            entry(
+                "1700000900000-0",
+                &[("order", r#"{"id":44812,"state":"paid"}"#), ("by", "web")],
+            ),
+            entry(
+                "1700000800000-0",
+                &[("order", r#"{"id":44811,"state":"new"}"#)],
+            ),
+            entry("1700000700000-0", &[("note", "plain text")]),
+        ]
+    }
+
+    fn notice(app: &App) -> String {
+        app.notice
+            .as_ref()
+            .map(|n| n.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn text(app: &App, w: u16, h: u16) -> String {
+        let t = testing::render(app, w, h);
+        let b = t.backend().buffer();
+        let mut out = String::new();
+        for y in 0..b.area.height {
+            for x in 0..b.area.width {
+                out.push_str(b[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The loaded list, `enter` on `orders`, and the first page answered.
+    fn entries_open() -> (App, Instant) {
+        let (mut app, t0) = loaded();
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [(id, req)] = &value_requests(&effects)[..] else {
+            panic!("expected one value request, got {effects:?}");
+        };
+        assert_eq!(
+            *req,
+            ValueRequest {
+                key: "orders".into(),
+                kind: Kind::Stream,
+                at: None,
+                field_ttls: true,
+                size: Some(2 * 1024 * 1024),
+            }
+        );
+        testing::reply(
+            &mut app,
+            *id,
+            entries_page(
+                orders_entries(),
+                Some(At::Before("1700000700000-0".into())),
+                true,
+            ),
+        );
+        (app, t0)
+    }
+
+    #[test]
+    fn enter_lists_the_entries_newest_first_and_n_loads_more() {
+        let (mut app, t0) = entries_open();
+        let s = &app.views.streams;
+        assert!(s.entries_open);
+        assert_eq!(s.shown_entries().unwrap().loaded(), 3);
+        // n reads the next 100, before the last ID read.
+        let effects = app.handle_key(ch('n'));
+        let [(id, req)] = &value_requests(&effects)[..] else {
+            panic!("{effects:?}");
+        };
+        assert_eq!(req.at, Some(At::Before("1700000700000-0".into())));
+        assert_eq!(req.kind, Kind::Stream);
+        testing::reply(
+            &mut app,
+            *id,
+            entries_page(vec![entry("1700000600000-0", &[("a", "b")])], None, false),
+        );
+        assert_eq!(app.views.streams.shown_entries().unwrap().loaded(), 4);
+        app.handle_key(ch('n'));
+        assert_eq!(notice(&app), "All 4 items are loaded.");
+        // No XINFO poll while the entries are shown.
+        assert_eq!(tick(&mut app, t0, 60_000), None);
+        // esc goes back to the list, which polls again at once (a poll is long due).
+        assert!(app.handle_key(key(KeyCode::Esc)).is_empty());
+        assert!(!app.views.streams.entries_open);
+        let id = tick(&mut app, t0, 60_100).expect("a poll back on the list");
+        answer(&mut app, id);
+        // Opening the same stream again keeps what was loaded.
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert!(value_requests(&effects).is_empty());
+        assert_eq!(app.views.streams.shown_entries().unwrap().loaded(), 4);
+        // Another starts afresh.
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(ch('j'));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [(_, req)] = &value_requests(&effects)[..] else {
+            panic!("{effects:?}");
+        };
+        assert_eq!((req.key.as_str(), req.at.clone()), ("events:1", None));
+    }
+
+    #[test]
+    fn entries_stay_open_across_views_and_r_reads_them_again() {
+        let (mut app, _) = entries_open();
+        app.handle_key(ch('1'));
+        let effects = app.handle_key(ch('4'));
+        // Shown again: nothing asked, no XINFO either.
+        assert!(testing::requests(&effects).is_empty(), "{effects:?}");
+        assert!(app.views.streams.entries_open);
+        // r reads the entries again from the newest.
+        let effects = app.handle_key(ch('r'));
+        let reqs = testing::requests(&effects);
+        let [(_, LiveRequest::Value(req))] = &reqs[..] else {
+            panic!("{reqs:?}");
+        };
+        assert_eq!((req.key.as_str(), req.at.clone()), ("orders", None));
+        assert_eq!(app.views.streams.shown_entries().unwrap().loaded(), 0);
+    }
+
+    #[test]
+    fn a_gone_stream_has_no_entries_to_list() {
+        let (mut app, _) = loaded();
+        app.handle_key(ch('G'));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert!(testing::requests(&effects).is_empty());
+        assert!(!app.views.streams.entries_open);
+        assert_eq!(
+            notice(&app),
+            "The key is gone, or no longer a stream. Rescan to update the list."
+        );
+        // n, f and y on the list say what to do first.
+        app.handle_key(ch('n'));
+        assert_eq!(
+            notice(&app),
+            "Press enter to list the selected stream's entries first."
+        );
+    }
+
+    #[test]
+    fn f_and_y_in_the_entries_work_as_on_the_key_detail() {
+        let (mut app, _) = entries_open();
+        app.handle_key(ch('f'));
+        let f = app.views.streams.shown_entries().unwrap().format;
+        // The first field of the newest entry is JSON: f moves on to MessagePack.
+        assert_eq!(f, Some(crate::value::Format::MsgPack));
+        assert_eq!(notice(&app), "Shown as MessagePack.");
+        let all = text(&app, 120, 36);
+        assert!(all.contains("shown as MessagePack"), "{all}");
+        // A stream entry has several fields: y does not copy it (as on the key detail).
+        let effects = app.handle_key(ch('y'));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Copy(_))));
+        assert_eq!(
+            notice(&app),
+            "A stream entry has several fields, so y does not copy it."
+        );
+        // tab moves to the value, which scrolls.
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(
+            app.views.streams.shown_entries().unwrap().focus,
+            crate::tui::app::views::value::Focus::Value
+        );
+        // p still pauses, and esc goes back.
+        app.handle_key(ch('p'));
+        assert!(app.views.streams.paused);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.views.streams.entries_open);
+    }
+
+    #[test]
+    fn entries_snapshots() {
+        let (mut app, _) = entries_open();
+        insta::assert_snapshot!("entries_80x24", testing::render(&app, 80, 24).backend());
+        insta::assert_snapshot!("entries_120x36", testing::render(&app, 120, 36).backend());
+        app.handle_key(ch('j'));
+        insta::assert_snapshot!(
+            "entries_second_80x24",
+            testing::render(&app, 80, 24).backend()
+        );
+    }
+
+    #[test]
+    fn escapes_in_entries_are_drawn_never_the_raw_bytes() {
+        let (mut app, _) = loaded();
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let (id, _) = value_requests(&effects).remove(0);
+        let e = Entry {
+            id: "1700000900000-0".into(),
+            fields: vec![
+                (
+                    Raw::from("na\x1b[2Jme"),
+                    Raw::from("ok\x1b[2J\u{9b}31m done"),
+                ),
+                (
+                    Raw::from("bin"),
+                    Raw::new(vec![0x9b, 0x1b, b'[', b'2', b'J', 0xff]),
+                ),
+            ],
+        };
+        testing::reply(&mut app, id, entries_page(vec![e], None, true));
+        for (w, h) in [(80, 24), (120, 36)] {
+            let all = text(&app, w, h);
+            assert!(all.contains("\\x1b[2J"), "{all}");
+            assert!(!all.contains('\x1b') && !all.contains('\u{9b}'), "{all}");
+        }
+        insta::assert_snapshot!(
+            "entries_escapes_80x24",
+            testing::render(&app, 80, 24).backend()
+        );
+    }
+
+    /// Rule 1: an entry's values show on screen and nowhere else.
+    #[test]
+    fn entry_values_never_reach_debug_notices_or_snapshot_files() {
+        let (mut app, _) = loaded();
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let (id, _) = value_requests(&effects).remove(0);
+        let reply = entries_page(
+            vec![entry("1700000900000-0", &[(MARK, MARK), ("b", MARK)])],
+            None,
+            true,
+        );
+        let msg = format!(
+            "{:?}",
+            Msg::Live {
+                id: app.session.as_ref().unwrap().id,
+                scan: app.session.as_ref().unwrap().scan,
+                req_id: id,
+                result: reply.clone(),
+            }
+        );
+        assert!(!crate::value::leaks(&msg, MARK), "{msg}");
+        testing::reply(&mut app, id, reply);
+        assert!(text(&app, 120, 36).contains(MARK));
+        let mut effects = Vec::new();
+        for k in ['f', 'y', 'j', 'n'] {
+            effects.extend(app.handle_key(ch(k)));
+            assert!(
+                !crate::value::leaks(&notice(&app), MARK),
+                "{}",
+                notice(&app)
+            );
+        }
+        let debug = format!("{effects:?} {:?} {:?}", app.views, app.session);
+        assert!(!crate::value::leaks(&debug, MARK), "{debug}");
+        // A snapshot file, saved from Patterns.
+        app.handle_key(ch('1'));
+        let effects = app.handle_key(ch('s'));
+        let [Effect::SaveSnapshot(report)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        assert!(!crate::value::leaks(
+            &serde_json::to_string(report).unwrap(),
+            MARK
+        ));
     }
 }

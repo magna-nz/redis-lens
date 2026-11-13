@@ -1,4 +1,5 @@
-//! State of the Server view: the Overview, Clients and Slow log panels (spec "3 Server").
+//! State of the Server view: the Overview, Clients, Slow log and Monitor panels (spec "3
+//! Server").
 //! Owner: wave B. Drawn by `ui/server.rs`; its live requests are in `src/live/server.rs`.
 //! See [`super`] for the interface `App` calls.
 //!
@@ -11,6 +12,14 @@
 //! Nothing here keeps a user name, a password or the server's own error text: the
 //! `CLIENT LIST` user is dropped by the parser, and every message is built from
 //! [`LiveError`], whose wording is fixed.
+//!
+//! The Monitor panel ([`Monitor`]) does not poll. `enter` asks first (`y`/`n`, or the
+//! profile name on a `prod` profile), then starts a run with [`Act::monitor`]; the run
+//! ends after [`MAX_TIME`] or [`MAX_LINES`] lines, with `esc`, or when the session's live
+//! connection goes. Its lines (values, with credentials masked on arrival) stay here, in
+//! memory, for the session. When it ends, the keys its lines name are ranked for Hot
+//! keys ([`Monitor::ranking`]), placed by the key specs the Slow log learns too (one
+//! cache, [`SlowLog`]); commands not in it are asked with `COMMAND INFO`.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv6Addr};
@@ -18,13 +27,16 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::live::monitor::{self, End, Entry, MAX_LINES, MAX_TIME, Ranking};
 use crate::live::server::{
     ClientConn, CommandKeys, InfoSample, Reply, Request, SlowConfig, SlowEntry, SlowLogReply,
+    names_to_learn,
 };
 use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
+use crate::model::Env;
 use crate::tui::app::Screen;
 
-use super::{Act, ViewState};
+use super::{Act, Input, ViewState};
 
 /// Polls kept for the sparklines.
 pub const HISTORY: usize = 60;
@@ -39,28 +51,35 @@ pub const IDLE_FLAG_SECS: u64 = 3600;
 /// Rates over a shorter gap are noise.
 const MIN_DT: Duration = Duration::from_millis(100);
 
-/// The three panels of phase 1.
+/// The four panels: three that poll, and Monitor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
     Overview,
     Clients,
     SlowLog,
+    Monitor,
 }
 
 impl Panel {
-    pub const ALL: [Panel; 3] = [Panel::Overview, Panel::Clients, Panel::SlowLog];
+    pub const ALL: [Panel; 4] = [
+        Panel::Overview,
+        Panel::Clients,
+        Panel::SlowLog,
+        Panel::Monitor,
+    ];
 
     pub fn of(screen: Screen) -> Option<Self> {
         match screen {
             Screen::Overview => Some(Self::Overview),
             Screen::Clients => Some(Self::Clients),
             Screen::SlowLog => Some(Self::SlowLog),
+            Screen::Monitor => Some(Self::Monitor),
             _ => None,
         }
     }
 }
 
-/// The three panels' state. `act.screen` says which one is shown.
+/// The four panels' state. `act.screen` says which one is shown.
 #[derive(Debug)]
 pub struct ServerState {
     pub paused: bool,
@@ -69,6 +88,7 @@ pub struct ServerState {
     pub overview: Overview,
     pub clients: Clients,
     pub slow: SlowLog,
+    pub monitor: Monitor,
 }
 
 impl Default for ServerState {
@@ -79,6 +99,7 @@ impl Default for ServerState {
             overview: Overview::default(),
             clients: Clients::default(),
             slow: SlowLog::default(),
+            monitor: Monitor::default(),
         }
     }
 }
@@ -94,14 +115,18 @@ impl ServerState {
             Panel::Overview => self.interval(),
             Panel::Clients => CLIENTS_EVERY,
             Panel::SlowLog => SLOWLOG_EVERY,
+            // Never polls ([`Self::due`]).
+            Panel::Monitor => Duration::MAX,
         }
     }
 
+    /// The polling of `panel`; for Monitor, its `COMMAND INFO` lookups.
     pub fn poll(&self, panel: Panel) -> &Poll {
         match panel {
             Panel::Overview => &self.overview.poll,
             Panel::Clients => &self.clients.poll,
             Panel::SlowLog => &self.slow.poll,
+            Panel::Monitor => &self.monitor.lookup,
         }
     }
 
@@ -110,6 +135,7 @@ impl ServerState {
             Panel::Overview => &mut self.overview.poll,
             Panel::Clients => &mut self.clients.poll,
             Panel::SlowLog => &mut self.slow.poll,
+            Panel::Monitor => &mut self.monitor.lookup,
         }
     }
 
@@ -123,6 +149,7 @@ impl ServerState {
                 config: self.slow.config_wanted,
                 keys: self.slow.keys_wanted,
             },
+            Panel::Monitor => return,
         };
         if let Some(id) = act.send(LiveRequest::Server(req)) {
             let p = self.poll_mut(panel);
@@ -133,7 +160,7 @@ impl ServerState {
 
     fn due(&self, panel: Panel, act: &Act<'_>) -> bool {
         let p = self.poll(panel);
-        if p.off.is_some() || p.busy(act) {
+        if panel == Panel::Monitor || p.off.is_some() || p.busy(act) {
             return false;
         }
         match (act.now, p.sent) {
@@ -161,6 +188,8 @@ impl ServerState {
             }
             Reply::Clients(list) => self.clients.set(list),
             Reply::SlowLog(r) => self.slow.set(*r),
+            // Only the Monitor panel asks for these: see [`Self::monitor_learned`].
+            Reply::CommandKeys(found) => self.slow.specs.extend(found),
         }
     }
 
@@ -210,7 +239,8 @@ impl ViewState for ServerState {
         }
     }
 
-    fn on_tick(&mut self, _now: Instant, act: &mut Act<'_>) {
+    fn on_tick(&mut self, now: Instant, act: &mut Act<'_>) {
+        self.monitor_tick(now, act);
         let Some(panel) = Panel::of(act.screen) else {
             return;
         };
@@ -223,6 +253,10 @@ impl ViewState for ServerState {
         let Some(panel) = Panel::of(act.screen) else {
             return;
         };
+        // The Monitor panel does not poll: `r` is not one of its keys.
+        if panel == Panel::Monitor {
+            return;
+        }
         // `r` also tries again a panel that went off: the ACL may have changed.
         let p = self.poll_mut(panel);
         p.off = None;
@@ -242,6 +276,9 @@ impl ViewState for ServerState {
         let Some(panel) = Panel::of(act.screen) else {
             return false;
         };
+        if panel == Panel::Monitor {
+            return self.monitor_key(key, act);
+        }
         match (panel, key.code) {
             (_, KeyCode::Char('p')) => {
                 self.paused = !self.paused;
@@ -269,6 +306,17 @@ impl ViewState for ServerState {
         }
     }
 
+    fn input(&self) -> Option<Input> {
+        self.monitor_input()
+    }
+
+    fn on_paste(&mut self, text: &str, _act: &mut Act<'_>) {
+        if let Some(Prompt::TypeName(t)) = self.monitor.prompt.as_mut() {
+            let room = MAX_TYPED.saturating_sub(t.chars().count());
+            t.extend(text.chars().filter(|c| !c.is_control()).take(room));
+        }
+    }
+
     fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
         let Some(panel) = Panel::ALL
             .into_iter()
@@ -280,6 +328,10 @@ impl ViewState for ServerState {
         let p = self.poll_mut(panel);
         p.in_flight = None;
         p.sent = p.sent.or(now);
+        if panel == Panel::Monitor {
+            self.monitor_learned(result, act);
+            return;
+        }
         match result {
             Ok(LiveReply::Server(reply)) => {
                 p.failed = None;
@@ -875,6 +927,410 @@ impl SlowLog {
             self.sel = s;
             true
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Monitor
+// ---------------------------------------------------------------------------
+
+/// How many `COMMAND INFO` rounds a ranking asks at most (names, then containers'
+/// subcommands, 64 names a round).
+const MAX_LOOKUPS: u8 = 8;
+/// The longest profile name the prompt takes.
+const MAX_TYPED: usize = 256;
+
+/// What the prompt before a run asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prompt {
+    /// `y` or `n`.
+    YesNo,
+    /// On a `prod` profile: the profile name, typed so far.
+    TypeName(String),
+}
+
+/// Why a run stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stop {
+    /// `esc`.
+    Esc,
+    /// [`MAX_TIME`] passed.
+    TimeUp,
+    /// [`MAX_LINES`] lines arrived.
+    LineCap,
+    /// Its connection was lost.
+    Lost,
+    /// The session's live connection closed.
+    Closed,
+    /// A rescan replaced the session's run.
+    Rescan,
+    /// The connection is no longer listed.
+    Unlisted,
+    /// It could not start: why, in redis-lens's own words.
+    Failed(String),
+}
+
+impl Stop {
+    /// One sentence for the panel.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Esc => "Stopped with esc.".to_string(),
+            Self::TimeUp => format!("Stopped after {} s.", MAX_TIME.as_secs()),
+            Self::LineCap => format!(
+                "Stopped after {} lines.",
+                crate::format::grouped(MAX_LINES as u64)
+            ),
+            Self::Lost => "Stopped: the connection to the server was lost.".to_string(),
+            Self::Closed => "Stopped: the live connection closed.".to_string(),
+            Self::Rescan => "Stopped by the rescan.".to_string(),
+            Self::Unlisted => "Stopped: this connection is no longer listed.".to_string(),
+            Self::Failed(why) => format!("MONITOR did not start: {why}."),
+        }
+    }
+}
+
+/// The Hot keys ranking of a finished run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorHot {
+    pub ranking: Ranking,
+    /// How long the run ran, in whole seconds.
+    pub secs: u64,
+    /// When it started, UTC.
+    pub at_unix: i64,
+    /// Why some keys could not be placed, when `COMMAND INFO` was refused.
+    pub keys_note: Option<String>,
+}
+
+/// Where the ranking of the last finished run is.
+#[derive(Debug, Default)]
+enum Rank {
+    #[default]
+    None,
+    /// Waiting for `COMMAND INFO`; `rounds` asked so far.
+    Pending {
+        rounds: u8,
+    },
+    Done(MonitorHot),
+}
+
+/// The Monitor panel.
+#[derive(Debug, Default)]
+pub struct Monitor {
+    /// The prompt is open.
+    pub prompt: Option<Prompt>,
+    /// The run started and not ended yet (it may not be ready).
+    pub run: Option<u64>,
+    /// The run's connection answered: lines are coming.
+    pub ready: bool,
+    started: Option<Instant>,
+    ended: Option<Instant>,
+    started_unix: Option<i64>,
+    /// How the last run ended.
+    pub stopped: Option<Stop>,
+    /// The last run's lines, oldest first, at most [`MAX_LINES`]. Values: on screen only.
+    pub lines: Vec<Entry>,
+    pub sel: usize,
+    /// The selection follows the newest line.
+    pub follow: bool,
+    /// The `COMMAND INFO` lookups of the ranking.
+    lookup: Poll,
+    rank: Rank,
+}
+
+impl Monitor {
+    /// The ranking of the last finished run, once its keys are placed.
+    pub fn ranking(&self) -> Option<&MonitorHot> {
+        match &self.rank {
+            Rank::Done(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// The last run's keys are being placed (`COMMAND INFO` is out).
+    pub fn ranking_pending(&self) -> bool {
+        matches!(self.rank, Rank::Pending { .. })
+    }
+
+    /// A run was started and has not ended.
+    pub fn running(&self) -> bool {
+        self.run.is_some()
+    }
+
+    /// Time left in the run, once it is ready and the clock has been read.
+    pub fn left(&self, now: Option<Instant>) -> Option<Duration> {
+        let started = self.started?;
+        Some(MAX_TIME.saturating_sub(now?.saturating_duration_since(started)))
+    }
+
+    /// How long the run ran (or has run so far), capped at [`MAX_TIME`].
+    pub fn ran(&self, now: Option<Instant>) -> Duration {
+        match (self.started, self.ended.or(now)) {
+            (Some(s), Some(e)) => e.saturating_duration_since(s).min(MAX_TIME),
+            _ => Duration::ZERO,
+        }
+    }
+
+    pub fn selected(&self) -> Option<&Entry> {
+        self.lines.get(self.sel)
+    }
+
+    fn push(&mut self, lines: Vec<Entry>) -> bool {
+        let room = MAX_LINES.saturating_sub(self.lines.len());
+        let full = lines.len() >= room;
+        self.lines.extend(lines.into_iter().take(room));
+        if self.follow {
+            self.sel = self.lines.len().saturating_sub(1);
+        }
+        full
+    }
+}
+
+impl ServerState {
+    /// The input the prompt shows in the key bar.
+    fn monitor_input(&self) -> Option<Input> {
+        Some(match self.monitor.prompt.as_ref()? {
+            Prompt::YesNo => Input {
+                label: "MONITOR",
+                text: String::new(),
+                hint: "  slows the server · y start · n cancel",
+            },
+            Prompt::TypeName(t) => Input {
+                label: "MONITOR",
+                text: t.clone(),
+                hint: "  type the profile name · enter start · esc cancel",
+            },
+        })
+    }
+
+    /// `enter` on the Monitor panel: opens the prompt, when a run can start.
+    fn ask_monitor(&mut self, act: &mut Act<'_>) {
+        if self.monitor.running() {
+            act.info("MONITOR is already running. esc stops it.");
+        } else if let Some(why) = crate::conn::monitor_unsupported(act.profile()) {
+            act.info(why);
+        } else if !act.live_ready() {
+            act.info("The live connection is not open, so MONITOR cannot start.");
+        } else {
+            self.monitor.prompt = Some(if act.profile().env == Env::Prod {
+                Prompt::TypeName(String::new())
+            } else {
+                Prompt::YesNo
+            });
+        }
+    }
+
+    fn start_monitor(&mut self, act: &mut Act<'_>) {
+        let Some(run) = act.monitor() else {
+            act.info("The live connection is not open, so MONITOR cannot start.");
+            return;
+        };
+        let m = &mut self.monitor;
+        m.run = Some(run);
+        m.ready = false;
+        m.started = None;
+        m.ended = None;
+        m.started_unix = None;
+        m.stopped = None;
+        m.lines.clear();
+        m.sel = 0;
+        m.follow = true;
+        act.info(format!(
+            "MONITOR started: it stops after {} s or {} lines, or with esc.",
+            MAX_TIME.as_secs(),
+            crate::format::grouped(MAX_LINES as u64)
+        ));
+    }
+
+    /// A key while the prompt is open, or on the Monitor panel.
+    fn monitor_key(&mut self, key: KeyEvent, act: &mut Act<'_>) -> bool {
+        if let Some(prompt) = self.monitor.prompt.as_mut() {
+            match (prompt, key.code) {
+                (_, KeyCode::Esc) | (Prompt::YesNo, KeyCode::Char('n' | 'N')) => {
+                    self.monitor.prompt = None;
+                    act.info("MONITOR not started.");
+                }
+                (Prompt::YesNo, KeyCode::Char('y' | 'Y')) => {
+                    self.monitor.prompt = None;
+                    self.start_monitor(act);
+                }
+                (Prompt::TypeName(t), KeyCode::Char(c)) => {
+                    if t.chars().count() < MAX_TYPED {
+                        t.push(c);
+                    }
+                }
+                (Prompt::TypeName(t), KeyCode::Backspace) => {
+                    t.pop();
+                }
+                (Prompt::TypeName(t), KeyCode::Enter) => {
+                    let typed = std::mem::take(t);
+                    self.monitor.prompt = None;
+                    if typed == act.profile().name {
+                        self.start_monitor(act);
+                    } else {
+                        act.error("MONITOR not started: that is not the profile name.");
+                    }
+                }
+                _ => {}
+            }
+            // The prompt takes every key.
+            return true;
+        }
+        match key.code {
+            KeyCode::Enter => {
+                self.ask_monitor(act);
+                true
+            }
+            KeyCode::Esc => match self.monitor.run {
+                Some(run) => {
+                    act.stop_monitor(run);
+                    act.info("MONITOR stopped.");
+                    self.finish_monitor(Stop::Esc, Some(act));
+                    true
+                }
+                None => false,
+            },
+            _ => {
+                let m = &mut self.monitor;
+                match move_selection(m.sel, m.lines.len(), key, act.page) {
+                    Some(s) => {
+                        m.sel = s;
+                        m.follow = s + 1 >= m.lines.len();
+                        true
+                    }
+                    None => false,
+                }
+            }
+        }
+    }
+
+    /// The run `run` is ready: lines are coming.
+    pub fn monitor_ready(&mut self, run: u64, at_unix_ms: i64, act: &mut Act<'_>) {
+        if self.monitor.run != Some(run) {
+            return;
+        }
+        self.monitor.ready = true;
+        self.monitor.started = act.now;
+        self.monitor.started_unix = Some(at_unix_ms.div_euclid(1000));
+    }
+
+    /// Lines of the run `run`. Past [`MAX_LINES`] the run stops.
+    pub fn monitor_lines(&mut self, run: u64, lines: Vec<Entry>, act: &mut Act<'_>) {
+        if self.monitor.run != Some(run) {
+            return;
+        }
+        if self.monitor.push(lines) {
+            act.stop_monitor(run);
+            self.finish_monitor(Stop::LineCap, Some(act));
+        }
+    }
+
+    /// The run `run` ended by itself, or could not start.
+    pub fn monitor_closed(&mut self, run: u64, end: Result<End, String>, act: &mut Act<'_>) {
+        if self.monitor.run != Some(run) {
+            return;
+        }
+        let stop = match end {
+            Ok(End::TimeUp) => Stop::TimeUp,
+            Ok(End::LineCap) => Stop::LineCap,
+            Ok(End::Lost | End::Gone) => Stop::Lost,
+            Err(why) => Stop::Failed(why),
+        };
+        if matches!(stop, Stop::Failed(_)) {
+            act.error(stop.text());
+        }
+        self.finish_monitor(stop, Some(act));
+    }
+
+    /// Ends the run, if one runs, without asking for anything (a rescan, or the live
+    /// connection closed). Returns its id, for the caller to stop it.
+    pub fn end_monitor(&mut self, why: Stop) -> Option<u64> {
+        self.monitor.prompt = None;
+        let run = self.monitor.run?;
+        self.finish_monitor(why, None);
+        Some(run)
+    }
+
+    /// The time limit, checked on every tick whichever panel is shown.
+    fn monitor_tick(&mut self, now: Instant, act: &mut Act<'_>) {
+        if let (Some(run), Some(started)) = (self.monitor.run, self.monitor.started)
+            && now.saturating_duration_since(started) >= MAX_TIME
+        {
+            act.stop_monitor(run);
+            self.finish_monitor(Stop::TimeUp, Some(act));
+        }
+    }
+
+    fn finish_monitor(&mut self, why: Stop, act: Option<&mut Act<'_>>) {
+        let m = &mut self.monitor;
+        m.run = None;
+        m.ready = false;
+        m.ended = act.as_ref().and_then(|a| a.now);
+        m.stopped = Some(why);
+        if m.started.is_none() {
+            // It never ran: the last ranking stays the last run's.
+            return;
+        }
+        m.rank = Rank::Pending { rounds: 0 };
+        match act {
+            Some(act) => self.monitor_lookup(act),
+            None => self.monitor_rank(),
+        }
+    }
+
+    /// Asks `COMMAND INFO` for the commands of the last run whose key specs the cache
+    /// lacks, or ranks the keys when there are none (or they may not be asked).
+    fn monitor_lookup(&mut self, act: &mut Act<'_>) {
+        let rounds = match self.monitor.rank {
+            Rank::Pending { rounds } => rounds,
+            _ => return,
+        };
+        let names = names_to_learn(
+            &self.slow.specs,
+            self.monitor.lines.iter().map(|e| e.line.args.as_slice()),
+        );
+        if names.is_empty() || !self.slow.keys_wanted || rounds >= MAX_LOOKUPS {
+            self.monitor_rank();
+            return;
+        }
+        match act.send(LiveRequest::Server(Request::CommandKeys { names })) {
+            Some(id) => {
+                self.monitor.lookup.in_flight = Some(id);
+                self.monitor.rank = Rank::Pending { rounds: rounds + 1 };
+            }
+            None => self.monitor_rank(),
+        }
+    }
+
+    /// The answer to a lookup: learn it, then ask again or rank.
+    fn monitor_learned(&mut self, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
+        match result {
+            Ok(LiveReply::Server(reply)) => self.apply(reply),
+            Ok(_) => {}
+            Err(e) => {
+                if matches!(e, LiveError::Denied(_) | LiveError::Unsupported(_)) {
+                    self.slow.keys_wanted = false;
+                    self.slow.keys_note = Some(format!("Key names are off: {e}."));
+                }
+                self.monitor_rank();
+                return;
+            }
+        }
+        self.monitor_lookup(act);
+    }
+
+    /// Ranks the last run's keys with what the cache knows now.
+    fn monitor_rank(&mut self) {
+        let m = &mut self.monitor;
+        let ranking = monitor::rank(&m.lines, &self.slow.specs);
+        let keys_note = (ranking.unknown > 0)
+            .then(|| self.slow.keys_note.clone())
+            .flatten();
+        m.rank = Rank::Done(MonitorHot {
+            ranking,
+            secs: m.ran(None).as_secs(),
+            at_unix: m.started_unix.unwrap_or(0),
+            keys_note,
+        });
     }
 }
 
@@ -1537,6 +1993,13 @@ mod tests {
             client: "10.0.1.5:50386".into(),
             client_name: "worker".into(),
             whole_key_read: false,
+            args: crate::value::Raw::new(
+                format!("{command} {}", keys.join(" "))
+                    .trim_end()
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            args_cut: 0,
         }
     }
 
@@ -1982,7 +2445,7 @@ mod tests {
                 },
                 Request::Clients => Reply::Clients(fleet()),
                 Request::SlowLog { .. } => Reply::SlowLog(Box::new(slow_reply(slow_entries()))),
-                Request::Ping => unreachable!(),
+                Request::Ping | Request::CommandKeys { .. } => unreachable!(),
             };
             answer(&mut app, id, reply);
             app.handle_key(key(KeyCode::Enter));
@@ -1990,5 +2453,535 @@ mod tests {
                 let _ = testing::render(&app, w, h);
             }
         }
+    }
+}
+
+/// The Monitor panel, the Slow log's arguments and the Hot keys ranking from Monitor.
+#[cfg(test)]
+mod monitor_tests {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    use crossterm::event::{KeyCode, KeyEvent};
+
+    use super::super::testing::{self, key};
+    use super::*;
+    use crate::live::server::{Begin, Find, KeySpec, SlowConfig, SlowLogReply};
+    use crate::tui::app::{App, Effect, Msg, Screen};
+    use crate::tui::fixtures;
+    use crate::value::{self, Raw};
+
+    /// A value: on screen only.
+    const MARK: &str = "hunter2-monitor-secret";
+    /// A credential: never anywhere.
+    const PASS: &str = "s3cret-pass-xyz";
+
+    fn ch(c: char) -> KeyEvent {
+        key(KeyCode::Char(c))
+    }
+
+    fn ids(app: &App) -> (u64, u64) {
+        let s = app.session.as_ref().unwrap();
+        (s.id, s.scan)
+    }
+
+    /// On the Monitor panel, connected (`prod`: the fixture's prod-cache-01) with the
+    /// clock at `t0`.
+    fn on_monitor(t0: Instant, prod: bool) -> App {
+        let mut app = testing::scanned();
+        if !prod {
+            app.session.as_mut().unwrap().profile.env = Env::Stage;
+        }
+        testing::live_ready(&mut app);
+        app.apply(Msg::TickAt(t0));
+        testing::show(&mut app, Screen::Monitor);
+        app
+    }
+
+    fn started(effects: &[Effect]) -> Option<u64> {
+        effects.iter().find_map(|e| match e {
+            Effect::Monitor { run, .. } => Some(*run),
+            _ => None,
+        })
+    }
+
+    fn stopped(effects: &[Effect]) -> Option<u64> {
+        effects.iter().find_map(|e| match e {
+            Effect::StopMonitor { run, .. } => Some(*run),
+            _ => None,
+        })
+    }
+
+    fn type_text(app: &mut App, s: &str) -> Vec<Effect> {
+        s.chars().flat_map(|c| app.handle_key(ch(c))).collect()
+    }
+
+    fn line(i: usize, cmd: &str) -> Entry {
+        monitor::read_line(&format!(
+            r#"1763039045.{:06} [0 10.0.1.5:{}] {cmd}"#,
+            i * 1000 % 1_000_000,
+            50_000 + i % 7
+        ))
+        .unwrap()
+    }
+
+    fn ready(app: &mut App, run: u64) {
+        let (id, scan) = ids(app);
+        app.apply(Msg::MonitorReady {
+            id,
+            scan,
+            run,
+            at_unix_ms: 1_763_039_045_000,
+        });
+    }
+
+    fn lines(app: &mut App, run: u64, lines: Vec<Entry>) -> Vec<Effect> {
+        let (id, scan) = ids(app);
+        app.apply(Msg::MonitorLines {
+            id,
+            scan,
+            run,
+            lines,
+        })
+    }
+
+    fn closed(app: &mut App, run: u64, end: Result<End, String>) -> Vec<Effect> {
+        let (id, scan) = ids(app);
+        app.apply(Msg::MonitorClosed { id, scan, run, end })
+    }
+
+    /// A non-prod run started with `y`, ready.
+    fn running(t0: Instant) -> (App, u64) {
+        let mut app = on_monitor(t0, false);
+        app.handle_key(key(KeyCode::Enter));
+        let run = started(&app.handle_key(ch('y'))).expect("a run");
+        ready(&mut app, run);
+        (app, run)
+    }
+
+    fn text(app: &App, w: u16, h: u16) -> String {
+        let t = testing::render(app, w, h);
+        let b = t.backend().buffer();
+        let mut out = String::new();
+        for y in 0..b.area.height {
+            for x in 0..b.area.width {
+                out.push_str(b[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn it_asks_y_or_n_first_and_n_sends_nothing() {
+        let mut app = on_monitor(Instant::now(), false);
+        let out = app.handle_key(key(KeyCode::Enter));
+        assert!(started(&out).is_none());
+        assert_eq!(app.views.server.monitor.prompt, Some(Prompt::YesNo));
+        assert_eq!(app.view_input().unwrap().label, "MONITOR");
+        // The prompt takes every key: a digit does not switch views.
+        assert!(started(&app.handle_key(ch('3'))).is_none());
+        assert_eq!(app.screen(), Screen::Monitor);
+        assert!(app.handle_key(ch('n')).is_empty());
+        assert!(app.views.server.monitor.prompt.is_none());
+        assert!(!app.views.server.monitor.running());
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.handle_key(key(KeyCode::Esc)).is_empty());
+        app.handle_key(key(KeyCode::Enter));
+        let run = started(&app.handle_key(ch('y'))).expect("y starts it");
+        assert_eq!(app.views.server.monitor.run, Some(run));
+        // A second enter while it runs does not ask again.
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.views.server.monitor.prompt.is_none());
+    }
+
+    #[test]
+    fn a_prod_profile_needs_its_name_typed() {
+        let mut app = on_monitor(Instant::now(), true);
+        // A read-only prod profile asks too.
+        assert!(app.session.as_ref().unwrap().profile.is_read_only());
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.views.server.monitor.prompt,
+            Some(Prompt::TypeName(String::new()))
+        );
+        // `y` is text here.
+        assert!(started(&app.handle_key(ch('y'))).is_none());
+        app.handle_key(key(KeyCode::Backspace));
+        let out = type_text(&mut app, "prod-cache-0");
+        assert!(started(&out).is_none());
+        assert!(started(&app.handle_key(key(KeyCode::Enter))).is_none());
+        assert!(!app.views.server.monitor.running());
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("not the profile name")
+        );
+        app.handle_key(key(KeyCode::Enter));
+        let name = app.session.as_ref().unwrap().profile.name.clone();
+        type_text(&mut app, &name);
+        assert!(started(&app.handle_key(key(KeyCode::Enter))).is_some());
+    }
+
+    #[test]
+    fn a_run_stops_at_ten_thousand_lines() {
+        let (mut app, run) = running(Instant::now());
+        let first: Vec<Entry> = (0..9_000).map(|i| line(i, r#""GET" "k""#)).collect();
+        assert!(stopped(&lines(&mut app, run, first)).is_none());
+        let more: Vec<Entry> = (0..1_500).map(|i| line(i, r#""GET" "k""#)).collect();
+        assert_eq!(stopped(&lines(&mut app, run, more)), Some(run));
+        let m = &app.views.server.monitor;
+        assert_eq!(m.lines.len(), MAX_LINES);
+        assert_eq!(m.stopped, Some(Stop::LineCap));
+        assert!(!m.running());
+        // Lines of the stopped run are ignored.
+        lines(&mut app, run, vec![line(1, r#""GET" "k""#)]);
+        assert_eq!(app.views.server.monitor.lines.len(), MAX_LINES);
+    }
+
+    #[test]
+    fn a_run_stops_after_thirty_seconds_and_with_esc() {
+        let t0 = Instant::now();
+        let (mut app, run) = running(t0);
+        assert!(stopped(&app.apply(Msg::TickAt(t0 + Duration::from_secs(29)))).is_none());
+        assert!(app.views.server.monitor.running());
+        let out = app.apply(Msg::TickAt(t0 + Duration::from_secs(30)));
+        assert_eq!(stopped(&out), Some(run));
+        assert_eq!(app.views.server.monitor.stopped, Some(Stop::TimeUp));
+        assert_eq!(app.views.server.monitor.ran(None), MAX_TIME);
+
+        let (mut app, run) = running(t0);
+        assert_eq!(stopped(&app.handle_key(key(KeyCode::Esc))), Some(run));
+        assert_eq!(app.views.server.monitor.stopped, Some(Stop::Esc));
+    }
+
+    #[test]
+    fn a_run_stops_with_the_live_connection_and_a_rescan() {
+        let (mut app, run) = running(Instant::now());
+        let (id, scan) = ids(&app);
+        let out = app.apply(Msg::LiveClosed {
+            id,
+            scan,
+            error: Some("the connection to the server was lost".into()),
+        });
+        assert_eq!(stopped(&out), Some(run));
+        assert_eq!(app.views.server.monitor.stopped, Some(Stop::Closed));
+
+        let (mut app, _) = running(Instant::now());
+        app.handle_key(ch('2'));
+        app.handle_key(ch('r'));
+        assert_eq!(app.views.server.monitor.stopped, Some(Stop::Rescan));
+    }
+
+    #[test]
+    fn a_refusal_is_said_in_fixed_words() {
+        let mut app = on_monitor(Instant::now(), false);
+        app.handle_key(key(KeyCode::Enter));
+        let run = started(&app.handle_key(ch('y'))).unwrap();
+        closed(
+            &mut app,
+            run,
+            Err(LiveError::Denied("MONITOR".into()).to_string()),
+        );
+        let all = text(&app, 80, 24);
+        assert!(
+            all.contains("the server refused MONITOR for this user"),
+            "{all}"
+        );
+        // It never ran: no ranking.
+        assert!(app.views.server.monitor.ranking().is_none());
+        insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
+    }
+
+    fn sample_lines() -> Vec<Entry> {
+        let mut v = vec![
+            line(1, &format!(r#""AUTH" "lens" "{PASS}""#)),
+            line(2, r#""GET" "user:10293:cart""#),
+            line(3, r#""HGETALL" "session:9f3""#),
+            line(4, r#""GET" "user:10293:cart""#),
+            line(5, &format!(r#""SET" "rate:1.2.3.4" "{MARK}" "EX" "60""#)),
+            line(6, r#""XINFO" "STREAM" "orders""#),
+            line(7, r#""GET" "feature:\x1b[31mflags\xe2\x80\xae""#),
+            line(8, r#""PING""#),
+        ];
+        v.push(line(
+            9,
+            &format!(r#""CONFIG" "SET" "requirepass" "{PASS}""#),
+        ));
+        v.push(
+            monitor::read_line(&format!(
+                r#"1763039046.5 [0 lua] "MSET" "a" "{}" "b" "c""#,
+                "v".repeat(2000)
+            ))
+            .unwrap(),
+        );
+        v
+    }
+
+    #[test]
+    fn credentials_never_reach_the_screen_debug_or_a_snapshot() {
+        let (mut app, run) = running(Instant::now());
+        let (id, scan) = ids(&app);
+        let msg = Msg::MonitorLines {
+            id,
+            scan,
+            run,
+            lines: sample_lines(),
+        };
+        assert!(!value::leaks(&format!("{msg:?}"), MARK));
+        assert!(!value::leaks(&format!("{msg:?}"), PASS));
+        let out = app.apply(msg);
+        for (w, h) in [(80, 24), (120, 36)] {
+            app.handle_key(key(KeyCode::Home));
+            let all = text(&app, w, h);
+            assert!(all.contains("AUTH *** ***"), "{all}");
+            assert!(!all.contains(PASS), "{all}");
+            assert!(
+                !all.contains('\u{1b}') && !all.contains('\u{202e}'),
+                "{all}"
+            );
+        }
+        // The value of SET is a value: on screen when selected, never in Debug.
+        let debug = format!("{out:?} {:?}", app.views);
+        assert!(!value::leaks(&debug, MARK), "{debug}");
+        assert!(!value::leaks(&debug, PASS), "{debug}");
+        // Credentials are masked as the lines arrive: not even the state holds them.
+        assert!(
+            app.views.server.monitor.lines.iter().all(|e| e
+                .line
+                .args
+                .iter()
+                .all(|a| a != PASS.as_bytes()))
+        );
+        let out = app.handle_key(key(KeyCode::Esc));
+        let debug = format!("{out:?} {:?} {:?}", app.views, app.notice);
+        assert!(!value::leaks(&debug, MARK), "{debug}");
+        // `s` from Patterns saves the scan only.
+        app.handle_key(ch('1'));
+        let effects = app.handle_key(ch('s'));
+        let [Effect::SaveSnapshot(report)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        let json = serde_json::to_string(report).unwrap();
+        assert!(!value::leaks(&json, MARK) && !value::leaks(&json, PASS));
+        assert!(!json.contains("rate:1.2.3.4"));
+    }
+
+    fn get_spec() -> CommandKeys {
+        CommandKeys::Specs(vec![KeySpec {
+            begin: Begin::Index(1),
+            find: Find::Range {
+                last: 0,
+                step: 1,
+                limit: 0,
+            },
+        }])
+    }
+
+    /// A finished run on a scan without LFU counters, its keys placed.
+    fn ranked() -> App {
+        let t0 = Instant::now();
+        let (mut app, run) = running(t0);
+        app.session.as_mut().unwrap().report = Some(fixtures::report_lru());
+        lines(&mut app, run, sample_lines());
+        app.apply(Msg::TickAt(t0 + Duration::from_secs(12)));
+        let out = closed(&mut app, run, Ok(End::Lost));
+        let reqs = testing::requests(&out);
+        let [(id, LiveRequest::Server(Request::CommandKeys { names }))] = &reqs[..] else {
+            panic!("{reqs:?}");
+        };
+        assert!(names.contains(&"get".to_string()) && names.contains(&"xinfo".to_string()));
+        assert!(!names.iter().any(|n| n.contains(MARK)));
+        assert!(app.views.server.monitor.ranking_pending());
+        let mut found: HashMap<String, CommandKeys> = names
+            .iter()
+            .map(|n| (n.clone(), CommandKeys::Specs(vec![])))
+            .collect();
+        for n in ["get", "hgetall", "set"] {
+            found.insert(n.into(), get_spec());
+        }
+        found.insert("xinfo".into(), CommandKeys::Container);
+        let out = testing::reply(
+            &mut app,
+            *id,
+            Ok(LiveReply::Server(Reply::CommandKeys(found))),
+        );
+        // Round two: the container's subcommand.
+        let reqs = testing::requests(&out);
+        let [(id, LiveRequest::Server(Request::CommandKeys { names }))] = &reqs[..] else {
+            panic!("{reqs:?}");
+        };
+        assert_eq!(names, &["xinfo|stream"]);
+        // Refused: rank with what is known.
+        testing::reply(&mut app, *id, Err(LiveError::Denied("COMMAND INFO".into())));
+        app
+    }
+
+    #[test]
+    fn hot_keys_rank_the_last_run_and_never_save_it() {
+        let mut app = ranked();
+        let hot = app.monitor_hot_keys().expect("a ranking");
+        assert_eq!(hot.ranking.keys[0], ("user:10293:cart".to_string(), 2));
+        assert_eq!(hot.ranking.lines, 10);
+        // XINFO STREAM (refused) is unknown; the cut MSET was learned without keys.
+        assert_eq!(hot.ranking.unknown, 1);
+        assert_eq!(hot.secs, 12);
+        assert!(hot.keys_note.is_some());
+        testing::show(&mut app, Screen::HotKeys);
+        let all = text(&app, 120, 36);
+        assert!(
+            all.contains("from MONITOR, 12 s, 10 lines, at 13:04 UTC"),
+            "{all}"
+        );
+        let effects = app.handle_key(ch('s'));
+        let [Effect::SaveSnapshot(report)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        let json = serde_json::to_string(report).unwrap();
+        assert!(!json.contains("user:10293:cart") || report.hot_keys.is_empty());
+        assert!(!json.contains("session:9f3"), "the ranking is not saved");
+        assert!(!value::leaks(&json, MARK));
+        // y copies the key name, as on the LFU ranking.
+        let effects = app.handle_key(ch('y'));
+        assert!(effects.iter().any(|e| matches!(e, Effect::Copy(_))));
+    }
+
+    #[test]
+    fn hot_keys_from_monitor_80x24() {
+        let mut app = ranked();
+        testing::show(&mut app, Screen::HotKeys);
+        insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
+    }
+
+    #[test]
+    fn hot_keys_from_monitor_120x36() {
+        let mut app = ranked();
+        testing::show(&mut app, Screen::HotKeys);
+        app.handle_key(ch('j'));
+        insta::assert_snapshot!(testing::render(&app, 120, 36).backend());
+    }
+
+    #[test]
+    fn monitor_not_started_80x24() {
+        let app = on_monitor(Instant::now(), false);
+        insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
+    }
+
+    #[test]
+    fn monitor_asking_prod_80x24() {
+        let mut app = on_monitor(Instant::now(), true);
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "prod-ca");
+        insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
+    }
+
+    #[test]
+    fn monitor_asking_y_or_n_120x36() {
+        let mut app = on_monitor(Instant::now(), false);
+        app.handle_key(key(KeyCode::Enter));
+        insta::assert_snapshot!(testing::render(&app, 120, 36).backend());
+    }
+
+    fn with_lines() -> App {
+        let t0 = Instant::now();
+        let (mut app, run) = running(t0);
+        lines(&mut app, run, sample_lines());
+        app.apply(Msg::TickAt(t0 + Duration::from_secs(7)));
+        app
+    }
+
+    #[test]
+    fn monitor_running_80x24() {
+        let app = with_lines();
+        insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
+    }
+
+    #[test]
+    fn monitor_running_120x36() {
+        let mut app = with_lines();
+        app.handle_key(ch('k'));
+        insta::assert_snapshot!(testing::render(&app, 120, 36).backend());
+    }
+
+    #[test]
+    fn monitor_stopped_80x24_selected_line_cut() {
+        let mut app = with_lines();
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::End));
+        let all = text(&app, 80, 24);
+        assert!(all.contains("more arguments not kept"), "{all}");
+        insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
+    }
+
+    #[test]
+    fn small_terminals_do_not_panic() {
+        let mut app = with_lines();
+        for (w, h) in [(40, 12), (20, 6), (10, 3), (1, 1), (200, 60)] {
+            let _ = testing::render(&app, w, h);
+        }
+        app.handle_key(key(KeyCode::Enter));
+        for (w, h) in [(40, 12), (1, 1)] {
+            let _ = testing::render(&app, w, h);
+        }
+    }
+
+    #[test]
+    fn slow_log_arguments_are_shown_masked_80x24() {
+        let t0 = Instant::now();
+        let mut app = testing::scanned();
+        testing::live_ready(&mut app);
+        app.apply(Msg::TickAt(t0));
+        let out = testing::show(&mut app, Screen::SlowLog);
+        let (id, _) = testing::requests(&out).pop().unwrap();
+        let entry = |id: u64, command: &str, args: &str, cut: u64| SlowEntry {
+            id,
+            unix: 1_763_039_045 - id as i64,
+            micros: 12_000 + id * 1000,
+            command: command.into(),
+            keys: vec![],
+            more_keys: 0,
+            client: "10.0.1.5:50386".into(),
+            client_name: String::new(),
+            whole_key_read: false,
+            args: Raw::new(args.as_bytes().to_vec()),
+            args_cut: cut,
+        };
+        let entries = vec![
+            entry(3, "CONFIG SET", "CONFIG SET requirepass ***", 0),
+            entry(2, "DEL", "DEL k1 k2 k3 k4 k5 k6 k7 k8 k9 k10 k11 k12", 40),
+            entry(1, "SET", &format!("SET k {MARK}"), 0),
+        ];
+        let reply = SlowLogReply {
+            entries,
+            config: Some(Ok(SlowConfig {
+                threshold_micros: 0,
+                max_len: 128,
+            })),
+            keys_off: None,
+            learned: HashMap::new(),
+        };
+        let msg = format!("{reply:?}");
+        assert!(!value::leaks(&msg, MARK), "{msg}");
+        testing::reply(
+            &mut app,
+            id,
+            Ok(LiveReply::Server(Reply::SlowLog(Box::new(reply)))),
+        );
+        assert!(!value::leaks(&format!("{:?}", app.views), MARK));
+        app.handle_key(ch('j'));
+        let all = text(&app, 80, 24);
+        assert!(all.contains("… 40 more arguments"), "{all}");
+        insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
+        app.handle_key(ch('k'));
+        app.handle_key(ch('k'));
+        assert!(text(&app, 120, 36).contains("CONFIG SET requirepass ***"));
+        app.handle_key(ch('1'));
+        let effects = app.handle_key(ch('s'));
+        let [Effect::SaveSnapshot(report)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        assert!(!value::leaks(&serde_json::to_string(report).unwrap(), MARK));
     }
 }

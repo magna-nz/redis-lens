@@ -52,7 +52,57 @@ const HELP: KeyHelp = k("?", "?", "Help", "Show or hide this key list", true);
 const ADD: KeyHelp = k("a", "a", "Add", "Add a connection", true);
 const QUIT: KeyHelp = k("q ctrl-c", "q", "Quit", "Quit", true);
 
-static GLOBAL: [KeyHelp; 4] = [VIEW_KEYS, HELP, ADD, QUIT];
+const COMMAND_LINE_KEY: KeyHelp = k(
+    ":",
+    ":",
+    "Command",
+    "Open the command line for readonly commands",
+    false,
+);
+
+static GLOBAL: [KeyHelp; 5] = [VIEW_KEYS, HELP, ADD, COMMAND_LINE_KEY, QUIT];
+
+/// The keys of the command line panel while it is open (`:`). Its input line replaces
+/// the footer, so none of them is in a footer.
+static COMMAND_LINE: [KeyHelp; 7] = [
+    k(
+        "enter",
+        "enter",
+        "Run",
+        "Run the command (readonly commands only)",
+        false,
+    ),
+    k(
+        "↑↓",
+        "↑↓",
+        "History",
+        "Step through this session's commands",
+        false,
+    ),
+    k(
+        "tab",
+        "tab",
+        "Complete",
+        "Complete a command, subcommand or loaded key name",
+        false,
+    ),
+    k("PgUp PgDn", "PgUp", "Scroll", "Scroll the output", false),
+    k("ctrl-l", "ctrl-l", "Clear", "Clear the output", false),
+    k(
+        "ctrl-u",
+        "ctrl-u",
+        "Clear line",
+        "Clear the input line",
+        false,
+    ),
+    k(
+        "esc",
+        "esc",
+        "Close",
+        "Close the command line, or cancel a question",
+        false,
+    ),
+];
 
 const MOVE: KeyHelp = k("↑↓ j k", "↑↓", "Move", "Move the selection", true);
 const PAGE: KeyHelp = k("PgUp PgDn", "PgUp", "Page", "Move one page", false);
@@ -68,14 +118,6 @@ const PANEL: KeyHelp = k(
     "tab",
     "Panel",
     "Next or previous panel",
-    true,
-);
-/// On Streams and Search: `tab` moves between the list and the selected row's details.
-const FOCUS: KeyHelp = k(
-    "tab shift-tab",
-    "tab",
-    "Details",
-    "Move between the list and the details",
     true,
 );
 const COPY_PATTERN: KeyHelp = k(
@@ -163,13 +205,20 @@ static PATTERNS: [KeyHelp; 12] = [
     SNAPSHOT,
 ];
 
-static KEY_LIST: [KeyHelp; 8] = [
+static KEY_LIST: [KeyHelp; 9] = [
     MOVE,
     PAGE,
     ENDS,
     k("/", "/", "Filter", "Filter the loaded keys by name", true),
     k("o", "o", "Sort", "Sort the loaded keys", true),
     k("n", "n", "More", "Load 1,000 more keys", true),
+    k(
+        "enter",
+        "enter",
+        "Open",
+        "Show the selected key and its value",
+        false,
+    ),
     COPY_KEY,
     k(
         "esc",
@@ -178,6 +227,41 @@ static KEY_LIST: [KeyHelp; 8] = [
         "Clear the filter, or go back to Patterns",
         true,
     ),
+];
+
+static KEY_DETAIL: [KeyHelp; 8] = [
+    k(
+        "↑↓ j k",
+        "↑↓",
+        "Move",
+        "Move the selection, or scroll the value",
+        true,
+    ),
+    PAGE,
+    ENDS,
+    k(
+        "tab shift-tab",
+        "tab",
+        "Value",
+        "Move between the items and the value",
+        true,
+    ),
+    k(
+        "f",
+        "f",
+        "Format",
+        "Show the value as text, hex, JSON or MessagePack",
+        true,
+    ),
+    k("n", "n", "More", "Load the next 100 items", true),
+    k(
+        "y",
+        "y",
+        "Copy",
+        "Copy the selected value as shown to the clipboard",
+        false,
+    ),
+    k("esc", "esc", "Back", "Go back to the key list", true),
 ];
 
 static TTL_DIFF: [KeyHelp; 8] = [
@@ -231,11 +315,134 @@ static CLIENTS: [KeyHelp; 8] = [
 
 static SLOW_LOG: [KeyHelp; 6] = [MOVE, PAGE, ENDS, PANEL, PAUSE, REFRESH];
 
-static STREAMS: [KeyHelp; 6] = [MOVE, PAGE, ENDS, FOCUS, PAUSE, REFRESH];
+static MONITOR: [KeyHelp; 6] = [
+    k("↑↓ j k", "↑↓", "Scroll", "Scroll the lines", true),
+    PAGE,
+    ENDS,
+    PANEL,
+    k(
+        "enter",
+        "enter",
+        "Start",
+        "Start MONITOR after asking; it stops after 30 s or 10,000 lines",
+        true,
+    ),
+    k("esc", "esc", "Stop", "Stop MONITOR now", true),
+];
 
-static PUBSUB: [KeyHelp; 5] = [MOVE, PAGE, ENDS, PAUSE, REFRESH];
+/// `f` on the screens that show a value: the key detail, stream entries, a Search result.
+const FORMAT: KeyHelp = k(
+    "f",
+    "f",
+    "Format",
+    "Show the value as text, hex, JSON or MessagePack",
+    true,
+);
+/// `y` on the screens that show a value.
+const COPY_VALUE: KeyHelp = k(
+    "y",
+    "y",
+    "Copy",
+    "Copy the selected value as shown to the clipboard",
+    false,
+);
 
-static SEARCH: [KeyHelp; 5] = [MOVE, PAGE, ENDS, FOCUS, REFRESH];
+static STREAMS: [KeyHelp; 11] = [
+    k(
+        "↑↓ j k",
+        "↑↓",
+        "Move",
+        "Move the selection, or scroll the value",
+        true,
+    ),
+    PAGE,
+    ENDS,
+    k(
+        "tab shift-tab",
+        "tab",
+        "Details",
+        "Move between the list and the details, or the entries and the value",
+        true,
+    ),
+    k(
+        "enter",
+        "enter",
+        "Entries",
+        "List the selected stream's entries",
+        true,
+    ),
+    k("n", "n", "More", "Load 100 more entries", true),
+    FORMAT,
+    COPY_VALUE,
+    k("esc", "esc", "Back", "Go back to the stream list", true),
+    PAUSE,
+    k(
+        "r",
+        "r",
+        "Refresh",
+        "Refresh this panel now, or read the entries again",
+        true,
+    ),
+];
+
+static PUBSUB: [KeyHelp; 11] = [
+    MOVE,
+    PAGE,
+    ENDS,
+    k(
+        "enter",
+        "enter",
+        "Subscribe",
+        "Subscribe to the selected channel",
+        true,
+    ),
+    k("s", "s", "Sub", "Subscribe to a channel or pattern", false),
+    k("space", "space", "Pause", "Pause or resume the tail", true),
+    k("c", "c", "Clear", "Clear the tail", false),
+    k("/", "/", "Filter", "Filter the tail", true),
+    k(
+        "esc",
+        "esc",
+        "Stop",
+        "Clear the filter, or stop the tail",
+        false,
+    ),
+    PAUSE,
+    REFRESH,
+];
+
+static SEARCH: [KeyHelp; 12] = [
+    k(
+        "↑↓ j k",
+        "↑↓",
+        "Move",
+        "Move the selection, or scroll the text",
+        true,
+    ),
+    PAGE,
+    ENDS,
+    k(
+        "tab shift-tab",
+        "tab",
+        "Details",
+        "Move between the list and the details, or the fields and the value",
+        true,
+    ),
+    k("/", "/", "Query", "Run a query on the selected index", true),
+    k("enter", "enter", "Open", "Open the selected result", true),
+    k("e", "e", "Explain", "Explain the query", true),
+    k("P", "P", "Profile", "Profile the query", true),
+    FORMAT,
+    COPY_VALUE,
+    k(
+        "esc",
+        "esc",
+        "Back",
+        "Go back to the indexes and results",
+        true,
+    ),
+    REFRESH,
+];
 
 static NODES: [KeyHelp; 7] = [
     MOVE,
@@ -258,12 +465,18 @@ pub fn global() -> &'static [KeyHelp] {
     &GLOBAL
 }
 
+/// Keys of the command line panel while it is open.
+pub fn command_line() -> &'static [KeyHelp] {
+    &COMMAND_LINE
+}
+
 /// Keys of one screen, not counting [`global`].
 pub fn for_screen(screen: Screen) -> &'static [KeyHelp] {
     match screen {
         Screen::Connections => &CONNECTIONS,
         Screen::Patterns => &PATTERNS,
         Screen::KeyList => &KEY_LIST,
+        Screen::KeyDetail => &KEY_DETAIL,
         Screen::Ttl | Screen::Diff => &TTL_DIFF,
         Screen::HotKeys => &HOT,
         Screen::BigKeys => &BIG_KEYS,
@@ -271,6 +484,7 @@ pub fn for_screen(screen: Screen) -> &'static [KeyHelp] {
         Screen::Overview => &OVERVIEW,
         Screen::Clients => &CLIENTS,
         Screen::SlowLog => &SLOW_LOG,
+        Screen::Monitor => &MONITOR,
         Screen::Streams => &STREAMS,
         Screen::PubSub => &PUBSUB,
         Screen::Search => &SEARCH,
@@ -291,8 +505,9 @@ fn find(screen: Screen, keys: &str) -> (&'static str, &'static str) {
 /// something to work on: a scan result on Analysis, a session on Server, Streams,
 /// Pub/Sub and Search. Without it they show how to get one.
 ///
-/// Snapshot on Patterns and Nodes, rescan on Patterns, and the page and copy keys everywhere,
-/// are left out because they do not fit in 80 columns; the overlay lists them.
+/// Snapshot on Patterns and Nodes, rescan on Patterns, the page and copy keys everywhere,
+/// and on Pub/Sub `s`, `c`, `esc`, `p` and `r`, are left out because they do not fit in
+/// 80 columns; the overlay lists them.
 pub fn footer(screen: Screen, ready: bool) -> Vec<(&'static str, &'static str)> {
     const MOVE: &str = "↑↓ j k";
     const TAB: &str = "tab shift-tab";
@@ -300,6 +515,7 @@ pub fn footer(screen: Screen, ready: bool) -> Vec<(&'static str, &'static str)> 
         Screen::Connections => &[MOVE, "enter", "a", "r", "0-6", "?", "q ctrl-c"],
         Screen::Patterns => &[MOVE, "→ ← l h", "enter", "/", "o", "0-6", "?", "q ctrl-c"],
         Screen::KeyList => &[MOVE, "/", "o", "n", "esc", "0-6", "?", "q ctrl-c"],
+        Screen::KeyDetail => &[MOVE, TAB, "f", "n", "esc", "0-6", "?", "q ctrl-c"],
         Screen::Ttl | Screen::Diff | Screen::HotKeys | Screen::BigKeys if ready => {
             &[MOVE, TAB, "r", "s", "0-6", "?", "q ctrl-c"]
         }
@@ -307,9 +523,10 @@ pub fn footer(screen: Screen, ready: bool) -> Vec<(&'static str, &'static str)> 
         Screen::Overview if ready => &[TAB, "p", "+ -", "r", "0-6", "?", "q ctrl-c"],
         Screen::Clients if ready => &[TAB, MOVE, "enter", "r", "0-6", "?", "q ctrl-c"],
         Screen::SlowLog if ready => &[TAB, MOVE, "p", "r", "0-6", "?", "q ctrl-c"],
-        Screen::Streams if ready => &[MOVE, TAB, "p", "r", "0-6", "?", "q ctrl-c"],
-        Screen::PubSub if ready => &[MOVE, "p", "r", "0-6", "?", "q ctrl-c"],
-        Screen::Search if ready => &[MOVE, TAB, "r", "0-6", "?", "q ctrl-c"],
+        Screen::Monitor if ready => &[TAB, "enter", "esc", MOVE, "0-6", "?", "q ctrl-c"],
+        Screen::Streams if ready => &[MOVE, TAB, "enter", "p", "0-6", "?", "q ctrl-c"],
+        Screen::PubSub if ready => &[MOVE, "enter", "space", "/", "0-6", "?", "q ctrl-c"],
+        Screen::Search if ready => &[MOVE, TAB, "/", "enter", "0-6", "?", "q ctrl-c"],
         Screen::Nodes if ready => &[MOVE, TAB, "enter", "r", "0-6", "?", "q ctrl-c"],
         s if s.view().panels().is_empty() => &["0-6", "a", "?", "q ctrl-c"],
         _ => &[TAB, "0-6", "a", "?", "q ctrl-c"],
@@ -347,6 +564,8 @@ pub fn markdown() -> String {
         out.push_str(&format!("\n#### {}\n\n", s.title()));
         table(&mut out, for_screen(s));
     }
+    out.push_str("\n#### Command line panel · keys\n\n");
+    table(&mut out, command_line());
     out
 }
 
@@ -444,6 +663,16 @@ mod tests {
             ["View", "Add", "Help", "Quit"]
         );
         assert_eq!(
+            names(Screen::Streams, true),
+            [
+                "Move", "Details", "Entries", "Pause", "View", "Help", "Quit"
+            ]
+        );
+        assert_eq!(
+            names(Screen::Search, true),
+            ["Move", "Details", "Query", "Open", "View", "Help", "Quit"]
+        );
+        assert_eq!(
             names(Screen::Overview, true),
             [
                 "Panel", "Pause", "Interval", "Refresh", "View", "Help", "Quit"
@@ -455,6 +684,34 @@ mod tests {
                 "Move", "Filter", "Sort", "More", "Back", "View", "Help", "Quit"
             ]
         );
+        for ready in [false, true] {
+            assert_eq!(
+                names(Screen::KeyDetail, ready),
+                [
+                    "Move", "Value", "Format", "More", "Back", "View", "Help", "Quit"
+                ]
+            );
+        }
+        assert_eq!(
+            names(Screen::PubSub, true),
+            [
+                "Move",
+                "Subscribe",
+                "Pause",
+                "Filter",
+                "View",
+                "Help",
+                "Quit"
+            ]
+        );
+        assert_eq!(
+            names(Screen::Monitor, true),
+            ["Panel", "Start", "Stop", "Scroll", "View", "Help", "Quit"]
+        );
+        assert_eq!(
+            names(Screen::Monitor, false),
+            ["Panel", "View", "Add", "Help", "Quit"]
+        );
         assert_eq!(
             names(Screen::Nodes, true),
             [
@@ -464,13 +721,14 @@ mod tests {
     }
 
     /// `tab` is in the table exactly where it does something: on every panel of a view
-    /// with panels, and on Streams and Search, where it moves to the details.
+    /// with panels, on Streams and Search, where it moves to the details, and on the key
+    /// detail, where it moves to the value.
     #[test]
     fn tab_is_listed_on_every_panel() {
         for s in Screen::ALL {
             let listed = for_screen(s).iter().any(|h| h.keys == "tab shift-tab");
-            let expected =
-                !s.view().panels().is_empty() || matches!(s, Screen::Streams | Screen::Search);
+            let expected = !s.view().panels().is_empty()
+                || matches!(s, Screen::Streams | Screen::Search | Screen::KeyDetail);
             assert_eq!(listed, expected, "{}", s.title());
         }
     }
@@ -492,5 +750,17 @@ mod tests {
             assert!(md.contains(&format!("#### {}\n", v.title())));
         }
         assert!(md.contains("| `?` |"));
+    }
+
+    #[test]
+    fn command_line_keys_are_listed_once() {
+        let mut seen = std::collections::HashSet::new();
+        for h in command_line() {
+            for t in h.keys.split_whitespace() {
+                assert!(seen.insert(t), "{t:?} is bound twice on the command line");
+            }
+        }
+        assert!(markdown().contains("#### Command line panel · keys\n"));
+        assert!(global().iter().any(|h| h.keys == ":"));
     }
 }

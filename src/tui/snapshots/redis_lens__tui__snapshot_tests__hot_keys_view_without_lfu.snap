@@ -1,6 +1,6 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 737
+assertion_line: 738
 expression: t.backend()
 ---
 " redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC "
@@ -13,7 +13,7 @@ expression: t.backend()
 "│ The eviction policy is allkeys-lru, so Redis keeps no LFU counters.                                                  │"
 "│ Set maxmemory-policy to allkeys-lfu or volatile-lfu to see hot keys.                                                 │"
 "│                                                                                                                      │"
-"│                                                                                                                      │"
+"│ Or rank keys by how often MONITOR sees them: Server (3) › Monitor.                                                   │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"

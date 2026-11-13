@@ -1,5 +1,6 @@
 ---
 source: src/tui/snapshot_tests.rs
+assertion_line: 231
 expression: t.backend()
 ---
 " redis-lens 0.1.0   not connected                                                                                       "
@@ -28,13 +29,13 @@ expression: t.backend()
 "│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 "┌─ acl-valkey-1 ───────────────────────────────────────────────────────────────────────────── LOCAL · found in Docker ─┐"
-"│ CONNECTION                                                             PERMISSION CHECK                              │"
-"│ Endpoint    127.0.0.1:6391                                             – SCAN          runs on connect               │"
-"│ Server      not connected yet                                          – TYPE · TTL                                  │"
-"│ Auth        required                                                   – MEMORY USAGE                                │"
-"│ Credential  not found: save it as a profile with credentials           – OBJECT FREQ                                 │"
-"│ TLS         off                                                        – INFO                                        │"
-"│ Writes      on (default outside production)                            – MEMORY STATS                                │"
+"│ Endpoint    127.0.0.1:6391                                             PERMISSION CHECK                              │"
+"│ Server      not connected yet                                          – SCAN          runs on connect               │"
+"│ Auth        required                                                   – TYPE · TTL                                  │"
+"│ Credential  not found: save it as a profile with credentials           – MEMORY USAGE                                │"
+"│ TLS         off                                                        – OBJECT FREQ                                 │"
+"│ Writes      on (default outside production)                            – INFO                                        │"
+"│ Values      shown on screen, never saved                               – MEMORY STATS                                │"
 "│ Found in Docker: container acl-valkey-1 (valkey/valkey:8.1-alpine). Press enter to connect.                          │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 " ↑↓ Move   enter Connect   a Add   r Rescan Docker   0-6 View   ? Help   q Quit                                         "

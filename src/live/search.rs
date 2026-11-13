@@ -1,28 +1,118 @@
-//! Live requests for the Search view. Owner: wave B. Phase 1: no writes, no values.
+//! Live requests for the Search view. Owner: wave B. No writes.
 //!
-//! `FT._LIST` and `FT.INFO` only: no query, no `FT.CREATE`, no `FT.DROPINDEX`. Redis
-//! Search (built into Redis 8) and valkey-search answer `FT.INFO` with different fields;
-//! a field the module does not return is `None` here, and the view leaves it out with a
-//! reason instead of showing an error.
+//! Phase 1 reads `FT._LIST` and `FT.INFO`. Phase 2 adds the queries, on one index each
+//! (spec "6 Search"):
+//!
+//! - `FT.SEARCH <index> <query> LIMIT 0 50`, the results held as [`Raw`];
+//! - `FT.EXPLAIN <index> <query>`, the plan as escaped lines ([`Text`]);
+//! - `FT.PROFILE <index> SEARCH QUERY <query> LIMIT 0 50`, the results and the profile
+//!   part as an indented tree of escaped lines.
+//!
+//! No `FT.CREATE`, no `FT.DROPINDEX`. Redis Search (built into Redis 8) and
+//! valkey-search answer `FT.INFO` with different fields; a field the module does not
+//! return is `None` here, and the view leaves it out with a reason instead of showing an
+//! error. valkey-search has no `FT.EXPLAIN` and no `FT.PROFILE`: they fail as
+//! [`LiveError::Unsupported`].
+//!
+//! Every command takes one from the budget. Errors are redis-lens's own words
+//! ([`error_for`]), with one exception for the three query commands
+//! ([`query_error`]): a plain error about the query (a syntax error, an unknown index)
+//! keeps the server's message, escaped and cut at [`QUERY_ERROR_CHARS`] characters,
+//! because it describes the query the user typed, not the user. `NOPERM` never does.
 
-use redis::{RedisResult, Value};
+use std::fmt;
+use std::time::{Duration, Instant};
+
+use redis::{ErrorKind, RedisError, RedisResult, ServerErrorKind, Value};
 
 use super::streams::{field, pairs, text, uint};
-use super::{Conn, LiveError, error_for, query, query_pipe};
+use super::{Conn, LiveError, error_for, is_unknown_command, query, query_pipe};
 use crate::budget::Budget;
+use crate::value::{self, Raw};
 
 /// The most indexes whose `FT.INFO` is read.
 pub const MAX_INDEXES: usize = 50;
+/// The most results a query returns: `LIMIT 0 50`.
+pub const MAX_RESULTS: usize = 50;
+/// The most characters of the server's message about a query that are kept.
+pub const QUERY_ERROR_CHARS: usize = 200;
+/// The most lines of an explain or profile text that are kept.
+pub const MAX_TEXT_LINES: usize = 2_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     /// `FT._LIST`, then `FT.INFO` for each index.
     Indexes,
+    /// `FT.SEARCH <index> <query> LIMIT 0 50`. `query` is sent as one argument, as it is.
+    Search { index: String, query: String },
+    /// `FT.EXPLAIN <index> <query>`.
+    Explain { index: String, query: String },
+    /// `FT.PROFILE <index> SEARCH QUERY <query> LIMIT 0 50`.
+    Profile { index: String, query: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reply {
     Indexes(IndexList),
+    Results(Results),
+    Explain(Text),
+    Profile { results: Results, profile: Text },
+}
+
+/// What a query found. Values only as [`Raw`], so `Debug` never shows one.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Results {
+    /// How many documents match, as the module counts them: often more than `docs`.
+    pub total: u64,
+    /// At most [`MAX_RESULTS`], in the module's order.
+    pub docs: Vec<Doc>,
+    /// The command's round trip, measured here (views never read the clock).
+    pub took: Duration,
+}
+
+/// One result: the key and the fields the module returned. A JSON index returns the
+/// document as the one field `$`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Doc {
+    pub key: String,
+    pub fields: Vec<(Raw, Raw)>,
+}
+
+/// Lines of text from the server that are safe to draw: each has gone through
+/// [`value::escape`]. They can echo data (a profile names the terms and ranges it
+/// read), so `Debug` shows only how many there are.
+#[derive(Clone, PartialEq, Default)]
+pub struct Text(Vec<String>);
+
+impl Text {
+    /// Escapes every line, keeping at most [`MAX_TEXT_LINES`].
+    pub fn new<S: AsRef<str>>(lines: impl IntoIterator<Item = S>) -> Self {
+        Self(
+            lines
+                .into_iter()
+                .take(MAX_TEXT_LINES)
+                .map(|l| value::escape(l.as_ref()))
+                .collect(),
+        )
+    }
+
+    pub fn lines(&self) -> &[String] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for Text {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Text(<{} lines>)", self.0.len())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -70,7 +160,102 @@ pub struct FieldInfo {
 pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply, LiveError> {
     match req {
         Request::Indexes => indexes(conn, budget).await.map(Reply::Indexes),
+        Request::Search { index, query } => {
+            let mut c = redis::cmd("FT.SEARCH");
+            c.arg(&index)
+                .arg(&query)
+                .arg("LIMIT")
+                .arg(0)
+                .arg(MAX_RESULTS);
+            let (v, took) = timed(conn, budget, "FT.SEARCH", &c).await?;
+            let mut results = parse_results(&v);
+            results.took = took;
+            Ok(Reply::Results(results))
+        }
+        Request::Explain { index, query } => {
+            let mut c = redis::cmd("FT.EXPLAIN");
+            c.arg(&index).arg(&query);
+            let (v, _) = timed(conn, budget, "FT.EXPLAIN", &c).await?;
+            Ok(Reply::Explain(parse_explain(&v)))
+        }
+        Request::Profile { index, query } => {
+            let mut c = redis::cmd("FT.PROFILE");
+            c.arg(&index)
+                .arg("SEARCH")
+                .arg("QUERY")
+                .arg(&query)
+                .arg("LIMIT")
+                .arg(0)
+                .arg(MAX_RESULTS);
+            let (v, took) = timed(conn, budget, "FT.PROFILE", &c).await?;
+            let (mut results, profile) = parse_profile(&v).ok_or_else(|| {
+                LiveError::Failed("FT.PROFILE came back in an unexpected shape".into())
+            })?;
+            results.took = took;
+            Ok(Reply::Profile { results, profile })
+        }
     }
+}
+
+/// Takes one command from `budget`, then sends `cmd` and measures its round trip (the
+/// wait for the budget not included). Like [`query`], except that a failure is read by
+/// [`query_error`].
+async fn timed(
+    conn: &mut Conn,
+    budget: &Budget,
+    name: &str,
+    cmd: &redis::Cmd,
+) -> Result<(Value, Duration), LiveError> {
+    budget.take(1).await;
+    let start = Instant::now();
+    let r: RedisResult<Value> = cmd.query_async(conn).await;
+    let took = start.elapsed();
+    r.map(|v| (v, took)).map_err(|e| query_error(name, &e))
+}
+
+/// A failure of `FT.SEARCH`, `FT.EXPLAIN` or `FT.PROFILE` (`command`). `NOPERM`, an
+/// unknown command, a timeout and a dropped connection read as everywhere else
+/// ([`error_for`]). A plain error (`ERR …`, or a code of the module's own such as
+/// `SEARCH_SYNTAX`) is about the query: its message is kept, without a leading
+/// upper-case code, escaped with [`value::escape`] and cut at [`QUERY_ERROR_CHARS`]
+/// characters. It never names the user: `NOPERM` is the only error that does.
+pub fn query_error(command: &str, e: &RedisError) -> LiveError {
+    let plain = matches!(
+        e.kind(),
+        ErrorKind::Server(ServerErrorKind::ResponseError) | ErrorKind::Extension
+    );
+    if !plain || is_unknown_command(e) {
+        return error_for(command, e);
+    }
+    let code = e.code().unwrap_or("");
+    let detail = e.detail().unwrap_or("");
+    let is_code = !code.is_empty()
+        && code
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    let msg = if is_code {
+        detail.to_string()
+    } else {
+        format!("{code} {detail}")
+    };
+    let msg = value::escape(msg.trim());
+    if msg.is_empty() {
+        return LiveError::Failed(format!("{command} failed"));
+    }
+    LiveError::Failed(format!(
+        "{command} failed: {}",
+        cut_chars(&msg, QUERY_ERROR_CHARS)
+    ))
+}
+
+/// `s` cut to `max` characters, the last one `…` when it was cut.
+fn cut_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 async fn indexes(conn: &mut Conn, budget: &Budget) -> Result<IndexList, LiveError> {
@@ -114,6 +299,237 @@ async fn indexes(conn: &mut Conn, budget: &Budget) -> Result<IndexList, LiveErro
         }
     }
     Ok(out)
+}
+
+/// The bytes of a string-like reply; other replies give no bytes.
+fn raw(v: &Value) -> Raw {
+    match v {
+        Value::BulkString(b) => Raw::new(b.clone()),
+        Value::SimpleString(s) => Raw::from(s.as_str()),
+        Value::VerbatimString { text, .. } => Raw::from(text.as_str()),
+        Value::Int(i) => Raw::from(i.to_string().as_str()),
+        Value::Double(d) => Raw::from(d.to_string().as_str()),
+        _ => Raw::default(),
+    }
+}
+
+/// `(name, value)` pairs of a flat array or a map, as bytes.
+fn raw_pairs(v: &Value) -> Vec<(Raw, Raw)> {
+    match v {
+        Value::Map(m) => m.iter().map(|(k, v)| (raw(k), raw(v))).collect(),
+        Value::Array(items) => items
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[k, v]| (raw(k), raw(v)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Reads the reply of `FT.SEARCH`: RESP2 `[total, key, [field, value …], key, …]`, or
+/// the RESP3 map with `total_results` and `results`. Keeps at most [`MAX_RESULTS`].
+pub fn parse_results(v: &Value) -> Results {
+    let mut out = Results::default();
+    match v {
+        Value::Array(items) => {
+            out.total = items.first().and_then(uint).unwrap_or(0);
+            let rest = items.get(1..).unwrap_or(&[]);
+            let mut i = 0;
+            while i < rest.len() {
+                let Some(key) = text(&rest[i]) else {
+                    i += 1;
+                    continue;
+                };
+                i += 1;
+                let fields = match rest.get(i) {
+                    Some(f @ (Value::Array(_) | Value::Map(_))) => {
+                        i += 1;
+                        raw_pairs(f)
+                    }
+                    _ => Vec::new(),
+                };
+                out.docs.push(Doc { key, fields });
+            }
+        }
+        Value::Map(_) => {
+            out.total = field(v, "total_results").and_then(uint).unwrap_or(0);
+            if let Some(Value::Array(results)) = field(v, "results") {
+                for r in results {
+                    let Some(key) = field(r, "id").and_then(text) else {
+                        continue;
+                    };
+                    let fields = field(r, "extra_attributes")
+                        .map(raw_pairs)
+                        .unwrap_or_default();
+                    out.docs.push(Doc { key, fields });
+                }
+            }
+        }
+        _ => {}
+    }
+    out.docs.truncate(MAX_RESULTS);
+    out
+}
+
+/// Reads the reply of `FT.EXPLAIN`: the plan as text, one line per line.
+pub fn parse_explain(v: &Value) -> Text {
+    let all = match v {
+        Value::Array(items) => items.iter().filter_map(text).collect::<Vec<_>>().join("\n"),
+        v => text(v).unwrap_or_default(),
+    };
+    let mut lines: Vec<&str> = all.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    Text::new(lines)
+}
+
+/// Reads the reply of `FT.PROFILE … SEARCH`: the results and the profile. RESP2 answers
+/// `[results, profile]`, RESP3 a map with `Results` and `Profile`.
+pub fn parse_profile(v: &Value) -> Option<(Results, Text)> {
+    let (results, profile) = match v {
+        Value::Array(items) if items.len() >= 2 => (&items[0], &items[1]),
+        Value::Map(_) => (field(v, "Results")?, field(v, "Profile")?),
+        _ => return None,
+    };
+    Some((parse_results(results), tree(profile)))
+}
+
+/// Any reply as an indented tree of lines: `name: value` for the pairs of a flat array
+/// or a map, `- ` before each composite item of a list, two more spaces per level.
+/// Every string is escaped. At most [`MAX_TEXT_LINES`] lines, 32 levels deep.
+pub fn tree(v: &Value) -> Text {
+    let mut out = Vec::new();
+    tree_into(v, 0, &mut out);
+    out.truncate(MAX_TEXT_LINES);
+    // Every piece was escaped as it was added.
+    Text(out)
+}
+
+/// A one-line form of a reply that is not a list or a map, escaped.
+fn scalar(v: &Value) -> Option<String> {
+    Some(match v {
+        Value::BulkString(b) => escaped_bytes(b),
+        Value::SimpleString(s) => value::escape(s),
+        Value::VerbatimString { text, .. } => value::escape(text),
+        Value::Int(i) => i.to_string(),
+        Value::Double(d) => d.to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Nil => "(nil)".to_string(),
+        Value::Okay => "OK".to_string(),
+        Value::ServerError(_) => "(error)".to_string(),
+        _ => return None,
+    })
+}
+
+/// Bytes as text that is safe to draw: invalid UTF-8 as `\xNN`.
+fn escaped_bytes(b: &[u8]) -> String {
+    let mut out = String::new();
+    for chunk in b.utf8_chunks() {
+        out.push_str(&value::escape(chunk.valid()));
+        for x in chunk.invalid() {
+            out.push_str(&format!("\\x{x:02x}"));
+        }
+    }
+    out
+}
+
+fn children(v: &Value) -> Option<Vec<&Value>> {
+    match v {
+        Value::Array(items) | Value::Set(items) | Value::Push { data: items, .. } => {
+            Some(items.iter().collect())
+        }
+        Value::Map(m) => Some(m.iter().flat_map(|(k, v)| [k, v]).collect()),
+        Value::Attribute { data, .. } => children(data),
+        _ => None,
+    }
+}
+
+/// A flat array reads as pairs when it has an even, non-zero length and every name is
+/// a short text.
+fn as_pairs(v: &Value) -> Option<Vec<(String, &Value)>> {
+    if let Value::Map(m) = v {
+        return Some(
+            m.iter()
+                .map(|(k, v)| (scalar(k).unwrap_or_default(), v))
+                .collect(),
+        );
+    }
+    let Value::Array(items) = v else {
+        return None;
+    };
+    if items.is_empty() || items.len() % 2 != 0 {
+        return None;
+    }
+    let named = items.as_chunks::<2>().0.iter().all(|[k, _]| {
+        matches!(k, Value::BulkString(_) | Value::SimpleString(_))
+            && scalar(k).is_some_and(|s| !s.is_empty() && s.chars().count() <= 48)
+    });
+    named.then(|| {
+        items
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[k, v]| (scalar(k).unwrap_or_default(), v))
+            .collect()
+    })
+}
+
+/// A list of scalars short enough to sit after its name: `a, b`.
+fn inline(v: &Value) -> Option<String> {
+    if let Some(s) = scalar(v) {
+        return Some(s);
+    }
+    let items = children(v)?;
+    if items.is_empty() {
+        return Some("(empty)".to_string());
+    }
+    let parts: Option<Vec<String>> = items.iter().map(|i| scalar(i)).collect();
+    let s = parts?.join(", ");
+    (s.chars().count() <= 60 && as_pairs(v).is_none()).then_some(s)
+}
+
+fn tree_into(v: &Value, depth: usize, out: &mut Vec<String>) {
+    if out.len() >= MAX_TEXT_LINES {
+        return;
+    }
+    let pad = "  ".repeat(depth);
+    if depth >= 32 {
+        out.push(format!("{pad}…"));
+        return;
+    }
+    if let Some(s) = scalar(v) {
+        out.push(format!("{pad}{s}"));
+        return;
+    }
+    if let Some(pairs) = as_pairs(v) {
+        for (name, val) in pairs {
+            match inline(val) {
+                Some(s) => out.push(format!("{pad}{name}: {s}")),
+                None => {
+                    out.push(format!("{pad}{name}"));
+                    tree_into(val, depth + 1, out);
+                }
+            }
+        }
+        return;
+    }
+    for item in children(v).unwrap_or_default() {
+        if let Some(s) = scalar(item) {
+            out.push(format!("{pad}{s}"));
+            continue;
+        }
+        let start = out.len();
+        tree_into(item, depth + 1, out);
+        // The item's first line starts with `- ` at this level.
+        if let Some(first) = out.get_mut(start) {
+            let inner = format!("{pad}  ");
+            if let Some(rest) = first.strip_prefix(&inner) {
+                *first = format!("{pad}- {rest}");
+            }
+        }
+    }
 }
 
 /// The names in the reply of `FT._LIST`, as the server sent them.
@@ -540,6 +956,176 @@ mod tests {
             }
             let _ = parse_names(&v);
             let _ = parse_field(&v);
+            let r = parse_results(&v);
+            prop_assert!(r.docs.len() <= MAX_RESULTS);
+            let _ = parse_profile(&v);
+            for t in [parse_explain(&v), tree(&v)] {
+                prop_assert!(t.len() <= MAX_TEXT_LINES);
+                for l in t.lines() {
+                    prop_assert!(!l.chars().any(char::is_control), "{l:?}");
+                }
+            }
         }
+    }
+
+    #[test]
+    fn search_results_in_resp2() {
+        // `FT.SEARCH idx * LIMIT 0 50` on a hash index and a JSON one.
+        let v = arr(vec![
+            Value::Int(1_204),
+            b("product:1"),
+            arr(vec![b("title"), b("red shoe"), b("price"), b("10")]),
+            b("session:1"),
+            arr(vec![b("$"), b(r#"{"user":{"id":"u1"}}"#)]),
+            // A key without fields (NOCONTENT-like) still counts.
+            b("bare"),
+        ]);
+        let r = parse_results(&v);
+        assert_eq!(r.total, 1_204);
+        let keys: Vec<_> = r.docs.iter().map(|d| d.key.as_str()).collect();
+        assert_eq!(keys, ["product:1", "session:1", "bare"]);
+        assert_eq!(r.docs[0].fields[1].1.as_bytes(), b"10");
+        assert_eq!(r.docs[1].fields[0].0.as_bytes(), b"$");
+        assert!(r.docs[2].fields.is_empty());
+        assert!(!format!("{r:?}").contains("red shoe"));
+    }
+
+    #[test]
+    fn search_results_in_resp3() {
+        let m = |items: Vec<(&str, Value)>| {
+            Value::Map(items.into_iter().map(|(k, v)| (b(k), v)).collect())
+        };
+        let v = m(vec![
+            ("attributes", arr(vec![])),
+            ("format", Value::SimpleString("STRING".into())),
+            (
+                "results",
+                arr(vec![m(vec![
+                    ("id", b("product:1")),
+                    (
+                        "extra_attributes",
+                        m(vec![("title", b("red shoe")), ("price", b("10"))]),
+                    ),
+                    ("values", arr(vec![])),
+                ])]),
+            ),
+            ("total_results", Value::Int(1)),
+            ("warning", arr(vec![])),
+        ]);
+        let r = parse_results(&v);
+        assert_eq!(r.total, 1);
+        assert_eq!(r.docs[0].key, "product:1");
+        assert_eq!(r.docs[0].fields.len(), 2);
+        // FT.PROFILE in RESP3: `Results` and `Profile`.
+        let p = m(vec![
+            ("Results", v),
+            ("Profile", m(vec![("Total profile time", b("0.1"))])),
+        ]);
+        let (r, t) = parse_profile(&p).unwrap();
+        assert_eq!(r.docs.len(), 1);
+        assert_eq!(t.lines(), ["Total profile time: 0.1"]);
+    }
+
+    #[test]
+    fn at_most_50_results_are_kept() {
+        let mut items = vec![Value::Int(500)];
+        for i in 0..80 {
+            items.push(b(&format!("k:{i}")));
+            items.push(arr(vec![b("f"), b("v")]));
+        }
+        let r = parse_results(&arr(items));
+        assert_eq!((r.total, r.docs.len()), (500, MAX_RESULTS));
+    }
+
+    #[test]
+    fn explain_and_tree_lines_are_escaped() {
+        let t = parse_explain(&b("INTERSECT {\r\n  @t:\x1b[2Jx\n}\n\n"));
+        assert_eq!(t.lines(), ["INTERSECT {", "  @t:\\x1b[2Jx", "}"]);
+        assert_eq!(format!("{t:?}"), "Text(<3 lines>)");
+        let v = arr(vec![
+            b("Iterators profile"),
+            arr(vec![
+                b("Term"),
+                b("a\x1bb"),
+                b("Child iterators"),
+                arr(vec![
+                    arr(vec![b("Type"), b("TAG")]),
+                    arr(vec![b("Type"), b("NUMERIC")]),
+                ]),
+            ]),
+            b("Warning"),
+            arr(vec![b("None")]),
+            b("Raw"),
+            Value::BulkString(vec![0xff, b'x']),
+        ]);
+        assert_eq!(
+            tree(&v).lines(),
+            [
+                "Iterators profile",
+                "  Term: a\\x1bb",
+                "  Child iterators",
+                "    - Type: TAG",
+                "    - Type: NUMERIC",
+                "Warning: None",
+                "Raw: \\xffx",
+            ]
+        );
+        // A deep reply stops at 32 levels.
+        let mut deep = b("x");
+        for _ in 0..100 {
+            deep = arr(vec![deep]);
+        }
+        assert!(tree(&deep).len() < 40);
+    }
+
+    fn server_error(wire: &str) -> RedisError {
+        let Value::ServerError(e) = redis::parse_redis_value(wire.as_bytes()).unwrap() else {
+            panic!("not an error: {wire}");
+        };
+        RedisError::from(e)
+    }
+
+    #[test]
+    fn query_errors_keep_the_message_about_the_query_only() {
+        let failed = |wire: &str| query_error("FT.SEARCH", &server_error(wire));
+        assert_eq!(
+            failed("-SEARCH_SYNTAX Syntax error at offset 7 near price\r\n"),
+            LiveError::Failed("FT.SEARCH failed: Syntax error at offset 7 near price".into())
+        );
+        assert_eq!(
+            failed("-ERR Unknown Index name\r\n"),
+            LiveError::Failed("FT.SEARCH failed: Unknown Index name".into())
+        );
+        // valkey-search starts with a plain word: it is part of the message.
+        assert_eq!(
+            failed("-Invalid query string syntax\r\n"),
+            LiveError::Failed("FT.SEARCH failed: Invalid query string syntax".into())
+        );
+        // NOPERM and unknown commands never keep the server's words.
+        assert_eq!(
+            failed("-NOPERM User zed-ro has no permissions to run the 'ft.search' command\r\n"),
+            LiveError::Denied("FT.SEARCH".into())
+        );
+        assert_eq!(
+            query_error(
+                "FT.EXPLAIN",
+                &server_error("-ERR unknown command 'FT.EXPLAIN', with args beginning with: \r\n")
+            ),
+            LiveError::Unsupported("FT.EXPLAIN".into())
+        );
+        // Other known kinds read as everywhere else.
+        assert_eq!(
+            failed("-LOADING Redis is loading the dataset in memory\r\n"),
+            LiveError::Failed("FT.SEARCH failed".into())
+        );
+        // Escaped and cut at 200 characters.
+        let long = format!("-SEARCH_SYNTAX near \x1b[2J{}\r\n", "y".repeat(500));
+        let LiveError::Failed(why) = failed(&long) else {
+            panic!();
+        };
+        let msg = why.strip_prefix("FT.SEARCH failed: ").unwrap();
+        assert!(msg.starts_with("near \\x1b[2Jyyy"), "{msg}");
+        assert_eq!(msg.chars().count(), QUERY_ERROR_CHARS);
+        assert!(msg.ends_with('…') && !msg.contains('\x1b'));
     }
 }

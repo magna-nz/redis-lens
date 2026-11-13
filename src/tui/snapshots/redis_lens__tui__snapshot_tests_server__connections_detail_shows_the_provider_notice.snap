@@ -1,5 +1,6 @@
 ---
 source: src/tui/snapshot_tests_server.rs
+assertion_line: 200
 expression: t.backend()
 ---
 " redis-lens 0.1.0   not connected                                                                                       "
@@ -28,13 +29,13 @@ expression: t.backend()
 "│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 "┌─ prod-cache-01 ────────────────────────────────────────────────────── PROD · saved profile · ElastiCache Serverless ─┐"
-"│ CONNECTION                                                             PERMISSION CHECK                              │"
-"│ Endpoint    prod-cache-01-x1y2z3.serverless.use1.cache.amazonaws.com:6…– SCAN          runs on connect               │"
-"│ Server      not connected yet                                          – TYPE · TTL                                  │"
-"│ Auth        password or ACL user                                       – MEMORY USAGE                                │"
-"│ Credential  OS keychain                                                – OBJECT FREQ                                 │"
-"│ TLS         on                                                         – INFO                                        │"
-"│ Writes      off (production default)                                   – MEMORY STATS                                │"
+"│ Endpoint    prod-cache-01-x1y2z3.serverless.use1.cache.amazonaws.com:6…PERMISSION CHECK                              │"
+"│ Server      not connected yet                                          – SCAN          runs on connect               │"
+"│ Auth        password or ACL user                                       – TYPE · TTL                                  │"
+"│ Credential  OS keychain                                                – MEMORY USAGE                                │"
+"│ TLS         on                                                         – OBJECT FREQ                                 │"
+"│ Writes      off (production default)                                   – INFO                                        │"
+"│ Values      shown on screen, never saved                               – MEMORY STATS                                │"
 "│ ▲ ElastiCache Serverless restricts MEMORY and OBJECT, so sizes and hot keys are missing; counts and TTLs still work. │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 " ↑↓ Move   enter Connect   a Add   r Rescan Docker   0-6 View   ? Help   q Quit                                         "

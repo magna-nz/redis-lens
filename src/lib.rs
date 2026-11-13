@@ -14,6 +14,7 @@
 //! - [`snapshot`], [`diff`], [`verdict`]: saved reports, comparing them, TTL risk.
 //! - [`cli`]: command-line entry points.
 //! - [`tui`]: the terminal UI.
+//! - [`value`]: values on screen: decompression, format detection, terminal-safe drawing.
 
 pub mod analysis;
 pub mod budget;
@@ -31,4 +32,5 @@ pub mod scan;
 pub mod secrets;
 pub mod snapshot;
 pub mod tui;
+pub mod value;
 pub mod verdict;

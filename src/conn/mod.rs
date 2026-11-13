@@ -70,6 +70,137 @@ pub async fn connect(
     auth.open(&route, &profile.endpoint).await
 }
 
+/// Open the Pub/Sub live tail's own connection to the profile's endpoint (never a
+/// replica): like [`connect`], through the same route and credentials (SSH, TLS, token
+/// command and Entra ID included), but speaking RESP3, so `SUBSCRIBE` and `PSUBSCRIBE`
+/// work on a multiplexed connection. What the server pushes (messages, subscribe
+/// confirmations, and a `Disconnection` when the connection is lost) arrives on the
+/// returned receiver.
+///
+/// Errors never contain the password or token, as for [`connect`]. A server that refuses
+/// RESP3 fails with [`redis::ErrorKind::RESP3NotSupported`].
+pub async fn open_subscriber(
+    profile: &Profile,
+    secrets: &dyn SecretStore,
+) -> Result<
+    (
+        Connection,
+        tokio::sync::mpsc::UnboundedReceiver<redis::PushInfo>,
+    ),
+    ConnError,
+> {
+    let route = Route::for_profile(profile, secrets).await?;
+    let mut auth = ResolvedAuth::new(profile, secrets).await?;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    auth.settings = auth.settings.set_protocol(redis::ProtocolVersion::RESP3);
+    auth.config = auth.config.set_push_sender(tx);
+    let conn = auth.open(&route, &profile.endpoint).await?;
+    Ok((conn, rx))
+}
+
+/// Why the Monitor panel cannot run `MONITOR` on `profile`'s route, or `None` when it
+/// can. redis-rs reads `MONITOR` only on a connection of its own kind, which resolves the
+/// host itself and has no credentials provider: so not through an SSH tunnel with TLS
+/// (the certificate is checked against the host name, which would then resolve past the
+/// tunnel), and not with Entra ID.
+pub fn monitor_unsupported(profile: &Profile) -> Option<&'static str> {
+    if profile.auth == Auth::EntraId {
+        Some("MONITOR is not available with Entra ID yet.")
+    } else if profile.ssh.is_some() && profile.endpoint.tls {
+        Some("MONITOR is not available through an SSH tunnel with TLS yet.")
+    } else {
+        None
+    }
+}
+
+/// The Monitor panel's connection: the lines `MONITOR` sends, as redis-rs reads them.
+/// Holds its [`Route`] so an SSH forward stays open while it is read. Dropping it closes
+/// the connection, which ends `MONITOR`.
+pub struct MonitorConn {
+    pub lines: std::pin::Pin<Box<dyn futures::Stream<Item = redis::Value> + Send>>,
+    _route: Arc<Route>,
+}
+
+/// Says only which kind of route it uses.
+impl std::fmt::Debug for MonitorConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let route = if self._route.is_ssh() {
+            "ssh"
+        } else {
+            "direct"
+        };
+        f.debug_struct("MonitorConn")
+            .field("route", &route)
+            .finish()
+    }
+}
+
+/// Opens `MONITOR` for `profile` (spec "Monitor (P2)"), with the same credentials,
+/// database, TLS trust roots and SSH tunnel as [`connect`] (see [`monitor_unsupported`]
+/// for the routes it refuses). Each `MONITOR` it sends takes one from `budget`.
+///
+/// redis-rs's monitor connection swallows the server's answer to `MONITOR`, so a refusal
+/// would look like a quiet server. It is asked first on an ordinary connection, which is
+/// closed at once: the inner `Err` is that answer (a `NOPERM`, an unknown command), the
+/// outer one a failure to connect. Errors never contain the password or token.
+pub async fn open_monitor(
+    profile: &Profile,
+    secrets: &dyn SecretStore,
+    budget: &crate::budget::Budget,
+) -> Result<Result<MonitorConn, redis::RedisError>, ConnError> {
+    if let Some(why) = monitor_unsupported(profile) {
+        return Err(ConnError::Redis(redis::RedisError::from(
+            std::io::Error::other(why),
+        )));
+    }
+    let route = Route::for_profile(profile, secrets).await?;
+    let auth = ResolvedAuth::new(profile, secrets).await?;
+    let ep = &profile.endpoint;
+    {
+        let mut check = auth.open(&route, ep).await?;
+        budget.take(1).await;
+        let answer: redis::RedisResult<redis::Value> =
+            redis::cmd("MONITOR").query_async(&mut check).await;
+        if let Err(e) = answer {
+            return Ok(Err(e));
+        }
+        // Dropped here: its MONITOR ends with it.
+    }
+    let addr = match route.as_ref() {
+        Route::Direct => connection_addr(ep, tls::tls_roots),
+        Route::Ssh(_) => {
+            let reached = route.reach(ep).await.map_err(Unusable::into_conn_error)?;
+            let Some(local) = reached.addrs.first() else {
+                return Err(
+                    Unusable::Resolve(std::io::Error::other("no address")).into_conn_error()
+                );
+            };
+            // Without TLS (see `monitor_unsupported`): the forward's local end.
+            ConnectionAddr::Tcp(local.ip().to_string(), local.port())
+        }
+    };
+    let info = addr
+        .into_connection_info()?
+        .set_redis_settings(auth.settings.clone());
+    let client = redis::Client::open(info)?;
+    budget.take(1).await;
+    let monitor = tokio::time::timeout(
+        CONNECT_TIMEOUT + RESPONSE_TIMEOUT,
+        client.get_async_monitor(),
+    )
+    .await
+    .map_err(|_| {
+        ConnError::Redis(redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "MONITOR did not start in time",
+        )))
+    })??;
+    Ok(Ok(MonitorConn {
+        lines: Box::pin(monitor.into_on_message::<redis::Value>()),
+        _route: route,
+    }))
+}
+
 /// How connections reach servers: directly, or through the profile's SSH bastion.
 pub enum Route {
     Direct,

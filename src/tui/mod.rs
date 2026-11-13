@@ -13,8 +13,13 @@
 //! After a connect succeeds, the session's connection stays open as its live connection
 //! ([`crate::live`]) until the next connect or quitting, whether the scan finished or
 //! failed. The scan and the live connection take from one [`Budget`].
+//!
+//! The Pub/Sub live tail ([`Effect::Subscribe`]) runs on a connection of its own, kept
+//! in the current [`LiveSession`] next to the live task, so a new connect, a rescan or
+//! quitting drops it with the session; it takes from the session's budget too. A Monitor
+//! run ([`Effect::Monitor`]) is kept the same way.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -32,6 +37,7 @@ use crate::budget::Budget;
 use crate::config::Config;
 use crate::conn::cluster::{ClusterTargets, ScanTargets};
 use crate::conn::{self, ScanTarget};
+use crate::live::pubsub::{Subscription, TAIL_KEPT, TailMessage};
 use crate::live::{self, LiveError, LiveHandle};
 use crate::model::{Credentials, Profile, ScanReport, ServerInfo, ServerMode};
 use crate::scan::{self, ScanOptions, ScanProgress};
@@ -183,6 +189,33 @@ struct LiveSession {
     id: ConnId,
     scan: ScanId,
     handle: Option<LiveHandle>,
+    /// The session's command budget, once its connect succeeded (a cluster has none).
+    budget: Option<Arc<Budget>>,
+    /// The Pub/Sub live tail, if one runs: dropping it aborts the task and drops its
+    /// connection.
+    tail: Option<TailTask>,
+    /// The Monitor run, if one runs: dropping it aborts the task and drops its
+    /// connection, which ends `MONITOR`.
+    monitor: Option<TailTask>,
+}
+
+impl LiveSession {
+    fn new(id: ConnId, scan: ScanId) -> Self {
+        Self {
+            id,
+            scan,
+            handle: None,
+            budget: None,
+            tail: None,
+            monitor: None,
+        }
+    }
+}
+
+/// A running live tail: its id and its task, aborted when this is dropped.
+struct TailTask {
+    tail: u64,
+    _task: AbortOnDrop,
 }
 
 type LiveSlot = Arc<Mutex<Option<LiveSession>>>;
@@ -226,6 +259,10 @@ fn start_live(
     budget: Arc<Budget>,
     tx: &Tx,
 ) -> bool {
+    // Before the live task, so a subscribe that follows `LiveReady` finds the budget.
+    if let Some(s) = lock(slot).as_mut().filter(|s| s.id == id && s.scan == scan) {
+        s.budget = Some(Arc::clone(&budget));
+    }
     install_live(slot, id, scan, tx, || {
         let (reply_tx, close_tx) = (tx.clone(), tx.clone());
         // Held until the task ends: through SSH the forward stays open only while a
@@ -321,6 +358,101 @@ impl Runner {
         }
     }
 
+    /// Starts live tail `tail` of session `(id, scan)`, replacing (and so dropping) the
+    /// session's other tail. When the session is not current or has no budget (not
+    /// connected, or a cluster), answers [`Msg::TailClosed`] at once.
+    fn subscribe(
+        &self,
+        id: ConnId,
+        scan: ScanId,
+        tail: u64,
+        profile: Profile,
+        secrets: SecretSource,
+        to: Subscription,
+    ) {
+        let mut guard = lock(&self.live);
+        let Some(s) = guard.as_mut().filter(|s| s.id == id && s.scan == scan) else {
+            drop(guard);
+            send(
+                &self.tx,
+                Msg::TailClosed {
+                    id,
+                    scan,
+                    tail,
+                    error: Some(LiveError::Closed.to_string()),
+                },
+            );
+            return;
+        };
+        let Some(budget) = s.budget.clone() else {
+            drop(guard);
+            send(
+                &self.tx,
+                Msg::TailClosed {
+                    id,
+                    scan,
+                    tail,
+                    error: Some(LiveError::Closed.to_string()),
+                },
+            );
+            return;
+        };
+        // The old tail's connection goes first.
+        s.tail = None;
+        let tx = self.tx.clone();
+        s.tail = Some(TailTask {
+            tail,
+            _task: AbortOnDrop(tokio::spawn(run_tail(
+                TailRun { id, scan, tail },
+                profile,
+                secrets,
+                to,
+                budget,
+                tx,
+            ))),
+        });
+    }
+
+    /// Starts Monitor run `run` of session `(id, scan)`, replacing (and so dropping) the
+    /// session's other run. When the session is not current or has no budget, answers
+    /// [`Msg::MonitorClosed`] at once.
+    fn monitor(&self, id: ConnId, scan: ScanId, run: u64, profile: Profile, secrets: SecretSource) {
+        let mut guard = lock(&self.live);
+        let found = guard
+            .as_mut()
+            .filter(|s| s.id == id && s.scan == scan)
+            .and_then(|s| s.budget.clone().map(|b| (s, b)));
+        let Some((s, budget)) = found else {
+            drop(guard);
+            send(
+                &self.tx,
+                Msg::MonitorClosed {
+                    id,
+                    scan,
+                    run,
+                    end: Err(LiveError::Closed.to_string()),
+                },
+            );
+            return;
+        };
+        s.monitor = None;
+        let tx = self.tx.clone();
+        s.monitor = Some(TailTask {
+            tail: run,
+            _task: AbortOnDrop(tokio::spawn(run_monitor(
+                TailRun {
+                    id,
+                    scan,
+                    tail: run,
+                },
+                profile,
+                secrets,
+                budget,
+                tx,
+            ))),
+        });
+    }
+
     /// Returns true when the app should quit. `out` is the terminal's output, for
     /// effects that write to the terminal itself.
     fn run(&mut self, effect: Effect, out: &mut impl Write) -> bool {
@@ -331,6 +463,37 @@ impl Runner {
                 return true;
             }
             Effect::Live { id, req_id, req } => self.send_live(id, req_id, req),
+            Effect::Subscribe {
+                id,
+                scan,
+                tail,
+                profile,
+                secrets,
+                to,
+            } => self.subscribe(id, scan, tail, profile, secrets, to),
+            Effect::Monitor {
+                id,
+                scan,
+                run,
+                profile,
+                secrets,
+            } => self.monitor(id, scan, run, profile, secrets),
+            Effect::StopMonitor { id, run } => {
+                if let Some(s) = lock(&self.live).as_mut()
+                    && s.id == id
+                    && s.monitor.as_ref().is_some_and(|t| t.tail == run)
+                {
+                    s.monitor = None;
+                }
+            }
+            Effect::Unsubscribe { id, tail } => {
+                if let Some(s) = lock(&self.live).as_mut()
+                    && s.id == id
+                    && s.tail.as_ref().is_some_and(|t| t.tail == tail)
+                {
+                    s.tail = None;
+                }
+            }
             Effect::Copy(text) => {
                 if let Some(msg) = copy_to(out, &text) {
                     send(&tx, msg);
@@ -355,11 +518,7 @@ impl Runner {
                     t.abort();
                 }
                 self.scans.insert(id, scan);
-                self.replace_live(Some(LiveSession {
-                    id,
-                    scan,
-                    handle: None,
-                }));
+                self.replace_live(Some(LiveSession::new(id, scan)));
                 self.scan_task = Some(tokio::spawn(connect_and_scan(
                     id,
                     scan,
@@ -602,16 +761,11 @@ where
     );
 }
 
-async fn connect_and_scan(
-    id: ConnId,
-    scan_id: ScanId,
-    profile: Profile,
-    secrets: SecretSource,
-    tx: Tx,
-    live: LiveSlot,
-) {
-    let name = report_name(&profile, &secrets);
-    let (store, secret): (Box<dyn SecretStore>, Option<String>) = match secrets {
+/// The store to read `profile`'s credentials from: the keychain for a saved profile,
+/// memory for a Docker container's; with the container's password, to scrub from error
+/// text (see [`scrub`]).
+fn store_for(profile: &Profile, secrets: SecretSource) -> (Box<dyn SecretStore>, Option<String>) {
+    match secrets {
         SecretSource::Keychain => (Box::new(KeyringStore), None),
         SecretSource::Container(creds) => {
             let store = MemoryStore::default();
@@ -624,7 +778,233 @@ async fn connect_and_scan(
             }
             (Box::new(store), secret)
         }
+    }
+}
+
+/// Which live tail a message is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TailRun {
+    id: ConnId,
+    scan: ScanId,
+    tail: u64,
+}
+
+/// The tail forwards messages at most this often.
+const TAIL_BATCH_EVERY: Duration = Duration::from_millis(100);
+
+/// The messages a tail received since its last batch: the newest [`TAIL_KEPT`], with
+/// how many older ones were left out.
+#[derive(Debug, Default)]
+struct TailBatch {
+    msgs: VecDeque<TailMessage>,
+    dropped: u64,
+}
+
+impl TailBatch {
+    fn push(&mut self, m: TailMessage) {
+        if self.msgs.len() == TAIL_KEPT {
+            self.msgs.pop_front();
+            self.dropped += 1;
+        }
+        self.msgs.push_back(m);
+    }
+
+    /// The batch to send, oldest first, and the count left out; `None` when nothing
+    /// arrived. Starts the next batch empty.
+    fn take(&mut self) -> Option<(Vec<TailMessage>, u64)> {
+        if self.msgs.is_empty() && self.dropped == 0 {
+            return None;
+        }
+        let b = std::mem::take(self);
+        Some((b.msgs.into(), b.dropped))
+    }
+}
+
+/// The time now, UTC, in milliseconds since the Unix epoch: a tail message's stamp.
+fn unix_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Why opening the tail's connection failed, in the words of a connect error (cleaned
+/// with `clean`), or a fixed text when it is the tail's own (RESP3 or `HELLO` refused).
+fn tail_open_error(e: &conn::ConnError, clean: impl Fn(String) -> String) -> String {
+    match live::pubsub::open_error(e) {
+        Some(fixed) => fixed.to_string(),
+        None => clean(e.to_string()),
+    }
+}
+
+/// One live tail, from connecting to its end: opens its own connection
+/// (`conn::open_subscriber`), subscribes, then forwards what arrives in batches
+/// ([`forward_tail`]) until the connection is lost. Every message about it is
+/// [`Msg::TailReady`], [`Msg::Tail`] or [`Msg::TailClosed`]. Aborting the task (the
+/// tail was replaced or stopped) drops the connection and sends nothing more.
+async fn run_tail(
+    run: TailRun,
+    profile: Profile,
+    secrets: SecretSource,
+    to: Subscription,
+    budget: Arc<Budget>,
+    tx: Tx,
+) {
+    let TailRun { id, scan, tail } = run;
+    let closed = |error: String| {
+        send(
+            &tx,
+            Msg::TailClosed {
+                id,
+                scan,
+                tail,
+                error: Some(error),
+            },
+        );
     };
+    let (store, secret) = store_for(&profile, secrets);
+    let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
+    let (mut conn, mut pushes) = match conn::open_subscriber(&profile, store.as_ref()).await {
+        Ok(c) => c,
+        Err(e) => return closed(tail_open_error(&e, clean)),
+    };
+    drop(store);
+    if let Err(why) = live::pubsub::subscribe(&mut conn, &budget, &to).await {
+        return closed(why);
+    }
+    if !send(&tx, Msg::TailReady { id, scan, tail }) {
+        return;
+    }
+    let sent = forward_tail(&mut pushes, unix_ms_now, |batch, dropped| {
+        send(
+            &tx,
+            Msg::Tail {
+                id,
+                scan,
+                tail,
+                batch,
+                dropped,
+            },
+        )
+    })
+    .await;
+    // Held until here: through SSH the forward stays open only while it is alive.
+    drop(conn);
+    if sent {
+        closed(live::CONNECTION_LOST.to_string());
+    }
+}
+
+/// One Monitor run, from connecting to its end: `conn::open_monitor` (one `MONITOR` from
+/// the budget for its check, one for the run), then the lines in batches
+/// (`live::monitor::forward`) until a limit or the connection's end. Every message about
+/// it is [`Msg::MonitorReady`], [`Msg::MonitorLines`] or [`Msg::MonitorClosed`]. A
+/// refusal is said in fixed words (`live::error_for`): never the server's text, which can
+/// name the user. Aborting the task drops the connection and sends nothing more.
+async fn run_monitor(
+    run: TailRun,
+    profile: Profile,
+    secrets: SecretSource,
+    budget: Arc<Budget>,
+    tx: Tx,
+) {
+    let TailRun {
+        id,
+        scan,
+        tail: run,
+    } = run;
+    let closed = |end: Result<live::monitor::End, String>| {
+        send(&tx, Msg::MonitorClosed { id, scan, run, end });
+    };
+    let (store, secret) = store_for(&profile, secrets);
+    let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
+    let opened = conn::open_monitor(&profile, store.as_ref(), &budget).await;
+    drop(store);
+    let mut mon = match opened {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => return closed(Err(live::error_for("MONITOR", &e).to_string())),
+        Err(e) => return closed(Err(clean(e.to_string()))),
+    };
+    if !send(
+        &tx,
+        Msg::MonitorReady {
+            id,
+            scan,
+            run,
+            at_unix_ms: unix_ms_now(),
+        },
+    ) {
+        return;
+    }
+    let end = live::monitor::forward(&mut mon.lines, live::monitor::Limits::default(), |lines| {
+        send(
+            &tx,
+            Msg::MonitorLines {
+                id,
+                scan,
+                run,
+                lines,
+            },
+        )
+    })
+    .await;
+    // Closed before saying so, so the server stops feeding it at once.
+    drop(mon);
+    if end != live::monitor::End::Gone {
+        closed(Ok(end));
+    }
+}
+
+/// Reads `pushes` until the connection is lost, passing the messages on to `batch` at
+/// most every [`TAIL_BATCH_EVERY`], at most [`TAIL_KEPT`] at a time (the newest), each
+/// stamped with `now` when it arrived. What is left when the connection goes is passed
+/// on first. False when `batch` returned false (the app is gone).
+async fn forward_tail(
+    pushes: &mut mpsc::UnboundedReceiver<redis::PushInfo>,
+    now: impl Fn() -> i64,
+    mut batch: impl FnMut(Vec<TailMessage>, u64) -> bool,
+) -> bool {
+    let mut pending = TailBatch::default();
+    let mut every = tokio::time::interval(TAIL_BATCH_EVERY);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            push = pushes.recv() => {
+                let lost = match push {
+                    None => true,
+                    Some(p) => match live::pubsub::parse_push(p, now()) {
+                        live::pubsub::Push::Message(m) => {
+                            pending.push(m);
+                            false
+                        }
+                        live::pubsub::Push::Lost => true,
+                        live::pubsub::Push::Other => false,
+                    },
+                };
+                if lost {
+                    return pending.take().is_none_or(|(b, d)| batch(b, d));
+                }
+            }
+            _ = every.tick() => {
+                if let Some((b, d)) = pending.take()
+                    && !batch(b, d)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+async fn connect_and_scan(
+    id: ConnId,
+    scan_id: ScanId,
+    profile: Profile,
+    secrets: SecretSource,
+    tx: Tx,
+    live: LiveSlot,
+) {
+    let name = report_name(&profile, &secrets);
+    let (store, secret) = store_for(&profile, secrets);
     let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
 
     // A standalone server, or every shard of a cluster.
@@ -1279,11 +1659,7 @@ mod tests {
     /// starting a connect task.
     fn connecting(runner: &mut Runner, id: ConnId, scan: ScanId) {
         runner.scans.insert(id, scan);
-        runner.replace_live(Some(LiveSession {
-            id,
-            scan,
-            handle: None,
-        }));
+        runner.replace_live(Some(LiveSession::new(id, scan)));
     }
 
     #[test]
@@ -1378,6 +1754,223 @@ mod tests {
         assert!(runner.run(Effect::Quit, &mut Recorder::default()));
         assert!(queue.is_closed());
         assert!(lock(&runner.live).is_none());
+    }
+
+    fn tail_msg(i: usize) -> TailMessage {
+        TailMessage::new(i as i64, "news".into(), None, format!("m{i}").into_bytes())
+    }
+
+    fn message_push(i: usize) -> redis::PushInfo {
+        redis::PushInfo {
+            kind: redis::PushKind::Message,
+            data: vec![
+                redis::Value::BulkString(b"news".to_vec()),
+                redis::Value::BulkString(format!("m{i}").into_bytes()),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_tail_batch_keeps_the_newest_2000_and_counts_the_rest() {
+        let mut b = TailBatch::default();
+        assert!(b.take().is_none());
+        for i in 0..TAIL_KEPT + 5 {
+            b.push(tail_msg(i));
+        }
+        let (msgs, dropped) = b.take().expect("a batch");
+        assert_eq!((msgs.len(), dropped), (TAIL_KEPT, 5));
+        assert_eq!(msgs[0].at_unix_ms, 5);
+        assert_eq!(msgs.last().unwrap().at_unix_ms, (TAIL_KEPT + 4) as i64);
+        // The next batch starts empty.
+        assert!(b.take().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_tail_forwards_in_order_and_passes_on_the_rest_when_lost() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for i in 0..3 {
+            tx.send(message_push(i)).unwrap();
+        }
+        // A subscribe confirmation is not a message.
+        tx.send(redis::PushInfo {
+            kind: redis::PushKind::Subscribe,
+            data: vec![
+                redis::Value::BulkString(b"news".to_vec()),
+                redis::Value::Int(1),
+            ],
+        })
+        .unwrap();
+        tx.send(redis::PushInfo {
+            kind: redis::PushKind::Disconnection,
+            data: vec![],
+        })
+        .unwrap();
+        let stamp = std::sync::atomic::AtomicI64::new(100);
+        let mut got = Vec::new();
+        let ok = forward_tail(
+            &mut rx,
+            || stamp.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            |b, d| {
+                assert_eq!(d, 0);
+                got.extend(b);
+                true
+            },
+        )
+        .await;
+        assert!(ok);
+        let payloads: Vec<_> = got.iter().map(|m| m.payload.as_bytes().to_vec()).collect();
+        assert_eq!(payloads, [b"m0".to_vec(), b"m1".to_vec(), b"m2".to_vec()]);
+        // Stamped when each arrived.
+        let at: Vec<_> = got.iter().map(|m| m.at_unix_ms).collect();
+        assert_eq!(at, [100, 101, 102]);
+
+        // A closed receiver is a lost connection too.
+        let (tx, mut rx) = mpsc::unbounded_channel::<redis::PushInfo>();
+        drop(tx);
+        assert!(forward_tail(&mut rx, || 0, |_, _| true).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_tail_sends_at_most_one_batch_every_100_ms() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let feed = tokio::spawn(async move {
+            // 1,000 messages over one second, then the connection goes.
+            for i in 0..1_000 {
+                tx.send(message_push(i)).unwrap();
+                if i % 10 == 9 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            tx.send(redis::PushInfo {
+                kind: redis::PushKind::Disconnection,
+                data: vec![],
+            })
+            .unwrap();
+        });
+        let start = tokio::time::Instant::now();
+        let mut sent_at = Vec::new();
+        let mut total = 0;
+        forward_tail(
+            &mut rx,
+            || 0,
+            |b, _| {
+                sent_at.push(tokio::time::Instant::now());
+                total += b.len();
+                true
+            },
+        )
+        .await;
+        feed.await.unwrap();
+        assert_eq!(total, 1_000);
+        // One second of messages, in about ten batches: never two within 100 ms, except
+        // the last one, passed on when the connection went.
+        assert!(sent_at.len() <= 12, "{} batches", sent_at.len());
+        for w in sent_at[..sent_at.len() - 1].windows(2) {
+            assert!(
+                w[1] - w[0] >= TAIL_BATCH_EVERY,
+                "batches {:?} apart",
+                w[1] - w[0]
+            );
+        }
+        assert!(sent_at.last().unwrap().duration_since(start) >= Duration::from_millis(990));
+    }
+
+    #[tokio::test]
+    async fn the_tail_stops_when_the_app_is_gone() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(message_push(0)).unwrap();
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            forward_tail(&mut rx, || 0, |_, _| false),
+        )
+        .await
+        .expect("kept running");
+        assert!(!ended);
+        drop(tx);
+    }
+
+    #[test]
+    fn a_subscribe_without_a_connected_session_is_answered_closed() {
+        let (mut runner, mut rx) = runner();
+        let subscribe = |id, scan| Effect::Subscribe {
+            id,
+            scan,
+            tail: 3,
+            profile: profile("p"),
+            secrets: SecretSource::Keychain,
+            to: Subscription::Channel("news".into()),
+        };
+        // No session; then a session still connecting (no budget yet).
+        runner.run(subscribe(1, 10), &mut Recorder::default());
+        connecting(&mut runner, 1, 10);
+        runner.run(subscribe(1, 10), &mut Recorder::default());
+        // A replaced run.
+        runner.run(subscribe(1, 9), &mut Recorder::default());
+        for _ in 0..3 {
+            match rx.try_recv().map(msg_of) {
+                Ok(Msg::TailClosed {
+                    id: 1,
+                    tail: 3,
+                    error: Some(e),
+                    ..
+                }) => assert_eq!(e, LiveError::Closed.to_string()),
+                _ => panic!("expected TailClosed"),
+            }
+        }
+        assert!(lock(&runner.live).as_ref().unwrap().tail.is_none());
+    }
+
+    #[tokio::test]
+    async fn one_tail_per_session_and_unsubscribe_or_a_new_connect_drops_it() {
+        let (mut runner, _rx) = runner();
+        connecting(&mut runner, 1, 10);
+        lock(&runner.live).as_mut().unwrap().budget = Some(Budget::new(None));
+        // A tail whose task never ends, standing in for one that is subscribed.
+        let install = |runner: &Runner, tail: u64| {
+            let (keep_tx, keep_rx) = tokio::sync::oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                let _keep = keep_tx;
+                std::future::pending::<()>().await;
+            });
+            lock(&runner.live).as_mut().unwrap().tail = Some(TailTask {
+                tail,
+                _task: AbortOnDrop(task),
+            });
+            keep_rx
+        };
+        let first = install(&runner, 1);
+        // Unsubscribing another tail leaves it.
+        runner.run(
+            Effect::Unsubscribe { id: 1, tail: 2 },
+            &mut Recorder::default(),
+        );
+        assert!(lock(&runner.live).as_ref().unwrap().tail.is_some());
+        runner.run(
+            Effect::Unsubscribe { id: 1, tail: 1 },
+            &mut Recorder::default(),
+        );
+        assert!(lock(&runner.live).as_ref().unwrap().tail.is_none());
+        // The aborted task dropped what it held.
+        assert!(first.await.is_err());
+        // A new connect drops the session's tail with it.
+        let second = install(&runner, 2);
+        connecting(&mut runner, 1, 11);
+        assert!(second.await.is_err());
+    }
+
+    #[test]
+    fn tail_open_errors_are_fixed_or_cleaned() {
+        let clean = |e: String| conn::parse::mask(&scrub(e, Some("hunter2")));
+        let resp3 = conn::ConnError::Redis(redis::RedisError::from((
+            redis::ErrorKind::RESP3NotSupported,
+            "no HELLO",
+        )));
+        assert_eq!(tail_open_error(&resp3, clean), live::pubsub::RESP3_REFUSED);
+        let other = conn::ConnError::Redis(redis::RedisError::from(std::io::Error::other(
+            "refused for redis://u:hunter2@h:6379",
+        )));
+        let text = tail_open_error(&other, clean);
+        assert!(!text.contains("hunter2"), "{text}");
     }
 
     #[test]

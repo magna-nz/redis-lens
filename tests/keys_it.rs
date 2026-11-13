@@ -302,7 +302,12 @@ async fn big_keys_reads_lengths_and_encodings_and_skips_vanished_keys() {
         // Past hash-max-listpack-entries (128 or 512 by version) a hash leaves listpack.
         assert_eq!(facts[1].1.encoding.as_deref(), Some("hashtable"));
         assert_eq!(facts[2].1.length, None, "not asked for");
-        assert_eq!(facts[2].1.encoding.as_deref(), Some("listpack"));
+        // A small hash is a listpack from Redis 7.0 (and on Valkey); a ziplist before.
+        assert!(
+            matches!(facts[2].1.encoding.as_deref(), Some("listpack" | "ziplist")),
+            "{:?}",
+            facts[2].1.encoding
+        );
     }
 }
 

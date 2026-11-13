@@ -111,10 +111,20 @@ async fn start_on(
     .start()
     .await
     .expect("start container (is Docker running?)");
-    let port = container
-        .get_host_port_ipv4(6379.tcp())
-        .await
-        .expect("mapped port");
+    // Docker can report the container started before its port is published: ask again
+    // for a little while before giving up.
+    let mut tries = 0;
+    let port = loop {
+        match container.get_host_port_ipv4(6379.tcp()).await {
+            Ok(p) => break p,
+            Err(e) if tries < 20 => {
+                tries += 1;
+                let _ = e;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("mapped port: {e:?}"),
+        }
+    };
     TestServer { port, container }
 }
 

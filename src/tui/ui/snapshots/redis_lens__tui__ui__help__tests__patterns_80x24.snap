@@ -3,12 +3,12 @@ source: src/tui/ui/help.rs
 assertion_line: 80
 expression: "render(Screen::Patterns, 80, 24).backend()"
 ---
-"                                                                                "
 "       ┌─ Keys · Patterns ──────────────────────────────────────────────┐       "
 "       │Everywhere                                                      │       "
 "       │0-6            Switch view, 0 Connections to 6 Search           │       "
 "       │?              Show or hide this key list                       │       "
 "       │a              Add a connection                                 │       "
+"       │:              Open the command line for readonly commands      │       "
 "       │q ctrl-c       Quit                                             │       "
 "       │Patterns                                                        │       "
 "       │↑↓ j k         Move the selection                               │       "

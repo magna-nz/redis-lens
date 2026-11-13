@@ -1,5 +1,6 @@
 ---
 source: src/tui/views/pubsub.rs
+assertion_line: 693
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
@@ -23,6 +24,6 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│ Selected                        orders:eu                                    │"
 "│ ▲ left out: the server refused PUBSUB NUMPAT for this user                   │"
 "│ ▲ left out: the server refused PUBSUB NUMSUB for this user                   │"
-"│ Counts only: message payloads are never read.                                │"
+"│ Counts read no payloads. enter or s starts a live tail.                      │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   p Pause   r Refresh   0-6 View   ? Help   q Quit                     "
+" ↑↓ Move   enter Subscribe   space Pause   / Filter   0-6 View   ? Help   q Quit"

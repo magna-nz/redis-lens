@@ -19,6 +19,8 @@ pub enum CopyKind {
     Pattern,
     Key,
     Command,
+    /// A value as shown on screen (spec "Values (P2)", "Clipboard").
+    Value,
 }
 
 impl CopyKind {
@@ -27,6 +29,7 @@ impl CopyKind {
             Self::Pattern => "pattern",
             Self::Key => "key",
             Self::Command => "command",
+            Self::Value => "value",
         }
     }
 }
@@ -34,10 +37,13 @@ impl CopyKind {
 /// Text that may go to the clipboard.
 ///
 /// There is deliberately no constructor from an arbitrary `String`, a profile, a
-/// connection string or credentials: only a pattern name, a key name or the
-/// suggested `redis-cli --scan` command can be built, so nothing credential-like
-/// can reach the clipboard (CLAUDE.md rule 1). Keep it that way.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// connection string or credentials: only a pattern name, a key name, the suggested
+/// `redis-cli --scan` command or a value as shown on screen ([`CopyText::value`]) can
+/// be built, so nothing credential-like can reach the clipboard (CLAUDE.md rule 1).
+/// Keep it that way.
+///
+/// `Debug` prints the kind and length only: a value must never reach `Debug` output.
+#[derive(Clone, PartialEq, Eq)]
 pub struct CopyText {
     kind: CopyKind,
     text: String,
@@ -60,6 +66,16 @@ impl CopyText {
         }
     }
 
+    /// A value as shown on screen, in the format shown: the text
+    /// [`crate::value::copy_text`] gives for it. Only `y` on that value builds one
+    /// (spec "Values (P2)").
+    pub fn value(shown: &str) -> Self {
+        Self {
+            kind: CopyKind::Value,
+            text: shown.to_string(),
+        }
+    }
+
     /// The `redis-cli --scan` command for a pattern label, or `None` when the pattern
     /// has characters that are not safe in a shell (see [`suggested_command`]).
     pub fn suggested_command(label: &str) -> Option<Self> {
@@ -76,6 +92,15 @@ impl CopyText {
     /// What it is: "pattern", "key" or "command".
     pub fn what(&self) -> &'static str {
         self.kind.as_str()
+    }
+}
+
+impl std::fmt::Debug for CopyText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CopyText")
+            .field("kind", &self.kind)
+            .field("len", &self.text.len())
+            .finish()
     }
 }
 
@@ -290,5 +315,20 @@ mod tests {
         assert_eq!(CopyText::pattern("a:{id}").what(), "pattern");
         assert_eq!(CopyText::pattern("a:{id}").as_str(), "a:{id}");
         assert_eq!(CopyText::key("a:1").what(), "key");
+        assert_eq!(CopyText::value("x").what(), "value");
+        assert_eq!(CopyText::value("x").as_str(), "x");
+    }
+
+    #[test]
+    fn debug_never_shows_the_text() {
+        for t in [
+            CopyText::value("s3cret"),
+            CopyText::key("s3cret"),
+            CopyText::pattern("s3cret"),
+        ] {
+            let dbg = format!("{t:?}");
+            assert!(!dbg.contains("s3cret"));
+            assert!(dbg.contains("len: 6"));
+        }
     }
 }

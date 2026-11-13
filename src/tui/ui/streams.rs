@@ -1,7 +1,11 @@
 //! Draws [`StreamsState`]. Owner: wave B, with `views/streams.rs`.
 //!
 //! The streams the last scan found, one row each, and the selected stream's groups and
-//! consumers below. Only IDs and counts are drawn: no entry value is ever held.
+//! consumers below. With the entries open (`enter`), the whole body shows them, drawn by
+//! the key detail's value panel ([`super::value::draw_value_panel`]).
+//!
+//! Every server string is escaped before it is drawn: key, group and consumer names,
+//! entry IDs, and (through the value renderer) the entries' fields.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -12,6 +16,8 @@ use crate::format;
 use crate::live::streams::{ConsumerInfo, GroupInfo, Lag, StreamInfo, Verdict};
 use crate::tui::app::views::streams::{DetailRow, Focus, StreamRow, StreamsState};
 use crate::tui::app::views::{Ctx, LiveState};
+
+use crate::value::escape;
 
 use super::widgets::{fit, pad_l, pad_r, panel, rows, scroll_offset, trunc};
 use super::{notice_panels, split_body, style};
@@ -63,6 +69,12 @@ fn verdict_style(v: Verdict) -> Style {
 /// header and the key bar.
 pub fn draw(frame: &mut Frame, area: Rect, state: &StreamsState, ctx: &Ctx<'_>) {
     const TITLE: &str = "Streams";
+    if let Some(entries) = state.shown_entries() {
+        let key = entries.row.as_ref().map_or("", |r| r.key.as_str());
+        let title = format!("Entries · {}", escape(key));
+        super::value::draw_value_panel(frame, area, entries, ctx, &title, None);
+        return;
+    }
     if let Some(off) = &state.off {
         let lines = vec![Line::from(Span::styled(
             format!(" ▲ {off}"),
@@ -210,7 +222,10 @@ fn total_pending(info: &StreamInfo) -> Option<u64> {
 
 fn list_row(r: &StreamRow, kw: usize, wide: bool) -> Line<'static> {
     let dash = || "—".to_string();
-    let mut spans = fit(vec![Span::styled(format!(" {}", r.key), style::fg())], kw);
+    let mut spans = fit(
+        vec![Span::styled(format!(" {}", escape(&r.key)), style::fg())],
+        kw,
+    );
     let Some(i) = &r.info else {
         spans.push(Span::styled(" gone since the scan", style::dim()));
         return Line::from(spans);
@@ -247,7 +262,7 @@ fn list_row(r: &StreamRow, kw: usize, wide: bool) -> Line<'static> {
     ]);
     if wide {
         spans.push(Span::styled(
-            format!(" {}", pad_r(&i.last_id, ID_W)),
+            format!(" {}", pad_r(&escape(&i.last_id), ID_W)),
             style::dim(),
         ));
     }
@@ -269,10 +284,10 @@ fn detail_panel(frame: &mut Frame, area: Rect, state: &StreamsState) {
     let hint = if focused {
         "↑↓ select · tab back"
     } else {
-        "tab: groups and consumers"
+        "tab: groups · enter: entries"
     };
     let Some(info) = &sel.info else {
-        let inner = panel(frame, area, &sel.key, "");
+        let inner = panel(frame, area, &escape(&sel.key), "");
         rows(
             frame,
             inner,
@@ -284,7 +299,7 @@ fn detail_panel(frame: &mut Frame, area: Rect, state: &StreamsState) {
         );
         return;
     };
-    let inner = panel(frame, area, &sel.key, hint);
+    let inner = panel(frame, area, &escape(&sel.key), hint);
     let w = usize::from(inner.width);
     let dash = || "—".to_string();
 
@@ -300,7 +315,7 @@ fn detail_panel(frame: &mut Frame, area: Rect, state: &StreamsState) {
             style::fgb(),
         ),
         Span::styled(" · last ", style::dim()),
-        Span::styled(info.last_id.clone(), style::fg()),
+        Span::styled(escape(&info.last_id), style::fg()),
     ];
 
     let mut verdict_line = vec![Span::styled(" verdict ", style::dim())];
@@ -374,7 +389,7 @@ fn detail_line(row: &DetailRow<'_>, nw: usize) -> Line<'static> {
                 style::fg()
             };
             Line::from(vec![
-                Span::styled(pad_r(&format!("     {}", c.name), nw), style::fg()),
+                Span::styled(pad_r(&format!("     {}", escape(&c.name)), nw), style::fg()),
                 Span::styled(
                     format!(" {}", pad_l(&c.pending.to_string(), PEND_W)),
                     style::fg(),
@@ -399,7 +414,7 @@ fn group_spans(g: &GroupInfo, nw: usize) -> Vec<Span<'static>> {
         _ => style::fg(),
     };
     vec![
-        Span::styled(pad_r(&format!(" ▸ {}", g.name), nw), style::fgb()),
+        Span::styled(pad_r(&format!(" ▸ {}", escape(&g.name)), nw), style::fgb()),
         Span::styled(
             format!(" {}", pad_l(&g.pending.to_string(), PEND_W)),
             style::fgb(),
@@ -408,7 +423,7 @@ fn group_spans(g: &GroupInfo, nw: usize) -> Vec<Span<'static>> {
         Span::styled(format!(" {}", pad_l("", AGE_W)), style::fg()),
         Span::styled(format!(" {}", pad_l(&lag, LAG_W)), lag_st),
         Span::styled(
-            format!(" {}", trunc(&g.last_delivered_id, 16)),
+            format!(" {}", trunc(&escape(&g.last_delivered_id), 16)),
             style::dim(),
         ),
     ]

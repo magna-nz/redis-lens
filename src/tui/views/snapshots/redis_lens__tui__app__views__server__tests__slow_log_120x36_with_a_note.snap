@@ -1,11 +1,12 @@
 ---
 source: src/tui/views/server.rs
+assertion_line: 2403
 expression: "testing::render(&app, 120, 36).backend()"
 ---
 " redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC "
 " Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                           "
 "  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
-"    Overview  ·  Clients  ·  Slow log                                                                    tab next panel "
+"    Overview  ·  Clients  ·  Slow log  ·  Monitor                                                        tab next panel "
 "┌─ Slow log ──────────────────────────────────────────────────────────────────────────── 9 entries · UTC · every 10 s ─┐"
 "│ threshold 10.0ms · keeps 128 entries                                                                                 │"
 "│  TIME      DURATION  COMMAND      KEYS                                                          CLIENT               │"
@@ -29,10 +30,10 @@ expression: "testing::render(&app, 120, 36).backend()"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
-"│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 "┌─ Entry ──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
 "│ when   2023-11-14 22:13:27 UTC · 45.3ms · HGETALL                                                                    │"
+"│ args   HGETALL cart:1002                                                                                             │"
 "│ keys   cart:1002                                                                                                     │"
 "│ client 10.0.1.5:50386 (worker)                                                                                       │"
 "│ ▲ Whole-key read that was slow: the key is probably big. Read it in pages.                                           │"

@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** v0.3 (cluster and SSH tunnels) merged to main (#14); Redis Insight parity phase 1 built, merged with v0.3 and in review (#15)
-**Last updated:** 2026-11-12 (main merged into `claude/redis-insight-tui-features-60db8f` for #15: 5 Nodes became the Nodes panel of 2 Analysis; the live views are off on a cluster)
+**Current milestone:** Redis Insight parity phase 2 (values on screen), in one PR: [#16](https://github.com/magna-nz/redis-lens/pull/16), branch `phase2/values-on-screen`. Phase 1 merged to main (#15).
+**Last updated:** 2026-11-14 (phase 2: all four parts built, in #16)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -416,8 +416,52 @@ A gap matrix against Redis Insight v3.8.0, with a three-phase roadmap, is in [do
     - The permission check's `classify` keeps v0.3's redirect rule and phase 1's fixed NOPERM text.
   - Not covered by the merge's tests: the live views on a cluster against a real cluster (they are off), and the "previous results" marking loop in `snapshot_tests.rs`, which still visits the five old screens and not Nodes.
   - Left as is, from V-B's notes: Recommendations are recomputed on each draw (cheap); at 80 columns VERDICT cuts long pattern names (owner to decide whether VERDICT should hide first).
-  - Known flake: a test container's port is sometimes not mapped yet (`tests/common/mod.rs:114`); it passes on a rerun.
-- **Next:** a demo against `make demo-up`, then one PR to `main` for the owner to merge. Then phase 2 (values on screen).
+  - Known flake: a test container's port is sometimes not mapped yet (`tests/common/mod.rs:114`); since phase 2 the helper asks again for up to 2 s.
+- **Phase 1 merged** to main as #15. Phase 2: see [Phase 2](#phase-2-2026-11-13-values-on-screen) below.
 - **Design corrections found while writing the spec:**
   - A stream doesn't store its `MAXLEN`, so Streams shows the age of the oldest entry and an `unbounded` verdict instead of a cap.
   - A pattern's glob can match keys of other patterns, so the key list and bulk actions keep only keys that infer to the selected pattern.
+
+## Phase 2 (2026-11-13): values on screen
+
+Built unattended on `phase2/values-on-screen`, one PR for the whole phase ([#16](https://github.com/magna-nz/redis-lens/pull/16)), one or more commits per part. Not merged: the owner merges. Nothing in phase 2 sends a write command.
+
+| Part | Content | Commits | State |
+|---|---|---|---|
+| 1 | Value renderer (`src/value/`: text, hex, JSON, MessagePack; gzip, zlib, lz4, zstd capped at 1 MiB; terminal safety), Key detail (`src/live/values.rs`, `views/value.rs`), `f`, `y`, `CopyText::value` | `3dad809` `cd7d27b` `960ff78` `60192fe` `60fa334`, verifier fixes `bb9b3e8` | **done**, verified (the verifier blocked on a MessagePack size blow-up and a cut column; both fixed, with tests) |
+| 2 | Stream entries, Pub/Sub live tail (own RESP3 connection), Search queries (`FT.SEARCH`, `FT.EXPLAIN`, `FT.PROFILE`) | `2272334` (shared masking, `src/live/command.rs`), `e514253`, verifier fixes `55ccddc` | **done**, verified (OK, no blockers; its two should-fixes are fixed: one Search query at a time, tail previews made off the UI thread) |
+| 3 | Slow log arguments (masked, on screen only), Monitor panel (own connection, asks first, 30 s or 10,000 lines), Hot keys from the last Monitor run | one commit with part 4 (they share the wiring files) | **done**; tests on Redis, Valkey and Redis 6.2 |
+| 4 | Command line panel: `:`, readonly commands only (`COMMAND INFO` flags), `@dangerous` asks, refusals point elsewhere, credentials masked in input and history, `COMMAND DOCS` helper, `tab` completion | one commit with part 3 | **done**; tests on Redis, Valkey and Redis 6.2 |
+
+### Decisions taken alone (phase 2)
+
+- **Value cache:** `value::Memo` keeps decode, render and preview results between frames, keyed by a `Raw`'s id (a counter given out when it is made). Bounded: 8 decoded, 8 rendered, 4,096 previews.
+- **MessagePack map keys that are not strings** are drawn as a string of their compact JSON; a container key inside such a key becomes `"…"`, so nesting can't double the size per level.
+- **Pub/Sub:** each message keeps only the first 4 KiB of its payload once its preview is made (up to 4,000 messages are held while paused). `s`, `c`, `esc`, `p` and `r` are only in the `?` overlay, so the bar fits 80 columns. The rate is over the last 5 s while the view is shown. A new subscription clears the list, the filter and the pause.
+- **Streams:** the XINFO poll stops while entries are shown; `y` on an entry does not copy (an entry has several fields, as in Key detail).
+- **Search:** results replace the schema while their index is selected; documents, explain and profile open over the whole body and `esc` goes back; `e` and `P` run the last query on the selected index; a refused or unknown `FT.*` command is off until `r`. Server error text is shown only for syntax-type errors, escaped and cut at 200 characters. valkey-search rejects `*`, so an empty query shows that message on Valkey.
+
+- **Monitor connection:** redis-rs's multiplexed connection drops replies nobody asked for, and its own monitor connection resolves the host itself and ignores the answer to `MONITOR`. So `conn::open_monitor` first sends `MONITOR` on an ordinary connection through the profile's route as a permission check, then opens the run with `get_async_monitor`: a run costs 2 commands from the budget. Direct routes work with and without TLS, and an SSH tunnel without TLS; the panel is off, with a fixed reason, behind SSH with TLS and with Entra ID.
+- **Monitor:** `enter` asks and `esc` stops; `y`/`n`, or the profile name on `prod`, where a wrong name cancels. Credentials in each line are masked as it arrives, so a password is never held; a line over 1 KiB is cut at an argument. The view follows the newest line until you scroll up (`End` follows again). No `y` copy of Monitor lines or Slow log arguments.
+- **Hot keys from Monitor:** used when the scan has no LFU counters (no LFU policy, or `OBJECT FREQ` refused). Key positions come from `COMMAND INFO` key specs shared with the Slow log; names not yet known are asked when the run ends (at most 8 rounds of 64, through the budget). KEY, PATTERN, COUNT and share; lines it can't place are counted. Never in a snapshot or report.
+- **Slow log arguments** are on an `args` row of the Entry panel (one entry fewer at 80×24), cut with `…`, then `… N more arguments` when the server cut the command.
+- **Command line:**
+  - only commands the server flags `readonly` are sent, on every profile; also refused: `blocking` (or `@blocking` on 6.2; `XREAD` only with `BLOCK`), and the commands that would change the shared connection. A container command is judged by its subcommand's entry in the same `COMMAND INFO` reply. If `COMMAND INFO` is refused or unknown, nothing can be sent (fails closed).
+  - `COMMAND INFO` and `COMMAND DOCS` are asked once per name, when its first word is followed by a space; `COMMAND LIST` once, when the panel first opens (absent on 6.2: completion then uses names already looked up).
+  - the cursor stays at the end of the line; masking works token by token as you type. History: last 100 lines, masked (so a recalled credential line holds `***`). Output: last 100 entries or 4 MiB. One command at a time.
+- **ACL:** `+monitor` and `+command|list` are left out of the demo's minimal user: `+monitor` shows every command and value on the server.
+
+### Open questions and leftovers (phase 2)
+
+- **The strict readonly rule refuses `INFO`, `PING`, `TIME`, `CLIENT LIST`, `CONFIG GET`, `SLOWLOG GET`, `PUBSUB …` and `COMMAND …`** on the command line, because they lack the `readonly` flag. Should a short allow-list of harmless commands be sent? Owner to decide.
+- Parts 3 and 4 are one commit: both edit the same wiring files (`app.rs`, `keymap.rs`, `views/mod.rs`, `ui/mod.rs`, `live/mod.rs`, spec.md), and splitting their hunks did not give a commit that builds.
+- Not tested against real servers: MONITOR through an SSH tunnel and over direct TLS (coded, unit-tested only); the command line through a full TUI session (the live path has integration tests); RESP3 reply shapes on the command line (unit tests; the live connection is RESP2).
+- The `?` overlay does not list the command line panel's own keys (they are in the spec's key table).
+
+- **Auto-fix could not be turned on** for #16: the app's permission check refused `set_monitor`. CI was checked by hand instead.
+- Search result fields are held as the server returned them (at most 50 documents), with no size cap per field.
+- Pub/Sub: non-UTF-8 channel names are shown and subscribed to lossily; each subscribe reads the keychain again; `run_tail` end to end through the runner has no test (its pieces do).
+- From the Part 2 verifier's notes, left as they are: a channel or index name that is not UTF-8 is sent back lossily; the input bar draws a pasted bidi control as it is (the user's own paste); any NOPERM while the subscriber connection opens reads as "HELLO refused"; stream paging with `XREVRANGE (id` needs Redis 6.2 or later.
+- **Main's Redis 6.2 integration job has failed since #15** (`keys_it` expected `listpack`; Redis 6.2 says `ziplist`). Fixed here in `5ded47e`, with the container helper now asking again for a port Docker has not published yet (the known flake).
+- CI flake fixed on the way: `conn::ssh` test `a_cancelled_start_kills_ssh` cancelled after a fixed 300 ms, before a loaded runner had started the fake ssh (`8d8e788`).
+- Streams and Search keep the same key bar in every mode (entries, document, explain), since `keymap::footer` only knows the screen.
