@@ -944,7 +944,11 @@ impl CmdlineState {
             first_line.push_str(" · ");
             first_line.push_str(&d.complexity);
         }
-        let mut second = format!("{} · {}", verdict.0, cmd.categories.join(" "));
+        let mut second = format!(
+            "{} · {}",
+            verdict.0,
+            crate::value::escape(&cmd.categories.join(" "))
+        );
         if let Some(d) = docs.filter(|d| !d.summary.is_empty()) {
             second = format!("{} · {second}", d.summary);
         }
