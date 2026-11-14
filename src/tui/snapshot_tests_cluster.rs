@@ -494,48 +494,6 @@ fn a_seed_only_scan_is_amber_everywhere_it_is_summed_up() {
     }
 }
 
-/// The views that still read one server are off on a cluster, say why, and ask nothing:
-/// the key list and detail, Streams and Pub/Sub (the Server panels and Search read the
-/// picked node, below).
-#[test]
-fn live_views_are_off_on_a_cluster_and_send_nothing() {
-    let (mut app, _) = live_cluster();
-    for screen in [
-        Screen::KeyList,
-        Screen::KeyDetail,
-        Screen::Streams,
-        Screen::PubSub,
-    ] {
-        let effects = super::app::views::testing::show(&mut app, screen);
-        assert_eq!(app.screen(), screen);
-        assert!(
-            !effects.iter().any(|e| matches!(e, Effect::Live { .. })),
-            "{screen:?}: {effects:?}"
-        );
-        let all = text(&render(&app, 120, 36));
-        assert!(
-            all.contains("Not available on a cluster yet: this view reads one server"),
-            "{screen:?}: {all}"
-        );
-        // `r` on a live view says the same and sends nothing either.
-        let effects = app.handle_key(ch('r'));
-        assert!(
-            !effects.iter().any(|e| matches!(e, Effect::Live { .. })),
-            "{screen:?}: {effects:?}"
-        );
-    }
-    // The Analysis panels and Patterns still show the merged results.
-    // (The notice from the last `r` is still in the key bar, so look above it.)
-    show(&mut app, Screen::BigKeys);
-    let lines = buffer_lines(&render(&app, 120, 36));
-    let body = lines[..lines.len() - 1].join("\n");
-    assert!(!body.contains("Not available on a cluster"), "{body}");
-    assert!(
-        body.contains("Lengths and encodings are not read on a cluster yet"),
-        "{body}"
-    );
-}
-
 // -- Cluster live views (P4): the picked node --------------------------------------
 
 use crate::live::server::{InfoSample, Reply as ServerReply, Request as ServerRequest};
@@ -840,4 +798,621 @@ fn the_per_shard_summary_polls_at_most_every_5_s_only_while_shown() {
     show(&mut app, Screen::Patterns);
     let effects = app.apply(Msg::TickAt(t0 + std::time::Duration::from_secs(60)));
     assert!(sent(&effects).is_empty());
+}
+
+// -- Cluster live views (P4): the views that work node by node ---------------------
+
+use crate::live::Follow;
+use crate::live::keys::{KeyRow, Page, Reply as KeysReply, Request as KeysRequest};
+
+/// Node `i`, following no redirect: how a page, facts or a bulk step is sent.
+fn never(i: usize) -> Dest {
+    Dest::node(i).follow(Follow::Never)
+}
+
+fn key_row(name: &str) -> KeyRow {
+    KeyRow {
+        key: name.into(),
+        key_type: crate::model::KeyType::Hash,
+        ttl: crate::model::Ttl::Persistent,
+        bytes: Some(512),
+        encoding: Some("listpack".into()),
+        length: Some(4),
+        freq: None,
+    }
+}
+
+fn page_reply(rows: Vec<KeyRow>, cursor: u64) -> Result<LiveReply, crate::live::LiveError> {
+    Ok(LiveReply::Keys(KeysReply::Page(Page {
+        rows,
+        cursor,
+        carry: Vec::new(),
+        other_pattern: 0,
+        unreadable: 0,
+        refused: Vec::new(),
+    })))
+}
+
+/// The key list pages among `effects`: id, where it goes, and its cursor.
+fn pages(effects: &[Effect]) -> Vec<(crate::live::ReqId, Dest, u64)> {
+    sent(effects)
+        .into_iter()
+        .filter_map(|(id, to, r)| match r {
+            LiveRequest::Keys(KeysRequest::Page { cursor, .. }) => Some((id, to, cursor)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn answer(
+    app: &mut App,
+    id: crate::live::ReqId,
+    r: Result<LiveReply, crate::live::LiveError>,
+) -> Vec<Effect> {
+    super::app::views::testing::reply(app, id, r)
+}
+
+#[test]
+fn the_key_list_walks_every_primary_in_slot_order_one_node_at_a_time() {
+    let (mut app, _) = live_cluster();
+    let effects = super::app::views::testing::show(&mut app, Screen::KeyList);
+    let p = pages(&effects);
+    assert_eq!(
+        p.iter()
+            .map(|(_, d, c)| (d.clone(), *c))
+            .collect::<Vec<_>>(),
+        [(never(0), 0)]
+    );
+    // Node 0 is walked out before the page is full: node 1 is read right away.
+    let effects = answer(
+        &mut app,
+        p[0].0,
+        page_reply(vec![key_row("user:1:cart")], 0),
+    );
+    let p = pages(&effects);
+    assert_eq!((p[0].1.clone(), p[0].2), (never(1), 0));
+    assert_eq!(app.views.keys.nodes_done, 1);
+    // Node 1 has more: its cursor is kept, and nothing is sent until `n`.
+    let effects = answer(
+        &mut app,
+        p[0].0,
+        page_reply(vec![key_row("user:2:cart")], 77),
+    );
+    assert!(pages(&effects).is_empty(), "{effects:?}");
+    let effects = app.handle_key(ch('n'));
+    let p = pages(&effects);
+    assert_eq!(
+        p.iter()
+            .map(|(_, d, c)| (d.clone(), *c))
+            .collect::<Vec<_>>(),
+        [(never(1), 77)]
+    );
+    let effects = answer(
+        &mut app,
+        p[0].0,
+        page_reply(vec![key_row("user:3:cart")], 0),
+    );
+    let p = pages(&effects);
+    assert_eq!((p[0].1.clone(), p[0].2), (never(2), 0));
+    let effects = answer(
+        &mut app,
+        p[0].0,
+        page_reply(vec![key_row("user:4:cart"), key_row("user:5:cart")], 0),
+    );
+    // Every node is done: nothing more is sent, `n` included.
+    assert!(pages(&effects).is_empty(), "{effects:?}");
+    assert!(pages(&app.handle_key(ch('n'))).is_empty());
+    let k = &app.views.keys;
+    assert_eq!(k.nodes_done, 3);
+    for (key, node) in [
+        ("user:1:cart", 0),
+        ("user:2:cart", 1),
+        ("user:3:cart", 1),
+        ("user:4:cart", 2),
+    ] {
+        assert_eq!(k.row_node.get(key), Some(&node), "{key}");
+    }
+    let wide = text(&render(&app, 120, 36));
+    assert!(wide.contains("3 of 3 nodes"), "{wide}");
+    let t = render(&app, 80, 24);
+    assert!(text(&t).contains("NODE"));
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn the_key_list_of_a_pattern_narrowed_to_a_node_reads_only_that_node() {
+    let (mut app, _) = live_cluster();
+    show(&mut app, Screen::Nodes);
+    press(&mut app, "j");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.screen(), Screen::Patterns);
+    let rows = app.pattern_rows();
+    app.patterns.sel = rows
+        .iter()
+        .position(|r| matches!(r, crate::tui::tree::Row::Pattern { .. }))
+        .expect("a pattern row");
+    let effects = app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.screen(), Screen::KeyList);
+    let p = pages(&effects);
+    assert_eq!(
+        p.iter()
+            .map(|(_, d, c)| (d.clone(), *c))
+            .collect::<Vec<_>>(),
+        [(never(1), 0)]
+    );
+    let effects = answer(
+        &mut app,
+        p[0].0,
+        page_reply(vec![key_row("user:9:cart")], 0),
+    );
+    assert!(pages(&effects).is_empty(), "{effects:?}");
+    assert!(text(&render(&app, 120, 36)).contains("1 of 1 nodes"));
+}
+
+#[test]
+fn the_key_detail_reads_the_slot_owner_and_names_it() {
+    let (mut app, _) = live_cluster();
+    let effects = super::app::views::testing::show(&mut app, Screen::KeyList);
+    let p = pages(&effects);
+    answer(&mut app, p[0].0, page_reply(vec![key_row("foo")], 5));
+    let effects = app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.screen(), Screen::KeyDetail);
+    let reads = sent(&effects);
+    assert!(!reads.is_empty());
+    // "foo" is slot 12182, node 2's: every read goes to its owner.
+    for (_, to, req) in &reads {
+        assert_eq!(*to, Dest::key("foo"), "{req:?}");
+    }
+    let all = text(&render(&app, 120, 36));
+    assert!(all.contains("10.0.1.13:6379"), "{all}");
+}
+
+#[test]
+fn big_keys_lengths_are_read_on_each_owner_split_by_node() {
+    use crate::live::keys::FactKey;
+    let (mut app, _) = live_cluster();
+    let s = app.session.as_ref().unwrap();
+    let fk = |k: &str| FactKey {
+        key: k.into(),
+        key_type: crate::model::KeyType::Hash,
+        length: true,
+    };
+    // bar: slot 5061 (node 0); c: 7365 (node 1); foo 12182 and a 15495 (node 2).
+    let parts =
+        super::app::views::analysis::split_by_node(s, vec![fk("foo"), fk("bar"), fk("a"), fk("c")]);
+    let parts: Vec<(Dest, Vec<String>)> = parts
+        .into_iter()
+        .map(|(d, ks)| (d, ks.into_iter().map(|k| k.key).collect()))
+        .collect();
+    assert_eq!(
+        parts,
+        [
+            (never(0), vec!["bar".to_string()]),
+            (never(1), vec!["c".to_string()]),
+            (never(2), vec!["foo".to_string(), "a".to_string()]),
+        ]
+    );
+    // The panel no longer says lengths are left out on a cluster.
+    show(&mut app, Screen::BigKeys);
+    let body = text(&render(&app, 120, 36));
+    assert!(!body.contains("not read on a cluster"), "{body}");
+    assert!(!body.contains("Not available on a cluster"), "{body}");
+}
+
+// -- The command line on a cluster ---------------------------------------------------
+
+use crate::live::cmdline::{CommandInfo, Output, Reply as CmdReply, Request as CmdRequest};
+use crate::live::server::{Begin, Find, KeySpec};
+
+/// A command's info with the key spec `keys` (as Redis 7 lists it).
+fn cmd(name: &str, flags: &[&str], cats: &[&str], keys: Vec<KeySpec>) -> CommandInfo {
+    CommandInfo {
+        name: name.into(),
+        flags: flags.iter().map(|s| (*s).into()).collect(),
+        categories: cats.iter().map(|s| (*s).into()).collect(),
+        keys,
+        ..CommandInfo::default()
+    }
+}
+
+/// Keys from argument 1 to `last` (relative), every `step` arguments.
+fn keys_from_1(last: i64, step: i64) -> Vec<KeySpec> {
+    vec![KeySpec {
+        begin: Begin::Index(1),
+        find: Find::Range {
+            last,
+            step,
+            limit: 0,
+        },
+    }]
+}
+
+fn get_info() -> CommandInfo {
+    cmd("get", &["readonly", "fast"], &["@read"], keys_from_1(0, 1))
+}
+
+fn mget_info() -> CommandInfo {
+    cmd(
+        "mget",
+        &["readonly", "fast"],
+        &["@read"],
+        keys_from_1(-1, 1),
+    )
+}
+
+fn ran(v: redis::Value) -> Result<LiveReply, crate::live::LiveError> {
+    Ok(LiveReply::Command(CmdReply::Ran(Output::of(
+        &v,
+        std::time::Duration::from_micros(300),
+    ))))
+}
+
+/// `:` opened on the live cluster (picked node `picked`), its `COMMAND LIST` answered.
+fn cluster_cmdline(picked: usize) -> App {
+    let (mut app, _) = live_cluster();
+    app.session.as_mut().unwrap().picked = picked;
+    let effects = app.handle_key(ch(':'));
+    assert!(app.views.cmdline.open, "{:?}", app.notice);
+    for (id, to, _) in sent(&effects) {
+        assert_eq!(to, Dest::node(picked));
+        answer(
+            &mut app,
+            id,
+            Ok(LiveReply::Command(CmdReply::Names(vec!["get".into()]))),
+        );
+    }
+    app
+}
+
+/// Types `line` and `enter`; answers `COMMAND INFO` with `info` and `COMMAND DOCS` with
+/// nothing (both asked on the picked node). Returns the requests that followed.
+fn run_line(
+    app: &mut App,
+    line: &str,
+    info: CommandInfo,
+) -> Vec<(crate::live::ReqId, Dest, LiveRequest)> {
+    let mut effects = Vec::new();
+    for c in line.chars() {
+        effects.extend(app.handle_key(ch(c)));
+    }
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    let picked = app.session.as_ref().unwrap().picked;
+    let mut after = Vec::new();
+    for (id, to, r) in sent(&effects) {
+        assert_eq!(to, Dest::node(picked), "{r:?}");
+        let r = match r {
+            LiveRequest::Command(CmdRequest::Info { .. }) => CmdReply::Info(Some(info.clone())),
+            LiveRequest::Command(CmdRequest::Docs { .. }) => CmdReply::Docs(None),
+            other => panic!("unexpected {other:?}"),
+        };
+        after.extend(answer(app, id, Ok(LiveReply::Command(r))));
+    }
+    sent(&after)
+}
+
+/// The typed commands among `reqs`, with where each goes.
+fn runs(reqs: &[(crate::live::ReqId, Dest, LiveRequest)]) -> Vec<(crate::live::ReqId, Dest)> {
+    reqs.iter()
+        .filter(|(_, _, r)| matches!(r, LiveRequest::Command(CmdRequest::Run { .. })))
+        .map(|(id, d, _)| (*id, d.clone()))
+        .collect()
+}
+
+fn dests(r: &[(crate::live::ReqId, Dest)]) -> Vec<Dest> {
+    r.iter().map(|(_, d)| d.clone()).collect()
+}
+
+#[test]
+fn the_command_line_sends_a_key_to_its_owner_and_heads_the_reply_with_the_node() {
+    let mut app = cluster_cmdline(0);
+    let r = runs(&run_line(&mut app, "GET foo", get_info()));
+    assert_eq!(dests(&r), [Dest::key("foo")]);
+    answer(
+        &mut app,
+        r[0].0,
+        ran(redis::Value::BulkString(b"v1".to_vec())),
+    );
+    let all = text(&render(&app, 80, 24));
+    assert!(all.contains("10.0.1.13:6379>"), "{all}");
+    assert!(all.contains("\"v1\""), "{all}");
+    // Keys in one slot (one hash tag) go together to their owner.
+    let r = runs(&run_line(&mut app, "MGET {u}a {u}b", mget_info()));
+    assert_eq!(dests(&r), [Dest::key("{u}a")]);
+}
+
+#[test]
+fn the_command_line_refuses_keys_in_different_slots_before_sending() {
+    let mut app = cluster_cmdline(0);
+    let after = run_line(&mut app, "MGET foo bar", mget_info());
+    assert!(runs(&after).is_empty(), "{after:?}");
+    let all = text(&render(&app, 120, 36));
+    assert!(all.contains("different slots (CROSSSLOT)"), "{all}");
+}
+
+#[test]
+fn the_command_line_sends_keyless_commands_and_unfound_keys_to_the_picked_node() {
+    let mut app = cluster_cmdline(1);
+    let ping = cmd("ping", &["readonly", "fast"], &["@connection"], vec![]);
+    let r = runs(&run_line(&mut app, "PING", ping));
+    assert_eq!(dests(&r), [Dest::node(1)]);
+    answer(
+        &mut app,
+        r[0].0,
+        ran(redis::Value::SimpleString("PONG".into())),
+    );
+    assert!(text(&render(&app, 120, 36)).contains("10.0.1.12:6379>"));
+    // Moving keys the key specs don't find: the picked node, and the panel says so.
+    let zunion = CommandInfo {
+        keys_partial: true,
+        ..cmd("zunion", &["readonly", "movablekeys"], &["@read"], vec![])
+    };
+    let r = runs(&run_line(&mut app, "ZUNION 2 foo bar", zunion));
+    assert_eq!(dests(&r), [Dest::node(1)]);
+    answer(&mut app, r[0].0, ran(redis::Value::Array(vec![])));
+    let all = text(&render(&app, 160, 40));
+    assert!(
+        all.contains("Its keys could not be found from its key specs"),
+        "{all}"
+    );
+}
+
+#[test]
+fn the_command_lines_writes_are_routed_by_their_keys_and_read_only_sends_none() {
+    use super::app::views::write_dest;
+    use crate::write::WriteOp;
+    let set = cmd("set", &["write", "denyoom"], &["@write"], keys_from_1(0, 1));
+    let mset = cmd(
+        "mset",
+        &["write", "denyoom"],
+        &["@write"],
+        keys_from_1(-1, 2),
+    );
+    let op = |line: &str, info: &CommandInfo| WriteOp::Command {
+        args: crate::live::cmdline::Args::new(
+            line.split(' ').map(|w| w.as_bytes().to_vec()).collect(),
+        ),
+        info: info.clone(),
+    };
+    let mut app = cluster_cmdline(0);
+    let s = app.session.as_ref().unwrap();
+    assert_eq!(write_dest(s, &op("SET foo 1", &set)), Ok(Dest::key("foo")));
+    assert_eq!(
+        write_dest(s, &op("MSET {u}a 1 {u}b 2", &mset)),
+        Ok(Dest::key("{u}a"))
+    );
+    let err = write_dest(s, &op("MSET foo 1 bar 2", &mset)).unwrap_err();
+    assert!(err.contains(crate::live::CROSSSLOT), "{err}");
+    // The profile is read-only: a typed write is refused in the panel, on any node.
+    assert!(app.session.as_ref().unwrap().profile.is_read_only());
+    for line in ["SET foo 1", "SET bar 1", "SET c 1"] {
+        let after = run_line(&mut app, line, set.clone());
+        assert!(
+            !after
+                .iter()
+                .any(|(_, _, r)| matches!(r, LiveRequest::Write(_))),
+            "{line}: {after:?}"
+        );
+        assert!(runs(&after).is_empty(), "{line}: {after:?}");
+    }
+}
+
+// -- Streams and Pub/Sub on a cluster ------------------------------------------------
+
+use crate::live::pubsub::{
+    Channel, Counts, Reply as PubSubReply, Request as PubSubRequest, ShardCounts,
+};
+use crate::live::streams::{Fetched, Reply as StreamsReply, Request as StreamsRequest, StreamInfo};
+
+fn node_of(d: &Dest) -> usize {
+    match d.to {
+        To::Node(i) => i,
+        To::Key(_) => panic!("sent by key: {d:?}"),
+    }
+}
+
+fn stream_info(key: &str, length: u64) -> StreamInfo {
+    StreamInfo {
+        key: key.into(),
+        length,
+        bytes: Some(64 * 1024),
+        first_id: Some("1700000000000-0".into()),
+        last_id: "1700000900000-0".into(),
+        oldest_age_ms: Some(60 * 60 * 1000),
+        entries_added: Some(length),
+        groups: Some(Vec::new()),
+        notes: Vec::new(),
+        pending: None,
+    }
+}
+
+/// The live cluster, its scan holding the streams `bar` (node 0), `c` (node 1), `foo`
+/// and `a` (node 2) as literal stream patterns.
+fn cluster_with_streams() -> App {
+    let (mut app, _) = live_cluster();
+    let report = app
+        .session
+        .as_mut()
+        .and_then(|s| s.report.as_mut())
+        .expect("a report");
+    for name in ["foo", "bar", "c", "a"] {
+        let mut p = fixtures::report(true).patterns[0].clone();
+        p.pattern = name.into();
+        p.key_type = Some(crate::model::KeyType::Stream);
+        p.examples = Vec::new();
+        report.patterns.push(p);
+    }
+    app
+}
+
+#[test]
+fn streams_poll_one_request_per_owning_node_and_show_each_streams_node() {
+    let mut app = cluster_with_streams();
+    let effects = super::app::views::testing::show(&mut app, Screen::Streams);
+    let polls: Vec<(crate::live::ReqId, usize, Vec<String>)> = sent(&effects)
+        .into_iter()
+        .filter_map(|(id, to, r)| match r {
+            LiveRequest::Streams(StreamsRequest::Info { keys, .. }) => {
+                Some((id, node_of(&to), keys))
+            }
+            _ => None,
+        })
+        .collect();
+    // One request per node, each with the streams its node owns.
+    let mut by_node: Vec<(usize, Vec<String>)> =
+        polls.iter().map(|(_, n, k)| (*n, k.clone())).collect();
+    by_node.sort();
+    let s = |v: &[&str]| v.iter().map(|k| (*k).to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        by_node,
+        [(0, s(&["bar"])), (1, s(&["c"])), (2, s(&["foo", "a"]))]
+    );
+    for (id, _, keys) in polls {
+        let streams = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| Fetched {
+                key: k.clone(),
+                info: Some(stream_info(k, 100 * (i as u64 + 1))),
+            })
+            .collect();
+        answer(
+            &mut app,
+            id,
+            Ok(LiveReply::Streams(StreamsReply::Info {
+                streams,
+                refused: Default::default(),
+            })),
+        );
+    }
+    let t = render(&app, 80, 24);
+    let all = text(&t);
+    assert!(all.contains("NODE"), "{all}");
+    assert!(all.contains("10.0.1.13:6379"), "{all}");
+    insta::assert_snapshot!(t.backend());
+}
+
+fn counts_reply(channels: &[(&str, u64)]) -> Result<LiveReply, crate::live::LiveError> {
+    Ok(LiveReply::PubSub(PubSubReply::Counts(Counts {
+        channels: channels
+            .iter()
+            .map(|(n, s)| Channel {
+                name: (*n).into(),
+                subscribers: Some(*s),
+            })
+            .collect(),
+        total_channels: channels.len(),
+        patterns: Some(0),
+        notes: Vec::new(),
+    })))
+}
+
+fn shard_reply(channels: &[(&str, u64)]) -> Result<LiveReply, crate::live::LiveError> {
+    Ok(LiveReply::PubSub(PubSubReply::ShardCounts(ShardCounts {
+        channels: channels
+            .iter()
+            .map(|(n, s)| Channel {
+                name: (*n).into(),
+                subscribers: Some(*s),
+            })
+            .collect(),
+        total_channels: channels.len(),
+        notes: Vec::new(),
+    })))
+}
+
+#[test]
+fn pubsub_counts_classic_channels_on_the_picked_node_and_shard_channels_on_every_primary() {
+    let (mut app, _) = live_cluster();
+    let effects = super::app::views::testing::show(&mut app, Screen::PubSub);
+    let reqs = sent(&effects);
+    let classic: Vec<_> = reqs
+        .iter()
+        .filter(|(_, _, r)| matches!(r, LiveRequest::PubSub(PubSubRequest::Counts)))
+        .collect();
+    assert_eq!(classic.len(), 1);
+    assert_eq!(classic[0].1, Dest::node(0));
+    let shards: Vec<_> = reqs
+        .iter()
+        .filter(|(_, _, r)| matches!(r, LiveRequest::PubSub(PubSubRequest::ShardCounts)))
+        .collect();
+    assert_eq!(
+        shards.iter().map(|(_, d, _)| d.clone()).collect::<Vec<_>>(),
+        [never(0), never(1), never(2)]
+    );
+    answer(
+        &mut app,
+        classic[0].0,
+        counts_reply(&[("news", 3), ("alerts", 1)]),
+    );
+    let per_node: [&[(&str, u64)]; 3] = [&[("bar", 2)], &[], &[("foo", 5), ("a", 1)]];
+    for ((id, _, _), chans) in shards.iter().zip(per_node) {
+        answer(&mut app, *id, shard_reply(chans));
+    }
+    let t = render(&app, 80, 24);
+    let all = text(&t);
+    assert!(all.contains("SHARD CHANNEL"), "{all}");
+    assert!(all.contains("subscribers on 10.0.1.11:6379"), "{all}");
+    insta::assert_snapshot!(t.backend());
+    // SPUBLISH goes to the channel's slot owner, through the gate: the profile is
+    // read-only, so `P` on a shard channel sends nothing to any node.
+    let s = app.session.as_ref().unwrap();
+    let op = crate::write::WriteOp::SPublish {
+        channel: "foo".into(),
+        message: crate::value::Raw::from("hi"),
+    };
+    assert_eq!(super::app::views::write_dest(s, &op), Ok(Dest::key("foo")));
+    let rows = app.views.pubsub.rows_len();
+    for _ in 0..rows {
+        let effects = app.handle_key(ch('P'));
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                Effect::Live {
+                    req: LiveRequest::Write(_),
+                    ..
+                }
+            )),
+            "{effects:?}"
+        );
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(ch('j'));
+    }
+}
+
+#[test]
+fn a_shard_subscribe_runs_on_the_channels_owner_and_refuses_a_pattern() {
+    let (mut app, _) = live_cluster();
+    super::app::views::testing::show(&mut app, Screen::PubSub);
+    press(&mut app, "S");
+    let mut effects = Vec::new();
+    for c in "orders:*".chars() {
+        effects.extend(app.handle_key(ch(c)));
+    }
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::Subscribe { .. })),
+        "{effects:?}"
+    );
+    let all = text(&render(&app, 120, 36));
+    assert!(all.contains("a pattern can't be shard-subscribed"), "{all}");
+    // The input stays open: a channel name subscribes on its slot's owner.
+    for _ in 0.."orders:*".len() {
+        app.handle_key(key(KeyCode::Backspace));
+    }
+    let mut effects = app.handle_key(ch('f'));
+    effects.extend(press_all(&mut app, "oo"));
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    let subs: Vec<_> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Subscribe { to, node, .. } => Some((to.clone(), *node)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        subs,
+        [(crate::live::pubsub::Subscription::Shard("foo".into()), 2)]
+    );
 }

@@ -22,6 +22,7 @@ use tokio::time::{Instant, sleep, timeout};
 async fn counts(conn: &mut MultiplexedConnection, budget: &Budget) -> Result<Counts, LiveError> {
     match pubsub::run(conn, budget, Request::Counts).await? {
         Reply::Counts(c) => Ok(c),
+        other => panic!("not counts: {other:?}"),
     }
 }
 

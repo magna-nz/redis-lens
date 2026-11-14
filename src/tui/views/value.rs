@@ -33,7 +33,7 @@ use crate::live::values::{
     At, Items, Kind, MAX_ITEMS, Reply, Request, VECTOR_SAMPLE, field_ttls_supported,
 };
 use crate::live::write::{Reply as WriteReply, list_marker};
-use crate::live::{CANCELLED, LiveError, LiveReply, LiveRequest, ReqId};
+use crate::live::{CANCELLED, Dest, LiveError, LiveReply, LiveRequest, ReqId};
 use crate::tui::app::Screen;
 use crate::tui::clipboard::CopyText;
 use crate::tui::editor::EditorJob;
@@ -267,7 +267,9 @@ impl ValueState {
             field_ttls: self.field_ttls,
             size: row.bytes,
         };
-        match act.send(LiveRequest::Value(req)) {
+        // On a cluster, to the owner of the key's slot.
+        let dest = Dest::key(row.key.as_bytes().to_vec());
+        match act.send_to(dest, LiveRequest::Value(req)) {
             Some(id) => {
                 self.loading = Some(id);
                 true
@@ -1462,7 +1464,8 @@ impl ValueState {
         let Some(row) = &self.row else {
             return;
         };
-        self.meta_loading = act.send(meta_request(row, &self.pattern));
+        let dest = Dest::key(row.key.as_bytes().to_vec());
+        self.meta_loading = act.send_to(dest, meta_request(row, &self.pattern));
     }
 
     fn meta_done(&mut self, result: Result<LiveReply, LiveError>) {
@@ -2286,11 +2289,6 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen(), Screen::Patterns);
-    }
-
-    #[test]
-    fn the_key_detail_reads_one_server() {
-        assert!(super::super::reads_one_server(Screen::KeyDetail));
     }
 
     #[test]

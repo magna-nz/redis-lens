@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use crate::format;
 use crate::live::pubsub::{MAX_CHANNELS, TAIL_KEPT};
 use crate::tui::app::views::Ctx;
-use crate::tui::app::views::pubsub::{PubSubState, Tail, TailRow, TailStatus};
+use crate::tui::app::views::pubsub::{PubSubState, Selected, Tail, TailRow, TailStatus};
 use crate::value;
 
 use super::streams::live_wait;
@@ -63,7 +63,6 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) 
         notice_panels(frame, area, TITLE, "", lines);
         return;
     }
-    let c = &state.counts;
     let (main, detail) = split_body(area);
     let mut right = String::new();
     if !ctx.live_ready() {
@@ -72,25 +71,47 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) 
     if state.paused {
         right.push_str("paused · ");
     }
-    right.push_str("active channels, most subscribers first");
+    match (ctx.node_title(), ctx.session.picked_node()) {
+        // The classic counts are the picked node's own subscribers.
+        (Some(t), Some(n)) => right.push_str(&format!("{t} · subscribers on {}", n.endpoint)),
+        _ => right.push_str("active channels, most subscribers first"),
+    }
     let inner = panel(frame, main, TITLE, &right);
     let w = usize::from(inner.width);
+    let (head, lines, sel) = list_lines(state, ctx, w, true);
+    let body = if head.spans.is_empty() {
+        inner
+    } else {
+        below_header(inner)
+    };
+    rows(frame, inner, vec![head], None);
+    let at = sel.unwrap_or(0);
+    let off = scroll_offset(at, usize::from(body.height));
+    let lines: Vec<Line<'static>> = lines
+        .into_iter()
+        .skip(off)
+        .take(usize::from(body.height))
+        .collect();
+    rows(frame, body, lines, sel.map(|s| s - off));
+    totals(frame, detail, state, ctx);
+}
 
-    if c.channels.is_empty() {
-        let lines = vec![
-            Line::from(Span::styled(" No active channels.", style::fgb())),
-            Line::from(Span::styled(
-                " A channel exists only while a client subscribes to it.",
-                style::dim(),
-            )),
-        ];
-        rows(frame, inner, lines, None);
-        totals(frame, detail, state);
-        return;
-    }
-
-    let has_counts = c.channels.iter().any(|ch| ch.subscribers.is_some());
-    let kw = w.saturating_sub(1 + SUBS_W + 1 + BAR_W + 1).max(8);
+/// The list of the view, below its header: the classic channels, then the shard
+/// channels (P4) under a header of their own, with a NODE column on a cluster. Returns
+/// the header, the lines and the line of the selected row. `bars`: the wide layout,
+/// with a bar per classic channel.
+fn list_lines(
+    state: &PubSubState,
+    ctx: &Ctx<'_>,
+    w: usize,
+    bars: bool,
+) -> (Line<'static>, Vec<Line<'static>>, Option<usize>) {
+    let c = &state.counts;
+    let has_counts = c.channels.iter().any(|ch| ch.subscribers.is_some())
+        || state.shards.iter().any(|r| r.subscribers.is_some());
+    let sw = if has_counts { SUBS_W + 1 } else { 0 };
+    let bw = if bars { BAR_W + 1 } else { 0 };
+    let kw = w.saturating_sub(sw + bw + usize::from(bars)).max(8);
     let mut head = vec![Span::styled(pad_r(" CHANNEL", kw), style::hd())];
     if has_counts {
         head.push(Span::styled(
@@ -98,45 +119,118 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) 
             style::hd(),
         ));
     }
-    rows(frame, inner, vec![Line::from(head)], None);
-    let body = below_header(inner);
-    let sel = state.sel.min(c.channels.len() - 1);
-    let off = scroll_offset(sel, usize::from(body.height));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut sel = None;
+    if c.channels.is_empty() {
+        lines.push(Line::from(fit(
+            vec![Span::styled(" No active channels.", style::fgb())],
+            w,
+        )));
+        if bars {
+            lines.push(Line::from(fit(
+                vec![Span::styled(
+                    " A channel exists only while a client subscribes to it.",
+                    style::dim(),
+                )],
+                w,
+            )));
+        }
+    }
     let max = c
         .channels
         .iter()
         .filter_map(|ch| ch.subscribers)
         .max()
         .unwrap_or(0);
-    let lines: Vec<Line<'static>> = c
-        .channels
-        .iter()
-        .skip(off)
-        .take(usize::from(body.height))
-        .map(|ch| {
-            let mut spans = fit(
-                vec![Span::styled(
-                    format!(" {}", value::escape(&ch.name)),
-                    style::fg(),
-                )],
-                kw,
-            );
-            if let Some(n) = ch.subscribers {
+    for (i, ch) in c.channels.iter().enumerate() {
+        if i == state.sel {
+            sel = Some(lines.len());
+        }
+        let mut spans = fit(
+            vec![Span::styled(
+                format!(" {}", value::escape(&ch.name)),
+                style::fg(),
+            )],
+            kw,
+        );
+        if let Some(n) = ch.subscribers {
+            spans.push(Span::styled(
+                format!(" {}", pad_l(&format::grouped(n), SUBS_W)),
+                style::fgb(),
+            ));
+            if bars {
                 let ratio = if max == 0 { 0.0 } else { n as f64 / max as f64 };
                 let (fill, track) = bar(ratio, BAR_W);
-                spans.push(Span::styled(
-                    format!(" {}", pad_l(&format::grouped(n), SUBS_W)),
-                    style::fgb(),
-                ));
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(fill, style::ok()));
                 spans.push(Span::styled(track, style::track()));
             }
-            Line::from(spans)
-        })
-        .collect();
-    rows(frame, body, lines, Some(sel - off));
-    totals(frame, detail, state);
+        }
+        lines.push(Line::from(spans));
+    }
+    // The shard channels, once read or left out.
+    if !state.shards_loaded && state.shards_off.is_none() {
+        // No header over "No active channels" alone.
+        let head = if c.channels.is_empty() {
+            Line::default()
+        } else {
+            Line::from(head)
+        };
+        return (head, lines, sel);
+    }
+    let by_node = ctx.session.is_cluster();
+    let nw = if by_node { super::keys::NODE_W } else { 0 };
+    let skw = kw.saturating_sub(nw).max(8);
+    let mut shard_head = vec![Span::styled(pad_r(" SHARD CHANNEL", skw), style::hd())];
+    if by_node {
+        shard_head.push(Span::styled(pad_r(" NODE", nw), style::hd()));
+    }
+    shard_head.push(Span::styled(
+        format!(" {}", pad_l("SUBS", SUBS_W)),
+        style::hd(),
+    ));
+    lines.push(Line::from(fit(shard_head, w)));
+    if let Some(why) = &state.shards_off {
+        lines.push(Line::from(fit(
+            vec![Span::styled(format!(" ▲ {why}"), style::amber())],
+            w,
+        )));
+        return (Line::from(head), lines, sel);
+    }
+    if state.shards.is_empty() {
+        lines.push(Line::from(fit(
+            vec![Span::styled(" No active shard channels.", style::dim())],
+            w,
+        )));
+    }
+    let n = c.channels.len();
+    for (i, r) in state.shards.iter().enumerate() {
+        if n + i == state.sel {
+            sel = Some(lines.len());
+        }
+        let mut spans = fit(
+            vec![Span::styled(
+                format!(" {}", value::escape(&r.name)),
+                style::fg(),
+            )],
+            skw,
+        );
+        if by_node {
+            let name = super::keys::node_name(ctx, Some(r.node));
+            spans.push(Span::styled(
+                format!(" {}", pad_r(&super::widgets::trunc(&name, nw - 1), nw - 1)),
+                style::dim(),
+            ));
+        }
+        if let Some(k) = r.subscribers {
+            spans.push(Span::styled(
+                format!(" {}", pad_l(&format::grouped(k), SUBS_W)),
+                style::fgb(),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    (Line::from(head), lines, sel)
 }
 
 /// `inner` without its first row (the column header).
@@ -160,15 +254,11 @@ fn channels_narrow(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx
     }
     let inner = panel(frame, area, "Channels", &right);
     let w = usize::from(inner.width);
-    if !state.loaded || c.channels.is_empty() {
-        let text = if state.loaded {
-            " No active channels.".to_string()
-        } else {
-            format!(
-                " {}",
-                live_wait(ctx).unwrap_or_else(|| "Reading the channels…".into())
-            )
-        };
+    if !state.loaded {
+        let text = format!(
+            " {}",
+            live_wait(ctx).unwrap_or_else(|| "Reading the channels…".into())
+        );
         rows(
             frame,
             inner,
@@ -177,43 +267,21 @@ fn channels_narrow(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx
         );
         return;
     }
-    let has_counts = c.channels.iter().any(|ch| ch.subscribers.is_some());
-    let sw = if has_counts { SUBS_W + 1 } else { 0 };
-    let kw = w.saturating_sub(sw);
-    let mut head = vec![Span::styled(pad_r(" CHANNEL", kw), style::hd())];
-    if has_counts {
-        head.push(Span::styled(
-            format!(" {}", pad_l("SUBS", SUBS_W)),
-            style::hd(),
-        ));
-    }
-    rows(frame, inner, vec![Line::from(head)], None);
-    let body = below_header(inner);
-    let sel = state.sel.min(c.channels.len() - 1);
-    let off = scroll_offset(sel, usize::from(body.height));
-    let lines: Vec<Line<'static>> = c
-        .channels
-        .iter()
+    let (head, lines, sel) = list_lines(state, ctx, w, false);
+    let body = if head.spans.is_empty() {
+        inner
+    } else {
+        below_header(inner)
+    };
+    rows(frame, inner, vec![head], None);
+    let at = sel.unwrap_or(0);
+    let off = scroll_offset(at, usize::from(body.height));
+    let lines: Vec<Line<'static>> = lines
+        .into_iter()
         .skip(off)
         .take(usize::from(body.height))
-        .map(|ch| {
-            let mut spans = fit(
-                vec![Span::styled(
-                    format!(" {}", value::escape(&ch.name)),
-                    style::fg(),
-                )],
-                kw,
-            );
-            if let Some(n) = ch.subscribers {
-                spans.push(Span::styled(
-                    format!(" {}", pad_l(&format::grouped(n), SUBS_W)),
-                    style::fgb(),
-                ));
-            }
-            Line::from(spans)
-        })
         .collect();
-    rows(frame, body, lines, Some(sel - off));
+    rows(frame, body, lines, sel.map(|s| s - off));
 }
 
 /// `HH:MM:SS.mmm`, UTC, of a receive stamp.
@@ -251,6 +319,8 @@ fn tail_title(t: &Tail, panel_w: usize) -> (String, String) {
         let name = value::escape(to.name());
         if to.is_pattern() {
             format!("pattern {name}")
+        } else if to.is_shard() {
+            format!("shard {name}")
         } else {
             name
         }
@@ -406,7 +476,7 @@ fn dim_line(text: String, w: usize) -> Line<'static> {
     Line::from(fit(vec![Span::styled(text, style::dim())], w))
 }
 
-fn totals(frame: &mut Frame, area: Rect, state: &PubSubState) {
+fn totals(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
     let c = &state.counts;
     let inner = panel(frame, area, "Totals", "");
     let w = usize::from(inner.width);
@@ -443,23 +513,43 @@ fn totals(frame: &mut Frame, area: Rect, state: &PubSubState) {
             Span::styled("  (direct SUBSCRIBE only)", style::dim()),
         ]),
     ];
-    if let Some(ch) = c.channels.get(state.sel) {
-        lines.push(Line::default());
-        lines.push(Line::from(fit(
-            vec![
-                label("Selected"),
-                Span::styled(value::escape(&ch.name), style::fg()),
-                Span::styled(
-                    ch.subscribers.map_or_else(String::new, |n| {
-                        format!("  ·  {} subscribers", format::grouped(n))
-                    }),
-                    style::dim(),
-                ),
-            ],
-            w,
-        )));
+    if state.shards_loaded && state.shards_off.is_none() {
+        lines.push(Line::from(vec![
+            label("Active shard channels"),
+            Span::styled(format::grouped(state.shards_total as u64), style::fgb()),
+            Span::styled("  (SSUBSCRIBE)", style::dim()),
+        ]));
     }
-    for note in &c.notes {
+    let selected = match state.selected() {
+        Some(Selected::Channel(ch)) => Some((ch.name.as_str(), ch.subscribers, None)),
+        Some(Selected::Shard(r)) => Some((r.name.as_str(), r.subscribers, Some(r.node))),
+        None => None,
+    };
+    if let Some((name, subs, node)) = selected {
+        lines.push(Line::default());
+        let mut spans = vec![
+            label(if node.is_some() {
+                "Selected shard channel"
+            } else {
+                "Selected"
+            }),
+            Span::styled(value::escape(name), style::fg()),
+            Span::styled(
+                subs.map_or_else(String::new, |n| {
+                    format!("  ·  {} subscribers", format::grouped(n))
+                }),
+                style::dim(),
+            ),
+        ];
+        if let Some(n) = node.and_then(|i| ctx.session.nodes.get(i)) {
+            spans.push(Span::styled(
+                format!("  ·  on {}", n.endpoint),
+                style::dim(),
+            ));
+        }
+        lines.push(Line::from(fit(spans, w)));
+    }
+    for note in c.notes.iter().chain(&state.shards_notes) {
         lines.push(Line::from(fit(
             vec![Span::styled(format!(" ▲ left out: {note}"), style::amber())],
             w,
@@ -474,9 +564,12 @@ fn totals(frame: &mut Frame, area: Rect, state: &PubSubState) {
             w,
         )));
     }
-    lines.push(Line::from(Span::styled(
-        " Counts read no payloads. enter or s starts a live tail.",
-        style::dim(),
+    lines.push(Line::from(fit(
+        vec![Span::styled(
+            " Counts read no payloads. enter or s starts a live tail, S a shard one.",
+            style::dim(),
+        )],
+        w,
     )));
     rows(frame, inner, lines, None);
 }

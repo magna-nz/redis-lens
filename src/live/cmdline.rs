@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use redis::{ErrorKind, RedisError, RedisResult, ServerErrorKind, Value};
 
 use super::command;
+use super::server::{self, KeySpec};
 use super::streams::{field, pairs, text};
 use super::{LiveConn, LiveError, error_for, is_unknown_command, query};
 use crate::budget::Budget;
@@ -122,6 +123,13 @@ pub struct CommandInfo {
     pub categories: Vec<String>,
     /// Redis 7 and Valkey: the subcommands of a container command such as `CONFIG`.
     pub subcommands: Vec<CommandInfo>,
+    /// Where its keys are, for routing on a cluster: the key specs (Redis 7.0 and
+    /// later, and Valkey), or one spec from the first/last/step key positions before.
+    /// Empty for a keyless command, and for a container (its subcommands hold theirs).
+    pub keys: Vec<KeySpec>,
+    /// Some keys may not be where `keys` says: the `movablekeys` flag, or a key spec
+    /// redis-lens can't read. Finding them would need `COMMAND GETKEYS`, never sent.
+    pub keys_partial: bool,
 }
 
 impl CommandInfo {
@@ -143,6 +151,51 @@ impl CommandInfo {
         let sub = String::from_utf8_lossy(sub).to_ascii_lowercase();
         let want = format!("{}|{sub}", self.name);
         self.subcommands.iter().find(|s| s.name == want)
+    }
+}
+
+/// The keys of a typed command, as its key specs find them (spec "Cluster live views
+/// (P4)", Command line).
+#[derive(Clone, PartialEq, Eq)]
+pub enum Keys {
+    /// The command takes no keys.
+    None,
+    /// It takes keys, but none was found where its key specs say
+    /// ([`CommandInfo::keys_partial`]).
+    Unfound,
+    /// The keys, in the order of the arguments.
+    Found(Vec<Vec<u8>>),
+}
+
+/// Key names are the user's: `Debug` prints how many there are.
+impl fmt::Debug for Keys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Keys::None => f.write_str("None"),
+            Keys::Unfound => f.write_str("Unfound"),
+            Keys::Found(k) => write!(f, "Found({} keys)", k.len()),
+        }
+    }
+}
+
+/// The keys of `args` (`args[0]` is the command), from the key specs of `info`, or of
+/// the subcommand typed when `info` is a container.
+pub fn command_keys(args: &[Vec<u8>], info: &CommandInfo) -> Keys {
+    let info = args
+        .get(1)
+        .filter(|_| !info.subcommands.is_empty())
+        .and_then(|s| info.subcommand(s))
+        .unwrap_or(info);
+    let found: Vec<Vec<u8>> = super::server::key_positions(&info.keys, args)
+        .into_iter()
+        .filter_map(|i| args.get(i).cloned())
+        .collect();
+    if !found.is_empty() {
+        Keys::Found(found)
+    } else if info.keys.is_empty() && !info.keys_partial {
+        Keys::None
+    } else {
+        Keys::Unfound
     }
 }
 
@@ -622,9 +675,21 @@ fn words(v: Option<&Value>) -> Vec<String> {
 fn parse_entry(v: &Value) -> Option<CommandInfo> {
     let parts = items(v)?;
     let name = text(parts.first()?)?.to_ascii_lowercase();
+    let flags = words(parts.get(2));
+    // The key specs, or before Redis 7.0 the first/last/step triple.
+    let keys = match server::parse_command_info(&Value::Array(parts.to_vec())) {
+        server::CommandKeys::Specs(s) => s,
+        server::CommandKeys::Container | server::CommandKeys::Unknown => Vec::new(),
+    };
+    let unread = parts
+        .get(8)
+        .and_then(items)
+        .is_some_and(|specs| specs.iter().any(|s| server::parse_spec(s).is_none()));
     Some(CommandInfo {
         name,
-        flags: words(parts.get(2)),
+        keys_partial: unread || flags.iter().any(|f| f == "movablekeys"),
+        keys,
+        flags,
         categories: words(parts.get(6)),
         subcommands: parts
             .get(9)
@@ -1099,6 +1164,8 @@ mod tests {
             flags: flags.iter().map(|s| (*s).into()).collect(),
             categories: cats.iter().map(|s| (*s).into()).collect(),
             subcommands: Vec::new(),
+            keys: Vec::new(),
+            keys_partial: false,
         }
     }
 
@@ -1453,6 +1520,131 @@ mod tests {
         assert!(i.subcommands.is_empty());
         assert_eq!(parse_info(&arr(vec![Value::Nil])), None);
         assert_eq!(parse_info(&arr(vec![])), None);
+    }
+
+    fn words(line: &str) -> Vec<Vec<u8>> {
+        line.split(' ').map(|w| w.as_bytes().to_vec()).collect()
+    }
+
+    /// A Redis 7 key spec: `begin_search` index `at`, `find_keys` range to `last`.
+    fn range_spec(at: i64, last: i64, step: i64) -> Value {
+        let map = |pairs: Vec<(&str, Value)>| {
+            Value::Map(pairs.into_iter().map(|(k, v)| (b(k), v)).collect())
+        };
+        map(vec![
+            (
+                "begin_search",
+                map(vec![
+                    ("type", b("index")),
+                    ("spec", map(vec![("index", Value::Int(at))])),
+                ]),
+            ),
+            (
+                "find_keys",
+                map(vec![
+                    ("type", b("range")),
+                    (
+                        "spec",
+                        map(vec![
+                            ("lastkey", Value::Int(last)),
+                            ("keystep", Value::Int(step)),
+                            ("limit", Value::Int(0)),
+                        ]),
+                    ),
+                ]),
+            ),
+        ])
+    }
+
+    /// A `COMMAND INFO` entry with first/last/step and the key specs `specs`.
+    fn keyed(name: &str, flags: &[&str], fls: (i64, i64, i64), specs: Vec<Value>) -> Value {
+        arr(vec![
+            b(name),
+            Value::Int(-2),
+            arr(flags.iter().map(|f| st(f)).collect()),
+            Value::Int(fls.0),
+            Value::Int(fls.1),
+            Value::Int(fls.2),
+            arr(vec![st("@read")]),
+            arr(vec![]),
+            arr(specs),
+            arr(vec![]),
+        ])
+    }
+
+    #[test]
+    fn a_commands_keys_come_from_its_key_specs_or_first_last_step() {
+        // Redis 7: the key specs.
+        let mget = parse_info(&arr(vec![keyed(
+            "mget",
+            &["readonly"],
+            (1, -1, 1),
+            vec![range_spec(1, -1, 1)],
+        )]))
+        .unwrap();
+        assert!(!mget.keys_partial);
+        assert_eq!(
+            command_keys(&words("MGET a b c"), &mget),
+            Keys::Found(words("a b c"))
+        );
+        // Redis 6.2: no key specs, the first/last/step triple.
+        let v62 = arr(vec![arr(vec![
+            b("mset"),
+            Value::Int(-3),
+            arr(vec![st("write")]),
+            Value::Int(1),
+            Value::Int(-1),
+            Value::Int(2),
+            arr(vec![st("@write")]),
+        ])]);
+        let mset = parse_info(&v62).unwrap();
+        assert_eq!(
+            command_keys(&words("MSET k1 v1 k2 v2"), &mset),
+            Keys::Found(words("k1 k2"))
+        );
+        // Keyless.
+        let ping = parse_info(&arr(vec![keyed("ping", &["fast"], (0, 0, 0), vec![])])).unwrap();
+        assert_eq!(command_keys(&words("PING"), &ping), Keys::None);
+        // Moving keys the specs can't place: unfound, never keyless.
+        let zunion = parse_info(&arr(vec![keyed(
+            "zunion",
+            &["readonly", "movablekeys"],
+            (0, 0, 0),
+            vec![],
+        )]))
+        .unwrap();
+        assert!(zunion.keys_partial);
+        assert_eq!(command_keys(&words("ZUNION 2 a b"), &zunion), Keys::Unfound);
+        // A spec redis-lens can't read makes the keys partial too.
+        let odd = Value::Map(vec![(
+            b("begin_search"),
+            Value::Map(vec![(b("type"), b("unknown"))]),
+        )]);
+        let migrate = parse_info(&arr(vec![keyed(
+            "migrate",
+            &["write"],
+            (3, 3, 1),
+            vec![odd],
+        )]))
+        .unwrap();
+        assert!(migrate.keys_partial);
+        // A container: the subcommand's own key specs.
+        let mut xinfo = parse_info(&arr(vec![entry("xinfo", &[], &["@slow"], vec![])])).unwrap();
+        let stream = parse_info(&arr(vec![keyed(
+            "xinfo|stream",
+            &["readonly"],
+            (2, 2, 1),
+            vec![range_spec(2, 0, 1)],
+        )]))
+        .unwrap();
+        xinfo.subcommands = vec![stream];
+        assert_eq!(
+            command_keys(&words("XINFO STREAM orders"), &xinfo),
+            Keys::Found(words("orders"))
+        );
+        // Debug prints how many keys, never their names.
+        let d = format!("{:?}", command_keys(&words("GET s3cr3t"), &mget));
+        assert_eq!(d, "Found(1 keys)");
     }
 
     fn flat(pairs: Vec<(&str, Value)>) -> Value {

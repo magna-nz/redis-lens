@@ -9,6 +9,12 @@
 //! sent. The run is [`crate::live::bulk`]'s, so the key file and the batches are the
 //! TUI's.
 //!
+//! On a cluster it discovers the shards on their primaries (never a replica, whatever
+//! `prefer_replica` says) and walks each primary in slot order, each with its own
+//! budget and its own `SCAN`; a key that moved meanwhile is left alone and counted, and
+//! each line of the key file starts with the node's address and a tab (spec "Cluster
+//! live views (P4)").
+//!
 //! The logic is in [`execute`], so tests run it against a temp config, a
 //! `MemoryStore` and a temp key-file directory; [`run`] wires it to the keychain and the
 //! terminal.
@@ -70,6 +76,8 @@ pub struct RunResult {
     pub skipped: u64,
     pub failed: u64,
     pub unreadable: u64,
+    /// Keys that moved to another node of the cluster during the run: left alone.
+    pub moved: u64,
     /// The key file, when a batch wrote one.
     pub file: Option<PathBuf>,
 }
@@ -157,32 +165,73 @@ pub async fn execute(
     let server = crate::scan::server_info_with_budget(&mut conn, &budget)
         .await
         .context("could not read INFO")?;
-    if server.mode == ServerMode::Cluster {
-        bail!("{}", bulk::CLUSTER_OFF);
-    }
     if let Some(why) = bulk::expire_off(&server) {
         bail!("{why}");
     }
-    budget.take(1).await;
-    let info: String = redis::cmd("INFO")
-        .arg("replication")
-        .query_async(&mut conn)
-        .await
-        .context("could not read INFO replication")?;
-    if conn::parse_replication(&info) == Replication::Replica {
-        bail!("{}", bulk::REPLICA_OFF);
-    }
+    // A cluster node: `redis_mode:cluster`, or (Valkey 8 says `server_mode`, which
+    // `server_info` does not read) `cluster_enabled:1` in `INFO cluster`.
+    let cluster = server.mode == ServerMode::Cluster || {
+        budget.take(1).await;
+        let info: Option<String> = redis::cmd("INFO")
+            .arg("cluster")
+            .query_async(&mut conn)
+            .await
+            .ok();
+        info.as_deref().and_then(conn::cluster::cluster_mode) == Some(true)
+    };
+    // The servers the run walks, one at a time: the profile's own server, or on a
+    // cluster every primary in slot order (spec "Cluster live views (P4)").
+    let mut shards: Vec<Shard<conn::Connection>> = if cluster {
+        drop(conn);
+        // Discovery on the primaries: never a replica, whatever the profile prefers.
+        let mut on_primaries = profile.clone();
+        on_primaries.prefer_replica = false;
+        let targets = conn::cluster::connect_targets(&on_primaries, secrets).await?;
+        let conn::cluster::ScanTargets::Cluster(c) = targets else {
+            bail!(
+                "the cluster's shards could not be read, so the pattern can't be expired on every primary"
+            );
+        };
+        let found = c
+            .nodes
+            .into_iter()
+            .map(|n| (n.endpoint.to_string(), n.role, n.conn))
+            .collect();
+        primaries(found, opts.max_commands_per_sec).map_err(|why| anyhow::anyhow!(why))?
+    } else {
+        budget.take(1).await;
+        let info: String = redis::cmd("INFO")
+            .arg("replication")
+            .query_async(&mut conn)
+            .await
+            .context("could not read INFO replication")?;
+        if conn::parse_replication(&info) == Replication::Replica {
+            bail!("{}", bulk::REPLICA_OFF);
+        }
+        vec![Shard {
+            node: None,
+            conn,
+            budget,
+        }]
+    };
 
     let WriteOp::Bulk { pattern, glob, .. } = &op else {
         unreachable!("built above");
     };
-    let count = bulk::dry_run(&mut conn, &budget, pattern, glob, |c| {
-        progress(&format!(
-            "Dry run: {} keys of the pattern so far",
-            crate::format::grouped(c.matched)
-        ));
-    })
-    .await?;
+    let mut count = Count::default();
+    let mut per_node = Vec::with_capacity(shards.len());
+    for s in &mut shards {
+        let before = count;
+        let c = bulk::dry_run(&mut s.conn, &s.budget, pattern, glob, |c| {
+            progress(&format!(
+                "Dry run: {} keys of the pattern so far",
+                crate::format::grouped(before.matched + c.matched)
+            ));
+        })
+        .await?;
+        count.add(&c);
+        per_node.push(c);
+    }
     let change = count.to_change(&action);
     let name = crate::value::escape(pattern);
     writeln!(
@@ -197,6 +246,22 @@ pub async fn execute(
         crate::format::grouped(count.with_ttl),
         crate::format::grouped(change)
     )?;
+    if shards.len() > 1 || shards.iter().any(|s| s.node.is_some()) {
+        writeln!(
+            out,
+            "Nodes:    {} primaries, walked one at a time in slot order:",
+            shards.len()
+        )?;
+        for (s, c) in shards.iter().zip(&per_node) {
+            writeln!(
+                out,
+                "          {}: {} keys of the pattern, {} without a TTL",
+                crate::value::escape(s.node.as_deref().unwrap_or("")),
+                crate::format::grouped(c.matched),
+                crate::format::grouped(c.to_change(&action))
+            )?;
+        }
+    }
     if count.other_pattern > 0 {
         writeln!(
             out,
@@ -252,40 +317,58 @@ pub async fn execute(
 
     let mut file = KeyFile::new(bulk_dir, &profile.name, &action, bulk::now_unix());
     let mut result = RunResult::default();
-    let (mut walk, mut carry) = (Walk::Start, Vec::new());
-    let stopped = loop {
-        let b = match bulk::batch(&mut conn, &budget, &permit, walk, carry, &mut file).await {
-            Ok(b) => b,
-            Err(e) => break Some(e.to_string()),
-        };
-        result.seen += b.seen;
-        result.changed += b.changed;
-        result.skipped += b.skipped;
-        result.failed += b.failed;
-        result.unreadable += b.unreadable;
-        if b.file.is_some() {
-            result.file = b.file.clone();
+    let mut stopped = None;
+    'nodes: for s in &mut shards {
+        let (mut walk, mut carry) = (Walk::Start, Vec::new());
+        loop {
+            let b = match bulk::batch_on(
+                &mut s.conn,
+                &s.budget,
+                &permit,
+                walk,
+                carry,
+                &mut file,
+                s.node.as_deref(),
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    stopped = Some(e.to_string());
+                    break 'nodes;
+                }
+            };
+            result.seen += b.seen;
+            result.changed += b.changed;
+            result.skipped += b.skipped;
+            result.failed += b.failed;
+            result.unreadable += b.unreadable;
+            result.moved += b.moved;
+            if b.file.is_some() {
+                result.file = b.file.clone();
+            }
+            progress(&format!(
+                "Set a TTL on {} of {} keys",
+                crate::format::grouped(result.changed),
+                crate::format::grouped(change)
+            ));
+            if b.failed > 0 {
+                stopped = Some(if b.denied {
+                    "the server refused EXPIRE for this user".to_string()
+                } else {
+                    format!(
+                        "the server answered EXPIRE with an error for {} keys",
+                        crate::format::grouped(b.failed)
+                    )
+                });
+                break 'nodes;
+            }
+            if b.finished() {
+                break;
+            }
+            (walk, carry) = (b.walk, b.carry);
         }
-        progress(&format!(
-            "Set a TTL on {} of {} keys",
-            crate::format::grouped(result.changed),
-            crate::format::grouped(change)
-        ));
-        if b.failed > 0 {
-            break Some(if b.denied {
-                "the server refused EXPIRE for this user".to_string()
-            } else {
-                format!(
-                    "the server answered EXPIRE with an error for {} keys",
-                    crate::format::grouped(b.failed)
-                )
-            });
-        }
-        if b.finished() {
-            break None;
-        }
-        (walk, carry) = (b.walk, b.carry);
-    };
+    }
     writeln!(
         out,
         "Set a TTL of {} on {} keys of {name}; {} left alone (a TTL already, or gone).",
@@ -293,8 +376,19 @@ pub async fn execute(
         crate::format::grouped(result.changed),
         crate::format::grouped(result.skipped)
     )?;
+    if result.moved > 0 {
+        writeln!(out, "{}.", capital(&bulk::moved_text(result.moved)))?;
+    }
     if let Some(f) = &result.file {
-        writeln!(out, "Key names: {}", f.display())?;
+        if shards.iter().any(|s| s.node.is_some()) {
+            writeln!(
+                out,
+                "Key names (each line: the node, a tab, the key): {}",
+                f.display()
+            )?;
+        } else {
+            writeln!(out, "Key names: {}", f.display())?;
+        }
         writeln!(out, "PERSIST on those keys undoes it.")?;
     }
     if let Some(why) = stopped {
@@ -304,6 +398,56 @@ pub async fn execute(
         count,
         run: Some(result),
     })
+}
+
+/// One server the run walks: a cluster primary (its announced address in `node`), or
+/// the profile's standalone server (`node` is `None`), with its own budget.
+struct Shard<C> {
+    node: Option<String>,
+    conn: C,
+    budget: std::sync::Arc<Budget>,
+}
+
+/// The primaries of a cluster discovered on its primaries, each with a budget of its
+/// own (`rate` per node): `(address, role, connection)` per shard, in slot order.
+/// Refused when a shard has no connection (the run would miss its keys) or was
+/// reached on a replica, which takes no writes.
+fn primaries<C>(
+    found: Vec<(String, crate::model::NodeRole, Option<C>)>,
+    rate: Option<u32>,
+) -> Result<Vec<Shard<C>>, String> {
+    let mut out = Vec::with_capacity(found.len());
+    for (addr, role, conn) in found {
+        let addr = crate::value::escape(&addr);
+        if role != crate::model::NodeRole::Primary {
+            return Err(format!(
+                "Not run: the shard at {addr} was reached on a replica, which takes no writes"
+            ));
+        }
+        let Some(conn) = conn else {
+            return Err(format!(
+                "Not run: the primary {addr} could not be connected to, so the pattern can't \
+                 be expired on every primary"
+            ));
+        };
+        out.push(Shard {
+            node: Some(addr),
+            conn,
+            budget: Budget::new(rate),
+        });
+    }
+    if out.is_empty() {
+        return Err("Not run: the cluster lists no primary".to_string());
+    }
+    Ok(out)
+}
+
+/// The first letter in upper case.
+fn capital(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 /// Ask `question` on the terminal and return the line typed. Without a terminal there
@@ -509,6 +653,34 @@ mod tests {
         let (r, _) = exec(profile(Env::Prod, Some(false)), args(false, false, None)).await;
         let e = r.unwrap_err().to_string();
         assert!(!e.contains("--confirm") && !e.contains("read-only"), "{e}");
+    }
+
+    #[test]
+    fn on_a_cluster_it_runs_on_every_primary_and_never_a_replica() {
+        use crate::model::NodeRole::{Primary, Replica};
+        let found = |roles: &[(crate::model::NodeRole, bool)]| {
+            roles
+                .iter()
+                .enumerate()
+                .map(|(i, &(r, c))| (format!("10.0.1.{i}:6379"), r, c.then_some(i)))
+                .collect::<Vec<_>>()
+        };
+        let all = primaries(found(&[(Primary, true), (Primary, true)]), Some(10)).unwrap();
+        assert_eq!(
+            all.iter().map(|s| s.node.clone()).collect::<Vec<_>>(),
+            [Some("10.0.1.0:6379".into()), Some("10.0.1.1:6379".into())]
+        );
+        // One budget per node, never one for the cluster.
+        assert!(!std::sync::Arc::ptr_eq(&all[0].budget, &all[1].budget));
+        let e = primaries(found(&[(Primary, true), (Replica, true)]), None)
+            .err()
+            .unwrap();
+        assert!(e.contains("10.0.1.1:6379") && e.contains("replica"), "{e}");
+        let e = primaries(found(&[(Primary, true), (Primary, false)]), None)
+            .err()
+            .unwrap();
+        assert!(e.contains("could not be connected"), "{e}");
+        assert!(primaries::<u8>(Vec::new(), None).is_err());
     }
 
     #[test]

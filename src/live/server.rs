@@ -342,13 +342,13 @@ pub enum CommandKeys {
 }
 
 /// One key spec: where the search starts, and how the keys follow from there.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeySpec {
     pub begin: Begin,
     pub find: Find,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Begin {
     /// At this argument (0 is the command name).
     Index(i64),
@@ -357,7 +357,7 @@ pub enum Begin {
     Keyword { word: String, from: i64 },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Find {
     /// From the start to `last` (relative to the start; `-1` is the last argument, and
     /// with `limit` the last of the first `1/limit` of the arguments), every `step`.
@@ -476,7 +476,7 @@ fn int_at(p: &[(String, &Value)], key: &str) -> Option<i64> {
     find(p, key).and_then(int_of)
 }
 
-fn parse_spec(v: &Value) -> Option<KeySpec> {
+pub(crate) fn parse_spec(v: &Value) -> Option<KeySpec> {
     let top = pairs(v);
     let bs = pairs(find(&top, "begin_search")?);
     let bs_spec = pairs(find(&bs, "spec")?);

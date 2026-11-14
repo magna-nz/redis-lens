@@ -398,6 +398,9 @@ pub enum WriteOp {
     // Pub/Sub.
     /// `p`: `PUBLISH channel message`.
     Publish { channel: String, message: Raw },
+    /// `P` on a shard channel: `SPUBLISH channel message`, sent to the channel's slot
+    /// owner (spec "Cluster live views (P4)", 5 Pub/Sub).
+    SPublish { channel: String, message: Raw },
 
     // Search.
     /// `C`: `FT.CREATE index ON HASH|JSON PREFIX n p… SCHEMA field [AS alias] type …`.
@@ -577,6 +580,7 @@ impl WriteOp {
             | XAutoClaim { .. }
             | XAck { .. }
             | Publish { .. }
+            | SPublish { .. }
             | FtCreate { .. } => Kind::Edit,
             HDel { .. }
             | SRem { .. }
@@ -642,6 +646,7 @@ impl WriteOp {
             XAck { .. } => "XACK",
             XTrim { .. } => "XTRIM",
             Publish { .. } => "PUBLISH",
+            SPublish { .. } => "SPUBLISH",
             FtCreate { .. } => "FT.CREATE",
             FtDropIndex { .. } => "FT.DROPINDEX",
             Bulk {
@@ -694,7 +699,7 @@ impl WriteOp {
             | XAutoClaim { key, .. }
             | XAck { key, .. }
             | XTrim { key, .. } => key.clone(),
-            Publish { channel, .. } => channel.clone(),
+            Publish { channel, .. } | SPublish { channel, .. } => channel.clone(),
             FtCreate { index, .. } | FtDropIndex { index } => index.clone(),
             Bulk { pattern, .. } => pattern.clone(),
             ClientKill { id } => id.to_string(),
@@ -873,6 +878,9 @@ impl WriteOp {
                 trim: Trim::MinId(id),
             } => vec![vec![b("XTRIM"), b(key), b("MINID"), b("~"), b(id)]],
             Publish { channel, message } => vec![vec![b("PUBLISH"), b(channel), r(message)]],
+            SPublish { channel, message } => {
+                vec![vec![b("SPUBLISH"), b(channel), r(message)]]
+            }
             FtCreate {
                 index,
                 on,
@@ -1172,6 +1180,10 @@ mod tests {
                 channel: "ch".into(),
                 message: v(),
             },
+            WriteOp::SPublish {
+                channel: "ch".into(),
+                message: v(),
+            },
             WriteOp::FtCreate {
                 index: "idx".into(),
                 on: IndexOn::Hash,
@@ -1202,6 +1214,8 @@ mod tests {
                     flags: vec!["write".into()],
                     categories: vec!["@write".into()],
                     subcommands: vec![],
+                    keys: Vec::new(),
+                    keys_partial: false,
                 },
             },
         ]
@@ -1315,6 +1329,8 @@ mod tests {
             flags: vec!["write".into()],
             categories: cats.iter().map(|c| c.to_string()).collect(),
             subcommands: vec![],
+            keys: Vec::new(),
+            keys_partial: false,
         };
         let args = |s: &str| {
             s.split(' ')
@@ -1436,7 +1452,11 @@ mod tests {
                 flags: vec![],
                 categories: vec!["@dangerous".into()],
                 subcommands: vec![],
+                keys: Vec::new(),
+                keys_partial: false,
             }],
+            keys: Vec::new(),
+            keys_partial: false,
         };
         let op = WriteOp::Command {
             args: Args::new(vec![

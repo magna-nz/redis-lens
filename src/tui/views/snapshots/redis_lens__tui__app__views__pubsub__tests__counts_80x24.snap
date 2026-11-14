@@ -1,6 +1,5 @@
 ---
 source: src/tui/views/pubsub.rs
-assertion_line: 675
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
@@ -22,7 +21,7 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│ Subscribers on listed channels  19  (direct SUBSCRIBE only)                  │"
 "│                                                                              │"
 "│ Selected                        orders:eu  ·  12 subscribers                 │"
-"│ Counts read no payloads. enter or s starts a live tail.                      │"
+"│ Counts read no payloads. enter or s starts a live tail, S a shard one.       │"
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
