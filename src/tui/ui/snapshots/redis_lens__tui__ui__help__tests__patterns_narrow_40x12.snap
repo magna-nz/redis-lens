@@ -1,14 +1,14 @@
 ---
 source: src/tui/ui/help.rs
-assertion_line: 110
+assertion_line: 106
 expression: "render(Screen::Patterns, 40, 12).backend()"
 ---
-"┌─ Keys · Patterns ────────────────────┐"
+"┌─ Keys · Patterns ─── ? or esc clos… ─┐"
 "│Everywhere                            │"
 "│0-6            Switch view, 0 Connect…│"
 "│?              Show or hide this key …│"
 "│a              Add a connection       │"
-"│:              Open the command line …│"
+"│:              Open the command line  │"
 "│q ctrl-c       Quit                   │"
 "│Patterns                              │"
 "│↑↓ j k         Move the selection     │"

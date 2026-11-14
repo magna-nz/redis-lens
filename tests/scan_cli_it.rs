@@ -22,6 +22,7 @@ fn temp_config(profile: &Profile) -> PathBuf {
     let path = dir.join("config.toml");
     Config {
         profiles: vec![profile.clone()],
+        ..Default::default()
     }
     .save(&path)
     .unwrap();

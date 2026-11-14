@@ -52,6 +52,13 @@ fn sentence(e: &str) -> String {
 /// Draws the screen `ctx.screen` of this view into `area`, the body between the
 /// header and the key bar.
 pub fn draw(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) {
+    draw_view(frame, area, state, ctx);
+    if let (Some(form), Some(sends)) = (&state.create, state.form_sends()) {
+        super::streams::draw_form(frame, area, form, &sends, ctx);
+    }
+}
+
+fn draw_view(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) {
     const TITLE: &str = "Search";
     if let Some(off) = &state.off {
         let lines = vec![Line::from(Span::styled(

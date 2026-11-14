@@ -12,7 +12,10 @@
 //! - `e` shows `FT.EXPLAIN` and `P` runs `FT.PROFILE`, one level deeper too, both for
 //!   the query last run (the one `/` starts from), on the selected index.
 //!
-//! Nothing is created or dropped. See [`super`] for the interface `App` calls. Results
+//! Writes (P3), through [`Act::write`], the one gate: `C` opens a form for an index
+//! (name, `ON HASH` or `JSON`, prefixes, fields) and sends `FT.CREATE`; `D` drops the
+//! selected index with `FT.DROPINDEX`, never with `DD`, so its documents stay. The list
+//! is read again after each. See [`super`] for the interface `App` calls. Results
 //! are held as [`Raw`](crate::value::Raw) and explain and profile text as [`Text`], so
 //! the derived `Debug` never shows a value.
 
@@ -20,6 +23,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use super::streams::form::{self, Form, Step, write_failed, write_off};
 use super::streams::{list_move, off_text, plain};
 use super::value::{Drawn, ValueState};
 use super::{Act, Input, ViewState};
@@ -28,6 +32,8 @@ use crate::live::search::{Doc, IndexInfo, IndexList, Reply, Request, Results, Te
 use crate::live::values::{Field, Items};
 use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::{KeyType, Ttl};
+use crate::value::escape;
+use crate::write::{IndexField, IndexOn, WriteOp};
 
 /// Rows of the schema list in the details panel that fit at once.
 const SCHEMA_PAGE: usize = 4;
@@ -155,9 +161,199 @@ pub struct SearchState {
     pub cmd_off: Vec<(Cmd, String)>,
     /// The results' previews, kept between frames. `Debug` shows only counts.
     pub memo: crate::value::Memo,
+    /// The create form (`C`), while it is open.
+    pub create: Option<Form>,
+    /// The write in flight: its id, the index, and whether it creates (or drops).
+    write: Option<(ReqId, String, bool)>,
+}
+
+/// Why `C` and `D` are off when the server has no Search module.
+pub const NO_MODULE: &str =
+    "Not available: the server has no Search module, so indexes can't be created or dropped.";
+
+/// The field types the create form takes.
+pub const FIELD_TYPES: [&str; 4] = ["TEXT", "TAG", "NUMERIC", "GEO"];
+
+/// The `FT.CREATE` of the create form. Prefixes are separated by spaces or commas;
+/// fields by commas (or newlines), each `name TYPE` or `path AS alias TYPE`.
+pub fn create_op(f: &Form) -> Result<WriteOp, String> {
+    let index = f.value("name");
+    if index.is_empty() {
+        return Err("Type the index's name.".into());
+    }
+    if index.contains(char::is_whitespace) {
+        return Err("An index name has no spaces.".into());
+    }
+    let on = if f.value("on") == "JSON" {
+        IndexOn::Json
+    } else {
+        IndexOn::Hash
+    };
+    let prefixes: Vec<String> = f
+        .value("prefixes")
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut fields = Vec::new();
+    for entry in f
+        .value("fields")
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        let words: Vec<&str> = entry.split_whitespace().collect();
+        let (name, alias, kind) = match words[..] {
+            [name, kind] => (name, None, kind),
+            [name, as_, alias, kind] if as_.eq_ignore_ascii_case("AS") => (name, Some(alias), kind),
+            _ => {
+                return Err(format!(
+                    "Write each field as name TYPE, or $.path AS alias TYPE: {}.",
+                    escape(entry)
+                ));
+            }
+        };
+        let kind = kind.to_ascii_uppercase();
+        if !FIELD_TYPES.contains(&kind.as_str()) {
+            return Err(format!(
+                "A field's type is TEXT, TAG, NUMERIC or GEO, not {}.",
+                escape(&kind)
+            ));
+        }
+        if on == IndexOn::Json && !name.starts_with('$') {
+            return Err(format!(
+                "On JSON a field is a path such as $.title: {}.",
+                escape(name)
+            ));
+        }
+        fields.push(IndexField {
+            name: name.to_string(),
+            alias: alias.map(str::to_string),
+            kind,
+        });
+    }
+    if fields.is_empty() {
+        return Err("Add at least one field, such as title TEXT.".into());
+    }
+    Ok(WriteOp::FtCreate {
+        index: index.to_string(),
+        on,
+        prefixes,
+        fields,
+    })
 }
 
 impl SearchState {
+    /// The `FT.CREATE` the form sends as filled now, as the prompt shows it, or what is
+    /// wrong: for the form's "Sends:" line.
+    pub fn form_sends(&self) -> Option<Result<String, String>> {
+        self.create
+            .as_ref()
+            .map(|f| create_op(f).map(|op| op.shown()))
+    }
+
+    /// `C`: opens the create form.
+    fn open_create(&mut self, act: &mut Act<'_>) {
+        if self.no_module {
+            act.error(NO_MODULE);
+            return;
+        }
+        let sample = WriteOp::FtCreate {
+            index: "i".into(),
+            on: IndexOn::Hash,
+            prefixes: Vec::new(),
+            fields: vec![IndexField {
+                name: "f".into(),
+                alias: None,
+                kind: "TEXT".into(),
+            }],
+        };
+        if write_off(act, &sample) {
+            return;
+        }
+        self.create = Some(Form::new(
+            "Create an index",
+            vec!["FT.CREATE indexes the keys with these prefixes, now and as they change.".into()],
+            vec![
+                form::Field::text("name", "the index's name, such as idx:products"),
+                form::Field::choice("on", &["HASH", "JSON"], "hashes, or JSON documents"),
+                form::Field::text(
+                    "prefixes",
+                    "key prefixes, separated by spaces or commas; empty: every key",
+                )
+                .as_list(),
+                form::Field::text(
+                    "fields",
+                    "name TYPE, … (TEXT, TAG, NUMERIC, GEO); on JSON: $.path AS alias TYPE",
+                )
+                .as_list(),
+            ],
+        ));
+    }
+
+    /// A key while the create form is open.
+    fn create_key(&mut self, key: KeyEvent, act: &mut Act<'_>) {
+        let Some(f) = self.create.as_mut() else {
+            return;
+        };
+        match f.key(key) {
+            Step::Typed => {}
+            Step::Cancel => self.create = None,
+            Step::Submit => match create_op(f) {
+                Err(why) => act.error(why),
+                Ok(op) => {
+                    self.create = None;
+                    let index = op.name_to_type();
+                    if let Some(id) = act.write(op) {
+                        self.write = Some((id, index, true));
+                    }
+                }
+            },
+        }
+    }
+
+    /// `D`: drops the selected index; its documents stay.
+    fn drop_index(&mut self, act: &mut Act<'_>) {
+        if self.no_module {
+            act.error(NO_MODULE);
+            return;
+        }
+        let Some(index) = self.selected().map(|i| i.name.clone()) else {
+            act.info("No index selected.");
+            return;
+        };
+        let op = WriteOp::FtDropIndex {
+            index: index.clone(),
+        };
+        if let Some(id) = act.write(op) {
+            self.write = Some((id, index, false));
+        }
+    }
+
+    /// The answer to the write in flight; the list is read again after it.
+    fn write_reply(
+        &mut self,
+        index: String,
+        create: bool,
+        result: Result<LiveReply, LiveError>,
+        act: &mut Act<'_>,
+    ) {
+        match result {
+            Ok(_) if create => act.info(format!("Created index {}.", escape(&index))),
+            Ok(_) => act.info(format!(
+                "Dropped index {}. Its documents stay.",
+                escape(&index)
+            )),
+            Err(e) => {
+                write_failed(act, &e);
+                return;
+            }
+        }
+        if !self.in_flight(act) {
+            self.fetch(act);
+        }
+    }
+
     /// The selected index.
     pub fn selected(&self) -> Option<&IndexInfo> {
         self.list.indexes.get(self.sel)
@@ -503,6 +699,9 @@ impl ViewState for SearchState {
     }
 
     fn input(&self) -> Option<Input> {
+        if let Some(f) = &self.create {
+            return f.input();
+        }
         self.input.as_ref().map(|text| Input {
             label: "/",
             text: text.clone(),
@@ -511,15 +710,33 @@ impl ViewState for SearchState {
     }
 
     fn on_paste(&mut self, text: &str, _act: &mut Act<'_>) {
+        if let Some(f) = self.create.as_mut() {
+            f.paste(text);
+            return;
+        }
         paste_into(self.input.as_mut(), text);
     }
 
     fn on_key(&mut self, key: KeyEvent, act: &mut Act<'_>) -> bool {
+        if self.create.is_some() {
+            self.create_key(key, act);
+            return true;
+        }
         if self.input.is_some() {
             return self.input_key(key, act);
         }
         // Keys that work the same one level deeper: they go back first.
         match (key.code, plain(&key)) {
+            (KeyCode::Char('C'), true) => {
+                self.deeper = None;
+                self.open_create(act);
+                return true;
+            }
+            (KeyCode::Char('D'), true) => {
+                self.deeper = None;
+                self.drop_index(act);
+                return true;
+            }
             (KeyCode::Char('/'), true) => {
                 if self.selected().is_none() {
                     act.info("No index selected.");
@@ -607,7 +824,14 @@ impl ViewState for SearchState {
         true
     }
 
-    fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, _act: &mut Act<'_>) {
+    fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
+        if let Some((wid, _, _)) = &self.write
+            && *wid == id
+        {
+            let (_, index, create) = self.write.take().expect("the write in flight");
+            self.write_reply(index, create, result, act);
+            return;
+        }
         if let Some((qid, cmd)) = self.query_pending
             && qid == id
         {
@@ -1439,5 +1663,195 @@ mod tests {
             &serde_json::to_string(report).unwrap(),
             MARK
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Create and drop (P3)
+    // -----------------------------------------------------------------------
+
+    use super::super::streams::form::testing::{
+        READ_ONLY, answer_anything, press, set_profile, writes,
+    };
+    use crate::live::write::Reply as WriteReply;
+    use crate::model::Env;
+    use crate::tui::app::confirm::Expect;
+
+    fn create_form(fields: &[(&str, &str)]) -> Form {
+        let mut f = Form::new(
+            "t",
+            vec![],
+            vec![
+                form::Field::text("name", ""),
+                form::Field::choice("on", &["HASH", "JSON"], ""),
+                form::Field::text("prefixes", ""),
+                form::Field::text("fields", ""),
+            ],
+        );
+        for (label, text) in fields {
+            f.fields
+                .iter_mut()
+                .find(|x| x.label == *label)
+                .unwrap()
+                .text = (*text).into();
+        }
+        f
+    }
+
+    #[test]
+    fn the_create_form_builds_ft_create() {
+        let f = create_form(&[
+            ("name", "idx:products"),
+            ("prefixes", "product:, item:"),
+            ("fields", "title TEXT, price numeric,\ntags TAG"),
+        ]);
+        let op = create_op(&f).unwrap();
+        assert_eq!(
+            op.shown(),
+            "FT.CREATE idx:products ON HASH PREFIX 2 product: item: SCHEMA title TEXT price NUMERIC tags TAG"
+        );
+        let f = create_form(&[
+            ("name", "idx:sessions"),
+            ("on", "JSON"),
+            ("fields", "$.user.id AS user TAG"),
+        ]);
+        assert_eq!(
+            create_op(&f).unwrap().shown(),
+            "FT.CREATE idx:sessions ON JSON SCHEMA $.user.id AS user TAG"
+        );
+        for (fields, why) in [
+            (vec![("fields", "title TEXT")], "Type the index's name."),
+            (
+                vec![("name", "a b"), ("fields", "title TEXT")],
+                "An index name has no spaces.",
+            ),
+            (
+                vec![("name", "i")],
+                "Add at least one field, such as title TEXT.",
+            ),
+            (
+                vec![("name", "i"), ("fields", "title VECTOR")],
+                "A field's type is TEXT, TAG, NUMERIC or GEO, not VECTOR.",
+            ),
+            (
+                vec![("name", "i"), ("fields", "title")],
+                "Write each field as name TYPE, or $.path AS alias TYPE: title.",
+            ),
+            (
+                vec![("name", "i"), ("on", "JSON"), ("fields", "title TEXT")],
+                "On JSON a field is a path such as $.title: title.",
+            ),
+        ] {
+            assert_eq!(create_op(&create_form(&fields)), Err(why.to_string()));
+        }
+    }
+
+    #[test]
+    fn c_creates_an_index_at_once_outside_prod_and_reads_the_list_again() {
+        let mut app = loaded(true);
+        set_profile(&mut app, Env::Local, None);
+        app.handle_key(ch('C'));
+        type_text(&mut app, "idx:orders");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "order:");
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "$.total AS total NUMERIC, $.status AS status TAG");
+        insta::assert_snapshot!(
+            "create_index_form_80x24",
+            testing::render(&app, 80, 24).backend()
+        );
+        let e = press(&mut app, KeyCode::Enter);
+        assert!(app.confirm.is_none());
+        let w = writes(&e);
+        assert_eq!(
+            w.iter().map(WriteOp::shown).collect::<Vec<_>>(),
+            vec![
+                "FT.CREATE idx:orders ON JSON PREFIX 1 order: SCHEMA $.total AS total NUMERIC $.status AS status TAG"
+            ]
+        );
+        let (id, _) = testing::requests(&e)[0].clone();
+        let e = testing::reply(&mut app, id, Ok(LiveReply::Write(WriteReply::Ok)));
+        assert_eq!(notice(&app), "Created index idx:orders.");
+        assert_eq!(
+            search_requests(&e)
+                .into_iter()
+                .map(|r| r.1)
+                .collect::<Vec<_>>(),
+            vec![Request::Indexes]
+        );
+    }
+
+    #[test]
+    fn d_drops_the_selected_index_never_its_documents() {
+        let mut app = loaded(true);
+        set_profile(&mut app, Env::Local, None);
+        app.handle_key(ch('j'));
+        assert!(writes(&app.handle_key(ch('D'))).is_empty());
+        let c = app.confirm.as_ref().expect("a question");
+        assert_eq!(c.expect, Expect::YesNo);
+        assert!(
+            c.lines()
+                .iter()
+                .any(|l| l == "Sends: FT.DROPINDEX idx:sessions")
+        );
+        let e = app.handle_key(ch('y'));
+        assert_eq!(
+            writes(&e),
+            vec![WriteOp::FtDropIndex {
+                index: "idx:sessions".into()
+            }]
+        );
+        let (id, _) = testing::requests(&e)[0].clone();
+        let e = testing::reply(&mut app, id, Ok(LiveReply::Write(WriteReply::Ok)));
+        assert_eq!(
+            notice(&app),
+            "Dropped index idx:sessions. Its documents stay."
+        );
+        assert_eq!(search_requests(&e).len(), 1);
+
+        // On prod: the index's name is typed; create asks y/n.
+        set_profile(&mut app, Env::Prod, Some(false));
+        app.handle_key(ch('D'));
+        assert_eq!(
+            app.confirm.as_ref().unwrap().expect,
+            Expect::Type("idx:sessions".into())
+        );
+        press(&mut app, KeyCode::Esc);
+        app.handle_key(ch('C'));
+        type_text(&mut app, "i");
+        press(&mut app, KeyCode::Up);
+        type_text(&mut app, "t TAG");
+        let e = press(&mut app, KeyCode::Enter);
+        assert!(writes(&e).is_empty());
+        assert_eq!(app.confirm.as_ref().unwrap().expect, Expect::YesNo);
+    }
+
+    #[test]
+    fn without_the_module_create_and_drop_say_why() {
+        let (mut app, id) = shown();
+        answer(&mut app, id, Err(LiveError::Unsupported("FT._LIST".into())));
+        set_profile(&mut app, Env::Local, None);
+        for k in ['C', 'D'] {
+            let e = app.handle_key(ch(k));
+            assert!(writes(&e).is_empty() && app.confirm.is_none());
+            assert!(app.views.search.create.is_none());
+            assert_eq!(notice(&app), NO_MODULE);
+        }
+    }
+
+    #[test]
+    fn no_index_is_created_or_dropped_on_a_read_only_profile() {
+        for (env, ro) in READ_ONLY {
+            for k in ['C', 'D'] {
+                let mut app = loaded(true);
+                set_profile(&mut app, env, ro);
+                let mut e = app.handle_key(ch(k));
+                assert!(app.views.search.create.is_none() && app.confirm.is_none());
+                assert!(notice(&app).contains("read-only"), "{}", notice(&app));
+                e.extend(answer_anything(&mut app));
+                assert!(writes(&e).is_empty(), "{k} {env:?} {ro:?}");
+            }
+        }
     }
 }

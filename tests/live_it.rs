@@ -321,12 +321,20 @@ const VIEW_RULES: [&str; 7] = [
 
 fn assert_labels_in_order(r: &PermissionReport) {
     let labels: Vec<&str> = r.checks.iter().map(|c| c.label).collect();
-    let expect: Vec<&str> = PERM_LABELS
+    let mut expect: Vec<&str> = PERM_LABELS
         .iter()
         .chain(&VIEW_PERM_LABELS)
         .copied()
         .collect();
-    assert_eq!(labels, expect);
+    // Then the write checks: `ACL DRYRUN` first, and one per write when it works.
+    expect.push(conn::PERM_ACL_DRYRUN);
+    assert_eq!(labels[..expect.len()], expect[..]);
+    assert!(
+        labels[expect.len()..]
+            .iter()
+            .all(|l| conn::is_write_probe(l)),
+        "{labels:?}"
+    );
 }
 
 #[tokio::test]

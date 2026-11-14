@@ -39,11 +39,6 @@ pub fn draw(frame: &mut Frame, area: Rect, screen: Screen) {
     lines.extend(keymap::global().iter().map(|h| entry(h, inner)));
     lines.push(heading(screen.title(), inner));
     lines.extend(keymap::for_screen(screen).iter().map(|h| entry(h, inner)));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        trunc("? or esc closes", inner),
-        style::dim(),
-    )));
 
     let h = (lines.len() as u16 + 2).min(area.height);
     let rect = Rect {
@@ -54,7 +49,8 @@ pub fn draw(frame: &mut Frame, area: Rect, screen: Screen) {
     };
     frame.render_widget(Clear, rect);
     let title = format!("Keys · {}", screen.title());
-    let body = panel(frame, rect, &title, "");
+    // The way out sits in the top border, so it shows however many keys there are.
+    let body = panel(frame, rect, &title, "? or esc closes");
     rows(frame, body, lines, None);
 }
 

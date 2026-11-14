@@ -19,7 +19,9 @@ use super::app::{App, Phase, Screen, Session, View};
 use super::keymap;
 
 mod analysis;
+mod bulk;
 mod cmdline;
+mod confirm;
 mod connections;
 mod delta;
 mod diff;
@@ -93,6 +95,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
         cmdline::draw(frame, body, &app.views.cmdline, &ctx);
     }
     footer(frame, foot, app);
+    if let Some(b) = &app.bulk {
+        bulk::draw(frame, body, b, app.tick);
+    }
+    if let Some(c) = &app.confirm {
+        confirm::draw(frame, body, c);
+    }
     if app.help {
         help::draw(frame, frame.area(), screen);
     }
@@ -678,7 +686,11 @@ fn input_line(label: &str, text: String, hint: &str, w: usize) -> Line<'static> 
 
 fn footer(frame: &mut Frame, area: Rect, app: &App) {
     let w = usize::from(area.width);
-    let line = if let Some(add) = &app.add {
+    let line = if let Some(c) = &app.confirm {
+        confirm::footer(c)
+    } else if let Some(b) = &app.bulk {
+        bulk::footer(b)
+    } else if let Some(add) = &app.add {
         match &add.password {
             Some(_) => input_line(
                 "password",

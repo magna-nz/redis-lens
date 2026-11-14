@@ -1,27 +1,27 @@
 ---
 source: src/tui/ui/help.rs
-assertion_line: 105
+assertion_line: 101
 expression: "render(Screen::Overview, 80, 24).backend()"
 ---
 "                                                                                "
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"       ┌─ Keys · Server · Overview ─────────────────────────────────────┐       "
+"                                                                                "
+"       ┌─ Keys · Server · Overview ─────────────────── ? or esc closes ─┐       "
 "       │Everywhere                                                      │       "
 "       │0-6            Switch view, 0 Connections to 6 Search           │       "
 "       │?              Show or hide this key list                       │       "
 "       │a              Add a connection                                 │       "
-"       │:              Open the command line for readonly commands      │       "
+"       │:              Open the command line                            │       "
 "       │q ctrl-c       Quit                                             │       "
 "       │Server · Overview                                               │       "
 "       │tab shift-tab  Next or previous panel                           │       "
 "       │p              Pause or resume polling                          │       "
 "       │+ -            Poll more or less often, 1 to 60 s               │       "
 "       │r              Refresh this panel now                           │       "
-"       │                                                                │       "
-"       │? or esc closes                                                 │       "
 "       └────────────────────────────────────────────────────────────────┘       "
+"                                                                                "
 "                                                                                "
 "                                                                                "
 "                                                                                "

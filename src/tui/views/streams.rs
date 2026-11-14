@@ -11,19 +11,39 @@
 //! its own) and `ui/value.rs` draws them, so `↑↓`, `tab`, `n`, `f` and `y` work as on
 //! the key detail. `esc` goes back to the list. While the entries are shown the `XINFO`
 //! poll stops; back on the list it reads at once when a poll is due.
+//!
+//! Writes (P3), each through [`Act::write`], the one gate:
+//!
+//! - `c` on a group, consumer or pending entry of the details claims the group's pending
+//!   entries idle long enough for another consumer (`XAUTOCLAIM`), from a form.
+//! - `A` on a group or consumer lists its pending entries (`XPENDING`, the first 100)
+//!   under it, a read that works on a read-only profile too; on one of them, it
+//!   acknowledges it (`XACK`).
+//! - `X` trims the selected stream (`XTRIM MAXLEN ~ n` or `MINID ~ id`), from a form.
+//!
+//! After each, the stream (and its pending list, when open) is read again.
 
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use self::form::{Field, Form, Step, write_failed, write_off};
 use super::value::ValueState;
-use super::{Act, ViewState};
+use super::{Act, Input, ViewState};
 use crate::live::keys::KeyRow;
 use crate::live::streams::{
-    ConsumerInfo, GroupInfo, MAX_STREAMS, Refused, Reply, Request, StreamInfo, Verdict, verdicts,
+    ConsumerInfo, GroupInfo, MAX_STREAMS, Pending, PendingEntry, Refused, Reply, Request,
+    StreamInfo, Verdict, verdicts,
 };
+use crate::live::write::Reply as WriteReply;
 use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::{KeyType, PatternStats, ScanReport, Ttl};
+use crate::value::escape;
+use crate::write::{Trim, WriteOp};
+
+/// The forms of the write actions of this view and of Server, Pub/Sub and Search.
+#[path = "form.rs"]
+pub mod form;
 
 /// How often `XINFO` is polled while the view is shown (spec "Shared command budget").
 pub const POLL: Duration = Duration::from_secs(5);
@@ -49,11 +69,123 @@ pub struct StreamRow {
     pub verdicts: Vec<Verdict>,
 }
 
-/// A line of the details panel: a group, or one of its consumers.
+/// A line of the details panel: a group, one of its consumers, or a pending entry
+/// listed with `A`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DetailRow<'a> {
     Group(&'a GroupInfo),
     Consumer(&'a GroupInfo, &'a ConsumerInfo),
+    Pending(&'a GroupInfo, &'a PendingEntry),
+}
+
+/// The default `COUNT` of a claim.
+pub const CLAIM_COUNT: u64 = 100;
+/// The default min idle time of a claim from a group row: one minute.
+pub const CLAIM_IDLE_MS: u64 = 60_000;
+
+/// A form open on the view.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamForm {
+    /// `c`: claim pending entries of `group` on `key`.
+    Claim {
+        key: String,
+        group: String,
+        form: Form,
+    },
+    /// `X`: trim `key`.
+    Trim { key: String, form: Form },
+}
+
+impl StreamForm {
+    pub fn form(&self) -> &Form {
+        match self {
+            Self::Claim { form, .. } | Self::Trim { form, .. } => form,
+        }
+    }
+
+    fn form_mut(&mut self) -> &mut Form {
+        match self {
+            Self::Claim { form, .. } | Self::Trim { form, .. } => form,
+        }
+    }
+
+    /// The op the form sends as it is filled now, or what is wrong with it.
+    pub fn op(&self) -> Result<WriteOp, String> {
+        match self {
+            Self::Claim { key, group, form } => claim_op(key, group, form),
+            Self::Trim { key, form } => trim_op(key, form),
+        }
+    }
+}
+
+/// The `XAUTOCLAIM` of a claim form.
+pub fn claim_op(key: &str, group: &str, form: &Form) -> Result<WriteOp, String> {
+    let consumer = form.value("to consumer");
+    if consumer.is_empty() {
+        return Err("Type the consumer that takes the entries.".into());
+    }
+    let min_idle_ms = form
+        .value("min idle ms")
+        .parse::<u64>()
+        .map_err(|_| "The min idle time is a whole number of milliseconds.".to_string())?;
+    let count = form
+        .value("count")
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| "The count is a whole number, 1 or more.".to_string())?;
+    Ok(WriteOp::XAutoClaim {
+        key: key.to_string(),
+        group: group.to_string(),
+        consumer: consumer.to_string(),
+        min_idle_ms,
+        count,
+    })
+}
+
+/// A stream ID as `XTRIM MINID` takes it: `ms` or `ms-seq`.
+fn is_stream_id(s: &str) -> bool {
+    let mut parts = s.splitn(2, '-');
+    let ms = parts.next().unwrap_or("");
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    digits(ms) && parts.next().is_none_or(digits)
+}
+
+/// The `XTRIM` of a trim form.
+pub fn trim_op(key: &str, form: &Form) -> Result<WriteOp, String> {
+    let value = form.value("value");
+    let trim = if form.value("trim by") == "MINID" {
+        if !is_stream_id(value) {
+            return Err("MINID takes an entry ID, such as 1700000000000-0.".into());
+        }
+        Trim::MinId(value.to_string())
+    } else {
+        Trim::MaxLen(
+            value
+                .parse::<u64>()
+                .map_err(|_| "MAXLEN takes how many entries to keep.".to_string())?,
+        )
+    };
+    Ok(WriteOp::XTrim {
+        key: key.to_string(),
+        trim,
+    })
+}
+
+/// A write of this view in flight.
+#[derive(Debug, Clone, PartialEq)]
+enum Sent {
+    Claim { key: String, consumer: String },
+    Ack { key: String, id: String },
+    Trim { key: String },
+}
+
+impl Sent {
+    fn key(&self) -> &str {
+        match self {
+            Self::Claim { key, .. } | Self::Ack { key, .. } | Self::Trim { key } => key,
+        }
+    }
 }
 
 /// The groups of `info`, each followed by its consumers.
@@ -103,6 +235,14 @@ pub struct StreamsState {
     pub entries: Option<Box<ValueState>>,
     /// The entries are on screen instead of the list.
     pub entries_open: bool,
+    /// The pending entries `A` listed: of which stream, and what `XPENDING` said.
+    pub pending_list: Option<(String, Pending)>,
+    /// The `XPENDING` read in flight.
+    pending_read: Option<ReqId>,
+    /// The form open, if any (`c`, `X`).
+    pub form: Option<StreamForm>,
+    /// The write in flight, if any.
+    write: Option<(ReqId, Sent)>,
 }
 
 /// The keys of the streams the scan found: keys of type stream among the examples of every
@@ -141,12 +281,55 @@ impl StreamsState {
         self.rows.get(self.sel)
     }
 
-    /// The details rows of the selected stream.
+    /// The details rows of the selected stream, with the pending entries `A` listed
+    /// under their group or consumer.
     pub fn details(&self) -> Vec<DetailRow<'_>> {
-        self.selected()
-            .and_then(|r| r.info.as_ref())
-            .map(detail_rows)
-            .unwrap_or_default()
+        let Some(row) = self.selected() else {
+            return Vec::new();
+        };
+        let Some(info) = row.info.as_ref() else {
+            return Vec::new();
+        };
+        let rows = detail_rows(info);
+        let Some((_, p)) = self.pending_list.as_ref().filter(|(k, _)| *k == row.key) else {
+            return rows;
+        };
+        let mut out = Vec::with_capacity(rows.len() + p.entries.len());
+        for r in rows {
+            out.push(r);
+            let (g, of) = match r {
+                DetailRow::Group(g) => (g, None),
+                DetailRow::Consumer(g, c) => (g, Some(&c.name)),
+                DetailRow::Pending(..) => continue,
+            };
+            if g.name == p.group && of == p.consumer.as_ref() {
+                out.extend(p.entries.iter().map(|e| DetailRow::Pending(g, e)));
+            }
+        }
+        out
+    }
+
+    /// The pending list shown for the selected stream, if `A` listed one.
+    pub fn shown_pending(&self) -> Option<&Pending> {
+        let key = &self.selected()?.key;
+        self.pending_list
+            .as_ref()
+            .filter(|(k, _)| k == key)
+            .map(|(_, p)| p)
+    }
+
+    /// The selected row of the details, when they have the focus.
+    fn detail_selected(&self) -> Option<DetailRow<'_>> {
+        if self.focus != Focus::Detail {
+            return None;
+        }
+        self.details().get(self.detail_sel).copied()
+    }
+
+    /// The op of the form open, as filled now, or what is wrong with it: for the
+    /// form's "Sends:" line.
+    pub fn form_sends(&self) -> Option<Result<String, String>> {
+        self.form.as_ref().map(|f| f.op().map(|op| op.shown()))
     }
 
     /// The entries on screen, if they are.
@@ -183,6 +366,300 @@ impl StreamsState {
         **entries = ValueState::default();
         entries.open(row, String::new(), act);
         entries.on_show(act);
+    }
+
+    /// `c`: opens the claim form for the group of the selected details row.
+    fn open_claim(&mut self, act: &mut Act<'_>) {
+        let Some(key) = self.selected().map(|r| r.key.clone()) else {
+            act.info("No stream selected.");
+            return;
+        };
+        let (group, from, idle) = match self.detail_selected() {
+            Some(DetailRow::Group(g)) => (g, None, CLAIM_IDLE_MS),
+            Some(DetailRow::Consumer(g, c)) => (g, Some(c.name.clone()), c.idle_ms),
+            Some(DetailRow::Pending(g, e)) => (g, Some(e.consumer.clone()), e.idle_ms),
+            None => {
+                act.info("Press tab and select a group or consumer: c claims its pending entries.");
+                return;
+            }
+        };
+        let sample = WriteOp::XAutoClaim {
+            key: key.clone(),
+            group: group.name.clone(),
+            consumer: "c".into(),
+            min_idle_ms: 0,
+            count: CLAIM_COUNT,
+        };
+        if write_off(act, &sample) {
+            return;
+        }
+        // Another consumer of the group, the most recently active, takes them.
+        let to = group
+            .readers
+            .iter()
+            .flatten()
+            .filter(|c| Some(&c.name) != from.as_ref())
+            .min_by_key(|c| c.idle_ms)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let mut about = vec![format!(
+            "Stream {} · group {}",
+            escape(&key),
+            escape(&group.name)
+        )];
+        if let Some(from) = &from {
+            about.push(format!(
+                "From {}: entries idle at least min idle go to the new consumer.",
+                escape(from)
+            ));
+        } else {
+            about.push("Entries idle at least min idle go to the new consumer.".to_string());
+        }
+        let form = Form::new(
+            "Claim pending entries",
+            about,
+            vec![
+                Field::text("to consumer", "the consumer that takes the entries").with(to),
+                Field::text(
+                    "min idle ms",
+                    "only entries delivered at least this long ago (XAUTOCLAIM claims any consumer's)",
+                )
+                .with((idle / 1000 * 1000).to_string()),
+                Field::text("count", "the most entries claimed").with(CLAIM_COUNT.to_string()),
+            ],
+        );
+        self.form = Some(StreamForm::Claim {
+            key,
+            group: group.name.clone(),
+            form,
+        });
+    }
+
+    /// `X`: opens the trim form for the selected stream.
+    fn open_trim(&mut self, act: &mut Act<'_>) {
+        let Some(row) = self.selected() else {
+            act.info("No stream selected.");
+            return;
+        };
+        let Some(info) = &row.info else {
+            act.info("The key is gone, or no longer a stream. Rescan to update the list.");
+            return;
+        };
+        let key = row.key.clone();
+        let sample = WriteOp::XTrim {
+            key: key.clone(),
+            trim: Trim::MaxLen(0),
+        };
+        if write_off(act, &sample) {
+            return;
+        }
+        let about = vec![
+            format!(
+                "Stream {} · {} entries",
+                escape(&key),
+                crate::format::grouped(info.length)
+            ),
+            "Approximate (~): the server may keep a few more.".to_string(),
+        ];
+        let form = Form::new(
+            "Trim stream",
+            about,
+            vec![
+                Field::choice(
+                    "trim by",
+                    &["MAXLEN", "MINID"],
+                    "MAXLEN keeps the newest entries; MINID drops entries older than an ID",
+                ),
+                Field::text(
+                    "value",
+                    "MAXLEN: how many entries to keep · MINID: the oldest ID to keep",
+                ),
+            ],
+        );
+        self.form = Some(StreamForm::Trim { key, form });
+    }
+
+    /// A key while a form is open.
+    fn form_key(&mut self, key: KeyEvent, act: &mut Act<'_>) {
+        let Some(open) = self.form.as_mut() else {
+            return;
+        };
+        match open.form_mut().key(key) {
+            Step::Typed => {}
+            Step::Cancel => self.form = None,
+            Step::Submit => match open.op() {
+                Err(why) => act.error(why),
+                Ok(op) => {
+                    let sent = match &op {
+                        WriteOp::XAutoClaim { key, consumer, .. } => Sent::Claim {
+                            key: key.clone(),
+                            consumer: consumer.clone(),
+                        },
+                        _ => Sent::Trim {
+                            key: op.name_to_type(),
+                        },
+                    };
+                    self.form = None;
+                    self.send_write(op, sent, act);
+                }
+            },
+        }
+    }
+
+    fn send_write(&mut self, op: WriteOp, sent: Sent, act: &mut Act<'_>) {
+        if let Some(id) = act.write(op) {
+            self.write = Some((id, sent));
+        }
+    }
+
+    /// `A`: on a pending entry, acknowledges it; on a group or consumer, lists its
+    /// pending entries.
+    fn ack_or_list(&mut self, act: &mut Act<'_>) {
+        let Some(key) = self.selected().map(|r| r.key.clone()) else {
+            act.info("No stream selected.");
+            return;
+        };
+        let (group, consumer) = match self.detail_selected() {
+            Some(DetailRow::Pending(g, e)) => {
+                let op = WriteOp::XAck {
+                    key: key.clone(),
+                    group: g.name.clone(),
+                    id: e.id.clone(),
+                };
+                let sent = Sent::Ack {
+                    key,
+                    id: e.id.clone(),
+                };
+                self.send_write(op, sent, act);
+                return;
+            }
+            Some(DetailRow::Group(g)) => (g.name.clone(), None),
+            Some(DetailRow::Consumer(g, c)) => (g.name.clone(), Some(c.name.clone())),
+            None => {
+                act.info("Press tab and select a group or consumer: A lists its pending entries.");
+                return;
+            }
+        };
+        // Listing them is a read: it works on a read-only profile too.
+        if self.read_pending(key, group, consumer, act) {
+            act.info(if act.writes_off().is_some() {
+                "Listing the pending entries. Writes are off, so A can't acknowledge them."
+            } else {
+                "Listing the pending entries: select one and press A to acknowledge it."
+            });
+        }
+    }
+
+    /// Sends `XPENDING` for `group` (of `consumer`) of `key`. False when it can't.
+    fn read_pending(
+        &mut self,
+        key: String,
+        group: String,
+        consumer: Option<String>,
+        act: &mut Act<'_>,
+    ) -> bool {
+        let req = Request::Pending {
+            key,
+            group,
+            consumer,
+            refused: self.refused,
+        };
+        match act.send(LiveRequest::Streams(req)) {
+            Some(id) => {
+                self.pending_read = Some(id);
+                true
+            }
+            None => {
+                act.info("The live connection is not open, so the pending entries can't be read.");
+                false
+            }
+        }
+    }
+
+    /// After a write on `key`: read it again, with its pending list when one is shown.
+    fn reread_after(&mut self, key: &str, act: &mut Act<'_>) {
+        if let Some((k, p)) = self.pending_list.as_ref().filter(|(k, _)| k == key) {
+            let (k, g, c) = (k.clone(), p.group.clone(), p.consumer.clone());
+            self.read_pending(k, g, c, act);
+            return;
+        }
+        if self.in_flight(act) {
+            self.reread = true;
+        } else {
+            self.fetch(act);
+        }
+    }
+
+    /// The answer to the write in flight.
+    fn write_reply(&mut self, sent: Sent, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
+        let reply = match result {
+            Ok(LiveReply::Write(r)) => r,
+            Ok(_) => return,
+            Err(e) => {
+                write_failed(act, &e);
+                return;
+            }
+        };
+        match (&sent, reply) {
+            (Sent::Claim { consumer, .. }, WriteReply::Claimed { ids, deleted }) => {
+                let mut text = format!(
+                    "Claimed {} for {}.",
+                    form::count(ids.len() as i64, "entry", "entries"),
+                    escape(consumer)
+                );
+                if deleted > 0 {
+                    text.push_str(&format!(
+                        " {} no longer in the stream left the pending list.",
+                        form::count(deleted as i64, "entry", "entries")
+                    ));
+                }
+                act.info(text);
+            }
+            (Sent::Ack { id, .. }, WriteReply::Int(n)) => act.info(if n > 0 {
+                format!("Acknowledged {}.", escape(id))
+            } else {
+                format!("{} was not pending any more.", escape(id))
+            }),
+            (Sent::Trim { .. }, WriteReply::Int(n)) => act.info(if n > 0 {
+                format!("Trimmed {}.", form::count(n, "entry", "entries"))
+            } else {
+                "Trimmed 0 entries: with ~ the server removes whole blocks only.".to_string()
+            }),
+            _ => act.info("Done."),
+        }
+        self.reread_after(sent.key(), act);
+    }
+
+    /// The answer to an `XPENDING` read: the stream's row and its pending list.
+    fn pending_reply(&mut self, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
+        match result {
+            Ok(LiveReply::Streams(Reply::Info { streams, refused })) => {
+                self.refused = refused;
+                for mut f in streams {
+                    let pending = f.info.as_mut().and_then(|i| i.pending.take());
+                    if let Some(row) = self.rows.iter_mut().find(|r| r.key == f.key) {
+                        row.verdicts = f.info.as_ref().map(verdicts).unwrap_or_default();
+                        row.info = f.info;
+                    }
+                    match pending {
+                        Some(p) => {
+                            if let Some(why) = &p.error {
+                                act.error(form::sentence(why));
+                            }
+                            self.pending_list = Some((f.key, p));
+                        }
+                        None => {
+                            self.pending_list = None;
+                            act.info("The key is gone, or no longer a stream.");
+                        }
+                    }
+                }
+                self.detail_sel = self.detail_sel.min(self.details().len().saturating_sub(1));
+            }
+            Ok(_) => {}
+            Err(LiveError::Closed) => {}
+            Err(e) => act.error(form::sentence(&e.to_string())),
+        }
     }
 
     fn fetch(&mut self, act: &mut Act<'_>) {
@@ -298,7 +775,21 @@ impl ViewState for StreamsState {
         }
     }
 
+    fn input(&self) -> Option<Input> {
+        self.form.as_ref().and_then(|f| f.form().input())
+    }
+
+    fn on_paste(&mut self, text: &str, _act: &mut Act<'_>) {
+        if let Some(f) = self.form.as_mut() {
+            f.form_mut().paste(text);
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent, act: &mut Act<'_>) -> bool {
+        if self.form.is_some() {
+            self.form_key(key, act);
+            return true;
+        }
         if self.entries_open {
             if key.code == KeyCode::Esc {
                 self.entries_open = false;
@@ -326,6 +817,18 @@ impl ViewState for StreamsState {
             }
             KeyCode::Char('n' | 'f' | 'y') if plain(&key) => {
                 act.info("Press enter to list the selected stream's entries first.");
+                true
+            }
+            KeyCode::Char('c') if plain(&key) => {
+                self.open_claim(act);
+                true
+            }
+            KeyCode::Char('A') if plain(&key) => {
+                self.ack_or_list(act);
+                true
+            }
+            KeyCode::Char('X') if plain(&key) => {
+                self.open_trim(act);
                 true
             }
             KeyCode::Char('p') if plain(&key) => {
@@ -369,6 +872,18 @@ impl ViewState for StreamsState {
     }
 
     fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
+        if let Some((wid, _)) = &self.write
+            && *wid == id
+        {
+            let (_, sent) = self.write.take().expect("the write in flight");
+            self.write_reply(sent, result, act);
+            return;
+        }
+        if self.pending_read == Some(id) {
+            self.pending_read = None;
+            self.pending_reply(result, act);
+            return;
+        }
         // Only the answer to the request in flight; an older one is stale. Any other is
         // a page of entries, or stale too (the entries state checks).
         if self.pending != Some(id) {
@@ -500,6 +1015,7 @@ mod tests {
             entries_added: Some(length + 4),
             groups,
             notes: Vec::new(),
+            pending: None,
         }
     }
 
@@ -1149,5 +1665,291 @@ mod tests {
             &serde_json::to_string(report).unwrap(),
             MARK
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Writes (P3)
+    // -----------------------------------------------------------------------
+
+    use super::form::testing::{READ_ONLY, answer_anything, press, set_profile, type_text, writes};
+    use crate::live::write::Reply as WriteReply;
+    use crate::model::Env;
+    use crate::tui::app::confirm::Expect;
+
+    fn pending_entry(id: &str, consumer: &str, idle_ms: u64, deliveries: u64) -> PendingEntry {
+        PendingEntry {
+            id: id.into(),
+            consumer: consumer.into(),
+            idle_ms,
+            deliveries,
+        }
+    }
+
+    /// The answer to a `Request::Pending` for `orders`, group `billing`, consumer `b-1`.
+    fn pending_reply() -> Result<LiveReply, LiveError> {
+        let mut f = fetched().remove(0);
+        f.info.as_mut().unwrap().pending = Some(Pending {
+            group: "billing".into(),
+            consumer: Some("b-1".into()),
+            entries: vec![
+                pending_entry("1700000600000-0", "b-1", 46 * 60 * 1000, 3),
+                pending_entry("1700000610000-0", "b-1", 45 * 60 * 1000, 1),
+                pending_entry("1700000620000-0", "b-1", 45 * 60 * 1000, 1),
+            ],
+            error: None,
+        });
+        Ok(LiveReply::Streams(Reply::Info {
+            streams: vec![f],
+            refused: Refused::default(),
+        }))
+    }
+
+    /// Loaded, writes as `env`/`read_only`, the details focused on consumer `b-1`.
+    fn on_consumer(env: Env, read_only: Option<bool>) -> App {
+        let (mut app, _) = loaded();
+        set_profile(&mut app, env, read_only);
+        press(&mut app, KeyCode::Tab);
+        app.handle_key(ch('j'));
+        assert!(matches!(
+            app.views.streams.details()[app.views.streams.detail_sel],
+            DetailRow::Consumer(_, c) if c.name == "b-1"
+        ));
+        app
+    }
+
+    /// [`on_consumer`] with its pending entries listed and the first one selected.
+    fn on_pending(env: Env, read_only: Option<bool>) -> App {
+        let mut app = on_consumer(env, read_only);
+        let e = app.handle_key(ch('A'));
+        let reqs = testing::requests(&e);
+        let [(id, LiveRequest::Streams(req))] = &reqs[..] else {
+            panic!("{reqs:?}");
+        };
+        assert_eq!(
+            *req,
+            Request::Pending {
+                key: "orders".into(),
+                group: "billing".into(),
+                consumer: Some("b-1".into()),
+                refused: Refused::default(),
+            }
+        );
+        testing::reply(&mut app, *id, pending_reply());
+        app.handle_key(ch('j'));
+        app
+    }
+
+    fn streams_requests(effects: &[Effect]) -> Vec<Request> {
+        testing::requests(effects)
+            .into_iter()
+            .filter_map(|(_, r)| match r {
+                LiveRequest::Streams(s) => Some(s),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_lists_the_pending_entries_and_acks_the_selected_one() {
+        let mut app = on_pending(Env::Local, None);
+        let s = &app.views.streams;
+        assert_eq!(s.details().len(), 8);
+        assert!(matches!(
+            s.details()[s.detail_sel],
+            DetailRow::Pending(g, e) if g.name == "billing" && e.id == "1700000600000-0"
+        ));
+        insta::assert_snapshot!("pending_80x24", testing::render(&app, 80, 24).backend());
+        let e = app.handle_key(ch('A'));
+        assert!(app.confirm.is_none());
+        assert_eq!(
+            writes(&e),
+            vec![WriteOp::XAck {
+                key: "orders".into(),
+                group: "billing".into(),
+                id: "1700000600000-0".into(),
+            }]
+        );
+        let (id, _) = testing::requests(&e)[0].clone();
+        let e = testing::reply(&mut app, id, Ok(LiveReply::Write(WriteReply::Int(1))));
+        assert_eq!(notice(&app), "Acknowledged 1700000600000-0.");
+        // The stream and its pending list are read again.
+        assert!(matches!(
+            streams_requests(&e)[..],
+            [Request::Pending { .. }]
+        ));
+
+        let mut app = on_pending(Env::Prod, Some(false));
+        app.handle_key(ch('A'));
+        assert_eq!(app.confirm.as_ref().unwrap().expect, Expect::YesNo);
+        assert_eq!(writes(&app.handle_key(ch('y'))).len(), 1);
+    }
+
+    #[test]
+    fn c_claims_pending_entries_for_another_consumer() {
+        let mut app = on_consumer(Env::Local, None);
+        app.handle_key(ch('c'));
+        let f = app.views.streams.form.as_ref().expect("the form").form();
+        assert_eq!(f.value("to consumer"), "b-2");
+        assert_eq!(f.value("min idle ms"), "2700000");
+        assert_eq!(f.value("count"), "100");
+        insta::assert_snapshot!("claim_form_80x24", testing::render(&app, 80, 24).backend());
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        let e = press(&mut app, KeyCode::Enter);
+        assert!(app.confirm.is_none());
+        assert_eq!(
+            writes(&e),
+            vec![WriteOp::XAutoClaim {
+                key: "orders".into(),
+                group: "billing".into(),
+                consumer: "b-2".into(),
+                min_idle_ms: 2_700_000,
+                count: 100,
+            }]
+        );
+        let (id, _) = testing::requests(&e)[0].clone();
+        let e = testing::reply(
+            &mut app,
+            id,
+            Ok(LiveReply::Write(WriteReply::Claimed {
+                ids: vec!["1-0".into(), "2-0".into()],
+                deleted: 1,
+            })),
+        );
+        assert_eq!(
+            notice(&app),
+            "Claimed 2 entries for b-2. 1 entry no longer in the stream left the pending list."
+        );
+        assert!(matches!(streams_requests(&e)[..], [Request::Info { .. }]));
+
+        // On the list, c says where to go.
+        press(&mut app, KeyCode::Tab);
+        app.handle_key(ch('c'));
+        assert!(app.views.streams.form.is_none());
+        assert!(notice(&app).contains("Press tab"), "{}", notice(&app));
+    }
+
+    #[test]
+    fn the_claim_and_trim_forms_check_what_is_typed() {
+        let claim = |to: &str, idle: &str, count: &str| {
+            let f = Form::new(
+                "t",
+                vec![],
+                vec![
+                    Field::text("to consumer", "").with(to),
+                    Field::text("min idle ms", "").with(idle),
+                    Field::text("count", "").with(count),
+                ],
+            );
+            claim_op("s", "g", &f)
+        };
+        assert!(claim("", "0", "1").is_err());
+        assert!(claim("c", "x", "1").is_err());
+        assert!(claim("c", "0", "0").is_err());
+        assert!(claim("c", "0", "1").is_ok());
+        let trim = |by: &str, value: &str| {
+            let mut f = Form::new(
+                "t",
+                vec![],
+                vec![
+                    Field::choice("trim by", &["MAXLEN", "MINID"], ""),
+                    Field::text("value", "").with(value),
+                ],
+            );
+            f.fields[0].text = by.into();
+            trim_op("s", &f).map(|op| op.shown())
+        };
+        assert_eq!(trim("MAXLEN", "1000"), Ok("XTRIM s MAXLEN ~ 1000".into()));
+        assert!(trim("MAXLEN", "-1").is_err());
+        assert_eq!(
+            trim("MINID", "1700000000000-5"),
+            Ok("XTRIM s MINID ~ 1700000000000-5".into())
+        );
+        assert_eq!(trim("MINID", "17"), Ok("XTRIM s MINID ~ 17".into()));
+        for bad in ["", "abc", "1-", "-1", "1-2-3"] {
+            assert!(trim("MINID", bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn x_trims_after_asking_and_types_the_key_on_prod() {
+        let (mut app, _) = loaded();
+        set_profile(&mut app, Env::Local, None);
+        app.handle_key(ch('X'));
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "1000");
+        insta::assert_snapshot!("trim_form_80x24", testing::render(&app, 80, 24).backend());
+        let e = press(&mut app, KeyCode::Enter);
+        assert!(writes(&e).is_empty());
+        assert_eq!(app.confirm.as_ref().unwrap().expect, Expect::YesNo);
+        let e = app.handle_key(ch('y'));
+        assert_eq!(
+            writes(&e),
+            vec![WriteOp::XTrim {
+                key: "orders".into(),
+                trim: Trim::MaxLen(1000),
+            }]
+        );
+        let (id, _) = testing::requests(&e)[0].clone();
+        testing::reply(&mut app, id, Ok(LiveReply::Write(WriteReply::Int(4))));
+        assert_eq!(notice(&app), "Trimmed 4 entries.");
+
+        set_profile(&mut app, Env::Prod, Some(false));
+        app.handle_key(ch('X'));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "1700000000000");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.confirm.as_ref().unwrap().expect,
+            Expect::Type("orders".into())
+        );
+        type_text(&mut app, "orders");
+        let e = press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            writes(&e),
+            vec![WriteOp::XTrim {
+                key: "orders".into(),
+                trim: Trim::MinId("1700000000000".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn no_stream_write_reaches_a_read_only_profile() {
+        for (env, ro) in READ_ONLY {
+            // c and X: off before the form opens.
+            for k in ['c', 'X'] {
+                let mut app = on_consumer(env, ro);
+                let mut e = app.handle_key(ch(k));
+                assert!(app.views.streams.form.is_none() && app.confirm.is_none());
+                assert!(notice(&app).contains("read-only"), "{}", notice(&app));
+                e.extend(answer_anything(&mut app));
+                assert!(writes(&e).is_empty(), "{k} {env:?} {ro:?}");
+            }
+            // A lists the pending entries (a read), and acknowledges none.
+            let mut app = on_pending(env, ro);
+            let mut e = app.handle_key(ch('A'));
+            assert!(app.confirm.is_none());
+            assert!(notice(&app).contains("read-only"), "{}", notice(&app));
+            e.extend(answer_anything(&mut app));
+            assert!(writes(&e).is_empty(), "A {env:?} {ro:?}");
+        }
+    }
+
+    #[test]
+    fn the_form_takes_every_key_and_esc_closes_it() {
+        let (mut app, _) = loaded();
+        set_profile(&mut app, Env::Local, None);
+        app.handle_key(ch('X'));
+        press(&mut app, KeyCode::Tab);
+        // Digits and q are text here, not views or quitting.
+        type_text(&mut app, "12q");
+        assert_eq!(app.screen(), Screen::Streams);
+        let f = app.views.streams.form.as_ref().unwrap().form();
+        assert_eq!(f.value("value"), "12q");
+        assert!(format!("{:?}", app.views.streams).contains("value: <3 chars>"));
+        let e = press(&mut app, KeyCode::Esc);
+        assert!(writes(&e).is_empty() && app.views.streams.form.is_none());
     }
 }

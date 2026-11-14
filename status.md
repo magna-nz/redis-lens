@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** Redis Insight parity phase 2 (values on screen): merged to main as [#16](https://github.com/magna-nz/redis-lens/pull/16) at `8bb87d8`, before the command line's review fixes; those are in [#17](https://github.com/magna-nz/redis-lens/pull/17) (branch `phase2/command-line-gate-fixes`). Phase 1 merged to main (#15).
-**Last updated:** 2026-11-14 (phase 2 merged as #16; command line gate fixes in #17, verified)
+**Current milestone:** Redis Insight parity phase 3 (writes), in one PR: [#18](https://github.com/magna-nz/redis-lens/pull/18), branch `claude/insight-phase3-e6291e`. Phase 2 merged to main (#16), and its command-line gate fixes (#17).
+**Last updated:** 2026-11-14 (phase 3: all five parts built, in #18; the verifier's findings fixed)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -467,3 +467,40 @@ Built unattended on `phase2/values-on-screen`, one PR for the whole phase ([#16]
 - **Main's Redis 6.2 integration job has failed since #15** (`keys_it` expected `listpack`; Redis 6.2 says `ziplist`). Fixed here in `5ded47e`, with the container helper now asking again for a port Docker has not published yet (the known flake).
 - CI flake fixed on the way: `conn::ssh` test `a_cancelled_start_kills_ssh` cancelled after a fixed 300 ms, before a loaded runner had started the fake ssh (`8d8e788`).
 - Streams and Search keep the same key bar in every mode (entries, document, explain), since `keymap::footer` only knows the screen.
+
+## Phase 3 (2026-11-14): writes
+
+Built unattended on `claude/insight-phase3-e6291e`, one PR for the phase ([#18](https://github.com/magna-nz/redis-lens/pull/18)). Not merged: the owner merges. #17 (command-line gate fixes) was merged into this branch before Part 5, since both edit the command-line files, and is now on main too.
+
+| Part | Content | Commits | State |
+|---|---|---|---|
+| 1 | The write gate (`src/write.rs`: `WriteOp`, `decide`, `Permit`), `LiveRequest::Write` and `src/live/write.rs`, the one confirm dialog (`src/tui/confirm.rs`), `ACL DRYRUN` probes, `w`, `conn set --writes`, `conn add --writes`, `[settings] skip_non_prod_confirm` | `ce271bd`, CI fix and `ACL DRYRUN` tests `2dfc3ff` | **done** |
+| 2 | Key edits on the Key detail (`e + t R d D`) and `N` on the key list, `$EDITOR` for big values | `2624159` (with part 3) | **done** |
+| 3 | Bulk expire and delete (`x`, `D` on Patterns), `redis-lens expire` | `2624159` (with part 2) | **done** |
+| 4 | Clients `K`, Slow log `c`/`R`, Streams `A`/`c`/`X`, Pub/Sub `P`, Search `C`/`D` | `491f373` | **done** |
+| 5 | Write commands on the command line, through the gate | `d1044e1` | **done** |
+
+Tests on Redis 7.4, Valkey 8.1 and Redis 6.2: `acl_dryrun_it`, `write_keys_it`, `bulk_it`, `write_views_it`, `cmdline_write_it`, plus unit tests that no write reaches the connection on a read-only profile for every action.
+
+### Decisions taken alone (phase 3)
+
+- **Keys:** acknowledging a stream entry is `A`, not `a` (the global Add key); publishing is `P`, not `p` (pauses polling).
+- **`skip_non_prod_confirm` never applies to bulk actions**, nor to `w` / `conn set`.
+- **Turning writes on asks only when the profile is read-only now.** `conn add --writes on` on a non-prod profile doesn't ask. Off never asks and applies at once in the TUI (before the config file is saved).
+- **One write at a time** over the session's multiplexed connection (a process-wide lock in `live::write`), since `WATCH` holds for the whole connection. Bulk batches don't use `WATCH`.
+- **String edits need the whole value loaded**; JSON needs an uncut document; streams and vector sets are not edited.
+- **`ACL DRYRUN`:** a write refused only for the probe's key or channel reads as "checked by the server on use"; a command the server lacks (no Search module) likewise. The Writes row on Connections counts writes the server refuses.
+- **`RENAME` counts as destructive** on the command line, and so do the pops, `LTRIM`, `ZREMRANGEBY*`, `GETDEL`, the moves (`LMOVE`, `SMOVE`, `MOVE`, `COPY`, `RESTORE`), `BITOP` and the `*STORE` commands, `EXPIRE`/`PEXPIRE`/`HEXPIRE`/`HPEXPIRE` and `GETEX`/`SET … EX|PX` with a time that isn't positive, the `*AT` forms and `EXAT`/`PXAT` always (the time may be past, so `SET k v EXAT …` asks), `XGROUP DESTROY|DELCONSUMER`, and `XDELEX`, `XACKDEL`, `VREM`, `DELIFEQ`, `DELEX`. On prod the typed name for a typed command is its key when it names exactly one non-empty key, else the profile's name (`DEL a b c`).
+- **`MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`, `SYNC`, `PSYNC`, `READONLY`, `READWRITE` and `CLIENT SETNAME|SETINFO|TRACKING|CACHING|NO-TOUCH|NO-EVICT` are refused** on the command line, writes on included: they change the connection every view (and `live::write`'s `WATCH`) shares.
+- **One question at a time:** a write asked while another question is open is not sent and says so; a bulk run doesn't open its question over another, and `esc` ends a bulk run whose question was closed elsewhere.
+- **Bulk:** the run scans again (the dry run is a forecast); key-file names escaped (`\n`, `\u{XXXX}` …); off on a replica target as well as a cluster; `redis-lens expire` refuses a read-only profile even without `--apply`, never asks the pattern on the terminal, and has `--max-rate`.
+- **Clients `K`** refuses only the connection that read `CLIENT LIST` (last command `client|list`, idle 0); the Pub/Sub tail and Monitor connections are not recognised.
+- **Streams:** `A` on a group or consumer lists its pending entries (a read, so on read-only profiles too); `XAUTOCLAIM` takes any consumer's idle entries, and the form says so.
+- **Command line:** a command without the `readonly` flag is a write (`Gate::Write`); #17's refusals (scripts, unlisted module commands, `POST`/`HOST:`, containers on 6.2) stay on every profile, writes on included. `WriteOp::invalid` runs the panel's gate again.
+
+### Open questions and leftovers (phase 3)
+
+- **Allow-list for `INFO`, `PING`, `TIME`, `CLIENT LIST`, `CONFIG GET` … on the command line** (from phase 2): still the owner's call. With phase 3 they count as writes, so they are sent only where writes are on (with the write gate's question on prod), and still not on a read-only profile.
+- From the verifier, left as they are: a set member replace (`SREM` + `SADD`) and a list element delete (`LSET` + `LREM`) are checked against the server's refusals by one command name only (`SADD`, `LREM`), so a user refused only the other one gets the server's error on use; `redis-lens expire` without `--apply` on a read-only profile exits 2 (it refuses before counting) where a dry run could have been allowed; the `ACL DRYRUN` probes at connect are not counted by the command budget (a fixed handful, once per connect).
+- `$EDITOR` was not driven in a real terminal; only the file handling and command are tested (with `sh`).
+- Between `PTTL` and `EXPIRE … NX`, a key can get a TTL from elsewhere; it is still listed in the key file, so `PERSIST` from the file would remove that TTL.

@@ -1172,17 +1172,218 @@ pub async fn check_view_permissions<C: ConnectionLike + Send>(conn: &mut C) -> V
     checks
 }
 
-/// [`check_permissions`] followed by [`check_view_permissions`]: what the TUI checks on
-/// connect. The scan command and `conn test` use [`check_permissions`] alone.
+/// The label of the `ACL DRYRUN` probe (spec "Permission check, additions", P3):
+/// allowed when `ACL DRYRUN` answers, skipped ("checked by the server on use") when it
+/// is refused, unknown (before Redis 7.0) or `ACL WHOAMI` is refused.
+pub const PERM_ACL_DRYRUN: &str = "ACL DRYRUN";
+
+/// What writes read as when `ACL DRYRUN` can't tell.
+pub const WRITES_CHECKED_ON_USE: &str = "checked by the server on use";
+
+/// The write commands `ACL DRYRUN` asks about, after [`PERM_ACL_DRYRUN`]: the label of
+/// each one's check (`write <name>`), its name as [`crate::write::WriteOp::command`]
+/// gives it, and the arguments asked about (on the key `redis-lens:probe`; `ACL
+/// DRYRUN` runs nothing).
+pub const WRITE_PROBES: [(&str, &str, &[&str]); 29] = [
+    ("write SET", "SET", &["SET", PROBE_KEY, "v"]),
+    ("write HSET", "HSET", &["HSET", PROBE_KEY, "f", "v"]),
+    ("write HSETNX", "HSETNX", &["HSETNX", PROBE_KEY, "f", "v"]),
+    ("write LSET", "LSET", &["LSET", PROBE_KEY, "0", "v"]),
+    ("write RPUSH", "RPUSH", &["RPUSH", PROBE_KEY, "v"]),
+    ("write SADD", "SADD", &["SADD", PROBE_KEY, "v"]),
+    ("write ZADD", "ZADD", &["ZADD", PROBE_KEY, "1", "v"]),
+    ("write XADD", "XADD", &["XADD", PROBE_KEY, "*", "f", "v"]),
+    (
+        "write JSON.SET",
+        "JSON.SET",
+        &["JSON.SET", PROBE_KEY, "$", "1"],
+    ),
+    ("write EXPIRE", "EXPIRE", &["EXPIRE", PROBE_KEY, "1"]),
+    ("write PERSIST", "PERSIST", &["PERSIST", PROBE_KEY]),
+    (
+        "write HEXPIRE",
+        "HEXPIRE",
+        &["HEXPIRE", PROBE_KEY, "1", "FIELDS", "1", "f"],
+    ),
+    (
+        "write HPERSIST",
+        "HPERSIST",
+        &["HPERSIST", PROBE_KEY, "FIELDS", "1", "f"],
+    ),
+    (
+        "write RENAMENX",
+        "RENAMENX",
+        &["RENAMENX", PROBE_KEY, "redis-lens:probe2"],
+    ),
+    ("write HDEL", "HDEL", &["HDEL", PROBE_KEY, "f"]),
+    ("write SREM", "SREM", &["SREM", PROBE_KEY, "v"]),
+    ("write ZREM", "ZREM", &["ZREM", PROBE_KEY, "v"]),
+    ("write XDEL", "XDEL", &["XDEL", PROBE_KEY, "1-0"]),
+    ("write LREM", "LREM", &["LREM", PROBE_KEY, "1", "v"]),
+    ("write UNLINK", "UNLINK", &["UNLINK", PROBE_KEY]),
+    (
+        "write CLIENT KILL",
+        "CLIENT KILL",
+        &["CLIENT", "KILL", "ID", "1"],
+    ),
+    (
+        "write CONFIG SET",
+        "CONFIG SET",
+        &["CONFIG", "SET", "slowlog-max-len", "128"],
+    ),
+    (
+        "write SLOWLOG RESET",
+        "SLOWLOG RESET",
+        &["SLOWLOG", "RESET"],
+    ),
+    (
+        "write XAUTOCLAIM",
+        "XAUTOCLAIM",
+        &["XAUTOCLAIM", PROBE_KEY, "g", "c", "0", "0-0"],
+    ),
+    ("write XACK", "XACK", &["XACK", PROBE_KEY, "g", "1-0"]),
+    (
+        "write XTRIM",
+        "XTRIM",
+        &["XTRIM", PROBE_KEY, "MAXLEN", "~", "1"],
+    ),
+    (
+        "write PUBLISH",
+        "PUBLISH",
+        &["PUBLISH", "redis-lens:probe", "m"],
+    ),
+    (
+        "write FT.CREATE",
+        "FT.CREATE",
+        &["FT.CREATE", "redis-lens:probe", "SCHEMA", "f", "TEXT"],
+    ),
+    (
+        "write FT.DROPINDEX",
+        "FT.DROPINDEX",
+        &["FT.DROPINDEX", "redis-lens:probe"],
+    ),
+];
+
+/// What one `ACL DRYRUN` answer means: `OK` allowed; a message that the user may not
+/// run the command, denied (fixed text, never the message, which names the user); a
+/// message about a key or channel, or an error (a command the server doesn't have),
+/// not known until the command is used.
+fn classify_dryrun(name: &str, v: &redis::Value) -> PermStatus {
+    match v {
+        redis::Value::Okay => PermStatus::Allowed,
+        redis::Value::SimpleString(s) if s.eq_ignore_ascii_case("ok") => PermStatus::Allowed,
+        redis::Value::BulkString(b) if b.eq_ignore_ascii_case(b"ok") => PermStatus::Allowed,
+        redis::Value::BulkString(b) => {
+            let text = String::from_utf8_lossy(b).to_ascii_lowercase();
+            if text.contains("to run the") {
+                PermStatus::Denied(noperm_text(name))
+            } else {
+                PermStatus::Skipped(WRITES_CHECKED_ON_USE.to_string())
+            }
+        }
+        _ => PermStatus::Skipped(WRITES_CHECKED_ON_USE.to_string()),
+    }
+}
+
+/// The `ACL DRYRUN` probe: `ACL WHOAMI` (the name is used for the probe only, never
+/// kept or shown), then one pipeline of `ACL DRYRUN <user> <command>` for each of
+/// [`WRITE_PROBES`]. Without `ACL DRYRUN` (refused, or before Redis 7.0) it is one
+/// skipped check and writes are checked by the server on use.
+pub async fn check_write_permissions<C: ConnectionLike + Send>(conn: &mut C) -> Vec<PermCheck> {
+    let skipped = || {
+        vec![PermCheck {
+            label: PERM_ACL_DRYRUN,
+            status: PermStatus::Skipped(WRITES_CHECKED_ON_USE.to_string()),
+        }]
+    };
+    let user: Result<redis::Value, _> = redis::cmd("ACL").arg("WHOAMI").query_async(conn).await;
+    let user = match user {
+        Ok(redis::Value::BulkString(b)) => b,
+        Ok(redis::Value::SimpleString(s)) => s.into_bytes(),
+        _ => return skipped(),
+    };
+    let mut pipe = redis::pipe();
+    pipe.ignore_errors();
+    for (_, _, args) in WRITE_PROBES {
+        let c = pipe.cmd("ACL").arg("DRYRUN").arg(user.as_slice());
+        for a in args {
+            c.arg(*a);
+        }
+    }
+    let replies: Vec<redis::Value> = match pipe.query_async(conn).await {
+        Ok(r) => r,
+        Err(_) => return skipped(),
+    };
+    // The first answer tells whether `ACL DRYRUN` itself works here.
+    let works = replies.first().is_some_and(|v| {
+        matches!(
+            v,
+            redis::Value::Okay | redis::Value::SimpleString(_) | redis::Value::BulkString(_)
+        )
+    });
+    if !works || replies.len() != WRITE_PROBES.len() {
+        return skipped();
+    }
+    let mut checks = vec![PermCheck {
+        label: PERM_ACL_DRYRUN,
+        status: PermStatus::Allowed,
+    }];
+    for ((label, name, _), v) in WRITE_PROBES.iter().zip(&replies) {
+        checks.push(PermCheck {
+            label,
+            status: classify_dryrun(name, v),
+        });
+    }
+    checks
+}
+
+/// True for the labels of [`check_write_permissions`]: shown as one Writes line, not
+/// in the permission list.
+pub fn is_write_probe(label: &str) -> bool {
+    label == PERM_ACL_DRYRUN || WRITE_PROBES.iter().any(|(l, _, _)| *l == label)
+}
+
+/// [`check_permissions`], [`check_view_permissions`] and [`check_write_permissions`]:
+/// what the TUI checks on connect. The scan command and `conn test` use [`check_permissions`] alone.
 pub async fn check_all_permissions<C: ConnectionLike + Send>(conn: &mut C) -> PermissionReport {
     let mut report = check_permissions(conn).await;
     report.checks.extend(check_view_permissions(conn).await);
+    report.checks.extend(check_write_permissions(conn).await);
     report
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dryrun_answers_read_in_redis_lens_words() {
+        let bulk = |s: &str| redis::Value::BulkString(s.as_bytes().to_vec());
+        assert_eq!(
+            classify_dryrun("SET", &redis::Value::Okay),
+            PermStatus::Allowed
+        );
+        assert_eq!(classify_dryrun("SET", &bulk("OK")), PermStatus::Allowed);
+        let denied = classify_dryrun(
+            "HSET",
+            &bulk("User lens-rw has no permissions to run the 'hset' command"),
+        );
+        assert_eq!(
+            denied,
+            PermStatus::Denied("NOPERM HSET is not allowed for this user".into())
+        );
+        assert_eq!(
+            classify_dryrun(
+                "HSET",
+                &bulk("User lens-rw has no permissions to access the 'redis-lens:probe' key")
+            ),
+            PermStatus::Skipped(WRITES_CHECKED_ON_USE.into())
+        );
+        assert!(is_write_probe("write HSET") && is_write_probe(PERM_ACL_DRYRUN));
+        assert!(!is_write_probe(PERM_SLOWLOG));
+        let labels: std::collections::HashSet<_> = WRITE_PROBES.iter().map(|p| p.0).collect();
+        assert_eq!(labels.len(), WRITE_PROBES.len());
+    }
 
     #[test]
     fn view_probes_read_in_redis_lens_words() {

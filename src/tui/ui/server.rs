@@ -40,6 +40,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
         Screen::Monitor => monitor(frame, area, &state.monitor, ctx),
         _ => super::not_built(frame, area, ctx.screen.name(), ctx),
     }
+    if ctx.screen == Screen::SlowLog
+        && let (Some(form), Some(sends)) = (&state.form, state.form_sends())
+    {
+        super::streams::draw_form(frame, area, form, &sends, ctx);
+    }
 }
 
 /// Draws a notice instead of the panel when it is off, or has nothing yet. True when it

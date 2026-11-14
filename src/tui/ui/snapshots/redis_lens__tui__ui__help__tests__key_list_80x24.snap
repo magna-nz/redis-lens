@@ -1,16 +1,16 @@
 ---
 source: src/tui/ui/help.rs
-assertion_line: 100
+assertion_line: 96
 expression: "render(Screen::KeyList, 80, 24).backend()"
 ---
 "                                                                                "
 "                                                                                "
-"       ┌─ Keys · Patterns · key list ───────────────────────────────────┐       "
+"       ┌─ Keys · Patterns · key list ───────────────── ? or esc closes ─┐       "
 "       │Everywhere                                                      │       "
 "       │0-6            Switch view, 0 Connections to 6 Search           │       "
 "       │?              Show or hide this key list                       │       "
 "       │a              Add a connection                                 │       "
-"       │:              Open the command line for readonly commands      │       "
+"       │:              Open the command line                            │       "
 "       │q ctrl-c       Quit                                             │       "
 "       │Patterns · key list                                             │       "
 "       │↑↓ j k         Move the selection                               │       "
@@ -22,8 +22,8 @@ expression: "render(Screen::KeyList, 80, 24).backend()"
 "       │enter          Show the selected key and its value              │       "
 "       │y              Copy the selected key name to the clipboard      │       "
 "       │esc            Clear the filter, or go back to Patterns         │       "
-"       │                                                                │       "
-"       │? or esc closes                                                 │       "
+"       │N              Add a key                                        │       "
 "       └────────────────────────────────────────────────────────────────┘       "
+"                                                                                "
 "                                                                                "
 "                                                                                "

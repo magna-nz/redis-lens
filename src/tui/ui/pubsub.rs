@@ -28,6 +28,13 @@ const TIME_W: usize = 12;
 /// Draws the screen `ctx.screen` of this view into `area`, the body between the
 /// header and the key bar.
 pub fn draw(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
+    draw_view(frame, area, state, ctx);
+    if let (Some(form), Some(sends)) = (&state.publish, state.form_sends()) {
+        super::streams::draw_form(frame, area, form, &sends, ctx);
+    }
+}
+
+fn draw_view(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
     const TITLE: &str = "Pub/Sub";
     if let Some(off) = &state.off {
         let lines = vec![Line::from(Span::styled(

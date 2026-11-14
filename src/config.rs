@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::model::Profile;
+pub use crate::write::Settings;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -32,6 +33,9 @@ pub enum ConfigError {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
+    /// `[settings]`: absent from the file while every setting is at its default.
+    #[serde(default, skip_serializing_if = "Settings::is_default")]
+    pub settings: Settings,
     #[serde(default, rename = "profile")]
     pub profiles: Vec<Profile>,
 }
@@ -117,6 +121,19 @@ impl Config {
                 Ok(())
             }
         }
+    }
+
+    /// Turns writes on or off for profile `name` (spec "Write permissions": `w`,
+    /// `conn set --writes`): `read_only` is set to `true` or `false`, and nothing else
+    /// changes. Returns the profile as changed.
+    pub fn set_writes(&mut self, name: &str, on: bool) -> Result<Profile, ConfigError> {
+        let p = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.name == name)
+            .ok_or_else(|| ConfigError::NotFound(name.to_string()))?;
+        p.read_only = Some(!on);
+        Ok(p.clone())
     }
 
     pub fn remove(&mut self, name: &str) -> Result<Profile, ConfigError> {
@@ -325,6 +342,38 @@ mod tests {
         assert_eq!((t.host.as_str(), t.port), ("jump", None));
         assert_eq!((t.identity_file, t.known_hosts_file), (None, None));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn settings_and_writes_round_trip_and_touch_nothing_else() {
+        let dir = temp_dir("writes");
+        let path = dir.join("config.toml");
+        let mut c = Config::default();
+        c.add(profile("a", 6379), false).unwrap();
+        c.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("settings"), "{text}");
+        let before = Config::load(&path).unwrap();
+        let mut c = before.clone();
+        let p = c.set_writes("a", true).unwrap();
+        assert_eq!(p.read_only, Some(false));
+        assert!(matches!(
+            c.set_writes("nope", true),
+            Err(ConfigError::NotFound(_))
+        ));
+        c.settings.skip_non_prod_confirm = true;
+        c.save(&path).unwrap();
+        let after = Config::load(&path).unwrap();
+        assert!(after.settings.skip_non_prod_confirm);
+        let mut expect = before.profiles[0].clone();
+        expect.read_only = Some(false);
+        assert_eq!(after.profiles, vec![expect]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("[settings]") && text.contains("read_only = false"),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

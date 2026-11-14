@@ -164,11 +164,9 @@ async fn a_write_is_refused_and_never_sent(server: &common::TestServer) {
         .await
         .unwrap();
     let mut c = server.admin().await;
+    // A write goes to the write gate (cmdline_write_it.rs), never to this runner.
     let (g, set) = decide(&mut c, "SET k after").await;
-    let Gate::Refuse(why) = g else {
-        panic!("{g:?}")
-    };
-    assert!(why.contains("SET is not a readonly command"), "{why}");
+    assert_eq!(g, Gate::Write);
     // Even when the panel would ask the runner anyway, confirmed or with another
     // command's flags, nothing is sent.
     let e = send(&mut c, "SET k after", set.unwrap(), true)
@@ -189,10 +187,12 @@ async fn a_write_is_refused_and_never_sent(server: &common::TestServer) {
     );
     let (g, _) = decide(&mut c, "BLPOP q 0").await;
     assert!(matches!(g, Gate::Refuse(_)), "{g:?}");
+    // No readonly flag: writes, for the write gate.
     let (g, _) = decide(&mut c, "FLUSHDB").await;
-    assert!(matches!(g, Gate::Refuse(_)), "{g:?}");
+    assert_eq!(g, Gate::Write);
+    // Before Redis 7.0 the server lists no subcommand flags: refused there.
     let (g, _) = decide(&mut c, "CONFIG GET maxmemory").await;
-    assert!(matches!(g, Gate::Refuse(_)), "{g:?}");
+    assert!(matches!(g, Gate::Refuse(_) | Gate::Write), "{g:?}");
     let (g, _) = decide(&mut c, "NOSUCHCOMMAND x").await;
     assert!(
         matches!(&g, Gate::Refuse(w) if w.contains("no command NOSUCHCOMMAND")),
@@ -240,8 +240,10 @@ async fn scripts_are_refused_and_never_sent(server: &common::TestServer) {
         );
     }
     assert!(len().await >= before, "the slow log was reset");
+    // Never sent as a read: a write for the write gate where the server lists the
+    // subcommand's flags, refused before Redis 7.0.
     let (g, _) = decide(&mut c, "MEMORY PURGE").await;
-    assert!(matches!(g, Gate::Refuse(_)), "{g:?}");
+    assert!(matches!(g, Gate::Refuse(_) | Gate::Write), "{g:?}");
     let (g, _) = decide(&mut c, "MEMORY USAGE x").await;
     assert_eq!(g, Gate::Send);
 }

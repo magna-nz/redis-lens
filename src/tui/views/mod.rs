@@ -92,6 +92,7 @@ use crate::live::pubsub::Subscription;
 use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::{PermStatus, PermissionReport, Profile, ScanReport, ServerInfo, ServerMode};
 use crate::tui::clipboard::CopyText;
+use crate::write::{Answer, Decision, Permit, Settings, WriteOp};
 
 use super::{Effect, Notice, Screen, Session, copy_checked};
 
@@ -279,6 +280,8 @@ pub struct Ctx<'a> {
     /// Ticks since the selection last changed, for `widgets::pad_r_marquee`. Counts
     /// only selections `App` sees; a view that keeps its own selection tracks its own.
     pub sel_ticks: u64,
+    /// `[settings]` from the config file, for the write gate.
+    pub settings: &'a Settings,
 }
 
 impl<'a> Ctx<'a> {
@@ -291,6 +294,7 @@ impl<'a> Ctx<'a> {
         now: Option<Instant>,
         page: usize,
         sel_ticks: u64,
+        settings: &'a Settings,
     ) -> Self {
         Self {
             screen,
@@ -300,7 +304,23 @@ impl<'a> Ctx<'a> {
             now,
             page,
             sel_ticks,
+            settings,
         }
+    }
+
+    /// What the write gate would do with `op` now (spec "Write permissions"): for a
+    /// view to say ahead of time that a write is off, and why. [`Act::write`] asks the
+    /// gate again when the key is pressed.
+    pub fn write_decision(&self, op: &WriteOp) -> Decision {
+        crate::write::decide_op(op, self.profile(), self.settings, &self.session.refusals)
+    }
+
+    /// Why writes are off on this profile, when they are: the read-only reason. `None`
+    /// when writes are on (each action may still ask, or be refused by the server).
+    pub fn writes_off(&self) -> Option<String> {
+        self.profile()
+            .is_read_only()
+            .then(|| crate::write::read_only_reason(self.profile()))
     }
 
     pub fn profile(&self) -> &'a Profile {
@@ -379,6 +399,21 @@ pub struct Act<'a> {
     effects: Vec<Effect>,
     next_tail: &'a mut u64,
     tail: Option<TailCmd>,
+    /// The writes sent, by request: their command names, so a `NOPERM` answer turns
+    /// the action off ([`crate::write::Refusals`]).
+    writes: &'a mut HashMap<ReqId, String>,
+    /// A write that waits for the user's answer, for `App` to ask.
+    ask: Option<WriteAsk>,
+}
+
+/// A write [`Act::write`] could not send without asking: `App` shows the question, and
+/// sends it (or answers the view [`crate::live::CANCELLED`]) with this id.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct WriteAsk {
+    pub id: ReqId,
+    pub owner: Owner,
+    pub op: WriteOp,
+    pub decision: Decision,
 }
 
 impl<'a> Deref for Act<'a> {
@@ -397,6 +432,7 @@ impl<'a> Act<'a> {
         pending: &'a mut HashMap<ReqId, Owner>,
         notice: &'a mut Option<Notice>,
         next_tail: &'a mut u64,
+        writes: &'a mut HashMap<ReqId, String>,
     ) -> Self {
         Self {
             ctx,
@@ -407,12 +443,79 @@ impl<'a> Act<'a> {
             effects: Vec::new(),
             next_tail,
             tail: None,
+            writes,
+            ask: None,
         }
     }
 
-    /// The effects asked for, and what was asked of the live tail.
-    pub(super) fn into_parts(self) -> (Vec<Effect>, Option<TailCmd>) {
-        (self.effects, self.tail)
+    /// The effects asked for, what was asked of the live tail, and a write that waits
+    /// for an answer.
+    pub(super) fn into_parts(self) -> (Vec<Effect>, Option<TailCmd>, Option<WriteAsk>) {
+        (self.effects, self.tail, self.ask)
+    }
+
+    /// Sends `op` through the write gate (spec "Write permissions"), the only way a
+    /// view writes. Returns the request's id, whose answer comes to
+    /// [`ViewState::on_reply`] as `Ok(LiveReply::Write(_))`, or `Err`:
+    /// [`LiveError::Failed`] with [`crate::live::CANCELLED`] when the user said no.
+    ///
+    /// - Refused (a read-only profile, a command the server refused, an op that is not
+    ///   well formed): nothing is sent, the reason is shown as an error notice, and
+    ///   `None`. Also `None` while the live connection is not ready.
+    /// - Sent now, when the table says it runs.
+    /// - Otherwise `App` asks first (`y`/`n`, or a name typed), with the profile and
+    ///   the exact command, and sends it only on the answer the gate wants.
+    pub fn write(&mut self, op: WriteOp) -> Option<ReqId> {
+        if !self.ctx.live_ready() {
+            self.error("Not sent: the live connection is not open.");
+            return None;
+        }
+        if self.ask.is_some() {
+            self.error("Not sent: answer the open question first.");
+            return None;
+        }
+        let decision = self.ctx.write_decision(&op);
+        match decision {
+            Decision::Refuse(why) => {
+                self.error(why);
+                None
+            }
+            Decision::Run => {
+                let ctx = self.ctx;
+                match Permit::grant(
+                    op,
+                    ctx.profile(),
+                    ctx.settings,
+                    &ctx.session.refusals,
+                    &Answer::None,
+                ) {
+                    Ok(permit) => self.send_permit(permit),
+                    Err(why) => {
+                        self.error(why);
+                        None
+                    }
+                }
+            }
+            Decision::Ask | Decision::Type(_) => {
+                let id = ReqId(*self.next_req);
+                *self.next_req += 1;
+                self.pending.insert(id, self.owner);
+                self.ask = Some(WriteAsk {
+                    id,
+                    owner: self.owner,
+                    op,
+                    decision,
+                });
+                Some(id)
+            }
+        }
+    }
+
+    fn send_permit(&mut self, permit: Permit) -> Option<ReqId> {
+        let name = permit.op().command();
+        let id = self.send(LiveRequest::Write(permit))?;
+        self.writes.insert(id, name);
+        Some(id)
     }
 
     /// Starts the Pub/Sub live tail on `to`, on a connection of its own (spec "5

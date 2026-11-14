@@ -46,6 +46,7 @@ use crate::{diff, snapshot};
 
 pub mod app;
 pub mod clipboard;
+pub mod editor;
 pub mod keymap;
 pub mod tree;
 pub mod ui;
@@ -103,9 +104,24 @@ pub async fn run(config: Option<PathBuf>) -> anyhow::Result<()> {
 fn spawn_input_thread(tx: Tx) {
     std::thread::spawn(move || {
         loop {
-            let msg = match crossterm::event::read() {
-                Ok(ev) => Incoming::Input(ev),
-                Err(e) => Incoming::InputFailed(e.to_string()),
+            // While `$EDITOR` runs (editor.rs) the terminal is the editor's: don't read.
+            if editor::INPUT_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            let msg = {
+                let _gate = editor::INPUT_GATE.lock().unwrap_or_else(|e| e.into_inner());
+                if editor::INPUT_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                match crossterm::event::poll(Duration::from_millis(50)) {
+                    Ok(false) => continue,
+                    Ok(true) => match crossterm::event::read() {
+                        Ok(ev) => Incoming::Input(ev),
+                        Err(e) => Incoming::InputFailed(e.to_string()),
+                    },
+                    Err(e) => Incoming::InputFailed(e.to_string()),
+                }
             };
             let failed = matches!(msg, Incoming::InputFailed(_));
             if tx.send(msg).is_err() || failed {
@@ -122,7 +138,11 @@ async fn event_loop(
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut app = match loaded {
-        Ok(cfg) => App::new(cfg.profiles),
+        Ok(cfg) => {
+            let mut app = App::new(cfg.profiles);
+            app.settings = cfg.settings;
+            app
+        }
         Err(e) => {
             let mut app = App::new(Vec::new());
             app.set_error(conn::parse::mask(&e.to_string()));
@@ -138,8 +158,13 @@ async fn event_loop(
     loop {
         for effect in pending.drain(..) {
             // A copy goes to the same output the frames are drawn to, between frames.
+            let editor = matches!(effect, Effect::Editor(_));
             if runner.run(effect, terminal.backend_mut()) {
                 return Ok(());
+            }
+            if editor {
+                // Back from `$EDITOR`: draw the whole screen again.
+                terminal.clear()?;
             }
         }
         let mut list_rows = 0;
@@ -499,6 +524,17 @@ impl Runner {
                     send(&tx, msg);
                 }
             }
+            Effect::Editor(job) => {
+                // Blocks the event loop while the editor runs: nothing is drawn then.
+                let result = editor::run(&job, out);
+                send(
+                    &tx,
+                    Msg::Edited {
+                        job: job.id,
+                        result,
+                    },
+                );
+            }
             Effect::DiscoverDocker => {
                 tokio::spawn(async move {
                     let msg = match conn::docker::discover().await {
@@ -527,6 +563,20 @@ impl Runner {
                     tx,
                     Arc::clone(&self.live),
                 )));
+            }
+            Effect::SetWrites { name, on } => {
+                let path = self.path.clone();
+                tokio::task::spawn_blocking(move || {
+                    let msg = match save_writes(&path, &name, on) {
+                        Ok(()) => Msg::WritesSaved { name, on },
+                        Err(e) => Msg::WritesFailed {
+                            name,
+                            on,
+                            error: e.to_string(),
+                        },
+                    };
+                    send(&tx, msg);
+                });
             }
             Effect::SaveConnection {
                 profile,
@@ -611,6 +661,15 @@ fn load_trend(dir: &Path, report: &ScanReport) -> Result<snapshot::Trend, snapsh
     )?;
     reports.push(report.clone());
     Ok(snapshot::trend(&reports))
+}
+
+/// `w` on Connections: `read_only` of profile `name` in the config file, and nothing
+/// else (spec "0 Connections, additions").
+fn save_writes(path: &Path, name: &str, on: bool) -> anyhow::Result<()> {
+    let mut config = Config::load(path)?;
+    config.set_writes(name, on)?;
+    config.save(path)?;
+    Ok(())
 }
 
 /// Save a new profile the way `conn add` does: credentials to the keychain first, so

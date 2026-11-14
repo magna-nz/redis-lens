@@ -56,7 +56,12 @@ fn profile(name: &str, env: Env, port: u16) -> Profile {
 
 fn config(profiles: Vec<Profile>) -> PathBuf {
     let path = temp_dir("config").join("config.toml");
-    Config { profiles }.save(&path).unwrap();
+    Config {
+        profiles,
+        ..Default::default()
+    }
+    .save(&path)
+    .unwrap();
     path
 }
 

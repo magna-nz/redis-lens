@@ -1,0 +1,28 @@
+---
+source: src/tui/confirm.rs
+expression: t.backend()
+---
+" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…   WRITES ON       "
+" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
+"  0   1 Patterns   2   3   4   5   6                                            "
+"┌─ user:10293:cart ──────────┐┌─ Fields ─────────────────── ⠋ loading · HSCAN ─┐"
+"│ Type        hash           ││ ⠋ Reading the value…                           │"
+"│ Encoding    listpack       ││                                                │"
+"│ Fields      12             ││                                                │"
+"│ ┌─ Delete key ────────────────────────────────────── prod-cache-01 · PROD ─┐ │"
+"│ │ Key user:10293:cart                                                      │ │"
+"│ │ This can't be undone.                                                    │ │"
+"│ │                                                                          │ │"
+"│ │ Sends: UNLINK user:10293:cart                                            │ │"
+"│ │                                                                          │ │"
+"│ │ Type user:10293:cart and press enter to send it:                         │ │"
+"│ │ › ▏                                                                      │ │"
+"│ │                                                                          │ │"
+"│ │ enter Delete   esc Cancel                                                │ │"
+"│ └──────────────────────────────────────────────────────────────────────────┘ │"
+"│                            ││                                                │"
+"│                            ││                                                │"
+"│                            ││                                                │"
+"│                            ││                                                │"
+"└────────────────────────────┘└────────────────────────────────────────────────┘"
+" enter Delete   esc Cancel                                                      "

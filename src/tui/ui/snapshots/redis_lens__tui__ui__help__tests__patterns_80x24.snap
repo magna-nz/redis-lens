@@ -1,14 +1,14 @@
 ---
 source: src/tui/ui/help.rs
-assertion_line: 80
+assertion_line: 76
 expression: "render(Screen::Patterns, 80, 24).backend()"
 ---
-"       ┌─ Keys · Patterns ──────────────────────────────────────────────┐       "
+"       ┌─ Keys · Patterns ──────────────────────────── ? or esc closes ─┐       "
 "       │Everywhere                                                      │       "
 "       │0-6            Switch view, 0 Connections to 6 Search           │       "
 "       │?              Show or hide this key list                       │       "
 "       │a              Add a connection                                 │       "
-"       │:              Open the command line for readonly commands      │       "
+"       │:              Open the command line                            │       "
 "       │q ctrl-c       Quit                                             │       "
 "       │Patterns                                                        │       "
 "       │↑↓ j k         Move the selection                               │       "
@@ -23,7 +23,7 @@ expression: "render(Screen::Patterns, 80, 24).backend()"
 "       │Y              Copy a redis-cli --scan command for the pattern  │       "
 "       │r              Scan again, keeping old results meanwhile        │       "
 "       │s              Save a scan snapshot file                        │       "
-"       │                                                                │       "
-"       │? or esc closes                                                 │       "
+"       │x              Set a TTL on every key of the pattern            │       "
+"       │D              Delete every key of the pattern                  │       "
 "       └────────────────────────────────────────────────────────────────┘       "
 "                                                                                "

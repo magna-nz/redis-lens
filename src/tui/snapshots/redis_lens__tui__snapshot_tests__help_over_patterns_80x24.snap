@@ -3,12 +3,12 @@ source: src/tui/snapshot_tests.rs
 assertion_line: 1266
 expression: t.backend()
 ---
-" redis-┌─ Keys · Patterns ──────────────────────────────────────────────┐       "
+" redis-┌─ Keys · Patterns ──────────────────────────── ? or esc closes ─┐       "
 " Redis │Everywhere                                                      │(1%)   "
 "  0   1│0-6            Switch view, 0 Connections to 6 Search           │       "
 "┌─ Patt│?              Show or hide this key list                       │mory ─┐"
 "│ PATTE│a              Add a connection                                 │CT    │"
-"│   ses│:              Open the command line for readonly commands      │      │"
+"│   ses│:              Open the command line                            │      │"
 "│ ▾ cac│q ctrl-c       Quit                                             │      │"
 "│     c│Patterns                                                        │      │"
 "│     c│↑↓ j k         Move the selection                               │      │"
@@ -23,7 +23,7 @@ expression: t.backend()
 "│ cache│Y              Copy a redis-cli --scan command for the pattern  │      │"
 "│ cache│r              Scan again, keeping old results meanwhile        │>30d  │"
 "│ cache│s              Save a scan snapshot file                        │·     │"
-"│ ▲ 1 o│                                                                │      │"
-"│ $ red│? or esc closes                                                 │      │"
+"│ ▲ 1 o│x              Set a TTL on every key of the pattern            │      │"
+"│ $ red│D              Delete every key of the pattern                  │      │"
 "└──────└────────────────────────────────────────────────────────────────┘──────┘"
 " ↑↓ Move   →← Fold   enter Open   / Filter   o Sort   0-6 View   ? Help   q Quit"

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use secrecy::{ExposeSecret, SecretString};
 
-use super::{ConnAddArgs, ConnCommand};
+use super::{ConnAddArgs, ConnCommand, WritesArg};
 use crate::config::Config;
 use crate::conn::docker::DiscoveredInstance;
 use crate::conn::token::display_command;
@@ -44,6 +44,22 @@ pub async fn run(config: Option<PathBuf>, cmd: ConnCommand) -> anyhow::Result<()
         ConnCommand::List => println!("{}", list(&path)?),
         ConnCommand::Remove { name } => println!("{}", remove(&path, &secrets, &name)?),
         ConnCommand::Test { name } => println!("{}", test(&path, &secrets, &name).await?),
+        ConnCommand::Set {
+            name,
+            writes,
+            confirm,
+            yes,
+        } => println!(
+            "{}",
+            set_writes(
+                &path,
+                &name,
+                writes == WritesArg::On,
+                confirm.as_deref(),
+                yes,
+                &ask_on_terminal
+            )?
+        ),
     }
     Ok(())
 }
@@ -284,6 +300,90 @@ fn confirm_on_terminal(command: &str) -> anyhow::Result<bool> {
     ))
 }
 
+/// Ask `question` on the terminal and return the line typed. Without a terminal there
+/// is no one to ask, so it refuses with `hint`.
+fn ask_on_terminal(question: &str, hint: &str) -> anyhow::Result<String> {
+    if !std::io::stdin().is_terminal() {
+        bail!("standard input is not a terminal, so no one can be asked; {hint}");
+    }
+    eprint!("{question}");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("could not read the answer")?;
+    Ok(trim_newline(&answer).to_string())
+}
+
+/// The question asked before writes are turned on for `profile` (spec.md "Write
+/// permissions", check 2). On a prod profile the name must be typed, or given with
+/// `--confirm`, and `--yes` never replaces it. On the others `--yes` or `--confirm` with
+/// the name answers it; otherwise `ask` asks `y`/`n`. `Ok` means writes may go on.
+fn confirm_writes_on(
+    profile: &Profile,
+    confirm: Option<&str>,
+    yes: bool,
+    ask: &dyn Fn(&str, &str) -> anyhow::Result<String>,
+) -> anyhow::Result<()> {
+    let name = profile.name.as_str();
+    if profile.env == Env::Prod {
+        let typed = match confirm {
+            Some(c) => c.to_string(),
+            None => ask(
+                &format!("{name} is a prod profile. Type its name to turn writes on: "),
+                &format!("pass --confirm {name} (--yes is not enough on a prod profile)"),
+            )?,
+        };
+        if typed != name {
+            bail!("writes stay off: the name given does not match {name}");
+        }
+        return Ok(());
+    }
+    match confirm {
+        Some(c) if c == name => return Ok(()),
+        Some(_) => bail!("writes stay off: the name given with --confirm does not match {name}"),
+        None if yes => return Ok(()),
+        None => {}
+    }
+    let answer = ask(
+        &format!("Turn writes on for {name}? Each write still asks before it is sent. [y/N] "),
+        "pass --yes to turn writes on without asking",
+    )?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        bail!("writes stay off for {name}")
+    }
+}
+
+/// `conn set <name> --writes on|off`: sets `read_only` in the config file and nothing
+/// else. Turning writes on asks first when the profile is read-only now; turning them
+/// off never asks.
+pub fn set_writes(
+    path: &Path,
+    name: &str,
+    on: bool,
+    confirm: Option<&str>,
+    yes: bool,
+    ask: &dyn Fn(&str, &str) -> anyhow::Result<String>,
+) -> anyhow::Result<String> {
+    let mut config = Config::load(path)?;
+    let profile = config
+        .get(name)
+        .ok_or_else(|| crate::config::ConfigError::NotFound(name.to_string()))?
+        .clone();
+    if on && profile.is_read_only() {
+        confirm_writes_on(&profile, confirm, yes, ask)?;
+    }
+    config.set_writes(name, on)?;
+    config.save(path)?;
+    Ok(if on {
+        format!("Writes are on for {name}. Each write still asks as the table in the docs says.")
+    } else {
+        format!("Writes are off for {name}: it is read-only.")
+    })
+}
+
 /// [`add_with`] with the token-command confirmation injected too. `confirm` gets the
 /// command as it would be typed and is only called for a token command without `--yes`.
 pub async fn add_confirmed(
@@ -294,6 +394,31 @@ pub async fn add_confirmed(
     warn: &mut dyn std::io::Write,
     prompt: &dyn Fn() -> anyhow::Result<String>,
     confirm: &dyn Fn(&str) -> anyhow::Result<bool>,
+) -> anyhow::Result<String> {
+    add_asking(
+        path,
+        secrets,
+        args,
+        stdin_password,
+        warn,
+        prompt,
+        confirm,
+        &ask_on_terminal,
+    )
+    .await
+}
+
+/// [`add_confirmed`] with the `--writes on` question injected too.
+#[allow(clippy::too_many_arguments)]
+pub async fn add_asking(
+    path: &Path,
+    secrets: &dyn SecretStore,
+    args: &ConnAddArgs,
+    stdin_password: Option<String>,
+    warn: &mut dyn std::io::Write,
+    prompt: &dyn Fn() -> anyhow::Result<String>,
+    confirm: &dyn Fn(&str) -> anyhow::Result<bool>,
+    ask: &dyn Fn(&str, &str) -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
     if has_docker_prefix(&args.name) {
         bail!("names starting with {DOCKER_PREFIX} are reserved for discovered containers");
@@ -401,12 +526,19 @@ pub async fn add_confirmed(
         endpoint: parsed.endpoint,
         db: parsed.db,
         auth,
-        read_only: None,
+        read_only: args.writes.map(|w| w == WritesArg::Off),
         prefer_replica: args.prefer_replica,
         provider,
         token_command,
         ssh: tunnel,
     };
+    if args.confirm.is_some() && args.writes != Some(WritesArg::On) {
+        bail!("--confirm answers the question --writes on asks; give --writes on too");
+    }
+    // Asked only when it turns writes on for a profile that would be read-only.
+    if args.writes == Some(WritesArg::On) && profile.env == Env::Prod {
+        confirm_writes_on(&profile, args.confirm.as_deref(), args.yes, ask)?;
+    }
 
     let r = profile.secret_ref();
     let ssh_ref = profile.ssh_secret_ref();
@@ -665,6 +797,8 @@ mod tests {
             provider: None,
             token_command: Vec::new(),
             yes: false,
+            writes: None,
+            confirm: None,
             ssh: None,
             ssh_identity: None,
             ssh_known_hosts: None,
@@ -1664,5 +1798,172 @@ mod tests {
         let out = format_discovered(&[d]);
         assert!(out.contains("127.0.0.1:49153") && out.contains("password"));
         assert!(!out.contains("s3cret"));
+    }
+
+    fn no_question(_: &str, _: &str) -> anyhow::Result<String> {
+        panic!("no question expected")
+    }
+
+    fn no_terminal(_: &str, hint: &str) -> anyhow::Result<String> {
+        bail!("standard input is not a terminal, so no one can be asked; {hint}")
+    }
+
+    fn saved(path: &Path, name: &str) -> Option<bool> {
+        Config::load(path).unwrap().get(name).unwrap().read_only
+    }
+
+    async fn add_env(
+        path: &Path,
+        store: &MemoryStore,
+        name: &str,
+        env: Option<super::super::EnvArg>,
+    ) {
+        let mut a = args(name, "redis://10.0.0.5:6379");
+        a.env = env;
+        add(path, store, &a, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_writes_on_prod_needs_the_name_and_never_takes_yes() {
+        use super::super::EnvArg;
+        let path = temp_path("writes-prod");
+        let store = MemoryStore::default();
+        add_env(&path, &store, "prod-1", Some(EnvArg::Prod)).await;
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let e = set_writes(&path, "prod-1", true, None, true, &no_terminal).unwrap_err();
+        assert!(e.to_string().contains("pass --confirm prod-1"), "{e}");
+        let e = set_writes(&path, "prod-1", true, Some("prod-2"), true, &no_question).unwrap_err();
+        assert!(e.to_string().contains("does not match"), "{e}");
+        let typed_wrong = |_: &str, _: &str| Ok("prod".to_string());
+        assert!(set_writes(&path, "prod-1", true, None, false, &typed_wrong).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let asked = std::cell::RefCell::new(String::new());
+        let typed = |q: &str, _: &str| {
+            *asked.borrow_mut() = q.to_string();
+            Ok("prod-1".to_string())
+        };
+        set_writes(&path, "prod-1", true, None, false, &typed).unwrap();
+        assert!(asked.borrow().contains("Type its name"));
+        assert_eq!(saved(&path, "prod-1"), Some(false));
+
+        // Off never asks.
+        set_writes(&path, "prod-1", false, None, false, &no_question).unwrap();
+        assert_eq!(saved(&path, "prod-1"), Some(true));
+        set_writes(&path, "prod-1", true, Some("prod-1"), false, &no_question).unwrap();
+        assert_eq!(saved(&path, "prod-1"), Some(false));
+        // Already on: nothing to ask.
+        set_writes(&path, "prod-1", true, None, false, &no_question).unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn set_writes_elsewhere_asks_y_n_or_takes_yes() {
+        use super::super::EnvArg;
+        let path = temp_path("writes-stage");
+        let store = MemoryStore::default();
+        add_env(&path, &store, "stage-1", Some(EnvArg::Stage)).await;
+        assert_eq!(saved(&path, "stage-1"), None);
+        set_writes(&path, "stage-1", false, None, false, &no_question).unwrap();
+        assert_eq!(saved(&path, "stage-1"), Some(true));
+
+        let e = set_writes(&path, "stage-1", true, None, false, &no_terminal).unwrap_err();
+        assert!(e.to_string().contains("pass --yes"), "{e}");
+        let no = |_: &str, _: &str| Ok("n".to_string());
+        assert!(set_writes(&path, "stage-1", true, None, false, &no).is_err());
+        assert_eq!(saved(&path, "stage-1"), Some(true));
+        let yes = |_: &str, _: &str| Ok("Y".to_string());
+        set_writes(&path, "stage-1", true, None, false, &yes).unwrap();
+        assert_eq!(saved(&path, "stage-1"), Some(false));
+
+        set_writes(&path, "stage-1", false, None, false, &no_question).unwrap();
+        set_writes(&path, "stage-1", true, None, true, &no_question).unwrap();
+        assert_eq!(saved(&path, "stage-1"), Some(false));
+
+        let e = set_writes(&path, "nope", true, None, true, &no_question).unwrap_err();
+        assert!(e.to_string().contains("nope"), "{e}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn set_writes_touches_only_read_only_and_no_credentials() {
+        let path = temp_path("writes-creds");
+        let store = MemoryStore::default();
+        add(
+            &path,
+            &store,
+            &args("c", "redis://u:s3cret-pw@10.0.0.5"),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut before = Config::load(&path).unwrap().get("c").unwrap().clone();
+        let entry_before = entry(&store, "c");
+        set_writes(&path, "c", false, None, false, &no_question).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("s3cret-pw") && !text.contains("\"u\""),
+            "{text}"
+        );
+        before.read_only = Some(true);
+        assert_eq!(Config::load(&path).unwrap().get("c").unwrap(), &before);
+        assert_eq!(entry(&store, "c"), entry_before);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn add_with_writes() {
+        use super::super::EnvArg;
+        let path = temp_path("add-writes");
+        let store = MemoryStore::default();
+        let no_prompt = || -> anyhow::Result<String> { panic!("no password prompt expected") };
+        let run = |a: ConnAddArgs, ask: &'static dyn Fn(&str, &str) -> anyhow::Result<String>| {
+            let path = path.clone();
+            let store = &store;
+            async move {
+                add_asking(
+                    &path,
+                    store,
+                    &a,
+                    None,
+                    &mut Vec::new(),
+                    &no_prompt,
+                    &never,
+                    ask,
+                )
+                .await
+            }
+        };
+        let mut a = args("local-off", "redis://127.0.0.1");
+        a.writes = Some(WritesArg::Off);
+        run(a, &no_question).await.unwrap();
+        assert_eq!(saved(&path, "local-off"), Some(true));
+
+        let mut a = args("local-on", "redis://127.0.0.1");
+        a.writes = Some(WritesArg::On);
+        run(a, &no_question).await.unwrap();
+        assert_eq!(saved(&path, "local-on"), Some(false));
+
+        let mut a = args("prod-on", "redis://10.0.0.5");
+        a.env = Some(EnvArg::Prod);
+        a.writes = Some(WritesArg::On);
+        a.yes = true;
+        let e = run(a, &no_terminal).await.unwrap_err();
+        assert!(e.to_string().contains("--confirm prod-on"), "{e}");
+        assert!(Config::load(&path).unwrap().get("prod-on").is_none());
+
+        let mut a = args("prod-on", "redis://10.0.0.5");
+        a.env = Some(EnvArg::Prod);
+        a.writes = Some(WritesArg::On);
+        a.confirm = Some("prod-on".into());
+        run(a, &no_question).await.unwrap();
+        assert_eq!(saved(&path, "prod-on"), Some(false));
+
+        let mut a = args("x", "redis://10.0.0.5");
+        a.confirm = Some("x".into());
+        let e = run(a, &no_question).await.unwrap_err();
+        assert!(e.to_string().contains("--writes on"), "{e}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
