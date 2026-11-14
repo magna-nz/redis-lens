@@ -313,6 +313,33 @@ fn connections_view() {
 }
 
 #[test]
+fn connections_with_tags_80x24() {
+    let mut ps = fixtures::profiles();
+    ps[0].tags = vec!["team-a".into(), "eu".into()];
+    ps[1].tags = vec!["team-b".into()];
+    let app = App::new(ps);
+    let t = render(&app, 80, 24);
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn connections_filtered_by_tag_80x24() {
+    let mut ps = fixtures::profiles();
+    ps[0].tags = vec!["team-a".into(), "eu".into()];
+    ps[1].tags = vec!["team-b".into()];
+    let mut app = App::new(ps);
+    app.handle_key(ch('/'));
+    for c in "team".chars() {
+        app.handle_key(ch(c));
+    }
+    let t = render(&app, 80, 24);
+    insta::assert_snapshot!("connections_filter_input_80x24", t.backend());
+    app.handle_key(key(KeyCode::Enter));
+    let t = render(&app, 80, 24);
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
 fn scanning_progress_header() {
     let mut app = App::new(fixtures::profiles());
     let id = connect_selected(&mut app);

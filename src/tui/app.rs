@@ -807,6 +807,10 @@ pub struct App {
     pub entries: Vec<ConnEntry>,
     pub docker: DockerState,
     pub conn_sel: ConnSel,
+    /// `/` on Connections: only the profiles whose name or tag holds this text show.
+    pub conn_filter: String,
+    /// The Connections filter input is open.
+    pub conn_filtering: bool,
     pub add: Option<AddState>,
     pub session: Option<Session>,
     pub patterns: PatternsState,
@@ -970,6 +974,8 @@ impl App {
             entries: Vec::new(),
             docker: DockerState::Searching,
             conn_sel: ConnSel::Add,
+            conn_filter: String::new(),
+            conn_filtering: false,
             add: None,
             session: None,
             patterns: PatternsState::default(),
@@ -1079,12 +1085,62 @@ impl App {
         self.entries.iter().filter(|e| e.is_docker())
     }
 
-    /// Selectable rows on the Connections view, in display order.
+    /// Whether `e` passes the Connections filter: its name or one of its tags holds the
+    /// filter text, ignoring case. Everything passes without a filter.
+    pub fn conn_matches(&self, e: &ConnEntry) -> bool {
+        let f = self.conn_filter.to_lowercase();
+        f.is_empty()
+            || e.profile.name.to_lowercase().contains(&f)
+            || e.profile.tags.iter().any(|t| t.to_lowercase().contains(&f))
+    }
+
+    /// The saved profiles the filter shows.
+    pub fn saved_shown(&self) -> impl Iterator<Item = &ConnEntry> {
+        self.saved().filter(|e| self.conn_matches(e))
+    }
+
+    /// The Docker containers the filter shows.
+    pub fn docker_shown(&self) -> impl Iterator<Item = &ConnEntry> {
+        self.docker_entries().filter(|e| self.conn_matches(e))
+    }
+
+    /// Selectable rows on the Connections view, in display order, after the filter.
     pub fn selectable(&self) -> Vec<ConnSel> {
-        let mut out: Vec<ConnSel> = self.saved().map(|e| ConnSel::Entry(e.id)).collect();
-        out.extend(self.docker_entries().map(|e| ConnSel::Entry(e.id)));
+        let mut out: Vec<ConnSel> = self.saved_shown().map(|e| ConnSel::Entry(e.id)).collect();
+        out.extend(self.docker_shown().map(|e| ConnSel::Entry(e.id)));
         out.push(ConnSel::Add);
         out
+    }
+
+    /// After the filter changed: keeps the selection when it still shows, else takes the
+    /// first row shown.
+    fn conn_reselect(&mut self) {
+        let items = self.selectable();
+        // The add row, left selected while nothing matched, gives way to a match.
+        if !items.contains(&self.conn_sel) || (self.conn_sel == ConnSel::Add && items.len() > 1) {
+            self.conn_sel = items[0];
+        }
+    }
+
+    fn conn_filter_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.conn_filter.clear();
+                self.conn_filtering = false;
+            }
+            KeyCode::Enter => self.conn_filtering = false,
+            KeyCode::Backspace => {
+                self.conn_filter.pop();
+            }
+            _ => {
+                if let Some(c) = plain_char(&key)
+                    && self.conn_filter.chars().count() < MAX_FILTER
+                {
+                    self.conn_filter.push(c);
+                }
+            }
+        }
+        self.conn_reselect();
     }
 
     pub fn selected_entry(&self) -> Option<&ConnEntry> {
@@ -1639,6 +1695,10 @@ impl App {
             self.filter_key(key);
             return Vec::new();
         }
+        if screen == Screen::Connections && self.conn_filtering {
+            self.conn_filter_key(key);
+            return Vec::new();
+        }
         // A view's own text input takes every key, as the Patterns filter does.
         if self.view_input().is_some() {
             return self.key_to_view(key).1;
@@ -1921,6 +1981,10 @@ impl App {
             let room = MAX_FILTER.saturating_sub(p.filter.chars().count());
             p.filter.extend(text.chars().take(room));
             p.sel = 0;
+        } else if self.screen() == Screen::Connections && self.conn_filtering {
+            let room = MAX_FILTER.saturating_sub(self.conn_filter.chars().count());
+            self.conn_filter.extend(text.chars().take(room));
+            self.conn_reselect();
         } else if self.view_input().is_some() {
             return self.on_active("paste", |v, act| v.on_paste(&text, act));
         } else if self.view == View::Connections {
@@ -2048,6 +2112,7 @@ impl App {
             provider: None,
             token_command: None,
             ssh: None,
+            tags: Vec::new(),
         };
         if let Some(add) = self.add.as_mut() {
             add.saving = true;
@@ -2080,7 +2145,11 @@ impl App {
                 ConnSel::Add => return self.start_add(),
                 ConnSel::Entry(id) => return self.connect(id),
             },
+            KeyCode::Esc if !self.conn_filter.is_empty() => {
+                self.conn_filter.clear();
+            }
             _ => match plain_char(&key) {
+                Some('/') => self.conn_filtering = true,
                 Some('r') => return self.rescan_docker(),
                 Some('w') => return self.toggle_writes(),
                 _ => {}
@@ -2769,6 +2838,9 @@ impl App {
                     },
                 );
                 self.add = None;
+                // The new profile shows, whatever the filter was.
+                self.conn_filter.clear();
+                self.conn_filtering = false;
                 self.conn_sel = ConnSel::Entry(id);
                 self.set_info(line);
             }
@@ -2827,10 +2899,7 @@ impl App {
         // Keep the selection, unless it vanished or nothing could be picked before.
         let nothing_before = old.is_empty() && self.saved().next().is_none() && self.add.is_none();
         if !self.selectable().contains(&self.conn_sel) || nothing_before {
-            self.conn_sel = self
-                .entries
-                .first()
-                .map_or(ConnSel::Add, |e| ConnSel::Entry(e.id));
+            self.conn_sel = self.selectable()[0];
         }
     }
 }
@@ -3512,6 +3581,94 @@ mod tests {
             app.handle_key(ch('k'));
         }
         assert_eq!(app.conn_sel, ids[0]);
+    }
+
+    fn tagged_profiles() -> Vec<Profile> {
+        let mut ps = fixtures::profiles();
+        ps[0].tags = vec!["team-a".into(), "eu".into()];
+        ps[1].tags = vec!["team-b".into()];
+        ps
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(ch(c));
+        }
+    }
+
+    fn shown_names(app: &App) -> Vec<String> {
+        app.selectable()
+            .iter()
+            .filter_map(|s| match s {
+                ConnSel::Entry(id) => app.entry(*id).map(|e| e.profile.name.clone()),
+                ConnSel::Add => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn slash_filters_connections_by_name_or_tag_and_esc_clears() {
+        let mut app = App::new(tagged_profiles());
+        app.apply(Msg::DockerFound(vec![fixtures::docker_instance()]));
+        assert_eq!(shown_names(&app).len(), 4);
+        app.handle_key(ch('/'));
+        assert!(app.conn_filtering);
+        // Every key is text in the input: digits, q, ? and a included.
+        type_text(&mut app, "q0?a");
+        assert_eq!(app.conn_filter, "q0?a");
+        assert_eq!(app.screen(), Screen::Connections);
+        assert!(app.add.is_none() && !app.help);
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        // By tag, ignoring case.
+        type_text(&mut app, "TEAM-A");
+        assert_eq!(shown_names(&app), ["prod-cache-01"]);
+        assert_eq!(app.conn_sel, app.selectable()[0]);
+        // Enter applies: keys work again, and the filter stays.
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.conn_filtering);
+        assert_eq!(shown_names(&app), ["prod-cache-01"]);
+        // By name.
+        app.handle_key(ch('/'));
+        for _ in 0.."TEAM-A".len() {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        type_text(&mut app, "stag");
+        assert_eq!(shown_names(&app), ["staging-cache"]);
+        assert_eq!(
+            app.selected_entry().map(|e| e.profile.name.as_str()),
+            Some("staging-cache")
+        );
+        app.handle_key(key(KeyCode::Enter));
+        // esc clears the filter, and the list is whole again.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.conn_filter.is_empty());
+        assert_eq!(shown_names(&app).len(), 4);
+        // esc inside the input clears and closes it.
+        app.handle_key(ch('/'));
+        type_text(&mut app, "zzz");
+        assert_eq!(shown_names(&app).len(), 0);
+        assert_eq!(app.selectable(), [ConnSel::Add]);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.conn_filtering && app.conn_filter.is_empty());
+        assert_eq!(shown_names(&app).len(), 4);
+    }
+
+    #[test]
+    fn the_connections_filter_sends_nothing_and_a_paste_goes_into_it() {
+        let mut app = App::new(tagged_profiles());
+        assert!(app.handle_key(ch('/')).is_empty());
+        assert!(app.handle_paste("eu\n".into()).is_empty());
+        assert_eq!(app.conn_filter, "eu");
+        assert!(app.add.is_none());
+        assert_eq!(shown_names(&app), ["prod-cache-01"]);
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
+        // enter on the shown profile connects it.
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&effects[..], [Effect::Connect { profile, .. }] if profile.name == "prod-cache-01")
+        );
     }
 
     #[test]
@@ -6140,6 +6297,7 @@ mod tests {
             (
                 app.screen(),
                 app.conn_sel,
+                (&app.conn_filter, app.conn_filtering),
                 app.add
                     .as_ref()
                     .map(|a| (a.input.clone(), a.password.is_some())),
@@ -6233,6 +6391,11 @@ mod tests {
                     let mut app = busy_app(screen);
                     if screen == Screen::Patterns && token == "esc" {
                         // Esc clears a filter: set one first.
+                        app.handle_key(ch('/'));
+                        app.handle_key(ch('e'));
+                        app.handle_key(key(KeyCode::Enter));
+                    }
+                    if screen == Screen::Connections && token == "esc" {
                         app.handle_key(ch('/'));
                         app.handle_key(ch('e'));
                         app.handle_key(key(KeyCode::Enter));

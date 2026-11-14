@@ -41,6 +41,7 @@ fn profile(port: u16) -> Profile {
         provider: None,
         token_command: None,
         ssh: None,
+        tags: Vec::new(),
     }
 }
 

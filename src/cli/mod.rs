@@ -166,20 +166,55 @@ pub enum ConnCommand {
         /// Profile name.
         name: String,
     },
-    /// Change a saved connection. Only `--writes` for now.
+    /// Write the saved connections as TOML `[[profile]]` tables, to FILE or standard
+    /// output. No credential is in them: those stay in the OS keychain, which is never
+    /// read here.
+    Export {
+        /// The file to write (mode 0600). Standard output without it.
+        file: Option<std::path::PathBuf>,
+        /// Replace FILE when it exists.
+        #[arg(long, requires = "file")]
+        force: bool,
+    },
+    /// Add the connections of a file written by `conn export`. All or none: nothing is
+    /// saved when any is refused. Credentials are not in the file; store them with
+    /// `conn add <name> --force ...` afterwards.
+    Import {
+        /// The file to read.
+        file: std::path::PathBuf,
+        /// Replace a profile that has the same name.
+        #[arg(long)]
+        force: bool,
+        /// Answer yes to the question asked for a profile with a token command.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Change a saved connection: turn writes on or off, add or remove tags.
+    #[command(group(
+        clap::ArgGroup::new("change")
+            .required(true)
+            .multiple(true)
+            .args(["writes", "tag", "untag"])
+    ))]
     Set {
         /// Profile name.
         name: String,
         /// Turn writes on or off (`read_only` in the config file). Turning them on asks
         /// first; on a prod profile you type the profile name.
         #[arg(long, value_enum)]
-        writes: WritesArg,
+        writes: Option<WritesArg>,
         /// The profile name, given instead of typing it when writes are turned on.
-        #[arg(long, value_name = "NAME")]
+        #[arg(long, value_name = "NAME", requires = "writes")]
         confirm: Option<String>,
         /// Turn writes on without asking. Never enough on a prod profile: give --confirm.
-        #[arg(long)]
+        #[arg(long, requires = "writes")]
         yes: bool,
+        /// Add a tag (1 to 32 letters, digits, `-`, `_`, `.` or `/`). Repeatable.
+        #[arg(long, value_name = "TAG")]
+        tag: Vec<String>,
+        /// Remove a tag. Repeatable.
+        #[arg(long, value_name = "TAG")]
+        untag: Vec<String>,
     },
 }
 
@@ -235,6 +270,9 @@ pub struct ConnAddArgs {
     /// The profile name, given instead of typing it when writes are turned on.
     #[arg(long, value_name = "NAME")]
     pub confirm: Option<String>,
+    /// Tag the profile (1 to 32 letters, digits, `-`, `_`, `.` or `/`). Repeatable.
+    #[arg(long = "tag", value_name = "TAG")]
+    pub tags: Vec<String>,
     /// Reach the server, and its cluster nodes and replicas, through an SSH bastion:
     /// `[USER@]HOST[:PORT]`, or a `Host` alias from ~/.ssh/config. Uses the system ssh
     /// with strict host-key checking; the username goes to the OS keychain.

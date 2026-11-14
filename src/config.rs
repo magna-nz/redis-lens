@@ -27,6 +27,8 @@ pub enum ConfigError {
     NotFound(String),
     #[error("a profile named {0} already exists")]
     Exists(String),
+    #[error("{0} exists already; pass --force to replace it")]
+    FileExists(PathBuf),
     #[error("could not find a config directory for this user")]
     NoConfigDir,
 }
@@ -68,40 +70,45 @@ impl Config {
 
     /// Writes atomically (temp file and rename), creating the directory if needed.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
-        let werr = |source| ConfigError::Write {
+        let text = toml::to_string_pretty(self).map_err(|e| ConfigError::Write {
             path: path.to_path_buf(),
-            source,
-        };
-        let text = toml::to_string_pretty(self).map_err(|e| {
-            werr(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                e.to_string(),
-            ))
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
         })?;
-        let dir = match path.parent() {
-            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
-            _ => PathBuf::from("."),
-        };
-        std::fs::create_dir_all(&dir).map_err(werr)?;
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "config.toml".to_string());
-        let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
-        let result = (|| {
-            std::fs::write(&tmp, text.as_bytes())?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-            }
-            std::fs::rename(&tmp, path)
-        })();
-        if let Err(e) = result {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(werr(e));
+        write_private(path, &text, true)
+    }
+
+    /// The profiles as TOML `[[profile]]` tables, exactly the config file's profile
+    /// fields and nothing else: no `[settings]`. A profile has no credential, and the
+    /// keychain is never read.
+    pub fn export_text(&self) -> Result<String, ConfigError> {
+        #[derive(Serialize)]
+        struct Export<'a> {
+            #[serde(rename = "profile")]
+            profiles: &'a [Profile],
         }
-        Ok(())
+        toml::to_string_pretty(&Export {
+            profiles: &self.profiles,
+        })
+        .map_err(|e| ConfigError::Parse {
+            path: PathBuf::from("export"),
+            message: e.to_string(),
+        })
+    }
+
+    /// The profiles of an export (or any config text); `[settings]` and unknown keys
+    /// are ignored. `origin` names the text in errors.
+    pub fn parse_profiles(text: &str, origin: &Path) -> Result<Vec<Profile>, ConfigError> {
+        #[derive(Deserialize)]
+        struct Import {
+            #[serde(default, rename = "profile")]
+            profiles: Vec<Profile>,
+        }
+        toml::from_str::<Import>(text)
+            .map(|i| i.profiles)
+            .map_err(|e| ConfigError::Parse {
+                path: origin.to_path_buf(),
+                message: e.to_string(),
+            })
     }
 
     pub fn get(&self, name: &str) -> Option<&Profile> {
@@ -136,12 +143,90 @@ impl Config {
         Ok(p.clone())
     }
 
+    /// Replaces the tags of profile `name`; nothing else changes.
+    pub fn set_tags(&mut self, name: &str, tags: Vec<String>) -> Result<(), ConfigError> {
+        let p = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.name == name)
+            .ok_or_else(|| ConfigError::NotFound(name.to_string()))?;
+        p.tags = tags;
+        Ok(())
+    }
+
     pub fn remove(&mut self, name: &str) -> Result<Profile, ConfigError> {
         match self.profiles.iter().position(|p| p.name == name) {
             Some(i) => Ok(self.profiles.remove(i)),
             None => Err(ConfigError::NotFound(name.to_string())),
         }
     }
+}
+
+/// Writes `text` to `path` atomically (a temp file in the same directory, mode 0600 on
+/// Unix, then a rename), creating the directory if needed. With `replace` false an
+/// existing file is never touched: [`ConfigError::FileExists`].
+pub fn write_private(path: &Path, text: &str, replace: bool) -> Result<(), ConfigError> {
+    let werr = |source| ConfigError::Write {
+        path: path.to_path_buf(),
+        source,
+    };
+    if !replace && path.symlink_metadata().is_ok() {
+        return Err(ConfigError::FileExists(path.to_path_buf()));
+    }
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&dir).map_err(werr)?;
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".to_string());
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let result = (|| {
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt;
+            // Never readable by others, not even for an instant.
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(text.as_bytes())?;
+        }
+        #[cfg(not(unix))]
+        std::fs::write(&tmp, text.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        if replace {
+            std::fs::rename(&tmp, path)
+        } else {
+            // A link fails when the name exists, even if it appeared since the check.
+            match std::fs::hard_link(&tmp, path) {
+                Ok(()) => std::fs::remove_file(&tmp),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+                // A file system without links: check once more, then rename.
+                Err(_) if path.symlink_metadata().is_ok() => {
+                    Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+                }
+                Err(_) => std::fs::rename(&tmp, path),
+            }
+        }
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        if e.kind() == std::io::ErrorKind::AlreadyExists && !replace {
+            return Err(ConfigError::FileExists(path.to_path_buf()));
+        }
+        return Err(werr(e));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -178,6 +263,7 @@ mod tests {
             provider: None,
             token_command: None,
             ssh: None,
+            tags: Vec::new(),
         }
     }
 
@@ -374,6 +460,58 @@ mod tests {
             "{text}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tags_round_trip_and_are_absent_when_empty() {
+        let dir = temp_dir("tags");
+        let path = dir.join("config.toml");
+        let mut tagged = profile("a", 1);
+        tagged.tags = vec!["team-a".into(), "eu".into()];
+        let mut c = Config::default();
+        c.add(tagged, false).unwrap();
+        c.add(profile("b", 2), false).unwrap();
+        c.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("tags").count(), 1, "{text}");
+        assert_eq!(Config::load(&path).unwrap(), c);
+        c.set_tags("a", Vec::new()).unwrap();
+        assert!(matches!(
+            c.set_tags("zz", Vec::new()),
+            Err(ConfigError::NotFound(_))
+        ));
+        c.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("tags"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn theme_round_trips_and_is_absent_when_dark() {
+        use crate::write::Theme;
+        let dir = temp_dir("theme");
+        let path = dir.join("config.toml");
+        let mut c = Config::default();
+        c.add(profile("a", 1), false).unwrap();
+        c.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("theme"));
+        c.settings.theme = Theme::Light;
+        c.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("[settings]") && text.contains("theme = \"light\""),
+            "{text}"
+        );
+        assert_eq!(Config::load(&path).unwrap().settings.theme, Theme::Light);
+        std::fs::write(&path, "[settings]\ntheme = \"dark\"\n").unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!(c.settings.theme, Theme::Dark);
+        assert!(c.settings.is_default());
+        std::fs::write(&path, "[settings]\ntheme = \"neon\"\n").unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::Parse { .. })
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -30,6 +30,7 @@ fn profile(name: &str, port: u16, auth: Auth) -> Profile {
         provider: None,
         token_command: None,
         ssh: None,
+        tags: Vec::new(),
     }
 }
 
@@ -319,6 +320,7 @@ async fn conn_add_keeps_credentials_out_of_the_config_file() {
         writes: None,
         confirm: None,
         ssh: None,
+        tags: Vec::new(),
         ssh_identity: None,
         ssh_known_hosts: None,
     };
@@ -835,6 +837,7 @@ async fn token_command_with_an_acl_username_from_the_keychain() {
             writes: None,
             confirm: None,
             ssh: None,
+            tags: Vec::new(),
             ssh_identity: None,
             ssh_known_hosts: None,
         };

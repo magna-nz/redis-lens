@@ -1,6 +1,5 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 1277
 expression: t.backend()
 ---
 " redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC "
@@ -12,10 +11,9 @@ expression: t.backend()
 "│ › prod-cache-01       PROD    prod-cache-01.internal:6380             keychain      read-only  ● connected       15G │"
 "│   staging-cache       STAGE   staging-cache.internal:6379             keychain      on         ○ not open          — │"
 "│   local-6379          LOCAL   localhost:6379                          none          on         ○ not open          — │"
-"│ DOCKER · 1 Redis-compatible container                                                                                │"
-"│   myapp-redis-1       LOC┌─ Keys · Connections ───────────────────────── ? or esc closes ─┐    ○ not open          — │"
-"│ + Add connection    paste│Everywhere                                                      │                          │"
-"│                          │0-6            Switch view, 0 Connections to 6 Search           │                          │"
+"│ DOCKER · 1 Redis-compatib┌─ Keys · Connections ───────────────────────── ? or esc closes ─┐                          │"
+"│   myapp-redis-1       LOC│Everywhere                                                      │    ○ not open          — │"
+"│ + Add connection    paste│0-6            Switch view, 0 Connections to 6 Search           │                          │"
 "│                          │?              Show or hide this key list                       │                          │"
 "│                          │a              Add a connection                                 │                          │"
 "│                          │:              Open the command line                            │                          │"
@@ -25,10 +23,11 @@ expression: t.backend()
 "│                          │PgUp PgDn      Move one page                                    │                          │"
 "│                          │Home End g G   Jump to the first or last row                    │                          │"
 "│                          │enter          Connect and scan                                 │                          │"
+"│                          │/              Filter the profiles by name or tag               │                          │"
+"│                          │esc            Clear the filter                                 │                          │"
 "│                          │r              Look for Docker containers again                 │                          │"
-"│                          │w              Turn writes on or off for the selected profile   │                          │"
-"└──────────────────────────└────────────────────────────────────────────────────────────────┘──────────────────────────┘"
-"┌─ prod-cache-01 ─────────────────────────────────────────────────────────────────────────────── PROD · saved profile ─┐"
+"└──────────────────────────│w              Turn writes on or off for the selected profile   │──────────────────────────┘"
+"┌─ prod-cache-01 ──────────└────────────────────────────────────────────────────────────────┘─── PROD · saved profile ─┐"
 "│ Endpoint    prod-cache-01.internal:6380                                PERMISSION CHECK                              │"
 "│ Server      Redis 7.4.2 · standalone                                   ✓ SCAN                                        │"
 "│ Auth        password or ACL user                                       ✓ TYPE · TTL                                  │"

@@ -146,11 +146,19 @@ const SNAPSHOT: KeyHelp = k("s", "s", "Snapshot", "Save a scan snapshot file", t
 const REFRESH: KeyHelp = k("r", "r", "Refresh", "Refresh this panel now", true);
 const PAUSE: KeyHelp = k("p", "p", "Pause", "Pause or resume polling", true);
 
-static CONNECTIONS: [KeyHelp; 6] = [
+static CONNECTIONS: [KeyHelp; 8] = [
     MOVE,
     PAGE,
     ENDS,
     k("enter", "enter", "Connect", "Connect and scan", true),
+    k(
+        "/",
+        "/",
+        "Filter",
+        "Filter the profiles by name or tag",
+        false,
+    ),
+    k("esc", "esc", "Clear", "Clear the filter", false),
     k(
         "r",
         "r",
@@ -214,12 +222,13 @@ static PATTERNS: [KeyHelp; 14] = [
     k("D", "D", "Delete", "Delete every key of the pattern", false),
 ];
 
-static KEY_LIST: [KeyHelp; 10] = [
+static KEY_LIST: [KeyHelp; 11] = [
     MOVE,
     PAGE,
     ENDS,
     k("/", "/", "Filter", "Filter the loaded keys by name", true),
     k("o", "o", "Sort", "Sort the loaded keys", true),
+    k("t", "t", "Type", "Show one type of the loaded keys", false),
     k("n", "n", "More", "Load 1,000 more keys", true),
     k(
         "enter",
@@ -233,7 +242,7 @@ static KEY_LIST: [KeyHelp; 10] = [
         "esc",
         "esc",
         "Back",
-        "Clear the filter, or go back to Patterns",
+        "Clear the filters, or go back to Patterns",
         true,
     ),
     k("N", "N", "New key", "Add a key", false),

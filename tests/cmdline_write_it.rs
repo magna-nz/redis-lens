@@ -29,6 +29,7 @@ fn profile(env: Env, read_only: Option<bool>) -> Profile {
         provider: None,
         token_command: None,
         ssh: None,
+        tags: Vec::new(),
     }
 }
 

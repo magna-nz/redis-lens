@@ -86,6 +86,7 @@ impl World {
             provider: None,
             token_command: None,
             ssh: Some(self.tunnel()),
+            tags: Vec::new(),
         }
     }
 
@@ -194,6 +195,7 @@ async fn scans_through_the_bastion(valkey: bool) {
     // The container name means nothing here: without the bastion there is no way in.
     let direct = Profile {
         ssh: None,
+        tags: Vec::new(),
         ..p.clone()
     };
     assert!(conn::connect(&direct, &store).await.is_err());
@@ -290,6 +292,7 @@ fn add_args(name: &str, url: &str, ssh: &str, w: &World) -> ConnAddArgs {
         writes: None,
         confirm: None,
         ssh: Some(ssh.into()),
+        tags: Vec::new(),
         ssh_identity: Some(w.key.private.clone()),
         ssh_known_hosts: Some(w.known_hosts.clone()),
     }
@@ -672,6 +675,7 @@ async fn an_unreachable_bastion_gives_unreachable() {
             identity_file: Some(key.private.clone()),
             known_hosts_file: Some(kh),
         }),
+        tags: Vec::new(),
     };
     let store = MemoryStore::default();
     store

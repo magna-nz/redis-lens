@@ -966,6 +966,7 @@ mod tests {
             provider: None,
             token_command: None,
             ssh: None,
+            tags: Vec::new(),
         };
         assert_eq!(ScanOptions::for_profile(&p).max_commands_per_sec, None);
         p.env = Env::Prod;
@@ -1001,6 +1002,7 @@ mod tests {
             provider: Some(Provider::ElasticacheServerless),
             token_command: None,
             ssh: None,
+            tags: Vec::new(),
         };
         for env in [Env::Prod, Env::Stage, Env::Other, Env::Local] {
             p.env = env;

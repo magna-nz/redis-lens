@@ -125,6 +125,8 @@ A panel of 2 Analysis, after Expiry.
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
 | `enter` | Connect and scan |
+| `/` | Filter the profiles by name or tag |
+| `esc` | Clear the filter |
 | `r` | Look for Docker containers again |
 | `w` | Turn writes on or off for the selected profile |
 
@@ -156,10 +158,11 @@ A panel of 2 Analysis, after Expiry.
 | `Home` `End` `g` `G` | Jump to the first or last row |
 | `/` | Filter the loaded keys by name |
 | `o` | Sort the loaded keys |
+| `t` | Show one type of the loaded keys |
 | `n` | Load 1,000 more keys |
 | `enter` | Show the selected key and its value |
 | `y` | Copy the selected key name to the clipboard |
-| `esc` | Clear the filter, or go back to Patterns |
+| `esc` | Clear the filters, or go back to Patterns |
 | `N` | Add a key |
 
 #### Patterns · key detail
@@ -597,10 +600,10 @@ Lists running containers whose image is redis, valkey, redis-stack or bitnami/re
 ```
 redis-lens                         open the TUI
 redis-lens conn add <name> --url <url> [--env prod|stage|local|other] [--password-stdin | --ask-password] [--entra] [--prefer-replica] [--provider P] [--ssh [USER@]HOST[:PORT] [--ssh-identity FILE] [--ssh-known-hosts FILE]] [--force] [--yes] [--writes on|off [--confirm NAME]] [--tag TAG]... [--sentinel HOST:PORT[,…] --sentinel-master NAME [--sentinel-tls] [--sentinel-user USER] [--sentinel-password-stdin | --sentinel-ask-password]] [-- TOKEN_COMMAND...]
-redis-lens conn set <name> [--writes on|off [--confirm NAME] [--yes]] [--tag TAG]... [--untag TAG]...
+redis-lens conn set <name> [--writes on|off [--confirm NAME] [--yes]] [--tag TAG]... [--untag TAG]...   (at least one of --writes, --tag, --untag)
 redis-lens conn list | remove <name> | test <name>
-redis-lens conn export [FILE] [--force]                                        (P4)
-redis-lens conn import FILE [--force] [--yes]                                  (P4)
+redis-lens conn export [FILE] [--force]
+redis-lens conn import FILE [--force] [--yes]
 redis-lens scan <name> [--sample N] [--match GLOB] [--max-rate N] [--save [--keep N] [--keep-days D]] [--json]
                 [--check RULE]... [--rules FILE] [--strict]
                 [--report md|html|csv [-o FILE] [--examples]]
@@ -985,12 +988,12 @@ A panel of 2 Analysis, after Nodes: what each slot range holds, from `CLUSTER SL
 
 #### Small items (P4)
 
-- **Type filter on the key list:** `t` cycles the types shown: all → string → hash → list → set → zset → stream → other → all, over the loaded keys, with the name filter. The title says `type <t>` while one is set. It sends nothing.
+- **Type filter on the key list:** `t` cycles the types shown: all → string → hash → list → set → zset → stream → other → all, over the loaded keys, with the name filter. The title says `type <t>` while one is set, and a type with no loaded key says so. It sends nothing. `esc` clears the name filter and the type together, and only then goes back to Patterns. In the filter input `t` is text. The key is in the `?` overlay, not on the key bar.
 - **Connection export and import:**
-  - `redis-lens conn export [FILE]` writes the saved profiles as TOML `[[profile]]` tables (standard output without `FILE`), exactly the config file's profile fields. It never reads the keychain, and never writes a credential: there is none in a profile, and the Sentinel and SSH usernames stay in the keychain. A file is written with mode 0600 and never over an existing file without `--force`.
-  - `redis-lens conn import FILE [--force] [--yes]` adds every profile of the file. A name that exists is refused unless `--force` replaces it; names with the `docker:` prefix are refused. Nothing is imported if any profile is refused. To keep an import from turning writes on, `read_only = false` is dropped (the env's default applies) and the output says so; `read_only = true` is kept. A profile with a token command shows its command and asks first, as `conn add` does (`--yes` skips; with no terminal it refuses). Imported profiles have no credentials: the output lists the profiles that need `conn add <name> --force …` to store them.
-- **Tags on connections:** `tags = ["team-a", "eu"]` in a profile (absent when empty). `conn add --tag TAG` (repeatable) and `conn set <name> --tag TAG | --untag TAG` change them; a tag is 1 to 32 characters of letters, digits, `-`, `_`, `.` and `/`. `conn list` adds a TAGS column when any profile has one. On 0 Connections the detail panel shows them, and `/` filters the list by name or tag (`esc` clears).
-- **Theme and `NO_COLOR`:** `[settings] theme = "dark"` (the default) or `"light"`, a palette for light terminals with the same roles (dim, warn, error, ok, selection). When the `NO_COLOR` environment variable is set and not empty, no colour is drawn at all: selection, badges and the active tab use reverse video and bold instead, and every state keeps its words (`read-only`, `✗ failed`), so nothing is told by colour alone.
+  - `redis-lens conn export [FILE]` writes the saved profiles as TOML `[[profile]]` tables (standard output without `FILE`), exactly the config file's profile fields. It never reads the keychain, and never writes a credential: there is none in a profile, and the Sentinel and SSH usernames stay in the keychain. A file is written atomically (a temporary file in the same directory, then a rename) with mode 0600, and never over an existing file without `--force`. With no saved profile it fails ("no saved connections to export").
+  - `redis-lens conn import FILE [--force] [--yes]` adds every profile of the file. A name that exists is refused unless `--force` replaces it; names with the `docker:` prefix are refused. Nothing is imported if any profile is refused: the error lists every refusal. Also refused: a name twice in the file or with control characters, a tag that is not valid, an SSH bastion host that is not valid, a token command with no program. `[settings]` and any other table in the file are ignored, and the keychain is never touched (`--force` leaves the replaced profile's keychain entry as it is). To keep an import from turning writes on, `read_only = false` is dropped (the env's default applies) and the output says so; `read_only = true` is kept. A profile with a token command shows its command and asks first, as `conn add` does (`--yes` skips; with no terminal it refuses). Imported profiles have no credentials: the output lists the profiles that need `conn add <name> --force …` to store them, those with auth `keychain` or `command` and those behind an SSH bastion (the username may be needed).
+- **Tags on connections:** `tags = ["team-a", "eu"]` in a profile (absent when empty). `conn add --tag TAG` (repeatable) and `conn set <name> --tag TAG | --untag TAG` change them; a tag is 1 to 32 characters of letters, digits, `-`, `_`, `.` and `/`, matched as typed (case counts), and a tag named twice is kept once. `conn set` with none of `--writes`, `--tag` and `--untag` is a usage error; removing a tag the profile lacks, or adding and removing one in the same call, is refused with nothing changed; `--writes` and the tags are saved together or not at all. `conn list` adds a TAGS column when any profile has one. On 0 Connections the detail panel shows them in a Tags row (it takes the place of the Values row, so the panel keeps its seven rows), and `/` filters the list by name or tag (a part of either, ignoring case; Docker containers by name), `esc` clears. Inside the filter input every key is text, `enter` applies it, and the filter and its count show in the tab bar and the panel title. The two keys are in the `?` overlay, not on the key bar (which would no longer fit 80 columns).
+- **Theme and `NO_COLOR`:** `[settings] theme = "dark"` (the default) or `"light"`, a palette for light terminals with the same roles (dim, warn, error, ok, selection). When the `NO_COLOR` environment variable is set and not empty, no colour is drawn at all: selection, badges and the active tab use reverse video and bold instead, and every state keeps its words (`read-only`, `✗ failed`), so nothing is told by colour alone. `NO_COLOR` wins over `theme`. The mode is read once when the TUI starts (an unknown `theme` value is a config error); it applies to the TUI.
 
 ### Permission check, additions
 

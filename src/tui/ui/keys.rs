@@ -14,7 +14,7 @@ use crate::format;
 use crate::live::LiveError;
 use crate::live::keys::KeyRow;
 use crate::model::Ttl;
-use crate::tui::app::views::keys::{KeySort, KeysState};
+use crate::tui::app::views::keys::{KeySort, KeysState, TypeFilter};
 use crate::tui::app::views::{Ctx, LiveState};
 
 use super::widgets::{fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset};
@@ -116,8 +116,14 @@ fn title_right(state: &KeysState, ctx: &Ctx<'_>, pattern: &str, shown: usize) ->
     let loaded = format::grouped(state.rows.len() as u64);
     let of = est.map_or_else(String::new, |n| format!(" of ~{}", format::count(n)));
     let mut right = format!("{loaded} loaded{of}");
+    let typed = state.type_filter != TypeFilter::All;
     if !state.filter.is_empty() {
         right = format!("filter \"{}\" · {shown} rows · {right}", state.filter);
+    } else if typed {
+        right = format!("{shown} rows · {right}");
+    }
+    if typed {
+        right = format!("type {} · {right}", state.type_filter.label());
     }
     if state.is_loading() {
         right = format!("{} loading · {right}", spinner(ctx.tick));
@@ -224,6 +230,11 @@ fn empty_lines(state: &KeysState, ctx: &Ctx<'_>) -> Vec<Line<'static>> {
         format!(
             " No loaded key matches \"{}\". Press esc to clear the filter.",
             state.filter
+        )
+    } else if state.type_filter != TypeFilter::All && !state.rows.is_empty() {
+        format!(
+            " No loaded key is of type {}. Press t for another type, esc to clear.",
+            state.type_filter.label()
         )
     } else if state.done {
         " No key of this pattern was found.".to_string()

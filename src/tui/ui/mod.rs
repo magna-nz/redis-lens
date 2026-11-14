@@ -614,6 +614,13 @@ fn tabs(app: &App, w: usize) -> Line<'static> {
             Span::styled("  (esc to clear)", style::dim()),
         ]);
     }
+    if app.screen() == Screen::Connections && !app.conn_filter.is_empty() && !app.conn_filtering {
+        spans.extend([
+            Span::styled("   filter: ", style::dim()),
+            Span::styled(app.conn_filter.clone(), style::amber()),
+            Span::styled("  (esc to clear)", style::dim()),
+        ]);
+    }
     Line::from(spans)
 }
 
@@ -710,6 +717,13 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
             "/",
             app.patterns.filter.clone(),
             "   type to filter patterns · enter to apply · esc to clear",
+            w,
+        )
+    } else if app.screen() == Screen::Connections && app.conn_filtering {
+        input_line(
+            "/",
+            app.conn_filter.clone(),
+            "   type a name or tag · enter to apply · esc to clear",
             w,
         )
     } else if let Some(input) = app.cmdline_input() {

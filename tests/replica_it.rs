@@ -108,6 +108,7 @@ fn profile(port: u16, prefer_replica: bool) -> Profile {
         provider: None,
         token_command: None,
         ssh: None,
+        tags: Vec::new(),
     }
 }
 

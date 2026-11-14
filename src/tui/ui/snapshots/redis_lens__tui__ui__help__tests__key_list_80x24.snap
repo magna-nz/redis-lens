@@ -1,6 +1,5 @@
 ---
 source: src/tui/ui/help.rs
-assertion_line: 96
 expression: "render(Screen::KeyList, 80, 24).backend()"
 ---
 "                                                                                "
@@ -18,12 +17,12 @@ expression: "render(Screen::KeyList, 80, 24).backend()"
 "       │Home End g G   Jump to the first or last row                    │       "
 "       │/              Filter the loaded keys by name                   │       "
 "       │o              Sort the loaded keys                             │       "
+"       │t              Show one type of the loaded keys                 │       "
 "       │n              Load 1,000 more keys                             │       "
 "       │enter          Show the selected key and its value              │       "
 "       │y              Copy the selected key name to the clipboard      │       "
-"       │esc            Clear the filter, or go back to Patterns         │       "
+"       │esc            Clear the filters, or go back to Patterns        │       "
 "       │N              Add a key                                        │       "
 "       └────────────────────────────────────────────────────────────────┘       "
-"                                                                                "
 "                                                                                "
 "                                                                                "
