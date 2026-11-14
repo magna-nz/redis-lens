@@ -4,9 +4,12 @@
 
 pub mod cluster;
 pub mod context;
+pub mod estimate;
+pub mod figures;
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::budget::Budget;
@@ -35,6 +38,9 @@ pub struct ScanOptions {
     /// The database the connection has selected, for its `INFO keyspace` and
     /// `INFO keysizes` lines.
     pub db: u32,
+    /// Set it to stop the scan early: it then returns a report built from what it has
+    /// sampled so far, with `complete` false (see [`StopFlag`]). Never set by default.
+    pub stop: StopFlag,
 }
 
 impl Default for ScanOptions {
@@ -46,7 +52,39 @@ impl Default for ScanOptions {
             max_commands_per_sec: Some(5_000),
             match_glob: None,
             db: 0,
+            stop: StopFlag::default(),
         }
+    }
+}
+
+/// Stops a running scan early and keeps what it has (the TUI's `esc` while an analysis
+/// runs).
+///
+/// Clones share one flag: keep a clone, put another in [`ScanOptions::stop`], and call
+/// [`StopFlag::stop`] while the scan runs. The scan looks at the flag before each `SCAN`
+/// and before each pipelined batch, so it stops within one batch (a batch already sent
+/// is read to the end). It then returns `Ok` with a [`ScanReport`] built from the
+/// samples so far, estimates scaled as usual and `complete` false; on a cluster every
+/// node cut short is [`crate::model::NodeStatus::Partial`] with a note saying it was
+/// stopped. A flag set before the scan starts still reads `INFO`, `DBSIZE` and the
+/// server context, then samples nothing.
+#[derive(Debug, Clone, Default)]
+pub struct StopFlag(Arc<AtomicBool>);
+
+impl StopFlag {
+    /// A flag that is not set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Asks every scan holding a clone of this flag to stop.
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// True once [`StopFlag::stop`] was called on any clone.
+    pub fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
     }
 }
 
@@ -243,7 +281,7 @@ pub async fn sample_keys_detailed_with_budget<C: ConnectionLike + Send>(
     budget: &Budget,
 ) -> Result<SampleOutcome, ScanError> {
     let publish = progress.map(watch_progress);
-    let (outcome, failure) = sample_inner(
+    let (outcome, failure, _stopped) = sample_inner(
         conn,
         opts,
         with_sizes,
@@ -285,6 +323,10 @@ pub(crate) trait PartialHook: Send {
 /// A failed `SCAN` or batch ends the walk: the outcome then holds what was sampled
 /// before it, with `keys_seen` counting only the keys looked up (or skipped as not
 /// UTF-8), `complete` false, and no final `done` progress; the error comes second.
+///
+/// [`ScanOptions::stop`] ends the walk too, before the next `SCAN` or batch: the outcome
+/// counts keys as after an error, with `complete` false, and the final `done` progress
+/// is published. The third value says the walk was stopped that way.
 async fn sample_inner<C: ConnectionLike + Send>(
     conn: &mut C,
     opts: &ScanOptions,
@@ -293,7 +335,7 @@ async fn sample_inner<C: ConnectionLike + Send>(
     progress: Option<&ProgressFn<'_>>,
     mut partial: Option<&mut (dyn PartialHook + '_)>,
     budget: &Budget,
-) -> (SampleOutcome, Option<ScanError>) {
+) -> (SampleOutcome, Option<ScanError>, bool) {
     let limit = usize::try_from(opts.sample_limit).unwrap_or(usize::MAX);
     let batch_size = opts.batch_size.max(1);
     let mut seen: HashSet<String> = HashSet::new();
@@ -317,17 +359,23 @@ async fn sample_inner<C: ConnectionLike + Send>(
             f(sampled as u64, done);
         }
     };
-    let stopped = |samples: Vec<KeySample>, answered: u64, skipped: usize, vanished, e| {
+    let failed = |samples: Vec<KeySample>, answered: u64, skipped: usize, vanished, e| {
         let outcome = SampleOutcome {
             samples,
             keys_seen: answered + skipped as u64,
             vanished,
             complete: false,
         };
-        (outcome, Some(e))
+        (outcome, Some(e), false)
     };
+    // Set when the stop flag ended the walk.
+    let mut stopped = false;
 
     while seen.len() < limit {
+        if opts.stop.is_stopped() {
+            stopped = true;
+            break;
+        }
         let mut cmd = redis::cmd("SCAN");
         cmd.arg(cursor).arg("COUNT").arg(opts.scan_count);
         if let Some(glob) = &opts.match_glob {
@@ -336,7 +384,7 @@ async fn sample_inner<C: ConnectionLike + Send>(
         budget.take(1).await;
         let (next, keys): (u64, Vec<Vec<u8>>) = match cmd.query_async(conn).await {
             Ok(r) => r,
-            Err(e) => return stopped(samples, answered, skipped.len(), vanished, e.into()),
+            Err(e) => return failed(samples, answered, skipped.len(), vanished, e.into()),
         };
         cursor = next;
         reached_end = cursor == 0;
@@ -361,6 +409,10 @@ async fn sample_inner<C: ConnectionLike + Send>(
         while pending.len() >= batch_size
             || (!pending.is_empty() && (cursor == 0 || seen.len() >= limit))
         {
+            if opts.stop.is_stopped() {
+                stopped = true;
+                break;
+            }
             let n = pending.len().min(batch_size);
             let batch: Vec<String> = pending.drain(..n).collect();
             let batch_out = match fetch_batch(
@@ -374,7 +426,7 @@ async fn sample_inner<C: ConnectionLike + Send>(
             .await
             {
                 Ok(b) => b,
-                Err(e) => return stopped(samples, answered, skipped.len(), vanished, e),
+                Err(e) => return failed(samples, answered, skipped.len(), vanished, e),
             };
             vanished += batch_out.vanished;
             answered += batch.len() as u64;
@@ -387,18 +439,28 @@ async fn sample_inner<C: ConnectionLike + Send>(
             publish(samples.len(), false);
         }
 
-        if cursor == 0 {
+        if stopped || cursor == 0 {
             break;
         }
     }
     publish(samples.len(), true);
-    let outcome = SampleOutcome {
-        samples,
-        keys_seen: (seen.len() + skipped.len()) as u64,
-        vanished,
-        complete: reached_end && !dropped,
+    let outcome = if stopped {
+        // Only the keys looked up count: those still pending were never asked about.
+        SampleOutcome {
+            samples,
+            keys_seen: answered + skipped.len() as u64,
+            vanished,
+            complete: false,
+        }
+    } else {
+        SampleOutcome {
+            samples,
+            keys_seen: (seen.len() + skipped.len()) as u64,
+            vanished,
+            complete: reached_end && !dropped,
+        }
     };
-    (outcome, None)
+    (outcome, None, stopped)
 }
 
 /// What [`fetch_batch`] did.
@@ -656,6 +718,9 @@ pub async fn scan_with_partial<C: ConnectionLike + Send>(
 /// sampling) from `budget` instead of a budget of its own built from
 /// `opts.max_commands_per_sec` (which is then not used). The TUI passes the budget its
 /// live views share.
+///
+/// The server's figures come from [`figures::server_figures_with_budget`], the same read
+/// a connect makes. [`ScanOptions::stop`] stops it early with a partial report.
 pub async fn scan_with_budget<C: ConnectionLike + Send>(
     profile_name: &str,
     conn: &mut C,
@@ -665,7 +730,8 @@ pub async fn scan_with_budget<C: ConnectionLike + Send>(
     partial: Option<&PartialSender>,
     budget: &Budget,
 ) -> Result<ScanReport, ScanError> {
-    let server = server_info_with_budget(conn, budget).await?;
+    let figures::ServerFigures { server, context } =
+        figures::server_figures_with_budget(conn, opts.db, perms, budget).await?;
     let with_sizes = perms.allowed(PERM_MEMORY);
     let target = opts.sample_limit.min(server.total_keys);
     let has_match = opts.match_glob.is_some();
@@ -688,12 +754,13 @@ pub async fn scan_with_budget<C: ConnectionLike + Send>(
             });
         }
     };
+    begin();
     let node = sample_server(
         conn,
         &server,
+        context,
         opts,
         perms,
-        &begin,
         publish.as_ref().map(|f| f as &ProgressFn<'_>),
         sink.as_mut().map(|s| s as &mut dyn PartialHook),
         budget,
@@ -787,6 +854,8 @@ pub(crate) struct ServerSample {
     pub with_sizes: bool,
     /// The walk stopped early on this error.
     pub error: Option<ScanError>,
+    /// [`ScanOptions::stop`] ended the walk before it was done.
+    pub stopped: bool,
 }
 
 impl ServerSample {
@@ -801,36 +870,33 @@ impl ServerSample {
     }
 }
 
-/// Read the server context, then sample, on one server whose `INFO` and `DBSIZE` are
-/// `server`, taking every command from `budget`. A cluster scan gives each node a
-/// [`Budget`] of its own at the full `opts.max_commands_per_sec`: the command budget is
-/// per server. `perms` decides whether sizes, LFU counters and
-/// `MEMORY STATS` are asked for. `begin` runs after the context is read and before the
-/// first `SCAN`. Never fails as a whole: an error mid-walk is kept in
-/// [`ServerSample::error`] with what was sampled before it.
+/// Sample one server whose figures ([`figures::server_figures_with_budget`]) are
+/// `server` and `context`, taking every command from `budget`. A cluster scan gives each
+/// node a [`Budget`] of its own at the full `opts.max_commands_per_sec`: the command
+/// budget is per server. `perms` decides whether sizes and LFU counters are asked for.
+/// Never fails as a whole: an error mid-walk is kept in [`ServerSample::error`] with
+/// what was sampled before it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn sample_server<C: ConnectionLike + Send>(
     conn: &mut C,
     server: &ServerInfo,
+    context: crate::model::ServerContext,
     opts: &ScanOptions,
     perms: &PermissionReport,
-    begin: &(dyn Fn() + Sync),
     progress: Option<&ProgressFn<'_>>,
     partial: Option<&mut (dyn PartialHook + '_)>,
     budget: &Budget,
 ) -> ServerSample {
-    // A few read-only commands; any part that fails is left out, never the scan.
-    let context = context::read(conn, opts.db, perms, budget).await;
     let with_sizes = perms.allowed(PERM_MEMORY);
     let with_freq = perms.allowed(PERM_FREQ) && server.lfu_enabled();
-    begin();
-    let (outcome, error) =
+    let (outcome, error, stopped) =
         sample_inner(conn, opts, with_sizes, with_freq, progress, partial, budget).await;
     ServerSample {
         context,
         outcome,
         with_sizes,
         error,
+        stopped,
     }
 }
 
@@ -1125,6 +1191,9 @@ mod tests {
             pub type_calls: HashMap<Vec<u8>, usize>,
             /// Refuse `INFO server` (for a node that fails before sampling).
             pub fail_info: bool,
+            /// Set this flag when this SCAN call (0-based) arrives: the user stops the
+            /// scan while that page is on its way.
+            pub stop_at_scan: Option<(usize, super::super::StopFlag)>,
             scans: usize,
         }
 
@@ -1143,6 +1212,7 @@ mod tests {
                     duplicates: false,
                     type_calls: HashMap::new(),
                     fail_info: false,
+                    stop_at_scan: None,
                     scans: 0,
                 }
             }
@@ -1157,6 +1227,11 @@ mod tests {
                     return false;
                 }
                 self.scans += 1;
+                if let Some((n, flag)) = &self.stop_at_scan
+                    && *n == self.scans - 1
+                {
+                    flag.stop();
+                }
                 self.fail_scan == Some(self.scans - 1)
             }
 
@@ -1795,7 +1870,7 @@ mod tests {
         let mut server = fake::Server::new(keys, 100);
         server.fail_scan = Some(2);
         let budget = Budget::new(None);
-        let (outcome, error) = run(sample_inner(
+        let (outcome, error, stopped) = run(sample_inner(
             &mut server,
             &opts(10_000, 50),
             true,
@@ -1805,6 +1880,7 @@ mod tests {
             &budget,
         ));
         assert!(matches!(error, Some(ScanError::Redis(_))));
+        assert!(!stopped);
         assert!(!outcome.complete);
         assert_eq!(outcome.keys_seen, 200);
         assert_eq!(outcome.vanished, 20);
@@ -1812,16 +1888,23 @@ mod tests {
         // The same through sample_server, with the context read first.
         let mut server = fake::Server::new(server.keys, 100);
         server.fail_scan = Some(2);
-        let info = run(server_info(&mut server)).unwrap();
+        let b = Budget::new(None);
+        let f = run(figures::server_figures_with_budget(
+            &mut server,
+            0,
+            &perms_all(),
+            &b,
+        ))
+        .unwrap();
         let s = run(sample_server(
             &mut server,
-            &info,
+            &f.server,
+            f.context,
             &opts(10_000, 50),
             &perms_all(),
-            &|| {},
             None,
             None,
-            &Budget::new(None),
+            &b,
         ));
         assert!(s.error.is_some());
         assert_eq!(s.outcome.samples.len(), 180);
@@ -1864,6 +1947,98 @@ mod tests {
         let (sampled, est) = server.seen_partials[1].unwrap();
         assert_eq!(sampled, 70);
         assert!(est.abs_diff(7_786) <= 2, "est {est}");
+    }
+
+    /// `esc` while an analysis runs: the scan ends before the next batch and returns a
+    /// report of what it sampled, not complete, estimates scaled from it.
+    #[test]
+    fn a_stopped_scan_keeps_what_it_has() {
+        let keys = keyspace(1_000, |_| Fate::Present);
+        let mut server = fake::Server::new(keys, 100);
+        let stop = StopFlag::new();
+        // The third SCAN's page is on its way when the user stops.
+        server.stop_at_scan = Some((2, stop.clone()));
+        let o = ScanOptions {
+            stop: stop.clone(),
+            ..opts(500, 50)
+        };
+        let (ptx, prx) = watch::channel(ScanProgress::default());
+        let (tx, rx) = watch::channel(None);
+        let report = run(scan_with_partial(
+            "t",
+            &mut server,
+            &o,
+            &perms_all(),
+            Some(&ptx),
+            Some(&tx),
+        ))
+        .unwrap();
+        assert!(stop.is_stopped());
+        assert!(!report.complete);
+        // The first two pages, in four batches; nothing of the third page is looked up.
+        assert_eq!(report.sampled_keys, 200);
+        assert_eq!(server.log.iter().filter(|c| *c == "SCAN").count(), 3);
+        assert_eq!(server.type_calls.len(), 200);
+        // 200 keys present of 1,000: the estimate is still the whole keyspace.
+        assert_eq!(est_total(&report), 1_000);
+        // The server context is kept, and the last partial and progress say it ended.
+        assert!(report.server_context.is_some());
+        let last = rx.borrow().clone().unwrap();
+        assert_eq!(last.patterns, report.patterns);
+        let p = *prx.borrow();
+        assert_eq!((p.sampled, p.target, p.done), (200, 500, true));
+    }
+
+    #[test]
+    fn a_scan_stopped_before_it_starts_samples_nothing() {
+        let mut server = fake::Server::new(keyspace(300, |_| Fate::Present), 100);
+        let stop = StopFlag::new();
+        stop.stop();
+        let o = ScanOptions {
+            stop,
+            ..opts(500, 50)
+        };
+        let report = run(scan("t", &mut server, &o, &perms_all(), None)).unwrap();
+        assert_eq!(report.sampled_keys, 0);
+        assert!(!report.complete);
+        assert!(report.patterns.is_empty());
+        // The figures are read; no key is.
+        assert_eq!(
+            server.log,
+            ["INFO", "INFO", "DBSIZE", "INFO", "INFO", "MEMORY"]
+        );
+        // A flag that is never set changes nothing.
+        let mut plain = fake::Server::new(keyspace(300, |_| Fate::Present), 100);
+        let report = run(scan("t", &mut plain, &opts(500, 50), &perms_all(), None)).unwrap();
+        assert!(report.complete);
+        assert_eq!(report.sampled_keys, 300);
+    }
+
+    /// Keys a stopped walk found but never looked up are not in the denominator.
+    #[test]
+    fn a_stopped_walk_counts_only_the_keys_it_looked_up() {
+        let mut server = fake::Server::new(keyspace(1_000, |_| Fate::Present), 250);
+        let stop = StopFlag::new();
+        server.stop_at_scan = Some((1, stop.clone()));
+        let o = ScanOptions {
+            stop,
+            ..opts(10_000, 100)
+        };
+        let (outcome, error, stopped) = run(sample_inner(
+            &mut server,
+            &o,
+            true,
+            false,
+            None,
+            None,
+            &Budget::new(None),
+        ));
+        assert!(error.is_none() && stopped);
+        assert!(!outcome.complete);
+        // Page 1 (250 keys): two batches of 100 looked up, 50 left pending; then the
+        // second SCAN stops it.
+        assert_eq!(outcome.keys_seen, 200);
+        assert_eq!(outcome.samples.len(), 200);
     }
 
     proptest::proptest! {

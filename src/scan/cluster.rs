@@ -34,10 +34,10 @@ use crate::model::{
     ServerContextParts, ServerInfo, ServerMode,
 };
 
+use super::figures::{NodeRead, read_nodes};
 use super::{
     PartialHook, PartialPatterns, PartialSender, ScanError, ScanOptions, ScanProgress,
-    ServerSample, Throttle, big_keys, estimate_scale, hot_keys, sample_server, server_info,
-    ttl_bytes,
+    ServerSample, Throttle, big_keys, estimate_scale, hot_keys, sample_server, ttl_bytes,
 };
 
 /// How many nodes are scanned at the same time.
@@ -54,6 +54,9 @@ const NOTE_STOPPED: &str =
     "the scan of this node stopped early (a connection or server error); its results are partial";
 /// Note for a node that was not connected and carries no note of its own.
 const NOTE_NOT_CONNECTED: &str = "this node could not be connected to";
+/// Note for a node whose walk [`ScanOptions::stop`] ended before it was done.
+pub const NOTE_USER_STOPPED: &str =
+    "the analysis was stopped before this node was done; its results are partial";
 
 /// Scan whatever [`crate::conn::cluster::connect_targets`] returned: a standalone server
 /// with [`super::scan_with_partial`] and `perms`, or a cluster with [`scan_cluster`]
@@ -300,29 +303,38 @@ pub(crate) async fn scan_nodes<C: ConnectionLike + Send>(
 ) -> Result<ScanReport, ScanError> {
     let has_match = opts.match_glob.is_some();
 
-    // Phase 1: INFO and DBSIZE of every connected node.
-    // The per-node futures are boxed as `Send` and collected before they are streamed:
-    // a stream that holds iterator closures trips rustc's higher-ranked `Send` check when
-    // the caller is spawned (see `tests::futures_are_send`).
-    let reads: Vec<BoxFuture<'_, Option<ServerInfo>>> = nodes
+    // The budget is per node: each node is its own server. Shared with the live views
+    // on that node when the caller gave one.
+    for n in &mut nodes {
+        if n.budget.is_none() {
+            n.budget = Some(Budget::new(opts.max_commands_per_sec));
+        }
+    }
+
+    // Phase 1: every connected node's figures (INFO, DBSIZE and the server context),
+    // through its budget, the same read a connect makes.
+    let reads: Vec<NodeRead<'_, C>> = nodes
         .iter_mut()
-        .map(|n| {
-            async move {
-                match n.conn.as_deref_mut() {
-                    Some(c) => server_info(c).await.ok(),
-                    None => None,
-                }
-            }
-            .boxed()
+        .map(|n| NodeRead {
+            conn: n.conn.as_deref_mut(),
+            perms: &n.perms,
+            budget: n
+                .budget
+                .clone()
+                .unwrap_or_else(|| Budget::new(opts.max_commands_per_sec)),
         })
         .collect();
-    let infos: Vec<Option<ServerInfo>> = stream::iter(reads)
-        .buffered(MAX_CONCURRENT_NODES)
-        .collect()
-        .await;
-    if infos.iter().all(Option::is_none) {
+    let figures = read_nodes(reads, opts.db).await;
+    if figures.iter().all(Option::is_none) {
         return Err(ScanError::NoNodes);
     }
+    let (infos, mut contexts): (Vec<Option<ServerInfo>>, Vec<Option<ServerContext>>) = figures
+        .into_iter()
+        .map(|f| match f {
+            Some(f) => (Some(f.server), Some(f.context)),
+            None => (None, None),
+        })
+        .unzip();
 
     // Phase 2: sample, the limit split by DBSIZE.
     let sizes: Vec<u64> = infos
@@ -361,13 +373,15 @@ pub(crate) async fn scan_nodes<C: ConnectionLike + Send>(
         .iter_mut()
         .zip(&infos)
         .zip(&quotas)
+        .zip(contexts.iter_mut())
         .enumerate()
-        .filter_map(|(i, ((n, info), quota))| {
+        .filter_map(|(i, (((n, info), quota), context))| {
             let info = info.as_ref()?;
+            let context = context.take()?;
             let conn = n.conn.as_deref_mut()?;
-            Some((i, conn, info, *quota, &n.perms, n.budget.clone()))
+            Some((i, conn, info, context, *quota, &n.perms, n.budget.clone()))
         })
-        .map(|(i, conn, info, quota, perms, budget)| {
+        .map(|(i, conn, info, context, quota, perms, budget)| {
             let counts = &counts;
             let shared = shared.as_ref();
             async move {
@@ -383,15 +397,14 @@ pub(crate) async fn scan_nodes<C: ConnectionLike + Send>(
                     }
                 };
                 let mut hook = shared.map(|shared| NodeHook { node: i, shared });
-                // The budget is per node: each node is its own server. Shared with the
-                // live views on that node when the caller gave one.
+                // Set for every node before phase 1.
                 let budget = budget.unwrap_or_else(|| Budget::new(node_opts.max_commands_per_sec));
                 let sample = sample_server(
                     conn,
                     info,
+                    context,
                     &node_opts,
                     perms,
-                    &|| {},
                     Some(&report),
                     hook.as_mut().map(|h| h as &mut dyn PartialHook),
                     &budget,
@@ -480,6 +493,11 @@ fn merge(
                 join_notes(meta.note.clone(), NOTE_STOPPED),
                 Some(s),
             ),
+            (true, Some(_), Some(s)) if s.stopped => (
+                NodeStatus::Partial,
+                join_notes(meta.note.clone(), NOTE_USER_STOPPED),
+                Some(s),
+            ),
             (true, Some(_), Some(s)) => (NodeStatus::Scanned, meta.note.clone(), Some(s)),
         };
         let mut samples: Vec<KeySample> = Vec::new();
@@ -559,7 +577,7 @@ fn merge(
 /// The cluster's [`ServerInfo`]: the flavor, version and policy of the first node
 /// scanned (in slot order), `mode: Cluster`, and `used_memory`, `maxmemory` and
 /// `total_keys` summed over the nodes scanned.
-fn merged_server(infos: &[ServerInfo]) -> ServerInfo {
+pub(crate) fn merged_server(infos: &[ServerInfo]) -> ServerInfo {
     let first = infos.first();
     ServerInfo {
         flavor: first.map_or(crate::model::ServerFlavor::Unknown, |i| i.flavor),
@@ -1131,6 +1149,69 @@ mod tests {
         let rows = r.nodes.unwrap();
         let sizes: Vec<bool> = rows.iter().map(|n| n.sizes_available).collect();
         assert_eq!(sizes, [true, false, true]);
+    }
+
+    /// One stop flag for every node: a node already done stays scanned, the node it
+    /// cut short and the nodes after it are partial with a note, and the report is
+    /// returned with what was sampled.
+    #[test]
+    fn a_stopped_cluster_scan_keeps_what_it_has() {
+        let stop = super::super::StopFlag::new();
+        let mut servers = vec![
+            fake::Server::new(keys(&["user"], 0..50), 100),
+            fake::Server::new(keys(&["user"], 50..1_050), 100),
+            fake::Server::new(keys(&["user"], 1_050..2_050), 100),
+        ];
+        // Node 1 is stopped while its second page is on its way.
+        servers[1].stop_at_scan = Some((1, stop.clone()));
+        let o = ScanOptions {
+            stop: stop.clone(),
+            ..opts(100_000, 50)
+        };
+        let (tx, _rx) = watch::channel(None);
+        let r = run(scan_nodes("c", inputs(&mut servers), &o, None, Some(&tx))).unwrap();
+        assert!(!r.complete);
+        let nodes = r.nodes.as_ref().unwrap();
+        // The futures of a current-thread runtime with ready replies run one at a
+        // time: node 0 finished first.
+        assert_eq!(nodes[0].status, NodeStatus::Scanned);
+        assert!(nodes[0].complete);
+        assert_eq!(nodes[0].sampled_keys, 50);
+        assert_eq!(nodes[1].status, NodeStatus::Partial);
+        assert_eq!(nodes[1].sampled_keys, 100);
+        assert_eq!(nodes[1].note.as_deref(), Some(NOTE_USER_STOPPED));
+        assert_eq!(nodes[2].status, NodeStatus::Partial);
+        assert_eq!(nodes[2].sampled_keys, 0);
+        assert!(!nodes[1].complete && !nodes[2].complete);
+        assert_eq!(r.sampled_keys, 150);
+        // Node 2 read its figures and never walked.
+        assert!(
+            !servers[2].log.iter().any(|c| c == "SCAN"),
+            "{:?}",
+            servers[2].log
+        );
+        assert!(nodes[2].server.is_some());
+    }
+
+    /// Phase 1 takes every node's figures from that node's budget.
+    #[test]
+    fn node_figures_count_against_the_node_budget() {
+        let mut servers = vec![
+            fake::Server::new(keys(&["user"], 0..10), 100),
+            fake::Server::new(keys(&["user"], 10..20), 100),
+        ];
+        let budgets: Vec<Arc<Budget>> = (0..2).map(|_| Budget::new(None)).collect();
+        let mut nodes = inputs(&mut servers);
+        for (n, b) in nodes.iter_mut().zip(&budgets) {
+            n.budget = Some(Arc::clone(b));
+        }
+        nodes[0].meta.slots = vec![(0, 8000)];
+        nodes[1].meta.slots = vec![(8001, 16383)];
+        let r = run(scan_nodes("c", nodes, &opts(1_000, 50), None, None)).unwrap();
+        assert!(r.complete);
+        for (s, b) in servers.iter().zip(&budgets) {
+            assert_eq!(b.taken(), s.log.len() as u64, "{:?}", s.log);
+        }
     }
 
     #[test]
