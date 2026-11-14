@@ -16,6 +16,15 @@
 //! - JSON: `JSON.GET key`, only when the key's `MEMORY USAGE` is known and at most
 //!   [`JSON_MAX_SIZE`]; the document kept is cut at [`JSON_SHOWN`];
 //! - vector set: `VRANDMEMBER key 100`, once;
+//! - array (Redis 8.8 and later): `ARSCAN key i 18446744073709551614 LIMIT 100`, then from
+//!   the index after the last one read;
+//! - the module types, once, in one pipeline: time series `TS.INFO` and
+//!   `TS.REVRANGE key - + COUNT 500`; Bloom `BF.INFO`; Cuckoo `CF.INFO`; Count-Min
+//!   Sketch `CMS.INFO`; Top-K `TOPK.INFO` and `TOPK.LIST key WITHCOUNT`; t-digest
+//!   `TDIGEST.INFO`, `TDIGEST.QUANTILE key 0.5 0.9 0.99`, `TDIGEST.MIN` and
+//!   `TDIGEST.MAX`. A refused or unknown command never fails the read: the first turns
+//!   the panel into one line saying why ([`Module::unavailable`]), the others leave
+//!   their part out with a note ([`Module::missing`]);
 //! - any other type: nothing.
 //!
 //! Values, field names, members and elements are held as [`Raw`], whose `Debug` shows
@@ -56,6 +65,20 @@ pub enum Kind {
     Json,
     /// `vectorset`.
     Vector,
+    /// `TSDB-TYPE`: RedisTimeSeries.
+    TimeSeries,
+    /// `MBbloom--` (RedisBloom) or `bloomfltr` (valkey-bloom).
+    Bloom,
+    /// `MBbloomCF`.
+    Cuckoo,
+    /// `CMSk-TYPE`: Count-Min Sketch.
+    Cms,
+    /// `TopK-TYPE`.
+    TopK,
+    /// `TDIS-TYPE`.
+    TDigest,
+    /// `array`: Redis 8.8 arrays, sparse and indexed.
+    Array,
     /// Any other type, with its `TYPE` reply: its value is not read.
     Other(String),
 }
@@ -72,6 +95,13 @@ impl Kind {
             "stream" => Self::Stream,
             "ReJSON-RL" => Self::Json,
             "vectorset" => Self::Vector,
+            "TSDB-TYPE" => Self::TimeSeries,
+            "MBbloom--" | "bloomfltr" => Self::Bloom,
+            "MBbloomCF" => Self::Cuckoo,
+            "CMSk-TYPE" => Self::Cms,
+            "TopK-TYPE" => Self::TopK,
+            "TDIS-TYPE" => Self::TDigest,
+            "array" => Self::Array,
             other => Self::Other(other.to_string()),
         }
     }
@@ -87,7 +117,35 @@ impl Kind {
             Self::Stream => "XREVRANGE",
             Self::Json => "JSON.GET",
             Self::Vector => "VRANDMEMBER",
+            Self::TimeSeries => "TS.INFO",
+            Self::Bloom => "BF.INFO",
+            Self::Cuckoo => "CF.INFO",
+            Self::Cms => "CMS.INFO",
+            Self::TopK => "TOPK.INFO",
+            Self::TDigest => "TDIGEST.INFO",
+            Self::Array => "ARSCAN",
             Self::Other(_) => return None,
+        })
+    }
+
+    /// A module type, read once into [`Items::Module`].
+    pub fn is_module(&self) -> bool {
+        matches!(
+            self,
+            Self::TimeSeries | Self::Bloom | Self::Cuckoo | Self::Cms | Self::TopK | Self::TDigest
+        )
+    }
+
+    /// What a module type is called on screen: `Time series`, `Bloom filter`, ….
+    pub fn module_label(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::TimeSeries => "Time series",
+            Self::Bloom => "Bloom filter",
+            Self::Cuckoo => "Cuckoo filter",
+            Self::Cms => "Count-Min Sketch",
+            Self::TopK => "Top-K",
+            Self::TDigest => "t-digest",
+            _ => return None,
         })
     }
 }
@@ -181,6 +239,11 @@ pub enum Items {
     },
     /// [`VECTOR_SAMPLE`] random elements of a vector set.
     Vector(Vec<Raw>),
+    /// An array's elements with their indexes, in index order.
+    Array(Vec<Element>),
+    /// A module type's summary: its `*.INFO` and, by type, samples, top items or
+    /// quantiles.
+    Module(Box<Module>),
     /// A type whose value redis-lens does not read.
     NotRead,
 }
@@ -194,6 +257,8 @@ impl Items {
             Self::List(v) | Self::Set(v) | Self::Vector(v) => v.len(),
             Self::ZSet(v) => v.len(),
             Self::Stream(v) => v.len(),
+            Self::Array(v) => v.len(),
+            Self::Module(_) => 1,
             Self::JsonNotRead { .. } | Self::NotRead => 0,
         }
     }
@@ -218,6 +283,52 @@ pub struct Member {
     pub member: Raw,
     pub score: Raw,
 }
+
+/// An array element.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Element {
+    pub index: u64,
+    pub value: Raw,
+}
+
+/// A module type's summary. Everything from the server is held as [`Raw`] (a TS
+/// label, a Top-K item and a rule's key are values), so `Debug` shows lengths only.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Module {
+    /// The `*.INFO` reply in the server's order: each field's name and its value, a
+    /// nested value (labels, rules) on one line as `name=value, …`.
+    pub info: Vec<(Raw, Raw)>,
+    /// A time series' last [`TS_SAMPLES`] samples, newest first.
+    pub samples: Vec<Sample>,
+    /// Top-K: the items and their counts, as `TOPK.LIST WITHCOUNT` lists them.
+    pub top: Vec<(Raw, Raw)>,
+    /// t-digest: `p50`, `p90`, `p99`, `min` and `max`, with their values.
+    pub stats: Vec<(&'static str, Raw)>,
+    /// Parts left out because their command was refused, unknown or failed, in
+    /// redis-lens's own words (`Samples not read: the server refused TS.REVRANGE for
+    /// this user.`).
+    pub missing: Vec<String>,
+    /// Nothing was read: the type's `*.INFO` was refused or is unknown. One line, in
+    /// redis-lens's own words.
+    pub unavailable: Option<String>,
+}
+
+/// A time series sample.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sample {
+    /// Milliseconds since the Unix epoch.
+    pub ts: i64,
+    pub value: Raw,
+}
+
+/// How many samples `TS.REVRANGE` asks for.
+pub const TS_SAMPLES: usize = 500;
+/// The t-digest quantiles asked for, with their labels.
+pub const TDIGEST_QUANTILES: [(&str, &str); 3] = [("p50", "0.5"), ("p90", "0.9"), ("p99", "0.99")];
+/// The highest array index (`ARSCAN`'s end).
+pub const ARRAY_MAX_INDEX: u64 = u64::MAX - 1;
+/// The most bytes one flattened `*.INFO` value keeps.
+const INFO_VALUE_MAX: usize = 4096;
 
 /// A stream entry.
 #[derive(Debug, Clone, PartialEq)]
@@ -402,6 +513,59 @@ fn page_cmds(
             let mut c = redis::cmd("VRANDMEMBER");
             c.arg(key).arg(VECTOR_SAMPLE);
             out.push(("VRANDMEMBER", c));
+        }
+        Kind::Array => {
+            let mut c = redis::cmd("ARSCAN");
+            c.arg(key)
+                .arg(index)
+                .arg(ARRAY_MAX_INDEX)
+                .arg("LIMIT")
+                .arg(PAGE_ITEMS);
+            out.push(("ARSCAN", c));
+        }
+        Kind::TimeSeries => {
+            let mut info = redis::cmd("TS.INFO");
+            info.arg(key);
+            let mut range = redis::cmd("TS.REVRANGE");
+            range
+                .arg(key)
+                .arg("-")
+                .arg("+")
+                .arg("COUNT")
+                .arg(TS_SAMPLES);
+            out.push(("TS.INFO", info));
+            out.push(("TS.REVRANGE", range));
+        }
+        Kind::Bloom | Kind::Cuckoo | Kind::Cms => {
+            let name = kind.command().unwrap_or("BF.INFO");
+            let mut c = redis::cmd(name);
+            c.arg(key);
+            out.push((name, c));
+        }
+        Kind::TopK => {
+            let mut info = redis::cmd("TOPK.INFO");
+            info.arg(key);
+            let mut list = redis::cmd("TOPK.LIST");
+            list.arg(key).arg("WITHCOUNT");
+            out.push(("TOPK.INFO", info));
+            out.push(("TOPK.LIST", list));
+        }
+        Kind::TDigest => {
+            let mut info = redis::cmd("TDIGEST.INFO");
+            info.arg(key);
+            let mut q = redis::cmd("TDIGEST.QUANTILE");
+            q.arg(key);
+            for (_, at) in TDIGEST_QUANTILES {
+                q.arg(at);
+            }
+            let mut min = redis::cmd("TDIGEST.MIN");
+            min.arg(key);
+            let mut max = redis::cmd("TDIGEST.MAX");
+            max.arg(key);
+            out.push(("TDIGEST.INFO", info));
+            out.push(("TDIGEST.QUANTILE", q));
+            out.push(("TDIGEST.MIN", min));
+            out.push(("TDIGEST.MAX", max));
         }
         Kind::Other(_) => {}
     }
@@ -624,8 +788,187 @@ fn parse(
             Items::Vector(raws("VRANDMEMBER", ok("VRANDMEMBER", &replies[0])?)?),
             None,
         ),
+        Kind::Array => {
+            let v = ok("ARSCAN", &replies[0])?;
+            let mut elements = Vec::new();
+            for (i, value) in pairs("ARSCAN", v)? {
+                let index = std::str::from_utf8(i.as_bytes())
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| shape("ARSCAN"))?;
+                elements.push(Element { index, value });
+            }
+            let next = elements
+                .last()
+                .filter(|e| full(elements.len()) && e.index < ARRAY_MAX_INDEX)
+                .map(|e| At::Index(e.index + 1));
+            (Items::Array(elements), next)
+        }
+        Kind::TimeSeries | Kind::Bloom | Kind::Cuckoo | Kind::Cms | Kind::TopK | Kind::TDigest => {
+            (Items::Module(Box::new(module(kind, cmds, replies)?)), None)
+        }
         Kind::Other(_) => (Items::NotRead, None),
     })
+}
+
+/// A module type's replies: the `*.INFO` first, then its type's other reads. A refused
+/// or unknown `*.INFO` makes the whole panel one line ([`Module::unavailable`]); its
+/// other failures fail the read (`n` tries again). Any other part that fails is left
+/// out with a note.
+fn module(
+    kind: &Kind,
+    cmds: &[(&'static str, redis::Cmd)],
+    replies: &[Value],
+) -> Result<Module, LiveError> {
+    let label = kind.module_label().unwrap_or("Value");
+    let mut m = Module::default();
+    let (Some((info_name, _)), Some(info)) = (cmds.first(), replies.first()) else {
+        return Err(incomplete());
+    };
+    match ok(info_name, info) {
+        Ok(v) => m.info = info_pairs(v),
+        Err(e @ (LiveError::Denied(_) | LiveError::Unsupported(_))) => {
+            m.unavailable = Some(format!("{label} not read: {e}."));
+            return Ok(m);
+        }
+        Err(e) => return Err(e),
+    }
+    for ((name, _), reply) in cmds.iter().zip(replies).skip(1) {
+        let what = match *name {
+            "TS.REVRANGE" => "Samples",
+            "TOPK.LIST" => "Top items",
+            "TDIGEST.QUANTILE" => "Quantiles",
+            "TDIGEST.MIN" => "Minimum",
+            _ => "Maximum",
+        };
+        let v = match ok(name, reply) {
+            Ok(v) => v,
+            Err(e) => {
+                m.missing.push(format!("{what} not read: {e}."));
+                continue;
+            }
+        };
+        let read = match *name {
+            "TS.REVRANGE" => samples(v).map(|s| m.samples = s),
+            "TOPK.LIST" => pairs(name, v).ok().map(|p| m.top = p),
+            "TDIGEST.QUANTILE" => array(v).map(|a| {
+                for ((label, _), q) in TDIGEST_QUANTILES.iter().zip(a) {
+                    if let Some(b) = bytes(q) {
+                        m.stats.push((label, Raw::new(b)));
+                    }
+                }
+            }),
+            "TDIGEST.MIN" => bytes(v).map(|b| m.stats.push(("min", Raw::new(b)))),
+            _ => bytes(v).map(|b| m.stats.push(("max", Raw::new(b)))),
+        };
+        if read.is_none() {
+            m.missing.push(format!(
+                "{what} not read: {name} came back in an unexpected shape."
+            ));
+        }
+    }
+    Ok(m)
+}
+
+/// `TS.REVRANGE` samples: `[timestamp, value]` pairs.
+fn samples(v: &Value) -> Option<Vec<Sample>> {
+    array(v)?
+        .iter()
+        .map(|s| match array(s) {
+            Some([ts, value]) => Some(Sample {
+                ts: int(ts)?,
+                value: Raw::new(bytes(value)?),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An `*.INFO` reply as name and value pairs: a map (RESP3) or a flat array (RESP2).
+fn info_pairs(v: &Value) -> Vec<(Raw, Raw)> {
+    let flat = |k: &Value, v: &Value| (Raw::new(flatten(k, 0)), Raw::new(flatten(v, 0)));
+    match v {
+        Value::Map(m) => m.iter().map(|(k, v)| flat(k, v)).collect(),
+        v => {
+            let a = array(v).unwrap_or(&[]);
+            a.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[k, v]| flat(k, v))
+                .collect()
+        }
+    }
+}
+
+/// A reply on one line: a scalar as it is; a map or a list of pairs as `k=v, k=v`; a
+/// list of lists as each on its own, `, ` between; another list with spaces. At most
+/// [`INFO_VALUE_MAX`] bytes, 4 levels deep.
+fn flatten(v: &Value, depth: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    flatten_into(v, depth, &mut out);
+    if out.len() > INFO_VALUE_MAX {
+        out.truncate(INFO_VALUE_MAX);
+        // Not in the middle of a character, so text stays text.
+        if let Err(e) = std::str::from_utf8(&out)
+            && e.error_len().is_none()
+        {
+            out.truncate(e.valid_up_to());
+        }
+        out.extend_from_slice("…".as_bytes());
+    }
+    out
+}
+
+fn flatten_into(v: &Value, depth: usize, out: &mut Vec<u8>) {
+    if out.len() > INFO_VALUE_MAX {
+        return;
+    }
+    if depth > 4 {
+        out.extend_from_slice("…".as_bytes());
+        return;
+    }
+    let join = |out: &mut Vec<u8>, k: usize, sep: &[u8]| {
+        if k > 0 {
+            out.extend_from_slice(sep);
+        }
+    };
+    match v {
+        Value::Nil => {}
+        Value::Map(m) => {
+            for (k, (key, val)) in m.iter().enumerate() {
+                join(out, k, b", ");
+                flatten_into(key, depth + 1, out);
+                out.push(b'=');
+                flatten_into(val, depth + 1, out);
+            }
+        }
+        v => match array(v) {
+            Some(a) => {
+                let is_pair = |x: &Value| matches!(array(x), Some([k, v]) if array(k).is_none() && array(v).is_none());
+                if !a.is_empty() && a.iter().all(is_pair) {
+                    for (k, x) in a.iter().enumerate() {
+                        join(out, k, b", ");
+                        if let Some([key, val]) = array(x) {
+                            flatten_into(key, depth + 1, out);
+                            out.push(b'=');
+                            flatten_into(val, depth + 1, out);
+                        }
+                    }
+                } else if !a.is_empty() && a.iter().all(|x| array(x).is_some()) {
+                    for (k, x) in a.iter().enumerate() {
+                        join(out, k, b", ");
+                        flatten_into(x, depth + 1, out);
+                    }
+                } else {
+                    for (k, x) in a.iter().enumerate() {
+                        join(out, k, b" ");
+                        flatten_into(x, depth + 1, out);
+                    }
+                }
+            }
+            None => out.extend(bytes(v).unwrap_or_default()),
+        },
+    }
 }
 
 /// Notes a refused or unknown command once; other failures leave only that part out.
@@ -878,5 +1221,294 @@ mod tests {
         });
         let text = format!("{page:?}");
         assert!(!text.contains("s3cr3t"), "{text}");
+    }
+
+    // ---- module types and arrays --------------------------------------------------
+
+    fn words_of(kind: &Kind, at: Option<At>) -> Vec<String> {
+        page_cmds("k", kind, at.as_ref(), None)
+            .iter()
+            .map(|(_, c)| {
+                c.args_iter()
+                    .map(|a| match a {
+                        redis::Arg::Simple(b) => String::from_utf8_lossy(b).into_owned(),
+                        _ => "<cursor>".into(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn module_type_replies_and_commands() {
+        for (t, k) in [
+            ("TSDB-TYPE", Kind::TimeSeries),
+            ("MBbloom--", Kind::Bloom),
+            ("bloomfltr", Kind::Bloom),
+            ("MBbloomCF", Kind::Cuckoo),
+            ("CMSk-TYPE", Kind::Cms),
+            ("TopK-TYPE", Kind::TopK),
+            ("TDIS-TYPE", Kind::TDigest),
+            ("array", Kind::Array),
+        ] {
+            assert_eq!(Kind::from_type(t), k, "{t}");
+            assert_eq!(k.is_module(), k != Kind::Array);
+        }
+        assert_eq!(
+            words_of(&Kind::TimeSeries, None),
+            ["TS.INFO k", "TS.REVRANGE k - + COUNT 500"]
+        );
+        assert_eq!(words_of(&Kind::Bloom, None), ["BF.INFO k"]);
+        assert_eq!(words_of(&Kind::Cuckoo, None), ["CF.INFO k"]);
+        assert_eq!(words_of(&Kind::Cms, None), ["CMS.INFO k"]);
+        assert_eq!(
+            words_of(&Kind::TopK, None),
+            ["TOPK.INFO k", "TOPK.LIST k WITHCOUNT"]
+        );
+        assert_eq!(
+            words_of(&Kind::TDigest, None),
+            [
+                "TDIGEST.INFO k",
+                "TDIGEST.QUANTILE k 0.5 0.9 0.99",
+                "TDIGEST.MIN k",
+                "TDIGEST.MAX k"
+            ]
+        );
+        assert_eq!(
+            words_of(&Kind::Array, Some(At::Index(1001))),
+            ["ARSCAN k 1001 18446744073709551614 LIMIT 100"]
+        );
+    }
+
+    #[test]
+    fn ts_info_in_both_protocols() {
+        let cmds = page_cmds("k", &Kind::TimeSeries, None, None);
+        // RESP2: a flat array, labels as pairs, rules as lists.
+        let resp2 = Value::Array(vec![
+            bulk("totalSamples"),
+            Value::Int(2),
+            bulk("labels"),
+            Value::Array(vec![
+                Value::Array(vec![bulk("sensor"), bulk("temp")]),
+                Value::Array(vec![bulk("room"), bulk("kitchen")]),
+            ]),
+            bulk("sourceKey"),
+            Value::Nil,
+            bulk("rules"),
+            Value::Array(vec![Value::Array(vec![
+                bulk("ts:avg"),
+                Value::Int(60000),
+                bulk("AVG"),
+                Value::Int(0),
+            ])]),
+        ]);
+        // RESP3: maps, doubles.
+        let resp3 = Value::Map(vec![
+            (bulk("totalSamples"), Value::Int(2)),
+            (
+                bulk("labels"),
+                Value::Map(vec![
+                    (bulk("sensor"), bulk("temp")),
+                    (bulk("room"), bulk("kitchen")),
+                ]),
+            ),
+            (bulk("sourceKey"), Value::Nil),
+            (
+                bulk("rules"),
+                Value::Map(vec![(
+                    bulk("ts:avg"),
+                    Value::Array(vec![Value::Int(60000), bulk("AVG"), Value::Int(0)]),
+                )]),
+            ),
+        ]);
+        let range2 = Value::Array(vec![
+            Value::Array(vec![Value::Int(1_700_000_001_000), bulk("22")]),
+            Value::Array(vec![Value::Int(1_700_000_000_000), bulk("21.5")]),
+        ]);
+        let range3 = Value::Array(vec![
+            Value::Array(vec![Value::Int(1_700_000_001_000), Value::Double(22.0)]),
+            Value::Array(vec![Value::Int(1_700_000_000_000), Value::Double(21.5)]),
+        ]);
+        for (info, range, rules) in [
+            (resp2, range2, "ts:avg 60000 AVG 0"),
+            (resp3, range3, "ts:avg=60000 AVG 0"),
+        ] {
+            let (items, next) = parse(
+                &Kind::TimeSeries,
+                &cmds,
+                &[info, range],
+                None,
+                &mut Vec::new(),
+            )
+            .unwrap();
+            assert_eq!(next, None);
+            let Items::Module(m) = items else { panic!() };
+            let get = |k: &str| {
+                m.info
+                    .iter()
+                    .find(|(n, _)| n.as_bytes() == k.as_bytes())
+                    .map(|(_, v)| String::from_utf8_lossy(v.as_bytes()).into_owned())
+            };
+            assert_eq!(get("totalSamples").as_deref(), Some("2"));
+            assert_eq!(get("labels").as_deref(), Some("sensor=temp, room=kitchen"));
+            assert_eq!(get("sourceKey").as_deref(), Some(""));
+            assert_eq!(get("rules").as_deref(), Some(rules));
+            assert_eq!(m.samples.len(), 2);
+            assert_eq!(m.samples[0].ts, 1_700_000_001_000);
+            assert_eq!(m.samples[1].value, Raw::from("21.5"));
+            assert!(m.missing.is_empty() && m.unavailable.is_none());
+        }
+    }
+
+    #[test]
+    fn topk_and_tdigest_replies() {
+        let cmds = page_cmds("k", &Kind::TopK, None, None);
+        let info = Value::Array(vec![bulk("k"), Value::Int(3)]);
+        let list = Value::Array(vec![bulk("a"), Value::Int(3), bulk("b"), Value::Int(2)]);
+        let (items, _) = parse(&Kind::TopK, &cmds, &[info, list], None, &mut Vec::new()).unwrap();
+        let Items::Module(m) = items else { panic!() };
+        assert_eq!(
+            m.top,
+            [
+                (Raw::from("a"), Raw::from("3")),
+                (Raw::from("b"), Raw::from("2"))
+            ]
+        );
+        let cmds = page_cmds("k", &Kind::TDigest, None, None);
+        let replies = [
+            Value::Array(vec![bulk("Observations"), Value::Int(6)]),
+            Value::Array(vec![bulk("4"), Value::Double(100.0), bulk("100")]),
+            bulk("1"),
+            server_error("NOPERM User lens-ro has no permissions to run the 'tdigest.max' command"),
+        ];
+        let (items, _) = parse(&Kind::TDigest, &cmds, &replies, None, &mut Vec::new()).unwrap();
+        let Items::Module(m) = items else { panic!() };
+        let labels: Vec<&str> = m.stats.iter().map(|(l, _)| *l).collect();
+        assert_eq!(labels, ["p50", "p90", "p99", "min"]);
+        assert_eq!(m.stats[1].1, Raw::from("100"));
+        assert_eq!(
+            m.missing,
+            ["Maximum not read: the server refused TDIGEST.MAX for this user."]
+        );
+        assert!(!format!("{m:?}").contains("lens-ro"));
+    }
+
+    #[test]
+    fn a_refused_or_unknown_info_is_one_line_never_an_error() {
+        let cmds = page_cmds("k", &Kind::TimeSeries, None, None);
+        let noperm =
+            server_error("NOPERM User lens-ro has no permissions to run the 'ts.info' command");
+        let unknown = server_error("ERR unknown command 'TS.INFO', with args beginning with: 'k' ");
+        let range = server_error("ERR unknown command 'TS.REVRANGE'");
+        for (e, want) in [
+            (
+                noperm,
+                "Time series not read: the server refused TS.INFO for this user.",
+            ),
+            (
+                unknown,
+                "Time series not read: the server does not support TS.INFO.",
+            ),
+        ] {
+            let (items, _) = parse(
+                &Kind::TimeSeries,
+                &cmds,
+                &[e, range.clone()],
+                None,
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let Items::Module(m) = items else { panic!() };
+            assert_eq!(m.unavailable.as_deref(), Some(want));
+            assert!(m.info.is_empty() && m.missing.is_empty());
+        }
+        // Another failure of the INFO fails the read, so n tries again.
+        let other = server_error("WRONGTYPE Operation against a key holding the wrong kind");
+        assert!(
+            parse(
+                &Kind::TimeSeries,
+                &cmds,
+                &[other, range],
+                None,
+                &mut Vec::new()
+            )
+            .is_err()
+        );
+        // A refused TS.REVRANGE only leaves the samples out.
+        let info = Value::Array(vec![bulk("totalSamples"), Value::Int(1)]);
+        let refused = server_error("NOPERM no permissions to run the 'ts.revrange' command");
+        let (items, _) = parse(
+            &Kind::TimeSeries,
+            &cmds,
+            &[info, refused],
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let Items::Module(m) = items else { panic!() };
+        assert_eq!(
+            m.missing,
+            ["Samples not read: the server refused TS.REVRANGE for this user."]
+        );
+    }
+
+    #[test]
+    fn array_pages_follow_the_last_index() {
+        let cmds = page_cmds("k", &Kind::Array, None, None);
+        let mut flat = Vec::new();
+        for i in 0..PAGE_ITEMS {
+            flat.push(bulk(&(i * 10).to_string()));
+            flat.push(bulk("v"));
+        }
+        let (items, next) = parse(
+            &Kind::Array,
+            &cmds,
+            &[Value::Array(flat)],
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(items.len(), PAGE_ITEMS);
+        assert_eq!(next, Some(At::Index(991)));
+        // RESP3 pairs, a short page: the last.
+        let pairs = Value::Array(vec![Value::Array(vec![Value::Int(7), bulk("x")])]);
+        let (items, next) = parse(&Kind::Array, &cmds, &[pairs], None, &mut Vec::new()).unwrap();
+        assert_eq!(
+            items,
+            Items::Array(vec![Element {
+                index: 7,
+                value: Raw::from("x")
+            }])
+        );
+        assert_eq!(next, None);
+        // The highest index ends the walk even on a full page.
+        let mut flat = Vec::new();
+        for i in 0..PAGE_ITEMS as u64 {
+            flat.push(bulk(&(ARRAY_MAX_INDEX - 99 + i).to_string()));
+            flat.push(bulk("v"));
+        }
+        let (_, next) = parse(
+            &Kind::Array,
+            &cmds,
+            &[Value::Array(flat)],
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn flattened_info_values_are_capped_on_a_character() {
+        let long = Value::BulkString("é".repeat(INFO_VALUE_MAX).into_bytes());
+        let out = flatten(&long, 0);
+        assert!(out.len() <= INFO_VALUE_MAX + 3);
+        assert!(std::str::from_utf8(&out).unwrap().ends_with('…'));
+        let mut deep = bulk("x");
+        for _ in 0..50 {
+            deep = Value::Array(vec![deep]);
+        }
+        assert!(flatten(&deep, 0).len() < 20);
     }
 }
