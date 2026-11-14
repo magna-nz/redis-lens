@@ -18,23 +18,43 @@
 //!   edited half-seen.
 //! - **Values.** Replies are held as [`Output`]; `Debug` of this state prints counts
 //!   only, never the input, the history or a reply.
+//! - **Views.** `ctrl-t` switches how every reply is drawn: text, table, JSON, raw
+//!   ([`cmdline::View`]). Each [`Output`] holds all four, made when it came back.
+//! - **Repeats.** `N cmd` (a leading count, at most [`cmdline::MAX_REPEAT`]) sends the
+//!   command N times, one after another, each one checked as a single command is:
+//!   readonly ones by [`cmdline::gate`] here and again where they are sent, writes
+//!   through [`Act::write`], the write gate, every time. A `@dangerous` readonly one
+//!   asks once for the whole run, naming the count; a write that would ask is not
+//!   repeated. `esc` stops a run, keeping the replies so far. With pipeline mode on
+//!   (`ctrl-p`), readonly repeats go [`cmdline::pipeline_batch`] at a time in one
+//!   pipeline ([`Request::Batch`]); writes still go one at a time.
 
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{Act, Input, LiveState, Owner, ViewState};
-use crate::live::cmdline::{self, Args, CommandInfo, Docs, Gate, Output, Reply, Request};
+use crate::live::cmdline::{
+    self, Args, CommandInfo, Docs, Gate, Output, Reply, Request, View, is_count_word,
+};
 use crate::live::command::{self, MASK, Secret};
 use crate::live::keys::KeyRow;
-use crate::live::{CANCELLED, LiveError, LiveReply, LiveRequest, ReqId};
+use crate::live::{CANCELLED, Dest, LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::Env;
 use crate::tui::app::{App, Effect};
 use crate::value;
 use crate::write::{Decision, WriteOp};
+
+/// Why a repeated write that would ask first is not sent.
+pub const REPEAT_ASKS: &str = "Not sent: this write asks first, and the write gate's \
+     question covers one command, so it is not repeated. Send it without the count.";
+
+/// Why a write [`Act::write`] did not take was not sent.
+const WRITE_NOT_SENT: &str =
+    "Not sent: the live connection is not ready, or another write is waiting for an answer.";
 
 /// The longest input line, in characters.
 pub const MAX_INPUT: usize = 8_192;
@@ -163,7 +183,10 @@ pub(crate) fn tokens(line: &str) -> Vec<Tok> {
 pub fn masked_input(line: &str) -> String {
     let toks = tokens(line);
     let words: Vec<Vec<u8>> = toks.iter().map(|t| t.word.clone()).collect();
-    let secrets = command::secrets(&words);
+    // A leading repeat count is not the command: the secrets are found after it.
+    let skip = cmdline::count_words(&words);
+    let mut secrets = vec![None; skip];
+    secrets.extend(command::secrets(&words[skip..]));
     let mut out = String::new();
     let mut pos = 0;
     for (t, s) in toks.iter().zip(secrets) {
@@ -197,13 +220,75 @@ pub(crate) enum Body {
     Failed(String),
     /// The reply.
     Out(Output),
+    /// The replies of a repeat (`N cmd`), numbered, and how far it got.
+    Runs(Runs),
+}
+
+/// One reply of a repeat.
+#[derive(Clone, PartialEq)]
+pub(crate) struct RunOut {
+    /// Its number in the run, from 1.
+    pub n: u32,
+    pub out: Output,
+    /// Commands in the pipeline it came back in: 1 for a round trip of its own.
+    pub batch: u32,
+    /// The first reply of its pipeline: the one whose time counts for the batch.
+    pub batch_start: bool,
+}
+
+/// How a repeat ended.
+#[derive(Clone, PartialEq)]
+pub(crate) enum RunEnd {
+    /// Every command was sent and answered.
+    Done,
+    /// `esc`: what was sent was answered, nothing more is sent.
+    Stopped,
+    /// A command was not sent, or failed: why, safe to draw.
+    Failed(String),
+}
+
+/// The replies of a repeat so far.
+#[derive(Clone, PartialEq)]
+pub(crate) struct Runs {
+    pub times: u32,
+    /// Commands sent so far.
+    pub sent: u32,
+    pub outs: Vec<RunOut>,
+    /// The oldest replies dropped to keep the output under [`MAX_OUTPUT_BYTES`].
+    pub dropped: u32,
+    /// `esc` was pressed: the run ends once what was sent is answered.
+    pub stopping: bool,
+    pub end: Option<RunEnd>,
+}
+
+impl Runs {
+    fn new(times: u32) -> Self {
+        Self {
+            times,
+            sent: 0,
+            outs: Vec::new(),
+            dropped: 0,
+            stopping: false,
+            end: None,
+        }
+    }
+
+    /// Replies come back so far, dropped ones included.
+    pub fn answered(&self) -> u32 {
+        self.dropped + u32::try_from(self.outs.len()).unwrap_or(u32::MAX)
+    }
+
+    fn bytes(&self) -> usize {
+        self.outs.iter().map(|o| o.out.bytes()).sum()
+    }
 }
 
 /// One command and what came of it.
 #[derive(Clone, PartialEq)]
 pub(crate) struct Entry {
     pub id: u64,
-    /// The command as [`command::masked_line`] writes it; `None` for a note alone.
+    /// The command as [`cmdline::masked_with_count`] writes it; `None` for a note
+    /// alone.
     pub line: Option<String>,
     pub body: Body,
     /// On a cluster, the address of the node the command was sent to: its reply is
@@ -211,12 +296,15 @@ pub(crate) struct Entry {
     pub node: Option<String>,
     /// Why it went where it went, when that needs saying ([`super::KEYS_UNFOUND`]).
     pub route_note: Option<&'static str>,
+    /// The command's flat array holds pairs ([`cmdline::pairs_hint`]), for the table.
+    pub pairs: bool,
 }
 
 impl Entry {
     fn bytes(&self) -> usize {
         let body = match &self.body {
-            Body::Out(o) => o.lines().iter().map(String::len).sum(),
+            Body::Out(o) => o.bytes(),
+            Body::Runs(r) => r.bytes(),
             Body::Note(s) | Body::Failed(s) => s.len(),
             _ => 0,
         };
@@ -231,22 +319,44 @@ enum Asked {
     Docs(String),
     Names,
     Run,
+    Batch,
 }
 
 /// The one command on its way.
 #[derive(Clone, PartialEq)]
 enum Pending {
-    /// Waiting for `COMMAND INFO` of `name` (request `id`) to decide.
+    /// Waiting for `COMMAND INFO` of `name` (request `id`) to decide; `times` from
+    /// the line's repeat count.
     Info {
         id: ReqId,
         name: String,
         args: Args,
         entry: u64,
+        times: u32,
     },
     /// Sent as request `id`.
     Run { id: ReqId, entry: u64 },
+    /// A repeat's pipeline, sent as request `id`.
+    Batch { id: ReqId, entry: u64 },
     /// A write handed to the write gate as request `id`: asking, or sent.
     Write { id: ReqId, entry: u64 },
+}
+
+/// The repeat on its way: what each of its commands is. Its progress is the entry's
+/// [`Runs`].
+#[derive(Clone, PartialEq)]
+struct Repeat {
+    entry: u64,
+    args: Args,
+    info: CommandInfo,
+    /// A write, sent through the write gate each time; otherwise a readonly command.
+    write: bool,
+    /// A `@dangerous` readonly command whose question was answered yes.
+    confirmed: bool,
+    /// Where a readonly one goes (a write's gate routes it itself).
+    dest: Option<Dest>,
+    /// `esc` was pressed.
+    stop: bool,
 }
 
 /// A readonly `@dangerous` command waiting for `y`, or for the profile name.
@@ -261,6 +371,9 @@ pub(crate) struct Confirm {
     pub typed: Option<String>,
     pub profile: String,
     pub command: String,
+    /// How many times it is sent: the line's repeat count, 1 without one. The
+    /// question names it and is asked once for all of them.
+    pub times: u32,
 }
 
 /// `COMMAND LIST`, asked once a session.
@@ -310,6 +423,12 @@ pub struct CmdlineState {
     completion: Option<Completion>,
     /// A line of the panel's own under the output, until the next key.
     pub(crate) status: Option<String>,
+    /// How replies are drawn: `ctrl-t` goes to the next view.
+    pub(crate) view: View,
+    /// Pipeline mode (`ctrl-p`): a readonly repeat goes in pipelines. Off at first.
+    pub(crate) pipeline: bool,
+    /// The repeat on its way, if one is.
+    repeat: Option<Repeat>,
 }
 
 /// Counts only: the input, the history and the replies are the user's.
@@ -331,6 +450,9 @@ impl fmt::Debug for CmdlineState {
             .field("confirm", &self.confirm.is_some())
             .field("completion", &self.completion.is_some())
             .field("status", &self.status.is_some())
+            .field("view", &self.view)
+            .field("pipeline", &self.pipeline)
+            .field("repeat", &self.repeat.is_some())
             .finish()
     }
 }
@@ -367,6 +489,11 @@ impl CmdlineState {
         self.pending.is_some()
     }
 
+    /// A repeat is on its way: `esc` stops it.
+    pub fn repeating(&self) -> bool {
+        self.repeat.is_some()
+    }
+
     fn push_entry(&mut self, line: Option<String>, body: Body) -> u64 {
         let id = self.next_entry;
         self.next_entry += 1;
@@ -376,6 +503,7 @@ impl CmdlineState {
             body,
             node: None,
             route_note: None,
+            pairs: false,
         });
         self.scroll.set(0);
         self.trim();
@@ -383,10 +511,20 @@ impl CmdlineState {
     }
 
     fn trim(&mut self) {
-        // Never the entry a pending command or question writes to.
-        let keep = |s: &Self| match (&s.pending, &s.confirm) {
-            (Some(Pending::Info { entry, .. } | Pending::Run { entry, .. }), _) => Some(*entry),
-            (_, Some(c)) => Some(c.entry),
+        // Never the entry a pending command, repeat or question writes to.
+        let keep = |s: &Self| match (&s.pending, &s.confirm, &s.repeat) {
+            (_, _, Some(r)) => Some(r.entry),
+            (
+                Some(
+                    Pending::Info { entry, .. }
+                    | Pending::Run { entry, .. }
+                    | Pending::Batch { entry, .. }
+                    | Pending::Write { entry, .. },
+                ),
+                _,
+                _,
+            ) => Some(*entry),
+            (_, Some(c), _) => Some(c.entry),
             _ => None,
         };
         let keep = keep(self);
@@ -470,10 +608,17 @@ impl CmdlineState {
     /// once a name, for the helper and the decision.
     fn prefetch(&mut self, act: &mut Act<'_>) {
         let toks = tokens(&self.input);
-        let Some(first) = toks.first() else {
+        // After a repeat count, the command is the next word.
+        let skip = usize::from(toks.first().is_some_and(|t| is_count_word(&t.word)));
+        let Some(first) = toks.get(skip) else {
             return;
         };
-        if toks.len() == 1 && first.end == self.input.len() {
+        if toks.len() == skip + 1 && first.end == self.input.len() {
+            return;
+        }
+        // A bad count is refused before anything is sent: not even the flags.
+        let words: Vec<Vec<u8>> = toks.iter().map(|t| t.word.clone()).collect();
+        if cmdline::parse_repeat(&words).is_err() {
             return;
         }
         let Some(name) = name_of(&first.word) else {
@@ -510,8 +655,15 @@ impl CmdlineState {
             self.completion = None;
         }
         match key.code {
+            // A repeat on its way stops first; the next esc closes.
+            KeyCode::Esc if self.repeat.is_some() => self.stop_repeat(),
             KeyCode::Esc => self.open = false,
             KeyCode::Enter => self.submit(act),
+            KeyCode::Char('t') if ctrl => {
+                self.view = self.view.next();
+                self.scroll.set(0);
+            }
+            KeyCode::Char('p') if ctrl => self.pipeline = !self.pipeline,
             KeyCode::Up => self.history_step(true),
             KeyCode::Down => self.history_step(false),
             KeyCode::Tab => self.complete(keys, act),
@@ -614,6 +766,9 @@ impl CmdlineState {
             Some(t) if !at_end => (toks.len() - 1, t.word.clone(), t.start),
             _ => (toks.len(), Vec::new(), self.input.len()),
         };
+        // After a repeat count the command is the second word.
+        let skip = usize::from(toks.first().is_some_and(|t| is_count_word(&t.word)) && index > 0);
+        let index = index - skip;
         let matches: Vec<String> = if index == 0 {
             if self.names == Names::NotAsked {
                 self.open(act);
@@ -637,7 +792,7 @@ impl CmdlineState {
                 .collect()
         } else {
             let info = toks
-                .first()
+                .get(skip)
                 .and_then(|t| name_of(&t.word))
                 .and_then(|n| self.infos.get(&n).cloned().flatten());
             match info {
@@ -702,20 +857,29 @@ impl CmdlineState {
         let text = std::mem::take(&mut self.input);
         self.hist_at = None;
         self.draft = None;
-        let args = match command::split(&text) {
+        let all = match command::split(&text) {
             Ok(a) => a,
             Err(e) => {
                 self.push_entry(Some(masked_input(&text)), Body::Note(e.message().into()));
                 return;
             }
         };
-        let line = command::masked_line(&args);
+        let line = cmdline::masked_with_count(&all);
         if self.history.last() != Some(&line) {
             self.history.push(line.clone());
             if self.history.len() > MAX_HISTORY {
                 self.history.remove(0);
             }
         }
+        // `N cmd`: a bad count is refused before anything is sent, its flags included.
+        let times = match cmdline::parse_repeat(&all) {
+            Ok(n) => n.unwrap_or(1),
+            Err(why) => {
+                self.push_entry(Some(line), Body::Note(why));
+                return;
+            }
+        };
+        let args = all[cmdline::count_words(&all)..].to_vec();
         if let Some(why) = command::refused(&args) {
             self.push_entry(Some(line), Body::Note(why.into()));
             return;
@@ -741,9 +905,13 @@ impl CmdlineState {
             return;
         };
         let entry = self.push_entry(Some(line), Body::Waiting);
+        let pairs = cmdline::pairs_hint(&args);
+        if let Some(e) = self.entries.iter_mut().find(|e| e.id == entry) {
+            e.pairs = pairs;
+        }
         let args = Args::new(args);
         if let Some(info) = self.infos.get(&name).cloned() {
-            self.decide(args, info, entry, act);
+            self.decide(args, info, entry, times, act);
             return;
         }
         let id = match self.asked_info(&name) {
@@ -761,6 +929,7 @@ impl CmdlineState {
                     name,
                     args,
                     entry,
+                    times,
                 })
             }
             None => self.set_body(
@@ -770,8 +939,16 @@ impl CmdlineState {
         }
     }
 
-    /// What [`cmdline::gate`] says, done.
-    fn decide(&mut self, args: Args, info: Option<CommandInfo>, entry: u64, act: &mut Act<'_>) {
+    /// What [`cmdline::gate`] says, done. `times` is the line's repeat count (1
+    /// without one): every one of them is checked as a single command is.
+    fn decide(
+        &mut self,
+        args: Args,
+        info: Option<CommandInfo>,
+        entry: u64,
+        times: u32,
+        act: &mut Act<'_>,
+    ) {
         match cmdline::gate(args.as_slice(), info.as_ref()) {
             Gate::Refuse(why) => self.set_body(entry, Body::Note(why)),
             Gate::Write => {
@@ -789,8 +966,22 @@ impl CmdlineState {
                     return;
                 }
                 // The read-only reason, or a command the server refused, in the panel.
-                if let Decision::Refuse(why) = act.write_decision(&op) {
+                let decision = act.write_decision(&op);
+                if let Decision::Refuse(why) = decision {
                     self.set_body(entry, Body::Note(why));
+                    return;
+                }
+                if times > 1 {
+                    // The write gate's question is about one command: a write that
+                    // asks is not repeated, and nothing is sent.
+                    if decision != Decision::Run {
+                        self.set_body(entry, Body::Note(REPEAT_ASKS.into()));
+                        return;
+                    }
+                    let WriteOp::Command { args, info } = op else {
+                        return;
+                    };
+                    self.start_repeat(args, info, true, false, None, times, entry, act);
                     return;
                 }
                 match act.write(op) {
@@ -798,20 +989,20 @@ impl CmdlineState {
                         self.pending = Some(Pending::Write { id, entry });
                         self.set_body(entry, Body::Waiting);
                     }
-                    None => self.set_body(
-                        entry,
-                        Body::Failed(
-                            "Not sent: the live connection is not ready, or another write \
-                             is waiting for an answer."
-                                .into(),
-                        ),
-                    ),
+                    None => self.set_body(entry, Body::Failed(WRITE_NOT_SENT.into())),
                 }
             }
             Gate::Send => {
                 let Some(info) = info else {
                     return;
                 };
+                if times > 1 {
+                    let Some(dest) = self.route(&args, &info, entry, act) else {
+                        return;
+                    };
+                    self.start_repeat(args, info, false, false, Some(dest), times, entry, act);
+                    return;
+                }
                 self.send(args, info, false, entry, act);
             }
             Gate::Ask => {
@@ -837,6 +1028,7 @@ impl CmdlineState {
                     typed: (p.env == Env::Prod).then(String::new),
                     profile: p.name.clone(),
                     command: cmd,
+                    times,
                 });
                 self.set_body(entry, Body::Asking);
             }
@@ -872,6 +1064,200 @@ impl CmdlineState {
                 entry,
                 Body::Failed("Not sent: the live connection is not open.".into()),
             ),
+        }
+    }
+
+    /// Starts a repeat of `times` commands on `entry`: the first is sent now, each
+    /// next one when the one before is answered ([`Self::next_repeat`]).
+    #[allow(clippy::too_many_arguments)]
+    fn start_repeat(
+        &mut self,
+        args: Args,
+        info: CommandInfo,
+        write: bool,
+        confirmed: bool,
+        dest: Option<Dest>,
+        times: u32,
+        entry: u64,
+        act: &mut Act<'_>,
+    ) {
+        self.set_body(entry, Body::Runs(Runs::new(times)));
+        self.repeat = Some(Repeat {
+            entry,
+            args,
+            info,
+            write,
+            confirmed,
+            dest,
+            stop: false,
+        });
+        self.next_repeat(act);
+    }
+
+    fn runs_mut(&mut self, entry: u64) -> Option<&mut Runs> {
+        self.entries
+            .iter_mut()
+            .find(|e| e.id == entry)
+            .and_then(|e| match &mut e.body {
+                Body::Runs(r) => Some(r),
+                _ => None,
+            })
+    }
+
+    /// Sends the repeat's next command, or pipeline, or ends it: when `esc` was
+    /// pressed, when all were sent, or when the next one is not let through. Each one
+    /// is checked as a single command would be, right before it is sent: a readonly one
+    /// by [`cmdline::gate`] (and again by [`cmdline::run`]), a write by the write gate
+    /// ([`Act::write_decision`], then [`Act::write`], which decides again and grants
+    /// its permit).
+    fn next_repeat(&mut self, act: &mut Act<'_>) {
+        let Some(r) = self.repeat.clone() else {
+            return;
+        };
+        let Some((sent, times)) = self.runs_mut(r.entry).map(|x| (x.sent, x.times)) else {
+            self.repeat = None;
+            return;
+        };
+        if r.stop {
+            return self.end_repeat(RunEnd::Stopped);
+        }
+        if sent >= times {
+            return self.end_repeat(RunEnd::Done);
+        }
+        if r.write {
+            let op = WriteOp::Command {
+                args: r.args,
+                info: r.info,
+            };
+            match act.write_decision(&op) {
+                Decision::Run => {}
+                Decision::Refuse(why) => return self.end_repeat(RunEnd::Failed(why)),
+                Decision::Ask | Decision::Type(_) => {
+                    return self.end_repeat(RunEnd::Failed(REPEAT_ASKS.into()));
+                }
+            }
+            let Some(id) = act.write(op) else {
+                return self.end_repeat(RunEnd::Failed(WRITE_NOT_SENT.into()));
+            };
+            self.pending = Some(Pending::Write { id, entry: r.entry });
+            if let Some(x) = self.runs_mut(r.entry) {
+                x.sent += 1;
+            }
+            return;
+        }
+        match cmdline::gate(r.args.as_slice(), Some(&r.info)) {
+            Gate::Send => {}
+            Gate::Ask if r.confirmed => {}
+            Gate::Refuse(why) => return self.end_repeat(RunEnd::Failed(why)),
+            Gate::Ask | Gate::Write => {
+                return self.end_repeat(RunEnd::Failed(cmdline::NOT_SENT.into()));
+            }
+        }
+        let Some(dest) = r.dest else {
+            return self.end_repeat(RunEnd::Failed(cmdline::NOT_SENT.into()));
+        };
+        let n = if self.pipeline {
+            let rate = crate::scan::ScanOptions::for_profile(act.profile()).max_commands_per_sec;
+            cmdline::pipeline_batch(rate, times - sent)
+        } else {
+            1
+        };
+        let req = if n > 1 {
+            Request::Batch {
+                args: r.args,
+                info: r.info,
+                confirmed: r.confirmed,
+                times: n,
+            }
+        } else {
+            Request::Run {
+                args: r.args,
+                info: r.info,
+                confirmed: r.confirmed,
+            }
+        };
+        let Some(id) = act.send_to(dest, LiveRequest::Command(req)) else {
+            return self.end_repeat(RunEnd::Failed(
+                "Not sent: the live connection is not open.".into(),
+            ));
+        };
+        if n > 1 {
+            self.asked.insert(id, Asked::Batch);
+            self.pending = Some(Pending::Batch { id, entry: r.entry });
+        } else {
+            self.asked.insert(id, Asked::Run);
+            self.pending = Some(Pending::Run { id, entry: r.entry });
+        }
+        if let Some(x) = self.runs_mut(r.entry) {
+            x.sent += n;
+        }
+    }
+
+    /// Ends the repeat, keeping its replies.
+    fn end_repeat(&mut self, end: RunEnd) {
+        let Some(r) = self.repeat.take() else {
+            return;
+        };
+        if let Some(x) = self.runs_mut(r.entry) {
+            x.end = Some(end);
+            x.stopping = false;
+        }
+        self.scroll.set(0);
+        self.trim();
+    }
+
+    /// `esc` while a repeat is on its way: nothing more is sent; the command already
+    /// sent is answered and kept.
+    fn stop_repeat(&mut self) {
+        let Some(r) = self.repeat.as_mut() else {
+            return;
+        };
+        r.stop = true;
+        let entry = r.entry;
+        if let Some(x) = self.runs_mut(entry) {
+            x.stopping = true;
+        }
+        if self.pending.is_none() {
+            self.end_repeat(RunEnd::Stopped);
+        }
+    }
+
+    /// The repeat on `entry`, if one is.
+    fn repeat_on(&self, entry: u64) -> bool {
+        self.repeat.as_ref().is_some_and(|r| r.entry == entry)
+    }
+
+    /// Replies of the repeat on `entry` came back, from a pipeline of `batch`: kept,
+    /// the oldest dropped past [`MAX_OUTPUT_BYTES`], then the next one goes.
+    fn repeat_replies(&mut self, entry: u64, outs: Vec<Output>, act: &mut Act<'_>) {
+        if let Some(x) = self.runs_mut(entry) {
+            let batch = u32::try_from(outs.len()).unwrap_or(u32::MAX);
+            for (i, out) in outs.into_iter().enumerate() {
+                let n = x.answered() + 1;
+                x.outs.push(RunOut {
+                    n,
+                    out,
+                    batch,
+                    batch_start: i == 0,
+                });
+            }
+            while x.outs.len() > 1 && x.bytes() > MAX_OUTPUT_BYTES {
+                x.outs.remove(0);
+                x.dropped += 1;
+            }
+        }
+        self.scroll.set(0);
+        self.trim();
+        self.next_repeat(act);
+    }
+
+    /// The command on `entry` failed or will never be answered: a repeat ends with
+    /// `why`, keeping its replies; a single command shows it.
+    fn failed(&mut self, entry: u64, why: String) {
+        if self.repeat_on(entry) {
+            self.end_repeat(RunEnd::Failed(why));
+        } else {
+            self.set_body(entry, Body::Failed(why));
         }
     }
 
@@ -917,7 +1303,21 @@ impl CmdlineState {
         let Some(c) = self.confirm.take() else {
             return;
         };
-        if yes {
+        if yes && c.times > 1 {
+            // One answer for the whole run: it named the count.
+            if let Some(dest) = self.route(&c.args, &c.info, c.entry, act) {
+                self.start_repeat(
+                    c.args,
+                    c.info,
+                    false,
+                    true,
+                    Some(dest),
+                    c.times,
+                    c.entry,
+                    act,
+                );
+            }
+        } else if yes {
             self.send(c.args, c.info, true, c.entry, act);
         } else {
             self.set_body(c.entry, Body::Note("Not sent: cancelled.".into()));
@@ -937,6 +1337,11 @@ impl CmdlineState {
                 text: String::new(),
                 hint: "  y send · n or esc cancel",
             },
+            None if self.repeat.is_some() => Input {
+                label: ":",
+                text: self.shown_input(),
+                hint: "  esc stop the run · ctrl-t view",
+            },
             None => Input {
                 label: ":",
                 text: self.shown_input(),
@@ -950,12 +1355,17 @@ impl CmdlineState {
     /// whether the first is a warning.
     pub(crate) fn helper(&self) -> Vec<(String, bool)> {
         if let Some(c) = &self.confirm {
+            // A repeat asks once, naming the count.
+            let (it, times) = match c.times {
+                0 | 1 => ("it".to_string(), String::new()),
+                n => (format!("it {n} times"), format!(" {n} times")),
+            };
             let ask = match &c.typed {
                 Some(_) => format!(
-                    "Type {} and press enter to send it, or esc to cancel.",
+                    "Type {} and press enter to send {it}, or esc to cancel.",
                     c.profile
                 ),
-                None => format!("Send it to {}? y to send, n or esc to cancel.", c.profile),
+                None => format!("Send {it} to {}? y to send, n or esc to cancel.", c.profile),
             };
             // A wrong name says so in place of the question.
             let second = match &self.status {
@@ -964,7 +1374,10 @@ impl CmdlineState {
             };
             return vec![
                 (
-                    format!("▲ {} is @dangerous and asks first: {}", c.command, c.line),
+                    format!(
+                        "▲ {} is @dangerous and asks first: {}{times}",
+                        c.command, c.line
+                    ),
                     true,
                 ),
                 second,
@@ -976,16 +1389,23 @@ impl CmdlineState {
         let toks = tokens(&self.input);
         let Some(first) = toks.first() else {
             return vec![(
-                "Writes go through the write gate. tab completes, ↑↓ history, ctrl-l \
-                 clears."
+                "Writes go through the write gate. ctrl-t view, ctrl-p pipeline, N cmd \
+                 repeats; tab completes, ↑↓ history, ctrl-l clears."
                     .into(),
                 false,
             )];
         };
-        let Some(name) = name_of(&first.word) else {
+        // `N cmd`: the count, then the command.
+        let all: Vec<Vec<u8>> = toks.iter().map(|t| t.word.clone()).collect();
+        let skip = usize::from(is_count_word(&first.word) && toks.len() > 1);
+        let times = match cmdline::parse_repeat(&all) {
+            Ok(n) => n.unwrap_or(1),
+            Err(why) => return vec![(why, true)],
+        };
+        let words = all[skip..].to_vec();
+        let Some(name) = words.first().and_then(|w| name_of(w)) else {
             return Vec::new();
         };
-        let words: Vec<Vec<u8>> = toks.iter().map(|t| t.word.clone()).collect();
         if let Some(why) = command::refused(&words) {
             return vec![(why.to_string(), true)];
         }
@@ -1006,7 +1426,7 @@ impl CmdlineState {
             (Some(d), Some(s)) => d.subcommand(&name, s).or(Some(d)),
             (d, _) => d,
         };
-        let verdict = match cmdline::gate(&words, Some(info)) {
+        let mut verdict = match cmdline::gate(&words, Some(info)) {
             Gate::Send => ("readonly".to_string(), false),
             Gate::Ask => ("readonly, asks first (@dangerous)".to_string(), true),
             Gate::Write => ("writes: through the write gate".to_string(), true),
@@ -1020,6 +1440,14 @@ impl CmdlineState {
             }
             Gate::Refuse(_) => ("not sent here".to_string(), true),
         };
+        if times > 1 {
+            let how = if self.pipeline {
+                "in pipelines"
+            } else {
+                "one at a time"
+            };
+            verdict.0 = format!("{}, sent {times} times {how}", verdict.0);
+        }
         let mut first_line = cmd.display();
         if let Some(d) = docs.filter(|d| !d.arguments.is_empty()) {
             first_line.push(' ');
@@ -1076,8 +1504,11 @@ impl CmdlineState {
                 match reply {
                     Ok(Reply::Info(i)) => {
                         self.infos.insert(name, i.clone());
-                        if let Some(Pending::Info { args, entry, .. }) = pending {
-                            self.decide(args, i, entry, act);
+                        if let Some(Pending::Info {
+                            args, entry, times, ..
+                        }) = pending
+                        {
+                            self.decide(args, i, entry, times, act);
                         }
                     }
                     Ok(_) | Err(_) => {
@@ -1108,13 +1539,37 @@ impl CmdlineState {
                     return;
                 }
                 self.pending = None;
+                if self.repeat_on(entry) {
+                    match reply {
+                        Ok(Reply::Ran(out)) => self.repeat_replies(entry, vec![out], act),
+                        Ok(_) => self.failed(entry, SHAPE.into()),
+                        Err(e) => self.failed(entry, e.to_string()),
+                    }
+                    return;
+                }
                 let body = match reply {
                     Ok(Reply::Ran(out)) => Body::Out(out),
-                    Ok(_) => Body::Failed("the reply came back in an unexpected shape".into()),
+                    Ok(_) => Body::Failed(SHAPE.into()),
                     Err(e) => Body::Failed(e.to_string()),
                 };
                 self.set_body(entry, body);
                 self.scroll.set(0);
+            }
+            Asked::Batch => {
+                let Some(Pending::Batch { id: p, entry }) = self.pending.clone() else {
+                    return;
+                };
+                if p != id {
+                    return;
+                }
+                self.pending = None;
+                match reply {
+                    Ok(Reply::Batch(outs)) if !outs.is_empty() => {
+                        self.repeat_replies(entry, outs, act);
+                    }
+                    Ok(_) => self.failed(entry, SHAPE.into()),
+                    Err(e) => self.failed(entry, e.to_string()),
+                }
             }
         }
     }
@@ -1127,17 +1582,15 @@ impl CmdlineState {
     }
 
     /// Requests that will never be answered (the live connection closed, a rescan
-    /// replaced it) are forgotten, and the command waiting on one says so.
+    /// replaced it) are forgotten, and the command waiting on one says so; a repeat
+    /// ends there, keeping its replies.
     fn forget_lost(&mut self, act: &Act<'_>) {
         // A write is the app's request, not in `asked`.
         if let Some(Pending::Write { id, entry }) = self.pending.clone()
             && !act.in_flight(id)
         {
             self.pending = None;
-            self.set_body(
-                entry,
-                Body::Failed("No answer: the live connection closed before the reply came.".into()),
-            );
+            self.failed(entry, NO_ANSWER.into());
         }
         let lost: Vec<ReqId> = self
             .asked
@@ -1154,22 +1607,23 @@ impl CmdlineState {
                 Some(
                     Pending::Info { id: p, entry, .. }
                     | Pending::Run { id: p, entry }
+                    | Pending::Batch { id: p, entry }
                     | Pending::Write { id: p, entry },
                 ) if *p == id => Some(*entry),
                 _ => None,
             };
             if let Some(entry) = entry {
                 self.pending = None;
-                self.set_body(
-                    entry,
-                    Body::Failed(
-                        "No answer: the live connection closed before the reply came.".into(),
-                    ),
-                );
+                self.failed(entry, NO_ANSWER.into());
             }
         }
     }
 }
+
+/// What a command whose answer never comes says.
+const NO_ANSWER: &str = "No answer: the live connection closed before the reply came.";
+/// What a reply of the wrong kind says.
+const SHAPE: &str = "the reply came back in an unexpected shape";
 
 impl ViewState for CmdlineState {
     fn on_tick(&mut self, _now: Instant, act: &mut Act<'_>) {
@@ -1181,9 +1635,19 @@ impl ViewState for CmdlineState {
             && p == id
         {
             self.pending = None;
+            if self.repeat_on(entry) {
+                match result {
+                    Ok(LiveReply::Write(crate::live::write::Reply::Ran(out))) => {
+                        self.repeat_replies(entry, vec![out], act);
+                    }
+                    Ok(_) => self.failed(entry, SHAPE.into()),
+                    Err(e) => self.failed(entry, e.to_string()),
+                }
+                return;
+            }
             let body = match result {
                 Ok(LiveReply::Write(crate::live::write::Reply::Ran(out))) => Body::Out(out),
-                Ok(_) => Body::Failed("the reply came back in an unexpected shape".into()),
+                Ok(_) => Body::Failed(SHAPE.into()),
                 Err(LiveError::Failed(s)) if s == CANCELLED => Body::Note(s),
                 Err(e) => Body::Failed(e.to_string()),
             };
@@ -1263,9 +1727,270 @@ impl App {
     }
 }
 
+/// How a repeat's last line is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tone {
+    Running,
+    Done,
+    Stopped,
+    Failed,
+}
+
+/// A repeat's replies in `view`, each numbered `#n` with its lines under it, and
+/// whether each line is an error's.
+pub(crate) fn numbered(r: &Runs, view: View, pairs: bool) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    for o in &r.outs {
+        let tag = format!("#{} ", o.n);
+        let pad = " ".repeat(tag.len());
+        for (i, l) in o.out.lines_in(view, pairs).iter().enumerate() {
+            let lead = if i == 0 { &tag } else { &pad };
+            out.push((format!("{lead}{l}"), o.out.error));
+        }
+    }
+    out
+}
+
+/// What a repeat that dropped its oldest replies says above the rest.
+pub(crate) fn dropped_text(r: &Runs) -> String {
+    format!(
+        "(the first {} replies were dropped: the output keeps at most 4 MiB)",
+        r.dropped
+    )
+}
+
+/// A repeat's last line: how far it is, or how it ended, with the time its round
+/// trips took (the waits for the budget not included).
+pub(crate) fn runs_end(r: &Runs) -> (String, Tone) {
+    let answered = r.answered();
+    let times = r.times;
+    match &r.end {
+        None if r.stopping => (
+            format!("stopping… {answered} of {times} answered; nothing more is sent"),
+            Tone::Running,
+        ),
+        None => (
+            format!("running… {answered} of {times} answered"),
+            Tone::Running,
+        ),
+        Some(RunEnd::Done) => {
+            let trips = r.outs.iter().filter(|o| o.batch_start).count();
+            let total: Duration = r
+                .outs
+                .iter()
+                .filter(|o| o.batch_start)
+                .map(|o| o.out.took)
+                .sum();
+            let pipelined = r.outs.iter().any(|o| o.batch > 1);
+            let how = match (trips, pipelined) {
+                (1, true) => "in 1 pipeline".to_string(),
+                (n, true) => format!("in {n} pipelines"),
+                (1, false) => "in 1 round trip".to_string(),
+                (n, false) => format!("in {n} round trips"),
+            };
+            let kept = if r.dropped > 0 {
+                " (the replies kept)"
+            } else {
+                ""
+            };
+            (
+                format!("({answered} replies {how}{kept} · {})", took_text(total)),
+                Tone::Done,
+            )
+        }
+        Some(RunEnd::Stopped) => (
+            format!("■ Stopped with esc: {answered} of {times} answered, nothing more sent."),
+            Tone::Stopped,
+        ),
+        Some(RunEnd::Failed(why)) => (
+            format!("✗ {why} ({answered} of {times} answered)"),
+            Tone::Failed,
+        ),
+    }
+}
+
+/// The time a command took, as `0.42 ms`, `12 ms` or `1.30 s`.
+pub fn took_text(d: Duration) -> String {
+    let us = d.as_micros();
+    if us < 10_000 {
+        format!("{:.2} ms", us as f64 / 1000.0)
+    } else if us < 1_000_000 {
+        format!("{} ms", us / 1000)
+    } else {
+        format!("{:.2} s", d.as_secs_f64())
+    }
+}
+
+/// An entry of the output as plain lines, in `view`, as the panel draws them but
+/// without styles: what a repeat's numbered replies and last line say. Values: for
+/// tests only, never logged.
+pub(crate) fn entry_text(e: &Entry, view: View) -> Vec<String> {
+    match &e.body {
+        Body::Waiting => vec!["running…".into()],
+        Body::Asking => vec!["Waiting for your answer below.".into()],
+        Body::Note(why) => vec![why.clone()],
+        Body::Failed(why) => vec![format!("(error) {why}")],
+        Body::Out(o) => o.lines_in(view, e.pairs).to_vec(),
+        Body::Runs(r) => {
+            let mut out = Vec::new();
+            if r.dropped > 0 {
+                out.push(dropped_text(r));
+            }
+            out.extend(numbered(r, view, e.pairs).into_iter().map(|(l, _)| l));
+            out.push(runs_end(r).0);
+            out
+        }
+    }
+}
+
+/// One step of [`run_cmdline_for_tests`].
+#[doc(hidden)]
+pub enum CmdlineStep {
+    /// Types the line and presses `enter`.
+    Line(String),
+    /// Presses the key: `ctrl-p`, `ctrl-t`, `y` for a question …
+    Key(KeyEvent),
+}
+
+/// What [`run_cmdline_for_tests`] saw. Holds replies: for tests only, so no `Debug`.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct CmdlineForTests {
+    /// Each entry of the output: its masked command line, and its lines in the text
+    /// view ([`entry_text`]).
+    pub entries: Vec<(Option<String>, Vec<String>)>,
+    /// What the app asked of the live connection, as `Debug` text (which holds no
+    /// value: argument counts and command names only), in order.
+    pub requests: Vec<String>,
+}
+
+/// The command line runtime, for the integration tests (`tests/cmdline_repeat_it.rs`):
+/// connects `profile` without an analysis exactly as the TUI does, opens the panel
+/// with `:`, and carries out `steps`, each time carrying out what the app asks of the
+/// live connection until the panel is idle again or a question waits for its answer.
+/// The live connection is closed again at the end.
+#[doc(hidden)]
+pub async fn run_cmdline_for_tests(
+    profile: crate::model::Profile,
+    credentials: Option<crate::model::Credentials>,
+    steps: Vec<CmdlineStep>,
+) -> CmdlineForTests {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::mpsc;
+
+    use crate::tui::app::SecretSource;
+    use crate::tui::{Incoming, LiveSession, LiveSlot, Run, connect_and_scan, lock};
+
+    fn carry_out(effects: Vec<Effect>, slot: &LiveSlot, requests: &mut Vec<String>) {
+        for e in effects {
+            if let Effect::Live {
+                req_id, to, req, ..
+            } = e
+            {
+                requests.push(format!("{req:?}"));
+                let guard = lock(slot);
+                let handle = guard.as_ref().and_then(|s| s.handle.as_ref());
+                assert!(
+                    handle.is_some_and(|h| h.send_to(req_id, to, req)),
+                    "the live connection is open"
+                );
+            }
+        }
+    }
+
+    /// Applies the next message; false once there are none.
+    async fn pump(
+        app: &mut App,
+        rx: &mut mpsc::UnboundedReceiver<Incoming>,
+        slot: &LiveSlot,
+        requests: &mut Vec<String>,
+    ) -> bool {
+        let incoming = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("the app gets an answer in time");
+        let Some(Incoming::Msg(m)) = incoming else {
+            return false;
+        };
+        let effects = app.apply(*m);
+        carry_out(effects, slot, requests);
+        true
+    }
+
+    /// The panel waits for a reply, and no question waits for the user.
+    fn busy(app: &App) -> bool {
+        let c = &app.views.cmdline;
+        let asking = app.confirm.is_some() || c.confirm.is_some();
+        !asking && (c.running() || !c.asked.is_empty())
+    }
+
+    let press = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+    let mut app = App::new(vec![profile.clone()]);
+    let effects = app.handle_key(press(KeyCode::Enter));
+    let (id, scan) = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::Connect { id, scan, .. } => Some((*id, *scan)),
+            _ => None,
+        })
+        .expect("enter connects");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let slot: LiveSlot = Arc::new(Mutex::new(Some(LiveSession::new(id, scan))));
+    connect_and_scan(
+        Run { id, scan },
+        profile,
+        SecretSource::Container(credentials),
+        None,
+        crate::scan::StopFlag::new(),
+        tx,
+        Arc::clone(&slot),
+    )
+    .await;
+    let mut requests = Vec::new();
+    while app.cmdline_off().is_some() {
+        assert!(
+            pump(&mut app, &mut rx, &slot, &mut requests).await,
+            "the connect ended before the live connection was ready"
+        );
+    }
+    let effects = app.handle_key(press(KeyCode::Char(':')));
+    carry_out(effects, &slot, &mut requests);
+    assert!(app.views.cmdline.open, "the panel opens");
+    while busy(&app) {
+        assert!(pump(&mut app, &mut rx, &slot, &mut requests).await);
+    }
+    for step in steps {
+        match step {
+            CmdlineStep::Line(line) => {
+                for c in line.chars() {
+                    let effects = app.handle_key(press(KeyCode::Char(c)));
+                    carry_out(effects, &slot, &mut requests);
+                }
+                let effects = app.handle_key(press(KeyCode::Enter));
+                carry_out(effects, &slot, &mut requests);
+            }
+            CmdlineStep::Key(k) => {
+                let effects = app.handle_key(k);
+                carry_out(effects, &slot, &mut requests);
+            }
+        }
+        while busy(&app) {
+            assert!(pump(&mut app, &mut rx, &slot, &mut requests).await);
+        }
+    }
+    let entries = app
+        .views
+        .cmdline
+        .entries
+        .iter()
+        .map(|e| (e.line.clone(), entry_text(e, View::Text)))
+        .collect();
+    drop(lock(&slot).take());
+    CmdlineForTests { entries, requests }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use redis::Value;
@@ -2068,5 +2793,450 @@ mod tests {
         for (w, h) in [(1, 1), (0, 0), (20, 5), (40, 12), (200, 2), (3, 30)] {
             testing::render(&app, w, h);
         }
+    }
+
+    // -----------------------------------------------------------------------------
+    // Result views, `N cmd` repeats and pipeline mode.
+    // -----------------------------------------------------------------------------
+
+    fn incr_info() -> CommandInfo {
+        info(
+            "incr",
+            &["write", "denyoom", "fast"],
+            &["@write", "@string", "@fast"],
+        )
+    }
+
+    /// Types `line` and presses enter, for a command whose flags are read already:
+    /// every effect, the command's own included.
+    fn enter_cached(app: &mut App, line: &str) -> Vec<Effect> {
+        let mut effects = type_text(app, line);
+        effects.extend(app.handle_key(key(KeyCode::Enter)));
+        effects
+    }
+
+    fn hgetall_info() -> CommandInfo {
+        info("hgetall", &["readonly"], &["@read", "@hash", "@slow"])
+    }
+
+    fn wrote(app: &mut App, id: ReqId, v: Value) -> Vec<Effect> {
+        testing::reply(
+            app,
+            id,
+            Ok(LiveReply::Write(crate::live::write::Reply::Ran(
+                Output::of(&v, Duration::from_millis(1)),
+            ))),
+        )
+    }
+
+    fn last_body(app: &App) -> Body {
+        app.views.cmdline.entries.last().unwrap().body.clone()
+    }
+
+    #[test]
+    fn a_readonly_repeat_goes_one_at_a_time_with_numbered_replies() {
+        let mut app = opened();
+        // The flags read are the command's, not the count's.
+        let r = reqs(&type_text(&mut app, "3 GET k"));
+        assert_eq!(
+            r.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>(),
+            [
+                Request::Info { name: "get".into() },
+                Request::Docs { name: "get".into() }
+            ]
+        );
+        assert!(reqs(&app.handle_key(key(KeyCode::Enter))).is_empty());
+        let mut next = reqs(&reply(&mut app, r[0].0, Reply::Info(Some(get_info()))));
+        for i in 1..=3 {
+            // One on its way at a time: the next goes when this one is answered.
+            let [
+                (
+                    id,
+                    Request::Run {
+                        args, confirmed, ..
+                    },
+                ),
+            ] = &next[..]
+            else {
+                panic!("{i}: {next:?}");
+            };
+            assert_eq!(args.as_slice(), [b"GET".to_vec(), b"k".to_vec()]);
+            assert!(!confirmed);
+            assert!(app.views.cmdline.running() && app.views.cmdline.repeating());
+            next = reqs(&reply(&mut app, *id, ran(Value::Int(i))));
+        }
+        assert!(next.is_empty(), "{next:?}");
+        assert!(!app.views.cmdline.running() && !app.views.cmdline.repeating());
+        let all = text(&app, 80, 24);
+        assert!(all.contains("› 3 GET k"), "{all}");
+        for i in 1..=3 {
+            assert!(all.contains(&format!("#{i} (integer) {i}")), "{all}");
+        }
+        assert!(
+            all.contains("(3 replies in 3 round trips · 1.26 ms)"),
+            "{all}"
+        );
+        assert_eq!(app.views.cmdline.history(), ["3 GET k"]);
+        insta::assert_snapshot!("repeat_80x24", testing::render(&app, 80, 24).backend());
+    }
+
+    #[test]
+    fn a_bad_count_is_refused_before_anything_is_sent() {
+        for (line, want) in [
+            ("101 GET k", "at most 100 repeats a line; 101 is more."),
+            ("100000000000000000000 GET k", "at most 100"),
+            ("0 GET k", "a repeat count of 0 sends nothing."),
+            ("-2 GET k", "a whole number from 1 to 100"),
+        ] {
+            let mut app = opened();
+            let mut e = type_text(&mut app, line);
+            // The helper says why while it is typed.
+            assert!(
+                app.views.cmdline.helper()[0].0.contains(want),
+                "{line}: {:?}",
+                app.views.cmdline.helper()
+            );
+            e.extend(app.handle_key(key(KeyCode::Enter)));
+            // Not even the command's flags.
+            assert!(reqs(&e).is_empty(), "{line}: {:?}", reqs(&e));
+            let Body::Note(why) = last_body(&app) else {
+                panic!("{line}")
+            };
+            assert!(why.contains(want) && !why.contains('\n'), "{line}: {why}");
+            assert!(!app.views.cmdline.running());
+        }
+        // 100 is the most.
+        let mut app = opened();
+        let next = enter_with(&mut app, "100 GET k", Some(get_info()));
+        assert_eq!(next.len(), 1, "{next:?}");
+    }
+
+    #[test]
+    fn a_dangerous_repeat_asks_once_naming_the_count() {
+        // prod: the profile name, typed once for the whole run.
+        let mut app = opened();
+        assert!(enter_with(&mut app, "3 KEYS user:*", Some(keys_info())).is_empty());
+        let all = text(&app, 120, 36);
+        assert!(
+            all.contains("KEYS is @dangerous and asks first: KEYS user:* 3 times"),
+            "{all}"
+        );
+        assert!(
+            all.contains("Type prod-cache-01 and press enter to send it 3 times"),
+            "{all}"
+        );
+        let mut e = type_text(&mut app, "prod-cache-01");
+        e.extend(app.handle_key(key(KeyCode::Enter)));
+        let mut next = reqs(&e);
+        for i in 0..3 {
+            let [(id, Request::Run { confirmed, .. })] = &next[..] else {
+                panic!("{i}: {next:?}");
+            };
+            assert!(confirmed);
+            // No second question.
+            assert!(app.views.cmdline.confirm.is_none() && app.confirm.is_none());
+            next = reqs(&reply(&mut app, *id, ran(Value::Array(vec![]))));
+        }
+        assert!(next.is_empty());
+        assert!(text(&app, 120, 36).contains("(3 replies in 3 round trips"));
+
+        // Elsewhere y, once; n sends none of them.
+        let mut app = opened();
+        app.session.as_mut().unwrap().profile.env = Env::Local;
+        enter_with(&mut app, "4 KEYS user:*", Some(keys_info()));
+        assert!(text(&app, 120, 36).contains("Send it 4 times to prod-cache-01?"));
+        assert!(reqs(&app.handle_key(ch('n'))).is_empty());
+        assert!(last_body(&app) == Body::Note("Not sent: cancelled.".into()));
+        assert!(!app.views.cmdline.repeating());
+    }
+
+    #[test]
+    fn a_write_repeat_goes_through_the_write_gate_every_time() {
+        let mut app = opened();
+        writable(&mut app, Env::Local);
+        // Pipeline mode does not change writes: one at a time.
+        app.handle_key(ctrl('p'));
+        let e = enter_all(&mut app, "5 INCR counter", Some(incr_info()));
+        let mut w = writes(&e);
+        for i in 1..=5 {
+            assert_eq!(w.len(), 1, "{i}: one at a time: {w:?}");
+            let WriteOp::Command { args, .. } = &w[0].1 else {
+                panic!("{w:?}")
+            };
+            assert_eq!(args.as_slice(), [b"INCR".to_vec(), b"counter".to_vec()]);
+            // An edit outside prod runs without a question, each time.
+            assert!(app.confirm.is_none());
+            w = writes(&wrote(&mut app, w[0].0, Value::Int(i)));
+        }
+        assert!(w.is_empty());
+        let all = text(&app, 120, 36);
+        assert!(all.contains("#5 (integer) 5"), "{all}");
+        assert!(all.contains("(5 replies in 5 round trips"), "{all}");
+
+        // A refusal from the server mid-run turns INCR off, and the run ends there.
+        let e = enter_cached(&mut app, "3 INCR counter");
+        let w = writes(&e);
+        let after = testing::reply(&mut app, w[0].0, Err(LiveError::Denied("INCR".into())));
+        assert!(writes(&after).is_empty());
+        let Body::Runs(r) = last_body(&app) else {
+            panic!()
+        };
+        assert!(
+            matches!(&r.end, Some(RunEnd::Failed(why)) if why.contains("refused INCR")),
+            "{:?}",
+            r.end.as_ref().map(|_| ())
+        );
+        assert!(!app.views.cmdline.running());
+    }
+
+    #[test]
+    fn a_write_repeat_on_a_read_only_profile_sends_nothing() {
+        for ro in [(Env::Prod, None), (Env::Local, Some(true))] {
+            let mut app = opened();
+            let s = app.session.as_mut().unwrap();
+            s.profile.env = ro.0;
+            s.profile.read_only = ro.1;
+            let e = enter_all(&mut app, "5 INCR counter", Some(incr_info()));
+            assert!(writes(&e).is_empty(), "{e:?}");
+            assert!(app.confirm.is_none());
+            let Body::Note(why) = last_body(&app) else {
+                panic!()
+            };
+            assert!(why.contains("prod-cache-01 is read-only"), "{why}");
+            assert!(!app.views.cmdline.running());
+        }
+    }
+
+    #[test]
+    fn a_write_repeat_that_would_ask_is_not_repeated() {
+        let mut app = opened();
+        writable(&mut app, Env::Local);
+        for (line, i) in [("2 DEL k", del_info()), ("2 FLUSHDB", flushdb_info())] {
+            let e = enter_all(&mut app, line, Some(i));
+            assert!(writes(&e).is_empty(), "{line}");
+            assert!(app.confirm.is_none(), "{line}");
+            assert!(last_body(&app) == Body::Note(REPEAT_ASKS.into()), "{line}");
+        }
+        // On prod with writes on, an edit asks: not repeated either.
+        let mut app = opened();
+        writable(&mut app, Env::Prod);
+        let e = enter_all(&mut app, "2 INCR counter", Some(incr_info()));
+        assert!(writes(&e).is_empty());
+        assert!(app.confirm.is_none());
+        assert!(last_body(&app) == Body::Note(REPEAT_ASKS.into()));
+        // Without the count it is asked as before.
+        enter_all(&mut app, "INCR counter", Some(incr_info()));
+        assert!(app.confirm.is_some());
+    }
+
+    #[test]
+    fn esc_stops_a_repeat_and_keeps_the_replies() {
+        let mut app = opened();
+        let next = enter_with(&mut app, "5 GET k", Some(get_info()));
+        let next = reqs(&reply(&mut app, next[0].0, ran(Value::Int(1))));
+        // The second is on its way: esc sends nothing more, and the panel stays open.
+        assert!(reqs(&app.handle_key(key(KeyCode::Esc))).is_empty());
+        assert!(app.views.cmdline.open);
+        assert!(text(&app, 80, 24).contains("stopping… 1 of 5 answered"));
+        let after = reqs(&reply(&mut app, next[0].0, ran(Value::Int(2))));
+        assert!(after.is_empty(), "{after:?}");
+        assert!(!app.views.cmdline.running() && !app.views.cmdline.repeating());
+        let all = text(&app, 80, 24);
+        assert!(all.contains("#1 (integer) 1") && all.contains("#2 (integer) 2"));
+        assert!(
+            all.contains("Stopped with esc: 2 of 5 answered, nothing more sent."),
+            "{all}"
+        );
+        // The next esc closes.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.views.cmdline.open);
+
+        // Stopped between pipelines too.
+        let mut app = opened();
+        app.session.as_mut().unwrap().profile.provider =
+            Some(crate::model::Provider::ElasticacheServerless);
+        app.handle_key(ctrl('p'));
+        let next = enter_with(&mut app, "100 GET k", Some(get_info()));
+        // 1,000 a second: pipelines of 100.
+        let [(id, Request::Batch { times: 100, .. })] = &next[..] else {
+            panic!("{next:?}")
+        };
+        app.handle_key(key(KeyCode::Esc));
+        let outs = (0..100)
+            .map(|i| Output::of(&Value::Int(i), Duration::ZERO))
+            .collect();
+        assert!(reqs(&reply(&mut app, *id, Reply::Batch(outs))).is_empty());
+        let Body::Runs(r) = last_body(&app) else {
+            panic!()
+        };
+        assert_eq!(r.answered(), 100);
+        assert!(r.end == Some(RunEnd::Done) || r.end == Some(RunEnd::Stopped));
+    }
+
+    #[test]
+    fn a_lost_reply_ends_a_repeat_with_the_replies_so_far() {
+        let mut app = opened();
+        let next = enter_with(&mut app, "3 GET k", Some(get_info()));
+        reply(&mut app, next[0].0, ran(Value::Int(1)));
+        let s = app.session.as_ref().unwrap();
+        let (id, scan) = (s.id, s.scan);
+        app.apply(Msg::LiveClosed {
+            id,
+            scan,
+            error: None,
+        });
+        app.apply(Msg::TickAt(std::time::Instant::now()));
+        assert!(!app.views.cmdline.running() && !app.views.cmdline.repeating());
+        let all = text(&app, 120, 36);
+        assert!(all.contains("#1 (integer) 1"), "{all}");
+        assert!(
+            all.contains("No answer: the live connection closed"),
+            "{all}"
+        );
+        assert!(all.contains("(1 of 3 answered)"), "{all}");
+    }
+
+    #[test]
+    fn pipeline_mode_sends_a_readonly_repeat_in_pipelines() {
+        let mut app = opened();
+        app.handle_key(ctrl('p'));
+        assert!(app.views.cmdline.pipeline);
+        assert!(text(&app, 120, 36).contains("· pipeline"));
+        // The prod profile's budget is 5,000 a second: one pipeline holds 100.
+        let next = enter_with(&mut app, "5 GET k", Some(get_info()));
+        let [
+            (
+                id,
+                Request::Batch {
+                    args,
+                    times,
+                    confirmed,
+                    ..
+                },
+            ),
+        ] = &next[..]
+        else {
+            panic!("{next:?}")
+        };
+        assert_eq!((args.as_slice().len(), *times, *confirmed), (2, 5, false));
+        let outs = (1..=5)
+            .map(|i| Output::of(&Value::Int(i), Duration::from_micros(800)))
+            .collect();
+        assert!(reqs(&reply(&mut app, *id, Reply::Batch(outs))).is_empty());
+        let all = text(&app, 120, 36);
+        assert!(all.contains("#5 (integer) 5"), "{all}");
+        assert!(all.contains("(5 replies in 1 pipeline · 0.80 ms)"), "{all}");
+        // A small budget makes small pipelines: a tenth of a second each.
+        app.session.as_mut().unwrap().profile.provider =
+            Some(crate::model::Provider::ElasticacheServerless);
+        let next = reqs(&enter_cached(&mut app, "100 GET k"));
+        assert!(
+            matches!(&next[..], [(_, Request::Batch { times: 100, .. })]),
+            "{next:?}"
+        );
+        // Off again: one at a time.
+        app.handle_key(ctrl('p'));
+        assert!(!app.views.cmdline.pipeline);
+    }
+
+    #[test]
+    fn ctrl_t_switches_how_replies_are_drawn() {
+        let mut app = opened();
+        let next = enter_with(&mut app, "HGETALL user:1", Some(hgetall_info()));
+        let hash = Value::Array(
+            ["name", "Ada", "visits", "12"]
+                .iter()
+                .map(|s| Value::BulkString(s.as_bytes().to_vec()))
+                .collect(),
+        );
+        reply(&mut app, next[0].0, ran(hash));
+        assert!(text(&app, 80, 24).contains("1) \"name\""));
+        for (view, name, shows) in [
+            (View::Table, "view_table_80x24", "2  visits  12"),
+            (View::Json, "view_json_80x24", "\"visits\","),
+            (View::Raw, "view_raw_80x24", "[bulk string] $6 \"visits\""),
+        ] {
+            app.handle_key(ctrl('t'));
+            assert_eq!(app.views.cmdline.view, view);
+            let all = text(&app, 80, 24);
+            assert!(all.contains(shows), "{view:?}: {all}");
+            assert!(all.contains(&format!("· {} view", view.label())), "{all}");
+            insta::assert_snapshot!(name, testing::render(&app, 80, 24).backend());
+        }
+        app.handle_key(ctrl('t'));
+        assert_eq!(app.views.cmdline.view, View::Text);
+        // The view is kept for the next replies, and ctrl-t is not typed.
+        assert_eq!(app.views.cmdline.shown_input(), "");
+    }
+
+    #[test]
+    fn credentials_after_a_count_are_masked() {
+        let mut app = opened();
+        let line = format!("3 CONFIG SET requirepass {MARK}");
+        type_text(&mut app, &line);
+        assert_eq!(
+            app.views.cmdline.shown_input(),
+            "3 CONFIG SET requirepass ***"
+        );
+        assert!(!value::leaks(&text(&app, 120, 36), MARK));
+        // Pressed enter: refused on this read-only profile, and kept masked.
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.views.cmdline.history(),
+            ["3 CONFIG SET requirepass ***"]
+        );
+        let all = text(&app, 120, 36);
+        assert!(!value::leaks(&all, MARK), "{all}");
+        assert!(!format!("{:?}", app.views.cmdline).contains(MARK));
+        let mut app = opened();
+        type_text(&mut app, &format!("2 AUTH {MARK}"));
+        assert_eq!(app.views.cmdline.shown_input(), "2 AUTH ***");
+    }
+
+    #[test]
+    fn tab_completes_the_command_after_a_count() {
+        let mut app = opened();
+        type_text(&mut app, "3 GE");
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.views.cmdline.shown_input(), "3 GET");
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.views.cmdline.shown_input(), "3 GETDEL");
+    }
+
+    #[test]
+    fn a_repeat_s_replies_never_reach_debug() {
+        let mut app = opened();
+        let next = enter_with(&mut app, "2 GET k", Some(get_info()));
+        let next = reqs(&reply(
+            &mut app,
+            next[0].0,
+            ran(Value::BulkString(MARK.as_bytes().to_vec())),
+        ));
+        assert!(app.views.cmdline.repeating());
+        let d = format!("{:?}", app.views.cmdline);
+        assert!(!d.contains(MARK), "{d}");
+        assert!(d.contains("repeat: true"), "{d}");
+        reply(&mut app, next[0].0, ran(Value::Int(1)));
+        assert!(!format!("{:?}", app.views.cmdline).contains(MARK));
+    }
+
+    #[test]
+    fn a_long_repeat_keeps_the_output_under_its_cap() {
+        let mut app = opened();
+        let mut next = enter_with(&mut app, "8 GET k", Some(get_info()));
+        // 8 replies of about 1 MiB in each of 4 views: the oldest go first.
+        let big = Value::BulkString(vec![b'a'; MAX_OUTPUT_BYTES / 6]);
+        while let [(id, _)] = &next[..] {
+            next = reqs(&reply(&mut app, *id, ran(big.clone())));
+        }
+        let Body::Runs(r) = last_body(&app) else {
+            panic!()
+        };
+        assert_eq!(r.answered(), 8);
+        assert!(r.dropped > 0 && !r.outs.is_empty());
+        assert!(r.bytes() <= MAX_OUTPUT_BYTES || r.outs.len() == 1);
+        assert_eq!(r.outs.last().unwrap().n, 8);
+        let shown = entry_text(app.views.cmdline.entries.last().unwrap(), View::Text);
+        assert!(shown[0].contains("replies were dropped"), "{:?}", shown[0]);
     }
 }
