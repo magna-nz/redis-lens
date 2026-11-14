@@ -688,6 +688,7 @@ mod tests {
         let mut app = app_with(Env::Local, None);
         app.settings = Settings {
             skip_non_prod_confirm: true,
+            ..Settings::default()
         };
         let (_, e) = write(&mut app, unlink());
         assert_eq!(writes(&e).len(), 1);

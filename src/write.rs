@@ -33,10 +33,29 @@ use crate::value::Raw;
 /// `[settings]` in the config file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
+    /// The colour theme: `"dark"` (the default) or `"light"`, for light terminals.
+    /// `NO_COLOR` overrides both (see `tui::ui::style`).
+    #[serde(default, skip_serializing_if = "Theme::is_default")]
+    pub theme: Theme,
     /// Turn off the `y`/`n` prompts of check 3 on profiles that aren't `prod`. It never
     /// applies to `prod`, to bulk actions, or to a prompt where a name is typed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_non_prod_confirm: bool,
+}
+
+/// `[settings] theme`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Theme {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Settings {
@@ -973,14 +992,17 @@ mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            tags: Vec::new(),
         }
     }
 
     const ON: Settings = Settings {
         skip_non_prod_confirm: false,
+        theme: Theme::Dark,
     };
     const SKIP: Settings = Settings {
         skip_non_prod_confirm: true,
+        theme: Theme::Dark,
     };
 
     #[test]

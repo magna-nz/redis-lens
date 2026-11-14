@@ -145,6 +145,7 @@ pub(crate) fn profile_in(env: crate::model::Env) -> Profile {
         token_command: None,
         ssh: None,
         sentinel: None,
+        tags: Vec::new(),
     }
 }
 

@@ -1,9 +1,7 @@
 ---
 source: src/tui/ui/help.rs
-assertion_line: 71
 expression: "render(Screen::Connections, 80, 24).backend()"
 ---
-"                                                                                "
 "                                                                                "
 "                                                                                "
 "                                                                                "
@@ -19,10 +17,11 @@ expression: "render(Screen::Connections, 80, 24).backend()"
 "       │PgUp PgDn      Move one page                                    │       "
 "       │Home End g G   Jump to the first or last row                    │       "
 "       │enter          Connect and scan                                 │       "
+"       │/              Filter the profiles by name or tag               │       "
+"       │esc            Clear the filter                                 │       "
 "       │r              Look for Docker containers again                 │       "
 "       │w              Turn writes on or off for the selected profile   │       "
 "       └────────────────────────────────────────────────────────────────┘       "
-"                                                                                "
 "                                                                                "
 "                                                                                "
 "                                                                                "

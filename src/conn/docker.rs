@@ -157,6 +157,7 @@ fn profile_for(name: String, port: u16, password: bool) -> Profile {
         token_command: None,
         ssh: None,
         sentinel: None,
+        tags: Vec::new(),
     }
 }
 

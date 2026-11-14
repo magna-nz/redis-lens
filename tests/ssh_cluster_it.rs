@@ -74,6 +74,7 @@ impl World {
             token_command: None,
             ssh: Some(self.bastion.tunnel(&self.key, &self.known_hosts)),
             sentinel: None,
+            tags: Vec::new(),
         }
     }
 
@@ -435,6 +436,7 @@ fn direct(port: u16, prefer_replica: bool) -> Profile {
         token_command: None,
         ssh: None,
         sentinel: None,
+        tags: Vec::new(),
     }
 }
 

@@ -48,19 +48,42 @@ pub async fn run(config: Option<PathBuf>, cmd: ConnCommand) -> anyhow::Result<()
         ConnCommand::List => println!("{}", list(&path)?),
         ConnCommand::Remove { name } => println!("{}", remove(&path, &secrets, &name)?),
         ConnCommand::Test { name } => println!("{}", test(&path, &secrets, &name).await?),
+        ConnCommand::Export { file, force } => {
+            let mut stdout = std::io::stdout();
+            if let Some(msg) = export(&path, file.as_deref(), force, &mut stdout)? {
+                println!("{msg}");
+            }
+        }
+        ConnCommand::Import { file, force, yes } => println!(
+            "{}",
+            import(
+                &path,
+                &secrets,
+                &file,
+                force,
+                yes,
+                &confirm_import_on_terminal
+            )?
+        ),
         ConnCommand::Set {
             name,
             writes,
             confirm,
             yes,
+            tag,
+            untag,
         } => println!(
             "{}",
-            set_writes(
+            set(
                 &path,
                 &name,
-                writes == WritesArg::On,
-                confirm.as_deref(),
-                yes,
+                &SetChanges {
+                    writes: writes.map(|w| w == WritesArg::On),
+                    confirm: confirm.as_deref(),
+                    yes,
+                    tag: &tag,
+                    untag: &untag,
+                },
                 &ask_on_terminal
             )?
         ),
@@ -456,9 +479,370 @@ fn confirm_writes_on(
     }
 }
 
-/// `conn set <name> --writes on|off`: sets `read_only` in the config file and nothing
-/// else. Turning writes on asks first when the profile is read-only now; turning them
+/// `conn export [FILE] [--force]`. Without `FILE` the TOML goes to `stdout` and the
+/// result is `None`; with one it is written there (atomically, mode 0600, never over an
+/// existing file without `force`) and the result is the line to print. Reads the config
+/// file only, never the keychain.
+pub fn export(
+    path: &Path,
+    file: Option<&Path>,
+    force: bool,
+    stdout: &mut dyn std::io::Write,
+) -> anyhow::Result<Option<String>> {
+    let config = Config::load(path)?;
+    if config.profiles.is_empty() {
+        bail!("no saved connections to export");
+    }
+    let text = config.export_text()?;
+    match file {
+        None => {
+            stdout
+                .write_all(text.as_bytes())
+                .context("could not write to standard output")?;
+            Ok(None)
+        }
+        Some(f) => {
+            crate::config::write_private(f, &text, force)?;
+            let n = config.profiles.len();
+            Ok(Some(format!(
+                "Wrote {n} connection{} to {}. It holds no credentials.",
+                if n == 1 { "" } else { "s" },
+                f.display()
+            )))
+        }
+    }
+}
+
+/// Ask on the terminal about the token command of an imported profile, as `conn add`
+/// does. The command is escaped: it comes from a file.
+fn confirm_import_on_terminal(name: &str, command: &str) -> anyhow::Result<bool> {
+    if std::io::stdin().is_terminal() {
+        eprintln!("Profile {name}:");
+    }
+    confirm_on_terminal(command)
+}
+
+/// `conn import FILE [--force] [--yes]` (spec.md "Small items (P4)"): every profile of
+/// `file` is added, or none. Refused: a name that exists (unless `force`), a `docker:`
+/// name, a name twice in the file, a bad tag, a bad bastion host, an empty token
+/// command. `read_only = false` is dropped so an import never turns writes on. A token
+/// command is shown and `confirm(name, command)` asked, unless `yes`. Nothing but the
+/// config file is written, and `[settings]` in the file is ignored.
+///
+/// The keychain is never read for a credential to use, and nothing is stored in it. But
+/// an imported profile must not pick up credentials stored under its name for another
+/// place: a file could otherwise point `prod` at another host and be sent prod's
+/// password at the next connect. So the entries under an imported name (the server's,
+/// the bastion's, the Sentinels') are deleted, unless the profile replaces one that
+/// sends them to the same place ([`same_destination`]). The output names each profile
+/// that lost stored credentials. A failed save puts them back.
+pub fn import(
+    path: &Path,
+    secrets: &dyn SecretStore,
+    file: &Path,
+    force: bool,
+    yes: bool,
+    confirm: &dyn Fn(&str, &str) -> anyhow::Result<bool>,
+) -> anyhow::Result<String> {
+    let text = std::fs::read_to_string(file)
+        .with_context(|| format!("could not read {}", file.display()))?;
+    let mut incoming = Config::parse_profiles(&text, file)?;
+    if incoming.is_empty() {
+        bail!("{} has no [[profile]] to import", file.display());
+    }
+    let mut config = Config::load(path)?;
+
+    // Every refusal is collected, so one run shows them all; names are escaped.
+    let mut refused: Vec<String> = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for p in &incoming {
+        let shown = crate::value::escape(&p.name);
+        if p.name.trim().is_empty() || p.name.chars().any(char::is_control) {
+            refused.push("a profile has an empty name or one with control characters".into());
+            continue;
+        }
+        if has_docker_prefix(&p.name) {
+            refused.push(format!(
+                "{shown}: names starting with {DOCKER_PREFIX} are reserved for discovered containers"
+            ));
+        }
+        if seen.contains(&p.name.as_str()) {
+            refused.push(format!("{shown}: the file has it twice"));
+        }
+        seen.push(&p.name);
+        if config.get(&p.name).is_some() && !force {
+            refused.push(format!(
+                "{shown}: exists already; pass --force to replace it"
+            ));
+        }
+        if let Some(t) = p.tags.iter().find(|t| !crate::model::valid_tag(t)) {
+            refused.push(format!(
+                "{shown}: {:?} is not a tag",
+                crate::value::escape(t)
+            ));
+        }
+        if let Some(t) = &p.ssh
+            && ssh::check_host(&t.host).is_err()
+        {
+            refused.push(format!("{shown}: the SSH bastion host is not valid"));
+        }
+        if p.token_command
+            .as_ref()
+            .is_some_and(|c| c.is_empty() || c[0].trim().is_empty())
+        {
+            refused.push(format!("{shown}: the token command has no program"));
+        }
+        if let Some(s) = &p.sentinel
+            && (s.nodes.is_empty()
+                || s.master.is_empty()
+                || s.master
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control()))
+        {
+            refused.push(format!(
+                "{shown}: the Sentinel table needs a master name without spaces and at least one node"
+            ));
+        }
+    }
+    if !refused.is_empty() {
+        bail!("nothing imported:\n  {}", refused.join("\n  "));
+    }
+
+    // Writes stay as the environment decides: an import never turns them on.
+    let mut notes: Vec<String> = Vec::new();
+    for p in &mut incoming {
+        if p.read_only == Some(false) {
+            p.read_only = None;
+            notes.push(format!(
+                "{}: read_only = false was dropped, so the {} default applies. \
+                 Turn writes on with `conn set {} --writes on`.",
+                crate::value::escape(&p.name),
+                p.env.label(),
+                crate::value::escape(&p.name)
+            ));
+        }
+    }
+    // Then every token command is shown, and nothing is saved before all are accepted.
+    for p in &incoming {
+        let Some(cmd) = &p.token_command else {
+            continue;
+        };
+        if yes {
+            continue;
+        }
+        let shown = crate::value::escape(&display_command(cmd));
+        if !confirm(&crate::value::escape(&p.name), &shown)? {
+            bail!(
+                "nothing imported: the token command of {} was not confirmed",
+                crate::value::escape(&p.name)
+            );
+        }
+    }
+
+    let n = incoming.len();
+    let mut needs: Vec<String> = Vec::new();
+    for p in &incoming {
+        let mut what: Vec<&str> = Vec::new();
+        match p.auth {
+            Auth::Keychain => what.push("password or ACL user"),
+            Auth::Command => what.push("username, if the server needs one"),
+            Auth::EntraId | Auth::None => {}
+        }
+        if p.ssh.is_some() {
+            what.push("SSH username, if the bastion needs one");
+        }
+        if p.sentinel.is_some() {
+            what.push("Sentinel password, if the Sentinels need one");
+        }
+        if !what.is_empty() {
+            needs.push(format!(
+                "  {}: {}",
+                crate::value::escape(&p.name),
+                what.join("; ")
+            ));
+        }
+    }
+
+    // The keychain entries that must not outlive the import: every entry under an
+    // imported name, unless the profile it replaces sends them to the same place.
+    let mut stale: Vec<(String, SecretRef)> = Vec::new();
+    for p in &incoming {
+        if config
+            .get(&p.name)
+            .is_some_and(|old| same_destination(old, p))
+        {
+            continue;
+        }
+        for r in [p.secret_ref(), p.ssh_secret_ref(), p.sentinel_secret_ref()] {
+            stale.push((p.name.clone(), r));
+        }
+    }
+    let mut removed: Vec<(String, SecretRef, Credentials)> = Vec::new();
+    let put_back = |removed: &[(String, SecretRef, Credentials)]| {
+        for (_, r, c) in removed {
+            let _ = secrets.set(r, c);
+        }
+    };
+    for (name, r) in stale {
+        let deleted = secrets.get(&r).and_then(|old| {
+            if let Some(c) = old {
+                secrets.delete(&r)?;
+                removed.push((name.clone(), r.clone(), c));
+            }
+            Ok(())
+        });
+        if let Err(e) = deleted {
+            put_back(&removed);
+            return Err(anyhow::Error::new(e).context(format!(
+                "nothing imported: the credentials stored under {} could not be removed from \
+                 the keychain",
+                crate::value::escape(&name)
+            )));
+        }
+    }
+    let names: Vec<String> = incoming
+        .iter()
+        .map(|p| crate::value::escape(&p.name))
+        .collect();
+    let saved = incoming
+        .into_iter()
+        .try_for_each(|p| config.add(p, force))
+        .and_then(|()| config.save(path));
+    if let Err(e) = saved {
+        put_back(&removed);
+        return Err(e.into());
+    }
+    let mut dropped: Vec<String> = Vec::new();
+    for (name, _, _) in &removed {
+        let shown = crate::value::escape(name);
+        if !dropped.contains(&shown) {
+            dropped.push(shown);
+        }
+    }
+
+    let mut lines = vec![format!(
+        "Imported {n} connection{}: {}.",
+        if n == 1 { "" } else { "s" },
+        names.join(", ")
+    )];
+    lines.extend(notes);
+    if !dropped.is_empty() {
+        lines.push(format!(
+            "Credentials stored in the OS keychain under {} were removed: they were stored \
+             for another address, bastion, Sentinel or kind of auth.",
+            dropped.join(", ")
+        ));
+    }
+    if !needs.is_empty() {
+        lines.push(
+            "No credentials came with them. These need `conn add <name> --force ...` to store them:"
+                .into(),
+        );
+        lines.extend(needs);
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Whether `new` sends the credentials stored under its name to the same place as
+/// `old`: the same address and TLS, kind of auth, token command, bastion and Sentinels.
+/// Only then may an import that replaces `old` keep its keychain entries.
+fn same_destination(old: &Profile, new: &Profile) -> bool {
+    old.endpoint == new.endpoint
+        && old.auth == new.auth
+        && old.token_command == new.token_command
+        && old.ssh == new.ssh
+        && old.sentinel == new.sentinel
+}
+
+/// The tags after `add` and `remove` are applied to `current`: each validated (see
+/// [`crate::model::valid_tag`]), duplicates dropped, order kept. A tag in both lists is
+/// an error, and so is a tag to remove that is not there.
+fn checked_tags(
+    current: &[String],
+    add: &[String],
+    remove: &[String],
+) -> anyhow::Result<Vec<String>> {
+    for t in add {
+        if !crate::model::valid_tag(t) {
+            bail!(
+                "{t:?} is not a tag: use 1 to 32 characters of letters, digits, '-', '_', '.' and '/'"
+            );
+        }
+        if remove.contains(t) {
+            bail!("{t} is both added and removed");
+        }
+    }
+    for t in remove {
+        if !current.contains(t) {
+            bail!("the profile has no tag {t}");
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for t in current.iter().chain(add) {
+        if !remove.contains(t) && !out.contains(t) {
+            out.push(t.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// What `conn set` changes. At least one part must be given.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SetChanges<'a> {
+    /// `--writes on` (`true`) or `off`.
+    pub writes: Option<bool>,
+    pub confirm: Option<&'a str>,
+    pub yes: bool,
+    pub tag: &'a [String],
+    pub untag: &'a [String],
+}
+
+/// `conn set <name> [--writes on|off] [--tag T]... [--untag T]...`: sets `read_only`
+/// and the tags in the config file and nothing else, in one save, after every check has
+/// passed. Turning writes on asks first when the profile is read-only now; turning them
 /// off never asks.
+pub fn set(
+    path: &Path,
+    name: &str,
+    changes: &SetChanges<'_>,
+    ask: &dyn Fn(&str, &str) -> anyhow::Result<String>,
+) -> anyhow::Result<String> {
+    if changes.writes.is_none() && changes.tag.is_empty() && changes.untag.is_empty() {
+        bail!("nothing to change: give --writes, --tag or --untag");
+    }
+    let mut config = Config::load(path)?;
+    let profile = config
+        .get(name)
+        .ok_or_else(|| crate::config::ConfigError::NotFound(name.to_string()))?
+        .clone();
+    let tags = checked_tags(&profile.tags, changes.tag, changes.untag)?;
+    if changes.writes == Some(true) && profile.is_read_only() {
+        confirm_writes_on(&profile, changes.confirm, changes.yes, ask)?;
+    }
+    let mut lines = Vec::new();
+    if let Some(on) = changes.writes {
+        config.set_writes(name, on)?;
+        lines.push(if on {
+            format!(
+                "Writes are on for {name}. Each write still asks as the table in the docs says."
+            )
+        } else {
+            format!("Writes are off for {name}: it is read-only.")
+        });
+    }
+    if !changes.tag.is_empty() || !changes.untag.is_empty() {
+        config.set_tags(name, tags.clone())?;
+        lines.push(if tags.is_empty() {
+            format!("{name} has no tags.")
+        } else {
+            format!("Tags of {name}: {}.", tags.join(", "))
+        });
+    }
+    config.save(path)?;
+    Ok(lines.join("\n"))
+}
+
+/// `conn set <name> --writes on|off` alone.
 pub fn set_writes(
     path: &Path,
     name: &str,
@@ -467,21 +851,17 @@ pub fn set_writes(
     yes: bool,
     ask: &dyn Fn(&str, &str) -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
-    let mut config = Config::load(path)?;
-    let profile = config
-        .get(name)
-        .ok_or_else(|| crate::config::ConfigError::NotFound(name.to_string()))?
-        .clone();
-    if on && profile.is_read_only() {
-        confirm_writes_on(&profile, confirm, yes, ask)?;
-    }
-    config.set_writes(name, on)?;
-    config.save(path)?;
-    Ok(if on {
-        format!("Writes are on for {name}. Each write still asks as the table in the docs says.")
-    } else {
-        format!("Writes are off for {name}: it is read-only.")
-    })
+    set(
+        path,
+        name,
+        &SetChanges {
+            writes: Some(on),
+            confirm,
+            yes,
+            ..SetChanges::default()
+        },
+        ask,
+    )
 }
 
 /// [`add_with`] with the token-command confirmation injected too. `confirm` gets the
@@ -542,6 +922,7 @@ pub async fn add_asking(
     } else {
         None
     };
+    let tags = checked_tags(&[], &args.tags, &[])?;
 
     let (url_user, url_password) = match &parsed.credentials {
         Some(c) => (
@@ -643,6 +1024,7 @@ pub async fn add_asking(
         token_command,
         ssh: tunnel,
         sentinel,
+        tags,
     };
     if args.confirm.is_some() && args.writes != Some(WritesArg::On) {
         bail!("--confirm answers the question --writes on asks; give --writes on too");
@@ -741,6 +1123,9 @@ pub async fn add_asking(
             msg.push_str(" The Sentinel credentials are in the OS keychain.");
         }
     }
+    if !profile.tags.is_empty() {
+        msg.push_str(&format!(" Tags: {}.", profile.tags.join(", ")));
+    }
     if let Some(p) = profile.provider {
         msg.push_str(&format!(" Provider: {}.", provider::label(p)));
         if let Some(n) = provider::notice(Some(p)) {
@@ -800,6 +1185,8 @@ pub fn list(path: &Path) -> anyhow::Result<String> {
     let any_ssh = config.profiles.iter().any(|p| p.ssh.is_some());
     // The SENTINEL column only when some profile asks Sentinels.
     let any_sentinel = config.profiles.iter().any(|p| p.sentinel.is_some());
+    // The TAGS column only when some profile has one.
+    let any_tags = config.profiles.iter().any(|p| !p.tags.is_empty());
     let rows: Vec<Vec<String>> = config
         .profiles
         .iter()
@@ -818,6 +1205,9 @@ pub fn list(path: &Path) -> anyhow::Result<String> {
                 row.push(p.sentinel.as_ref().map(sentinel_label).unwrap_or_default());
             }
             row.push(p.provider.map_or("", provider::label).to_string());
+            if any_tags {
+                row.push(p.tags.join(","));
+            }
             row
         })
         .collect();
@@ -829,6 +1219,9 @@ pub fn list(path: &Path) -> anyhow::Result<String> {
         header.push("SENTINEL");
     }
     header.push("PROVIDER");
+    if any_tags {
+        header.push("TAGS");
+    }
     Ok(table(&header, &rows))
 }
 
@@ -969,6 +1362,7 @@ mod tests {
             writes: None,
             confirm: None,
             ssh: None,
+            tags: Vec::new(),
             ssh_identity: None,
             ssh_known_hosts: None,
             sentinel: None,
@@ -2222,6 +2616,7 @@ mod tests {
                 token_command: None,
                 ssh: None,
                 sentinel: None,
+                tags: Vec::new(),
             },
             credentials: Some(Credentials {
                 username: None,
@@ -2344,6 +2739,794 @@ mod tests {
         assert_eq!(Config::load(&path).unwrap().get("c").unwrap(), &before);
         assert_eq!(entry(&store, "c"), entry_before);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    fn tags_of(path: &Path, name: &str) -> Vec<String> {
+        Config::load(path).unwrap().get(name).unwrap().tags.clone()
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn add_tags_validated_and_listed() {
+        let path = temp_path("tags-add");
+        let store = MemoryStore::default();
+        let mut a = args("t1", "redis://10.0.0.5:6379");
+        a.tags = strs(&["team-a", "eu", "team-a", "a/b.c_d"]);
+        let msg = add(&path, &store, &a, None).await.unwrap();
+        assert!(msg.contains("Tags: team-a, eu, a/b.c_d."), "{msg}");
+        assert_eq!(tags_of(&path, "t1"), ["team-a", "eu", "a/b.c_d"]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("tags = ["), "{text}");
+
+        // A bad tag saves nothing.
+        for bad in ["", "has space", "ünï", &"x".repeat(33), "a,b"] {
+            let mut a = args("t2", "redis://10.0.0.5:6379");
+            a.tags = vec![bad.to_string()];
+            let e = add(&path, &store, &a, None).await.unwrap_err();
+            assert!(e.to_string().contains("is not a tag"), "{bad:?}: {e}");
+        }
+        assert!(Config::load(&path).unwrap().get("t2").is_none());
+
+        // TAGS only while some profile has one.
+        let listed = list(&path).unwrap();
+        assert!(listed.lines().next().unwrap().ends_with("TAGS"), "{listed}");
+        assert!(listed.contains("team-a,eu,a/b.c_d"), "{listed}");
+        add(&path, &store, &args("plain", "redis://10.0.0.6:6379"), None)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let path = temp_path("tags-none");
+        add(&path, &store, &args("plain", "redis://10.0.0.6:6379"), None)
+            .await
+            .unwrap();
+        assert!(!list(&path).unwrap().contains("TAGS"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn set_tags_adds_removes_and_touches_nothing_else() {
+        let path = temp_path("tags-set");
+        let store = MemoryStore::default();
+        add(
+            &path,
+            &store,
+            &args("c", "redis://u:s3cret-pw@10.0.0.5"),
+            None,
+        )
+        .await
+        .unwrap();
+        let entry_before = entry(&store, "c");
+        let mut before = Config::load(&path).unwrap().get("c").unwrap().clone();
+        let changes = |tag: &'static [String], untag: &'static [String]| SetChanges {
+            tag,
+            untag,
+            ..SetChanges::default()
+        };
+        let add_tags: &'static [String] = Box::leak(strs(&["a", "b", "a"]).into_boxed_slice());
+        let msg = set(&path, "c", &changes(add_tags, &[]), &no_question).unwrap();
+        assert_eq!(msg, "Tags of c: a, b.");
+        let rm: &'static [String] = Box::leak(strs(&["a"]).into_boxed_slice());
+        set(&path, "c", &changes(&[], rm), &no_question).unwrap();
+        assert_eq!(tags_of(&path, "c"), ["b"]);
+        before.tags = strs(&["b"]);
+        assert_eq!(Config::load(&path).unwrap().get("c").unwrap(), &before);
+        assert_eq!(entry(&store, "c"), entry_before);
+
+        // Refusals change nothing: a tag not there, a bad tag, both at once.
+        let file = std::fs::read_to_string(&path).unwrap();
+        let nope: &'static [String] = Box::leak(strs(&["zz"]).into_boxed_slice());
+        assert!(set(&path, "c", &changes(&[], nope), &no_question).is_err());
+        let bad: &'static [String] = Box::leak(strs(&["no good"]).into_boxed_slice());
+        assert!(set(&path, "c", &changes(bad, &[]), &no_question).is_err());
+        let b: &'static [String] = Box::leak(strs(&["b"]).into_boxed_slice());
+        assert!(set(&path, "c", &changes(b, b), &no_question).is_err());
+        assert!(set(&path, "missing", &changes(b, &[]), &no_question).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), file);
+
+        // The last tag removed leaves no `tags` key.
+        let msg = set(&path, "c", &changes(&[], b), &no_question).unwrap();
+        assert_eq!(msg, "c has no tags.");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("tags"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn set_with_nothing_to_change_is_refused_and_writes_and_tags_go_together() {
+        use super::super::EnvArg;
+        let path = temp_path("tags-writes");
+        let store = MemoryStore::default();
+        add_env(&path, &store, "s", Some(EnvArg::Stage)).await;
+        let e = set(&path, "s", &SetChanges::default(), &no_question).unwrap_err();
+        assert!(e.to_string().contains("nothing to change"), "{e}");
+        // A refused writes question keeps the tags unchanged too.
+        let t = strs(&["x"]);
+        let e = set(
+            &path,
+            "s",
+            &SetChanges {
+                writes: Some(false),
+                tag: &t,
+                ..SetChanges::default()
+            },
+            &no_question,
+        )
+        .unwrap();
+        assert!(
+            e.contains("Writes are off for s") && e.contains("Tags of s: x."),
+            "{e}"
+        );
+        assert_eq!(saved(&path, "s"), Some(true));
+        assert_eq!(tags_of(&path, "s"), ["x"]);
+        let no = |_: &str, _: &str| Ok("n".to_string());
+        let t2 = strs(&["y"]);
+        assert!(
+            set(
+                &path,
+                "s",
+                &SetChanges {
+                    writes: Some(true),
+                    tag: &t2,
+                    ..SetChanges::default()
+                },
+                &no
+            )
+            .is_err()
+        );
+        assert_eq!(tags_of(&path, "s"), ["x"]);
+        assert_eq!(saved(&path, "s"), Some(true));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn clap_conn_set_needs_a_change_and_takes_repeated_tags() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| crate::cli::Cli::try_parse_from(argv);
+        let e = parse(&["redis-lens", "conn", "set", "p"]).unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let e = parse(&["redis-lens", "conn", "set", "p", "--yes"]).unwrap_err();
+        assert!(e.use_stderr(), "{e}");
+        assert!(parse(&["redis-lens", "conn", "set", "p", "--writes", "off"]).is_ok());
+        assert!(
+            parse(&[
+                "redis-lens",
+                "conn",
+                "set",
+                "p",
+                "--tag",
+                "a",
+                "--tag",
+                "b",
+                "--untag",
+                "c"
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "redis-lens",
+                "conn",
+                "add",
+                "p",
+                "--url",
+                "redis://h",
+                "--tag",
+                "a",
+                "--tag",
+                "b"
+            ])
+            .is_ok()
+        );
+    }
+
+    fn ok_confirm(_: &str, _: &str) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    fn no_confirm(_: &str, _: &str) -> anyhow::Result<bool> {
+        panic!("no question expected")
+    }
+
+    fn write_file(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn profile_text(name: &str, extra: &str) -> String {
+        format!(
+            "[[profile]]\nname = \"{name}\"\nenv = \"stage\"\n{extra}\n[profile.endpoint]\nhost = \"h\"\nport = 6379\ntls = false\n\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn export_then_import_round_trips_and_holds_no_credential() {
+        use super::super::EnvArg;
+        let src = temp_path("exp-src");
+        let store = MemoryStore::default();
+        let mut a = args("a", "redis://alice:s3cret-pw@10.0.0.5:6380/3");
+        a.env = Some(EnvArg::Prod);
+        a.tags = strs(&["team-a", "eu"]);
+        a.ssh = Some("jump-user@bastion.example.com:2222".into());
+        add(&src, &store, &a, None).await.unwrap();
+        let mut b = args("b", "redis://10.0.0.6");
+        b.writes = Some(WritesArg::Off);
+        add(&src, &store, &b, None).await.unwrap();
+        add(
+            &src,
+            &store,
+            &ConnAddArgs {
+                token_command: strs(&["az", "account", "get-access-token"]),
+                yes: true,
+                ..args("c", "redis://bob@10.0.0.7")
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let mut cfg = Config::load(&src).unwrap();
+        cfg.settings.skip_non_prod_confirm = true;
+        cfg.save(&src).unwrap();
+
+        let mut out = Vec::new();
+        assert_eq!(export(&src, None, false, &mut out).unwrap(), None);
+        let text = String::from_utf8(out).unwrap();
+        for secret in ["s3cret-pw", "alice", "jump-user", "bob"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        assert!(!text.contains("[settings]"), "{text}");
+        assert_eq!(text.matches("[[profile]]").count(), 3, "{text}");
+
+        let file = src.parent().unwrap().join("out.toml");
+        let msg = export(&src, Some(&file), false, &mut Vec::new())
+            .unwrap()
+            .unwrap();
+        assert!(msg.contains("Wrote 3 connections"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+
+        let dst = temp_path("exp-dst");
+        let msg = import(
+            &dst,
+            &MemoryStore::default(),
+            &file,
+            false,
+            true,
+            &no_confirm,
+        )
+        .unwrap();
+        assert!(msg.starts_with("Imported 3 connections: a, b, c."), "{msg}");
+        let got = Config::load(&dst).unwrap();
+        assert_eq!(got.profiles, Config::load(&src).unwrap().profiles);
+        assert!(got.settings.is_default());
+        let _ = std::fs::remove_dir_all(src.parent().unwrap());
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn export_never_overwrites_without_force_and_writes_0600_atomically() {
+        let src = temp_path("exp-file");
+        let store = MemoryStore::default();
+        add(&src, &store, &args("a", "redis://10.0.0.5"), None)
+            .await
+            .unwrap();
+        let dir = src.parent().unwrap().to_path_buf();
+        let file = dir.join("export.toml");
+        std::fs::write(&file, "mine").unwrap();
+        let e = export(&src, Some(&file), false, &mut Vec::new()).unwrap_err();
+        assert!(e.to_string().contains("--force"), "{e}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine");
+        export(&src, Some(&file), true, &mut Vec::new()).unwrap();
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("[[profile]]")
+        );
+        let fresh = dir.join("fresh.toml");
+        export(&src, Some(&fresh), false, &mut Vec::new()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for f in [&file, &fresh] {
+                let mode = std::fs::metadata(f).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "{f:?}");
+            }
+        }
+        // No temp file is left behind: config.toml, export.toml, fresh.toml.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3);
+        // Nothing to export.
+        let empty = temp_path("exp-empty");
+        let e = export(&empty, None, false, &mut Vec::new()).unwrap_err();
+        assert!(e.to_string().contains("no saved connections"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_is_all_or_nothing_and_says_every_refusal() {
+        let dst = temp_path("imp-refuse");
+        let existing = profile_text("taken", "");
+        let cfg = dst.clone();
+        write_file(&cfg, &existing);
+        let before = std::fs::read_to_string(&cfg).unwrap();
+        let file = dst.parent().unwrap().join("in.toml");
+        let text = [
+            profile_text("fine", ""),
+            profile_text("taken", ""),
+            profile_text("Docker:cache", ""),
+            profile_text("twice", ""),
+            profile_text("twice", ""),
+            profile_text("badtag", "tags = [\"no good\"]"),
+            profile_text("badtoken", "token_command = [\"\"]"),
+        ]
+        .concat();
+        write_file(&file, &text);
+        let e = import(
+            &dst,
+            &MemoryStore::default(),
+            &file,
+            false,
+            true,
+            &no_confirm,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.starts_with("nothing imported:"), "{e}");
+        for part in [
+            "taken: exists already; pass --force",
+            "Docker:cache: names starting with docker:",
+            "twice: the file has it twice",
+            "badtag: \"no good\" is not a tag",
+            "badtoken: the token command has no program",
+        ] {
+            assert!(e.contains(part), "{part} not in {e}");
+        }
+        assert!(!e.contains("fine"), "{e}");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before);
+
+        // --force replaces the one that exists; the docker: name stays refused.
+        write_file(
+            &file,
+            &[profile_text("fine", ""), profile_text("taken", "db = 4")].concat(),
+        );
+        let msg = import(
+            &dst,
+            &MemoryStore::default(),
+            &file,
+            true,
+            true,
+            &no_confirm,
+        )
+        .unwrap();
+        assert!(
+            msg.starts_with("Imported 2 connections: fine, taken."),
+            "{msg}"
+        );
+        let got = Config::load(&dst).unwrap();
+        assert_eq!(got.get("taken").unwrap().db, 4);
+        assert_eq!(got.profiles.len(), 2);
+        write_file(&file, &profile_text("DOCKER:x", ""));
+        assert!(
+            import(
+                &dst,
+                &MemoryStore::default(),
+                &file,
+                true,
+                true,
+                &no_confirm
+            )
+            .is_err()
+        );
+        // Not a profile file, a missing file, an empty one.
+        write_file(&file, "this is = not [toml");
+        assert!(
+            import(
+                &dst,
+                &MemoryStore::default(),
+                &file,
+                false,
+                true,
+                &no_confirm
+            )
+            .is_err()
+        );
+        write_file(&file, "# nothing\n");
+        let e = import(
+            &dst,
+            &MemoryStore::default(),
+            &file,
+            false,
+            true,
+            &no_confirm,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("no [[profile]]"), "{e}");
+        assert!(
+            import(
+                &dst,
+                &MemoryStore::default(),
+                &dst.with_file_name("nope.toml"),
+                false,
+                true,
+                &no_confirm
+            )
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+    }
+
+    #[test]
+    fn import_drops_read_only_false_keeps_true_and_ignores_settings() {
+        let dst = temp_path("imp-ro");
+        let file = dst.parent().unwrap().join("in.toml");
+        let text = format!(
+            "[settings]\nskip_non_prod_confirm = true\n\n{}{}{}",
+            profile_text("rw", "read_only = false"),
+            profile_text("ro", "read_only = true"),
+            profile_text("dflt", ""),
+        );
+        write_file(&file, &text);
+        let msg = import(
+            &dst,
+            &MemoryStore::default(),
+            &file,
+            false,
+            true,
+            &no_confirm,
+        )
+        .unwrap();
+        assert!(
+            msg.contains("rw: read_only = false was dropped, so the STAGE default applies"),
+            "{msg}"
+        );
+        assert_eq!(msg.matches("was dropped").count(), 1, "{msg}");
+        let got = Config::load(&dst).unwrap();
+        assert_eq!(got.get("rw").unwrap().read_only, None);
+        assert_eq!(got.get("ro").unwrap().read_only, Some(true));
+        assert_eq!(got.get("dflt").unwrap().read_only, None);
+        assert!(got.settings.is_default());
+        // A prod profile stays read-only whatever the file said.
+        let file = dst.parent().unwrap().join("prod.toml");
+        write_file(
+            &file,
+            &profile_text("p", "read_only = false").replace("stage", "prod"),
+        );
+        import(
+            &dst,
+            &MemoryStore::default(),
+            &file,
+            false,
+            true,
+            &no_confirm,
+        )
+        .unwrap();
+        assert!(Config::load(&dst).unwrap().get("p").unwrap().is_read_only());
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+    }
+
+    #[test]
+    fn import_asks_about_a_token_command_unless_yes() {
+        let dst = temp_path("imp-token");
+        let file = dst.parent().unwrap().join("in.toml");
+        let text = [
+            profile_text("plain", ""),
+            profile_text(
+                "tok",
+                "auth = \"command\"\ntoken_command = [\"az\", \"my token\"]",
+            ),
+        ]
+        .concat();
+        write_file(&file, &text);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let record = |name: &str, cmd: &str| {
+            asked.borrow_mut().push((name.to_string(), cmd.to_string()));
+            Ok(false)
+        };
+        let e = import(&dst, &MemoryStore::default(), &file, false, false, &record).unwrap_err();
+        assert!(e.to_string().contains("was not confirmed"), "{e}");
+        assert_eq!(
+            *asked.borrow(),
+            [("tok".to_string(), "az 'my token'".to_string())]
+        );
+        // Declined: nothing, not even the plain profile, is saved.
+        assert!(Config::load(&dst).unwrap().profiles.is_empty());
+        // No terminal: the question itself refuses.
+        let no_tty = |_: &str, _: &str| bail!("standard input is not a terminal");
+        assert!(import(&dst, &MemoryStore::default(), &file, false, false, &no_tty).is_err());
+        assert!(Config::load(&dst).unwrap().profiles.is_empty());
+        // --yes skips the question; yes answers it.
+        import(
+            &dst,
+            &MemoryStore::default(),
+            &file,
+            false,
+            true,
+            &no_confirm,
+        )
+        .unwrap();
+        assert_eq!(Config::load(&dst).unwrap().profiles.len(), 2);
+        let dst2 = temp_path("imp-token-y");
+        import(
+            &dst2,
+            &MemoryStore::default(),
+            &file,
+            false,
+            false,
+            &ok_confirm,
+        )
+        .unwrap();
+        assert_eq!(Config::load(&dst2).unwrap().profiles.len(), 2);
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+        let _ = std::fs::remove_dir_all(dst2.parent().unwrap());
+    }
+
+    #[test]
+    fn import_lists_the_profiles_that_need_credentials() {
+        let dst = temp_path("imp-creds");
+        let file = dst.parent().unwrap().join("in.toml");
+        let text = [
+            profile_text("open", ""),
+            profile_text("pw", "auth = \"keychain\""),
+            profile_text("tok", "auth = \"command\"\ntoken_command = [\"az\"]"),
+            profile_text("entra", "auth = \"entra-id\""),
+        ]
+        .concat()
+            + "[[profile]]\nname = \"far\"\n[profile.endpoint]\nhost = \"h\"\nport = 1\n[profile.ssh]\nhost = \"jump\"\n";
+        write_file(&file, &text);
+        let msg = import(
+            &dst,
+            &MemoryStore::default(),
+            &file,
+            false,
+            true,
+            &no_confirm,
+        )
+        .unwrap();
+        assert!(msg.contains("`conn add <name> --force ...`"), "{msg}");
+        assert!(msg.contains("  pw: password or ACL user"), "{msg}");
+        assert!(
+            msg.contains("  tok: username, if the server needs one"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("  far: SSH username, if the bastion needs one"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("  open:") && !msg.contains("  entra:"),
+            "{msg}"
+        );
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+    }
+
+    /// The three keychain entries under `name` as plain values: the server's, the
+    /// bastion's, the Sentinels'.
+    fn entries(store: &MemoryStore, name: &str) -> [Option<(Option<String>, String)>; 3] {
+        ["profile:", "ssh:profile:", "sentinel:profile:"].map(|prefix| {
+            store
+                .get(&SecretRef {
+                    service: crate::model::SECRET_SERVICE.to_string(),
+                    account: format!("{prefix}{name}"),
+                })
+                .unwrap()
+                .map(|c| (c.username, c.password.expose_secret().to_string()))
+        })
+    }
+
+    fn put_entries(store: &MemoryStore, name: &str) {
+        for (prefix, pw) in [
+            ("profile:", "prod-pw"),
+            ("ssh:profile:", "ssh-pw"),
+            ("sentinel:profile:", "sentinel-pw"),
+        ] {
+            store
+                .set(
+                    &SecretRef {
+                        service: crate::model::SECRET_SERVICE.to_string(),
+                        account: format!("{prefix}{name}"),
+                    },
+                    &Credentials {
+                        username: Some("someone".into()),
+                        password: SecretString::from(pw),
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    /// A file can't point a saved name at another host and be sent its password:
+    /// `--force` deletes what the keychain holds under that name, and says so.
+    #[test]
+    fn import_force_removes_credentials_stored_for_another_place() {
+        let dst = temp_path("imp-repoint");
+        let file = dst.parent().unwrap().join("in.toml");
+        let store = MemoryStore::default();
+        write_file(&file, &profile_text("prod", "auth = \"keychain\""));
+        import(&dst, &store, &file, false, true, &no_confirm).unwrap();
+        put_entries(&store, "prod");
+        put_entries(&store, "other");
+
+        let moved = profile_text("prod", "auth = \"keychain\"").replace("\"h\"", "\"evil\"");
+        write_file(&file, &moved);
+        let msg = import(&dst, &store, &file, true, true, &no_confirm).unwrap();
+        assert_eq!(entries(&store, "prod"), [None, None, None]);
+        assert!(
+            msg.contains("Credentials stored in the OS keychain under prod were removed"),
+            "{msg}"
+        );
+        for secret in ["prod-pw", "ssh-pw", "sentinel-pw", "someone"] {
+            assert!(!msg.contains(secret), "{msg}");
+        }
+        // Another profile's entries are not touched.
+        assert!(entries(&store, "other").iter().all(Option::is_some));
+        assert_eq!(
+            Config::load(&dst)
+                .unwrap()
+                .get("prod")
+                .unwrap()
+                .endpoint
+                .host,
+            "evil"
+        );
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+    }
+
+    /// Each thing that decides where the credentials go counts as another place.
+    #[test]
+    fn import_force_counts_tls_auth_bastion_and_sentinel_as_another_place() {
+        let base = profile_text("p", "auth = \"keychain\"");
+        let changed = [
+            base.replace("port = 6379", "port = 6380"),
+            base.replace("tls = false", "tls = true"),
+            base.replace(
+                "auth = \"keychain\"",
+                "auth = \"command\"\ntoken_command = [\"az\"]",
+            ),
+            format!(
+                "{}[profile.ssh]\nhost = \"jump\"\n",
+                base.trim_end_matches('\n').to_owned() + "\n"
+            ),
+            format!(
+                "{}[profile.sentinel]\nmaster = \"m\"\nnodes = [\"s1:26379\"]\n",
+                base.trim_end_matches('\n').to_owned() + "\n"
+            ),
+        ];
+        for (i, text) in changed.iter().enumerate() {
+            let dst = temp_path(&format!("imp-place-{i}"));
+            let file = dst.parent().unwrap().join("in.toml");
+            let store = MemoryStore::default();
+            write_file(&file, &base);
+            import(&dst, &store, &file, false, true, &no_confirm).unwrap();
+            put_entries(&store, "p");
+            write_file(&file, text);
+            import(&dst, &store, &file, true, true, &no_confirm).unwrap();
+            assert_eq!(entries(&store, "p"), [None, None, None], "case {i}: {text}");
+            let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+        }
+    }
+
+    /// Replacing a profile with one that goes to the same place (new tags, another env)
+    /// keeps its credentials and says nothing about them.
+    #[test]
+    fn import_force_to_the_same_place_keeps_the_credentials() {
+        let dst = temp_path("imp-same");
+        let file = dst.parent().unwrap().join("in.toml");
+        let store = MemoryStore::default();
+        write_file(&file, &profile_text("p", "auth = \"keychain\""));
+        import(&dst, &store, &file, false, true, &no_confirm).unwrap();
+        put_entries(&store, "p");
+        let before = entries(&store, "p");
+
+        write_file(
+            &file,
+            &profile_text("p", "auth = \"keychain\"\ntags = [\"eu\"]\ndb = 2"),
+        );
+        let msg = import(&dst, &store, &file, true, true, &no_confirm).unwrap();
+        assert_eq!(entries(&store, "p"), before);
+        assert!(!msg.contains("were removed"), "{msg}");
+        assert_eq!(Config::load(&dst).unwrap().get("p").unwrap().tags, ["eu"]);
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+    }
+
+    /// A name that is new to the config file can still have entries left in the
+    /// keychain (a profile deleted by hand): they go too.
+    #[test]
+    fn import_removes_entries_left_under_a_new_name() {
+        let dst = temp_path("imp-leftover");
+        let file = dst.parent().unwrap().join("in.toml");
+        let store = MemoryStore::default();
+        put_entries(&store, "ghost");
+        write_file(&file, &profile_text("ghost", "auth = \"keychain\""));
+        let msg = import(&dst, &store, &file, false, true, &no_confirm).unwrap();
+        assert_eq!(entries(&store, "ghost"), [None, None, None]);
+        assert!(msg.contains("under ghost were removed"), "{msg}");
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+    }
+
+    /// All or nothing covers the keychain: a refused import and a failed save leave
+    /// every entry as it was.
+    #[test]
+    fn a_refused_or_failed_import_leaves_the_keychain_as_it_was() {
+        let dst = temp_path("imp-rollback");
+        let file = dst.parent().unwrap().join("in.toml");
+        let store = MemoryStore::default();
+        write_file(&file, &profile_text("p", "auth = \"keychain\""));
+        import(&dst, &store, &file, false, true, &no_confirm).unwrap();
+        put_entries(&store, "p");
+        let before = entries(&store, "p");
+        let moved = profile_text("p", "auth = \"keychain\"").replace("\"h\"", "\"evil\"");
+
+        // Refused: the name exists and --force was not given.
+        write_file(&file, &moved);
+        assert!(import(&dst, &store, &file, false, true, &no_confirm).is_err());
+        assert_eq!(entries(&store, "p"), before);
+
+        // The save fails: the entries are put back and the profile is unchanged.
+        make_unsaveable(&dst);
+        assert!(import(&dst, &store, &file, true, true, &no_confirm).is_err());
+        assert_eq!(entries(&store, "p"), before);
+        assert_eq!(
+            Config::load(&dst).unwrap().get("p").unwrap().endpoint.host,
+            "h"
+        );
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+    }
+
+    #[test]
+    fn import_checks_a_sentinel_table_and_lists_its_credentials() {
+        let dst = temp_path("imp-sentinel");
+        let file = dst.parent().unwrap().join("in.toml");
+        let store = MemoryStore::default();
+        let with = |table: &str| {
+            format!(
+                "{}[profile.sentinel]\n{table}\n",
+                profile_text("s", "tags = [\"eu\"]")
+                    .trim_end_matches('\n')
+                    .to_owned()
+                    + "\n"
+            )
+        };
+        for bad in [
+            "master = \"m\"\nnodes = []",
+            "master = \"\"\nnodes = [\"s1\"]",
+            "master = \"two words\"\nnodes = [\"s1\"]",
+        ] {
+            write_file(&file, &with(bad));
+            let e = import(&dst, &store, &file, false, true, &no_confirm).unwrap_err();
+            assert!(e.to_string().contains("s: the Sentinel table needs"), "{e}");
+            assert!(Config::load(&dst).unwrap().profiles.is_empty());
+        }
+        write_file(
+            &file,
+            &with("master = \"m\"\nnodes = [\"s1\", \"s2:26380\"]\ntls = true"),
+        );
+        let msg = import(&dst, &store, &file, false, true, &no_confirm).unwrap();
+        assert!(
+            msg.contains("  s: Sentinel password, if the Sentinels need one"),
+            "{msg}"
+        );
+        // Tags and a Sentinel table together survive an export and an import.
+        let exported = dst.parent().unwrap().join("out.toml");
+        export(&dst, Some(&exported), false, &mut Vec::new()).unwrap();
+        let dst2 = temp_path("imp-sentinel-2");
+        import(&dst2, &store, &exported, false, true, &no_confirm).unwrap();
+        let got = Config::load(&dst2).unwrap();
+        assert_eq!(got.profiles, Config::load(&dst).unwrap().profiles);
+        let p = got.get("s").unwrap();
+        assert_eq!(p.tags, ["eu"]);
+        assert_eq!(p.sentinel.as_ref().unwrap().nodes.len(), 2);
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+        let _ = std::fs::remove_dir_all(dst2.parent().unwrap());
+    }
+
+    #[test]
+    fn clap_conn_export_and_import() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| crate::cli::Cli::try_parse_from(argv);
+        assert!(parse(&["redis-lens", "conn", "export"]).is_ok());
+        assert!(parse(&["redis-lens", "conn", "export", "f.toml", "--force"]).is_ok());
+        assert!(parse(&["redis-lens", "conn", "export", "--force"]).is_err());
+        assert!(parse(&["redis-lens", "conn", "import"]).is_err());
+        assert!(parse(&["redis-lens", "conn", "import", "f", "--force", "--yes"]).is_ok());
     }
 
     #[tokio::test]

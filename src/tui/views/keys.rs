@@ -4,7 +4,7 @@
 //!
 //! The list loads [`PAGE_KEYS`](crate::live::keys::PAGE_KEYS) keys of the pattern when
 //! it opens and as many more with each `n`. Only keys that infer to the pattern are
-//! listed. `/` filters the loaded keys by name, `o` sorts them, `y` copies the selected
+//! listed. `/` filters the loaded keys by name, `t` by type, `o` sorts them, `y` copies the selected
 //! key name, `esc` clears the filter and then goes back to Patterns. `enter` on a key is
 //! left to `App`, which opens the selected key's detail ([`super::value`]). See
 //! [`super`] for the interface `App` calls.
@@ -112,6 +112,66 @@ impl KeySort {
     }
 }
 
+/// The type `t` shows: all, or one of the types, with JSON and the unknown ones as
+/// `other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TypeFilter {
+    #[default]
+    All,
+    String,
+    Hash,
+    List,
+    Set,
+    ZSet,
+    Stream,
+    Other,
+}
+
+impl TypeFilter {
+    const ORDER: [TypeFilter; 8] = [
+        Self::All,
+        Self::String,
+        Self::Hash,
+        Self::List,
+        Self::Set,
+        Self::ZSet,
+        Self::Stream,
+        Self::Other,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::String => "string",
+            Self::Hash => "hash",
+            Self::List => "list",
+            Self::Set => "set",
+            Self::ZSet => "zset",
+            Self::Stream => "stream",
+            Self::Other => "other",
+        }
+    }
+
+    /// The next one in the cycle, `other` going back to `all`.
+    pub fn next(self) -> Self {
+        let at = Self::ORDER.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ORDER[(at + 1) % Self::ORDER.len()]
+    }
+
+    pub fn matches(self, t: KeyType) -> bool {
+        match self {
+            Self::All => true,
+            Self::String => t == KeyType::String,
+            Self::Hash => t == KeyType::Hash,
+            Self::List => t == KeyType::List,
+            Self::Set => t == KeyType::Set,
+            Self::ZSet => t == KeyType::ZSet,
+            Self::Stream => t == KeyType::Stream,
+            Self::Other => matches!(t, KeyType::Json | KeyType::Other),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct KeysState {
     /// The pattern whose keys are listed, as `PatternStats::pattern`.
@@ -145,6 +205,8 @@ pub struct KeysState {
     /// The policy is LFU, so the LFU column shows, even when `OBJECT FREQ` is refused.
     pub lfu: bool,
     pub filter: String,
+    /// `t`: only keys of this type, together with the name filter.
+    pub type_filter: TypeFilter,
     /// The filter input is open.
     pub filtering: bool,
     pub sort: KeySort,
@@ -179,7 +241,10 @@ impl KeysState {
     pub fn visible(&self) -> Vec<usize> {
         let f = self.filter.to_lowercase();
         let mut idx: Vec<usize> = (0..self.rows.len())
-            .filter(|&i| f.is_empty() || self.rows[i].key.to_lowercase().contains(&f))
+            .filter(|&i| {
+                self.type_filter.matches(self.rows[i].key_type)
+                    && (f.is_empty() || self.rows[i].key.to_lowercase().contains(&f))
+            })
             .collect();
         let sort = self.sort.effective(self.sizes, self.freq);
         idx.sort_by(|&a, &b| sort.cmp(&self.rows[a], &self.rows[b]));
@@ -511,9 +576,10 @@ impl ViewState for KeysState {
             return true;
         }
         match (key.code, plain(&key)) {
-            (KeyCode::Esc, _) if !self.filter.is_empty() => {
+            (KeyCode::Esc, _) if !self.filter.is_empty() || self.type_filter != TypeFilter::All => {
                 let keep = self.selected().map(|r| r.key.clone());
                 self.filter.clear();
+                self.type_filter = TypeFilter::All;
                 self.reselect(keep, tick);
                 true
             }
@@ -529,6 +595,13 @@ impl ViewState for KeysState {
                     .next(self.sizes, self.freq);
                 self.reselect(keep, tick);
                 act.info(format!("Keys sorted by {}.", self.sort.label()));
+                true
+            }
+            (_, Some('t')) => {
+                let keep = self.selected().map(|r| r.key.clone());
+                self.type_filter = self.type_filter.next();
+                self.reselect(keep, tick);
+                act.info(format!("Showing {} keys.", self.type_filter.label()));
                 true
             }
             (_, Some('n')) => {
@@ -752,6 +825,111 @@ mod tests {
         let mut app = loaded();
         app.handle_key(key(KeyCode::Down));
         insta::assert_snapshot!(testing::render(&app, 120, 36).backend());
+    }
+
+    /// The carts with a few keys of other types mixed in.
+    fn mixed() -> App {
+        let (mut app, effects) = open("user:{id}:cart");
+        let (id, _) = page_request(&effects);
+        let mut rows = carts();
+        for (i, t) in [
+            KeyType::String,
+            KeyType::String,
+            KeyType::Json,
+            KeyType::Other,
+            KeyType::Stream,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut r = row(&format!("user:9{i}:cart"), None, 10, "raw", 1, 0);
+            r.key_type = t;
+            rows.push(r);
+        }
+        testing::reply(&mut app, id, page(rows, 4_242));
+        app
+    }
+
+    fn type_of(app: &App) -> Vec<KeyType> {
+        let k = &app.views.keys;
+        k.visible().iter().map(|&i| k.rows[i].key_type).collect()
+    }
+
+    #[test]
+    fn t_cycles_the_types_and_sends_nothing() {
+        let mut app = mixed();
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            let effects = app.handle_key(ch('t'));
+            assert!(testing::requests(&effects).is_empty());
+            seen.push(app.views.keys.type_filter.label());
+        }
+        assert_eq!(
+            seen,
+            [
+                "string", "hash", "list", "set", "zset", "stream", "other", "all"
+            ]
+        );
+        assert_eq!(app.views.keys.visible().len(), 14);
+    }
+
+    #[test]
+    fn the_type_filter_combines_with_the_name_filter() {
+        let mut app = mixed();
+        app.handle_key(ch('t'));
+        assert_eq!(type_of(&app), [KeyType::String; 2]);
+        app.handle_key(ch('t'));
+        assert_eq!(app.views.keys.visible().len(), 9);
+        // other takes JSON and unknown types.
+        for _ in 0..5 {
+            app.handle_key(ch('t'));
+        }
+        assert_eq!(app.views.keys.type_filter, TypeFilter::Other);
+        let mut other = type_of(&app);
+        other.sort_by_key(|t| t.as_str());
+        assert_eq!(other, [KeyType::Json, KeyType::Other]);
+        // Back to strings, then a name filter on top.
+        for _ in 0..2 {
+            app.handle_key(ch('t'));
+        }
+        assert_eq!(app.views.keys.type_filter, TypeFilter::String);
+        app.handle_key(ch('/'));
+        app.handle_key(ch('1'));
+        app.handle_key(key(KeyCode::Enter));
+        let k = &app.views.keys;
+        assert_eq!(k.visible().len(), 1);
+        assert_eq!(k.selected().map(|r| r.key.as_str()), Some("user:91:cart"));
+    }
+
+    #[test]
+    fn t_is_text_in_the_filter_input_and_esc_clears_both_filters() {
+        let mut app = mixed();
+        app.handle_key(ch('/'));
+        app.handle_key(ch('t'));
+        assert_eq!(app.views.keys.type_filter, TypeFilter::All);
+        assert_eq!(app.views.keys.filter, "t");
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(ch('t'));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::KeyList);
+        assert_eq!(app.views.keys.type_filter, TypeFilter::All);
+        assert_eq!(app.views.keys.visible().len(), 14);
+        app.handle_key(key(KeyCode::Esc));
+        assert_ne!(app.screen(), Screen::KeyList);
+    }
+
+    #[test]
+    fn key_list_with_a_type_filter_80x24() {
+        let mut app = mixed();
+        app.handle_key(ch('t'));
+        insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
+    }
+
+    #[test]
+    fn key_list_with_a_type_and_nothing_of_it_80x24() {
+        let mut app = loaded();
+        app.handle_key(ch('t'));
+        insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
     }
 
     #[test]

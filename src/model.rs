@@ -547,6 +547,17 @@ pub struct Profile {
     /// address given to `conn add`, shown until the first connect, and is never dialled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sentinel: Option<Sentinel>,
+    /// Labels to group and find profiles by, see [`valid_tag`]. Never secret.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+/// A tag is 1 to 32 characters of letters, digits, `-`, `_`, `.` and `/`.
+pub fn valid_tag(tag: &str) -> bool {
+    (1..=32).contains(&tag.chars().count())
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
 }
 
 /// The Sentinels a profile asks for its primary (`[profile.sentinel]`). Nothing secret
@@ -833,6 +844,16 @@ mod tests {
     }
 
     #[test]
+    fn tag_validation() {
+        for ok in ["a", "team-a", "a_b.c/d", "X9", &"x".repeat(32)] {
+            assert!(valid_tag(ok), "{ok}");
+        }
+        for bad in ["", "a b", "a,b", "é", "a:b", "a\n", &"x".repeat(33)] {
+            assert!(!valid_tag(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn pttl_parsing() {
         assert_eq!(Ttl::from_pttl(-2), None);
         assert_eq!(Ttl::from_pttl(-1), Some(Ttl::Persistent));
@@ -878,6 +899,7 @@ mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            tags: Vec::new(),
         };
         assert!(p.is_read_only());
         p.env = Env::Local;
@@ -924,6 +946,7 @@ mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            tags: Vec::new(),
         };
         let text = toml::to_string(&p).unwrap();
         for word in ["password", "username", "user", "secret", "token"] {
@@ -1000,6 +1023,7 @@ mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            tags: Vec::new(),
         };
         let ssh = p.ssh_secret_ref();
         assert_eq!(ssh.service, SECRET_SERVICE);
@@ -1089,6 +1113,7 @@ mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            tags: Vec::new(),
         };
         assert!(!toml::to_string(&p).unwrap().contains("ssh"));
         p.ssh = Some(SshTunnel {

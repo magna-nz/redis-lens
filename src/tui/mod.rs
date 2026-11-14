@@ -140,6 +140,12 @@ async fn event_loop(
     loaded: Result<Config, crate::config::ConfigError>,
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
+    // The colours are set once, before the first frame: the theme from the file, and
+    // NO_COLOR from the environment, which wins.
+    let theme = loaded
+        .as_ref()
+        .map_or_else(|_| Default::default(), |c| c.settings.theme);
+    ui::style::init(theme, ui::style::no_color_requested());
     let mut app = match loaded {
         Ok(cfg) => {
             let mut app = App::new(cfg.profiles);
@@ -1389,6 +1395,7 @@ mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            tags: Vec::new(),
         }
     }
 

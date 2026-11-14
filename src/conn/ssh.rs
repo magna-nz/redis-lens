@@ -581,6 +581,7 @@ pub(super) mod tests {
             token_command: None,
             ssh: t,
             sentinel: None,
+            tags: Vec::new(),
         }
     }
 

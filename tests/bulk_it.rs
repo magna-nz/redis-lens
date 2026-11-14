@@ -57,6 +57,7 @@ fn profile(port: u16, env: Env, read_only: Option<bool>) -> Profile {
         token_command: None,
         ssh: None,
         sentinel: None,
+        tags: Vec::new(),
     }
 }
 

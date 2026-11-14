@@ -2338,6 +2338,7 @@ while (my $c = $l->accept) {
             token_command: Some(cmd.iter().map(|s| s.to_string()).collect()),
             ssh: None,
             sentinel: None,
+            tags: Vec::new(),
         }
     }
 
