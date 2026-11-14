@@ -377,11 +377,13 @@ pub enum Effect {
     /// Put the text on the clipboard with the terminal's OSC 52 sequence. Only a
     /// pattern, a key name or the suggested command can be built (see [`CopyText`]).
     Copy(CopyText),
-    /// Send `req` on the live connection of session `id` ([`crate::live`]). The answer
-    /// comes back as [`Msg::Live`].
+    /// Send `req` to `to` on the live connection of session `id` ([`crate::live`]): a
+    /// node of a cluster, or the owner of a key's slot; on a standalone server always
+    /// its one node. The answer comes back as [`Msg::Live`].
     Live {
         id: ConnId,
         req_id: crate::live::ReqId,
+        to: crate::live::Dest,
         req: crate::live::LiveRequest,
     },
     /// Start the Pub/Sub live tail `tail` of session `id`'s run `scan` on `to`, on a
@@ -389,7 +391,8 @@ pub enum Effect {
     /// from that run's command budget. It replaces the session's other tail, if any.
     /// Its messages come back as [`Msg::TailReady`], [`Msg::Tail`] and
     /// [`Msg::TailClosed`]. A new connect or rescan of the session, and quitting, end it
-    /// too.
+    /// too. `node`: the node of the session's table it runs on (0 on a standalone
+    /// server).
     Subscribe {
         id: ConnId,
         scan: ScanId,
@@ -397,6 +400,7 @@ pub enum Effect {
         profile: Profile,
         secrets: SecretSource,
         to: crate::live::pubsub::Subscription,
+        node: usize,
     },
     /// End session `id`'s live tail `tail` and drop its connection.
     Unsubscribe {
@@ -409,13 +413,14 @@ pub enum Effect {
     /// messages come back as [`Msg::MonitorReady`], [`Msg::MonitorLines`] and
     /// [`Msg::MonitorClosed`]. It ends by itself after `crate::live::monitor::Limits`;
     /// [`Effect::StopMonitor`], a new connect or rescan of the session, and quitting end
-    /// it too.
+    /// it too. `node`: the node it runs on, as for [`Effect::Subscribe`].
     Monitor {
         id: ConnId,
         scan: ScanId,
         run: u64,
         profile: Profile,
         secrets: SecretSource,
+        node: usize,
     },
     /// End session `id`'s Monitor run `run` and drop its connection.
     StopMonitor {
@@ -472,6 +477,14 @@ pub enum Msg {
         id: ConnId,
         scan: ScanId,
         answer: SentinelAnswer,
+    },
+    /// A cluster's nodes, as discovery found them, after [`Msg::Connected`] and before
+    /// [`Msg::LiveReady`]: the order of the live task's node table. Never sent for a
+    /// standalone server.
+    Nodes {
+        id: ConnId,
+        scan: ScanId,
+        nodes: Vec<crate::live::nodes::NodeInfo>,
     },
     ConnectFailed {
         id: ConnId,
@@ -648,6 +661,12 @@ pub struct Session {
     pub refusals: crate::write::Refusals,
     /// For a Sentinel profile: which Sentinel named the primary of this run, and where.
     pub sentinel: Option<SentinelAnswer>,
+    /// A cluster's nodes ([`Msg::Nodes`]), in the live task's order; empty on a
+    /// standalone server. Kept across a rescan until the new run's list arrives.
+    pub nodes: Vec<crate::live::nodes::NodeInfo>,
+    /// The picked node: an index into `nodes` (spec "Cluster live views (P4)"). 0 on a
+    /// standalone server.
+    pub picked: usize,
 }
 
 impl Session {
@@ -657,6 +676,36 @@ impl Session {
         self.sentinel
             .as_ref()
             .map_or(&self.profile.endpoint, |a| &a.primary)
+    }
+
+    /// True on a cluster whose nodes are known.
+    pub fn is_cluster(&self) -> bool {
+        !self.nodes.is_empty()
+    }
+
+    /// The picked node, on a cluster.
+    pub fn picked_node(&self) -> Option<&crate::live::nodes::NodeInfo> {
+        self.nodes.get(self.picked)
+    }
+
+    /// `node 127.0.0.1:7001 · 1 of 3`, for the right of a title, on a cluster only.
+    pub fn node_title(&self) -> Option<String> {
+        let n = self.picked_node()?;
+        Some(format!(
+            "node {} · {} of {}",
+            n.endpoint,
+            self.picked + 1,
+            self.nodes.len()
+        ))
+    }
+
+    /// The index of the node that serves `key`'s slot, from the slot map discovery
+    /// read; `None` on a standalone server or when no node serves it.
+    pub fn owner_of(&self, key: &[u8]) -> Option<usize> {
+        let slot = crate::conn::slot::key_slot(key);
+        self.nodes
+            .iter()
+            .position(|n| n.slots.iter().any(|&(a, b)| a <= slot && slot <= b))
     }
 
     /// The diff against the previous snapshot, when there is one.
@@ -1502,6 +1551,7 @@ impl App {
             TailCmd::StopMonitor { run } => Some(Effect::StopMonitor { id, run }),
             TailCmd::Monitor { run } => {
                 let profile = s.profile.clone();
+                let node = s.picked;
                 let Some(secrets) = self.entry(id).map(secret_source) else {
                     self.views.server.end_monitor(views::server::Stop::Unlisted);
                     return None;
@@ -1512,9 +1562,11 @@ impl App {
                     run,
                     profile,
                     secrets,
+                    node,
                 })
             }
             TailCmd::Subscribe { tail, to } => {
+                let node = s.picked;
                 let profile = s.profile.clone();
                 let Some(secrets) = self.entry(id).map(secret_source) else {
                     self.views
@@ -1529,6 +1581,7 @@ impl App {
                     profile,
                     secrets,
                     to,
+                    node,
                 })
             }
         }
@@ -1685,6 +1738,7 @@ impl App {
                 self.help = true;
                 return Vec::new();
             }
+            Some(c @ ('[' | ']')) if views::picks_node(screen) => return self.pick_node(c == ']'),
             Some('s') if screen.is_scan_view() => return self.save_snapshot(),
             Some('r') if screen.is_scan_view() => return self.rescan(),
             Some('r') if screen.is_live_view() => return self.refresh(),
@@ -1727,6 +1781,59 @@ impl App {
                 effects
             }
         }
+    }
+
+    /// `[` and `]` on the views that read the picked node: the previous or next node of
+    /// the cluster (spec "Cluster live views (P4)"). Nothing on a standalone server.
+    fn pick_node(&mut self, next: bool) -> Vec<Effect> {
+        let Some(s) = self.session.as_mut() else {
+            return Vec::new();
+        };
+        let n = s.nodes.len();
+        if n < 2 {
+            return Vec::new();
+        }
+        s.picked = if next {
+            (s.picked + 1) % n
+        } else {
+            (s.picked + n - 1) % n
+        };
+        self.node_changed()
+    }
+
+    /// The picked node changed: the Server panels and Search drop what they read from
+    /// the last one, and the view on screen reads the new one.
+    fn node_changed(&mut self) -> Vec<Effect> {
+        let mut out = self.on_active("hide", |v, act| v.on_hide(act));
+        self.views.server.node_changed();
+        self.views.search = Default::default();
+        out.extend(self.on_active("show", |v, act| v.on_show(act)));
+        out
+    }
+
+    /// [`Msg::Nodes`]: the cluster's nodes. The picked node stays when the list still
+    /// has it (same ID and address, after a rescan), otherwise it is the first primary.
+    fn set_nodes(&mut self, nodes: Vec<crate::live::nodes::NodeInfo>) -> Vec<Effect> {
+        let Some(s) = self.session.as_mut() else {
+            return Vec::new();
+        };
+        let old = s.picked_node().cloned();
+        let kept = old.as_ref().and_then(|o| {
+            nodes
+                .iter()
+                .position(|n| n.id == o.id && n.endpoint == o.endpoint)
+        });
+        s.picked = kept.unwrap_or_else(|| {
+            nodes
+                .iter()
+                .position(|n| n.role == crate::model::NodeRole::Primary)
+                .unwrap_or(0)
+        });
+        s.nodes = nodes;
+        if old.is_some() && kept.is_none() {
+            return self.node_changed();
+        }
+        Vec::new()
     }
 
     /// `r` on Server, Streams, Pub/Sub and Search: the panel on screen fetches now.
@@ -2178,6 +2285,8 @@ impl App {
             live: LiveState::Waiting,
             refusals: crate::write::Refusals::default(),
             sentinel: None,
+            nodes: Vec::new(),
+            picked: 0,
         });
         self.patterns = PatternsState::default();
         self.sel = ViewSel::default();
@@ -2482,6 +2591,12 @@ impl App {
                     }
                     return out;
                 }
+            }
+            Msg::Nodes { id, scan, nodes } => {
+                if !self.is_session(id, scan) {
+                    return Vec::new();
+                }
+                return self.set_nodes(nodes);
             }
             Msg::ConnectFailed { id, scan, error } => {
                 if !self.is_session(id, scan) {
@@ -6193,7 +6308,9 @@ mod tests {
                 &app.patterns,
                 app.sel,
                 &app.docker,
-                app.session.as_ref().map(|s| (s.scan, s.phase.clone())),
+                app.session
+                    .as_ref()
+                    .map(|s| (s.scan, s.phase.clone(), s.picked)),
                 &app.views,
                 &app.confirm,
             )
@@ -6276,6 +6393,15 @@ mod tests {
             for token in tokens(screen) {
                 for k in events_of(token) {
                     let mut app = busy_app(screen);
+                    if matches!(token, "[" | "]") {
+                        // They pick a node of a cluster and do nothing on a standalone
+                        // server (spec "Cluster live views (P4)"): give it nodes.
+                        app.apply(Msg::Nodes {
+                            id: app.session.as_ref().unwrap().id,
+                            scan: scan_of(&app),
+                            nodes: fixtures::live_nodes(),
+                        });
+                    }
                     if screen == Screen::Patterns && token == "esc" {
                         // Esc clears a filter: set one first.
                         app.handle_key(ch('/'));

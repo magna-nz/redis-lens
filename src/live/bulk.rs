@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use redis::Value;
 use redis::aio::ConnectionLike;
 
-use super::{Conn, LiveError, error_for};
+use super::{LiveConn, LiveError, error_for};
 use crate::analysis::{key_in_pattern, match_glob};
 use crate::budget::Budget;
 use crate::model::{ServerFlavor, ServerInfo, ServerMode};
@@ -168,7 +168,11 @@ impl Batch {
 }
 
 /// Runs one step. Every command goes through `budget`.
-pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply, LiveError> {
+pub async fn run(
+    conn: &mut impl LiveConn,
+    budget: &Budget,
+    req: Request,
+) -> Result<Reply, LiveError> {
     match req {
         Request::Count {
             pattern,

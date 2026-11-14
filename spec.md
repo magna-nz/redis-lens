@@ -260,6 +260,7 @@ A panel of 2 Analysis, after Expiry.
 | `p` | Pause or resume polling |
 | `+` `-` | Poll more or less often, 1 to 60 s |
 | `r` | Refresh this panel now |
+| `[` `]` | Pick the previous or next node (cluster only) |
 
 #### Server · Clients
 
@@ -274,6 +275,7 @@ A panel of 2 Analysis, after Expiry.
 | `p` | Pause or resume polling |
 | `r` | Refresh this panel now |
 | `K` | Kill the selected connection |
+| `[` `]` | Pick the previous or next node (cluster only) |
 
 #### Server · Slow log
 
@@ -287,6 +289,7 @@ A panel of 2 Analysis, after Expiry.
 | `r` | Refresh this panel now |
 | `c` | Change the slow log threshold or length |
 | `R` | Reset the slow log |
+| `[` `]` | Pick the previous or next node (cluster only) |
 
 #### Server · Monitor
 
@@ -298,6 +301,7 @@ A panel of 2 Analysis, after Expiry.
 | `tab` `shift-tab` | Next or previous panel |
 | `enter` | Start MONITOR after asking; it stops after 30 s or 10,000 lines |
 | `esc` | Stop MONITOR now |
+| `[` `]` | Pick the previous or next node (cluster only) |
 
 #### Streams
 
@@ -334,6 +338,7 @@ A panel of 2 Analysis, after Expiry.
 | `p` | Pause or resume polling |
 | `r` | Refresh this panel now |
 | `P` | Publish a message |
+| `[` `]` | Pick the previous or next node (cluster only) |
 
 #### Search
 
@@ -353,6 +358,7 @@ A panel of 2 Analysis, after Expiry.
 | `r` | Refresh this panel now |
 | `C` | Create an index |
 | `D` | Drop the selected index (its documents stay) |
+| `[` `]` | Pick the previous or next node (cluster only) |
 
 #### Command line panel · keys
 
@@ -659,7 +665,7 @@ Phase 1 is built: [Navigation](#navigation), the [Shared command budget](#shared
   - 5 Pub/Sub
   - 6 Search
 - **Panels and drill-down:** `tab` and `shift-tab` move between a view's panels. `enter` goes one level deeper, `esc` one level back. The tab bar marks the current view and shows the panel names on a second row. Below 100 columns, the tab bar shows only the digits of views other than the current one. When the panel names don't fit spaced out, they sit closer together; when even that is too wide, the second row shows only the current panel and its place, such as `Nodes · 6 of 6`.
-- **Clusters:** until P4 lands, the views that read one server over the live connection (the key list and the key detail, 3 Server, 4 Streams, 5 Pub/Sub and 6 Search) are off on a cluster and say "Not available on a cluster yet: this view reads one server, and a cluster spreads its keys, clients and channels over its nodes." A cluster connect opens no live connection and runs no view probes. Patterns and every Analysis panel work on the merged results; Big keys and Expiry cover every node's samples, and each big key carries its node. **P4:** they work node by node, see [Cluster live views](#cluster-live-views-p4).
+- **Clusters:** a cluster connect keeps a live connection to each shard's node and runs the view probes on every node ([Cluster live views](#cluster-live-views-p4)). 3 Server (Overview, Clients, Slow log, Monitor) and 6 Search work on the picked node, and the Overview adds the per-shard summary. Until the rest of P4 lands, the key list and the key detail, 4 Streams, 5 Pub/Sub, the bulk actions and the command line are still off on a cluster and say "Not available on a cluster yet: this view reads one server, and a cluster spreads its keys, clients and channels over its nodes."; Big keys does not read lengths and encodings there. Patterns and every Analysis panel work on the merged results; Big keys and Expiry cover every node's samples, and each big key carries its node.
 - **Command line (P2):** `:` opens it from any view except the add flow, a filter or query input and an open dialog (the `?` overlay), where it is text. It is off before the live connection is ready and on a cluster, and says why. See [Command line panel](#command-line-panel).
 - **Header:** the header shows the profile's write state:
   - `read-only` (amber) on a read-only profile;
@@ -886,7 +892,7 @@ A write is sent only when all three checks allow it.
   - and every command with the `@dangerous` ACL category, read from `COMMAND INFO`.
 - **Each prompt** names the profile and shows the exact command it will send, as one line with credentials masked and control characters escaped. It says when a write can't be undone. `y` sends, `n` or `esc` cancels; a typed name is sent with `enter`, and a name that doesn't match sends nothing. Values in a prompt stay on screen only, like every value.
 - **One gate:** every write goes through one write gate, which applies checks 2 and 3. Tests check that no write command reaches a read-only profile. In the code, a write is sent only with a `Permit`, which only the gate gives (`src/write.rs`), in the TUI and from the command line (`redis-lens expire`). Writes run one at a time over the session's connection, since `WATCH` holds for the whole connection.
-- **Clusters:** the live views are off on a cluster, so their writes are too. Bulk actions and `redis-lens expire` refuse on a cluster with the reason. **P4:** every write on a cluster goes through the same gate and is sent to its key's slot owner (or the picked node), never to a shard read on a replica; see [Cluster live views](#cluster-live-views-p4). The tests that no write reaches a read-only profile cover every node.
+- **Clusters:** the views still off on a cluster have their writes off too. Bulk actions and `redis-lens expire` refuse on a cluster with the reason. The writes of the views that are on (`K`, the Slow log's `c` and `R`, and Search's index writes) go to the picked node. **P4:** every write on a cluster goes through the same gate and is sent to its key's slot owner (or the picked node), never to a shard read on a replica; see [Cluster live views](#cluster-live-views-p4). The tests that no write reaches a read-only profile cover every node.
 
 ### Bulk actions
 
@@ -924,7 +930,7 @@ Phase 4 closes the topology and connection gaps against Redis Insight: the live 
 
 On a cluster, the views that read one server work node by node. Nothing is merged on the server side: redis-lens keeps its own connection to each node, routes each command itself, and never uses redis-rs's cluster client.
 
-- **Connections kept.** A cluster connect keeps the connection discovery opened to each shard (the primary, or the verified replica with `prefer_replica`) for the live views, as a standalone connect keeps its scan connection. Each node keeps the command budget the scan gives it ([Cluster](#cluster), step 5), shared by the scan and that node's live requests: the budget applies **per node**, never one budget for the whole cluster. A node that failed discovery has no connection, and every view says so when a request would go to it. `Msg::Connected` carries the node list (ID, address as announced, role, slot ranges), so the views know the nodes before the scan finishes.
+- **Connections kept.** A cluster connect keeps the connection discovery opened to each shard (the primary, or the verified replica with `prefer_replica`) for the live views, as a standalone connect keeps its scan connection. Each node keeps the command budget the scan gives it ([Cluster](#cluster), step 5), shared by the scan and that node's live requests: the budget applies **per node**, never one budget for the whole cluster. A node that failed discovery has no connection, and every view says so when a request would go to it ("127.0.0.1:7002 is not connected (discovery could not use it), so nothing is sent to it"). A node whose connection drops answers every later request with "the connection to 127.0.0.1:7002 was lost; rescan to connect again" while the other nodes go on; the live connection only ends when every node is lost. `Msg::Nodes`, sent right after `Msg::Connected`, carries the node list (ID, address as announced, role, slot ranges), so the views know the nodes before the scan finishes.
 - **Probes per node.** The view probes and the `ACL DRYRUN` probes ([Permission check, additions](#permission-check-additions)) run on every connected node, each through that node's budget. A view or a write counts as allowed only when every node allows it; a refusal names no node and no user.
 - **Routing.**
   - A command with keys goes to the node that owns the key's slot, from the slot map discovery read. The slot is computed locally (CRC16 of the key, or of its `{hash tag}`, modulo 16384), never asked with `CLUSTER KEYSLOT`.
@@ -932,18 +938,18 @@ On a cluster, the views that read one server work node by node. Nothing is merge
   - A request whose keys hash to different slots is split by node where each part stands alone (key metadata on the key list and Big keys, stream infos); otherwise it is refused before anything is sent ("the keys are in different slots (CROSSSLOT), so it can't be sent as one command").
   - **Redirects:** a `MOVED` reply to a node redis-lens holds a connection to is followed once: the request is sent again on that node and the slot map remembers the move for the session. `ASK` is followed once with `ASKING` sent in the same pipeline as the command. A redirect to an address redis-lens has no connection to is not followed: no new node is ever connected to after discovery, so credentials only go where discovery already sent them. A second redirect, or one to an unknown address, fails with a fixed reason ("the cluster is moving that slot; try again, or rescan"). A write sent with `WATCH` and `MULTI`/`EXEC` is never followed on `ASK`, and on `MOVED` only when the `WATCH` itself was redirected (nothing was queued yet).
   - **Replicas:** on a shard scanned on its replica (`prefer_replica`), reads go to the replica (it is in `READONLY` mode). Writes, the bulk actions and the command line's writes are off for that shard, with the reason "this shard was read on a replica; connect without prefer_replica to write". No primary connection is opened for them.
-- **The picked node.** Server, Search, Monitor, classic Pub/Sub and the command line's keyless commands read one node at a time: the picked node, by default the first primary in slot order. `[` and `]` pick the previous and next node, from any of those views; the pick is one per session and lasts across views and a rescan whose node list still has that node (same ID and address), else it goes back to the first primary. Each of these views shows it at the right of its title: `node 127.0.0.1:7001 · 1 of 3`. On a standalone server `[` and `]` do nothing and the title is as before.
+- **The picked node.** Server, Search, Monitor, classic Pub/Sub and the command line's keyless commands read one node at a time: the picked node, by default the first primary in slot order. `[` and `]` pick the previous and next node, from any of those views; the pick is one per session and lasts across views and a rescan whose node list still has that node (same ID and address), else it goes back to the first primary. Each of these views shows it first at the right of its title, notices included: `node 127.0.0.1:7001 · 1 of 3`. A new pick restarts the shown view's polling on the new node, clears the Overview and Clients, empties the Slow log (its key specs kept) and resets 6 Search to its index list. With fewer than two nodes, and on a standalone server, `[` and `]` do nothing and the title is as before.
 - **Key list of a pattern.** `SCAN MATCH` on every primary in slot order, or only on the node 1 Patterns is narrowed to ([1 Patterns](#1-patterns)). The nodes are walked one at a time: a page of 1,000 keys reads the current node until its cursor returns to 0, then goes on to the next, so `n` never sends to more than one node at once. The title adds the nodes done (`2 of 3 nodes`). A NODE column after the key shows the node each key came from (cut with `…` to 15 cells), as on Hot keys; the key detail names it in full. The metadata pipeline runs on the same node as the `SCAN` that found the keys.
 - **Key detail and key edits.** Sent to the slot owner of the key, with the redirect rule above. Writes still go through the one gate in `src/write.rs`. `R` (rename, `RENAMENX`) needs both names in one slot; across slots it is refused before asking, with the CROSSSLOT reason. `N` (add a key) sends to the new name's slot owner.
 - **Big keys.** Length and encoding are read on each key's slot owner (they were left out on a cluster).
 - **3 Server.**
   - Overview, Clients, Slow log and Monitor read the picked node. The Overview's sparklines start again when the pick changes. `K` kills a connection on the picked node, and the Monitor run stays on the node it started on (its title names it) until it ends.
-  - **Per-shard summary (Overview):** below the figures, one row per primary in slot order: address, ops/s, used memory against `maxmemory`, clients, keys (`INFO keyspace` db0), and a ✗ for a node that did not answer. It is the one place a poll goes to every node: one `INFO` per primary, every 5 s or at the Overview's interval if that is longer, only while the Overview is on screen and polling is not paused, each from its own node's budget. It is never shown on a standalone server.
+  - **Per-shard summary (Overview):** below the figures, in a "Shards" panel, one row per shard in slot order for the node the session reads there (the primary, or the verified replica with `prefer_replica`), the picked one marked `›`: address, ops/s (`instantaneous_ops_per_sec`), used memory against `maxmemory` (with a percentage when set), clients, keys (`INFO keyspace` db0), and "✗ not connected" or "✗ no answer" for a node without a connection or one that did not answer. At 24 rows the figures above it are cut to fit. It is the one place a poll goes to every node: one `INFO` per shard node, every 5 s or at the Overview's interval if that is longer, only while the Overview is on screen and polling is not paused, each from its own node's budget. It is never shown on a standalone server.
 - **4 Streams.** The streams the scan found, each read on its slot owner (`XINFO`, `XPENDING`, the entries, ack, claim and trim). One poll sends one request per node that owns a listed stream, each from that node's budget, with the 50-stream cap over the whole list. A NODE column shows each stream's node.
 - **5 Pub/Sub.**
   - **Classic channels** are read from the picked node: on a cluster a message published on any node reaches every node's subscribers, but `PUBSUB CHANNELS` and `NUMSUB` count only that node's own subscribers, and the title says so (`subscribers on 127.0.0.1:7001`). The tail (`SUBSCRIBE`, `PSUBSCRIBE`) runs on the picked node.
   - **Shard channels** (Redis 7.0 and later, and Valkey; on a standalone server too): a second list under the classic one, from `PUBSUB SHARDCHANNELS` (the first 1,000) and `PUBSUB SHARDNUMSUB` in batches of 100. On a cluster they are read from every primary on each counts poll (every 5 s, only while Pub/Sub is on screen), each from its own node's budget, and each row shows its node. `S` subscribes to the selected shard channel, or asks for one, with `SSUBSCRIBE` on its slot owner; a pattern can't be shard-subscribed, and the prompt says so. `P` on a shard channel publishes with `SPUBLISH` to its slot owner, through the write gate like `PUBLISH`, and says how many subscribers of that node got it. On Redis 6.2 the shard list is left out with a reason.
-- **6 Search** reads the picked node: an index on a cluster without the Search coordinator only covers that node's keys, and the title says `on 127.0.0.1:7001`.
+- **6 Search** reads the picked node: an index on a cluster without the Search coordinator only covers that node's keys, and the title names it as above (`node 127.0.0.1:7001 · 1 of 3`).
 - **Bulk actions and `redis-lens expire`.** Per primary, in slot order, one node at a time: the dry run counts on every primary (and says how many keys each holds), the run walks each primary's own `SCAN MATCH` with that node's budget. Off on a cluster read on replicas (`prefer_replica`), with the reason, as on a standalone replica target. Redirects are not followed in a bulk run: a key that moved during the run is left alone and counted ("12 keys moved to another node during the run and were left alone"). On a cluster each line of the key file is the node's address as announced, a tab, then the key name escaped as before (a tab in a name is already `\t`, so the line splits at the first tab). `redis-lens expire` on a cluster discovers the shards and runs on the primaries, never on replicas.
 - **Command line.**
   - A command's keys are found from the key specs in its `COMMAND INFO` reply (before Redis 7.0, its first/last/step key positions), the same as the Slow log. A command with keys goes to its slot's owner; keyless commands go to the picked node. The reply is headed by the node it ran on (`127.0.0.1:7002>`).

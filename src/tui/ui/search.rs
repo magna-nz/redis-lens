@@ -58,6 +58,16 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) {
     }
 }
 
+/// The right of a Search title: on a cluster the picked node first, since an index
+/// only covers that node's keys (spec "Cluster live views (P4)").
+fn on_node(ctx: &Ctx<'_>, right: &str) -> String {
+    match ctx.node_title() {
+        Some(n) if right.is_empty() => n,
+        Some(n) => format!("{n} · {right}"),
+        None => right.to_string(),
+    }
+}
+
 fn draw_view(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) {
     const TITLE: &str = "Search";
     if let Some(off) = &state.off {
@@ -65,7 +75,7 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) 
             format!(" ▲ {off}"),
             style::amber(),
         ))];
-        notice_panels(frame, area, TITLE, "off", lines);
+        notice_panels(frame, area, TITLE, &on_node(ctx, "off"), lines);
         return;
     }
     if state.no_module {
@@ -83,7 +93,7 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) 
                 style::dim(),
             )),
         ];
-        notice_panels(frame, area, TITLE, "module missing", lines);
+        notice_panels(frame, area, TITLE, &on_node(ctx, "module missing"), lines);
         return;
     }
     if !state.loaded
@@ -93,13 +103,13 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) 
             Line::from(Span::styled(format!(" ▲ {}.", sentence(e)), style::amber())),
             Line::from(Span::styled(" Press r to read again.", style::dim())),
         ];
-        notice_panels(frame, area, TITLE, "failed", lines);
+        notice_panels(frame, area, TITLE, &on_node(ctx, "failed"), lines);
         return;
     }
     if !state.loaded {
         let text = live_wait(ctx).unwrap_or_else(|| "Reading the indexes with FT._LIST…".into());
         let lines = vec![Line::from(Span::styled(format!(" {text}"), style::dim()))];
-        notice_panels(frame, area, TITLE, "", lines);
+        notice_panels(frame, area, TITLE, &on_node(ctx, ""), lines);
         return;
     }
     let name = module(ctx);
@@ -111,7 +121,7 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) 
                 style::dim(),
             )),
         ];
-        notice_panels(frame, area, TITLE, name, lines);
+        notice_panels(frame, area, TITLE, &on_node(ctx, name), lines);
         return;
     }
 
@@ -131,7 +141,11 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) 
         String::new()
     };
     let live = if ctx.live_ready() { "" } else { "not live · " };
-    let inner = panel(frame, main, TITLE, &format!("{live}{name}{cut}"));
+    // On a cluster an index covers the picked node's keys: name it first.
+    let node = ctx
+        .node_title()
+        .map_or_else(String::new, |n| format!("{n} · "));
+    let inner = panel(frame, main, TITLE, &format!("{node}{live}{name}{cut}"));
     let w = usize::from(inner.width);
 
     let any = |f: fn(&IndexInfo) -> bool| list.indexes.iter().any(f);

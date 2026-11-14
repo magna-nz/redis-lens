@@ -247,9 +247,9 @@ fn recommendations_panel(
         )));
     }
     let cluster = ctx.server().is_some_and(|s| s.mode == ServerMode::Cluster);
-    if !ctx.live_ready() && state.facts.is_empty() && !state.is_loading() {
+    if (cluster || !ctx.live_ready()) && state.facts.is_empty() && !state.is_loading() {
         let why = if cluster {
-            // A cluster opens no live connection (see `views::CLUSTER_OFF`).
+            // Not read on a cluster yet: each key would go to its slot owner.
             " Lengths and encodings are not read on a cluster yet, so the rules that need them are skipped."
         } else {
             " Lengths and encodings are read once the live connection is open."

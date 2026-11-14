@@ -23,6 +23,7 @@ pub mod docker;
 pub mod parse;
 pub mod provider;
 pub mod sentinel;
+pub mod slot;
 pub mod ssh;
 mod tls;
 pub mod token;
@@ -93,18 +94,30 @@ async fn open_server(
     }
 }
 
+/// A cluster node that a connection of its own (Monitor, the Pub/Sub tail) goes to:
+/// one discovery connected to, at its announced address, and whether discovery's
+/// connection to it sent the profile's credentials
+/// ([`cluster::NodeTarget::credentials`]). Without them, the new connection sends none
+/// either, as discovery decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeAddr {
+    pub endpoint: Endpoint,
+    pub credentials: bool,
+}
+
 /// Open the Pub/Sub live tail's own connection to the profile's endpoint (never a
-/// replica): like [`connect`], through the same route and credentials (SSH, TLS, token
-/// command and Entra ID included), but speaking RESP3, so `SUBSCRIBE` and `PSUBSCRIBE`
-/// work on a multiplexed connection. What the server pushes (messages, subscribe
-/// confirmations, and a `Disconnection` when the connection is lost) arrives on the
-/// returned receiver.
+/// replica), or to cluster node `node`: like [`connect`], through the same route and
+/// credentials (SSH, TLS, token command and Entra ID included), but speaking RESP3, so
+/// `SUBSCRIBE` and `PSUBSCRIBE` work on a multiplexed connection. What the server pushes
+/// (messages, subscribe confirmations, and a `Disconnection` when the connection is
+/// lost) arrives on the returned receiver.
 ///
 /// Errors never contain the password or token, as for [`connect`]. A server that refuses
 /// RESP3 fails with [`redis::ErrorKind::RESP3NotSupported`].
 pub async fn open_subscriber(
     profile: &Profile,
     secrets: &dyn SecretStore,
+    node: Option<&NodeAddr>,
 ) -> Result<
     (
         Connection,
@@ -113,11 +126,16 @@ pub async fn open_subscriber(
     ConnError,
 > {
     let route = Route::for_profile(profile, secrets).await?;
-    let mut auth = ResolvedAuth::new(profile, secrets).await?;
+    let mut auth = ResolvedAuth::new(profile, secrets).await?.for_node(node);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     auth.settings = auth.settings.set_protocol(redis::ProtocolVersion::RESP3);
     auth.config = auth.config.set_push_sender(tx);
-    let conn = open_server(profile, secrets, &route, &auth).await?;
+    // A cluster node is reached as discovery reached it; a server is reached as a
+    // connect reaches it (through the Sentinels for a Sentinel profile).
+    let conn = match node {
+        Some(n) => auth.open(&route, &n.endpoint).await?,
+        None => open_server(profile, secrets, &route, &auth).await?,
+    };
     Ok((conn, rx))
 }
 
@@ -158,9 +176,10 @@ impl std::fmt::Debug for MonitorConn {
     }
 }
 
-/// Opens `MONITOR` for `profile` (spec "Monitor (P2)"), with the same credentials,
-/// database, TLS trust roots and SSH tunnel as [`connect`] (see [`monitor_unsupported`]
-/// for the routes it refuses). Each `MONITOR` it sends takes one from `budget`.
+/// Opens `MONITOR` for `profile` (spec "Monitor (P2)"), or on cluster node `node`, with
+/// the same credentials, database, TLS trust roots and SSH tunnel as [`connect`] (see
+/// [`monitor_unsupported`] for the routes it refuses). Each `MONITOR` it sends takes one
+/// from `budget`.
 ///
 /// redis-rs's monitor connection swallows the server's answer to `MONITOR`, so a refusal
 /// would look like a quiet server. It is asked first on an ordinary connection, which is
@@ -170,6 +189,7 @@ pub async fn open_monitor(
     profile: &Profile,
     secrets: &dyn SecretStore,
     budget: &crate::budget::Budget,
+    node: Option<&NodeAddr>,
 ) -> Result<Result<MonitorConn, redis::RedisError>, ConnError> {
     if let Some(why) = monitor_unsupported(profile) {
         return Err(ConnError::Redis(redis::RedisError::from(
@@ -177,18 +197,23 @@ pub async fn open_monitor(
         )));
     }
     let route = Route::for_profile(profile, secrets).await?;
-    let auth = ResolvedAuth::new(profile, secrets).await?;
+    let auth = ResolvedAuth::new(profile, secrets).await?.for_node(node);
     // A Sentinel profile's server is the primary the Sentinels name, at the addresses
-    // found for it once: the monitor connection below goes there too.
-    let (mut check, pinned) = match &profile.sentinel {
-        None => (auth.open(&route, &profile.endpoint).await?, None),
-        Some(s) => {
+    // found for it once: the monitor connection below goes there too. A cluster node is
+    // reached as discovery reached it.
+    let (mut check, pinned) = match (node, &profile.sentinel) {
+        (Some(n), _) => (auth.open(&route, &n.endpoint).await?, None),
+        (None, None) => (auth.open(&route, &profile.endpoint).await?, None),
+        (None, Some(s)) => {
             let p = sentinel::open_primary(profile, s, secrets, &route, &auth).await?;
             (p.conn, Some(p.addrs))
         }
     };
     let primary = check.sentinel().map(|a| a.primary.clone());
-    let ep = primary.as_ref().unwrap_or(&profile.endpoint);
+    let ep = match node {
+        Some(n) => &n.endpoint,
+        None => primary.as_ref().unwrap_or(&profile.endpoint),
+    };
     {
         budget.take(1).await;
         let answer: redis::RedisResult<redis::Value> =
@@ -533,6 +558,22 @@ impl ResolvedAuth {
         })
     }
 
+    /// For a connection of its own to cluster node `node`: without credentials when
+    /// discovery's connection to it had none (see [`NodeAddr`]), as discovery's
+    /// no-credentials probe connects; otherwise unchanged.
+    fn for_node(self, node: Option<&NodeAddr>) -> Self {
+        if node.is_none_or(|n| n.credentials) {
+            return self;
+        }
+        Self {
+            settings: RedisConnectionInfo::default()
+                .set_skip_set_lib_name()
+                .set_db(self.settings.db()),
+            config: base_config(),
+            sends_credentials: false,
+        }
+    }
+
     /// Connect to `ep` over `route` with these credentials, the endpoint's TLS setting
     /// and the database. Direct, redis-rs resolves the host; through SSH the connection
     /// goes to the forward's local end, and TLS still checks `ep`'s host name.
@@ -829,7 +870,8 @@ async fn info_replication(c: &mut MultiplexedConnection) -> Result<String, redis
 /// and passes is scanned on that same connection and never gets credentials. Only a
 /// candidate that answers `NOAUTH` may get them, and only when the profile has some and
 /// [`may_send_credentials`] allows; it is then checked again on the authenticated
-/// connection, which is the one returned.
+/// connection, which is the one returned. The flag says whether the connection returned
+/// sent credentials.
 async fn verified_replica(
     auth: &ResolvedAuth,
     route: &Arc<Route>,
@@ -837,7 +879,7 @@ async fn verified_replica(
     primary: &Endpoint,
     primary_replid: &str,
     ep: &Endpoint,
-) -> Result<Connection, Unusable> {
+) -> Result<(Connection, bool), Unusable> {
     let candidate = route.reach(ep).await?;
     let pinned =
         |config: AsyncConnectionConfig| config.set_dns_resolver(Pinned(candidate.addrs.clone()));
@@ -852,7 +894,7 @@ async fn verified_replica(
                     .query_async::<()>(&mut probe)
                     .await?;
             }
-            return Ok(Connection::new(probe, route));
+            return Ok((Connection::new(probe, route), false));
         }
         Ok(_) => return Err(Unusable::NotAReplica),
         Err(e) if auth.sends_credentials && e.code() == Some("NOAUTH") => {}
@@ -869,7 +911,7 @@ async fn verified_replica(
     let mut c = open(ep, auth.settings.clone(), &pinned(auth.config.clone())).await?;
     let info = info_replication(&mut c).await?;
     if is_replica_of(&info, primary_replid) {
-        Ok(Connection::new(c, route))
+        Ok((Connection::new(c, route), true))
     } else {
         Err(Unusable::NotAReplica)
     }
@@ -986,7 +1028,7 @@ async fn verify_candidate(
     }
     let attempt = verified_replica(auth, route, db, primary, replid, ep);
     match tokio::time::timeout(REPLICA_TIMEOUT, attempt).await {
-        Ok(Ok(c)) => Ok(c),
+        Ok(Ok((c, _))) => Ok(c),
         Ok(Err(why)) => Err(unusable_reason(ep, why, route.is_ssh())),
         Err(_) => Err(format!("{ep}: timed out")),
     }
@@ -2010,6 +2052,40 @@ mod tests {
         ])
         .await;
         (primary, replica)
+    }
+
+    /// A connection of its own to a cluster node that discovery reached without
+    /// credentials sends none either; one that had them keeps them.
+    #[tokio::test]
+    async fn a_node_without_credentials_gets_none() {
+        use crate::secrets::MemoryStore;
+        let mut p = fake_profile(6379, false);
+        p.auth = Auth::Keychain;
+        let store = MemoryStore::default();
+        store
+            .set(
+                &p.secret_ref(),
+                &crate::model::Credentials {
+                    username: Some("lens".into()),
+                    password: secrecy::SecretString::from("hunter2".to_string()),
+                },
+            )
+            .unwrap();
+        let node = |credentials| NodeAddr {
+            endpoint: ep("10.0.0.2", 7001, false),
+            credentials,
+        };
+        let auth = ResolvedAuth::new(&p, &store).await.unwrap();
+        assert!(auth.sends_credentials);
+        let kept = ResolvedAuth::new(&p, &store)
+            .await
+            .unwrap()
+            .for_node(Some(&node(true)));
+        assert_eq!(kept.settings.username(), Some("lens"));
+        let none = auth.for_node(Some(&node(false)));
+        assert!(!none.sends_credentials);
+        assert_eq!(none.settings.username(), None);
+        assert_eq!(none.settings.password(), None);
     }
 
     fn fake_profile(port: u16, prefer_replica: bool) -> Profile {

@@ -216,7 +216,7 @@ async fn subscriber(
             p
         }
     };
-    conn::open_subscriber(&p, &secrets)
+    conn::open_subscriber(&p, &secrets, None)
         .await
         .expect("open the subscriber")
 }

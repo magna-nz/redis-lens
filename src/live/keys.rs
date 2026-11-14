@@ -11,7 +11,7 @@ use std::collections::HashSet;
 
 use redis::{FromRedisValue, Value};
 
-use super::{Conn, LiveError, error_for, query, query_pipe};
+use super::{LiveConn, LiveError, error_for, query, query_pipe};
 use crate::analysis::{KeyFacts, key_in_pattern, match_glob};
 use crate::budget::Budget;
 use crate::model::{KeyType, Ttl};
@@ -118,7 +118,11 @@ pub fn length_command(t: KeyType) -> Option<&'static str> {
 }
 
 /// Runs one request. Every command goes through `budget`.
-pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply, LiveError> {
+pub async fn run(
+    conn: &mut impl LiveConn,
+    budget: &Budget,
+    req: Request,
+) -> Result<Reply, LiveError> {
     match req {
         Request::Page {
             pattern,
@@ -156,7 +160,7 @@ impl Refused {
 
 #[allow(clippy::too_many_arguments)]
 async fn page(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     pattern: &str,
     mut cursor: u64,
@@ -217,7 +221,7 @@ async fn page(
 /// pipeline, then the length of each in a second one. Pushes a row per key that still
 /// exists and returns how many could not be read.
 async fn meta_batch(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     keys: &[String],
     sizes: bool,
@@ -303,7 +307,7 @@ async fn meta_batch(
 /// The length of each key by its type, pipelined; `None` for types without a length
 /// command and for failures.
 async fn lengths(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     keys: &[(String, KeyType)],
     refused: &mut Refused,
@@ -334,7 +338,11 @@ async fn lengths(
 
 /// [`Request::Facts`]: `OBJECT ENCODING` for every key, and the length of those that ask
 /// for it, in batches.
-async fn facts(conn: &mut Conn, budget: &Budget, keys: &[FactKey]) -> Result<Reply, LiveError> {
+async fn facts(
+    conn: &mut impl LiveConn,
+    budget: &Budget,
+    keys: &[FactKey],
+) -> Result<Reply, LiveError> {
     let mut refused = Refused::default();
     let mut out = Vec::with_capacity(keys.len());
     for batch in keys.chunks(BATCH) {

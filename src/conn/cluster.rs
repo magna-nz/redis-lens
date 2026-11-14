@@ -69,6 +69,14 @@ pub struct NodeTarget {
     pub note: Option<String>,
     /// Filled by [`ClusterTargets::check_permissions`].
     pub perms: Option<PermissionReport>,
+    /// The node's command budget, shared by the scan and the live views on it (spec
+    /// "Cluster live views (P4)"). `None` until a caller sets one; a scan then makes its
+    /// own.
+    pub budget: Option<Arc<crate::budget::Budget>>,
+    /// The connection sent the profile's credentials. False for a replica that was
+    /// verified, and is read, on a connection without them: a connection of its own to
+    /// that node (Monitor, the Pub/Sub tail) must not send them either.
+    pub credentials: bool,
 }
 
 /// The note on the only target when neither `CLUSTER SHARDS` nor `CLUSTER SLOTS` could
@@ -127,6 +135,48 @@ impl ClusterTargets {
         summary_text(&shards)
     }
 
+    /// [`super::check_all_permissions`] (the scan's checks, the view probes and the
+    /// `ACL DRYRUN` probes) on every connected node, each through that node's
+    /// [`NodeTarget::budget`] when it has one; merged as
+    /// [`Self::check_permissions`] merges (spec "Cluster live views (P4)", probes per
+    /// node).
+    pub async fn check_all_permissions(&mut self) -> PermissionReport {
+        let checks: Vec<BoxFuture<'_, (usize, PermissionReport)>> = self
+            .nodes
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, t)| t.conn.is_some())
+            .map(|(i, t)| {
+                async move {
+                    let budget = t.budget.clone();
+                    let Some(c) = t.conn.as_mut() else {
+                        return (i, PermissionReport::default());
+                    };
+                    let r = match budget {
+                        Some(b) => {
+                            let mut c = Budgeted {
+                                conn: c,
+                                budget: &b,
+                            };
+                            super::check_all_permissions(&mut c).await
+                        }
+                        None => super::check_all_permissions(c).await,
+                    };
+                    t.perms = Some(r.clone());
+                    (i, r)
+                }
+                .boxed()
+            })
+            .collect();
+        let mut reports: Vec<(usize, PermissionReport)> = stream::iter(checks)
+            .buffer_unordered(crate::scan::cluster::MAX_CONCURRENT_NODES)
+            .collect()
+            .await;
+        reports.sort_by_key(|(i, _)| *i);
+        let reports: Vec<PermissionReport> = reports.into_iter().map(|(_, r)| r).collect();
+        merge_permissions(&reports)
+    }
+
     /// Run [`super::check_permissions`] on every connected node, keep each node's
     /// report in [`NodeTarget::perms`], and return the merged report: a command counts
     /// as allowed only when every connected node allows it.
@@ -158,6 +208,40 @@ impl ClusterTargets {
         reports.sort_by_key(|(i, _)| *i);
         let reports: Vec<PermissionReport> = reports.into_iter().map(|(_, r)| r).collect();
         merge_permissions(&reports)
+    }
+}
+
+/// A connection that takes one command from `budget` for each command it sends (the
+/// length of a pipeline): the per-node probes go through their node's budget.
+struct Budgeted<'a, C> {
+    conn: &'a mut C,
+    budget: &'a crate::budget::Budget,
+}
+
+impl<C: ConnectionLike + Send> ConnectionLike for Budgeted<'_, C> {
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a redis::Cmd) -> redis::RedisFuture<'a, Value> {
+        Box::pin(async move {
+            self.budget.take(1).await;
+            self.conn.req_packed_command(cmd).await
+        })
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        cmd: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<Value>> {
+        Box::pin(async move {
+            self.budget
+                .take(u32::try_from(cmd.len()).unwrap_or(u32::MAX))
+                .await;
+            self.conn.req_packed_commands(cmd, offset, count).await
+        })
+    }
+
+    fn get_db(&self) -> i64 {
+        self.conn.get_db()
     }
 }
 
@@ -197,11 +281,20 @@ fn summary_text(shards: &[ShardState<'_>]) -> String {
 /// The merged permission report of a cluster, from each connected node's report in
 /// node order: per label, `Allowed` only when every node allows it, otherwise the first
 /// node's status that is not `Allowed` (`Denied` or `Skipped`). With no report at all,
-/// every label is `Skipped`.
+/// every scan label ([`PERM_LABELS`]) is `Skipped`. The scan's labels come first, then
+/// every other label (the view and write probes) in the order first seen.
 pub(crate) fn merge_permissions(reports: &[PermissionReport]) -> PermissionReport {
-    let checks = PERM_LABELS
-        .iter()
-        .filter_map(|&label| {
+    let mut labels: Vec<&'static str> = PERM_LABELS.to_vec();
+    for r in reports {
+        for c in &r.checks {
+            if !labels.contains(&c.label) {
+                labels.push(c.label);
+            }
+        }
+    }
+    let checks = labels
+        .into_iter()
+        .filter_map(|label| {
             if reports.is_empty() {
                 return Some(PermCheck {
                     label,
@@ -912,6 +1005,8 @@ fn seed_alone(profile: &Profile, seed: Connection, seed_id: Option<String>) -> C
             conn: Some(seed),
             note: Some(SHARDS_UNREADABLE.to_string()),
             perms: None,
+            budget: None,
+            credentials: true,
         }],
     }
 }
@@ -932,6 +1027,8 @@ async fn connect_shard(ctx: &Ctx<'_>, shard: Shard) -> NodeTarget {
         conn: None,
         note: None,
         perms: None,
+        budget: None,
+        credentials: true,
     };
     let primary_conn = match &chosen {
         Err(refusal) => Err(NodeFailure::Address(*refusal)),
@@ -951,11 +1048,12 @@ async fn connect_shard(ctx: &Ctx<'_>, shard: Shard) -> NodeTarget {
     }
 
     match replica_for(ctx, &target.endpoint, &mut primary_conn, &shard.replicas).await {
-        Ok((node, ep, conn)) => {
+        Ok((node, ep, conn, credentials)) => {
             target.id = node.id.clone();
             target.endpoint = ep;
             target.role = NodeRole::Replica;
             target.conn = Some(conn);
+            target.credentials = credentials;
         }
         Err(why) => {
             target.conn = Some(primary_conn);
@@ -974,7 +1072,7 @@ async fn replica_for<'r>(
     primary_ep: &Endpoint,
     primary: &mut Connection,
     replicas: &'r [AnnouncedNode],
-) -> Result<(&'r AnnouncedNode, Endpoint, Connection), String> {
+) -> Result<(&'r AnnouncedNode, Endpoint, Connection, bool), String> {
     let tls = ctx.profile.endpoint.tls;
     let candidates: Vec<(&AnnouncedNode, Endpoint)> = replicas
         .iter()
@@ -1003,16 +1101,16 @@ async fn replica_for<'r>(
         }
         // The credential rule is judged against the seed, as for every announced node.
         let attempt = async {
-            let mut c =
+            let (mut c, credentials) =
                 verified_replica(ctx.auth, ctx.route, 0, &ctx.profile.endpoint, &replid, &ep)
                     .await
                     .map_err(|u| NodeFailure::from_unusable(&u))?;
             check_id(&mut c, &node.id).await?;
             read_only(&mut c).await?;
-            Ok::<_, NodeFailure>(c)
+            Ok::<_, NodeFailure>((c, credentials))
         };
         match tokio::time::timeout(REPLICA_TIMEOUT, attempt).await {
-            Ok(Ok(c)) => return Ok((node, ep, c)),
+            Ok(Ok((c, credentials))) => return Ok((node, ep, c, credentials)),
             Ok(Err(f)) => why = f.note(&ep),
             Err(_) => why = NodeFailure::Timeout.note(&ep),
         }
@@ -1911,6 +2009,8 @@ mod tests {
                 conn: None,
                 note: Some(unreachable.into()),
                 perms: None,
+                budget: None,
+                credentials: true,
             }],
         };
         assert_eq!(targets.summary(), "cluster · 1 shard · 1 unreachable");
@@ -1965,6 +2065,26 @@ mod tests {
         let none = merge_permissions(&[]);
         assert_eq!(none.checks.len(), PERM_LABELS.len());
         assert!(PERM_LABELS.iter().all(|l| !none.allowed(l)));
+    }
+
+    #[test]
+    fn merged_permissions_keep_the_view_and_write_probes() {
+        use crate::model::PERM_SCAN;
+        let (slowlog, dryrun) = (super::super::PERM_SLOWLOG, super::super::PERM_ACL_DRYRUN);
+        let denied = PermStatus::Denied("NOPERM".into());
+        let a = report(&[
+            (PERM_SCAN, PermStatus::Allowed),
+            (slowlog, PermStatus::Allowed),
+            (dryrun, PermStatus::Allowed),
+        ]);
+        let b = report(&[(PERM_SCAN, PermStatus::Allowed), (slowlog, denied.clone())]);
+        let merged = merge_permissions(&[a, b]);
+        let labels: Vec<_> = merged.checks.iter().map(|c| c.label).collect();
+        // The scan's labels first, then the others in the order first seen.
+        assert_eq!(labels, [PERM_SCAN, slowlog, dryrun]);
+        // A view counts as allowed only when every node allows it.
+        assert_eq!(merged.checks[1].status, denied);
+        assert!(matches!(merged.checks[2].status, PermStatus::Skipped(_)));
     }
 
     // -- Property tests: any shard list written out as SHARDS (RESP2 or RESP3) or

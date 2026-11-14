@@ -870,3 +870,18 @@ pub fn cluster_report_replicas() -> ScanReport {
     nodes[2].note = Some("replica not used: 10.0.1.23:6379: timed out".into());
     r
 }
+
+/// The live node table of [`cluster_report`]'s cluster, as `Msg::Nodes` carries it:
+/// three primaries at `10.0.1.11-13:6379`, in slot order, all connected.
+pub fn live_nodes() -> Vec<crate::live::nodes::NodeInfo> {
+    let slots = slot_split(3);
+    (0..3)
+        .map(|i| crate::live::nodes::NodeInfo {
+            id: NODE_IDS[i].into(),
+            endpoint: node_endpoint(11 + i as u8),
+            role: NodeRole::Primary,
+            slots: vec![slots[i]],
+            connected: true,
+        })
+        .collect()
+}

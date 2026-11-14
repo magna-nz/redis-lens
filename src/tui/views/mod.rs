@@ -89,7 +89,7 @@ use std::time::Instant;
 use crossterm::event::KeyEvent;
 
 use crate::live::pubsub::Subscription;
-use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
+use crate::live::{Dest, Follow, LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::{PermStatus, PermissionReport, Profile, ScanReport, ServerInfo, ServerMode};
 use crate::tui::clipboard::CopyText;
 use crate::write::{Answer, Decision, Permit, Settings, WriteOp};
@@ -131,22 +131,114 @@ pub fn probe_of(screen: Screen) -> Option<&'static str> {
 pub const CLUSTER_OFF: &str = "Not available on a cluster yet: this view reads one server, \
      and a cluster spreads its keys, clients and channels over its nodes.";
 
-/// The screens that read the live connection to one server: off on a cluster. The key
-/// list is one of them: it walks the keys with `SCAN`, which on a cluster covers one
-/// node; and so is the key detail, which reads its value over the same connection.
+/// The screens that read the live connection to one server and are still off on a
+/// cluster. The key list is one of them: it walks the keys with `SCAN`, which on a
+/// cluster covers one node; and so is the key detail, which reads its value over the
+/// same connection. The Server panels and Search read the picked node instead
+/// ([`picks_node`]).
 pub fn reads_one_server(screen: Screen) -> bool {
     matches!(
         screen,
-        Screen::KeyList
-            | Screen::KeyDetail
-            | Screen::Overview
+        Screen::KeyList | Screen::KeyDetail | Screen::Streams | Screen::PubSub
+    )
+}
+
+/// The screens that read the picked node of a cluster (spec "Cluster live views (P4)"),
+/// where `[` and `]` pick another.
+pub fn picks_node(screen: Screen) -> bool {
+    matches!(
+        screen,
+        Screen::Overview
             | Screen::Clients
             | Screen::SlowLog
             | Screen::Monitor
-            | Screen::Streams
             | Screen::PubSub
             | Screen::Search
     )
+}
+
+/// Why a write to a shard read on a replica is refused (spec "Cluster live views (P4)",
+/// Replicas).
+pub const REPLICA_NO_WRITES: &str =
+    "this shard was read on a replica; connect without prefer_replica to write";
+
+/// The keys `op` names, which must share a slot on a cluster, and whether it is sent
+/// with `WATCH` (and so follows only a `MOVED` of the `WATCH`). Empty for the keyless
+/// writes, which go to the picked node.
+fn op_keys(op: &WriteOp) -> (Vec<&str>, bool) {
+    use WriteOp::*;
+    match op {
+        SetString { key, .. } | LSet { key, .. } | LDel { key, .. } | NewKey { key, .. } => {
+            (vec![key], true)
+        }
+        HSet { key, .. }
+        | HSetNx { key, .. }
+        | RPush { key, .. }
+        | SReplace { key, .. }
+        | SAdd { key, .. }
+        | ZScore { key, .. }
+        | ZAdd { key, .. }
+        | XAdd { key, .. }
+        | JsonSet { key, .. }
+        | KeyTtl { key, .. }
+        | FieldTtl { key, .. }
+        | HDel { key, .. }
+        | SRem { key, .. }
+        | ZRem { key, .. }
+        | XDel { key, .. }
+        | Unlink { key }
+        | XAutoClaim { key, .. }
+        | XAck { key, .. }
+        | XTrim { key, .. } => (vec![key], false),
+        Rename { key, new } => (vec![key, new], false),
+        // Keyless: the picked node. The command line and bulk actions are still off on
+        // a cluster; they route their own keys when they come on.
+        ClientKill { .. }
+        | SlowlogConfig(_)
+        | SlowlogReset
+        | Publish { .. }
+        | FtCreate { .. }
+        | FtDropIndex { .. }
+        | Bulk { .. }
+        | Command { .. } => (Vec::new(), false),
+    }
+}
+
+/// Where the write `op` goes: on a standalone server its one node; on a cluster the
+/// owner of its key's slot, or the picked node for a keyless write. Refused, with the
+/// sentence to show, when its keys are in different slots or its node was read on a
+/// replica: before anything is asked or sent.
+pub(crate) fn write_dest(session: &Session, op: &WriteOp) -> Result<Dest, String> {
+    let (keys, watch) = op_keys(op);
+    let follow = if watch {
+        Follow::MovedOnFirst
+    } else {
+        Follow::Redirects
+    };
+    if !session.is_cluster() {
+        return Ok(Dest::node(0).follow(follow));
+    }
+    let slots: Vec<u16> = keys
+        .iter()
+        .map(|k| crate::conn::slot::key_slot(k.as_bytes()))
+        .collect();
+    if slots.windows(2).any(|w| w[0] != w[1]) {
+        return Err(format!("Not sent: {}.", crate::live::CROSSSLOT));
+    }
+    let (node, dest) = match keys.first() {
+        Some(k) => (
+            session.owner_of(k.as_bytes()),
+            Dest::key(k.as_bytes().to_vec()),
+        ),
+        None => (Some(session.picked), Dest::node(session.picked)),
+    };
+    if node
+        .and_then(|i| session.nodes.get(i))
+        .is_some_and(|n| n.role == crate::model::NodeRole::Replica)
+    {
+        return Err(format!("Not sent: {REPLICA_NO_WRITES}."));
+    }
+    Ok(dest.follow(follow))
 }
 
 /// Which view state a screen, or a live request, belongs to.
@@ -346,6 +438,17 @@ impl<'a> Ctx<'a> {
         self.session.live == LiveState::Ready
     }
 
+    /// True on a cluster: the server line says so, or the nodes are known.
+    pub fn is_cluster(&self) -> bool {
+        self.session.is_cluster() || self.server().is_some_and(|s| s.mode == ServerMode::Cluster)
+    }
+
+    /// `node 127.0.0.1:7001 · 1 of 3` for the right of a title on the views that read
+    /// the picked node; `None` on a standalone server.
+    pub fn node_title(&self) -> Option<String> {
+        self.session.node_title()
+    }
+
     /// The status of the check labelled `label`, once the permission check ran.
     pub fn check(&self, label: &str) -> Option<&'a PermStatus> {
         self.perms?
@@ -359,9 +462,7 @@ impl<'a> Ctx<'a> {
     /// or not checked (yet). Never the server's own error text, which can name the
     /// ACL user.
     pub fn off_reason(&self) -> Option<String> {
-        if reads_one_server(self.screen)
-            && self.server().is_some_and(|s| s.mode == ServerMode::Cluster)
-        {
+        if reads_one_server(self.screen) && self.is_cluster() {
             return Some(CLUSTER_OFF.to_string());
         }
         let label = probe_of(self.screen)?;
@@ -474,6 +575,12 @@ impl<'a> Act<'a> {
             self.error("Not sent: answer the open question first.");
             return None;
         }
+        // On a cluster: keys in one slot, on a node that takes writes. Refused before
+        // asking.
+        if let Err(why) = write_dest(self.ctx.session, &op) {
+            self.error(why);
+            return None;
+        }
         let decision = self.ctx.write_decision(&op);
         match decision {
             Decision::Refuse(why) => {
@@ -513,7 +620,14 @@ impl<'a> Act<'a> {
 
     fn send_permit(&mut self, permit: Permit) -> Option<ReqId> {
         let name = permit.op().command();
-        let id = self.send(LiveRequest::Write(permit))?;
+        let dest = match write_dest(self.ctx.session, permit.op()) {
+            Ok(d) => d,
+            Err(why) => {
+                self.error(why);
+                return None;
+            }
+        };
+        let id = self.send_to(dest, LiveRequest::Write(permit))?;
         self.writes.insert(id, name);
         Some(id)
     }
@@ -557,10 +671,19 @@ impl<'a> Act<'a> {
         self.tail = Some(TailCmd::StopMonitor { run });
     }
 
-    /// Sends `req` on the session's live connection. The answer comes back to this
-    /// view's [`ViewState::on_reply`] with the returned id. `None`, and nothing sent,
-    /// while the live connection is not [`LiveState::Ready`].
+    /// Sends `req` on the session's live connection: on a cluster, to the picked node.
+    /// The answer comes back to this view's [`ViewState::on_reply`] with the returned
+    /// id. `None`, and nothing sent, while the live connection is not
+    /// [`LiveState::Ready`].
     pub fn send(&mut self, req: LiveRequest) -> Option<ReqId> {
+        let picked = self.ctx.session.picked;
+        self.send_to(Dest::node(picked), req)
+    }
+
+    /// [`Self::send`] to `dest`: a node of the cluster (by its index in
+    /// `session.nodes`), or the owner of a key's slot. On a standalone server every
+    /// `dest` is its one node.
+    pub fn send_to(&mut self, dest: Dest, req: LiveRequest) -> Option<ReqId> {
         if !self.ctx.live_ready() {
             return None;
         }
@@ -570,6 +693,7 @@ impl<'a> Act<'a> {
         self.effects.push(Effect::Live {
             id: self.ctx.session.id,
             req_id: id,
+            to: dest,
             req,
         });
         Some(id)

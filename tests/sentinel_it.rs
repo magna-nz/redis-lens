@@ -319,7 +319,7 @@ async fn tail_and_monitor(valkey: bool) {
     let secrets = store(&s, &p);
     let mut admin = s.admin(s.primary_port).await;
 
-    let (mut sub, mut pushes) = conn::open_subscriber(&p, &secrets).await.unwrap();
+    let (mut sub, mut pushes) = conn::open_subscriber(&p, &secrets, None).await.unwrap();
     assert_eq!(sub.sentinel().unwrap().primary, primary_ep(s.primary_port));
     sub.subscribe("orders").await.unwrap();
     let _: i64 = redis::cmd("PUBLISH")
@@ -342,7 +342,7 @@ async fn tail_and_monitor(valkey: bool) {
     assert!(format!("{:?}", got.data).contains("orders"), "{got:?}");
 
     let budget = redis_lens::budget::Budget::new(None);
-    let mut m = conn::open_monitor(&p, &secrets, &budget)
+    let mut m = conn::open_monitor(&p, &secrets, &budget, None)
         .await
         .unwrap()
         .expect("MONITOR allowed");

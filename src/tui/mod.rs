@@ -12,7 +12,10 @@
 //!
 //! After a connect succeeds, the session's connection stays open as its live connection
 //! ([`crate::live`]) until the next connect or quitting, whether the scan finished or
-//! failed. The scan and the live connection take from one [`Budget`].
+//! failed. The scan and the live connection take from one [`Budget`]. On a cluster,
+//! the connection discovery opened to each shard stays open the same way, each node
+//! with its own budget shared by its scan and its live requests (spec "Cluster live
+//! views (P4)").
 //!
 //! The Pub/Sub live tail ([`Effect::Subscribe`]) runs on a connection of its own, kept
 //! in the current [`LiveSession`] next to the live task, so a new connect, a rescan or
@@ -214,8 +217,10 @@ struct LiveSession {
     id: ConnId,
     scan: ScanId,
     handle: Option<LiveHandle>,
-    /// The session's command budget, once its connect succeeded (a cluster has none).
-    budget: Option<Arc<Budget>>,
+    /// Each node's command budget and where a connection of its own to it goes, by the
+    /// node's index in the live task's table, once the connect succeeded: one entry on
+    /// a standalone server.
+    nodes: Vec<NodeRoute>,
     /// The Pub/Sub live tail, if one runs: dropping it aborts the task and drops its
     /// connection.
     tail: Option<TailTask>,
@@ -230,11 +235,20 @@ impl LiveSession {
             id,
             scan,
             handle: None,
-            budget: None,
+            nodes: Vec::new(),
             tail: None,
             monitor: None,
         }
     }
+}
+
+/// What a connection of its own to one node needs: the node's budget and, on a
+/// cluster, its address and whether credentials go to it (`None`: the profile's own
+/// endpoint).
+#[derive(Clone)]
+struct NodeRoute {
+    budget: Arc<Budget>,
+    addr: Option<conn::NodeAddr>,
 }
 
 /// A running live tail: its id and its task, aborted when this is dropped.
@@ -286,7 +300,10 @@ fn start_live(
 ) -> bool {
     // Before the live task, so a subscribe that follows `LiveReady` finds the budget.
     if let Some(s) = lock(slot).as_mut().filter(|s| s.id == id && s.scan == scan) {
-        s.budget = Some(Arc::clone(&budget));
+        s.nodes = vec![NodeRoute {
+            budget: Arc::clone(&budget),
+            addr: None,
+        }];
     }
     install_live(slot, id, scan, tx, || {
         let (reply_tx, close_tx) = (tx.clone(), tx.clone());
@@ -313,6 +330,74 @@ fn start_live(
             },
         )
     })
+}
+
+/// [`start_live`] for a cluster: one live task over every shard's connection, each with
+/// its node's budget ([`conn::cluster::NodeTarget::budget`]). Only the nodes discovery
+/// connected to are in it with a connection; the others answer that they are not
+/// connected.
+fn start_live_cluster(
+    slot: &LiveSlot,
+    id: ConnId,
+    scan: ScanId,
+    targets: &ClusterTargets,
+    tx: &Tx,
+) -> bool {
+    let mut routes = Vec::new();
+    let mut held = Vec::new();
+    let mut table = Vec::new();
+    for t in &targets.nodes {
+        let budget = t.budget.clone().unwrap_or_else(|| Budget::new(None));
+        routes.push(NodeRoute {
+            budget: Arc::clone(&budget),
+            addr: Some(conn::NodeAddr {
+                endpoint: t.endpoint.clone(),
+                credentials: t.credentials,
+            }),
+        });
+        // Held until the task ends, for the SSH forwards (see `start_live`).
+        held.extend(t.conn.clone());
+        table.push(live::nodes::Node {
+            info: node_info(t),
+            conn: t.conn.clone().map(conn::Connection::into_inner),
+            budget,
+        });
+    }
+    if let Some(s) = lock(slot).as_mut().filter(|s| s.id == id && s.scan == scan) {
+        s.nodes = routes;
+    }
+    install_live(slot, id, scan, tx, || {
+        let (reply_tx, close_tx) = (tx.clone(), tx.clone());
+        live::spawn_nodes(
+            live::nodes::Table::cluster(table),
+            move |req_id, result| {
+                send(
+                    &reply_tx,
+                    Msg::Live {
+                        id,
+                        scan,
+                        req_id,
+                        result,
+                    },
+                );
+            },
+            move |error| {
+                drop(held);
+                send(&close_tx, Msg::LiveClosed { id, scan, error });
+            },
+        )
+    })
+}
+
+/// What the views know of a shard's node (spec "Cluster live views (P4)").
+fn node_info(t: &conn::cluster::NodeTarget) -> live::nodes::NodeInfo {
+    live::nodes::NodeInfo {
+        id: t.id.clone(),
+        endpoint: t.endpoint.clone(),
+        role: t.role,
+        slots: t.slots.clone(),
+        connected: t.conn.is_some(),
+    }
 }
 
 fn send(tx: &Tx, msg: Msg) -> bool {
@@ -356,9 +441,9 @@ impl Runner {
         self.replace_live(None);
     }
 
-    /// Sends `req` on session `id`'s live task, or answers it with
+    /// Sends `req` to `to` on session `id`'s live task, or answers it with
     /// [`LiveError::Closed`] when `id` isn't the current session or has no live task.
-    fn send_live(&self, id: ConnId, req_id: live::ReqId, req: live::LiveRequest) {
+    fn send_live(&self, id: ConnId, req_id: live::ReqId, to: live::Dest, req: live::LiveRequest) {
         let sent = {
             let guard = lock(&self.live);
             match guard.as_ref() {
@@ -366,7 +451,7 @@ impl Runner {
                     id: current,
                     handle: Some(handle),
                     ..
-                }) if *current == id => handle.send(req_id, req),
+                }) if *current == id => handle.send_to(req_id, to, req),
                 _ => false,
             }
         };
@@ -383,9 +468,10 @@ impl Runner {
         }
     }
 
-    /// Starts live tail `tail` of session `(id, scan)`, replacing (and so dropping) the
-    /// session's other tail. When the session is not current or has no budget (not
-    /// connected, or a cluster), answers [`Msg::TailClosed`] at once.
+    /// Starts live tail `tail` of session `(id, scan)` on node `node`, replacing (and so
+    /// dropping) the session's other tail. When the session is not current or has no
+    /// such node (not connected), answers [`Msg::TailClosed`] at once.
+    #[allow(clippy::too_many_arguments)]
     fn subscribe(
         &self,
         id: ConnId,
@@ -394,6 +480,7 @@ impl Runner {
         profile: Profile,
         secrets: SecretSource,
         to: Subscription,
+        node: usize,
     ) {
         let mut guard = lock(&self.live);
         let Some(s) = guard.as_mut().filter(|s| s.id == id && s.scan == scan) else {
@@ -409,7 +496,7 @@ impl Runner {
             );
             return;
         };
-        let Some(budget) = s.budget.clone() else {
+        let Some(route) = s.nodes.get(node).cloned() else {
             drop(guard);
             send(
                 &self.tx,
@@ -432,22 +519,30 @@ impl Runner {
                 profile,
                 secrets,
                 to,
-                budget,
+                route,
                 tx,
             ))),
         });
     }
 
-    /// Starts Monitor run `run` of session `(id, scan)`, replacing (and so dropping) the
-    /// session's other run. When the session is not current or has no budget, answers
-    /// [`Msg::MonitorClosed`] at once.
-    fn monitor(&self, id: ConnId, scan: ScanId, run: u64, profile: Profile, secrets: SecretSource) {
+    /// Starts Monitor run `run` of session `(id, scan)` on node `node`, replacing (and so
+    /// dropping) the session's other run. When the session is not current or has no
+    /// such node, answers [`Msg::MonitorClosed`] at once.
+    fn monitor(
+        &self,
+        id: ConnId,
+        scan: ScanId,
+        run: u64,
+        profile: Profile,
+        secrets: SecretSource,
+        node: usize,
+    ) {
         let mut guard = lock(&self.live);
         let found = guard
             .as_mut()
             .filter(|s| s.id == id && s.scan == scan)
-            .and_then(|s| s.budget.clone().map(|b| (s, b)));
-        let Some((s, budget)) = found else {
+            .and_then(|s| s.nodes.get(node).cloned().map(|b| (s, b)));
+        let Some((s, route)) = found else {
             drop(guard);
             send(
                 &self.tx,
@@ -472,7 +567,7 @@ impl Runner {
                 },
                 profile,
                 secrets,
-                budget,
+                route,
                 tx,
             ))),
         });
@@ -487,7 +582,12 @@ impl Runner {
                 self.close_live();
                 return true;
             }
-            Effect::Live { id, req_id, req } => self.send_live(id, req_id, req),
+            Effect::Live {
+                id,
+                req_id,
+                to,
+                req,
+            } => self.send_live(id, req_id, to, req),
             Effect::Subscribe {
                 id,
                 scan,
@@ -495,14 +595,16 @@ impl Runner {
                 profile,
                 secrets,
                 to,
-            } => self.subscribe(id, scan, tail, profile, secrets, to),
+                node,
+            } => self.subscribe(id, scan, tail, profile, secrets, to, node),
             Effect::Monitor {
                 id,
                 scan,
                 run,
                 profile,
                 secrets,
-            } => self.monitor(id, scan, run, profile, secrets),
+                node,
+            } => self.monitor(id, scan, run, profile, secrets, node),
             Effect::StopMonitor { id, run } => {
                 if let Some(s) = lock(&self.live).as_mut()
                     && s.id == id
@@ -905,10 +1007,11 @@ async fn run_tail(
     profile: Profile,
     secrets: SecretSource,
     to: Subscription,
-    budget: Arc<Budget>,
+    route: NodeRoute,
     tx: Tx,
 ) {
     let TailRun { id, scan, tail } = run;
+    let budget = route.budget;
     let closed = |error: String| {
         send(
             &tx,
@@ -922,7 +1025,8 @@ async fn run_tail(
     };
     let (store, secret) = store_for(&profile, secrets);
     let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
-    let (mut conn, mut pushes) = match conn::open_subscriber(&profile, store.as_ref()).await {
+    let opened = conn::open_subscriber(&profile, store.as_ref(), route.addr.as_ref()).await;
+    let (mut conn, mut pushes) = match opened {
         Ok(c) => c,
         Err(e) => return closed(tail_open_error(&e, clean)),
     };
@@ -963,7 +1067,7 @@ async fn run_monitor(
     run: TailRun,
     profile: Profile,
     secrets: SecretSource,
-    budget: Arc<Budget>,
+    route: NodeRoute,
     tx: Tx,
 ) {
     let TailRun {
@@ -971,12 +1075,13 @@ async fn run_monitor(
         scan,
         tail: run,
     } = run;
+    let budget = route.budget;
     let closed = |end: Result<live::monitor::End, String>| {
         send(&tx, Msg::MonitorClosed { id, scan, run, end });
     };
     let (store, secret) = store_for(&profile, secrets);
     let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
-    let opened = conn::open_monitor(&profile, store.as_ref(), &budget).await;
+    let opened = conn::open_monitor(&profile, store.as_ref(), &budget, route.addr.as_ref()).await;
     drop(store);
     let mut mon = match opened {
         Ok(Ok(m)) => m,
@@ -1098,8 +1203,9 @@ async fn connect_and_scan(
     }
     let target = clean_target(targets.target(), clean);
     // One budget for this session: the scan and the live connection both take from it.
-    // The permission probes run once on connect and don't. A cluster scan gives each
-    // node a budget of its own instead.
+    // The permission probes run once on connect and don't. On a cluster each node has a
+    // budget of its own instead, shared by its scan and its live requests, and the
+    // probes run on every node through its budget.
     let opts = ScanOptions::for_profile(&profile);
     let budget = Budget::new(opts.max_commands_per_sec);
     let (perms, server) = match &mut targets {
@@ -1110,9 +1216,15 @@ async fn connect_and_scan(
                 scan::server_info_with_budget(conn, &budget).await.ok(),
             )
         }
-        // The view probes are not run: on a cluster the live views are off (see
-        // `views::Ctx::off_reason`).
-        ScanTargets::Cluster(c) => (c.check_permissions().await, cluster_server_info(c).await),
+        ScanTargets::Cluster(c) => {
+            for node in &mut c.nodes {
+                node.budget = Some(Budget::new(opts.max_commands_per_sec));
+            }
+            (
+                c.check_all_permissions().await,
+                cluster_server_info(c).await,
+            )
+        }
     };
     if !send(
         &tx,
@@ -1127,11 +1239,25 @@ async fn connect_and_scan(
         return;
     }
     // The live views read from the node the scan reads from (the replica when one is
-    // preferred). The live task keeps its clone open after the scan ends. A cluster has
-    // no live connection.
-    if let ScanTargets::Single { conn, .. } = &targets
-        && !start_live(&live, id, scan_id, conn.clone(), Arc::clone(&budget), &tx)
-    {
+    // preferred). The live task keeps its clone open after the scan ends. On a cluster,
+    // the views learn the nodes first, then the live task starts over all of them.
+    let started = match &targets {
+        ScanTargets::Single { conn, .. } => {
+            start_live(&live, id, scan_id, conn.clone(), Arc::clone(&budget), &tx)
+        }
+        ScanTargets::Cluster(c) => {
+            let nodes = c.nodes.iter().map(node_info).collect();
+            send(
+                &tx,
+                Msg::Nodes {
+                    id,
+                    scan: scan_id,
+                    nodes,
+                },
+            ) && start_live_cluster(&live, id, scan_id, c, &tx)
+        }
+    };
+    if !started {
         return;
     }
 
@@ -1745,6 +1871,7 @@ mod tests {
         let effect = Effect::Live {
             id: 5,
             req_id: live::ReqId(1),
+            to: live::Dest::default(),
             req: ping(),
         };
         assert!(!runner.run(effect, &mut out));
@@ -1755,6 +1882,7 @@ mod tests {
             Effect::Live {
                 id: 5,
                 req_id: live::ReqId(2),
+                to: live::Dest::default(),
                 req: ping(),
             },
             &mut out,
@@ -1766,6 +1894,7 @@ mod tests {
             Effect::Live {
                 id: 5,
                 req_id: live::ReqId(3),
+                to: live::Dest::default(),
                 req: ping(),
             },
             &mut out,
@@ -1797,11 +1926,12 @@ mod tests {
             Effect::Live {
                 id: 1,
                 req_id: live::ReqId(7),
+                to: live::Dest::default(),
                 req: ping(),
             },
             &mut Recorder::default(),
         );
-        let (req_id, req) = queue.try_recv().expect("queued");
+        let (req_id, _, req) = queue.try_recv().expect("queued");
         assert_eq!((req_id, req), (live::ReqId(7), ping()));
         assert!(rx.try_recv().is_err());
 
@@ -1812,6 +1942,7 @@ mod tests {
             Effect::Live {
                 id: 1,
                 req_id: live::ReqId(8),
+                to: live::Dest::default(),
                 req: ping(),
             },
             &mut Recorder::default(),
@@ -1974,6 +2105,7 @@ mod tests {
             profile: profile("p"),
             secrets: SecretSource::Keychain,
             to: Subscription::Channel("news".into()),
+            node: 0,
         };
         // No session; then a session still connecting (no budget yet).
         runner.run(subscribe(1, 10), &mut Recorder::default());
@@ -1999,7 +2131,10 @@ mod tests {
     async fn one_tail_per_session_and_unsubscribe_or_a_new_connect_drops_it() {
         let (mut runner, _rx) = runner();
         connecting(&mut runner, 1, 10);
-        lock(&runner.live).as_mut().unwrap().budget = Some(Budget::new(None));
+        lock(&runner.live).as_mut().unwrap().nodes = vec![NodeRoute {
+            budget: Budget::new(None),
+            addr: None,
+        }];
         // A tail whose task never ends, standing in for one that is subscribed.
         let install = |runner: &Runner, tail: u64| {
             let (keep_tx, keep_rx) = tokio::sync::oneshot::channel::<()>();

@@ -65,7 +65,7 @@ async fn start(
     mpsc::UnboundedReceiver<Vec<Entry>>,
     tokio::task::JoinHandle<End>,
 ) {
-    let mut m = conn::open_monitor(p, secrets, budget)
+    let mut m = conn::open_monitor(p, secrets, budget, None)
         .await
         .expect("connect")
         .expect("MONITOR allowed");
@@ -192,7 +192,7 @@ async fn a_user_without_monitor_is_refused_in_fixed_words() {
             )
             .unwrap();
         let budget = Budget::new(None);
-        let answer = conn::open_monitor(&p, &secrets, &budget)
+        let answer = conn::open_monitor(&p, &secrets, &budget, None)
             .await
             .expect("the connect works");
         let Err(e) = answer else {
@@ -215,7 +215,7 @@ async fn a_profile_on_an_unsupported_route_is_refused_before_connecting() {
     assert!(conn::monitor_unsupported(&p).is_some());
     let budget = Budget::new(None);
     assert!(
-        conn::open_monitor(&p, &MemoryStore::default(), &budget)
+        conn::open_monitor(&p, &MemoryStore::default(), &budget, None)
             .await
             .is_err()
     );

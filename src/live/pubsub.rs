@@ -10,7 +10,7 @@
 use redis::{PushInfo, PushKind, RedisResult, Value};
 
 use super::streams::{text, uint};
-use super::{CONNECTION_LOST, Conn, LiveError, error_for, query_pipe};
+use super::{CONNECTION_LOST, LiveConn, LiveError, error_for, query_pipe};
 use crate::budget::Budget;
 use crate::conn::ConnError;
 use crate::value::Raw;
@@ -52,13 +52,17 @@ pub struct Channel {
 }
 
 /// Runs one request. Every command goes through `budget`.
-pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply, LiveError> {
+pub async fn run(
+    conn: &mut impl LiveConn,
+    budget: &Budget,
+    req: Request,
+) -> Result<Reply, LiveError> {
     match req {
         Request::Counts => counts(conn, budget).await.map(Reply::Counts),
     }
 }
 
-async fn counts(conn: &mut Conn, budget: &Budget) -> Result<Counts, LiveError> {
+async fn counts(conn: &mut impl LiveConn, budget: &Budget) -> Result<Counts, LiveError> {
     let mut pipe = redis::pipe();
     pipe.ignore_errors();
     pipe.cmd("PUBSUB").arg("CHANNELS");
@@ -341,7 +345,11 @@ pub fn parse_push(push: PushInfo, at_unix_ms: i64) -> Push {
 /// Sends `SUBSCRIBE` or `PSUBSCRIBE` for `to` on `conn`, a connection from
 /// `conn::open_subscriber`, taking one command from `budget`. The messages then arrive
 /// on that connection's push receiver. The error is in redis-lens's own words.
-pub async fn subscribe(conn: &mut Conn, budget: &Budget, to: &Subscription) -> Result<(), String> {
+pub async fn subscribe(
+    conn: &mut redis::aio::MultiplexedConnection,
+    budget: &Budget,
+    to: &Subscription,
+) -> Result<(), String> {
     budget.take(1).await;
     let sent = match to {
         Subscription::Channel(c) => conn.subscribe(c.as_str()).await,
