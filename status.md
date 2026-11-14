@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** Redis Insight parity phase 4 (topology and connections), in one PR from branch `claude/insight-phase4-289a4c`. Phases 1 to 3 are on main (#15, #16, #17, #18).
-**Last updated:** 2026-11-14 (phase 4: spec written; building)
+**Last updated:** 2026-11-14 (phase 4: spec written, Sentinel built; building the rest)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -513,7 +513,7 @@ Built unattended on `claude/insight-phase4-289a4c`, one PR for the phase. Not me
 |---|---|---|---|
 | 0 | Spec: the P4 section, milestones, the parity roadmap | | **done** |
 | 1 | Live views on a cluster: node connections kept with their budgets, routing by slot (local CRC16), `MOVED`/`ASK` once, the picked node (`[` `]`), per-shard summary, Streams per slot owner, classic and sharded Pub/Sub, Search and Monitor per node, bulk and `redis-lens expire` per primary, the command line by key specs with CROSSSLOT refused | | not started |
-| 2 | Sentinel: `[profile.sentinel]`, `sentinel:profile:<name>` keychain entry, `GET-MASTER-ADDR-BY-NAME` with the primary checked, `SENTINEL REPLICAS` for `prefer_replica`, `conn add`/`test`/`list`, Connections detail | | not started |
+| 2 | Sentinel: `[profile.sentinel]`, `sentinel:profile:<name>` keychain entry, `GET-MASTER-ADDR-BY-NAME` with the primary checked, `SENTINEL REPLICAS` for `prefer_replica`, `conn add`/`test`/`list`, Connections detail | `a2d467b` | **done**; `tests/sentinel_it.rs` 14 tests on Redis 7.4, Valkey 8.1 and Redis 6.2; verifier pending |
 | 3 | Database switch (`b`) | | not started |
 | 4 | Slots panel (`CLUSTER SLOT-STATS`) | | not started |
 | 5 | Type filter (`t`), `conn export`/`import`, tags, light theme and `NO_COLOR` | | not started |
