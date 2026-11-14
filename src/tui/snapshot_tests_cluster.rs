@@ -494,19 +494,17 @@ fn a_seed_only_scan_is_amber_everywhere_it_is_summed_up() {
     }
 }
 
-/// The views that read one server are off on a cluster, say why, and ask nothing.
+/// The views that still read one server are off on a cluster, say why, and ask nothing:
+/// the key list and detail, Streams and Pub/Sub (the Server panels and Search read the
+/// picked node, below).
 #[test]
 fn live_views_are_off_on_a_cluster_and_send_nothing() {
-    let (mut app, _) = cluster_scanned(fixtures::cluster_report(), HEALTHY);
+    let (mut app, _) = live_cluster();
     for screen in [
         Screen::KeyList,
         Screen::KeyDetail,
-        Screen::Overview,
-        Screen::Clients,
-        Screen::SlowLog,
         Screen::Streams,
         Screen::PubSub,
-        Screen::Search,
     ] {
         let effects = super::app::views::testing::show(&mut app, screen);
         assert_eq!(app.screen(), screen);
@@ -536,4 +534,310 @@ fn live_views_are_off_on_a_cluster_and_send_nothing() {
         body.contains("Lengths and encodings are not read on a cluster yet"),
         "{body}"
     );
+}
+
+// -- Cluster live views (P4): the picked node --------------------------------------
+
+use crate::live::server::{InfoSample, Reply as ServerReply, Request as ServerRequest};
+use crate::live::{Dest, LiveReply, LiveRequest, To};
+
+/// [`cluster_scanned`] with the node table and the live connection ready, as a cluster
+/// connect sends them.
+fn live_cluster() -> (App, ConnId) {
+    let (mut app, id) = cluster_scanned(fixtures::cluster_report(), HEALTHY);
+    let scan = scan_of(&app);
+    app.apply(Msg::Nodes {
+        id,
+        scan,
+        nodes: fixtures::live_nodes(),
+    });
+    app.apply(Msg::LiveReady { id, scan });
+    (app, id)
+}
+
+/// The live requests among `effects`, with where each goes.
+fn sent(effects: &[Effect]) -> Vec<(crate::live::ReqId, Dest, LiveRequest)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Live {
+                req_id, to, req, ..
+            } => Some((*req_id, to.clone(), req.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn info_reply(app: &mut App, req_id: crate::live::ReqId, sample: InfoSample) -> Vec<Effect> {
+    super::app::views::testing::reply(
+        app,
+        req_id,
+        Ok(LiveReply::Server(ServerReply::Info {
+            at: std::time::Instant::now(),
+            sample: Box::new(sample),
+        })),
+    )
+}
+
+fn shard_sample(i: u64) -> InfoSample {
+    InfoSample {
+        clients: Some(10 + i),
+        used_memory: Some((i + 1) * 300 * 1024 * 1024),
+        maxmemory: Some(1024 * 1024 * 1024),
+        ops_now: Some(1200 * (i + 1)),
+        keys: Some(400_000 + i * 1000),
+        commands: Some(1_000),
+        uptime_secs: Some(86_400),
+        role: Some(crate::live::server::Role::Primary),
+        ..InfoSample::default()
+    }
+}
+
+#[test]
+fn the_server_panels_and_search_read_the_picked_node() {
+    let (mut app, _) = live_cluster();
+    assert_eq!(app.session.as_ref().unwrap().picked, 0, "the first primary");
+    let effects = super::app::views::testing::show(&mut app, Screen::Overview);
+    let reqs = sent(&effects);
+    // The Overview's INFO on the picked node, and one INFO per shard for the summary.
+    let to: Vec<To> = reqs.iter().map(|(_, d, _)| d.to.clone()).collect();
+    assert_eq!(
+        to,
+        [To::Node(0), To::Node(0), To::Node(1), To::Node(2)],
+        "{reqs:?}"
+    );
+    assert!(
+        reqs.iter()
+            .all(|(_, _, r)| *r == LiveRequest::Server(ServerRequest::Info))
+    );
+    for screen in [Screen::Clients, Screen::SlowLog, Screen::Search] {
+        let effects = super::app::views::testing::show(&mut app, screen);
+        let reqs = sent(&effects);
+        assert!(!reqs.is_empty(), "{screen:?}");
+        assert!(
+            reqs.iter().all(|(_, d, _)| d.to == To::Node(0)),
+            "{screen:?}: {reqs:?}"
+        );
+        let all = text(&render(&app, 120, 36));
+        assert!(
+            all.contains("node 10.0.1.11:6379 · 1 of 3"),
+            "{screen:?}: {all}"
+        );
+        assert!(!all.contains("Not available on a cluster"), "{screen:?}");
+    }
+    // `]` picks the next node: Search reads it at once, and names it.
+    let effects = app.handle_key(ch(']'));
+    assert_eq!(app.session.as_ref().unwrap().picked, 1);
+    let reqs = sent(&effects);
+    assert!(!reqs.is_empty());
+    assert!(reqs.iter().all(|(_, d, _)| d.to == To::Node(1)), "{reqs:?}");
+    assert!(text(&render(&app, 120, 36)).contains("node 10.0.1.12:6379 · 2 of 3"));
+    // `[` twice goes round to the last.
+    app.handle_key(ch('['));
+    app.handle_key(ch('['));
+    assert_eq!(app.session.as_ref().unwrap().picked, 2);
+    // Elsewhere `[` does nothing.
+    show(&mut app, Screen::Patterns);
+    assert!(app.handle_key(ch('[')).is_empty());
+    assert_eq!(app.session.as_ref().unwrap().picked, 2);
+}
+
+#[test]
+fn picking_a_node_restarts_the_overview_and_keeps_a_monitor_run_on_its_node() {
+    let (mut app, _) = live_cluster();
+    let effects = super::app::views::testing::show(&mut app, Screen::Overview);
+    let (first, _, _) = sent(&effects)[0].clone();
+    info_reply(&mut app, first, shard_sample(0));
+    assert_eq!(app.views.server.overview.history.len(), 1);
+    let effects = app.handle_key(ch(']'));
+    // The sparklines start again, on the new node.
+    assert!(app.views.server.overview.history.is_empty());
+    assert!(
+        sent(&effects)
+            .iter()
+            .any(|(_, d, r)| d.to == To::Node(1) && *r == LiveRequest::Server(ServerRequest::Info))
+    );
+    // A Monitor run started on node 1 stays there when the pick moves on.
+    show(&mut app, Screen::Monitor);
+    app.handle_key(key(KeyCode::Enter));
+    let mut effects = press_all(&mut app, "prod-cache-01");
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    let node = effects.iter().find_map(|e| match e {
+        Effect::Monitor { node, .. } => Some(*node),
+        _ => None,
+    });
+    assert_eq!(node, Some(1), "{effects:?}");
+    let effects = app.handle_key(ch(']'));
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::StopMonitor { .. })),
+        "{effects:?}"
+    );
+    assert!(app.views.server.monitor.run.is_some());
+    let all = text(&render(&app, 120, 36));
+    assert!(all.contains("node 10.0.1.12:6379"), "{all}");
+}
+
+fn press_all(app: &mut App, s: &str) -> Vec<Effect> {
+    s.chars().flat_map(|c| app.handle_key(ch(c))).collect()
+}
+
+#[test]
+fn the_pick_lasts_across_a_rescan_that_keeps_its_node() {
+    let (mut app, id) = live_cluster();
+    show(&mut app, Screen::Overview);
+    app.handle_key(ch(']'));
+    app.handle_key(ch(']'));
+    assert_eq!(app.session.as_ref().unwrap().picked, 2);
+    // A rescan whose list still has the node (same ID and address): kept.
+    show(&mut app, Screen::Patterns);
+    app.handle_key(ch('r'));
+    let scan = scan_of(&app);
+    app.apply(Msg::Nodes {
+        id,
+        scan,
+        nodes: fixtures::live_nodes(),
+    });
+    assert_eq!(app.session.as_ref().unwrap().picked, 2);
+    // A list without it (the node moved): back to the first primary.
+    let mut moved = fixtures::live_nodes();
+    moved[2].endpoint.port = 7000;
+    moved[0].role = crate::model::NodeRole::Replica;
+    app.apply(Msg::Nodes {
+        id,
+        scan,
+        nodes: moved,
+    });
+    assert_eq!(app.session.as_ref().unwrap().picked, 1);
+    // A replaced run's list is ignored.
+    app.apply(Msg::Nodes {
+        id,
+        scan: scan - 1,
+        nodes: Vec::new(),
+    });
+    assert_eq!(app.session.as_ref().unwrap().nodes.len(), 3);
+}
+
+#[test]
+fn writes_go_to_the_slot_owner_and_are_refused_across_slots_or_on_a_replica() {
+    use super::app::views::write_dest;
+    use crate::write::WriteOp;
+    let (mut app, _) = live_cluster();
+    let s = app.session.as_ref().unwrap();
+    let hset = |key: &str| WriteOp::HSet {
+        key: key.into(),
+        field: crate::value::Raw::from("f"),
+        value: crate::value::Raw::from("v"),
+    };
+    // "bar" is slot 5061, node 0's; "foo" 12182, node 2's: routed by key.
+    assert_eq!(write_dest(s, &hset("bar")), Ok(Dest::key("bar")));
+    assert_eq!(write_dest(s, &hset("foo")), Ok(Dest::key("foo")));
+    // Keyless writes go to the picked node.
+    assert_eq!(write_dest(s, &WriteOp::SlowlogReset), Ok(Dest::node(0)));
+    // A WATCH write follows only a MOVED of its WATCH.
+    let set = WriteOp::SetString {
+        key: "bar".into(),
+        old: crate::value::Raw::from("a"),
+        value: crate::value::Raw::from("b"),
+    };
+    assert_eq!(
+        write_dest(s, &set),
+        Ok(Dest::key("bar").follow(crate::live::Follow::MovedOnFirst))
+    );
+    // Rename across slots: refused before asking; within one hash tag it goes.
+    let rename = |a: &str, b: &str| WriteOp::Rename {
+        key: a.into(),
+        new: b.into(),
+    };
+    let err = write_dest(s, &rename("foo", "bar")).unwrap_err();
+    assert!(err.contains(crate::live::CROSSSLOT), "{err}");
+    assert_eq!(
+        write_dest(s, &rename("{u}a", "{u}b")),
+        Ok(Dest::key("{u}a"))
+    );
+    // A shard read on a replica takes no writes.
+    let s = app.session.as_mut().unwrap();
+    s.nodes[2].role = crate::model::NodeRole::Replica;
+    let err = write_dest(s, &hset("foo")).unwrap_err();
+    assert!(
+        err.contains("this shard was read on a replica; connect without prefer_replica to write"),
+        "{err}"
+    );
+    assert!(write_dest(s, &hset("bar")).is_ok());
+}
+
+#[test]
+fn a_read_only_cluster_profile_sends_no_write_to_any_node() {
+    let (mut app, _) = live_cluster();
+    assert!(app.session.as_ref().unwrap().profile.is_read_only());
+    for node in 0..3 {
+        show(&mut app, Screen::SlowLog);
+        while app.session.as_ref().unwrap().picked != node {
+            app.handle_key(ch(']'));
+        }
+        for k in ['R', 'c'] {
+            let effects = app.handle_key(ch(k));
+            assert!(
+                !effects.iter().any(|e| matches!(
+                    e,
+                    Effect::Live {
+                        req: LiveRequest::Write(_),
+                        ..
+                    }
+                )),
+                "{k} on node {node}: {effects:?}"
+            );
+            app.handle_key(key(KeyCode::Esc));
+        }
+    }
+}
+
+#[test]
+fn overview_with_the_per_shard_summary_80x24() {
+    let (mut app, _) = live_cluster();
+    let effects = super::app::views::testing::show(&mut app, Screen::Overview);
+    let reqs = sent(&effects);
+    // The Overview's own poll, then the summary's three; the third shard never answers.
+    info_reply(&mut app, reqs[0].0, shard_sample(0));
+    info_reply(&mut app, reqs[1].0, shard_sample(0));
+    info_reply(&mut app, reqs[2].0, shard_sample(1));
+    super::app::views::testing::reply(
+        &mut app,
+        reqs[3].0,
+        Err(crate::live::LiveError::Failed("INFO failed".into())),
+    );
+    let t = render(&app, 80, 24);
+    let all = text(&t);
+    assert!(all.contains("✗ no answer"), "{all}");
+    assert!(all.contains("node 10.0.1.11:6379 · 1 of 3"), "{all}");
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn the_per_shard_summary_polls_at_most_every_5_s_only_while_shown() {
+    let (mut app, _) = live_cluster();
+    let t0 = std::time::Instant::now();
+    app.apply(Msg::TickAt(t0));
+    let effects = super::app::views::testing::show(&mut app, Screen::Overview);
+    let reqs = sent(&effects);
+    assert_eq!(reqs.len(), 4);
+    for (id, _, _) in &reqs {
+        info_reply(&mut app, *id, shard_sample(0));
+    }
+    let summary = |effects: &[Effect]| {
+        sent(effects)
+            .iter()
+            .filter(|(_, d, _)| d.to != To::Node(0))
+            .count()
+    };
+    // At 2 s the Overview polls again, the summary does not.
+    let effects = app.apply(Msg::TickAt(t0 + std::time::Duration::from_secs(2)));
+    assert_eq!(summary(&effects), 0, "{effects:?}");
+    let effects = app.apply(Msg::TickAt(t0 + std::time::Duration::from_secs(5)));
+    assert_eq!(summary(&effects), 2, "{effects:?}");
+    // Off screen: nothing.
+    show(&mut app, Screen::Patterns);
+    let effects = app.apply(Msg::TickAt(t0 + std::time::Duration::from_secs(60)));
+    assert!(sent(&effects).is_empty());
 }

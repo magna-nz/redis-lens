@@ -24,7 +24,7 @@
 
 use redis::Value;
 
-use super::{Conn, LiveError, error_for, query, query_pipe};
+use super::{LiveConn, LiveError, error_for, query, query_pipe};
 use crate::budget::Budget;
 use crate::model::{KeyType, ServerFlavor, Ttl};
 use crate::value::Raw;
@@ -251,7 +251,11 @@ fn major_minor(version: &str) -> Option<(u64, u64)> {
 }
 
 /// Runs one request. Every command goes through `budget`.
-pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply, LiveError> {
+pub async fn run(
+    conn: &mut impl LiveConn,
+    budget: &Budget,
+    req: Request,
+) -> Result<Reply, LiveError> {
     let mut refused = Vec::new();
     let (type_name, kind, items, next) = match &req.at {
         None => {
@@ -309,7 +313,7 @@ pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply
 
 /// Sends a page's commands for `kind` on their own and reads them.
 async fn read_page(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     key: &str,
     kind: &Kind,
@@ -639,7 +643,7 @@ pub fn json_size_ok(size: Option<u64>) -> bool {
 
 /// `HTTL key FIELDS n …` for a page's fields.
 async fn field_ttls(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     key: &str,
     mut fields: Vec<Field>,

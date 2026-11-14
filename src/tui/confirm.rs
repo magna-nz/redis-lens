@@ -331,12 +331,21 @@ impl App {
                         "Not sent: the live connection is not open.".into(),
                     );
                 }
+                // Checked when it was asked; the node table is the same.
+                let to = match super::views::write_dest(s, &op) {
+                    Ok(to) => to,
+                    Err(why) => {
+                        self.set_error(why.clone());
+                        return self.write_failed(id, owner, why);
+                    }
+                };
                 match Permit::grant(op, &s.profile, &self.settings, &s.refusals, &answer) {
                     Ok(permit) => {
                         self.live_writes.insert(id, permit.op().command());
                         vec![Effect::Live {
                             id: s.id,
                             req_id: id,
+                            to,
                             req: LiveRequest::Write(permit),
                         }]
                     }

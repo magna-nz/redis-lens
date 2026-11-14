@@ -104,6 +104,79 @@ pub struct ServerState {
     write: Option<(ReqId, Sent)>,
     /// The second setting of the form, sent once the first one went through.
     then: Option<WriteOp>,
+    /// The per-shard summary of a cluster's Overview.
+    pub shards: Shards,
+}
+
+/// The per-shard summary polls at most this often, or at the Overview's interval when
+/// that is longer (spec "Cluster live views (P4)").
+pub const SHARDS_EVERY: Duration = Duration::from_secs(5);
+
+/// The per-shard summary below a cluster's Overview: one `INFO` per shard's node, each
+/// from that node's budget, only while the Overview is shown and polling is not paused.
+#[derive(Debug, Default)]
+pub struct Shards {
+    /// One per node of `session.nodes`, in slot order.
+    pub rows: Vec<ShardRow>,
+    sent: Option<Instant>,
+}
+
+/// One shard's row: its last `INFO`, and whether its last poll failed.
+#[derive(Debug, Default)]
+pub struct ShardRow {
+    in_flight: Option<ReqId>,
+    pub last: Option<InfoSample>,
+    /// The node did not answer the last poll (drawn as ✗).
+    pub failed: bool,
+}
+
+impl Shards {
+    fn busy(&self, act: &Act<'_>) -> bool {
+        self.rows
+            .iter()
+            .any(|r| r.in_flight.is_some_and(|id| act.in_flight(id)))
+    }
+
+    /// Sends one `INFO` to each node when the summary is due. Nothing on a standalone
+    /// server.
+    fn poll(&mut self, every: Duration, act: &mut Act<'_>) {
+        let n = act.session.nodes.len();
+        if n == 0 || !act.live_ready() || self.busy(act) {
+            return;
+        }
+        let due = match (act.now, self.sent) {
+            (Some(now), Some(sent)) => now.saturating_duration_since(sent) >= every,
+            (_, None) => true,
+            (None, Some(_)) => false,
+        };
+        if !due {
+            return;
+        }
+        self.rows.resize_with(n, ShardRow::default);
+        for (i, row) in self.rows.iter_mut().enumerate() {
+            row.in_flight = act.send_to(
+                crate::live::Dest::node(i),
+                LiveRequest::Server(Request::Info),
+            );
+        }
+        self.sent = act.now;
+    }
+
+    /// The answer to one of the summary's requests. False when `id` is not one.
+    fn reply(&mut self, id: ReqId, result: &Result<LiveReply, LiveError>) -> bool {
+        let Some(row) = self.rows.iter_mut().find(|r| r.in_flight == Some(id)) else {
+            return false;
+        };
+        row.in_flight = None;
+        match result {
+            Ok(LiveReply::Server(Reply::Info { sample, .. })) => {
+                row.last = Some((**sample).clone());
+                row.failed = false;
+            }
+            _ => row.failed = true,
+        }
+        true
+    }
 }
 
 impl Default for ServerState {
@@ -118,6 +191,7 @@ impl Default for ServerState {
             form: None,
             write: None,
             then: None,
+            shards: Shards::default(),
         }
     }
 }
@@ -169,6 +243,18 @@ pub fn slowlog_ops(form: &Form, known: Option<SlowConfig>) -> Result<Vec<WriteOp
 }
 
 impl ServerState {
+    /// Another node of the cluster was picked: what Overview, Clients and the Slow log
+    /// show belonged to the last one, so it goes (the sparklines start again). A
+    /// running Monitor stays on its node; the per-shard summary covers every node.
+    /// The command key specs are the same on every node and are kept.
+    pub fn node_changed(&mut self) {
+        self.overview = Overview::default();
+        self.clients = Clients::default();
+        let specs = std::mem::take(&mut self.slow.specs);
+        self.slow = SlowLog::default();
+        self.slow.specs = specs;
+    }
+
     /// The `CONFIG SET`s the form sends as filled now, as the prompt shows them, or
     /// what is wrong: for the form's "Sends:" line.
     pub fn form_sends(&self) -> Option<Result<String, String>> {
@@ -420,11 +506,12 @@ impl ViewState for ServerState {
             return;
         };
         // Paused: fetch only what has never been fetched.
-        if self.paused && self.poll(panel).got {
-            return;
-        }
-        if self.due(panel, act) {
+        if !(self.paused && self.poll(panel).got) && self.due(panel, act) {
             self.send(panel, act);
+        }
+        if panel == Panel::Overview && !self.paused {
+            let every = self.interval().max(SHARDS_EVERY);
+            self.shards.poll(every, act);
         }
     }
 
@@ -435,6 +522,10 @@ impl ViewState for ServerState {
         };
         if !self.paused && act.live_ready() && self.due(panel, act) {
             self.send(panel, act);
+        }
+        if panel == Panel::Overview && !self.paused {
+            let every = self.interval().max(SHARDS_EVERY);
+            self.shards.poll(every, act);
         }
     }
 
@@ -535,6 +626,9 @@ impl ViewState for ServerState {
         {
             self.write = None;
             self.write_reply(sent, result, act);
+            return;
+        }
+        if self.shards.reply(id, &result) {
             return;
         }
         let Some(panel) = Panel::ALL
@@ -1254,6 +1348,8 @@ pub struct Monitor {
     /// The `COMMAND INFO` lookups of the ranking.
     lookup: Poll,
     rank: Rank,
+    /// On a cluster, the node the last run went to: it stays there until it ends.
+    pub node: Option<crate::model::Endpoint>,
 }
 
 impl Monitor {
@@ -1343,8 +1439,10 @@ impl ServerState {
             act.info("The live connection is not open, so MONITOR cannot start.");
             return;
         };
+        let node = act.session.picked_node().map(|n| n.endpoint.clone());
         let m = &mut self.monitor;
         m.run = Some(run);
+        m.node = node;
         m.ready = false;
         m.started = None;
         m.ended = None;

@@ -145,6 +145,15 @@ const RESCAN: KeyHelp = k(
 const SNAPSHOT: KeyHelp = k("s", "s", "Snapshot", "Save a scan snapshot file", true);
 const REFRESH: KeyHelp = k("r", "r", "Refresh", "Refresh this panel now", true);
 const PAUSE: KeyHelp = k("p", "p", "Pause", "Pause or resume polling", true);
+/// `[` `]` on the views that read the picked node of a cluster: only in the overlay,
+/// so the key bars still fit 80 columns.
+const PICK_NODE: KeyHelp = k(
+    "[ ]",
+    "[ ]",
+    "Node",
+    "Pick the previous or next node (cluster only)",
+    false,
+);
 
 static CONNECTIONS: [KeyHelp; 6] = [
     MOVE,
@@ -317,7 +326,7 @@ static BIG_KEYS: [KeyHelp; 7] = [MOVE, PAGE, ENDS, PANEL, COPY_KEY, RESCAN, SNAP
 
 static EXPIRY: [KeyHelp; 3] = [PANEL, RESCAN, SNAPSHOT];
 
-static OVERVIEW: [KeyHelp; 4] = [
+static OVERVIEW: [KeyHelp; 5] = [
     PANEL,
     PAUSE,
     k(
@@ -328,9 +337,10 @@ static OVERVIEW: [KeyHelp; 4] = [
         true,
     ),
     REFRESH,
+    PICK_NODE,
 ];
 
-static CLIENTS: [KeyHelp; 9] = [
+static CLIENTS: [KeyHelp; 10] = [
     MOVE,
     PAGE,
     ENDS,
@@ -346,9 +356,10 @@ static CLIENTS: [KeyHelp; 9] = [
     PAUSE,
     REFRESH,
     k("K", "K", "Kill", "Kill the selected connection", false),
+    PICK_NODE,
 ];
 
-static SLOW_LOG: [KeyHelp; 8] = [
+static SLOW_LOG: [KeyHelp; 9] = [
     MOVE,
     PAGE,
     ENDS,
@@ -363,9 +374,10 @@ static SLOW_LOG: [KeyHelp; 8] = [
         false,
     ),
     k("R", "R", "Reset", "Reset the slow log", false),
+    PICK_NODE,
 ];
 
-static MONITOR: [KeyHelp; 6] = [
+static MONITOR: [KeyHelp; 7] = [
     k("↑↓ j k", "↑↓", "Scroll", "Scroll the lines", true),
     PAGE,
     ENDS,
@@ -378,6 +390,7 @@ static MONITOR: [KeyHelp; 6] = [
         true,
     ),
     k("esc", "esc", "Stop", "Stop MONITOR now", true),
+    PICK_NODE,
 ];
 
 /// `f` on the screens that show a value: the key detail, stream entries, a Search result.
@@ -450,7 +463,7 @@ static STREAMS: [KeyHelp; 14] = [
     k("X", "X", "Trim", "Trim the stream", false),
 ];
 
-static PUBSUB: [KeyHelp; 12] = [
+static PUBSUB: [KeyHelp; 13] = [
     MOVE,
     PAGE,
     ENDS,
@@ -475,9 +488,10 @@ static PUBSUB: [KeyHelp; 12] = [
     PAUSE,
     REFRESH,
     k("P", "P", "Publish", "Publish a message", false),
+    PICK_NODE,
 ];
 
-static SEARCH: [KeyHelp; 14] = [
+static SEARCH: [KeyHelp; 15] = [
     k(
         "↑↓ j k",
         "↑↓",
@@ -516,6 +530,7 @@ static SEARCH: [KeyHelp; 14] = [
         "Drop the selected index (its documents stay)",
         false,
     ),
+    PICK_NODE,
 ];
 
 static NODES: [KeyHelp; 7] = [

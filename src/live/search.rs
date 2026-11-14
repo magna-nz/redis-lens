@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use redis::{ErrorKind, RedisError, RedisResult, ServerErrorKind, Value};
 
 use super::streams::{field, pairs, text, uint};
-use super::{Conn, LiveError, error_for, is_unknown_command, query, query_pipe};
+use super::{LiveConn, LiveError, error_for, is_unknown_command, query, query_pipe};
 use crate::budget::Budget;
 use crate::value::{self, Raw};
 
@@ -157,7 +157,11 @@ pub struct FieldInfo {
 }
 
 /// Runs one request. Every command goes through `budget`.
-pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply, LiveError> {
+pub async fn run(
+    conn: &mut impl LiveConn,
+    budget: &Budget,
+    req: Request,
+) -> Result<Reply, LiveError> {
     match req {
         Request::Indexes => indexes(conn, budget).await.map(Reply::Indexes),
         Request::Search { index, query } => {
@@ -201,7 +205,7 @@ pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply
 /// wait for the budget not included). Like [`query`], except that a failure is read by
 /// [`query_error`].
 async fn timed(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     name: &str,
     cmd: &redis::Cmd,
@@ -258,7 +262,7 @@ fn cut_chars(s: &str, max: usize) -> String {
     out
 }
 
-async fn indexes(conn: &mut Conn, budget: &Budget) -> Result<IndexList, LiveError> {
+async fn indexes(conn: &mut impl LiveConn, budget: &Budget) -> Result<IndexList, LiveError> {
     let listed: Value = query(conn, budget, "FT._LIST", &redis::cmd("FT._LIST")).await?;
     let mut names = parse_names(&listed);
     names.sort();

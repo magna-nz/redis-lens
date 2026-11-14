@@ -70,7 +70,13 @@ impl AnalysisState {
         }
         let Some(report) = act.report() else { return };
         let rid = report_id(report);
-        if self.loaded_for.as_ref() == Some(&rid) || self.loading.is_some() || !act.live_ready() {
+        // On a cluster the keys live on several nodes: not read yet (each key goes to
+        // its slot owner once that lands).
+        if self.loaded_for.as_ref() == Some(&rid)
+            || self.loading.is_some()
+            || !act.live_ready()
+            || act.is_cluster()
+        {
             return;
         }
         let big: std::collections::HashSet<&str> =

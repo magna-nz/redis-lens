@@ -25,7 +25,7 @@ use redis::{ErrorKind, RedisError, RedisResult, ServerErrorKind, Value};
 
 use super::command;
 use super::streams::{field, pairs, text};
-use super::{Conn, LiveError, error_for, is_unknown_command, query};
+use super::{LiveConn, LiveError, error_for, is_unknown_command, query};
 use crate::budget::Budget;
 use crate::value;
 
@@ -486,7 +486,11 @@ impl fmt::Debug for Output {
 }
 
 /// Runs one request. Every command takes one from `budget`.
-pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply, LiveError> {
+pub async fn run(
+    conn: &mut impl LiveConn,
+    budget: &Budget,
+    req: Request,
+) -> Result<Reply, LiveError> {
     match req {
         Request::Info { name } => {
             let mut c = redis::cmd("COMMAND");

@@ -902,6 +902,7 @@ mod tests {
                 profile,
                 secrets,
                 to,
+                ..
             },
         ] = &effects[..]
         else {

@@ -267,6 +267,7 @@ impl App {
             Effect::Live {
                 id: s.id,
                 req_id: id,
+                to: crate::live::Dest::node(s.picked),
                 req: LiveRequest::Bulk(req),
             },
         ))
