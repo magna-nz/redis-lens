@@ -245,7 +245,21 @@ pub enum RecKind {
     MixedTtl,
     /// A pattern that never expires and is not growing.
     PersistentStable,
+    /// A `volatile-*` eviction policy while the sample has few or no keys with a TTL.
+    VolatileNoTtl,
+    /// `noeviction` with memory close to `maxmemory`.
+    NoEvictionFull,
+    /// The eviction policy is not LFU, so `OBJECT FREQ` is unavailable.
+    LfuOff,
 }
+
+/// A `volatile-*` policy is blind when fewer than this share of the sampled keys has a
+/// TTL.
+pub const VOLATILE_TTL_SHARE: f64 = 0.05;
+/// Sampled keys needed before the `volatile-*` rule speaks.
+pub const VOLATILE_MIN_SAMPLED: u64 = 10;
+/// `noeviction` is called full at this share of `maxmemory`.
+pub const NOEVICTION_FULL_SHARE: f64 = 0.9;
 
 /// One line of the Recommendations list: what was found, and what to do about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,6 +403,72 @@ fn encoding_recs(
     }
 }
 
+/// The eviction policy against what the sample and the server's memory show. An empty
+/// policy is unknown and says nothing.
+fn eviction_recs(report: &ScanReport, out: &mut Vec<Recommendation>) {
+    let s = &report.server;
+    let policy = s.maxmemory_policy.trim();
+    if policy.is_empty() {
+        return;
+    }
+    let sampled: u64 = report.patterns.iter().map(|p| p.sampled_keys).sum();
+    let with_ttl: u64 = report
+        .patterns
+        .iter()
+        .map(|p| p.sampled_keys.saturating_sub(p.no_ttl))
+        .sum();
+    if policy.starts_with("volatile-")
+        && sampled >= VOLATILE_MIN_SAMPLED
+        && (with_ttl as f64 / sampled as f64) < VOLATILE_TTL_SHARE
+    {
+        let what = if with_ttl == 0 {
+            "none of the sampled keys has a TTL".to_string()
+        } else {
+            format!(
+                "only {} of the sampled keys have a TTL",
+                format::percent(with_ttl as f64 / sampled as f64)
+            )
+        };
+        let limit = if s.maxmemory > 0 {
+            "writes fail once memory reaches maxmemory"
+        } else {
+            "writes will fail once maxmemory is set and reached"
+        };
+        out.push(Recommendation {
+            severity: Severity::Warn,
+            text: format!("The policy is {policy}, but {what}."),
+            hint: format!(
+                "It only evicts keys that have a TTL, so it cannot free memory and {limit}. Set TTLs, or use an allkeys-* policy."
+            ),
+            kind: RecKind::VolatileNoTtl,
+        });
+    }
+    if policy == "noeviction"
+        && s.maxmemory > 0
+        && s.used_memory as f64 >= s.maxmemory as f64 * NOEVICTION_FULL_SHARE
+    {
+        out.push(Recommendation {
+            severity: Severity::Warn,
+            text: format!(
+                "Memory is at {} of maxmemory with the noeviction policy.",
+                format::percent(s.used_memory as f64 / s.maxmemory as f64)
+            ),
+            hint: "Redis will refuse writes at the limit. Raise maxmemory, free memory, or use an eviction policy such as allkeys-lru.".to_string(),
+            kind: RecKind::NoEvictionFull,
+        });
+    }
+    if !s.lfu_enabled() {
+        out.push(Recommendation {
+            severity: Severity::Info,
+            text: format!(
+                "The policy is {policy}, so the server keeps no access counters and Hot keys cannot rank by them."
+            ),
+            hint: "Set maxmemory-policy to allkeys-lfu (or volatile-lfu) to get them, or run Server › Monitor to count the keys the commands name.".to_string(),
+            kind: RecKind::LfuOff,
+        });
+    }
+}
+
 /// Every rule of spec "2 Analysis", most important first; within a severity, in the
 /// spec's order. `facts` holds what the live connection read for the keys of
 /// [`keys_to_check`]; keys missing from it are left out of the rules that need it.
@@ -463,6 +543,7 @@ pub fn recommendations(
             kind,
         });
     }
+    eviction_recs(report, &mut out);
     // Stable: the spec's order stays within a severity.
     out.sort_by_key(|r| r.severity);
     out
@@ -516,7 +597,7 @@ mod tests {
                 mode: ServerMode::Standalone,
                 used_memory: 0,
                 maxmemory: 0,
-                maxmemory_policy: "noeviction".into(),
+                maxmemory_policy: "allkeys-lfu".into(),
                 total_keys: 0,
             },
             sampled_keys: patterns.iter().map(|p| p.sampled_keys).sum(),
@@ -905,5 +986,113 @@ mod tests {
         assert_eq!(pattern_of(&r, "lock:billing-run"), "lock:{var}");
         assert_eq!(pattern_of(&r, "user:7:cart"), "user:{id}:cart");
         assert_eq!(pattern_of(&r, "other:7"), "other:{id}");
+    }
+
+    fn with_policy(policy: &str, used: u64, max: u64, patterns: Vec<PatternStats>) -> ScanReport {
+        let mut r = report(patterns);
+        r.server.maxmemory_policy = policy.into();
+        r.server.used_memory = used;
+        r.server.maxmemory = max;
+        r
+    }
+
+    fn kinds(r: &ScanReport) -> Vec<RecKind> {
+        recommendations(r, None, &HashMap::new())
+            .iter()
+            .map(|r| r.kind)
+            .filter(|k| {
+                matches!(
+                    k,
+                    RecKind::VolatileNoTtl | RecKind::NoEvictionFull | RecKind::LfuOff
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn volatile_policy_without_ttl_keys_is_flagged() {
+        let r = with_policy(
+            "volatile-lru",
+            10,
+            100,
+            vec![stats("a:{id}", KeyType::String, 100, 100, 1_000)],
+        );
+        let recs = recommendations(&r, None, &HashMap::new());
+        let rec = recs
+            .iter()
+            .find(|r| r.kind == RecKind::VolatileNoTtl)
+            .unwrap();
+        assert_eq!(rec.severity, Severity::Warn);
+        assert!(rec.text.contains("volatile-lru") && rec.text.contains("none"));
+        // volatile-lfu has counters: only the TTL rule fires.
+        let r = with_policy(
+            "volatile-lfu",
+            10,
+            100,
+            vec![stats("a:{id}", KeyType::String, 100, 97, 1_000)],
+        );
+        assert_eq!(kinds(&r), vec![RecKind::VolatileNoTtl]);
+    }
+
+    #[test]
+    fn volatile_policy_with_enough_ttl_keys_or_too_few_samples_is_quiet() {
+        let r = with_policy(
+            "volatile-lfu",
+            0,
+            0,
+            vec![stats("a:{id}", KeyType::String, 100, 50, 1_000)],
+        );
+        assert!(kinds(&r).is_empty());
+        let r = with_policy(
+            "volatile-lfu",
+            0,
+            0,
+            vec![stats("a:{id}", KeyType::String, 5, 5, 100)],
+        );
+        assert!(kinds(&r).is_empty());
+    }
+
+    #[test]
+    fn noeviction_near_maxmemory_is_flagged_only_with_a_limit() {
+        let p = || vec![stats("a:{id}", KeyType::String, 100, 50, 1_000)];
+        let r = with_policy("noeviction", 95, 100, p());
+        assert!(kinds(&r).contains(&RecKind::NoEvictionFull));
+        assert!(kinds(&r).contains(&RecKind::LfuOff));
+        assert!(
+            !kinds(&with_policy("noeviction", 50, 100, p())).contains(&RecKind::NoEvictionFull)
+        );
+        // No limit: memory cannot be near it.
+        assert!(
+            !kinds(&with_policy("noeviction", 1 << 40, 0, p())).contains(&RecKind::NoEvictionFull)
+        );
+        // Other policies evict.
+        assert!(
+            !kinds(&with_policy("allkeys-lru", 99, 100, p())).contains(&RecKind::NoEvictionFull)
+        );
+    }
+
+    #[test]
+    fn lfu_off_says_how_to_get_it_and_lfu_is_quiet() {
+        let p = || vec![stats("a:{id}", KeyType::String, 100, 50, 1_000)];
+        let recs = recommendations(
+            &with_policy("allkeys-lru", 0, 0, p()),
+            None,
+            &HashMap::new(),
+        );
+        let rec = recs.iter().find(|r| r.kind == RecKind::LfuOff).unwrap();
+        assert_eq!(rec.severity, Severity::Info);
+        assert!(rec.hint.contains("allkeys-lfu") && rec.hint.contains("Monitor"));
+        assert!(kinds(&with_policy("allkeys-lfu", 0, 0, p())).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_policy_says_nothing() {
+        let r = with_policy(
+            "",
+            99,
+            100,
+            vec![stats("a:{id}", KeyType::String, 100, 100, 1_000)],
+        );
+        assert!(kinds(&r).is_empty());
     }
 }

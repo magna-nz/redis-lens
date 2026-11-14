@@ -1276,11 +1276,17 @@ fn is_press(key: &KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
-/// `y` and `Y` copy on Patterns, TTL, Diff and Hot keys.
+/// `y` and `Y` copy on Patterns, TTL, Diff and Hot keys; `y` alone on the Slow log
+/// and Monitor.
 fn copies(screen: Screen) -> bool {
     matches!(
         screen,
-        Screen::Patterns | Screen::Ttl | Screen::Diff | Screen::HotKeys
+        Screen::Patterns
+            | Screen::Ttl
+            | Screen::Diff
+            | Screen::HotKeys
+            | Screen::SlowLog
+            | Screen::Monitor
     )
 }
 
@@ -2792,6 +2798,10 @@ impl App {
             }
         };
         let text = match self.screen() {
+            // A command line has no scan command: `Y` does nothing there.
+            Screen::SlowLog | Screen::Monitor if command => return Vec::new(),
+            Screen::SlowLog => self.views.server.slow.copy_text().map(Some),
+            Screen::Monitor => self.views.server.monitor.copy_text().map(Some),
             Screen::Patterns => self.selected_pattern_label().map(of_pattern),
             Screen::Ttl => self.selected_ttl_pattern().map(of_pattern),
             Screen::Diff => self.selected_diff_pattern().map(of_pattern),
