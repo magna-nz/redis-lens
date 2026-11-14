@@ -1,0 +1,28 @@
+---
+source: src/tui/ui/overview.rs
+expression: t
+---
+" prod-cache-01   PROD   read-only   cluster · 3 shards     ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"┌─ node 10.0.1.11:6379 · 1 of 3 ─────────── [ ] picks a node · INFO every 2 s ─┐"
+"│ ops/s         100 ·▄▄▄                 clients        10 ▁█▅▁                │"
+"│ memory       982K ▁▃▆█ of 3.8M         hit rate      90% ·▄▄▄                │"
+"│ evicted     0.5/s ·▄▄▄                 expired     5.0/s ·▄▄▄                │"
+"│ Redis 7.4.2 · up 16m 46s · primary, 1 replica · RDB ok · AOF off · allkeys-l…│"
+"│                                                                              │"
+"│ SHARD SLOTS  NODE             ROLE     OPS/S MEMORY   KEYS                   │"
+"│›0-5460       10.0.1.11:6379   primary      —   982K   400K                   │"
+"│ 5461-10922   10.0.1.12:6379   primary      —   982K   401K                   │"
+"│ 10923-16383  10.0.1.13:6379   primary      —   982K   402K                   │"
+"├─ Keys ─────────────────────────────────── 100,000 sampled keys at 14:02 UTC ─┤"
+"│ 7.92M keys · 31% have a TTL · 13G of data, 2.1G overhead                     │"
+"│                                                                              │"
+"│ THINGS TO LOOK AT                                             WHERE          │"
+"│ › ▲ 12% of cache:search:{hash} keys never expire while the r… Expiry         │"
+"│   ▲ 31% of user:{id}:cart keys never expire while the rest d… Expiry         │"
+"│   ● tmp:import:{ulid} never expires.                          Expiry         │"
+"│                                                                              │"
+"│ WHERE THE MEMORY IS                                                          │"
+"│   session:{uuid}     ███████▎░░░░░░░░  46%     6.1G                          │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" ↑↓ Move   enter Go there   r Analyze keys   v More            : Command  ? Help"

@@ -255,6 +255,26 @@ impl ServerState {
         self.slow.specs = specs;
     }
 
+    /// What the connect read once for `panel` (Slow log or Clients: `SLOWLOG GET`,
+    /// `CLIENT LIST`), taken as that panel's answer, with no poll in flight or timed:
+    /// the panel reads again when it is first shown. A refusal turns the panel off with
+    /// its fixed text, as a poll's would.
+    pub fn connect_read(&mut self, panel: Panel, result: Result<LiveReply, LiveError>) {
+        if !matches!(panel, Panel::SlowLog | Panel::Clients) {
+            return;
+        }
+        match result {
+            Ok(LiveReply::Server(reply)) => {
+                let p = self.poll_mut(panel);
+                p.failed = None;
+                p.got = true;
+                self.apply(reply);
+            }
+            Ok(_) => {}
+            Err(e) => self.failed(panel, &e),
+        }
+    }
+
     /// The `CONFIG SET`s the form sends as filled now, as the prompt shows them, or
     /// what is wrong: for the form's "Sends:" line.
     pub fn form_sends(&self) -> Option<Result<String, String>> {
@@ -567,7 +587,12 @@ impl ViewState for ServerState {
             (_, KeyCode::Char('p')) => {
                 self.paused = !self.paused;
                 if self.paused {
-                    act.info("Polling paused. r fetches once.");
+                    // On Overview `r` analyzes the keys; elsewhere it still fetches once.
+                    act.info(if panel == Panel::Overview {
+                        "Live figures paused. p resumes."
+                    } else {
+                        "Polling paused. r fetches once."
+                    });
                 } else {
                     act.info("Polling resumed.");
                     if !self.poll(panel).busy(act) && self.poll(panel).off.is_none() {

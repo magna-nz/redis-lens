@@ -1,6 +1,5 @@
 ---
 source: src/tui/dbs.rs
-assertion_line: 808
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " prod-cache-01   PROD   read-only   db 3 · 15G / 24G       ● analyzed 14:02 UTC "

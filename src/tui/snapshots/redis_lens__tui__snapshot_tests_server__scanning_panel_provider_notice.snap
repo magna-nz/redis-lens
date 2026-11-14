@@ -1,23 +1,22 @@
 ---
 source: src/tui/snapshot_tests_server.rs
-assertion_line: 249
 expression: t.backend()
 ---
 " prod-cache-01   PROD   read-only   Redis 7.4.2 · 15G / 24G · 7.92M keys · ▲ no sizes                   ⠋ analyzing 12% "
 "  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
-"┌─ Now ────────────────────────────────────────────────────────────────────────────────── INFO · every 2 s · p pauses ─┐"
+"┌─ Now ──────────────────────────────────────────────────────────────────────────────────── INFO every 2 s · p pauses ─┐"
 "│ Waiting for the live connection…                                                                                     │"
-"├─ Keys ─────────────────────────────────────────────────────────────────────────────────── about 40K commands in all ─┤"
+"├─ Keys ─────────────────────────────────────────────────────────────────────────────────── about 20K commands in all ─┤"
 "│ 7.92M keys · 15G used                                                                                                │"
 "│                                                                                                                      │"
-"│ ANALYZING  sampling 1,240 of 10,000 keys   █▊░░░░░░░░░░░░                                                            │"
-"│ Browse and Analyze fill in as it goes.  esc stops it.                                                                │"
+"│ ANALYZING  sampling 1,240 of 10,000 keys   ███▊░░░░░░░░░░░░░░░░░░░░░░░░░░  about 18 s left                           │"
+"│ TYPE and PTTL for each sampled key, at most 1,000 commands/s.                                                        │"
+"│ Browse and Analyze fill in as it goes.  esc stops it and keeps what it has.                                          │"
+"│                                                                                                                      │"
+"│ FROM THE SERVER                                                                              WHERE                   │"
+"│   Nothing stands out in what the server reports.                                                                     │"
 "│                                                                                                                      │"
 "│ ▲ ElastiCache Serverless restricts MEMORY and OBJECT, so sizes and hot keys are missing; counts and TTLs still work. │"
-"│                                                                                                                      │"
-"│                                                                                                                      │"
-"│                                                                                                                      │"
-"│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"

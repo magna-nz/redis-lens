@@ -1,0 +1,28 @@
+---
+source: src/tui/ui/overview.rs
+expression: t
+---
+" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys      ⠇ analyzing 41% "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"┌─ Now ──────────────────────────────────────────── INFO every 2 s · p pauses ─┐"
+"│ ops/s         100 ·▄▄▄                 clients        10 ▁█▅▁                │"
+"│ memory       982K ▁▃▆█ of 3.8M         hit rate      90% ·▄▄▄                │"
+"│ evicted     0.5/s ·▄▄▄                 expired     5.0/s ·▄▄▄                │"
+"│ Redis 7.4.2 · up 16m 46s · primary, 1 replica · RDB ok · AOF off · allkeys-l…│"
+"├─ Keys ─────────────────────────────────────────── about 40K commands in all ─┤"
+"│ 7.92M keys · 31% have a TTL · 13G of data, 2.1G overhead                     │"
+"│                                                                              │"
+"│ ANALYZING  sampling 4,100 of 10,000 keys   ███████░░░░░░░░░░  about 5 s left │"
+"│ TYPE, PTTL, MEMORY USAGE and OBJECT FREQ for each sampled key, at most 5,000…│"
+"│ Browse and Analyze fill in as it goes.  esc stops it and keeps what it has.  │"
+"│                                                                              │"
+"│ FROM THE SERVER                                               WHERE          │"
+"│ › ▲ 3 big keys, counted by the server (INFO keysizes).        Big keys       │"
+"│   ▲ KEYS took 812 ms at 14:01 UTC.                            Slow log       │"
+"│   ● 212 connections from 10.0.9.17 idle for over an hour.     Clients        │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" esc Stop   p Pause   +- Interval                              : Command  ? Help"

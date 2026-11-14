@@ -1,6 +1,5 @@
 ---
 source: src/tui/ui/overview.rs
-assertion_line: 608
 expression: "snap(&app, 80, 24)"
 ---
 " prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
@@ -9,12 +8,12 @@ expression: "snap(&app, 80, 24)"
 "│ op│ › type to find any action or screen…                                 │   │"
 "│ me│                                                                      │   │"
 "│ ev│ HERE                                                                 │   │"
-"│ up│ r              Analyze the keys: Quick (10,000) or Deep (100,000)    │   │"
-"├─ K│ ↑↓ j k         Move the selection                                    │2 ─┤"
+"│ Re│ r              Analyze the keys: Quick (10,000) or Deep (100,000)    │-l…│"
+"├─ K│ ↑↓ j k         Move the selection                                    │C ─┤"
 "│ 7.│ PgUp PgDn      Move one page                                         │   │"
 "│   │ Home End g G   Jump to the first or last row                         │   │"
 "│ TH│ enter          Go to the selected finding's panel                    │   │"
-"│ › │ esc            Stop a running analysis; drops what it sampled        │   │"
+"│ › │ esc            Stop the analysis and keep what it has sampled        │   │"
 "│   │ p              Pause or resume the live figures                      │   │"
 "│   │ + -            Poll the live figures more or less often, 1 to 60 s   │   │"
 "│   │ [ ]            Pick the previous or next node (cluster only)         │   │"

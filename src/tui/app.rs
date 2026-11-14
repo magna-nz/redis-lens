@@ -505,9 +505,11 @@ pub enum Effect {
         secrets: SecretSource,
         sample: Option<u64>,
     },
-    /// Stop session `id`'s analysis run `scan` (`esc` while it runs): its scan task is
-    /// aborted and its live connection stays open. Nothing comes back.
-    CancelAnalysis {
+    /// Stop session `id`'s analysis run `scan` (`esc` while it runs): the scan's stop
+    /// flag (`ScanOptions::stop`) is set, so it stops within one batch and sends what it
+    /// sampled as its report ([`Msg::ScanDone`], not complete). Its live connection
+    /// stays open.
+    StopAnalysis {
         id: ConnId,
         scan: ScanId,
     },
@@ -640,6 +642,32 @@ pub enum Msg {
         server: Option<ServerInfo>,
         perms: PermissionReport,
         target: ScanTarget,
+    },
+    /// The server's own figures the run read on connect (no key read), right after
+    /// [`Msg::Connected`]: Overview's "Keys" headline and the estimate of an analysis.
+    Figures {
+        id: ConnId,
+        scan: ScanId,
+        figures: views::overview::Figures,
+    },
+    /// `SLOWLOG GET` and `CLIENT LIST`, read once on connect from node `node` (0 on a
+    /// standalone server, else the first primary) where the permission check allowed
+    /// them (`None`: not sent). For the Slow log and Clients panels and Overview's
+    /// findings; after [`Msg::LiveReady`].
+    ServerReads {
+        id: ConnId,
+        scan: ScanId,
+        node: usize,
+        slow: Option<Result<crate::live::LiveReply, crate::live::LiveError>>,
+        clients: Option<Result<crate::live::LiveReply, crate::live::LiveError>>,
+    },
+    /// The newest saved snapshot of the run's profile, read from the snapshot directory
+    /// (never the server) on connect: Overview's "Last analysis" line. `None` when
+    /// there is none or the directory could not be read.
+    LastSnapshot {
+        id: ConnId,
+        scan: ScanId,
+        last: Option<views::overview::LastSnapshot>,
     },
     /// A Sentinel profile's connect asked the Sentinels: which one named the primary,
     /// and where. Sent before [`Msg::Connected`]. Holds no credential.
@@ -846,9 +874,15 @@ pub struct Session {
     /// When this run connected, in Unix seconds from [`App::set_wall_clock`]: the
     /// header's `● connected 14:02`. `None` before, or without a clock (tests).
     pub connected_at_unix: Option<i64>,
-    /// This run's analysis was stopped (`esc`): what it still sends about its scan is
-    /// ignored. Its live connection stays.
+    /// `esc` stopped this run's analysis: until its report arrives it is stopping;
+    /// after, the report on screen is the partial one it kept (marked `(stopped)`).
+    /// False again when the analysis had sampled its whole target by then.
     pub stopped: bool,
+    /// What the run read of the server itself on connect ([`Msg::Figures`]); kept
+    /// across a rescan until the new run's arrive.
+    pub figures: Option<views::overview::Figures>,
+    /// The newest saved snapshot of this profile ([`Msg::LastSnapshot`]).
+    pub last_snapshot: Option<views::overview::LastSnapshot>,
 }
 
 impl Session {
@@ -1667,6 +1701,12 @@ impl App {
 
     /// Sets the wall clock, in Unix seconds. The runtime calls it with every tick; the
     /// header shows the time a run connected from it.
+    /// The wall clock from [`App::set_wall_clock`], in Unix seconds (UTC); `None`
+    /// before the first tick, and in tests that set none.
+    pub fn wall_clock(&self) -> Option<i64> {
+        self.wall
+    }
+
     pub fn set_wall_clock(&mut self, unix: i64) {
         self.wall = Some(unix);
     }
@@ -2179,6 +2219,10 @@ impl App {
         if self.area.has_panels() && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             return self.cycle_panel(key.code == KeyCode::BackTab);
         }
+        // `esc` stops a running analysis wherever it has nothing else to do.
+        if key.code == KeyCode::Esc && self.analysis_running() && self.esc_is_free(screen) {
+            return self.stop_analysis();
+        }
         match screen {
             Screen::Connections => self.conn_key(key),
             Screen::Overview => self.overview_key(key),
@@ -2292,28 +2336,47 @@ impl App {
         }
     }
 
-    /// Overview: `↑↓` pick a finding, `enter` goes to it, `esc` stops an analysis that
-    /// runs; the rest (`p`, `+`, `-`) goes to the live figures' view state.
+    /// Overview: `↑↓` pick a finding, `enter` goes to its panel (`esc`, which stops an
+    /// analysis that runs, is handled before); the rest (`p`, `+`, `-`) goes to the
+    /// live figures' view state.
     fn overview_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        let len = self.overview_findings();
-        if let Some(to) = list_move(&key, self.overview.sel, len, self.page()) {
+        let found = views::overview::findings(self);
+        if let Some(to) = list_move(&key, self.overview.sel, found.len(), self.page()) {
             self.overview.sel = to;
             return Vec::new();
         }
-        match key.code {
-            KeyCode::Enter if len > 0 => return self.switch(Screen::BigKeys),
-            KeyCode::Esc if self.analyzing() => return self.cancel_analysis(),
-            _ => {}
+        if key.code == KeyCode::Enter
+            && let Some(f) = found.get(self.overview.sel.min(found.len().saturating_sub(1)))
+        {
+            return self.switch(f.to);
         }
         self.key_to_view(key).1
     }
 
-    /// How many findings Overview lists: today's recommendations, once analyzed.
+    /// How many findings Overview lists ([`views::overview::findings`]): what the
+    /// server says on its own, or after an analysis what it found.
     pub fn overview_findings(&self) -> usize {
-        let (Some(s), Some(r)) = (self.session.as_ref(), self.report()) else {
-            return 0;
-        };
-        crate::analysis::recommendations(r, s.diff(), &self.views.analysis.facts).len()
+        views::overview::findings(self).len()
+    }
+
+    /// True when `esc` on `screen` has nothing else to do, so it stops an analysis that
+    /// runs: no filter to clear, no node to leave, no deeper level to go back from, no
+    /// Monitor run or group of connections open. Dialogs, inputs and the command line
+    /// take `esc` before this is asked.
+    fn esc_is_free(&self, screen: Screen) -> bool {
+        match screen {
+            Screen::Overview
+            | Screen::Ttl
+            | Screen::Diff
+            | Screen::HotKeys
+            | Screen::Nodes
+            | Screen::BigKeys
+            | Screen::Slots
+            | Screen::SlowLog => true,
+            Screen::Patterns => self.patterns.filter.is_empty() && self.patterns.node.is_none(),
+            Screen::Clients => self.views.server.clients.drill.is_none(),
+            _ => false,
+        }
     }
 
     /// True while an analysis runs (connected, sampling).
@@ -2321,6 +2384,14 @@ impl App {
         self.session
             .as_ref()
             .is_some_and(|s| s.analysis.is_some() && s.phase == Phase::Scanning)
+    }
+
+    /// True from `enter` in "Analyze the keys?" until the analysis's report or failure:
+    /// its run may still be connecting. `esc` stops it then too.
+    pub fn analysis_running(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| {
+            s.analysis.is_some() && matches!(s.phase, Phase::Connecting | Phase::Scanning)
+        })
     }
 
     /// The `?` help takes every key: typing searches every action of every screen,
@@ -2468,6 +2539,16 @@ impl App {
             self.set_info("An analysis is running. Press s again when it finishes to save it.");
             return Vec::new();
         }
+        if self
+            .session
+            .as_ref()
+            .is_some_and(views::overview::stopped_early)
+        {
+            self.set_info(
+                "This analysis was stopped early, so its results are partial and are not saved. Press r to analyze again.",
+            );
+            return Vec::new();
+        }
         match self.report() {
             Some(r) => vec![Effect::SaveSnapshot(Box::new(r.clone()))],
             None if self.session.as_ref().is_some_and(|s| s.partial.is_some()) => {
@@ -2491,9 +2572,9 @@ impl App {
             return Vec::new();
         };
         match s.phase {
-            Phase::Scanning => {
-                self.set_info("An analysis is already running. esc on 1 Overview stops it.")
-            }
+            Phase::Scanning => self.set_info(
+                "An analysis is already running. esc on 1 Overview stops it and keeps what it has.",
+            ),
             Phase::Connecting => self.set_info("Still connecting. Press r again once connected."),
             _ => self.analyze = Some(views::overview::AnalyzeDialog::default()),
         }
@@ -2527,7 +2608,12 @@ impl App {
     /// connection of the replaced run goes with it: its unanswered requests are
     /// forgotten.
     fn start_analysis(&mut self, depth: views::overview::Depth) -> Vec<Effect> {
-        self.new_run(Some(depth))
+        let out = self.new_run(Some(depth));
+        if !out.is_empty() {
+            self.overview.started = self.now;
+            self.overview.announce = true;
+        }
+        out
     }
 
     /// A new run of the session on its current profile (a database switch): an
@@ -2602,33 +2688,58 @@ impl App {
         }]
     }
 
-    /// `esc` on Overview while an analysis runs: stops it and drops what it sampled.
-    /// Results kept from an earlier run stay. The live connection stays open, so this
-    /// waits until it is.
-    fn cancel_analysis(&mut self) -> Vec<Effect> {
+    /// The notice when an analysis's report arrives: `✓ Analysis done: 10,000 keys in
+    /// 7 s. 5 things to look at on 1 Overview.`, or what a stopped one kept. `None` for
+    /// a run that did not analyze.
+    fn done_notice(&self) -> Option<String> {
+        let s = self.session.as_ref()?;
+        s.analysis?;
+        if !self.overview.announce && !s.stopped {
+            return None;
+        }
+        let r = s.report.as_ref()?;
+        let keys = crate::format::grouped(r.sampled_keys);
+        let took = match (self.overview.started, self.now) {
+            (Some(a), Some(b)) if b.saturating_duration_since(a).as_secs() >= 1 => {
+                format!(
+                    " in {}",
+                    crate::format::duration(b.saturating_duration_since(a))
+                )
+            }
+            _ => String::new(),
+        };
+        if s.stopped {
+            return Some(format!(
+                "Analysis stopped: kept {keys} sampled keys{took}. The results are partial."
+            ));
+        }
+        let n = self.overview_findings();
+        let things = match n {
+            0 => "Nothing stands out".to_string(),
+            1 => "1 thing to look at".to_string(),
+            n => format!("{n} things to look at"),
+        };
+        Some(format!(
+            "✓ Analysis done: {keys} keys{took}. {things} on 1 Overview."
+        ))
+    }
+
+    /// `esc` while an analysis runs (on a screen where `esc` has nothing else to do):
+    /// asks the scan to stop ([`Effect::StopAnalysis`]). It stops within one batch and
+    /// sends what it sampled as its report, which becomes the current results, marked
+    /// stopped ([`Msg::ScanDone`]). Until then the results on screen stay.
+    fn stop_analysis(&mut self) -> Vec<Effect> {
         let Some(s) = self.session.as_mut() else {
             return Vec::new();
         };
-        if s.live != LiveState::Ready {
-            self.set_info("Still connecting: press esc again in a moment to stop the analysis.");
+        if s.stopped {
+            self.set_info("Stopping: the analysis ends after its current batch.");
             return Vec::new();
         }
-        let (id, scan) = (s.id, s.scan);
-        s.analysis = None;
-        s.progress = None;
         s.stopped = true;
-        let kept = s.previous.take().is_some() && s.report.is_some();
-        s.phase = if kept { Phase::Done } else { Phase::Connected };
-        if s.partial.take().is_some() {
-            self.patterns.tree = PatternTree::default();
-            self.patterns.sel = 0;
-        }
-        self.set_info(if kept {
-            "Analysis stopped. The earlier results stay."
-        } else {
-            "Analysis stopped. Nothing it sampled was kept."
-        });
-        vec![Effect::CancelAnalysis { id, scan }]
+        let (id, scan) = (s.id, s.scan);
+        self.set_info("Stopping the analysis. What it sampled so far is kept.");
+        vec![Effect::StopAnalysis { id, scan }]
     }
 
     /// `y` (`command` false) and `Y` on Patterns, TTL, Diff and Hot keys: the selected
@@ -3009,6 +3120,8 @@ impl App {
             analysis: None,
             connected_at_unix: None,
             stopped: false,
+            figures: None,
+            last_snapshot: None,
         });
         self.patterns = PatternsState::default();
         self.sel = ViewSel::default();
@@ -3335,6 +3448,45 @@ impl App {
                     return out;
                 }
             }
+            Msg::Figures { id, scan, figures } => {
+                if let Some(s) = self
+                    .session
+                    .as_mut()
+                    .filter(|s| s.id == id && s.scan == scan)
+                {
+                    s.figures = Some(figures);
+                }
+            }
+            Msg::ServerReads {
+                id,
+                scan,
+                node,
+                slow,
+                clients,
+            } => {
+                // Read on the node the views read (the picked one), and only then.
+                if !self.is_session(id, scan)
+                    || self.session.as_ref().is_some_and(|s| s.picked != node)
+                {
+                    return Vec::new();
+                }
+                let server = &mut self.views.server;
+                if let Some(r) = slow {
+                    server.connect_read(views::server::Panel::SlowLog, r);
+                }
+                if let Some(r) = clients {
+                    server.connect_read(views::server::Panel::Clients, r);
+                }
+            }
+            Msg::LastSnapshot { id, scan, last } => {
+                if let Some(s) = self
+                    .session
+                    .as_mut()
+                    .filter(|s| s.id == id && s.scan == scan)
+                {
+                    s.last_snapshot = last;
+                }
+            }
             Msg::Nodes { id, scan, nodes } => {
                 if !self.is_session(id, scan) {
                     return Vec::new();
@@ -3360,7 +3512,6 @@ impl App {
                     && s.id == id
                     && s.scan == scan
                     && s.phase != Phase::Done
-                    && !s.stopped
                 {
                     s.progress = Some(progress);
                 }
@@ -3368,9 +3519,10 @@ impl App {
             Msg::ScanPartial { id, scan, partial } => {
                 // Only while this session's own scan runs: not from a replaced run of
                 // the same entry, not before it is connected, not after it finished,
-                // failed or was stopped. A report on screen blocks it unless it is the
-                // previous run's, kept during an analysis. (A connect's run sends none;
-                // one that does is sampling, so it counts as analyzing.)
+                // failed. A report on screen blocks it unless it is the previous run's,
+                // kept during an analysis. (A connect's run sends none; one that does is
+                // sampling, so it counts as analyzing.) A stopping analysis still sends
+                // its last ones: they are part of what it keeps.
                 let Some(s) = self.session.as_mut() else {
                     return Vec::new();
                 };
@@ -3379,7 +3531,6 @@ impl App {
                 if s.id != id
                     || s.scan != scan
                     || !sampling
-                    || s.stopped
                     || (s.report.is_some() && s.previous.is_none())
                 {
                     return Vec::new();
@@ -3401,10 +3552,39 @@ impl App {
                 self.rebuild_patterns(anchor);
             }
             Msg::ScanDone { id, scan, report } => {
-                if !self.is_session(id, scan) || self.session.as_ref().is_some_and(|s| s.stopped) {
+                if !self.is_session(id, scan) {
                     return Vec::new();
                 }
                 let report = *report;
+                if let Some(s) = self.session.as_mut()
+                    && s.stopped
+                {
+                    // Stopped by `esc`: what it sampled is the result, unless that is
+                    // nothing (stopped before its first batch), when the results on
+                    // screen stay as they were.
+                    if report.sampled_keys == 0 {
+                        s.stopped = false;
+                        s.progress = None;
+                        s.previous = None;
+                        s.phase = if s.report.is_some() {
+                            Phase::Done
+                        } else {
+                            Phase::Connected
+                        };
+                        if s.partial.take().is_some() {
+                            self.patterns.tree = PatternTree::default();
+                            self.patterns.sel = 0;
+                        }
+                        self.overview.announce = false;
+                        self.set_info(
+                            "Analysis stopped before it sampled any key. Nothing changed.",
+                        );
+                        return Vec::new();
+                    }
+                    // It may have sampled its whole target before it saw the stop.
+                    let target = s.progress.map_or(u64::MAX, |p| p.target);
+                    s.stopped = report.sampled_keys < target;
+                }
                 if let Some(e) = self.entry_mut(id) {
                     e.server = Some(report.server.clone());
                 }
@@ -3439,6 +3619,10 @@ impl App {
                     self.patterns.node = None;
                 }
                 self.rebuild_patterns(anchor);
+                if let Some(n) = self.done_notice() {
+                    self.set_info(n);
+                }
+                self.overview.announce = false;
                 if rescan {
                     self.sel.ttl = self
                         .sel
@@ -3640,10 +3824,12 @@ impl App {
                 }
             }
             Msg::ScanFailed { id, scan, error } => {
-                if !self.is_session(id, scan) || self.session.as_ref().is_some_and(|s| s.stopped) {
+                if !self.is_session(id, scan) {
                     return Vec::new();
                 }
+                self.overview.announce = false;
                 if let Some(s) = self.session.as_mut() {
+                    s.stopped = false;
                     s.phase = Phase::Failed(error.clone());
                     // Partial results of a failed scan must not stay up as if final.
                     if s.partial.take().is_some() {
@@ -6157,7 +6343,7 @@ mod tests {
         assert!(app.analyze.is_none());
         assert_eq!(
             app.notice.clone().unwrap().text,
-            "An analysis is already running. esc on 1 Overview stops it."
+            "An analysis is already running. esc on 1 Overview stops it and keeps what it has."
         );
         assert_eq!(scan_of(&app), s2);
         // Finished: works on every report view.
@@ -7795,8 +7981,9 @@ mod tests {
         assert_eq!(app.analyze, None);
     }
 
-    #[test]
-    fn esc_on_overview_cancels_a_running_analysis() {
+    /// [`just_connected`], then a Quick analysis started and connected, its live
+    /// connection open, 4,100 of 10,000 keys sampled, its first partial results in.
+    fn analyzing() -> (App, ConnId, ScanId) {
         let (mut app, id) = just_connected();
         app.handle_key(ch('r'));
         let effects = app.handle_key(key(KeyCode::Enter));
@@ -7805,23 +7992,332 @@ mod tests {
         };
         connected(&mut app, id, scan);
         app.apply(Msg::LiveReady { id, scan });
+        app.apply(Msg::ScanProgress {
+            id,
+            scan,
+            progress: ScanProgress {
+                sampled: 4_100,
+                target: 10_000,
+                done: false,
+            },
+        });
+        app.apply(Msg::ScanPartial {
+            id,
+            scan,
+            partial: fixtures::partial(true),
+        });
         assert!(app.analyzing());
+        (app, id, scan)
+    }
+
+    /// The fixture report, as if `sampled` keys were sampled.
+    fn sampled(n: u64) -> Box<ScanReport> {
+        let mut r = fixtures::report(true);
+        r.sampled_keys = n;
+        r.complete = false;
+        Box::new(r)
+    }
+
+    #[test]
+    fn esc_stops_a_running_analysis_and_keeps_what_it_sampled() {
+        let (mut app, id, scan) = analyzing();
         let effects = app.handle_key(key(KeyCode::Esc));
         assert!(
-            matches!(effects[..], [Effect::CancelAnalysis { id: i, scan: s }] if i == id && s == scan),
+            matches!(effects[..], [Effect::StopAnalysis { id: i, scan: s }] if i == id && s == scan),
             "{effects:?}"
         );
-        assert!(!app.analyzing());
+        // It runs until its report comes; the partial results stay meanwhile.
         let s = app.session.as_ref().unwrap();
-        assert_eq!(s.phase, Phase::Connected);
-        assert_eq!(s.analysis, None);
-        // A late result of the cancelled run is ignored.
+        assert!(s.stopped && app.analyzing());
+        assert!(s.partial.is_some());
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("What it sampled so far is kept")
+        );
+        // esc again sends nothing more.
+        assert!(app.handle_key(key(KeyCode::Esc)).is_empty());
+        // The scan's last progress and its partial report are taken.
+        app.apply(Msg::ScanProgress {
+            id,
+            scan,
+            progress: ScanProgress {
+                sampled: 4_200,
+                target: 10_000,
+                done: true,
+            },
+        });
+        let effects = app.apply(Msg::ScanDone {
+            id,
+            scan,
+            report: sampled(4_200),
+        });
+        assert!(
+            matches!(effects[..], [Effect::LoadHistory { .. }]),
+            "{effects:?}"
+        );
+        let s = app.session.as_ref().unwrap();
+        assert_eq!(s.phase, Phase::Done);
+        assert_eq!(s.report.as_ref().map(|r| r.sampled_keys), Some(4_200));
+        assert!(views::overview::stopped_early(s));
+        assert!(!app.analyzing());
+        let n = app.notice.as_ref().unwrap();
+        assert!(
+            n.text
+                .starts_with("Analysis stopped: kept 4,200 sampled keys"),
+            "{}",
+            n.text
+        );
+        // A partial report is not saved as a snapshot.
+        show(&mut app, Screen::Patterns);
+        assert!(app.handle_key(ch('s')).is_empty());
+        assert!(app.notice.as_ref().unwrap().text.contains("stopped early"));
+        // A new analysis is a full one again.
+        show(&mut app, Screen::Overview);
+        app.handle_key(ch('r'));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            effects[..],
+            [Effect::Connect {
+                sample: Some(10_000),
+                ..
+            }]
+        ));
+        assert!(!app.session.as_ref().unwrap().stopped);
+    }
+
+    #[test]
+    fn esc_stops_an_analysis_only_where_it_has_nothing_else_to_do() {
+        let stops = |effects: &[Effect]| {
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::StopAnalysis { .. }))
+        };
+        // Browse › Keys with a filter: esc clears it first, then stops.
+        let (mut app, _, _) = analyzing();
+        show(&mut app, Screen::Patterns);
+        app.patterns.filter = "user".into();
+        assert!(!stops(&app.handle_key(key(KeyCode::Esc))));
+        assert!(app.patterns.filter.is_empty());
+        assert!(stops(&app.handle_key(key(KeyCode::Esc))));
+        // A pattern's keys: esc goes back up.
+        let (mut app, _, _) = analyzing();
+        show(&mut app, Screen::Patterns);
+        app.patterns.keys_open = true;
+        app.set_screen(Screen::KeyList);
+        assert!(!stops(&app.handle_key(key(KeyCode::Esc))));
+        assert_eq!(app.screen(), Screen::Patterns);
+        // A group of connections open on Clients: esc closes it.
+        let (mut app, _, _) = analyzing();
+        show(&mut app, Screen::Clients);
+        app.views.server.clients.drill = Some(views::server::GroupKey::Net("10.0.9.0/24".into()));
+        assert!(!stops(&app.handle_key(key(KeyCode::Esc))));
+        assert!(app.views.server.clients.drill.is_none());
+        assert!(stops(&app.handle_key(key(KeyCode::Esc))));
+        // On the Analyze panels and Slow log it stops at once.
+        for screen in [Screen::BigKeys, Screen::Ttl, Screen::Diff, Screen::SlowLog] {
+            let (mut app, _, _) = analyzing();
+            show(&mut app, screen);
+            assert!(stops(&app.handle_key(key(KeyCode::Esc))), "{screen:?}");
+        }
+        // Without an analysis, esc on Overview sends nothing.
+        let (mut app, _) = just_connected();
+        assert!(app.handle_key(key(KeyCode::Esc)).is_empty());
+    }
+
+    #[test]
+    fn a_stop_before_the_first_sample_keeps_the_results_on_screen() {
+        // An earlier analysis's results are on screen while the next one runs.
+        let (mut app, id, scan) = analyzing();
+        app.apply(Msg::ScanDone {
+            id,
+            scan,
+            report: sampled(10_000),
+        });
+        assert!(!views::overview::stopped_early(
+            app.session.as_ref().unwrap()
+        ));
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .text
+                .starts_with("✓ Analysis done: 10,000 keys")
+        );
+        app.handle_key(ch('r'));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { scan: s2, .. }] = effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        connected(&mut app, id, s2);
+        let effects = app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(effects[..], [Effect::StopAnalysis { .. }]));
+        // It stopped before its first batch: nothing replaces the results.
+        app.apply(Msg::ScanDone {
+            id,
+            scan: s2,
+            report: sampled(0),
+        });
+        let s = app.session.as_ref().unwrap();
+        assert_eq!(s.phase, Phase::Done);
+        assert_eq!(s.report.as_ref().map(|r| r.sampled_keys), Some(10_000));
+        assert!(!s.stopped && s.previous.is_none());
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("before it sampled any key")
+        );
+    }
+
+    #[test]
+    fn a_stop_after_the_whole_sample_is_not_marked_stopped() {
+        let (mut app, id, scan) = analyzing();
+        app.apply(Msg::ScanProgress {
+            id,
+            scan,
+            progress: ScanProgress {
+                sampled: 10_000,
+                target: 10_000,
+                done: true,
+            },
+        });
+        app.handle_key(key(KeyCode::Esc));
+        app.apply(Msg::ScanDone {
+            id,
+            scan,
+            report: sampled(10_000),
+        });
+        let s = app.session.as_ref().unwrap();
+        assert!(!s.stopped && !views::overview::stopped_early(s));
+    }
+
+    #[test]
+    fn a_stopped_analysis_that_fails_shows_the_failure() {
+        let (mut app, id, scan) = analyzing();
+        app.handle_key(key(KeyCode::Esc));
+        app.apply(Msg::ScanFailed {
+            id,
+            scan,
+            error: "the connection was lost".into(),
+        });
+        let s = app.session.as_ref().unwrap();
+        assert!(matches!(s.phase, Phase::Failed(_)));
+        assert!(!s.stopped);
+    }
+
+    #[test]
+    fn connect_figures_reads_and_the_last_snapshot_are_kept_for_their_run() {
+        let (mut app, id) = just_connected();
+        let scan = scan_of(&app);
+        let figures = views::overview::Figures {
+            server: Some(views::overview::tests::figures(Some(3))),
+            nodes: Vec::new(),
+            failed: None,
+        };
+        // Another run's are ignored.
+        app.apply(Msg::Figures {
+            id,
+            scan: scan + 7,
+            figures: figures.clone(),
+        });
+        assert!(app.session.as_ref().unwrap().figures.is_none());
+        app.apply(Msg::Figures {
+            id,
+            scan,
+            figures: figures.clone(),
+        });
+        assert_eq!(app.session.as_ref().unwrap().figures, Some(figures));
+        // The slow log and the client list fill the Server panels; a refusal turns
+        // one off with fixed text.
+        app.apply(Msg::ServerReads {
+            id,
+            scan,
+            node: 0,
+            slow: Some(Ok(views::overview::tests::slow_reply())),
+            clients: Some(Err(crate::live::LiveError::Denied("CLIENT LIST".into()))),
+        });
+        assert_eq!(app.views.server.slow.entries.len(), 2);
+        let off = app.views.server.clients.poll.off.clone().unwrap();
+        assert!(off.contains("refused CLIENT LIST"), "{off}");
+        let reasons = views::overview::off_reasons(&app);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.starts_with("Idle clients are off: the server refused CLIENT LIST")),
+            "{reasons:?} {off}"
+        );
+        // Read on a node the views do not read: dropped.
+        app.apply(Msg::ServerReads {
+            id,
+            scan,
+            node: 2,
+            slow: None,
+            clients: Some(Ok(views::overview::tests::clients_reply())),
+        });
+        assert!(app.views.server.clients.conns.is_empty());
+        let last = views::overview::LastSnapshot {
+            taken_at_unix: 1_700_000_000,
+            sampled_keys: 100_000,
+        };
+        app.apply(Msg::LastSnapshot {
+            id,
+            scan,
+            last: Some(last),
+        });
+        assert_eq!(app.session.as_ref().unwrap().last_snapshot, Some(last));
+    }
+
+    #[test]
+    fn enter_on_a_finding_goes_to_the_panel_it_names() {
+        let (mut app, id) = just_connected();
+        let scan = scan_of(&app);
+        app.apply(Msg::Figures {
+            id,
+            scan,
+            figures: views::overview::Figures {
+                server: Some(views::overview::tests::figures(Some(3))),
+                nodes: Vec::new(),
+                failed: None,
+            },
+        });
+        app.apply(Msg::ServerReads {
+            id,
+            scan,
+            node: 0,
+            slow: Some(Ok(views::overview::tests::slow_reply())),
+            clients: Some(Ok(views::overview::tests::clients_reply())),
+        });
+        let found = views::overview::findings(&app);
+        let to: Vec<Screen> = found.iter().map(|f| f.to).collect();
+        assert_eq!(to, [Screen::BigKeys, Screen::SlowLog, Screen::Clients]);
+        assert_eq!(app.overview_findings(), 3);
+        for (i, want) in to.into_iter().enumerate() {
+            show(&mut app, Screen::Overview);
+            app.overview.sel = 0;
+            for _ in 0..i {
+                app.handle_key(key(KeyCode::Down));
+            }
+            app.handle_key(key(KeyCode::Enter));
+            assert_eq!(app.screen(), want);
+        }
+        // After an analysis: its recommendations, then the slow log.
+        show(&mut app, Screen::Overview);
         app.apply(Msg::ScanDone {
             id,
             scan,
             report: Box::new(fixtures::report(true)),
         });
-        assert!(app.session.as_ref().unwrap().report.is_none());
+        let found = views::overview::findings(&app);
+        assert!(found.len() >= 2);
+        assert!(found.iter().any(|f| f.to == Screen::Ttl));
+        assert_eq!(found.last().map(|f| f.to), Some(Screen::SlowLog));
+        app.overview.sel = 0;
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen(), found[0].to);
     }
 
     #[test]

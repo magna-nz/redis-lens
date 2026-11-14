@@ -248,7 +248,7 @@ static OVERVIEW: [KeyHelp; 9] = [
         "esc",
         "esc",
         "Stop",
-        "Stop a running analysis; drops what it sampled",
+        "Stop the analysis and keep what it has sampled",
         true,
     ),
     k("p", "p", "Pause", "Pause or resume the live figures", true),
@@ -800,7 +800,7 @@ pub fn footer(screen: Screen, c: FooterCtx) -> Vec<(&'static str, &'static str)>
         Screen::Connections => &[MOVE, "enter", "a", "w", "/"],
         Screen::Overview if c.analyzing => &["esc", "p", "+ -"],
         Screen::Overview if c.analyzed => &[MOVE, "enter", "r", "v"],
-        Screen::Overview if c.ready => &["r", "p", "+ -", "v"],
+        Screen::Overview if c.ready => &["r", MOVE, "enter", "v"],
         Screen::Patterns if c.analyzed => &[MOVE, OPEN, "/", "o", "v"],
         Screen::Patterns => &[MOVE, OPEN, "/", "r", TAB],
         Screen::KeyList => &[MOVE, OPEN, "/", "n", BACK],
@@ -1076,7 +1076,7 @@ mod tests {
         );
         assert_eq!(
             names(Screen::Overview, connected),
-            ["Analyze keys", "Pause", "Interval", "More"]
+            ["Analyze keys", "Move", "Go there", "More"]
         );
         assert_eq!(
             names(Screen::Overview, analyzed),

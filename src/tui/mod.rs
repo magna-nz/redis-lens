@@ -40,10 +40,11 @@ use crate::budget::Budget;
 use crate::config::Config;
 use crate::conn::cluster::{ClusterTargets, ScanTargets};
 use crate::conn::{self, ScanTarget};
+use crate::conn::{PERM_CLIENT_LIST, PERM_SLOWLOG};
 use crate::live::pubsub::{Subscription, TAIL_KEPT, TailMessage};
 use crate::live::{self, LiveError, LiveHandle};
-use crate::model::{Credentials, Profile, ScanReport, ServerInfo, ServerMode};
-use crate::scan::{self, ScanOptions, ScanProgress};
+use crate::model::{Credentials, NodeRole, Profile, ScanReport};
+use crate::scan::{self, ScanOptions, ScanProgress, StopFlag};
 use crate::secrets::{KeyringStore, MemoryStore, SecretStore};
 use crate::{diff, snapshot};
 
@@ -210,6 +211,8 @@ struct Runner {
     /// The newest run of each entry, for answering an [`Effect::Live`] that can't be
     /// sent.
     scans: HashMap<ConnId, ScanId>,
+    /// The current run and its scan's stop flag ([`Effect::StopAnalysis`]).
+    stop: Option<(ConnId, ScanId, StopFlag)>,
 }
 
 impl Drop for Runner {
@@ -457,6 +460,7 @@ impl Runner {
             scan_task: None,
             live: Arc::new(Mutex::new(None)),
             scans: HashMap::new(),
+            stop: None,
         }
     }
 
@@ -714,26 +718,38 @@ impl Runner {
                 }
                 self.scans.insert(id, scan);
                 self.replace_live(Some(LiveSession::new(id, scan)));
+                let stop = StopFlag::new();
+                self.stop = Some((id, scan, stop.clone()));
+                if sample.is_none() {
+                    // Overview's "Last analysis" line: the snapshot directory, not the
+                    // server.
+                    let name = report_name(&profile, &secrets);
+                    let tx = tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let last = snapshot::default_dir()
+                            .ok()
+                            .and_then(|dir| last_snapshot(&dir, &name));
+                        send(&tx, Msg::LastSnapshot { id, scan, last });
+                    });
+                }
                 self.scan_task = Some(tokio::spawn(connect_and_scan(
-                    id,
-                    scan,
+                    Run { id, scan },
                     profile,
                     secrets,
                     sample,
+                    stop,
                     tx,
                     Arc::clone(&self.live),
                 )));
             }
-            Effect::CancelAnalysis { id, scan } => {
-                // Only the current run's: its scan task stops; the live task, kept in
-                // the live slot, stays.
-                if self.scans.get(&id) == Some(&scan)
-                    && lock(&self.live)
-                        .as_ref()
-                        .is_some_and(|s| s.id == id && s.scan == scan)
-                    && let Some(t) = self.scan_task.take()
+            Effect::StopAnalysis { id, scan } => {
+                // Only the current run's: its scan stops within a batch and reports what
+                // it has; the live task, kept in the live slot, stays.
+                if let Some((i, s, flag)) = &self.stop
+                    && *i == id
+                    && *s == scan
                 {
-                    t.abort();
+                    flag.stop();
                 }
             }
             Effect::SetWrites { name, on } => {
@@ -821,6 +837,16 @@ impl Runner {
         }
         false
     }
+}
+
+/// The newest snapshot of `name` (a report name, see [`report_name`]) in `dir`, for
+/// Overview's "Last analysis" line. Reads files only.
+fn last_snapshot(dir: &Path, name: &str) -> Option<app::views::overview::LastSnapshot> {
+    let r = snapshot::latest_before(dir, name, i64::MAX, None).ok()??;
+    Some(app::views::overview::LastSnapshot {
+        taken_at_unix: r.taken_at_unix,
+        sampled_keys: r.sampled_keys,
+    })
 }
 
 /// The diff between the newest snapshot older than `report` and `report`.
@@ -1252,18 +1278,28 @@ async fn forward_tail(
     }
 }
 
-/// Connects run `scan_id` of entry `id`: the permission check and the server's own
-/// figures, then its live connection. With `sample` it then analyzes: a scan with
-/// `ScanOptions::sample_limit` set to it. Without, it ends there, having read no key.
-async fn connect_and_scan(
+/// Which run of which entry a connect is: what every message it sends carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Run {
     id: ConnId,
-    scan_id: ScanId,
+    scan: ScanId,
+}
+
+/// Connects run `run`: the permission check and the server's own figures (no key is
+/// read: `scan::figures`), then its live connection, then once `SLOWLOG GET` and
+/// `CLIENT LIST` where the check allowed them. With `sample` it then analyzes: a scan
+/// with `ScanOptions::sample_limit` set to it, which `stop` ends early with what it has
+/// sampled. Without, it ends there, having read no key.
+async fn connect_and_scan(
+    run: Run,
     profile: Profile,
     secrets: SecretSource,
     sample: Option<u64>,
+    stop: StopFlag,
     tx: Tx,
     live: LiveSlot,
 ) {
+    let Run { id, scan: scan_id } = run;
     let name = report_name(&profile, &secrets);
     let (store, secret) = store_for(&profile, secrets);
     let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
@@ -1299,28 +1335,51 @@ async fn connect_and_scan(
         return;
     }
     let target = clean_target(targets.target(), clean);
-    // One budget for this session: the scan and the live connection both take from it.
-    // The permission probes run once on connect and don't. On a cluster each node has a
-    // budget of its own instead, shared by its scan and its live requests, and the
-    // probes run on every node through its budget.
+    // One budget for this session: the figures, the scan and the live connection all
+    // take from it. The permission probes run once on connect and don't. On a cluster
+    // each node has a budget of its own instead, shared by its figures, its scan and its
+    // live requests, and the probes run on every node through its budget.
     let mut opts = ScanOptions::for_profile(&profile);
     let budget = Budget::new(opts.max_commands_per_sec);
-    let (perms, server) = match &mut targets {
+    let (perms, figures) = match &mut targets {
         ScanTargets::Single { conn, .. } => {
             let perms = conn::check_all_permissions(conn).await;
-            (
-                perms,
-                scan::server_info_with_budget(conn, &budget).await.ok(),
-            )
+            let figures =
+                match scan::figures::server_figures_with_budget(conn, profile.db, &perms, &budget)
+                    .await
+                {
+                    Ok(f) => app::views::overview::Figures {
+                        server: Some(f),
+                        nodes: Vec::new(),
+                        failed: None,
+                    },
+                    // Never the error's own text: it can name the ACL user.
+                    Err(e) => app::views::overview::Figures {
+                        server: None,
+                        nodes: Vec::new(),
+                        failed: Some(scan::figures::failure_text(&e)),
+                    },
+                };
+            (perms, figures)
         }
         ScanTargets::Cluster(c) => {
             for node in &mut c.nodes {
                 node.budget = Some(Budget::new(opts.max_commands_per_sec));
             }
-            (
-                c.check_all_permissions().await,
-                cluster_server_info(c).await,
-            )
+            let perms = c.check_all_permissions().await;
+            let figures = match scan::figures::cluster_figures(c, opts.max_commands_per_sec).await {
+                Ok(f) => app::views::overview::Figures {
+                    server: Some(f.merged),
+                    nodes: f.nodes,
+                    failed: None,
+                },
+                Err(e) => app::views::overview::Figures {
+                    server: None,
+                    nodes: Vec::new(),
+                    failed: Some(scan::figures::failure_text(&e)),
+                },
+            };
+            (perms, figures)
         }
     };
     if !send(
@@ -1328,9 +1387,16 @@ async fn connect_and_scan(
         Msg::Connected {
             id,
             scan: scan_id,
-            server,
+            server: figures.server.as_ref().map(|f| f.server.clone()),
             perms: perms.clone(),
             target,
+        },
+    ) || !send(
+        &tx,
+        Msg::Figures {
+            id,
+            scan: scan_id,
+            figures,
         },
     ) {
         return;
@@ -1359,9 +1425,23 @@ async fn connect_and_scan(
     }
     // A connect reads no key: only `r` analyzes.
     let Some(limit) = sample else {
+        let reads = server_reads(&mut targets, &perms, &budget).await;
+        if let Some((node, slow, clients)) = reads {
+            send(
+                &tx,
+                Msg::ServerReads {
+                    id,
+                    scan: scan_id,
+                    node,
+                    slow,
+                    clients,
+                },
+            );
+        }
         return;
     };
     opts.sample_limit = limit;
+    opts.stop = stop;
 
     scan_and_report(id, scan_id, tx, |ptx, partial_tx| async move {
         match &mut targets {
@@ -1394,32 +1474,88 @@ async fn connect_and_scan(
     .await;
 }
 
-/// The header's server line before a cluster scan finishes: `INFO` and `DBSIZE` of
-/// every connected node, merged by [`merge_servers`]. `None` when no node answered.
-async fn cluster_server_info(c: &mut ClusterTargets) -> Option<ServerInfo> {
-    let mut found = Vec::new();
-    for node in &mut c.nodes {
-        if let Some(conn) = node.conn.as_mut()
-            && let Ok(s) = scan::server_info(conn).await
-        {
-            found.push(s);
+type ServerRead = Option<Result<live::LiveReply, LiveError>>;
+
+/// `SLOWLOG GET` (with the slow log's settings and the key specs its entries need, as
+/// the Slow log panel asks) and `CLIENT LIST`, once, through the existing `live::server`
+/// requests and the node's budget, each only where the permission check allowed it.
+/// On a cluster they go to the node the views read first: the first primary, as
+/// `App` picks it. `None` when there is no such node. Reads no key.
+async fn server_reads(
+    targets: &mut ScanTargets,
+    perms: &crate::model::PermissionReport,
+    budget: &Arc<Budget>,
+) -> Option<(usize, ServerRead, ServerRead)> {
+    let (node, conn, budget) = match targets {
+        ScanTargets::Single { conn, .. } => (0, conn, Arc::clone(budget)),
+        ScanTargets::Cluster(c) => {
+            let i = c
+                .nodes
+                .iter()
+                .position(|n| n.role == NodeRole::Primary)
+                .unwrap_or(0);
+            let n = c.nodes.get_mut(i)?;
+            let b = n.budget.clone().unwrap_or_else(|| Budget::new(None));
+            (i, n.conn.as_mut()?, b)
         }
-    }
-    merge_servers(found)
+    };
+    let slow = if perms.allowed(PERM_SLOWLOG) {
+        let req = live::server::Request::SlowLog {
+            specs: HashMap::new(),
+            config: true,
+            keys: true,
+        };
+        Some(live::run(conn, &budget, live::LiveRequest::Server(req)).await)
+    } else {
+        None
+    };
+    let clients = if perms.allowed(PERM_CLIENT_LIST) {
+        let req = live::LiveRequest::Server(live::server::Request::Clients);
+        Some(live::run(conn, &budget, req).await)
+    } else {
+        None
+    };
+    Some((node, slow, clients))
 }
 
-/// One server line for a cluster, the way the finished report has it: the first node's
-/// flavor, version and policy, with memory, the limit and keys summed over the nodes.
-fn merge_servers(servers: Vec<ServerInfo>) -> Option<ServerInfo> {
-    let mut it = servers.into_iter();
-    let mut out = it.next()?;
-    out.mode = ServerMode::Cluster;
-    for s in it {
-        out.used_memory = out.used_memory.saturating_add(s.used_memory);
-        out.maxmemory = out.maxmemory.saturating_add(s.maxmemory);
-        out.total_keys = out.total_keys.saturating_add(s.total_keys);
-    }
-    Some(out)
+/// The connect runtime, for the integration tests (`tests/tui_connect.rs`): runs one
+/// connect of `profile` (credentials from memory, as for a Docker container) exactly
+/// as the TUI does, passing every message it sends on to `out`. With `sample` it
+/// analyzes; `stop` stops that analysis as `esc` does. When it returns the live
+/// connection is closed again.
+#[doc(hidden)]
+pub async fn run_connect_for_tests(
+    profile: Profile,
+    credentials: Option<Credentials>,
+    sample: Option<u64>,
+    stop: StopFlag,
+    out: mpsc::UnboundedSender<Msg>,
+) {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let forward = tokio::spawn(async move {
+        while let Some(incoming) = rx.recv().await {
+            if let Incoming::Msg(m) = incoming
+                && out.send(*m).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let slot: LiveSlot = Arc::new(Mutex::new(Some(LiveSession::new(1, 1))));
+    connect_and_scan(
+        Run { id: 1, scan: 1 },
+        profile,
+        SecretSource::Container(credentials),
+        sample,
+        stop,
+        tx,
+        Arc::clone(&slot),
+    )
+    .await;
+    // Ends the live task, and with it the last sender: the forwarder passes on what
+    // is left, then ends.
+    drop(lock(&slot).take());
+    let _ = forward.await;
 }
 
 #[cfg(test)]
@@ -1854,32 +1990,30 @@ mod tests {
     }
 
     #[test]
-    fn cluster_server_lines_sum_memory_limits_and_keys() {
-        assert_eq!(merge_servers(Vec::new()), None);
-        let node = |used: u64, max: u64, keys: u64, version: &str| ServerInfo {
-            version: version.into(),
-            used_memory: used,
-            maxmemory: max,
-            total_keys: keys,
-            ..crate::tui::fixtures::server()
-        };
-        let one = merge_servers(vec![node(10, 100, 3, "7.4.2")]).unwrap();
-        assert_eq!(one.mode, ServerMode::Cluster);
+    fn the_last_snapshot_is_the_newest_of_the_profile_read_from_files() {
+        let dir = temp_path("last").parent().unwrap().to_path_buf();
+        // Nothing saved yet, or no directory at all: no line.
+        assert_eq!(last_snapshot(&dir, "prod-cache-01"), None);
+        let report = fixtures::report(true);
+        let t0 = report.taken_at_unix;
+        let mut older = report.clone();
+        older.taken_at_unix = t0 - 86_400;
+        older.sampled_keys = 10_000;
+        snapshot::save(&dir, &older).unwrap();
+        snapshot::save(&dir, &report).unwrap();
+        // Another profile's is not this one's.
+        let mut other = report.clone();
+        other.profile = "other".into();
+        other.taken_at_unix = t0 + 60;
+        snapshot::save(&dir, &other).unwrap();
         assert_eq!(
-            (one.used_memory, one.maxmemory, one.total_keys),
-            (10, 100, 3)
+            last_snapshot(&dir, &report.profile),
+            Some(app::views::overview::LastSnapshot {
+                taken_at_unix: t0,
+                sampled_keys: report.sampled_keys,
+            })
         );
-        let m = merge_servers(vec![
-            node(10, 100, 3, "7.4.2"),
-            node(20, 0, 4, "7.4.1"),
-            node(30, 300, 5, "7.4.0"),
-        ])
-        .unwrap();
-        // The first node's version and policy, the rest summed.
-        assert_eq!(m.version, "7.4.2");
-        assert_eq!(m.maxmemory_policy, "allkeys-lfu");
-        assert_eq!((m.used_memory, m.maxmemory, m.total_keys), (60, 400, 12));
-        assert_eq!(m.mode, ServerMode::Cluster);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

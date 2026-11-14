@@ -428,6 +428,10 @@ fn status(app: &App, s: &Session) -> Vec<Span<'static>> {
                 style::dim(),
             ),
         ],
+        // `esc` asked it to stop: it ends after its current batch, keeping what it has.
+        Phase::Scanning if s.stopped => {
+            vec![Span::styled(format!("{spin} stopping…"), style::amber())]
+        }
         Phase::Scanning => {
             let pr = s.progress.unwrap_or_default();
             let pct = (pr.sampled * 100)
@@ -442,7 +446,16 @@ fn status(app: &App, s: &Session) -> Vec<Span<'static>> {
         Phase::Done => vec![
             Span::styled("● ", style::ok()),
             Span::styled(
-                format!("analyzed{}", at(s.report.as_ref().map(|r| r.taken_at_unix))),
+                format!(
+                    "analyzed{}{}",
+                    at(s.report.as_ref().map(|r| r.taken_at_unix)),
+                    // A partial report `esc` kept: said, not only coloured.
+                    if super::app::views::overview::stopped_early(s) {
+                        " (stopped)"
+                    } else {
+                        ""
+                    }
+                ),
                 style::dim(),
             ),
         ],

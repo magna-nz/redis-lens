@@ -142,7 +142,7 @@ A panel of 2 Analysis, after Expiry.
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
 | `enter` | Go to the selected finding's panel |
-| `esc` | Stop a running analysis; drops what it sampled |
+| `esc` | Stop the analysis and keep what it has sampled |
 | `p` | Pause or resume the live figures |
 | `+` `-` | Poll the live figures more or less often, 1 to 60 s |
 | `[` `]` | Pick the previous or next node (cluster only) |

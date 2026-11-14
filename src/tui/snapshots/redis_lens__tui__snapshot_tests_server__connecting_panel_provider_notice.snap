@@ -1,15 +1,13 @@
 ---
 source: src/tui/snapshot_tests_server.rs
-assertion_line: 217
 expression: t.backend()
 ---
 " prod-cache-01   PROD   read-only   prod-cache-01-x1y2z3.serverless.use1.ca…                              ⠋ connecting… "
 "  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
-"┌─ Now ────────────────────────────────────────────────────────────────────────────────── INFO · every 2 s · p pauses ─┐"
+"┌─ Now ──────────────────────────────────────────────────────────────────────────────────── INFO every 2 s · p pauses ─┐"
 "│ Waiting for the live connection…                                                                                     │"
 "├─ Keys ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤"
 "│ ⠋ Connecting to prod-cache-01 (prod-cache-01-x1y2z3.serverless.use1.cache.amazonaws.com:6380) and checking permissio…│"
-"│                                                                                                                      │"
 "│ ▲ ElastiCache Serverless restricts MEMORY and OBJECT, so sizes and hot keys are missing; counts and TTLs still work. │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
@@ -37,5 +35,6 @@ expression: t.backend()
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
+"│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" r Analyze keys   p Pause   +- Interval   v More                                                       : Command  ? Help"
+" r Analyze keys   ↑↓ Move   enter Go there   v More                                                    : Command  ? Help"
