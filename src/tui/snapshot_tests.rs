@@ -392,6 +392,39 @@ fn connections_sentinel_after_connecting() {
     insta::assert_snapshot!(t.backend());
 }
 
+/// Connecting again after the Sentinels answered: the line names the primary they gave,
+/// not the profile's configured endpoint.
+#[test]
+fn sentinel_connecting_line_shows_the_resolved_primary() {
+    let mut app = sentinel_app();
+    let id = connect_selected(&mut app);
+    app.apply(Msg::SentinelResolved {
+        id,
+        scan: scan_of(&app),
+        answer: crate::conn::sentinel::SentinelAnswer {
+            sentinel: "10.0.2.12:26379".parse().unwrap(),
+            master: "orders".into(),
+            primary: crate::model::Endpoint {
+                host: "10.0.2.31".into(),
+                port: 6379,
+                tls: true,
+            },
+        },
+    });
+    let t = render(&app, 120, 36);
+    let lines = buffer_lines(&t);
+    assert!(
+        lines.iter().any(|l| l.contains("10.0.2.31:6379")),
+        "{lines:#?}"
+    );
+    let configured = app.session.as_ref().unwrap().profile.endpoint.to_string();
+    assert!(
+        !lines.iter().any(|l| l.contains(&configured)),
+        "{configured} is shown: {lines:#?}"
+    );
+    insta::assert_snapshot!(t.backend());
+}
+
 #[test]
 fn connections_with_tags_80x24() {
     let mut ps = fixtures::profiles();

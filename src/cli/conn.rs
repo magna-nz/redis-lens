@@ -1081,7 +1081,9 @@ pub async fn add_asking(
             "the profile was saved, but its old SSH username could not be deleted from the keychain",
         )?;
     }
-    if sentinel_creds.is_none() && existing.as_ref().is_some_and(|e| e.sentinel.is_some()) {
+    // Whether or not the old profile had a Sentinel: a leftover entry (from an earlier
+    // profile of this name) would be read as this profile's Sentinel credentials.
+    if sentinel_creds.is_none() {
         secrets.delete(&sentinel_ref).context(
             "the profile was saved, but its old Sentinel credentials could not be deleted from \
              the keychain",
@@ -2152,6 +2154,44 @@ mod tests {
         );
         // Without --sentinel there is no SENTINEL column.
         assert!(!list(&path).unwrap().contains("SENTINEL"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A Sentinel entry left from an earlier profile of the same name is not used by the
+    /// new one: saved without Sentinel credentials, the entry goes, whether the name is
+    /// new or an old profile without a Sentinel is replaced.
+    #[tokio::test]
+    async fn a_leftover_sentinel_entry_goes_when_the_new_profile_has_none() {
+        let path = temp_path("sentinel-leftover");
+        let store = MemoryStore::default();
+        let leftover = |store: &MemoryStore| {
+            store
+                .set(
+                    &SecretRef {
+                        service: crate::model::SECRET_SERVICE.to_string(),
+                        account: "sentinel:profile:w".to_string(),
+                    },
+                    &Credentials {
+                        username: None,
+                        password: SecretString::from("stale-pw".to_string()),
+                    },
+                )
+                .unwrap();
+        };
+        leftover(&store);
+        let a = sentinel_args("w", "redis://h", "s1");
+        add(&path, &store, &a, None).await.unwrap();
+        assert_eq!(sentinel_entry(&store, "w"), None);
+
+        // Replacing a profile that had no Sentinel.
+        let mut a = args("w", "redis://h");
+        a.force = true;
+        add(&path, &store, &a, None).await.unwrap();
+        leftover(&store);
+        let mut a = sentinel_args("w", "redis://h", "s1");
+        a.force = true;
+        add(&path, &store, &a, None).await.unwrap();
+        assert_eq!(sentinel_entry(&store, "w"), None);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
