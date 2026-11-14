@@ -29,7 +29,7 @@ pub const AT_ONCE: usize = 4;
 pub const HOTTEST: usize = 20;
 
 /// Why the panel is off on a standalone server.
-pub const NOT_CLUSTER: &str = "Not a cluster: this scan read one standalone server.";
+pub const NOT_CLUSTER: &str = "Not a cluster: this is one standalone server.";
 /// Why the panel is off when the server refused the command.
 pub const REFUSED: &str = "The server refused CLUSTER SLOT-STATS for this user.";
 /// The note in the title when no CPU or network figure is above 0.

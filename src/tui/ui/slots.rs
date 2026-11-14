@@ -1,9 +1,9 @@
-//! 2 Analysis · Slots: the slot ranges of each node with their figures from
-//! `CLUSTER SLOT-STATS`, the hottest slots, and the scan's keys that hash to the selected
-//! slot. State in `views/slots.rs`.
+//! Analyze › Slots: the slot ranges of each node with their figures from
+//! `CLUSTER SLOT-STATS`, the hottest slots, and the analysis's keys that hash to the
+//! selected slot, in one frame of three sections. State in `views/slots.rs`.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use crate::format;
@@ -13,25 +13,37 @@ use crate::tui::app::views::slots::{
     NEEDS_ENABLED, NOT_CLUSTER, Outcome, RangeRow, SlotsState, Totals, keys_in_slot,
 };
 
-use super::widgets::{pad_l, pad_r, panel, rows, scroll_offset, trunc};
-use super::{notice_panels, style};
+use super::analysis::{Col, MARK, Tier, head_row, notice, paragraph, pick_cols};
+use super::style;
+use super::widgets::{Section, Title, pad_l, pad_r, rows, scroll_offset, sections, trunc};
 
-const RANGE_W: usize = 12;
 const NODE_W: usize = 19;
 const NUM_W: usize = 7;
+/// The first column (range or slot) never takes more than this many cells.
+const FIRST_CAP: usize = 14;
 /// Range rows shown before the table is cut.
 const MAX_RANGE_ROWS: usize = 5;
+/// The figures after the keys show from this many cells wide, and with `v`.
+const WIDE_AT: usize = 90;
+
+/// The columns of both tables: `first` names the first one (`RANGE` or `SLOT`).
+fn columns(first: &'static str, memory: bool) -> Vec<Col> {
+    let mut cols = vec![
+        Col::new(first, 7, Tier::Base),
+        Col::new("NODE", NODE_W, Tier::Base),
+        Col::new("KEYS", NUM_W, Tier::Base),
+        Col::new("CPU µs", NUM_W, Tier::Wide),
+        Col::new("NET IN", NUM_W, Tier::Wide),
+        Col::new("NET OUT", NUM_W, Tier::Wide),
+    ];
+    if memory {
+        cols.push(Col::new("MEMORY", NUM_W, Tier::Wide));
+    }
+    cols
+}
 
 fn dash(v: Option<u64>, f: impl Fn(u64) -> String) -> String {
     v.map_or_else(|| "—".to_string(), f)
-}
-
-fn num_cell(s: &str) -> Span<'static> {
-    Span::styled(format!("{}  ", pad_l(s, NUM_W)), style::fg())
-}
-
-fn head_cell(s: &str) -> Span<'static> {
-    Span::styled(format!("{}  ", pad_l(s, NUM_W)), style::hd())
 }
 
 fn range_label(start: u16, end: u16) -> String {
@@ -43,11 +55,11 @@ fn range_label(start: u16, end: u16) -> String {
 }
 
 fn cell(s: &str, w: usize) -> String {
-    pad_r(&trunc(s, w - 1), w)
+    pad_r(&trunc(s, w.saturating_sub(1)), w)
 }
 
 fn waiting(frame: &mut Frame, area: Rect, text: &str) {
-    notice_panels(
+    notice(
         frame,
         area,
         "Slots",
@@ -58,16 +70,15 @@ fn waiting(frame: &mut Frame, area: Rect, text: &str) {
 
 pub fn draw(frame: &mut Frame, area: Rect, st: &SlotsState, ctx: &Ctx<'_>) {
     let off = |frame: &mut Frame, why: String| {
-        let w = usize::from(area.width).saturating_sub(6).max(10);
-        let lines = wrap(&why, w)
-            .into_iter()
-            .enumerate()
-            .map(|(i, l)| {
-                let mark = if i == 0 { "▲ " } else { "  " };
-                Line::from(Span::styled(format!(" {mark}{l}"), style::amber()))
-            })
-            .collect();
-        notice_panels(frame, area, "Slots", "off", lines);
+        let w = usize::from(area.width.saturating_sub(2));
+        let lines = paragraph(
+            vec![Span::styled(format!(" {MARK} "), style::amber())],
+            "   ",
+            &why,
+            style::amber(),
+            w,
+        );
+        notice(frame, area, "Slots", "off", lines);
     };
     if !ctx.is_cluster() {
         return off(frame, NOT_CLUSTER.to_string());
@@ -84,15 +95,10 @@ pub fn draw(frame: &mut Frame, area: Rect, st: &SlotsState, ctx: &Ctx<'_>) {
     }
     let ranges = st.range_rows(nodes);
     let memory = st.flavor() == Some(ServerFlavor::Redis);
-    let range_h = u16::try_from(ranges.len().min(MAX_RANGE_ROWS) + 3).unwrap_or(8);
-    let [top, mid, bottom] = Layout::vertical([
-        Constraint::Length(range_h),
-        Constraint::Min(3),
-        Constraint::Length(6),
-    ])
-    .areas(area);
+    // The sections: ranges (header and rows), the hottest slots, the selected slot.
+    let range_h = u16::try_from(ranges.len().min(MAX_RANGE_ROWS) + 1).unwrap_or(6);
+    let detail_h = 4u16;
 
-    // The ranges.
     let right = if st.cpu_and_network_zero() {
         NEEDS_ENABLED.to_string()
     } else {
@@ -104,48 +110,67 @@ pub fn draw(frame: &mut Frame, area: Rect, st: &SlotsState, ctx: &Ctx<'_>) {
         };
         format!("{n} range{}{more}", if n == 1 { "" } else { "s" })
     };
-    let inner = panel(frame, top, "Slot ranges", &right);
-    let mut head = vec![
-        Span::styled(format!(" {}", pad_r("RANGE", RANGE_W)), style::hd()),
-        Span::styled(pad_r("NODE", NODE_W), style::hd()),
-        head_cell("KEYS"),
-        head_cell("CPU µs"),
-        head_cell("NET IN"),
-        head_cell("NET OUT"),
-    ];
-    if memory {
-        head.push(head_cell("MEMORY"));
-    }
-    let mut lines = vec![Line::from(head)];
-    let fixed = 1 + RANGE_W + NODE_W;
-    let rest = usize::from(inner.width).saturating_sub(fixed);
+    let hot_right = format!("by {} · o changes the order", st.order.label());
+    let selected = st.selected();
+    let detail_title = selected.map_or_else(
+        || "Details".to_string(),
+        |h| format!("Slot {}", h.stat.slot),
+    );
+    let detail_right = selected.map_or_else(String::new, |h| nodes[h.node].endpoint.to_string());
+    let inner = sections(
+        frame,
+        area,
+        &[
+            Section {
+                title: Title::new("Slot ranges", &right),
+                rows: Some(range_h),
+            },
+            Section {
+                title: Title::new("Hottest slots", &hot_right),
+                rows: None,
+            },
+            Section {
+                title: Title::new(&detail_title, &detail_right),
+                rows: Some(detail_h),
+            },
+        ],
+    );
+
+    // The ranges.
+    let w = usize::from(inner[0].width);
+    let cols = columns("RANGE", memory);
+    let (keep, first_w) = pick_cols(&cols, w, WIDE_AT, ctx.more);
+    let first_w = first_w.min(FIRST_CAP);
+    let numeric: Vec<usize> = (2..cols.len()).collect();
+    let mut lines = vec![head_row(&cols, &keep, first_w, &numeric)];
     for r in ranges.iter().take(MAX_RANGE_ROWS) {
         lines.push(range_line(
             r,
             nodes[r.node].endpoint.to_string(),
-            memory,
-            rest,
+            &cols,
+            &keep,
+            first_w,
+            w,
         ));
     }
-    rows(frame, inner, lines, None);
+    rows(frame, inner[0], lines, None);
 
     // The hottest slots.
-    let right = format!("by {} · o changes the order", st.order.label());
-    let inner = panel(frame, mid, "Hottest slots", &right);
-    let head = Line::from(vec![
-        Span::styled(" SLOT   ", style::hd()),
-        Span::styled(pad_r("NODE", NODE_W), style::hd()),
-        head_cell("KEYS"),
-        head_cell("CPU µs"),
-        head_cell("NET IN"),
-        head_cell("NET OUT"),
-    ]);
+    let cols = columns("SLOT", false);
+    let (keep, first_w) = pick_cols(&cols, w, WIDE_AT, ctx.more);
+    let first_w = first_w.min(FIRST_CAP);
+    let numeric: Vec<usize> = (2..cols.len()).collect();
     let body = Rect {
-        y: inner.y + 1,
-        height: inner.height.saturating_sub(1),
-        ..inner
+        y: inner[1].y + 1,
+        height: inner[1].height.saturating_sub(1),
+        ..inner[1]
     };
-    rows(frame, inner, vec![head], None);
+    rows(
+        frame,
+        inner[1],
+        vec![head_row(&cols, &keep, first_w, &numeric)],
+        None,
+    );
     if st.hottest.is_empty() {
         let text = if st.is_loading() {
             " Reading…".to_string()
@@ -168,46 +193,55 @@ pub fn draw(frame: &mut Frame, area: Rect, st: &SlotsState, ctx: &Ctx<'_>) {
             .take(usize::from(body.height))
             .map(|h| {
                 let s = &h.stat;
-                Line::from(vec![
-                    Span::styled(format!(" {}", pad_r(&s.slot.to_string(), 7)), style::fgb()),
-                    Span::styled(
-                        cell(&nodes[h.node].endpoint.to_string(), NODE_W),
-                        style::fg(),
-                    ),
-                    num_cell(&dash(s.keys, format::count)),
-                    num_cell(&dash(s.cpu_usec, format::count)),
-                    num_cell(&dash(s.net_in, format::bytes)),
-                    num_cell(&dash(s.net_out, format::bytes)),
-                ])
+                let mut spans = vec![Span::styled(
+                    pad_r(&format!(" {}", s.slot), first_w),
+                    style::fgb(),
+                )];
+                for &i in &keep[1..] {
+                    spans.push(Span::raw(" "));
+                    let cw = cols[i].w;
+                    spans.push(match cols[i].head {
+                        "NODE" => {
+                            Span::styled(cell(&nodes[h.node].endpoint.to_string(), cw), style::fg())
+                        }
+                        "KEYS" => {
+                            Span::styled(pad_l(&dash(s.keys, format::count), cw), style::fg())
+                        }
+                        "CPU µs" => {
+                            Span::styled(pad_l(&dash(s.cpu_usec, format::count), cw), style::fg())
+                        }
+                        "NET IN" => {
+                            Span::styled(pad_l(&dash(s.net_in, format::bytes), cw), style::fg())
+                        }
+                        _ => Span::styled(pad_l(&dash(s.net_out, format::bytes), cw), style::fg()),
+                    });
+                }
+                Line::from(spans)
             })
             .collect();
         rows(frame, body, lines, Some(sel - off));
     }
 
     // The selected slot's keys.
-    let Some(h) = st.selected() else {
-        panel(frame, bottom, "Details", "");
+    let Some(h) = selected else {
         return;
     };
-    let inner = panel(
-        frame,
-        bottom,
-        &format!("Slot {}", h.stat.slot),
-        &nodes[h.node].endpoint.to_string(),
-    );
     let keys = ctx
         .report()
         .map(|r| keys_in_slot(r, h.stat.slot))
         .unwrap_or_default();
-    let w = usize::from(inner.width);
+    let w = usize::from(inner[2].width);
     let mut lines = Vec::new();
     if keys.is_empty() {
-        lines.push(Line::from(Span::styled(
-            " No example, big or hot key of the scan hashes to this slot.",
+        lines.extend(paragraph(
+            vec![Span::raw(" ")],
+            " ",
+            "No example, big or hot key of the analysis hashes to this slot.",
             style::dim(),
-        )));
+            w,
+        ));
     }
-    for k in keys.iter().take(usize::from(inner.height)) {
+    for k in keys.iter().take(usize::from(inner[2].height)) {
         let tail = format!("  {}  ({})", k.pattern, k.kinds);
         let key_w = w.saturating_sub(tail.chars().count() + 1).max(8);
         lines.push(Line::from(vec![
@@ -215,58 +249,90 @@ pub fn draw(frame: &mut Frame, area: Rect, st: &SlotsState, ctx: &Ctx<'_>) {
             Span::styled(trunc(&tail, w.saturating_sub(key_w + 1)), style::dim()),
         ]));
     }
-    rows(frame, inner, lines, None);
+    rows(frame, inner[2], lines, None);
 }
 
-fn range_line(r: &RangeRow, node: String, memory: bool, rest: usize) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled(
-            format!(" {}", cell(&range_label(r.start, r.end), RANGE_W)),
-            style::fg(),
+fn range_line(
+    r: &RangeRow,
+    node: String,
+    cols: &[Col],
+    keep: &[usize],
+    first_w: usize,
+    width: usize,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        pad_r(
+            &format!(
+                " {}",
+                trunc(&range_label(r.start, r.end), first_w.saturating_sub(2))
+            ),
+            first_w,
         ),
-        Span::styled(cell(&node, NODE_W), style::fgb()),
-    ];
-    match &r.outcome {
-        Outcome::Waiting => spans.push(Span::styled("…", style::dim())),
-        Outcome::Failed(why) => spans.push(Span::styled(
-            trunc(&format!("✗ {why}"), rest.max(2)),
-            style::warn(),
-        )),
-        Outcome::Done(t) => {
-            let Totals {
-                keys,
-                cpu_usec,
-                net_in,
-                net_out,
-                memory: mem,
-            } = *t;
-            spans.push(num_cell(&dash(keys, format::count)));
-            spans.push(num_cell(&dash(cpu_usec, format::count)));
-            spans.push(num_cell(&dash(net_in, format::bytes)));
-            spans.push(num_cell(&dash(net_out, format::bytes)));
-            if memory {
-                spans.push(num_cell(&dash(mem, format::bytes)));
+        style::fg(),
+    )];
+    let totals = match &r.outcome {
+        Outcome::Done(t) => Some(*t),
+        _ => None,
+    };
+    for &i in &keep[1..] {
+        spans.push(Span::raw(" "));
+        let cw = cols[i].w;
+        if i == 1 {
+            spans.push(Span::styled(cell(&node, cw), style::fgb()));
+            // Not done: the rest of the row says why.
+            match &r.outcome {
+                Outcome::Waiting => {
+                    spans.push(Span::styled("…", style::dim()));
+                    break;
+                }
+                Outcome::Failed(why) => {
+                    let used = first_w + 1 + cw + 1;
+                    spans.push(Span::styled(
+                        trunc(&format!("✗ {why}"), width.saturating_sub(used).max(2)),
+                        style::warn(),
+                    ));
+                    break;
+                }
+                Outcome::Done(_) => {}
             }
+            continue;
         }
+        let Some(Totals {
+            keys,
+            cpu_usec,
+            net_in,
+            net_out,
+            memory,
+        }) = totals
+        else {
+            continue;
+        };
+        let text = match cols[i].head {
+            "KEYS" => dash(keys, format::count),
+            "CPU µs" => dash(cpu_usec, format::count),
+            "NET IN" => dash(net_in, format::bytes),
+            "NET OUT" => dash(net_out, format::bytes),
+            _ => dash(memory, format::bytes),
+        };
+        spans.push(Span::styled(pad_l(&text, cw), style::fg()));
     }
     Line::from(spans)
 }
 
-/// `text` cut into lines of at most `w` cells at spaces.
-fn wrap(text: &str, w: usize) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for word in text.split_whitespace() {
-        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > w {
-            out.push(std::mem::take(&mut cur));
-        }
-        if !cur.is_empty() {
-            cur.push(' ');
-        }
-        cur.push_str(word);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_figures_after_the_keys_come_with_width_or_v() {
+        let cols = columns("RANGE", true);
+        let (keep, _) = pick_cols(&cols, 78, WIDE_AT, false);
+        assert_eq!(keep, vec![0, 1, 2]);
+        let (keep, _) = pick_cols(&cols, 110, WIDE_AT, false);
+        assert_eq!(keep, vec![0, 1, 2, 3, 4, 5, 6]);
+        let (keep, _) = pick_cols(&cols, 78, WIDE_AT, true);
+        assert!(keep.len() > 3);
+        // No memory column off Redis.
+        assert_eq!(columns("SLOT", false).len(), 6);
     }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
 }

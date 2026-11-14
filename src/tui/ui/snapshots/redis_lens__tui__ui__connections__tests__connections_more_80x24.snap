@@ -1,0 +1,28 @@
+---
+source: src/tui/ui/connections.rs
+expression: more
+---
+" redis-lens 0.1.0   not connected                 pick a connection, then enter "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"┌─ Connections ──────────────────────────────────────── 3 saved · 0 in Docker ─┐"
+"│   NAME          ENV     ADDRESS           ACCESS     STATUS        SIGN-IN   │"
+"│ SAVED                                                                        │"
+"│   prod-cache-01  PROD   prod-cache-01.in… read-only  ○ not open    keychain  │"
+"│   staging-cache  STAGE  staging-cache.in… writes on  ○ not open    keychain  │"
+"│   local-6379     LOCAL  localhost:6379    writes on  ○ not open    none      │"
+"│ DOCKER · searching…                                                          │"
+"│ + Add a connection  press a, then paste a redis:// URL                       │"
+"│                                                                              │"
+"├─ prod-cache-01 ─────────────────────────────────────────────── PROD · saved ─┤"
+"│ Address   prod-cache-01.internal:6380 · TLS on                               │"
+"│ Sign-in   password or ACL user, kept in the OS keychain                      │"
+"│ Access    read-only, the default for production. w turns writes on.          │"
+"│ Values    shown on screen, never saved                                       │"
+"│ Checks    run when you connect: redis-lens asks what this user may do before │"
+"│           it reads anything.                                                 │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" ↑↓ Move   enter Connect   a Add   w Writes   / Filter                    ? Help"

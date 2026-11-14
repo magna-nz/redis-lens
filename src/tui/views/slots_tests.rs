@@ -196,7 +196,7 @@ fn it_reads_on_show_and_on_r_and_never_on_a_tick() {
         assert!(testing::requests(&out).is_empty(), "no poll");
     }
     // Leaving and coming back does not read again.
-    app.handle_key(ch('3'));
+    app.handle_key(ch('0'));
     let out = testing::show(&mut app, Screen::Slots);
     assert!(testing::requests(&out).is_empty());
     // r does, on every node.
@@ -226,11 +226,15 @@ fn a_connection_that_is_ready_later_is_read_on_the_next_tick_once() {
 
 #[test]
 fn a_standalone_server_sends_nothing() {
+    // Slots is a panel of Analyze only on a cluster: tabbing through Analyze on a
+    // standalone server never shows it, and nothing is sent for it.
     let mut app = testing::scanned();
     testing::live_ready(&mut app);
-    let out = testing::show(&mut app, Screen::Slots);
-    assert!(sent(&out).is_empty());
-    let out = app.handle_key(ch('r'));
+    let mut out = testing::show(&mut app, Screen::BigKeys);
+    for _ in 0..8 {
+        out.extend(app.handle_key(key(KeyCode::Tab)));
+        assert_ne!(app.screen(), Screen::Slots);
+    }
     assert!(sent(&out).is_empty());
 }
 
@@ -528,12 +532,6 @@ mod snapshots {
             .is_empty()
         );
         app.handle_key(ch('g'));
-        insta::assert_snapshot!(render(&app));
-    }
-
-    #[test]
-    fn off_standalone_80x24() {
-        let (app, _) = testing::app_on(Screen::Slots);
         insta::assert_snapshot!(render(&app));
     }
 }

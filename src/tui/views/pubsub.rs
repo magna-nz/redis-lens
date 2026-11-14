@@ -1397,8 +1397,9 @@ mod tests {
         let (mut app, _, tail) = subscribed();
         batch(&mut app, tail, vec![msg(1, "a", b"kept")], 0);
         let (id, scan) = ids(&app);
-        app.handle_key(ch('1'));
-        let effects = app.handle_key(ch('r'));
+        app.handle_key(ch('2'));
+        app.handle_key(ch('r'));
+        let effects = app.handle_key(key(KeyCode::Enter));
         assert!(
             matches!(effects[..], [Effect::Connect { .. }]),
             "{effects:?}"

@@ -54,6 +54,7 @@ pub mod command;
 pub mod dbs;
 pub mod keys;
 pub mod monitor;
+pub mod names;
 pub mod nodes;
 pub mod pubsub;
 pub mod search;
@@ -378,6 +379,8 @@ pub enum LiveRequest {
     Slots(slots::Request),
     /// `INFO keyspace`, for the database list.
     Dbs(dbs::Request),
+    /// A page of key names (`SCAN` only), for Browse before an analysis.
+    Names(names::Request),
 }
 
 /// The answer to a [`LiveRequest`], from the same group.
@@ -394,6 +397,7 @@ pub enum LiveReply {
     Bulk(bulk::Reply),
     Slots(slots::Reply),
     Dbs(dbs::Reply),
+    Names(names::Reply),
 }
 
 /// Why a request failed. The text is always redis-lens's own fixed wording, never the
@@ -437,6 +441,7 @@ pub async fn run(
         LiveRequest::Bulk(r) => bulk::run(conn, budget, r).await.map(LiveReply::Bulk),
         LiveRequest::Slots(r) => slots::run(conn, budget, r).await.map(LiveReply::Slots),
         LiveRequest::Dbs(r) => dbs::run(conn, budget, r).await.map(LiveReply::Dbs),
+        LiveRequest::Names(r) => names::run(conn, budget, r).await.map(LiveReply::Names),
     }
 }
 

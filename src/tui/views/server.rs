@@ -106,6 +106,10 @@ pub struct ServerState {
     then: Option<WriteOp>,
     /// The per-shard summary of a cluster's Overview.
     pub shards: Shards,
+    /// Another node was picked with `[` `]` (a cluster): its slow log and client list,
+    /// which Overview's findings come from, are read once while Overview is on screen
+    /// ([`Self::read_findings`]).
+    findings_due: bool,
 }
 
 /// The per-shard summary polls at most this often, or at the Overview's interval when
@@ -192,6 +196,7 @@ impl Default for ServerState {
             write: None,
             then: None,
             shards: Shards::default(),
+            findings_due: false,
         }
     }
 }
@@ -253,6 +258,77 @@ impl ServerState {
         let specs = std::mem::take(&mut self.slow.specs);
         self.slow = SlowLog::default();
         self.slow.specs = specs;
+    }
+
+    /// `[` `]` picked another node: [`Self::node_changed`], and Overview reads the new
+    /// node's slow log and client list once while it is on screen, so its findings
+    /// are of that node too.
+    pub fn node_picked(&mut self) {
+        self.node_changed();
+        self.findings_due = true;
+    }
+
+    /// A new run of the session (an analysis, a database switch) replaced the live
+    /// connection: answers the panels got so far are older than what its connect
+    /// reads ([`Self::connect_read`]).
+    pub fn new_run(&mut self) {
+        self.clients.poll.fresh = false;
+        self.slow.poll.fresh = false;
+    }
+
+    /// Overview's findings after `[` `]` ([`Self::node_picked`]): one `SLOWLOG GET` and
+    /// one `CLIENT LIST` on the picked node, through its budget, each only where the
+    /// permission check allowed it and the panel has nothing of this node yet. Once:
+    /// the Slow log and Clients panels poll on their own when shown.
+    fn read_findings(&mut self, act: &mut Act<'_>) {
+        if !self.findings_due || !act.live_ready() {
+            return;
+        }
+        self.findings_due = false;
+        use super::{PROBE_CLIENT_LIST, PROBE_SLOWLOG};
+        use crate::model::PermStatus;
+        for (panel, label) in [
+            (Panel::SlowLog, PROBE_SLOWLOG),
+            (Panel::Clients, PROBE_CLIENT_LIST),
+        ] {
+            let p = self.poll(panel);
+            if p.got || p.busy(act) || p.off.is_some() {
+                continue;
+            }
+            if act.check(label) == Some(&PermStatus::Allowed) {
+                self.send(panel, act);
+            }
+        }
+    }
+
+    /// What the connect read once for `panel` (Slow log or Clients: `SLOWLOG GET`,
+    /// `CLIENT LIST`), taken as that panel's answer, with no poll timed: the panel
+    /// reads again when it is first shown. A refusal turns the panel off with its
+    /// fixed text, as a poll's would. Dropped when the panel already has a newer
+    /// answer: one of this run's polls came in, or one is in flight (`in_flight`).
+    pub fn connect_read(
+        &mut self,
+        panel: Panel,
+        result: Result<LiveReply, LiveError>,
+        in_flight: impl Fn(ReqId) -> bool,
+    ) {
+        if !matches!(panel, Panel::SlowLog | Panel::Clients) {
+            return;
+        }
+        let p = self.poll(panel);
+        if p.fresh || p.in_flight.is_some_and(in_flight) {
+            return;
+        }
+        match result {
+            Ok(LiveReply::Server(reply)) => {
+                let p = self.poll_mut(panel);
+                p.failed = None;
+                p.got = true;
+                self.apply(reply);
+            }
+            Ok(_) => {}
+            Err(e) => self.failed(panel, &e),
+        }
     }
 
     /// The `CONFIG SET`s the form sends as filled now, as the prompt shows them, or
@@ -509,6 +585,9 @@ impl ViewState for ServerState {
         if !(self.paused && self.poll(panel).got) && self.due(panel, act) {
             self.send(panel, act);
         }
+        if panel == Panel::Overview {
+            self.read_findings(act);
+        }
         if panel == Panel::Overview && !self.paused {
             let every = self.interval().max(SHARDS_EVERY);
             self.shards.poll(every, act);
@@ -522,6 +601,9 @@ impl ViewState for ServerState {
         };
         if !self.paused && act.live_ready() && self.due(panel, act) {
             self.send(panel, act);
+        }
+        if panel == Panel::Overview {
+            self.read_findings(act);
         }
         if panel == Panel::Overview && !self.paused {
             let every = self.interval().max(SHARDS_EVERY);
@@ -567,7 +649,13 @@ impl ViewState for ServerState {
             (_, KeyCode::Char('p')) => {
                 self.paused = !self.paused;
                 if self.paused {
-                    act.info("Polling paused. r fetches once.");
+                    // On Overview `r` analyzes the keys; on Clients and Slow log it
+                    // still reads the panel once.
+                    act.info(match panel {
+                        Panel::Overview => "Live figures paused. p resumes.",
+                        Panel::Clients => "Polling paused. r reads the clients once, p resumes.",
+                        _ => "Polling paused. r reads the slow log once, p resumes.",
+                    });
                 } else {
                     act.info("Polling resumed.");
                     if !self.poll(panel).busy(act) && self.poll(panel).off.is_none() {
@@ -645,6 +733,8 @@ impl ViewState for ServerState {
             self.monitor_learned(result, act);
             return;
         }
+        // An answer on this run's live connection: newer than the connect's read.
+        p.fresh = true;
         match result {
             Ok(LiveReply::Server(reply)) => {
                 p.failed = None;
@@ -668,6 +758,9 @@ pub struct Poll {
     pub failed: Option<String>,
     /// An answer has come in.
     pub got: bool,
+    /// An answer came in on the current run's live connection ([`ServerState::new_run`]
+    /// clears it).
+    fresh: bool,
 }
 
 impl Poll {
@@ -1295,7 +1388,7 @@ impl Stop {
             ),
             Self::Lost => "Stopped: the connection to the server was lost.".to_string(),
             Self::Closed => "Stopped: the live connection closed.".to_string(),
-            Self::Rescan => "Stopped by the rescan.".to_string(),
+            Self::Rescan => "Stopped by a new analysis or a database switch.".to_string(),
             Self::Unlisted => "Stopped: this connection is no longer listed.".to_string(),
             Self::Failed(why) => format!("MONITOR did not start: {why}."),
         }
@@ -1875,7 +1968,7 @@ mod tests {
         assert_eq!(only_request(&out).1, Request::Info);
 
         // On another view it asks for nothing.
-        app.handle_key(ch('1'));
+        app.handle_key(ch('0'));
         assert!(testing::requests(&app.apply(Msg::TickAt(t0 + secs(30)))).is_empty());
     }
 
@@ -1933,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn p_pauses_polling_and_r_fetches_once() {
+    fn p_pauses_polling_and_resuming_fetches_at_once() {
         let t0 = Instant::now();
         let (mut app, out) = app_at(t0, Screen::Overview);
         let (id, _) = only_request(&out);
@@ -1948,26 +2041,36 @@ mod tests {
         assert!(app.handle_key(ch('p')).is_empty());
         assert!(state(&app).paused);
         assert!(testing::requests(&app.apply(Msg::TickAt(t0 + secs(20)))).is_empty());
-        // `r` still fetches, once.
-        let out = app.handle_key(ch('r'));
-        assert_eq!(only_request(&out).1, Request::Info);
-        assert!(
-            testing::requests(&app.handle_key(ch('r'))).is_empty(),
-            "one is already out"
-        );
+        // `r` on Overview analyzes the keys: it asks first, and fetches nothing.
+        assert!(testing::requests(&app.handle_key(ch('r'))).is_empty());
+        assert!(app.analyze.is_some());
+        app.handle_key(key(KeyCode::Esc));
         // Resuming asks at once when nothing is out.
-        let (id, _) = testing::requests(&out)[0].clone();
-        answer(
-            &mut app,
-            id,
-            Reply::Info {
-                at: t0 + secs(20),
-                sample: Box::new(sample(20)),
-            },
-        );
         let out = app.handle_key(ch('p'));
         assert!(!state(&app).paused);
         assert_eq!(only_request(&out).1, Request::Info);
+    }
+
+    /// The notice `p` gives says what is true on its screen: on Overview `r` analyzes the
+    /// keys, so only `p` brings the figures back; on Clients and Slow log `r` reads once.
+    #[test]
+    fn the_pause_notice_says_what_r_does_on_each_screen() {
+        for (screen, text) in [
+            (Screen::Overview, "Live figures paused. p resumes."),
+            (
+                Screen::Clients,
+                "Polling paused. r reads the clients once, p resumes.",
+            ),
+            (
+                Screen::SlowLog,
+                "Polling paused. r reads the slow log once, p resumes.",
+            ),
+        ] {
+            let (mut app, _) = app_at(Instant::now(), screen);
+            app.handle_key(ch('p'));
+            assert!(state(&app).paused, "{screen:?}");
+            assert_eq!(app.notice.as_ref().unwrap().text, text, "{screen:?}");
+        }
     }
 
     #[test]
@@ -2040,11 +2143,10 @@ mod tests {
         assert!(testing::requests(&app.apply(Msg::TickAt(t0 + secs(60)))).is_empty());
         let out = testing::show(&mut app, Screen::Clients);
         assert_eq!(only_request(&out).1, Request::Clients);
-        // `r` tries again.
-        testing::show(&mut app, Screen::Overview);
-        let out = app.handle_key(ch('r'));
-        assert_eq!(only_request(&out).1, Request::Info);
-        assert!(state(&app).overview.poll.off.is_none());
+        // Shown again it stays off and sends nothing (`r` there analyzes the keys).
+        let out = testing::show(&mut app, Screen::Overview);
+        assert!(server_requests(&out).is_empty());
+        assert!(state(&app).overview.poll.off.is_some());
     }
 
     #[test]
@@ -2587,8 +2689,9 @@ mod tests {
         let t0 = Instant::now();
         let (mut app, _) = app_at(t0, Screen::Overview);
         feed_overview(&mut app, t0, 4);
+        // The next poll goes out, then `p` pauses before it is answered.
+        app.apply(Msg::TickAt(t0 + secs(8)));
         app.handle_key(ch('p'));
-        app.handle_key(ch('r'));
         let id = app_pending_info(&app);
         testing::reply(&mut app, id, Err(LiveError::Failed("INFO failed".into())));
         insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
@@ -3270,6 +3373,7 @@ mod monitor_tests {
         let (mut app, _) = running(Instant::now());
         app.handle_key(ch('2'));
         app.handle_key(ch('r'));
+        app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.views.server.monitor.stopped, Some(Stop::Rescan));
     }
 
@@ -3357,7 +3461,7 @@ mod monitor_tests {
         let debug = format!("{out:?} {:?} {:?}", app.views, app.notice);
         assert!(!value::leaks(&debug, MARK), "{debug}");
         // `s` from Patterns saves the scan only.
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         let effects = app.handle_key(ch('s'));
         let [Effect::SaveSnapshot(report)] = &effects[..] else {
             panic!("{effects:?}");
@@ -3430,7 +3534,7 @@ mod monitor_tests {
         testing::show(&mut app, Screen::HotKeys);
         let all = text(&app, 120, 36);
         assert!(
-            all.contains("from MONITOR, 12 s, 10 lines, at 13:04 UTC"),
+            all.contains("from Monitor, 12 s, 10 lines, at 13:04 UTC"),
             "{all}"
         );
         let effects = app.handle_key(ch('s'));
@@ -3575,7 +3679,7 @@ mod monitor_tests {
         app.handle_key(ch('k'));
         app.handle_key(ch('k'));
         assert!(text(&app, 120, 36).contains("CONFIG SET requirepass ***"));
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         let effects = app.handle_key(ch('s'));
         let [Effect::SaveSnapshot(report)] = &effects[..] else {
             panic!("{effects:?}");

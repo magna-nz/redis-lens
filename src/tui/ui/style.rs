@@ -276,6 +276,24 @@ pub fn key() -> Style {
     role(Role::Key, mode())
 }
 
+/// What [`super::widgets::dim`] lays over the screen behind a dialog, in `mode`: the dim
+/// colour and no bold; in the colourless mode the dim attribute, so it still reads.
+pub fn backdrop_in(mode: Mode) -> Style {
+    match mode.palette() {
+        Some(p) => Style::new()
+            .fg(p.dim)
+            .remove_modifier(Modifier::BOLD | Modifier::REVERSED),
+        None => Style::new()
+            .add_modifier(Modifier::DIM)
+            .remove_modifier(Modifier::BOLD),
+    }
+}
+
+/// [`backdrop_in`] the mode in use.
+pub fn backdrop() -> Style {
+    backdrop_in(mode())
+}
+
 /// PROD red, STAGE amber, LOCAL teal, OTHER grey.
 pub fn env_badge(env: Env) -> Style {
     env_badge_in(env, mode())

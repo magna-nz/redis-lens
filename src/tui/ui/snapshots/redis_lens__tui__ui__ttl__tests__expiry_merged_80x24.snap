@@ -1,0 +1,29 @@
+---
+source: src/tui/ui/ttl.rs
+assertion_line: 402
+expression: small
+---
+" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys                                "
+"┌─ Expiry ─────────────────── riskiest first ─┬─ tmp:import:{ulid} ─── string ─┐"
+"│ PATTERN                              NO TTL │ 48K keys · 737M                │"
+"│ tmp:import:{ulid}                    100% ▲ │                                │"
+"│ queue:emails                         100% ▲ │ ▲ All 48K keys never expire    │"
+"│ user:{id}:profile                    100% ▲ │   and the pattern is growing.  │"
+"│ cache:search:{hash}                   12% ▲ │   It is new since the last     │"
+"│ user:{id}:cart                        31% ▲ │   snapshot. This is probably a │"
+"│ feature:{var}                          100% │   leak: nothing ever removes   │"
+"│ rl:{ip}:{id}                             0% │   these keys.                  │"
+"│ session:{uuid}                           0% │                                │"
+"│ cache:product:{id}                       0% │ EXPIRES IN                     │"
+"│ user:{id}:feed                           0% │ none <1m <1h <1d <7d <30d >30d │"
+"│ lock:{var}                               0% │ ███  ·   ·   ·   ·   ·    ·    │"
+"│                                             │                                │"
+"│                                             │ FREED BY TTL, ALL              │"
+"│                                             │ 1 h   ▌░░░░░░░░     679M    5% │"
+"│                                             │ 1 d   █▌░░░░░░░     2.2G   17% │"
+"│                                             │ 7 d   █▋░░░░░░░     2.4G   18% │"
+"│                                             │ 30 d  █▋░░░░░░░     2.4G   18% │"
+"└─────────────────────────────────────────────┴────────────────────────────────┘"
+" ↑↓ Move   tab Next panel   y Copy   r Analyze   s Snapshot    : Command  ? Help"

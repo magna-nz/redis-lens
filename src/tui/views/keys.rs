@@ -676,7 +676,10 @@ impl ViewState for KeysState {
             return true;
         }
         match (key.code, plain(&key)) {
-            (KeyCode::Esc, _) if !self.filter.is_empty() || self.type_filter != TypeFilter::All => {
+            // `←` `h` `esc` clear the filters first, then go back to the patterns.
+            (KeyCode::Esc | KeyCode::Left, _) | (_, Some('h'))
+                if !self.filter.is_empty() || self.type_filter != TypeFilter::All =>
+            {
                 let keep = self.selected().map(|r| r.key.clone());
                 self.filter.clear();
                 self.type_filter = TypeFilter::All;
@@ -804,7 +807,7 @@ mod tests {
     fn open(pattern: &str) -> (App, Vec<Effect>) {
         let mut app = testing::scanned();
         let mut out = testing::live_ready(&mut app);
-        out.extend(app.handle_key(ch('1')));
+        out.extend(app.handle_key(ch('2')));
         let at = {
             let data = app.pattern_data().expect("patterns");
             let name = |i: usize| data.patterns[i].pattern.as_str();
@@ -1029,6 +1032,27 @@ mod tests {
     }
 
     #[test]
+    fn left_and_h_clear_the_filters_first_like_esc() {
+        for back in [key(KeyCode::Left), ch('h')] {
+            let mut app = mixed();
+            app.handle_key(ch('t'));
+            app.handle_key(ch('/'));
+            app.handle_key(ch('1'));
+            app.handle_key(key(KeyCode::Enter));
+            assert!(app.views.keys.visible().len() < 14);
+            // The first `←` clears both filters and stays on the keys.
+            app.handle_key(back);
+            assert_eq!(app.screen(), Screen::KeyList, "{back:?}");
+            assert_eq!(app.views.keys.filter, "");
+            assert_eq!(app.views.keys.type_filter, TypeFilter::All);
+            assert_eq!(app.views.keys.visible().len(), 14);
+            // The next goes back to the patterns.
+            app.handle_key(back);
+            assert_eq!(app.screen(), Screen::Patterns, "{back:?}");
+        }
+    }
+
+    #[test]
     fn key_list_with_a_type_filter_80x24() {
         let mut app = mixed();
         app.handle_key(ch('t'));
@@ -1176,10 +1200,12 @@ mod tests {
         })));
         testing::reply(&mut app, id, reply);
         let screen = format!("{:?}", testing::render(&app, 120, 36).backend());
+        // The right pane wraps the note: its words, in order, over two lines.
         assert!(
-            screen.contains("Column off: the server refused MEMORY USAGE for this user."),
+            screen.contains("▲ Column off: the server refused MEMORY"),
             "{screen}"
         );
+        assert!(screen.contains("  USAGE for this user."), "{screen}");
         assert!(screen.contains("2 keys could not be read"), "{screen}");
         // Sorting skips the size column it no longer has... once sizes are off.
         assert!(!screen.contains("NOPERM"), "{screen}");
@@ -1191,8 +1217,13 @@ mod tests {
         let (id, _) = page_request(&effects);
         testing::reply(&mut app, id, Err(LiveError::Denied("SCAN".into())));
         let screen = format!("{:?}", testing::render(&app, 80, 24).backend());
+        // The list pane wraps it under its `✗`.
         assert!(
-            screen.contains("The server refused SCAN for this user, so the keys can't be"),
+            screen.contains("✗ The server refused SCAN for this"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("  user, so the keys can't be listed."),
             "{screen}"
         );
     }

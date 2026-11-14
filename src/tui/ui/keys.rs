@@ -1,9 +1,12 @@
-//! Draws [`KeysState`]: the key list of one pattern (spec "1 Patterns, additions", "Key
-//! list"). Owner: wave B2, with `views/keys.rs`.
+//! Draws [`KeysState`]: Browse › Keys, `→` on a pattern (mockup "Browse a pattern's
+//! keys"). The pattern's keys on the left, the selected key on the right, both from
+//! the row the list loaded, so the right pane costs no command. `→` opens the value
+//! ([`super::value`]); the key list then stays on the left.
 //!
-//! The table of loaded keys above, the selected key and the list's state below. Fits
-//! 80 columns: the key column takes what the others leave, and long names are cut
-//! with `…` (the selected one scrolls).
+//! At 80 columns the list shows KEY, SIZE and EXPIRES; at wider widths (or with `v`)
+//! TYPE, STORED AS, LENGTH and, with an LFU policy, LFU join in; on a cluster NODE as
+//! well. Long names are cut with `…` (the selected one scrolls). Every name from the
+//! server is escaped.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -14,51 +17,91 @@ use crate::format;
 use crate::live::LiveError;
 use crate::live::keys::KeyRow;
 use crate::model::Ttl;
+use crate::tui::app::App;
 use crate::tui::app::views::keys::{KeySort, KeysState, TypeFilter};
 use crate::tui::app::views::{Ctx, LiveState};
+use crate::value::escape;
 
-use super::widgets::{fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset};
-use super::{spinner, split_body, style};
+use super::patterns::wrap_words;
+use super::widgets::{
+    Pane, Title, fit, marquee_spans, pad_l, pad_r, rows, scroll_offset, split_at, split_frame,
+    trunc,
+};
+use super::{spinner, style};
 
 const TYPE_W: usize = 7;
 const TTL_W: usize = 8;
 const SIZE_W: usize = 6;
-const ENC_W: usize = 10;
+const ENC_W: usize = 11;
 const LEN_W: usize = 7;
-const LFU_W: usize = 3;
+const LFU_W: usize = 4;
 /// The NODE column on a cluster: the address cut with `…` to 15 cells, and a space.
 pub const NODE_W: usize = 16;
-/// The narrowest the key column gets before the encoding column is hidden.
-const KEY_MIN: usize = 16;
+/// The narrowest the key column gets before an optional column is hidden.
+const KEY_MIN: usize = 14;
+/// From this inner width on, the optional columns show without `v`.
+const WIDE: usize = 60;
 
-/// Column layout: the key column's width and whether the optional ones show.
+/// The key list's width from the frame's left edge to the divider: 41 of 80 columns
+/// and 72 of 120, as in the mockups; with `v` it takes more.
+pub fn list_width(total: u16, more: bool) -> u16 {
+    let ratio = if more {
+        0.7
+    } else if total >= 110 {
+        0.6
+    } else {
+        41.0 / 80.0
+    };
+    split_at(total, ratio)
+}
+
+/// Column layout: the key column's width and which optional ones show.
 #[derive(Debug, Clone, Copy)]
 struct Cols {
     key: usize,
+    ty: bool,
     enc: bool,
+    len: bool,
     lfu: bool,
     /// The NODE column after the key (a cluster).
     node: bool,
 }
 
 impl Cols {
-    fn new(inner: usize, lfu: bool, node: bool) -> Self {
-        let fixed = |enc: bool| {
-            (if node { NODE_W } else { 0 })
-                + (TYPE_W + 1)
-                + (TTL_W + 2)
-                + (SIZE_W + 2)
-                + if enc { ENC_W + 1 } else { 0 }
-                + (LEN_W + 2)
-                + if lfu { LFU_W + 1 } else { 0 }
+    fn fixed(&self) -> usize {
+        (SIZE_W + 1)
+            + (TTL_W + 1)
+            + if self.node { NODE_W } else { 0 }
+            + if self.ty { TYPE_W } else { 0 }
+            + if self.enc { ENC_W } else { 0 }
+            + if self.len { LEN_W + 1 } else { 0 }
+            + if self.lfu { LFU_W + 1 } else { 0 }
+    }
+
+    fn new(inner: usize, more: bool, lfu: bool, node: bool) -> Self {
+        let all = inner >= WIDE || more;
+        let mut c = Self {
+            key: 0,
+            ty: all,
+            enc: all,
+            len: all,
+            lfu: all && lfu,
+            node: node && all,
         };
-        let enc = inner >= fixed(true) + KEY_MIN;
-        Self {
-            key: inner.saturating_sub(fixed(enc)).max(8),
-            enc,
-            lfu,
-            node,
+        for step in 0..5 {
+            if inner >= c.fixed() + KEY_MIN {
+                break;
+            }
+            match step {
+                0 => c.enc = false,
+                1 => c.lfu = false,
+                2 => c.len = false,
+                3 => c.ty = false,
+                _ => c.node = false,
+            }
         }
+        c.key = inner.saturating_sub(c.fixed()).max(8);
+        c
     }
 }
 
@@ -82,27 +125,53 @@ fn sizes_off(state: &KeysState) -> bool {
     !state.sizes || refused(state, "MEMORY USAGE")
 }
 
-pub fn draw(frame: &mut Frame, area: Rect, state: &KeysState, ctx: &Ctx<'_>) {
-    let (main, detail) = split_body(area);
+/// The pattern's estimated keys: the analysis's, or before one the names' estimate.
+fn estimate(app: &App, pattern: &str) -> Option<(u64, bool)> {
+    let d = app.pattern_data()?;
+    let p = d.patterns.iter().find(|p| p.pattern == pattern)?;
+    let exact = d.names && app.patterns.names.complete();
+    Some((p.est_keys, exact))
+}
+
+pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(ctx) = app.ctx() else {
+        return;
+    };
+    let state = &app.views.keys;
     let pattern = state.pattern.clone().unwrap_or_default();
     let visible = state.visible();
     let sel = state.sel.min(visible.len().saturating_sub(1));
-    let inner = panel(
-        frame,
-        main,
-        &format!("Patterns › {pattern}"),
-        &title_right(state, ctx, &pattern, visible.len()),
-    );
-    let c = Cols::new(usize::from(inner.width), state.lfu, state.by_node());
-    let sort = state.sort.effective(state.sizes, state.freq);
-    rows(frame, inner, vec![header(&c, sort)], None);
-    let body = Rect {
-        y: inner.y + 1,
-        height: inner.height.saturating_sub(1),
-        ..inner
+    let row = state.selected();
+    let left_title = format!("‹ {}", escape(&pattern));
+    let left_right = title_right(state, &ctx, &pattern, visible.len());
+    let (right_title, right_right) = match row {
+        Some(r) => (escape(&r.key), r.key_type.as_str().to_string()),
+        None => ("Keys".to_string(), String::new()),
     };
+    let (left, right) = split_frame(
+        frame,
+        area,
+        list_width(area.width, ctx.more),
+        Title::new(&left_title, &left_right),
+        Title::new(&right_title, &right_right),
+        Pane::Left,
+    );
+    let c = Cols::new(
+        usize::from(left.width),
+        ctx.more,
+        state.lfu,
+        state.by_node(),
+    );
+    let sort = state.sort.effective(state.sizes, state.freq);
+    rows(frame, left, vec![header(&c, sort)], None);
+    let body = Rect {
+        y: left.y + 1,
+        height: left.height.saturating_sub(2),
+        ..left
+    };
+    let lw = usize::from(left.width);
     if visible.is_empty() {
-        rows(frame, body, empty_lines(state, ctx), None);
+        rows(frame, body, empty_lines(state, &ctx, lw), None);
     } else {
         let off = scroll_offset(sel, usize::from(body.height));
         let ticks = ctx.tick.saturating_sub(state.sel_since);
@@ -115,26 +184,36 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &KeysState, ctx: &Ctx<'_>) {
                 let row = &state.rows[r];
                 let node = c
                     .node
-                    .then(|| node_name(ctx, state.row_node.get(&row.key).copied()));
+                    .then(|| node_name(&ctx, state.row_node.get(&row.key).copied()));
                 key_row(row, &c, state, node, (i == sel).then_some(ticks))
             })
             .collect();
         rows(frame, body, lines, Some(sel - off));
     }
-    detail_panel(frame, detail, state, ctx);
+    let bottom = Rect {
+        y: left.y + left.height.saturating_sub(1),
+        height: u16::from(left.height >= 2),
+        ..left
+    };
+    let est = estimate(app, &pattern);
+    rows(
+        frame,
+        bottom,
+        vec![Line::from(fit(
+            vec![Span::styled(status(state, est, ctx.tick), style::dim())],
+            lw,
+        ))],
+        None,
+    );
+    detail(frame, right, state, &ctx, &pattern);
     if let Some(form) = &state.form {
         super::value::draw_form(frame, area, form);
     }
 }
 
 fn title_right(state: &KeysState, ctx: &Ctx<'_>, pattern: &str, shown: usize) -> String {
-    let est = ctx
-        .report()
-        .and_then(|r| r.patterns.iter().find(|p| p.pattern == pattern))
-        .map(|p| p.est_keys);
-    let loaded = format::grouped(state.rows.len() as u64);
-    let of = est.map_or_else(String::new, |n| format!(" of ~{}", format::count(n)));
-    let mut right = format!("{loaded} loaded{of}");
+    let sort = state.sort.effective(state.sizes, state.freq);
+    let mut right = format!("by {}", sort.label());
     let typed = state.type_filter != TypeFilter::All;
     if !state.filter.is_empty() {
         right = format!("filter \"{}\" · {shown} rows · {right}", state.filter);
@@ -155,14 +234,18 @@ fn title_right(state: &KeysState, ctx: &Ctx<'_>, pattern: &str, shown: usize) ->
     if state.is_loading() {
         right = format!("{} loading · {right}", spinner(ctx.tick));
     }
-    format!("SCAN MATCH {} · {right}", match_glob(pattern))
+    // The command only with `v` (brief: command names leave titles).
+    if ctx.more {
+        right = format!("SCAN MATCH {} · {right}", match_glob(pattern));
+    }
+    right
 }
 
 fn header(c: &Cols, sort: KeySort) -> Line<'static> {
     let arrow = |s: KeySort| match (sort == s, s.ascending()) {
         (true, true) => "▲",
         (true, false) => "▼",
-        _ => " ",
+        _ => "",
     };
     let key = format!(" KEY{}", if sort == KeySort::Name { " ▲" } else { "" });
     let mut spans = vec![Span::styled(pad_r(&key, c.key), style::hd())];
@@ -170,35 +253,49 @@ fn header(c: &Cols, sort: KeySort) -> Line<'static> {
         spans.push(Span::styled(pad_r("NODE", NODE_W), style::hd()));
     }
     spans.extend([
-        Span::styled(pad_r("TYPE", TYPE_W + 1), style::hd()),
         Span::styled(
-            format!("{}{} ", pad_l("TTL", TTL_W), arrow(KeySort::Ttl)),
+            format!(
+                "{} ",
+                pad_l(&format!("SIZE{}", arrow(KeySort::Size)), SIZE_W)
+            ),
             style::hd(),
         ),
         Span::styled(
-            format!("{}{} ", pad_l("SIZE", SIZE_W), arrow(KeySort::Size)),
+            format!(
+                "{} ",
+                pad_l(&format!("EXPIRES{}", arrow(KeySort::Ttl)), TTL_W)
+            ),
             style::hd(),
         ),
     ]);
-    if c.enc {
-        spans.push(Span::styled(pad_r("ENCODING", ENC_W + 1), style::hd()));
+    if c.ty {
+        spans.push(Span::styled(pad_r("TYPE", TYPE_W), style::hd()));
     }
-    spans.push(Span::styled(
-        format!("{}{} ", pad_l("LENGTH", LEN_W), arrow(KeySort::Length)),
-        style::hd(),
-    ));
+    if c.enc {
+        spans.push(Span::styled(pad_r("STORED AS", ENC_W), style::hd()));
+    }
+    if c.len {
+        spans.push(Span::styled(
+            format!(
+                "{} ",
+                pad_l(&format!("LENGTH{}", arrow(KeySort::Length)), LEN_W)
+            ),
+            style::hd(),
+        ));
+    }
     if c.lfu {
         spans.push(Span::styled(
-            format!("{}{}", pad_l("LFU", LFU_W), arrow(KeySort::Freq)),
+            format!("{} ", pad_l(&format!("LFU{}", arrow(KeySort::Freq)), LFU_W)),
             style::hd(),
         ));
     }
     Line::from(spans)
 }
 
-fn ttl_text(t: Ttl) -> String {
+/// A TTL for a cell: `never` without one.
+pub fn ttl_text(t: Ttl) -> String {
     match t {
-        Ttl::Persistent => "none".to_string(),
+        Ttl::Persistent => "never".to_string(),
         Ttl::Expires(d) => format::duration(d),
     }
 }
@@ -211,16 +308,20 @@ fn key_row(
     scroll: Option<u64>,
 ) -> Line<'static> {
     let dash = || "—".to_string();
-    let text = vec![Span::styled(format!(" {}", r.key), style::fg())];
+    let text = vec![Span::styled(format!(" {}", escape(&r.key)), style::fg())];
     let w = c.key.saturating_sub(1);
     let mut spans = match scroll {
         Some(ticks) => marquee_spans(text, w, ticks),
         None => fit(text, w),
     };
-    spans.push(Span::raw(" "));
+    let used: usize = spans
+        .iter()
+        .map(|s| super::widgets::width(&s.content))
+        .sum();
+    spans.push(Span::raw(" ".repeat(c.key.saturating_sub(used))));
     if let Some(node) = node {
         spans.push(Span::styled(
-            pad_r(&super::widgets::trunc(&node, NODE_W - 1), NODE_W),
+            pad_r(&trunc(&node, NODE_W - 1), NODE_W),
             style::dim(),
         ));
     }
@@ -234,178 +335,243 @@ fn key_row(
         r.bytes.map_or_else(dash, format::bytes)
     };
     spans.extend([
-        Span::styled(pad_r(r.key_type.as_str(), TYPE_W + 1), style::dim()),
-        Span::styled(format!("{}  ", pad_l(&ttl_text(r.ttl), TTL_W)), ttl_style),
-        Span::styled(format!("{}  ", pad_l(&size, SIZE_W)), style::fg()),
+        Span::styled(format!("{} ", pad_l(&size, SIZE_W)), style::fg()),
+        Span::styled(format!("{} ", pad_l(&ttl_text(r.ttl), TTL_W)), ttl_style),
     ]);
+    if c.ty {
+        spans.push(Span::styled(
+            pad_r(r.key_type.as_str(), TYPE_W),
+            style::dim(),
+        ));
+    }
     if c.enc {
-        let enc = r.encoding.clone().unwrap_or_else(dash);
+        let enc = r.encoding.as_deref().map_or_else(dash, escape);
         let past = past_compact_encoding(r.key_type) == Some(enc.as_str());
         spans.push(Span::styled(
-            pad_r(&super::widgets::trunc(&enc, ENC_W), ENC_W + 1),
+            pad_r(&trunc(&enc, ENC_W - 1), ENC_W),
             if past { style::amber() } else { style::dim() },
         ));
     }
-    let len = r.length.map_or_else(dash, format::count);
-    spans.push(Span::styled(
-        format!("{}  ", pad_l(&len, LEN_W)),
-        style::fg(),
-    ));
+    if c.len {
+        let len = r.length.map_or_else(dash, format::grouped);
+        spans.push(Span::styled(
+            format!("{} ", pad_l(&len, LEN_W)),
+            style::fg(),
+        ));
+    }
     if c.lfu {
         let lfu = r.freq.map_or_else(dash, |f| f.to_string());
-        spans.push(Span::styled(pad_l(&lfu, LFU_W), style::fg()));
+        spans.push(Span::styled(
+            format!("{} ", pad_l(&lfu, LFU_W)),
+            style::fg(),
+        ));
     }
     Line::from(spans)
 }
 
-/// What the table says while it has no rows.
-fn empty_lines(state: &KeysState, ctx: &Ctx<'_>) -> Vec<Line<'static>> {
-    let text = if let Some(e) = &state.error {
-        return vec![Line::from(Span::styled(format!(" ✗ {e}"), style::warn()))];
+/// What the list says while it has no rows.
+fn empty_lines(state: &KeysState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>> {
+    let (text, st) = if let Some(e) = &state.error {
+        (format!(" ✗ {e}"), style::warn())
     } else if let LiveState::Closed(why) = ctx.live() {
         let why = why.as_deref().unwrap_or("it was closed");
-        return vec![Line::from(Span::styled(
-            format!(" ✗ The live connection is closed: {why}. Scan again to reopen it."),
+        (
+            format!(" ✗ The live connection is closed: {why}. Connect again to reopen it."),
             style::warn(),
-        ))];
+        )
     } else if !state.filter.is_empty() && !state.rows.is_empty() {
-        format!(
-            " No loaded key matches \"{}\". Press esc to clear the filter.",
-            state.filter
-        )
-    } else if state.type_filter != TypeFilter::All && !state.rows.is_empty() {
-        format!(
-            " No loaded key is of type {}. Press t for another type, esc to clear.",
-            state.type_filter.label()
-        )
-    } else if state.done {
-        " No key of this pattern was found.".to_string()
-    } else if state.pages > 0 && !state.is_loading() {
-        " No key of this pattern in the part scanned so far. n scans further.".to_string()
-    } else if !ctx.live_ready() {
-        format!(" {} Waiting for the live connection…", spinner(ctx.tick))
-    } else {
-        format!(" {} Loading keys with SCAN…", spinner(ctx.tick))
-    };
-    vec![Line::from(Span::styled(text, style::dim()))]
-}
-
-fn detail_panel(frame: &mut Frame, area: Rect, state: &KeysState, ctx: &Ctx<'_>) {
-    let row = state.selected();
-    let (title, right) = match row {
-        Some(r) => (r.key.clone(), r.key_type.as_str().to_string()),
-        None => ("Keys".to_string(), String::new()),
-    };
-    let inner = panel(frame, area, &title, &right);
-    let w = usize::from(inner.width);
-    let label = |s: &str| Span::styled(pad_r(&format!(" {s}"), 10), style::dim());
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    if let Some(r) = row {
-        let len = match (r.length, length_unit(r.key_type)) {
-            (Some(n), Some(u)) => format!("{} {u}", format::grouped(n)),
-            (Some(n), None) => format::grouped(n),
-            (None, _) => "—".to_string(),
-        };
-        let size = if sizes_off(state) {
-            "— (no MEMORY USAGE)".to_string()
-        } else {
-            r.bytes.map_or_else(|| "—".to_string(), format::bytes)
-        };
-        lines.push(Line::from(vec![
-            label("ENCODING"),
-            Span::styled(
-                r.encoding.clone().unwrap_or_else(|| "—".into()),
-                style::fgb(),
-            ),
-            Span::styled("   LENGTH ", style::dim()),
-            Span::styled(len, style::fgb()),
-        ]));
-        let mut second = vec![
-            label("SIZE"),
-            Span::styled(size, style::fgb()),
-            Span::styled("   TTL ", style::dim()),
-            Span::styled(ttl_text(r.ttl), style::fgb()),
-        ];
-        if state.lfu {
-            second.push(Span::styled("   LFU ", style::dim()));
-            second.push(Span::styled(
-                r.freq.map_or_else(|| "—".into(), |f| f.to_string()),
-                style::fgb(),
-            ));
-        }
-        lines.push(Line::from(second));
-        let mut third = vec![label("PATTERN")];
-        let p = state.pattern.clone().unwrap_or_default();
-        third.extend(pattern_spans(&p, style::fg(), style::ph()));
-        if state.by_node() {
-            // The node in full: the column cuts it.
-            third.push(Span::styled("   NODE ", style::dim()));
-            third.push(Span::styled(
-                node_name(ctx, state.row_node.get(&r.key).copied()),
-                style::fgb(),
-            ));
-        }
-        lines.push(Line::from(third));
-        lines.push(Line::default());
-    }
-    lines.push(Line::from(Span::styled(status(state), style::dim())));
-    if state.other_pattern > 0 {
-        lines.push(Line::from(Span::styled(
+        (
             format!(
-                " {} keys matched the glob but infer to other patterns, so they are left out.",
-                format::grouped(state.other_pattern)
+                " No loaded key matches \"{}\". esc clears the filter.",
+                state.filter
             ),
             style::dim(),
-        )));
+        )
+    } else if state.type_filter != TypeFilter::All && !state.rows.is_empty() {
+        (
+            format!(
+                " No loaded key is of type {}. t for another type, esc to clear.",
+                state.type_filter.label()
+            ),
+            style::dim(),
+        )
+    } else if state.done {
+        (
+            " No key of this pattern was found.".to_string(),
+            style::dim(),
+        )
+    } else if state.pages > 0 && !state.is_loading() {
+        (
+            " No key of this pattern in the part read so far. n reads further.".to_string(),
+            style::dim(),
+        )
+    } else if !ctx.live_ready() {
+        (
+            format!(" {} Waiting for the live connection…", spinner(ctx.tick)),
+            style::dim(),
+        )
+    } else {
+        (
+            format!(" {} Loading keys…", spinner(ctx.tick)),
+            style::dim(),
+        )
+    };
+    wrap_words(&text, w)
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, st)))
+        .collect()
+}
+
+/// The list's bottom line: how far it got, and `n`.
+fn status(state: &KeysState, est: Option<(u64, bool)>, tick: u64) -> String {
+    let n = format::grouped(state.rows.len() as u64);
+    let of = match est {
+        Some((e, true)) => format!(" of {}", format::grouped(e)),
+        Some((e, false)) => format!(" of ~{}", format::count(e)),
+        None => String::new(),
+    };
+    if state.done {
+        format!(" All {n} keys loaded.")
+    } else if state.is_loading() {
+        format!(" {} {n}{of} loaded, loading more…", spinner(tick))
+    } else if state.rows.is_empty() && state.pages > 0 {
+        " No keys found yet. n reads further.".to_string()
+    } else if state.rows.is_empty() {
+        " No keys loaded yet.".to_string()
+    } else {
+        format!(" {n}{of} loaded. n loads 1,000 more.")
+    }
+}
+
+/// The right pane: the selected key's length, size and expiry, why it is marked, and
+/// what the list left out or could not read.
+fn detail(frame: &mut Frame, inner: Rect, state: &KeysState, ctx: &Ctx<'_>, pattern: &str) {
+    let w = usize::from(inner.width);
+    let wide = w >= 40;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let para = |lines: &mut Vec<Line<'static>>, text: &str, st| {
+        lines.extend(
+            wrap_words(text, w)
+                .into_iter()
+                .map(|l| Line::from(Span::styled(l, st))),
+        );
+    };
+    if let Some(r) = state.selected() {
+        let mut facts: Vec<String> = Vec::new();
+        if let Some(n) = r.length {
+            facts.push(match length_unit(r.key_type) {
+                Some(u) => format!("{} {u}", format::grouped(n)),
+                None => format::grouped(n),
+            });
+        }
+        if !sizes_off(state)
+            && let Some(b) = r.bytes
+        {
+            facts.push(format::bytes(b));
+        }
+        let expires = match r.ttl {
+            Ttl::Persistent => "never expires".to_string(),
+            Ttl::Expires(d) => format!("expires in {}", format::duration(d)),
+        };
+        if wide {
+            facts.push(expires);
+            lines.push(Line::from(fit(
+                vec![Span::styled(
+                    format!(" {}", facts.join(" · ")),
+                    style::fgb(),
+                )],
+                w,
+            )));
+        } else {
+            if !facts.is_empty() {
+                lines.push(Line::from(fit(
+                    vec![Span::styled(
+                        format!(" {}", facts.join(" · ")),
+                        style::fgb(),
+                    )],
+                    w,
+                )));
+            }
+            lines.push(Line::from(Span::styled(format!(" {expires}"), style::fg())));
+        }
+        if state.by_node() {
+            lines.push(Line::from(fit(
+                vec![Span::styled(
+                    format!(
+                        " on node {}",
+                        node_name(ctx, state.row_node.get(&r.key).copied())
+                    ),
+                    style::dim(),
+                )],
+                w,
+            )));
+        }
+        let enc = r.encoding.as_deref().unwrap_or("");
+        if let Some(past) = past_compact_encoding(r.key_type).filter(|p| *p == enc) {
+            let per = match length_unit(r.key_type) {
+                Some("fields") => "field",
+                _ => "member",
+            };
+            lines.push(Line::default());
+            para(
+                &mut lines,
+                &format!(
+                    " ▲ Stored as a {past}: past the compact size, so it takes more memory per {per}."
+                ),
+                style::amber(),
+            );
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(" → shows the value", style::dim())));
+    }
+    let mut notes: Vec<(String, ratatui::style::Style)> = Vec::new();
+    if state.other_pattern > 0 {
+        notes.push((
+            format!(
+                " {} {} matched {} but belong to other patterns, so they are not listed.",
+                format::grouped(state.other_pattern),
+                if state.other_pattern == 1 {
+                    "key"
+                } else {
+                    "keys"
+                },
+                match_glob(pattern)
+            ),
+            style::dim(),
+        ));
     }
     if state.unreadable > 0 {
-        lines.push(Line::from(Span::styled(
+        notes.push((
             format!(
                 " {} keys could not be read (refused by a key ACL, or not UTF-8).",
                 format::grouped(state.unreadable)
             ),
             style::dim(),
-        )));
+        ));
     }
     for e in off_notes(state) {
-        lines.push(Line::from(Span::styled(e, style::amber())));
+        notes.push((e, style::amber()));
     }
     for &i in &state.missing {
         if let Some(n) = ctx.session.nodes.get(i) {
-            lines.push(Line::from(Span::styled(
+            notes.push((
                 format!(
                     " ▲ {}",
                     crate::live::nodes::not_connected(&n.endpoint)
                         .replace("so nothing is sent to it", "so its keys are not listed")
                 ),
                 style::amber(),
-            )));
+            ));
         }
     }
     if let (Some(e), false) = (&state.error, state.rows.is_empty()) {
-        lines.push(Line::from(Span::styled(format!(" ✗ {e}"), style::warn())));
+        notes.push((format!(" ✗ {e}"), style::warn()));
     }
-    let lines = lines
-        .into_iter()
-        .map(|l| Line::from(fit(l.spans, w)))
-        .collect();
+    for (text, st) in notes {
+        lines.push(Line::default());
+        para(&mut lines, &text, st);
+    }
     rows(frame, inner, lines, None);
-}
-
-/// How far the list got.
-fn status(state: &KeysState) -> String {
-    let n = format::grouped(state.rows.len() as u64);
-    if state.done {
-        format!(" All {n} keys of this pattern are loaded.")
-    } else if state.is_loading() {
-        format!(" {n} keys loaded, loading more…")
-    } else if state.rows.is_empty() && state.pages > 0 {
-        " No keys found yet. n scans further.".to_string()
-    } else if state.rows.is_empty() {
-        " No keys loaded yet.".to_string()
-    } else {
-        format!(" {n} keys loaded. n loads 1,000 more.")
-    }
 }
 
 /// One line per column that is off, in redis-lens's own words.

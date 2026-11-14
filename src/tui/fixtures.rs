@@ -832,8 +832,7 @@ pub fn cluster_report() -> ScanReport {
 }
 
 /// The note the scanner gives a node that failed mid-scan.
-pub const NOTE_STOPPED: &str =
-    "the scan of this node stopped early (a connection or server error); its results are partial";
+pub const NOTE_STOPPED: &str = crate::scan::cluster::NOTE_STOPPED;
 /// The note connecting gives a node that could not be reached.
 pub const NOTE_UNREACHABLE: &str = "10.0.1.13:6379: could not connect";
 

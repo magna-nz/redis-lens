@@ -2,6 +2,8 @@
 //!
 //! Owner: scanner.
 
+pub mod names;
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 

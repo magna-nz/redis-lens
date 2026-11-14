@@ -1,0 +1,28 @@
+---
+source: src/tui/ui/overview.rs
+expression: t
+---
+" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys          ● connected "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"┌─ Now ──────────────────────────────────────────── INFO every 2 s · p pauses ─┐"
+"│ ops/s         100 ·▄▄▄                 clients        10 ▁█▅▁                │"
+"│ memory       982K ▁▃▆█ of 3.8M         hit rate      90% ·▄▄▄                │"
+"│ evicted     0.5/s ·▄▄▄                 expired     5.0/s ·▄▄▄                │"
+"│ Re┌─ Analyze the keys? ─────────────────────────── prod-cache-01 · PROD ─┐-l…│"
+"├─ K│ Sampling reads a few commands per key; nothing is written.           │d ─┤"
+"│ 7.│                                                                      │   │"
+"│   │ › Quick   10,000 keys     about 40K commands     about 8 s           │   │"
+"│ FR│   Deep    100,000 keys    about 400K commands    about 80 s          │   │"
+"│ › │                                                                      │   │"
+"│   │ Deep finds rare patterns and rare big keys. Both stay under this     │   │"
+"│   │ profile's limit of 5,000 commands/s, and esc stops either one and    │   │"
+"│   │ keeps what it has.                                                   │   │"
+"│ WH│                                                                      │   │"
+"│   │ enter Start   ↑↓ Pick   esc Cancel                                   │   │"
+"│   └──────────────────────────────────────────────────────────────────────┘   │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" A question is open: answer it, or esc to cancel.                               "

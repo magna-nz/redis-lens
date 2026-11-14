@@ -66,6 +66,8 @@ fn scanned_with(report: ScanReport, perms: PermissionReport) -> (App, ConnId) {
         scan: scan_of(&app),
         report: Box::new(report),
     });
+    // A connect lands on Overview; these snapshots start on Browse › Keys.
+    super::app::views::testing::show(&mut app, Screen::Patterns);
     (app, id)
 }
 
@@ -133,9 +135,12 @@ fn go(app: &mut App, c: char) {
 }
 
 /// Goes to `screen`, unless it is the key list (or the key detail over it) and there is
-/// no pattern to open.
+/// no pattern to open, or Nodes or Slots off a cluster (not screens there).
 fn show(app: &mut App, screen: Screen) -> bool {
     if matches!(screen, Screen::KeyList | Screen::KeyDetail) && app.pattern_rows().is_empty() {
+        return false;
+    }
+    if matches!(screen, Screen::Nodes | Screen::Slots) && !app.is_cluster() {
         return false;
     }
     super::app::views::testing::show(app, screen);
@@ -161,6 +166,7 @@ fn select_pattern(app: &mut App, label: &str) {
             Row::Pattern { idx, .. } => report.patterns[idx].pattern == label,
         })
         .unwrap_or_else(|| panic!("no row {label}"));
+    assert_eq!(app.screen(), Screen::Patterns);
     while app.patterns.sel < at {
         app.handle_key(ch('j'));
     }
@@ -234,41 +240,36 @@ fn connections_docker_auth() {
 #[test]
 fn docker_auth_detail_panel() {
     let mut app = docker_auth_app();
-    for (name, auth, cred) in [
+    for (name, sign_in) in [
         (
             "pw-redis-1",
-            "password (default user)",
-            "from the container, memory only",
+            "password for the default user, from the container, kept in memory only",
         ),
-        ("myapp-redis-1", "none", "none"),
+        ("myapp-redis-1", "none"),
         (
             "acl-valkey-1",
-            "required",
-            "not found: save it as a profile with credentials",
+            "a password is required and was not found: save it as a profile with credentials",
         ),
-        ("odd-valkey-1", "unknown", "could not tell"),
+        ("odd-valkey-1", "could not tell"),
     ] {
         select_entry(&mut app, name);
         let lines = buffer_lines(&render(&app, 140, 40));
-        let field = |key: &str| {
-            lines
-                .iter()
-                .find_map(|l| {
-                    l.split_once(&format!(" {key}  "))
-                        .map(|(_, v)| v.trim_start().to_string())
-                })
-                .unwrap_or_else(|| panic!("{name}: no {key} field"))
-        };
-        assert!(
-            field("Auth").starts_with(&format!("{auth}  ")),
-            "{name}: {}",
-            field("Auth")
-        );
-        assert!(
-            field("Credential").starts_with(&format!("{cred}  ")),
-            "{name}: {}",
-            field("Credential")
-        );
+        // The sentence may wrap: join the label's row and the rows that continue it.
+        let at = lines
+            .iter()
+            .position(|l| l.contains(" Sign-in  "))
+            .unwrap_or_else(|| panic!("{name}: no Sign-in field"));
+        let mut field = String::new();
+        for l in &lines[at..] {
+            let inner = l.trim_matches(|c| c == '│' || c == ' ');
+            let inner = inner.strip_prefix("Sign-in").unwrap_or(inner).trim();
+            if inner.is_empty() || inner.starts_with("Access") {
+                break;
+            }
+            field.push(' ');
+            field.push_str(inner);
+        }
+        assert_eq!(field.trim(), sign_in, "{name}");
         for line in &lines {
             assert!(
                 !line.contains("Fixture-Container-Pw"),
@@ -435,7 +436,7 @@ fn connections_with_tags_80x24() {
     insta::assert_snapshot!(t.backend());
 }
 
-/// A Sentinel profile's Sentinel row takes the Values row, so its tags follow TLS.
+/// A Sentinel profile shows its Sentinel row and its tags, and no Values row.
 #[test]
 fn connections_sentinel_with_tags_80x24() {
     let mut p = fixtures::profiles().remove(0);
@@ -449,10 +450,7 @@ fn connections_sentinel_with_tags_80x24() {
     let app = App::new(vec![p]);
     let t = render(&app, 80, 24);
     let lines = buffer_lines(&t);
-    assert!(
-        lines.iter().any(|l| l.contains("on · tags team-a, eu")),
-        "{lines:#?}"
-    );
+    assert!(lines.iter().any(|l| l.contains("team-a, eu")), "{lines:#?}");
     insta::assert_snapshot!(t.backend());
 }
 
@@ -477,25 +475,34 @@ fn connections_filtered_by_tag_80x24() {
 fn scanning_progress_header() {
     let mut app = App::new(fixtures::profiles());
     let id = connect_selected(&mut app);
-    app.apply(Msg::Connected {
-        id,
-        scan: scan_of(&app),
-        server: Some(fixtures::server()),
-        perms: fixtures::perms_ok(),
-        target: ScanTarget::Primary,
-    });
+    let connected = |app: &mut App| {
+        app.apply(Msg::Connected {
+            id,
+            scan: scan_of(app),
+            server: Some(fixtures::server()),
+            perms: fixtures::perms_ok(),
+            target: ScanTarget::Primary,
+        })
+    };
+    connected(&mut app);
+    // `r`, `enter`: a Quick analysis.
+    app.handle_key(ch('r'));
+    app.handle_key(key(KeyCode::Enter));
+    connected(&mut app);
     app.apply(Msg::ScanProgress {
         id,
         scan: scan_of(&app),
         progress: ScanProgress {
-            sampled: 12_400,
-            target: 85_964,
+            sampled: 1_240,
+            target: 10_000,
             done: false,
         },
     });
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[1].contains("Sampled 12,400 / 85,964"), "{}", lines[1]);
+    assert!(lines[0].contains("analyzing 12%"), "{}", lines[0]);
+    let all = lines.join("\n");
+    assert!(all.contains("sampling 1,240 of 10,000 keys"), "{all}");
 }
 
 #[test]
@@ -574,6 +581,8 @@ fn partial_after_previous_profile() -> App {
         scan: scan_of(&app),
         partial,
     });
+    // A connect lands on Overview; these look at Browse › Keys.
+    go(&mut app, '1');
     app
 }
 
@@ -607,7 +616,7 @@ fn partial_marker_survives_narrow_terminals() {
 #[test]
 fn other_views_wait_while_partial() {
     let mut app = partial_after_previous_profile();
-    for (view, title) in [('2', "TTL"), ('3', "Diff"), ('4', "Hot keys")] {
+    for (view, title) in [('2', "Expiry"), ('3', "Changes"), ('4', "Hot keys")] {
         go(&mut app, view);
         let lines = buffer_lines(&render(&app, 120, 36));
         let t = body_top(&lines);
@@ -635,10 +644,11 @@ fn failed_scan_drops_partial_results_from_the_screen() {
     });
     app.handle_key(ch('x')); // clear the error notice
     let lines = buffer_lines(&render(&app, 120, 36));
+    // The first row of the list pane, right under its title.
     assert!(
-        lines[5].contains("✗ connection reset by peer"),
+        lines[4].contains("✗ connection reset by peer"),
         "{}",
-        lines[5]
+        lines[4]
     );
     for line in &lines {
         assert!(!line.contains("partial"), "{line}");
@@ -665,6 +675,7 @@ fn empty_partial_says_nothing_sampled_yet() {
         scan: scan_of(&app),
         partial: std::sync::Arc::new(partial),
     });
+    go(&mut app, '1');
     let lines = buffer_lines(&render(&app, 120, 36));
     assert!(
         lines[3].contains("partial · 0 / 100,000 sampled"),
@@ -721,6 +732,8 @@ fn patterns_filter_applied() {
 fn patterns_with_delta() {
     let mut app = scanned_with_history(true);
     select_pattern(&mut app, "cache:search:{hash}");
+    // Δ is one of the `v` columns.
+    app.handle_key(ch('v'));
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
     assert!(lines[4].contains("Δ"), "{}", lines[4]);
@@ -729,7 +742,8 @@ fn patterns_with_delta() {
 
 #[test]
 fn patterns_delta_without_sizes_counts_keys() {
-    let app = scanned_with_history(false);
+    let mut app = scanned_with_history(false);
+    app.handle_key(ch('v'));
     let lines = buffer_lines(&render(&app, 120, 36));
     let row = lines
         .iter()
@@ -808,14 +822,13 @@ fn diff_view_with_trend() {
         |name: &str| crate::format::sparkline(&fixtures::trend(true).pattern(name).unwrap().values);
     assert_eq!(spark("cache:search:{hash}"), "▁▁▂▂▃▃▄█");
     assert!(row.contains(&spark("cache:search:{hash}")), "{row}");
+    // The detail pane draws the sparkline, then the rate in words (which may wrap).
     assert!(
-        text.contains(&format!(
-            " trend          {}  +8.7% a day (+128M a day)",
-            spark("cache:search:{hash}")
-        )),
+        text.contains(&format!(" TREND {}", spark("cache:search:{hash}"))),
         "{text}"
     );
-    assert!(text.contains("a day) over 8 scans, all partial"), "{text}");
+    assert!(text.contains("+8.7% a day (+128M a day)"), "{text}");
+    assert!(text.contains("over 8 snapshots"), "{text}");
     insta::assert_snapshot!(t.backend());
 }
 
@@ -841,12 +854,8 @@ fn diff_view_with_trend_without_sizes() {
     assert_eq!(values[2], None);
     let spark = crate::format::sparkline(values);
     assert!(spark.contains('·'), "{spark}");
-    assert!(
-        text.contains(&format!(
-            " trend          {spark}  flat over 8 scans, all partial"
-        )),
-        "{text}"
-    );
+    assert!(text.contains(&format!(" TREND {spark}")), "{text}");
+    assert!(text.contains("flat over 8 snapshots"), "{text}");
     insta::assert_snapshot!(t.backend());
 }
 
@@ -876,7 +885,7 @@ fn diff_view_without_history() {
     let t = render(&app, 120, 36);
     let text = buffer_lines(&t).join("\n");
     assert!(text.contains("No earlier snapshot for prod-cache-01."));
-    assert!(text.contains("Press s to save one; the next scan compares against it."));
+    assert!(text.contains("Press s to save one; the next analysis compares against it."));
     insta::assert_snapshot!(t.backend());
 }
 
@@ -915,26 +924,35 @@ fn colour_at(t: &Terminal<TestBackend>, row_text: &str, cell_text: &str, from: u
 fn change_and_verdict_colours() {
     use crate::tui::ui::style::{AMBER, DIM, RED, TEAL};
     let mut app = scanned_with_history(true);
+    // The Δ column is one of the `v` columns on Browse.
+    app.handle_key(ch('v'));
     let t = render(&app, 120, 36);
     // Δ column: new is red, +232M amber, a shrink teal, unchanged dim.
-    assert_eq!(colour_at(&t, "tmp:import:{ulid}", "+", 100), RED);
-    assert_eq!(colour_at(&t, "queue:emails", "+", 100), AMBER);
-    assert_eq!(colour_at(&t, "rl:{ip}:{id}", "-", 100), TEAL);
-    assert_eq!(colour_at(&t, "lock:{var}", "·", 100), DIM);
+    assert_eq!(colour_at(&t, "tmp:import:{ulid}", "+", 40), RED);
+    assert_eq!(colour_at(&t, "queue:emails", "+", 40), AMBER);
+    assert_eq!(colour_at(&t, "rl:{ip}:{id}", "-", 40), TEAL);
+    assert_eq!(colour_at(&t, "lock:{var}", "·", 40), DIM);
     go(&mut app, '2');
     let t = render(&app, 120, 36);
-    // Warning rows have a red "none" bucket and verdict; stable ones amber and dim.
-    assert_eq!(colour_at(&t, "user:{id}:cart", "▅", 50), RED);
-    assert_eq!(colour_at(&t, "user:{id}:cart", "m", 90), RED);
-    assert_eq!(colour_at(&t, "feature:{var}", "█", 50), AMBER);
-    assert_eq!(colour_at(&t, "feature:{var}", "p", 90), DIM);
-    assert_eq!(colour_at(&t, "session:{uuid}", "█", 50), TEAL);
+    // The mark of a row worth a look: red for a pattern that never expires and grows,
+    // amber where some keys never expire; stable and ok rows have none and are dim.
+    assert_eq!(colour_at(&t, "user:{id}:profile", "▲", 40), RED);
+    assert_eq!(colour_at(&t, "user:{id}:cart", "▲", 40), AMBER);
+    assert_eq!(colour_at(&t, "feature:{var}", "n", 40), DIM);
+    assert_eq!(colour_at(&t, "session:{uuid}", "k", 40), DIM);
+    // The selected (riskiest) pattern's histogram has a red "none" bucket.
+    let lines = buffer_lines(&t);
+    let y = lines.iter().position(|l| l.contains("none <1m")).unwrap() as u16 + 1;
+    let x = (70..120u16)
+        .find(|&x| t.backend().buffer()[(x, y)].symbol() == "█")
+        .expect("a bar under the labels");
+    assert_eq!(t.backend().buffer()[(x, y)].fg, RED);
     go(&mut app, '3');
     let t = render(&app, 120, 36);
-    // Diff bars: growth of 300M or more red, smaller growth amber, shrink teal.
-    assert_eq!(colour_at(&t, "cache:search:{hash}", "█", 80), RED);
-    assert_eq!(colour_at(&t, "queue:emails", "█", 80), AMBER);
-    assert_eq!(colour_at(&t, "rl:{ip}:{id}", "█", 80), TEAL);
+    // Changes: growth of 300M or more is red, smaller growth amber, shrink teal.
+    assert_eq!(colour_at(&t, "cache:search:{hash}", "+", 30), RED);
+    assert_eq!(colour_at(&t, "queue:emails", "+", 30), AMBER);
+    assert_eq!(colour_at(&t, "rl:{ip}:{id}", "-", 30), TEAL);
 }
 
 #[test]
@@ -1074,7 +1092,7 @@ fn keychain_hint_and_scan_target_are_drawn() {
     assert!(!t.contains("Waiting for the OS keychain"), "{t}");
     app.handle_key(ch('0'));
     let t = text(&app);
-    assert!(t.contains("scanning replica 10.0.1.21:6379"), "{t}");
+    assert!(t.contains("reading replica 10.0.1.21:6379"), "{t}");
 }
 
 const LONG_NAME: &str = "audit-trail-{id}-with-an-exceedingly-long-descriptive-pattern-name-{uuid}";
@@ -1099,9 +1117,8 @@ fn patterns_narrow_rows_do_not_wrap() {
     // The table's rows, between its header and its closing border.
     let end = before.iter().position(|l| l.starts_with('└')).unwrap();
     let table = &before[5..end];
-    let report = app.report().unwrap();
-    assert_eq!(table.len(), 7, "{before:#?}");
-    assert!(report.patterns.len() >= table.len());
+    // The list's rows and its bottom line: the whole height but the chrome.
+    assert_eq!(table.len(), 17, "{before:#?}");
     // One line for the long name, cut with `…`, and none for its tail.
     assert!(table[0].starts_with("│   audit-t"), "{}", table[0]);
     assert!(table[0].contains('…'), "{}", table[0]);
@@ -1183,12 +1200,12 @@ fn patterns_sorted_by_keys() {
     app.handle_key(ch('o'));
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[3].contains("sorted by keys"), "{}", lines[3]);
+    assert!(lines[3].contains("by keys"), "{}", lines[3]);
     assert!(lines[4].contains("KEYS▼"), "{}", lines[4]);
     assert!(!lines[4].contains("MEMORY▼"), "{}", lines[4]);
     // The selection stayed on the same pattern, now further down.
     assert!(
-        lines.iter().any(|l| l.starts_with("┌─ user:{id}:cart ")),
+        lines.iter().any(|l| l.contains("┬─ user:{id}:cart ")),
         "{lines:#?}"
     );
     assert!(lines[12].contains("user:{id}:cart"), "{}", lines[12]);
@@ -1201,7 +1218,7 @@ fn patterns_sorted_by_name_shows_an_up_arrow() {
     let mut app = scanned(true);
     press(&mut app, "oooo");
     let lines = buffer_lines(&render(&app, 120, 36));
-    assert!(lines[3].contains("sorted by name"), "{}", lines[3]);
+    assert!(lines[3].contains("by name"), "{}", lines[3]);
     assert!(lines[4].starts_with("│ PATTERN ▲"), "{}", lines[4]);
     assert!(!lines[4].contains('▼'), "{}", lines[4]);
 }
@@ -1213,24 +1230,35 @@ fn table_at(app: &App, w: u16) -> Vec<String> {
     lines[3..=end].to_vec()
 }
 
-/// Asserts the header shows exactly `shown` of the optional columns and that the
-/// share percentage lines up between the header and every row.
+/// Asserts the header shows exactly `shown` of the optional columns, that the share
+/// percentage lines up between the header and every row when it shows, and that no
+/// row is wider than the terminal.
 fn check_columns(table: &[String], w: u16, shown: &[&str]) {
     let head = &table[1];
-    for col in ["SHARE", "AVG", "Δ"] {
+    for col in ["TYPE", "SHARE", "AVG", "NO TTL", "Δ"] {
         assert_eq!(
             head.contains(col),
             shown.contains(&col),
             "{w}: {col} in {head}"
         );
     }
-    let pct = |l: &str| l.chars().position(|c| c == '%');
-    let at = pct(head).unwrap();
-    for row in &table[2..table.len() - 1] {
-        if row.trim_matches(|c| c == '│' || c == ' ').is_empty() {
-            continue;
+    // KEYS, MEMORY and the `▲` column always.
+    assert!(
+        head.contains("KEYS") && head.contains("MEMORY"),
+        "{w}: {head}"
+    );
+    if shown.contains(&"SHARE") {
+        // The share's `%` sits under the header's last `%`-free cell of SHARE: every
+        // row puts it in the same column.
+        let pct = |l: &str| l.chars().position(|c| c == '%');
+        let rows: Vec<&String> = table[2..table.len() - 2]
+            .iter()
+            .filter(|r| r.contains('%'))
+            .collect();
+        let at = pct(rows[0]);
+        for row in rows {
+            assert_eq!(pct(row), at, "{w}: {row}\n{head}");
         }
-        assert_eq!(pct(row), Some(at), "{w}: {row}\n{head}");
     }
     for l in table {
         assert_eq!(l.chars().count(), usize::from(w), "{l}");
@@ -1251,44 +1279,48 @@ fn narrow_steps(app: &App, steps: &[(u16, &[&str])]) -> String {
 fn patterns_narrow_columns() {
     let mut app = scanned(true);
     select_pattern(&mut app, "user:{id}:cart");
-    // 83 is the narrowest with every column; then the share bar goes (82), then the
-    // average size (74); below 66 the row is cut at the right edge. VERDICT always shows.
-    let snap = narrow_steps(
+    // Without `v`: PATTERN, KEYS, MEMORY and `▲`; from 110 columns TYPE and the share
+    // bar join in.
+    let plain = narrow_steps(
         &app,
         &[
-            (83, &["SHARE", "AVG"]),
-            (82, &["AVG"]),
-            (75, &["AVG"]),
-            (74, &[]),
-            (66, &[]),
+            (120, &["TYPE", "SHARE"]),
+            (110, &["TYPE", "SHARE"]),
+            (109, &[]),
+            (80, &[]),
+            (60, &[]),
         ],
     );
-    let cut = table_at(&app, 50);
-    // Every column is hidden and the name is at its narrowest: the row is cut.
-    assert!(cut[1].starts_with("│ PATTERN    TYPE"), "{}", cut[1]);
-    assert!(!cut[1].contains("NO TTL"), "{}", cut[1]);
-    insta::assert_snapshot!(format!("{snap}50 wide:\n{}", cut.join("\n")));
+    // With `v` the list takes 70% and shows the rest; when the pattern column would
+    // get too narrow the share bar goes first, then AVG.
+    app.handle_key(ch('v'));
+    let more = narrow_steps(
+        &app,
+        &[
+            (120, &["TYPE", "SHARE", "AVG", "NO TTL"]),
+            (100, &["TYPE", "AVG", "NO TTL"]),
+            (80, &["TYPE", "NO TTL"]),
+        ],
+    );
+    insta::assert_snapshot!(format!("{plain}with v:\n\n{more}"));
 }
 
 #[test]
 fn patterns_narrow_columns_with_delta() {
     let mut app = scanned_with_history(true);
     select_pattern(&mut app, "user:{id}:cart");
-    // 91 is the narrowest with every column; the share bar goes first (90), then Δ
-    // (82), then the average size (74). VERDICT always shows.
-    let snap = narrow_steps(
+    // Δ is a `v` column: when room runs out it goes after the share bar, before AVG.
+    let plain = narrow_steps(&app, &[(120, &["TYPE", "SHARE"]), (80, &[])]);
+    app.handle_key(ch('v'));
+    let more = narrow_steps(
         &app,
         &[
-            (91, &["SHARE", "AVG", "Δ"]),
-            (90, &["AVG", "Δ"]),
-            (83, &["AVG", "Δ"]),
-            (82, &["AVG"]),
-            (75, &["AVG"]),
-            (74, &[]),
-            (66, &[]),
+            (120, &["TYPE", "SHARE", "AVG", "NO TTL", "Δ"]),
+            (100, &["TYPE", "AVG", "NO TTL", "Δ"]),
+            (80, &["TYPE", "NO TTL"]),
         ],
     );
-    insta::assert_snapshot!(snap);
+    insta::assert_snapshot!(format!("{plain}with v:\n\n{more}"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1302,7 +1334,8 @@ fn rescanning(view: char) -> (App, ConnId, ScanId) {
     go(&mut app, view);
     press(&mut app, "j");
     let id = app.session.as_ref().unwrap().id;
-    let effects = app.handle_key(ch('r'));
+    app.handle_key(ch('r'));
+    let effects = app.handle_key(key(KeyCode::Enter));
     let [Effect::Connect { scan, .. }] = effects[..] else {
         panic!("unexpected effects {effects:?}");
     };
@@ -1325,17 +1358,19 @@ fn rescanning(view: char) -> (App, ConnId, ScanId) {
     (app, id, scan)
 }
 
-const RESCANNING: &str = "rescanning · previous results";
-const RESCAN_FAILED: &str = "rescan failed · previous results";
+const RESCANNING: &str = "analyzing · previous results";
+const RESCAN_FAILED: &str = "analysis failed · previous results";
 
 #[test]
 fn patterns_rescanning_shows_previous_results() {
-    let (app, _, _) = rescanning('1');
+    let (mut app, _, _) = rescanning('1');
+    // Δ is one of the `v` columns.
+    app.handle_key(ch('v'));
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
     assert!(lines[3].contains(RESCANNING), "{}", lines[3]);
-    // The header says a scan runs; the Δ column of the old report stays.
-    assert!(lines[0].contains("scanning"), "{}", lines[0]);
+    // The header says an analysis runs; the Δ column of the old report stays.
+    assert!(lines[0].contains("analyzing"), "{}", lines[0]);
     assert!(lines[4].contains('Δ'), "{}", lines[4]);
     insta::assert_snapshot!(t.backend());
 }
@@ -1371,6 +1406,7 @@ fn every_view_marks_previous_results_until_the_rescans_first_partial() {
     set_history(&mut app2, id2, None);
     go(&mut app2, '3');
     app2.handle_key(ch('r'));
+    app2.handle_key(key(KeyCode::Enter));
     for view in ['3', '4'] {
         go(&mut app2, view);
         assert!(top(&app2, 120).contains(RESCANNING), "view {view}");
@@ -1381,7 +1417,7 @@ fn every_view_marks_previous_results_until_the_rescans_first_partial() {
         scan,
         partial: fixtures::partial(true),
     });
-    app.handle_key(ch('1'));
+    app.handle_key(ch('2'));
     let line = top(&app, 120);
     assert!(line.contains("partial · 3,200 / 100,000 sampled"), "{line}");
     assert!(!line.contains("previous"), "{line}");
@@ -1404,7 +1440,7 @@ fn patterns_rescan_failed_keeps_previous_results_marked() {
     let t = render(&app, 80, 24);
     let lines = buffer_lines(&t);
     assert!(lines[3].contains(RESCAN_FAILED), "{}", lines[3]);
-    assert!(lines[23].contains("Scan failed: connection reset"));
+    assert!(lines[23].contains("Analysis failed: connection reset"));
     for view in ['2', '3', '4'] {
         go(&mut app, view);
         let lines = buffer_lines(&render(&app, 120, 36));
@@ -1419,11 +1455,11 @@ fn patterns_rescan_failed_keeps_previous_results_marked() {
 #[test]
 fn help_over_patterns_80x24() {
     let mut app = scanned_with_history(true);
-    press(&mut app, "1j?");
+    press(&mut app, "2j?");
     let t = render(&app, 80, 24);
     let text = buffer_lines(&t).join("\n");
-    assert!(text.contains("Keys · Patterns"));
-    assert!(text.contains("? or esc closes"));
+    assert!(text.contains("Help · Browse › Keys"));
+    assert!(text.contains("esc closes"));
     insta::assert_snapshot!(t.backend());
 }
 
@@ -1433,7 +1469,7 @@ fn help_over_connections_120x36() {
     press(&mut app, "0?");
     let t = render(&app, 120, 36);
     let text = buffer_lines(&t).join("\n");
-    assert!(text.contains("Keys · Connections"));
+    assert!(text.contains("Help · Connections"));
     assert!(text.contains("Look for Docker containers again"));
     insta::assert_snapshot!(t.backend());
 }
@@ -1442,12 +1478,14 @@ fn help_over_connections_120x36() {
 fn help_overlay_on_every_view_and_size_does_not_panic() {
     let mut app = scanned_with_history(true);
     for screen in Screen::ALL {
-        show(&mut app, screen);
+        if !show(&mut app, screen) {
+            continue;
+        }
         press(&mut app, "?");
         for (w, h) in [(80, 24), (40, 12), (20, 5), (1, 1), (200, 60)] {
             render(&app, w, h);
         }
-        let title = format!("Keys · {}", screen.title());
+        let title = format!("Help · {}", screen.title());
         assert!(
             buffer_lines(&render(&app, 80, 24))
                 .join("\n")
@@ -1475,72 +1513,184 @@ fn detail_command_is_what_shift_y_copies() {
         let [Effect::Copy(t)] = &effects[..] else {
             panic!("unexpected effects {effects:?}");
         };
-        let text = buffer_lines(&render(&app, 120, 36)).join("\n");
-        assert!(
-            text.contains(&format!("$ {}", t.as_str())),
-            "{}",
-            t.as_str()
-        );
+        // The detail pane breaks a long command at spaces, under its `$`.
+        let lines = buffer_lines(&render(&app, 120, 36));
+        let pane = |l: &String| {
+            let parts: Vec<&str> = l.split('│').collect();
+            parts[parts.len().saturating_sub(2)].trim().to_string()
+        };
+        let at = lines
+            .iter()
+            .position(|l| pane(l).starts_with("$ "))
+            .unwrap_or_else(|| panic!("no command for {}", t.as_str()));
+        let mut shown = pane(&lines[at]);
+        for l in &lines[at + 1..] {
+            let p = pane(l);
+            if p.is_empty() || !l.contains('│') {
+                break;
+            }
+            shown = format!("{shown} {p}");
+        }
+        assert_eq!(shown, format!("$ {}", t.as_str()));
     }
 }
 
-/// The list rows a view draws, from its main panel: between the top border and the
-/// bottom border, less the column header.
-fn drawn_list_rows(lines: &[String]) -> usize {
-    let top = lines.iter().position(|l| l.starts_with('┌')).unwrap();
-    let bottom = top
-        + lines[top..]
+/// The rows of the list section of the frame on screen: from the frame's top border to
+/// the next border across it (the `├` above the details, or the bottom `└`), less
+/// `above` rows of it that are not list rows (the column header, a status line, a
+/// bottom line).
+fn drawn_list_rows(lines: &[String], above: usize) -> usize {
+    let top = lines
+        .iter()
+        .position(|l| l.starts_with('┌'))
+        .unwrap_or_else(|| panic!("no frame:\n{}", lines.join("\n")));
+    let end = top
+        + 1
+        + lines[top + 1..]
             .iter()
-            .position(|l| l.starts_with('└'))
-            .unwrap();
-    (bottom - top - 1).saturating_sub(1)
+            .position(|l| l.starts_with('├') || l.starts_with('└'))
+            .unwrap_or_else(|| panic!("no frame end:\n{}", lines.join("\n")));
+    (end - top - 1).saturating_sub(above)
 }
 
+/// The sizes [`list_rows_is_what_every_list_view_draws`] checks.
+const LIST_SIZES: [(u16, u16); 6] = [(80, 24), (120, 36), (60, 20), (200, 60), (80, 17), (80, 18)];
+
+/// `ui::list_rows` of `app`'s screen at `w` × `h` is the rows its list section has, as
+/// drawn, less `above`.
+fn assert_list_rows(app: &App, w: u16, h: u16, above: usize) {
+    let rows = ui::list_rows(ratatui::layout::Rect::new(0, 0, w, h), app);
+    let lines = buffer_lines(&render(app, w, h));
+    assert_eq!(
+        drawn_list_rows(&lines, above),
+        rows,
+        "{:?} at {w}x{h}:\n{}",
+        app.screen(),
+        lines.join("\n")
+    );
+}
+
+/// PgUp and PgDn move by `ui::list_rows`: on every list screen it is the rows its list
+/// shows, at every size. Split frames (Expiry, Changes, Hot keys, Big keys, Pub/Sub)
+/// fill the body: two borders and the header. Browse's lists have a bottom line as well.
+/// The full-width lists (Connections, Clients, Slow log, Monitor) have their details
+/// below them; Connections is long enough to take all the rows it may. Nodes is checked
+/// with the cluster snapshots. Not checked here: a key's value (its items share the right
+/// pane with the value), Slots (cluster only) and Overview's findings (a few rows).
 #[test]
 fn list_rows_is_what_every_list_view_draws() {
+    use crate::tui::app::views::testing;
+    // Analyze and Browse › Keys, from a finished analysis with history.
     let mut app = scanned_with_history(true);
-    for (w, h) in [(80, 24), (120, 36), (60, 20), (200, 60), (80, 17), (80, 18)] {
-        let rows = ui::list_rows(ratatui::layout::Rect::new(0, 0, w, h));
-        for view in ['0', '1', '2', '3', '4'] {
-            go(&mut app, view);
-            let lines = buffer_lines(&render(&app, w, h));
-            // The tab bar's panel row takes one on Analysis (`App::page` knows).
-            let panel_row = usize::from(!app.view.panels().is_empty());
-            assert_eq!(
-                drawn_list_rows(&lines),
-                rows.saturating_sub(panel_row),
-                "view {view} at {w}x{h}"
-            );
+    for (w, h) in LIST_SIZES {
+        for screen in [Screen::BigKeys, Screen::Ttl, Screen::Diff, Screen::HotKeys] {
+            assert!(show(&mut app, screen));
+            assert_list_rows(&app, w, h, 1);
+        }
+        for screen in [Screen::Patterns, Screen::KeyList] {
+            assert!(show(&mut app, screen));
+            assert_list_rows(&app, w, h, 2);
+        }
+        // Back from the key list to the patterns.
+        app.handle_key(key(KeyCode::Esc));
+    }
+    // Connections: more connections than any of the sizes shows.
+    let mut profiles = fixtures::profiles();
+    let first = profiles[0].clone();
+    profiles.extend((0..60).map(|i| {
+        let mut p = first.clone();
+        p.name = format!("cache-{i:02}");
+        p
+    }));
+    let mut conns = App::new(profiles);
+    conns.apply(Msg::DockerFound(vec![fixtures::docker_instance()]));
+    for (w, h) in LIST_SIZES {
+        assert_eq!(conns.screen(), Screen::Connections);
+        assert_list_rows(&conns, w, h, 1);
+    }
+    // The live views, with something to list.
+    let mut app = testing::scanned();
+    testing::live_ready(&mut app);
+    let v = &mut app.views;
+    v.streams.loaded = true;
+    v.streams.rows = (0..80)
+        .map(|i| super::app::views::streams::StreamRow {
+            key: format!("events:{i}"),
+            info: None,
+            verdicts: Vec::new(),
+        })
+        .collect();
+    v.search.loaded = true;
+    v.search.list.indexes = (0..80)
+        .map(|i| crate::live::search::IndexInfo {
+            name: format!("idx:{i}"),
+            ..Default::default()
+        })
+        .collect();
+    v.search.list.total = 80;
+    v.pubsub.loaded = true;
+    v.pubsub.counts.channels = (0..80)
+        .map(|i| crate::live::pubsub::Channel {
+            name: format!("news.{i}"),
+            subscribers: Some(i),
+        })
+        .collect();
+    v.pubsub.counts.total_channels = 80;
+    let conns: Vec<crate::live::server::ClientConn> = (0..80)
+        .map(|i| crate::live::server::ClientConn {
+            id: i,
+            addr: format!("10.0.{i}.1:5000"),
+            name: format!("worker-{i}"),
+            cmd: "get".into(),
+            ..Default::default()
+        })
+        .collect();
+    v.server.clients.groups = super::app::views::server::build_groups(&conns);
+    v.server.clients.conns = conns;
+    v.server.clients.poll.got = true;
+    v.server.slow.poll.got = true;
+    for (w, h) in LIST_SIZES {
+        for screen in [Screen::Streams, Screen::Search] {
+            assert!(show(&mut app, screen));
+            assert_list_rows(&app, w, h, 2);
+        }
+        assert!(show(&mut app, Screen::PubSub));
+        assert_list_rows(&app, w, h, 1);
+        assert!(show(&mut app, Screen::Clients));
+        assert_list_rows(&app, w, h, 1);
+        // A status line above the header.
+        for screen in [Screen::SlowLog, Screen::Monitor] {
+            assert!(show(&mut app, screen));
+            assert_list_rows(&app, w, h, 2);
         }
     }
-    // 80x24 shows 7 rows. Too small for any row: 0, and PgDn still moves one.
-    assert_eq!(ui::list_rows(ratatui::layout::Rect::new(0, 0, 80, 24)), 7);
-    for h in [0, 1, 10, 16] {
-        assert_eq!(
-            ui::list_rows(ratatui::layout::Rect::new(0, 0, 80, h)),
-            0,
-            "{h}"
-        );
+    // 80x24 shows 18 rows on Analyze. Too small for any row: 0, and PgDn still moves
+    // one.
+    show(&mut app, Screen::Ttl);
+    let at = |w, h| ui::list_rows(ratatui::layout::Rect::new(0, 0, w, h), &app);
+    assert_eq!(at(80, 24), 17);
+    for h in [0, 1, 4] {
+        assert_eq!(at(80, h), 0, "{h}");
     }
 }
 
 #[test]
 fn page_down_from_the_top_selects_the_row_below_the_screen() {
-    // With the page from the runtime's maths, PgDn from the top of the TTL list at
-    // 80x24 (6 rows below the tab bar's panel row) selects row 6: the list scrolls one
-    // row and the selection is the bottom row on screen.
+    // With a page of 7 list rows, as the runtime sets it, PgDn from the top of the
+    // Expiry list selects row 7. The list frame takes the whole body at 80x24, so it
+    // does not scroll: the selection is the eighth row on screen.
     let mut app = scanned_with_history(true);
     go(&mut app, '2');
-    app.set_list_rows(ui::list_rows(ratatui::layout::Rect::new(0, 0, 80, 24)));
+    app.set_list_rows(7);
     app.handle_key(key(KeyCode::PageDown));
-    assert_eq!(app.sel.ttl, 6);
+    assert_eq!(app.sel.ttl, 7);
     let t = render(&app, 80, 24);
     let buf = t.backend().buffer();
     let selected: Vec<u16> = (0..24u16)
         .filter(|&y| buf[(2, y)].bg == super::ui::style::sel().bg.unwrap())
         .collect();
-    // Rows 6-11 are the list (border at 4, header at 5); the last one is selected.
-    assert_eq!(selected, [11]);
+    // The border is at 3, the header at 4, the list from 5: row 7 is at 12.
+    assert_eq!(selected, [12]);
 }
 
 #[test]
@@ -1549,16 +1699,17 @@ fn a_slow_keychain_during_a_rescan_shows_the_hint_in_the_header() {
     let t0 = Instant::now();
     let mut app = scanned_with_history(true);
     app.apply(Msg::TickAt(t0));
-    app.handle_key(ch('1'));
+    app.handle_key(ch('2'));
     app.handle_key(ch('r'));
+    app.handle_key(key(KeyCode::Enter));
     let text = |app: &App| buffer_lines(&render(app, 140, 40)).join("\n");
     assert!(!text(&app).contains("Waiting for the OS keychain"));
     app.apply(Msg::TickAt(t0 + Duration::from_secs(3)));
     let lines = buffer_lines(&render(&app, 140, 40));
-    assert!(lines[1].contains(super::app::KEYCHAIN_HINT), "{}", lines[1]);
+    assert!(lines[0].contains(super::app::KEYCHAIN_HINT), "{}", lines[0]);
     // The previous results stay in the body.
     assert!(
-        lines[3].contains("rescanning · previous results"),
+        lines[3].contains("analyzing · previous results"),
         "{}",
         lines[3]
     );
@@ -1579,8 +1730,9 @@ fn tab_bar_with_panels_at_80_columns() {
     let mut app = scanned(true);
     show(&mut app, Screen::BigKeys);
     let header = header_text(&app, 80);
-    // Below 100 columns the views not on screen show only their digit.
-    assert!(!header.contains("Server"), "{header}");
+    // The areas, and Analyze's panels under them.
+    assert!(header.contains("3 Analyze"), "{header}");
+    assert!(header.contains("Big keys"), "{header}");
     insta::assert_snapshot!(header);
 }
 
@@ -1591,12 +1743,12 @@ fn tab_bar_with_panels_at_120_columns() {
     let header = header_text(&app, 120);
     for name in [
         "Connections",
-        "Patterns",
-        "Analysis",
+        "Overview",
+        "Browse",
+        "Analyze",
         "Server",
-        "Streams",
         "Pub/Sub",
-        "Search",
+        "Slow log",
     ] {
         assert!(header.contains(name), "{name}: {header}");
     }
@@ -1608,27 +1760,26 @@ fn tab_bar_with_panels_at_120_columns() {
         colour_at(&t, "Slow log", "C", 0),
         style::title().fg.unwrap()
     );
-    assert_eq!(colour_at(&t, "Slow log", "O", 0), style::DIM);
+    assert_eq!(colour_at(&t, "Slow log", "M", 0), style::DIM);
 }
 
 #[test]
 fn views_without_panels_have_no_panel_row() {
     let mut app = scanned(true);
+    for screen in [Screen::Connections, Screen::Overview, Screen::PubSub] {
+        show(&mut app, screen);
+        let lines = buffer_lines(&render(&app, 120, 24));
+        assert_eq!(body_top(&lines), 2, "{screen:?}");
+    }
     for screen in [
-        Screen::Connections,
         Screen::Patterns,
         Screen::Streams,
-        Screen::PubSub,
-        Screen::Search,
+        Screen::Ttl,
+        Screen::Clients,
     ] {
         show(&mut app, screen);
         let lines = buffer_lines(&render(&app, 120, 24));
         assert_eq!(body_top(&lines), 3, "{screen:?}");
-    }
-    for screen in [Screen::Ttl, Screen::Overview] {
-        show(&mut app, screen);
-        let lines = buffer_lines(&render(&app, 120, 24));
-        assert_eq!(body_top(&lines), 4, "{screen:?}");
     }
 }
 
@@ -1663,7 +1814,7 @@ fn header_says_read_only_on_prod_by_default() {
     insta::assert_snapshot!(header);
     let t = render(&app, 120, 24);
     assert_eq!(
-        colour_at(&t, "read-only", "r", 70),
+        colour_at(&t, "read-only", "r", 20),
         crate::tui::ui::style::AMBER
     );
 }
@@ -1676,7 +1827,7 @@ fn header_says_writes_on_outside_prod() {
     insta::assert_snapshot!(header);
     let t = render(&app, 120, 24);
     assert_eq!(
-        colour_at(&t, "writes on", "w", 70),
+        colour_at(&t, "writes on", "w", 20),
         crate::tui::ui::style::RED
     );
 }
@@ -1704,6 +1855,10 @@ fn header_badge_on_prod_with_writes_on() {
 fn connections_detail_lists_the_view_probes() {
     let (mut app, _) = scanned_with(fixtures::report(true), fixtures::perms_with_probes());
     app.handle_key(ch('0'));
+    // One sentence by default; `v` lists each check that ran.
+    let sentence = buffer_lines(&render(&app, 120, 36)).join("\n");
+    assert!(!sentence.contains("SLOWLOG"), "{sentence}");
+    app.handle_key(ch('v'));
     let text = buffer_lines(&render(&app, 120, 36)).join("\n");
     for label in ["SLOWLOG", "CLIENT LIST", "XINFO", "PUBSUB", "FT._LIST"] {
         assert!(text.contains(label), "{label}: {text}");
@@ -1715,9 +1870,10 @@ fn connections_detail_lists_the_view_probes() {
 fn connections_detail_with_failed_probes() {
     let (mut app, _) = scanned_with(fixtures::report(true), fixtures::perms_probes_off());
     app.handle_key(ch('0'));
+    app.handle_key(ch('v'));
     let text = buffer_lines(&render(&app, 120, 36)).join("\n");
-    assert!(!text.contains("Some checks were denied"), "{text}");
-    assert!(text.contains("Views whose check failed are off"), "{text}");
+    assert!(!text.contains("Some checks were refused"), "{text}");
+    assert!(text.contains("Panels whose check failed are off"), "{text}");
     // The NOPERM text of a view probe names the user; the list never shows it.
     assert!(!text.contains("lens-limited"), "{text}");
     insta::assert_snapshot!(render(&app, 120, 36).backend());
@@ -1736,4 +1892,112 @@ fn a_view_whose_probe_failed_says_why_it_is_off() {
     insta::assert_snapshot!(t.backend());
     show(&mut app, Screen::Search);
     insta::assert_snapshot!(render(&app, 80, 24).backend());
+}
+
+/// The header's status carries its time, UTC, "connected" as "analyzed" does: in full
+/// when it fits, `14:02` at 80 columns as the mockups, and it goes before the key count
+/// or the memory does.
+#[test]
+fn the_header_status_carries_its_time_and_gives_it_up_first() {
+    let connected = || {
+        let mut app = App::new(fixtures::profiles());
+        // 14:02 UTC.
+        app.set_wall_clock(50_520);
+        let id = connect_selected(&mut app);
+        app.apply(Msg::Connected {
+            id,
+            scan: scan_of(&app),
+            server: Some(fixtures::server()),
+            perms: fixtures::perms_ok(),
+            target: ScanTarget::Primary,
+        });
+        (app, id)
+    };
+    let (app, _) = connected();
+    let (mut analyzed, id) = connected();
+    analyzed.apply(Msg::ScanDone {
+        id,
+        scan: scan_of(&analyzed),
+        report: Box::new(fixtures::report(true)),
+    });
+    for (status, app) in [("connected", &app), ("analyzed", &analyzed)] {
+        let at = |w: u16| buffer_lines(&render(app, w, 24))[0].clone();
+        assert!(
+            at(120).ends_with(&format!("● {status} 14:02 UTC ")),
+            "{}",
+            at(120)
+        );
+        assert!(at(120).contains("15G / 24G · 7.92M keys"), "{}", at(120));
+        // 80 columns: the mockup's line.
+        assert!(
+            at(80).ends_with(&format!("● {status} 14:02 ")),
+            "{}",
+            at(80)
+        );
+        assert!(at(80).contains("15G / 24G · 7.92M keys"), "{}", at(80));
+        // Narrower: the time goes, the figures stay.
+        assert!(at(75).ends_with(&format!("● {status} ")), "{}", at(75));
+        assert!(at(75).contains("15G / 24G · 7.92M keys"), "{}", at(75));
+        for w in [50, 60, 75, 80, 120, 140] {
+            assert_eq!(at(w).chars().count(), usize::from(w));
+        }
+    }
+}
+
+/// Connected to prod-cache-01, no analysis yet, on `screen`.
+fn connected_without_analysis(screen: Screen) -> App {
+    let mut app = App::new(fixtures::profiles());
+    let id = connect_selected(&mut app);
+    app.apply(Msg::Connected {
+        id,
+        scan: scan_of(&app),
+        server: Some(fixtures::server()),
+        perms: fixtures::perms_ok(),
+        target: ScanTarget::Primary,
+    });
+    super::app::views::testing::show(&mut app, screen);
+    app
+}
+
+/// Big keys before an analysis says so as the other Analyze panels do, with the cost
+/// of `r` from the engine's estimate: never a blank panel.
+#[test]
+fn big_keys_without_an_analysis_says_what_it_needs() {
+    let app = connected_without_analysis(Screen::BigKeys);
+    for (w, h) in [(80, 24), (120, 36)] {
+        let lines = buffer_lines(&render(&app, w, h));
+        let text = lines.join("\n");
+        assert!(text.contains("No analysis yet."), "{text}");
+        assert!(text.contains("Big keys ranks the biggest keys."), "{text}");
+        assert!(text.contains("waits for an analysis"), "{text}");
+        let est = super::app::views::overview::estimate_for(
+            super::app::views::overview::Depth::Quick,
+            &app,
+        );
+        assert!(
+            text.contains(&format!(
+                "r  Analyze: {} keys",
+                crate::format::grouped(est.keys)
+            )),
+            "{text}"
+        );
+        assert!(lines[h as usize - 1].starts_with(" r Analyze"), "{text}");
+    }
+}
+
+/// Streams before an analysis: the footer offers `r Analyze`, which is what `r` does
+/// there (its key table row says Refresh, for once there are streams).
+#[test]
+fn streams_before_an_analysis_offer_r_analyze_in_the_footer() {
+    let mut app = connected_without_analysis(Screen::Streams);
+    let lines = buffer_lines(&render(&app, 80, 24));
+    assert!(
+        lines[23].starts_with(" r Analyze   tab Next panel"),
+        "{}",
+        lines[23]
+    );
+    assert!(!lines[23].contains("Refresh"), "{}", lines[23]);
+    let effects = app.handle_key(ch('r'));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(app.analyze.is_some(), "r opens Analyze the keys?");
 }

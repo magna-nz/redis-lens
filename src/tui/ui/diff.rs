@@ -1,5 +1,6 @@
-//! View 3: the current scan against the previous snapshot of the same profile, with a
-//! trend column over the earlier snapshots when there are enough of them.
+//! Analyze › Changes: the current analysis against the previous snapshot of the same
+//! profile, with a trend over the earlier snapshots when there are enough of them.
+//! The patterns that changed on the left, what changed in the selected one on the right.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -11,17 +12,53 @@ use crate::format;
 use crate::snapshot::{PatternTrend, Trend, TrendMetric, format_utc};
 use crate::tui::app::{App, History};
 
+use super::analysis::{
+    Col, MARK, Tier, head_row, left_width, need_report, notice, paragraph, pick_cols, title_right,
+};
 use super::delta::{Change, cause_words, ratio_change, signed_bytes, signed_percent};
-use super::widgets::{fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset};
-use super::{mark_previous, notice_panels, report_or_wait, spinner, split_body, style};
+use super::widgets::{
+    Pane, Title, fit, marquee_spans, pad_l, pad_r, pattern_spans, rows, scroll_offset, split_frame,
+};
+use super::{mark_previous, spinner, style};
 
 const NUM_W: usize = 7;
 const PCT_W: usize = 6;
 /// Cells on each side of the bar's centre line.
 const HALF: usize = 12;
-const BAR_W: usize = HALF * 2 + 1 + 3;
+const BAR_W: usize = HALF * 2 + 1;
 /// Wide enough for `smaller values`.
 const WHY_W: usize = 14;
+
+/// The list pane shows the Wide columns from this many cells.
+const WIDE_AT: usize = 56;
+/// The detail pane uses the roomy table from this many cells.
+const DETAIL_WIDE: usize = 46;
+
+const MARK_COL: usize = 1;
+const DELTA: usize = 2;
+const PCT: usize = 3;
+const NOW: usize = 4;
+const WHY: usize = 5;
+const BEFORE: usize = 6;
+const TREND: usize = 7;
+const BAR: usize = 8;
+
+/// The columns; the trend's width depends on the snapshots.
+fn columns(trend_w: usize) -> [Col; 9] {
+    [
+        Col::new("PATTERN", 14, Tier::Base),
+        Col::new("", 1, Tier::Base),
+        Col::new("Δ", NUM_W, Tier::Base),
+        Col::new("Δ%", PCT_W, Tier::Base),
+        Col::new("NOW", NUM_W - 1, Tier::Wide),
+        Col::new("WHY", WHY_W, Tier::Wide),
+        Col::new("BEFORE", NUM_W, Tier::More),
+        // No trend: a column of width 0 is never picked.
+        // No trend: a column of width 0 is never picked.
+        Col::new("TREND", trend_w, Tier::Wide),
+        Col::new("", BAR_W, Tier::More),
+    ]
+}
 
 /// The trend column's width for `trend`, 0 without one: a cell per point, at least as
 /// wide as its heading.
@@ -29,22 +66,25 @@ fn trend_width(trend: Option<&Trend>) -> usize {
     trend.map_or(0, |t| t.points.len().max("TREND".len()))
 }
 
-fn name_width(inner: usize, trend_w: usize) -> usize {
-    let trend = if trend_w > 0 { trend_w + 2 } else { 0 };
-    let fixed = (NUM_W + 2) * 3 + PCT_W + 2 + trend + BAR_W + WHY_W;
-    inner.saturating_sub(fixed).max(12)
-}
-
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
-    let Some((session, _)) = report_or_wait(frame, area, app, "Diff") else {
+    if need_report(
+        frame,
+        area,
+        app,
+        "Changes",
+        "compares this analysis with the last snapshot.",
+    ) {
+        return;
+    }
+    let Some(session) = app.session.as_ref() else {
         return;
     };
     let line = |text: String, st: Style| Line::from(Span::styled(text, st));
     match &session.history {
-        History::Pending => notice_panels(
+        History::Pending => notice(
             frame,
             area,
-            "Diff",
+            "Changes",
             &mark_previous(app, ""),
             vec![Line::from(vec![
                 Span::raw(" "),
@@ -52,10 +92,10 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled(" Looking for an earlier snapshot…", style::dim()),
             ])],
         ),
-        History::NoSnapshot => notice_panels(
+        History::NoSnapshot => notice(
             frame,
             area,
-            "Diff",
+            "Changes",
             &mark_previous(app, "no history"),
             vec![
                 line(
@@ -63,20 +103,20 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                     style::fgb(),
                 ),
                 line(
-                    " Press s to save one; the next scan compares against it.".to_string(),
+                    " Press s to save one; the next analysis compares against it.".to_string(),
                     style::dim(),
                 ),
             ],
         ),
-        History::Failed(e) => notice_panels(
+        History::Failed(e) => notice(
             frame,
             area,
-            "Diff",
+            "Changes",
             &mark_previous(app, ""),
             vec![
                 line(format!(" ✗ Could not load snapshots: {e}"), style::warn()),
                 line(
-                    " The other views still work; only the comparison is missing.".to_string(),
+                    " The other panels still work; only the comparison is missing.".to_string(),
                     style::dim(),
                 ),
             ],
@@ -98,50 +138,55 @@ fn header(d: &ReportDiff) -> String {
 
 fn draw_diff(frame: &mut Frame, area: Rect, app: &App, d: &ReportDiff) {
     if d.patterns.is_empty() {
-        notice_panels(
+        notice(
             frame,
             area,
-            "Diff",
+            "Changes",
             &mark_previous(app, &header(d)),
             vec![Line::from(Span::styled(
-                " Neither scan sampled any keys.",
+                " Neither analysis sampled any keys.",
                 style::dim(),
             ))],
         );
         return;
     }
-    let (main, detail) = split_body(area);
     let sel = app.sel.diff.min(d.patterns.len() - 1);
-    let inner = panel(frame, main, "Diff", &mark_previous(app, &header(d)));
+    let p = &d.patterns[sel];
+    let c = Change::of(p);
+    let more = app.more_here();
+    let right = title_right(
+        app,
+        area.width,
+        &format!("since {}", format_utc(d.before_taken_at_unix)),
+    );
+    let kind = format!("{} since the snapshot", c.text());
+    let (left, detail) = split_frame(
+        frame,
+        area,
+        left_width(area.width),
+        Title::new("Changes", &right),
+        Title::new(&p.pattern, &kind),
+        Pane::Left,
+    );
     let trend = app.trend();
     let trend_w = trend_width(trend);
-    let name = name_width(usize::from(inner.width), trend_w);
-    let mut head = vec![
-        Span::styled(pad_r(" PATTERN", name), style::hd()),
-        Span::styled(format!("{}  ", pad_l("BEFORE", NUM_W)), style::hd()),
-        Span::styled(format!("{}  ", pad_l("NOW", NUM_W)), style::hd()),
-        Span::styled(format!("{}  ", pad_l("Δ", NUM_W)), style::hd()),
-        Span::styled(format!("{}  ", pad_l("Δ%", PCT_W)), style::hd()),
-    ];
-    if trend.is_some() {
-        head.push(Span::styled(
-            format!("{}  ", pad_r("TREND", trend_w)),
-            style::hd(),
-        ));
-    }
-    head.extend([
-        Span::styled(
-            pad_r(&format!("{} grew", pad_l("shrank", HALF)), BAR_W),
-            style::hd(),
-        ),
-        Span::styled("WHY", style::hd()),
-    ]);
-    let head = Line::from(head);
-    rows(frame, inner, vec![head], None);
+    let cols = columns(trend_w);
+    let (keep, name) = pick_cols(&cols, usize::from(left.width), WIDE_AT, more);
+    // A pattern's bar and trend are for `v`; without a trend there is no such column.
+    let keep: Vec<usize> = keep
+        .into_iter()
+        .filter(|&i| i != TREND || trend_w > 0)
+        .collect();
+    rows(
+        frame,
+        left,
+        vec![head_row(&cols, &keep, name, &[DELTA, PCT, NOW, BEFORE])],
+        None,
+    );
     let body = Rect {
-        y: inner.y + 1,
-        height: inner.height.saturating_sub(1),
-        ..inner
+        y: left.y + 1,
+        height: left.height.saturating_sub(1),
+        ..left
     };
     let max = d
         .patterns
@@ -158,17 +203,12 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, d: &ReportDiff) {
         .enumerate()
         .map(|(i, p)| {
             let spark = trend.map(|t| (sparkline_for(t, &p.pattern), trend_w));
-            diff_row(
-                p,
-                max,
-                name,
-                spark,
-                (off + i == sel).then(|| app.sel_ticks()),
-            )
+            let scroll = (off + i == sel).then(|| app.sel_ticks());
+            diff_row(&keep, &cols, p, max, name, spark, scroll)
         })
         .collect();
     rows(frame, body, lines, Some(sel - off));
-    detail_panel(frame, detail, &d.patterns[sel], trend);
+    detail_lines(frame, detail, p, trend, more.then(|| header(d)));
 }
 
 /// The pattern's sparkline over the trend's points, all gaps when it is in none of
@@ -183,7 +223,7 @@ fn sparkline_for(t: &Trend, pattern: &str) -> String {
 /// Formats a byte or key figure.
 type Fmt = fn(u64) -> String;
 
-/// Before and after as text: bytes when both scans had sizes, keys otherwise.
+/// Before and after as text: bytes when both analyses had sizes, keys otherwise.
 fn sides(p: &PatternDiff) -> (Option<u64>, Option<u64>, Fmt) {
     if p.delta_bytes.is_some() {
         (p.bytes_before, p.bytes_after, format::bytes)
@@ -211,8 +251,15 @@ fn grew_style(c: Change) -> Style {
     }
 }
 
+/// Whether the row gets a `▲`: a new pattern, or growth of at least 300M.
+fn worth_a_look(c: Change) -> bool {
+    c.is_alarming()
+}
+
 /// One row. `spark` is the trend cell and the column's width, when there is a trend.
 fn diff_row(
+    keep: &[usize],
+    cols: &[Col],
     p: &PatternDiff,
     max: u64,
     name: usize,
@@ -225,47 +272,59 @@ fn diff_row(
     let mut spans = vec![Span::raw(" ")];
     spans.extend(pattern_spans(&p.pattern, style::fg(), style::ph()));
     let mut spans = match scroll {
-        Some(ticks) => marquee_spans(spans, name.saturating_sub(1), ticks),
-        None => fit(spans, name.saturating_sub(1)),
+        Some(ticks) => marquee_spans(spans, name, ticks),
+        None => fit(spans, name),
     };
-    spans.push(Span::raw(" "));
-    let len = if c.unchanged || c.value == 0 || max == 0 {
-        0
-    } else {
-        ((c.value.unsigned_abs() as f64 / max as f64 * HALF as f64).round() as usize).clamp(1, HALF)
-    };
-    let (neg, pos) = if c.value < 0 { (len, 0) } else { (0, len) };
     let why_style = if p.cause == Cause::New {
         style::warn()
     } else {
         style::dim()
     };
-    spans.extend([
-        Span::styled(
-            format!("{}  ", pad_l(&before.map_or_else(dash, fmt), NUM_W)),
-            style::dim(),
-        ),
-        Span::styled(
-            format!("{}  ", pad_l(&after.map_or_else(dash, fmt), NUM_W)),
-            style::fg(),
-        ),
-        Span::styled(format!("{}  ", pad_l(&c.text(), NUM_W)), c.style()),
-        Span::styled(
-            format!("{}  ", pad_l(&percent_text(p, before, after), PCT_W)),
-            c.style(),
-        ),
-    ]);
-    if let Some((cells, w)) = spark {
-        spans.push(Span::styled(format!("{}  ", pad_r(&cells, w)), style::fg()));
+    for &i in &keep[1..] {
+        spans.push(Span::raw(" "));
+        let w = cols[i].w;
+        match i {
+            MARK_COL => spans.push(Span::styled(
+                if worth_a_look(c) { MARK } else { " " },
+                c.style(),
+            )),
+            DELTA => spans.push(Span::styled(pad_l(&c.text(), w), c.style())),
+            PCT => spans.push(Span::styled(
+                pad_l(&percent_text(p, before, after), w),
+                c.style(),
+            )),
+            NOW => spans.push(Span::styled(
+                pad_l(&after.map_or_else(dash, fmt), w),
+                style::fg(),
+            )),
+            WHY => spans.push(Span::styled(pad_r(cause_words(p.cause), w), why_style)),
+            BEFORE => spans.push(Span::styled(
+                pad_l(&before.map_or_else(dash, fmt), w),
+                style::dim(),
+            )),
+            TREND => {
+                let cells = spark.as_ref().map_or_else(String::new, |s| s.0.clone());
+                spans.push(Span::styled(pad_r(&cells, w), style::fg()));
+            }
+            BAR => {
+                let len = if c.unchanged || c.value == 0 || max == 0 {
+                    0
+                } else {
+                    ((c.value.unsigned_abs() as f64 / max as f64 * HALF as f64).round() as usize)
+                        .clamp(1, HALF)
+                };
+                let (neg, pos) = if c.value < 0 { (len, 0) } else { (0, len) };
+                spans.extend([
+                    Span::raw(" ".repeat(HALF - neg)),
+                    Span::styled("█".repeat(neg), style::ok()),
+                    Span::styled("│", style::border()),
+                    Span::styled("█".repeat(pos), grew_style(c)),
+                    Span::raw(" ".repeat(HALF - pos)),
+                ]);
+            }
+            _ => {}
+        }
     }
-    spans.extend([
-        Span::raw(" ".repeat(HALF - neg)),
-        Span::styled("█".repeat(neg), style::ok()),
-        Span::styled("│", style::border()),
-        Span::styled("█".repeat(pos), grew_style(c)),
-        Span::raw(" ".repeat(HALF - pos + 3)),
-        Span::styled(cause_words(p.cause), why_style),
-    ]);
     Line::from(spans)
 }
 
@@ -276,15 +335,17 @@ fn avg(bytes: Option<u64>, keys: Option<u64>) -> Option<u64> {
     }
 }
 
-/// One `label  before  now  change` row of the detail panel.
+/// One `label  before  now  change` row of the detail pane: `lw` cells for the label,
+/// `cw` for each figure.
 fn compare_line(
     p: &PatternDiff,
     label: &str,
-    before: Option<u64>,
-    after: Option<u64>,
+    figures: (Option<u64>, Option<u64>),
     fmt: fn(u64) -> String,
     available: bool,
+    (lw, cw): (usize, usize),
 ) -> Line<'static> {
+    let (before, after) = figures;
     let dash = || "—".to_string();
     let (change, st) = if !available {
         (dash(), style::dim())
@@ -301,18 +362,18 @@ fn compare_line(
         }
     };
     Line::from(vec![
-        Span::styled(pad_r(&format!(" {label}"), 16), style::dim()),
-        Span::styled(pad_l(&before.map_or_else(dash, fmt), 10), style::fg()),
-        Span::styled(pad_l(&after.map_or_else(dash, fmt), 10), style::fgb()),
-        Span::styled(pad_l(&change, 10), st),
+        Span::styled(pad_r(&format!(" {label}"), lw), style::dim()),
+        Span::styled(pad_l(&before.map_or_else(dash, fmt), cw), style::fg()),
+        Span::styled(pad_l(&after.map_or_else(dash, fmt), cw), style::fgb()),
+        Span::styled(pad_l(&change, cw), st),
     ])
 }
 
-/// A sentence about why the pattern changed.
-fn cause_sentence(p: &PatternDiff) -> (&'static str, Style) {
+/// A sentence about why the pattern changed, and whether it carries the `▲`.
+fn cause_sentence(p: &PatternDiff) -> (&'static str, Style, bool) {
     let c = Change::of(p);
     let text = match p.cause {
-        Cause::New => "▲ New since the snapshot: nothing matched this pattern then.",
+        Cause::New => "New since the snapshot: nothing matched this pattern then.",
         Cause::Gone => "Gone: no sampled key matches this pattern any more.",
         Cause::MoreKeys => "The change comes mostly from more keys; the average size moved less.",
         Cause::FewerKeys => "The change comes mostly from fewer keys; the average size moved less.",
@@ -324,7 +385,7 @@ fn cause_sentence(p: &PatternDiff) -> (&'static str, Style) {
         }
         Cause::Unchanged => "No meaningful change.",
         Cause::Unknown => {
-            "Not in the other scan, which used a different MATCH, so it may not be new or gone."
+            "Not in the other analysis, which used a different MATCH, so it may not be new or gone."
         }
     };
     let st = match p.cause {
@@ -332,24 +393,25 @@ fn cause_sentence(p: &PatternDiff) -> (&'static str, Style) {
         Cause::Unchanged | Cause::Unknown => style::dim(),
         _ => c.style(),
     };
-    (text, st)
+    (text, st, p.cause == Cause::New)
 }
 
 /// Growth of at least this share a day, either way, is coloured in the trend line.
 const NOTABLE_GROWTH: f64 = 0.005;
 
-/// The detail panel's trend line: the sparkline and the least-squares growth a day.
-fn trend_line(t: &Trend, pattern: &str) -> Line<'static> {
+/// The detail pane's trend: the sparkline, then the least-squares growth a day in words.
+fn trend_lines(t: &Trend, pattern: &str, w: usize) -> Vec<Line<'static>> {
     let fmt: fn(u64) -> String = match t.metric {
         TrendMetric::Bytes => format::bytes,
         TrendMetric::Keys => format::count,
     };
-    let scans = t.points.len();
+    // Each point is a saved snapshot of an analysis.
+    let snapshots = t.points.len();
     let partial = t.partial_points();
     let over = match partial {
-        0 => format!("over {scans} scans"),
-        n if n == scans => format!("over {scans} scans, all partial"),
-        n => format!("over {scans} scans, {n} partial"),
+        0 => format!("over {snapshots} snapshots"),
+        n if n == snapshots => format!("over {snapshots} snapshots, all partial"),
+        n => format!("over {snapshots} snapshots, {n} partial"),
     };
     let pt: Option<&PatternTrend> = t.pattern(pattern);
     let (text, st) = match pt.and_then(|p| p.growth) {
@@ -369,73 +431,94 @@ fn trend_line(t: &Trend, pattern: &str) -> Line<'static> {
             (text, st)
         }
         None => (
-            format!("too few scans with this pattern for a growth rate ({over})"),
+            format!("too few snapshots with this pattern for a growth rate ({over})"),
             style::dim(),
         ),
     };
-    Line::from(vec![
-        Span::styled(pad_r(" trend", 16), style::dim()),
-        Span::styled(format!("{}  ", sparkline_for(t, pattern)), style::fg()),
-        Span::styled(text, st),
-    ])
+    let mut lines = vec![Line::from(vec![
+        Span::styled(" TREND ", style::hd()),
+        Span::styled(sparkline_for(t, pattern), style::fg()),
+    ])];
+    lines.extend(paragraph(vec![Span::raw(" ")], " ", &text, st, w));
+    lines
 }
 
-fn detail_panel(frame: &mut Frame, area: Rect, p: &PatternDiff, trend: Option<&Trend>) {
-    let c = Change::of(p);
-    let right = format!("{} since the snapshot", c.text());
-    let inner = panel(frame, area, &p.pattern, &right);
+fn detail_lines(
+    frame: &mut Frame,
+    inner: Rect,
+    p: &PatternDiff,
+    trend: Option<&Trend>,
+    memory: Option<String>,
+) {
+    let w = usize::from(inner.width);
     let sizes = p.delta_bytes.is_some();
-    let (sentence, st) = cause_sentence(p);
+    let dims = if w >= DETAIL_WIDE { (16, 10) } else { (10, 8) };
+    let (sentence, st, marked) = cause_sentence(p);
     let mut lines = vec![
         Line::from(Span::styled(" WHERE THE CHANGE CAME FROM", style::hd())),
         Line::from(vec![
-            Span::raw(" ".repeat(16)),
-            Span::styled(pad_l("BEFORE", 10), style::hd()),
-            Span::styled(pad_l("NOW", 10), style::hd()),
-            Span::styled(pad_l("CHANGE", 10), style::hd()),
+            Span::raw(" ".repeat(dims.0)),
+            Span::styled(pad_l("BEFORE", dims.1), style::hd()),
+            Span::styled(pad_l("NOW", dims.1), style::hd()),
+            Span::styled(pad_l("CHANGE", dims.1), style::hd()),
         ]),
-        compare_line(p, "keys", p.keys_before, p.keys_after, format::count, true),
+        compare_line(
+            p,
+            "keys",
+            (p.keys_before, p.keys_after),
+            format::count,
+            true,
+            dims,
+        ),
         compare_line(
             p,
             "avg size",
-            avg(p.bytes_before, p.keys_before),
-            avg(p.bytes_after, p.keys_after),
+            (
+                avg(p.bytes_before, p.keys_before),
+                avg(p.bytes_after, p.keys_after),
+            ),
             format::bytes,
             sizes,
+            dims,
         ),
         compare_line(
             p,
             "memory",
-            p.bytes_before,
-            p.bytes_after,
+            (p.bytes_before, p.bytes_after),
             format::bytes,
             sizes,
+            dims,
         ),
     ];
     let spacer = if let Some(t) = trend {
-        lines.push(Line::from(fit(
-            trend_line(t, &p.pattern).spans,
-            usize::from(inner.width),
-        )));
-        Some(lines.len())
+        lines.push(Line::default());
+        lines.extend(trend_lines(t, &p.pattern, w));
+        Some(5)
     } else {
         None
     };
-    lines.extend([
-        Line::default(),
-        Line::from(fit(
-            vec![Span::styled(format!(" {sentence}"), st)],
-            usize::from(inner.width),
-        )),
-    ]);
+    lines.push(Line::default());
+    let lead = if marked {
+        Span::styled(format!(" {MARK} "), st)
+    } else {
+        Span::raw("   ")
+    };
+    lines.extend(paragraph(vec![lead], "   ", sentence, st, w));
     if !sizes {
-        lines.push(Line::from(Span::styled(
-            " Sizes unavailable: one of the scans could not run MEMORY USAGE.",
+        lines.extend(paragraph(
+            vec![Span::raw(" ")],
+            " ",
+            "Sizes unavailable: one of the analyses could not run MEMORY USAGE.",
             style::dim(),
-        )));
+            w,
+        ));
     }
-    // The trend line takes a row: give up the blank one before the sentence rather than
-    // the last line, when the panel is too short for both.
+    if let Some(m) = memory {
+        lines.push(Line::default());
+        lines.extend(paragraph(vec![Span::raw(" ")], " ", &m, style::dim(), w));
+    }
+    // The trend takes rows: give up the blank one before it rather than the last line,
+    // when the pane is too short for both.
     if let Some(i) = spacer
         && lines.len() > usize::from(inner.height)
     {
@@ -457,5 +540,36 @@ mod tests {
         d.used_memory_before = 1 << 63;
         d.used_memory_after = 0;
         assert!(header(&d).contains("(-"));
+    }
+
+    #[test]
+    fn changes_before_an_analysis_says_what_it_needs() {
+        use super::super::analysis::support::no_analysis;
+        use crate::tui::app::views::testing;
+        for (w, h) in [(80, 24), (120, 36)] {
+            let app = no_analysis(crate::tui::app::Screen::Diff);
+            let s = testing::render(&app, w, h).backend().to_string();
+            assert!(s.contains("waits for an analysis"), "{s}");
+            assert!(
+                s.contains("Changes compares this analysis with the last snapshot."),
+                "{s}"
+            );
+            assert!(s.contains("r  Analyze: "), "{s}");
+            insta::assert_snapshot!(format!("changes_no_analysis_{w}x{h}"), s);
+        }
+    }
+
+    #[test]
+    fn the_columns_follow_the_width_and_v() {
+        let cols = columns(0);
+        // 80 columns: the mark, the change and its percent.
+        let (keep, _) = pick_cols(&cols, 41, WIDE_AT, false);
+        assert_eq!(keep, vec![0, MARK_COL, DELTA, PCT]);
+        // 120 columns add NOW and WHY.
+        let (keep, _) = pick_cols(&cols, 69, WIDE_AT, false);
+        assert_eq!(keep, vec![0, MARK_COL, DELTA, PCT, NOW, WHY]);
+        // Without a trend there is no TREND column to pick with `v`.
+        let (keep, _) = pick_cols(&cols, 200, WIDE_AT, true);
+        assert!(keep.contains(&BEFORE) && keep.contains(&BAR));
     }
 }

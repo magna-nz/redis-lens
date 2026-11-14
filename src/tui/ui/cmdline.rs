@@ -11,10 +11,10 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Clear;
+use ratatui::widgets::{Block, Clear};
 
 use super::style;
-use super::widgets::{char_width, panel, rows, trunc};
+use super::widgets::{char_width, rows, trunc, width};
 use crate::tui::app::views::Ctx;
 use crate::tui::app::views::cmdline::{Body, CmdlineState, Entry};
 
@@ -37,8 +37,14 @@ pub fn draw(frame: &mut Frame, body: Rect, state: &CmdlineState, ctx: &Ctx<'_>) 
         ..body
     };
     frame.render_widget(Clear, area);
-    let right = format!("readonly commands · {}", ctx.profile().name);
-    let inner = panel(frame, area, "Command line", &right);
+    // What the line does here, in words: the profile, then whether writes ask.
+    let access = if ctx.profile().is_read_only() {
+        "read-only: readonly commands"
+    } else {
+        "writes ask as usual"
+    };
+    let right = format!("{} · {access}", ctx.profile().name);
+    let inner = amber_panel(frame, area, ": Command line", &right);
     let helper_rows = if inner.height >= HELPER_ROWS + 2 {
         HELPER_ROWS
     } else {
@@ -65,6 +71,34 @@ pub fn draw(frame: &mut Frame, body: Rect, state: &CmdlineState, ctx: &Ctx<'_>) 
         })
         .collect();
     rows(frame, help_area, lines, None);
+}
+
+/// A bordered panel like [`super::widgets::panel`] with an amber border, so it is clear
+/// that the keys now type text. The `:` in the title says so without the colour.
+fn amber_panel(frame: &mut Frame, area: Rect, title: &str, right: &str) -> Rect {
+    let avail = usize::from(area.width).saturating_sub(4);
+    let title = trunc(title, avail.saturating_sub(4).max(1));
+    let room = avail.saturating_sub(width(&title) + 4);
+    let mut block = Block::bordered()
+        .border_style(style::amber())
+        .title_top(Line::from(vec![
+            Span::styled("─ ", style::amber()),
+            Span::styled(title, style::title()),
+            Span::styled(" ", style::amber()),
+        ]));
+    if !right.is_empty() && room > 4 {
+        block = block.title_top(
+            Line::from(vec![
+                Span::styled(" ", style::amber()),
+                Span::styled(trunc(right, room - 3), style::dim()),
+                Span::styled(" ─", style::amber()),
+            ])
+            .right_aligned(),
+        );
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
 }
 
 /// The output, its last rows at the bottom, scrolled up by `state.scroll` rows (which
@@ -111,7 +145,7 @@ fn entry_rows(e: &Entry, w: usize, tick: u64) -> Vec<Line<'static>> {
         let mut first = true;
         for chunk in wrap(line, w.saturating_sub(2)) {
             out.push(Line::from(vec![
-                Span::styled(if first { " >" } else { "  " }, style::amber()),
+                Span::styled(if first { " ›" } else { "  " }, style::amber()),
                 Span::styled(format!(" {chunk}"), style::fgb()),
             ]));
             first = false;
@@ -129,8 +163,12 @@ fn entry_rows(e: &Entry, w: usize, tick: u64) -> Vec<Line<'static>> {
             Span::styled(" running…", style::dim()),
         ])),
         Body::Asking => plain(&mut out, "Waiting for your answer below.", style::dim()),
+        // A command that was not sent says so with a glyph, not only with colour.
+        Body::Note(why) if e.line.is_some() => {
+            plain(&mut out, &format!("✗ {why}"), style::amber());
+        }
         Body::Note(why) => plain(&mut out, why, style::amber()),
-        Body::Failed(why) => plain(&mut out, &format!("(error) {why}"), style::warn()),
+        Body::Failed(why) => plain(&mut out, &format!("✗ (error) {why}"), style::warn()),
         Body::Out(o) => {
             // On a cluster: the node it ran on, then why it went there if that needs
             // saying (spec "Cluster live views (P4)", Command line).

@@ -79,6 +79,8 @@ fn cluster_scanned(report: ScanReport, summary: &str) -> (App, ConnId) {
         scan: scan_of(&app),
         report: Box::new(report),
     });
+    // A connect lands on Overview; these start on Browse › Keys.
+    show(&mut app, Screen::Patterns);
     (app, id)
 }
 
@@ -123,33 +125,33 @@ fn nodes_healthy_three_shards() {
     show(&mut app, Screen::Nodes);
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    // The panel row of the tab bar names it.
-    assert!(lines[3].contains("Nodes"), "{}", lines[3]);
-    assert!(lines[4].starts_with("┌─ Nodes "), "{}", lines[4]);
-    assert!(lines[4].contains("3 shards"), "{}", lines[4]);
+    // The sub-tab row names it.
+    assert!(lines[2].contains("Nodes"), "{}", lines[2]);
+    assert!(lines[3].starts_with("┌─ Nodes "), "{}", lines[3]);
+    assert!(lines[3].contains("3 shards"), "{}", lines[3]);
     for (row, slots, ep) in [
-        (6, "0-5460", "10.0.1.11:6379"),
-        (7, "5461-10922", "10.0.1.12:6379"),
-        (8, "10923-16383", "10.0.1.13:6379"),
+        (5, "0-5460", "10.0.1.11:6379"),
+        (6, "5461-10922", "10.0.1.12:6379"),
+        (7, "10923-16383", "10.0.1.13:6379"),
     ] {
         let l = &lines[row];
         assert!(l.contains(slots) && l.contains(ep), "{l}");
-        assert!(l.contains("primary") && l.contains("scanned"), "{l}");
+        assert!(l.contains("primary") && l.contains("✓ analyzed"), "{l}");
     }
     // Columns line up with the header.
-    for col in ["ENDPOINT", "ROLE", "STATUS"] {
-        let at = column_of(&lines, 5, col);
+    for col in ["NODE", "ROLE", "STATE"] {
+        let at = column_of(&lines, 4, col);
         let first = match col {
-            "ENDPOINT" => "10.0.1.11",
+            "NODE" => "10.0.1.11",
             "ROLE" => "primary",
-            _ => "scanned",
+            _ => "✓ analyzed",
         };
-        assert_eq!(column_of(&lines, 6, first), at, "{col}");
+        assert_eq!(column_of(&lines, 5, first), at, "{col}");
     }
-    assert_eq!(colour_of(&t, "scanned"), TEAL);
-    // The detail panel is the selected (first) node's.
+    assert_eq!(colour_of(&t, "✓ analyzed"), TEAL);
+    // The detail section is the selected (first) node's, under the list in the same frame.
     assert!(
-        lines.iter().any(|l| l.starts_with("┌─ 10.0.1.11:6379 ")),
+        lines.iter().any(|l| l.starts_with("├─ 10.0.1.11:6379 ")),
         "{lines:#?}"
     );
     insta::assert_snapshot!(t.backend());
@@ -162,16 +164,20 @@ fn nodes_with_a_failed_and_a_partial_node() {
     press(&mut app, "G");
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[4].contains("1 failed · 1 partial"), "{}", lines[4]);
+    assert!(lines[3].contains("1 failed · 1 partial"), "{}", lines[3]);
     // Failed red, partial amber, notes in the same colours.
     assert_eq!(colour_at(&t, "│ 10923-16383", "✗", 40), RED);
     assert_eq!(colour_at(&t, "│ 5461-10922", "▲", 40), AMBER);
     assert_eq!(colour_of(&t, fixtures::NOTE_UNREACHABLE), RED);
     // The failed node has no server figures and no sample.
     let failed = lines.iter().find(|l| l.contains("│ 10923-16383")).unwrap();
-    assert_eq!(failed.matches('—').count(), 3, "{failed}");
-    // The failed node is selected: its whole note is in the detail panel.
-    assert!(text(&t).contains(&format!("✗ {}", fixtures::NOTE_UNREACHABLE)));
+    assert_eq!(failed.matches('—').count(), 2, "{failed}");
+    // The failed node is selected: its whole note is in the details, which may wrap it.
+    let detail = lines[8..].join(" ");
+    for word in fixtures::NOTE_UNREACHABLE.split_whitespace() {
+        assert!(detail.contains(word), "{word}: {detail}");
+    }
+    assert!(detail.contains("✗ "), "{detail}");
     // The header's summary is amber.
     assert_eq!(colour_of(&t, DEGRADED), AMBER);
     insta::assert_snapshot!(t.backend());
@@ -184,11 +190,14 @@ fn nodes_partial_note_wraps_in_the_detail_panel() {
     press(&mut app, "j");
     let t = render(&app, 80, 24);
     let all = text(&t);
-    // Every word of the note is on screen, over two lines of the detail panel.
-    let detail: String = buffer_lines(&t)[13..23].join(" ");
-    for word in fixtures::NOTE_STOPPED.split_whitespace() {
+    // Every word of the note is on screen, over two lines of the detail panel, in
+    // the TUI's words: an analysis, not a scan.
+    let detail: String = buffer_lines(&t)[9..23].join(" ");
+    let note = "the analysis of this node stopped early (a connection or server error); its results are partial";
+    for word in note.split_whitespace() {
         assert!(detail.contains(word), "{word} missing:\n{all}");
     }
+    assert!(!detail.contains("scan"), "{all}");
 }
 
 #[test]
@@ -198,12 +207,11 @@ fn nodes_with_replicas_scanned() {
     press(&mut app, "G");
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[4].contains("2 on replicas"), "{}", lines[4]);
-    assert!(lines[6].contains("10.0.1.21:6379") && lines[6].contains("replica"));
-    assert!(lines[7].contains("10.0.1.22:6379") && lines[7].contains("replica"));
+    assert!(lines[3].contains("2 read on replicas"), "{}", lines[3]);
+    assert!(lines[5].contains("10.0.1.21:6379") && lines[5].contains("replica"));
+    assert!(lines[6].contains("10.0.1.22:6379") && lines[6].contains("replica"));
     // The shard whose replica could not be used: its primary, with the reason.
-    assert!(lines[8].contains("10.0.1.13:6379") && lines[8].contains("primary"));
-    assert!(lines[8].contains("replica not used"), "{}", lines[8]);
+    assert!(lines[7].contains("10.0.1.13:6379") && lines[7].contains("primary"));
     assert!(text(&t).contains("▲ replica not used: 10.0.1.23:6379: timed out"));
     // Not degraded: the summary in the header is dim.
     assert_eq!(colour_of(&t, REPLICAS), DIM);
@@ -225,12 +233,47 @@ fn nodes_narrow_80x24_and_60x20() {
         for l in &lines {
             assert_eq!(l.chars().count(), usize::from(w), "{l}");
         }
-        // Slots and endpoints always show; at 80 the note column has no room.
-        assert!(lines[6].contains("0-5460") && lines[6].contains("10.0.1.11:6379"));
-        assert!(!lines[5].contains("NOTE"), "{}", lines[5]);
+        // Slots and endpoints always show; the note is in the details, not the list.
+        assert!(lines[5].contains("0-5460") && lines[5].contains("10.0.1.11:6379"));
+        assert!(!lines[4].contains("NOTE"), "{}", lines[4]);
         snap.push_str(&format!("{w}x{h}:\n{}\n\n", lines.join("\n")));
     }
     insta::assert_snapshot!(snap);
+}
+
+/// PgUp and PgDn on Nodes move by the rows its list shows (`ui::list_rows`): with more
+/// shards than fit, the list section takes what leaves the details their rows, less the
+/// column header, at every size.
+#[test]
+fn nodes_list_rows_is_what_the_list_draws() {
+    let mut report = fixtures::cluster_report();
+    let base = report.nodes.clone().unwrap();
+    report.nodes = Some(
+        (0..60u16)
+            .map(|i| {
+                let mut n = base[usize::from(i) % base.len()].clone();
+                n.id = format!("node-{i}");
+                n.primary_id = n.id.clone();
+                n.endpoint.port = 7000 + i;
+                n
+            })
+            .collect(),
+    );
+    let (mut app, _) = cluster_scanned(report, HEALTHY);
+    show(&mut app, Screen::Nodes);
+    for (w, h) in [(80, 24), (120, 36), (60, 20), (200, 60), (80, 17), (80, 18)] {
+        let rows = ui::list_rows(ratatui::layout::Rect::new(0, 0, w, h), &app);
+        let lines = buffer_lines(&render(&app, w, h));
+        let top = lines.iter().position(|l| l.starts_with('┌')).unwrap();
+        let details = top
+            + 1
+            + lines[top + 1..]
+                .iter()
+                .position(|l| l.starts_with('├') || l.starts_with('└'))
+                .unwrap();
+        // The rows between the borders, less the column header.
+        assert_eq!(details - top - 2, rows, "{w}x{h}:\n{}", lines.join("\n"));
+    }
 }
 
 #[test]
@@ -254,17 +297,16 @@ fn nodes_on_a_standalone_report() {
         scan: scan_of(&app),
         report: Box::new(report),
     });
-    show(&mut app, Screen::Nodes);
-    let t = render(&app, 80, 24);
-    let all = text(&t);
-    assert!(all.contains("Not a cluster: this scan read one standalone server."));
-    // As on an empty Hot keys view, the footer is the view's own: r and s still work.
+    // Nodes and Slots are panels of Analyze only on a cluster.
     assert!(
-        buffer_lines(&t)[23].starts_with(" ↑↓ Move   tab Panel   enter Patterns"),
-        "{}",
-        buffer_lines(&t)[23]
+        !app.panels_of(crate::tui::app::Area::Analyze)
+            .contains(&crate::tui::app::Panel::Nodes)
     );
-    insta::assert_snapshot!(t.backend());
+    show(&mut app, Screen::BigKeys);
+    for _ in 0..8 {
+        app.handle_key(key(KeyCode::Tab));
+        assert!(!matches!(app.screen(), Screen::Nodes | Screen::Slots));
+    }
 }
 
 #[test]
@@ -278,6 +320,8 @@ fn patterns_narrowed_to_a_node() {
         taken_at_unix,
         result: Ok(Some(fixtures::history(true))),
     });
+    // Δ is one of the `v` columns.
+    app.handle_key(ch('v'));
     assert!(buffer_lines(&render(&app, 120, 36))[4].contains('Δ'));
     show(&mut app, Screen::Nodes);
     press(&mut app, "j");
@@ -298,7 +342,7 @@ fn patterns_narrowed_to_a_node() {
     // esc: back to Nodes, then the merged rows with their Δ column on 1.
     app.handle_key(key(KeyCode::Esc));
     assert_eq!(app.screen(), Screen::Nodes);
-    app.handle_key(ch('1'));
+    app.handle_key(ch('2'));
     let back = buffer_lines(&render(&app, 120, 36));
     assert!(back[3].starts_with("┌─ Patterns "), "{}", back[3]);
     assert!(!back[3].contains("node"), "{}", back[3]);
@@ -313,24 +357,24 @@ fn hot_keys_with_the_node_column() {
     press(&mut app, "j");
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[5].contains("NODE"), "{}", lines[5]);
-    let node_col = column_of(&lines, 5, "NODE");
+    assert!(lines[4].contains("NODE"), "{}", lines[4]);
+    let node_col = column_of(&lines, 4, "NODE");
     // Each key shows the node it was sampled on, under the heading.
     let report = app.report().unwrap();
     let nodes = report.nodes.as_ref().unwrap();
     for (i, k) in report.hot_keys.iter().enumerate() {
         let ep = nodes[usize::from(k.node.unwrap())].endpoint.to_string();
-        assert_eq!(column_of(&lines, 6 + i, &ep), node_col, "{}", lines[6 + i]);
+        assert_eq!(column_of(&lines, 5 + i, &ep), node_col, "{}", lines[5 + i]);
     }
     // The detail panel names the selected key's node too.
-    assert!(text(&t).contains(" NODE   10.0.1.12:6379"), "{}", text(&t));
+    assert!(text(&t).contains(" Node    10.0.1.12:6379"), "{}", text(&t));
     // A standalone report keeps today's columns.
     let mut standalone = fixtures::report(true);
     standalone.hot_keys = fixtures::hot_keys();
     let (mut plain, _) = cluster_scanned(standalone, HEALTHY);
     show(&mut plain, Screen::HotKeys);
     let plain_lines = buffer_lines(&render(&plain, 120, 36));
-    assert!(!plain_lines[5].contains("NODE"), "{}", plain_lines[5]);
+    assert!(!plain_lines[4].contains("NODE"), "{}", plain_lines[4]);
     insta::assert_snapshot!(t.backend());
 }
 
@@ -341,12 +385,12 @@ fn hot_keys_node_column_cuts_a_long_address() {
     let (mut app, _) = cluster_scanned(report, HEALTHY);
     show(&mut app, Screen::HotKeys);
     let lines = buffer_lines(&render(&app, 120, 36));
-    let row = &lines[6];
+    let row = &lines[5];
     // Cut to 15 cells, and a cell stays free before the pattern.
-    assert!(row.contains(" cache-node-000… cache:"), "{row}");
+    assert!(row.contains(" cache-node-000… "), "{row}");
 }
 
-/// The header (brand line, server line and tabs) of `app` drawn `w` wide.
+/// The header (the header line, the tabs and the sub-tabs) of `app` drawn `w` wide.
 fn header(app: &App, w: u16) -> String {
     buffer_lines(&render(app, w, 24))[..3].join("\n")
 }
@@ -366,7 +410,7 @@ fn header_with_the_cluster_summary() {
                 "{w}: {first}"
             );
             if w >= 120 {
-                assert!(first.contains("scan complete"), "{w}: {first}");
+                assert!(first.contains("analyzed"), "{w}: {first}");
             }
             snap.push_str(&format!("{summary} at {w}:\n{h}\n\n"));
         }
@@ -402,15 +446,15 @@ fn connections_detail_shows_the_cluster_summary() {
         let lines = buffer_lines(&t);
         let server = lines
             .iter()
-            .find(|l| l.starts_with('│') && l.contains(" Server "))
+            .find(|l| l.starts_with('│') && l.contains(" Address "))
             .unwrap_or_else(|| panic!("{lines:#?}"));
         assert!(
             server.contains(&format!("Redis 7.4.2 · {summary}")),
             "{server}"
         );
-        // The Endpoint line stays the profile's.
-        let endpoint = lines.iter().find(|l| l.contains(" Endpoint ")).unwrap();
-        assert!(!endpoint.contains("scanning"), "{endpoint}");
+        // The address stays the profile's: no node is named as the one being read.
+        let endpoint = lines.iter().find(|l| l.contains(" Address ")).unwrap();
+        assert!(!endpoint.contains("reading"), "{endpoint}");
         let got = colour_of(&t, &format!("Redis 7.4.2 · {summary}"));
         match colour {
             Some(c) => assert_eq!(got, c, "{summary}"),
@@ -462,7 +506,7 @@ fn every_cluster_screen_at_every_size_does_not_panic() {
     let (mut app, _) = cluster_scanned(odd, HEALTHY);
     show(&mut app, Screen::HotKeys);
     let lines = buffer_lines(&render(&app, 120, 36));
-    assert!(lines[6].contains(" —  "), "{}", lines[6]);
+    assert!(lines[5].contains(" —  "), "{}", lines[5]);
 }
 
 #[test]
@@ -487,8 +531,8 @@ fn a_seed_only_scan_is_amber_everywhere_it_is_summed_up() {
     show(&mut app, Screen::Nodes);
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[6].starts_with("│ —  "), "{}", lines[6]);
-    let detail = lines[27..36].join(" ");
+    assert!(lines[5].starts_with("│ —  "), "{}", lines[5]);
+    let detail = lines[8..36].join(" ");
     for word in crate::conn::cluster::SHARDS_UNREADABLE.split_whitespace() {
         assert!(detail.contains(word), "{word}: {detail}");
     }
@@ -635,6 +679,130 @@ fn picking_a_node_restarts_the_overview_and_keeps_a_monitor_run_on_its_node() {
     assert!(app.views.server.monitor.run.is_some());
     let all = text(&render(&app, 120, 36));
     assert!(all.contains("node 10.0.1.12:6379"), "{all}");
+}
+
+/// A cluster connected without an analysis, with every view probe allowed, its live
+/// connection open, on Overview, and the connect's slow log and client list of the
+/// first primary in.
+fn cluster_on_overview(perms: crate::model::PermissionReport) -> App {
+    use super::app::views::overview::tests::{clients_reply, slow_reply};
+    let mut app = App::new(fixtures::profiles());
+    let effects = app.handle_key(key(KeyCode::Enter));
+    let [Effect::Connect { id, .. }] = effects[..] else {
+        panic!("unexpected effects {effects:?}");
+    };
+    let scan = scan_of(&app);
+    app.apply(Msg::Connected {
+        id,
+        scan,
+        server: Some(fixtures::cluster_report().server),
+        perms,
+        target: ScanTarget::Cluster(HEALTHY.into()),
+    });
+    app.apply(Msg::Nodes {
+        id,
+        scan,
+        nodes: fixtures::live_nodes(),
+    });
+    app.apply(Msg::LiveReady { id, scan });
+    app.apply(Msg::ServerReads {
+        id,
+        scan,
+        node: 0,
+        slow: Some(Ok(slow_reply())),
+        clients: Some(Ok(clients_reply())),
+    });
+    assert_eq!(app.screen(), Screen::Overview);
+    app
+}
+
+fn finding_texts(app: &App) -> Vec<String> {
+    super::app::views::overview::findings(app)
+        .into_iter()
+        .map(|f| f.text)
+        .collect()
+}
+
+fn slow_and_clients(effects: &[Effect]) -> Vec<(Dest, LiveRequest)> {
+    sent(effects)
+        .into_iter()
+        .filter(|(_, _, r)| {
+            matches!(
+                r,
+                LiveRequest::Server(ServerRequest::SlowLog { .. } | ServerRequest::Clients)
+            )
+        })
+        .map(|(_, d, r)| (d, r))
+        .collect()
+}
+
+/// `]` on a cluster's Overview: the findings that came from the last node's slow log
+/// and client list go, and the new node's are read once (each through that node's
+/// budget, on the live connection to it), so they come back for that node.
+#[test]
+fn picking_a_node_on_overview_reads_its_slow_log_and_clients_once() {
+    use super::app::views::overview::tests::{clients_reply, slow_reply};
+    let mut app = cluster_on_overview(fixtures::perms_with_probes());
+    let before = finding_texts(&app);
+    assert!(
+        before.iter().any(|t| t.starts_with("KEYS took")),
+        "{before:?}"
+    );
+    assert!(before.iter().any(|t| t.contains("10.0.9.17")), "{before:?}");
+
+    let effects = app.handle_key(ch(']'));
+    let reads = slow_and_clients(&effects);
+    assert_eq!(reads.len(), 2, "{effects:?}");
+    assert!(reads.iter().all(|(d, _)| d.to == To::Node(1)), "{reads:?}");
+    // Nothing of the last node is shown for this one meanwhile.
+    assert!(finding_texts(&app).is_empty(), "{:?}", finding_texts(&app));
+
+    for (id, _, req) in sent(&effects) {
+        let reply = match req {
+            LiveRequest::Server(ServerRequest::SlowLog { .. }) => slow_reply(),
+            LiveRequest::Server(ServerRequest::Clients) => clients_reply(),
+            _ => continue,
+        };
+        super::app::views::testing::reply(&mut app, id, Ok(reply));
+    }
+    let after = finding_texts(&app);
+    assert!(
+        after.iter().any(|t| t.starts_with("KEYS took")),
+        "{after:?}"
+    );
+    assert!(after.iter().any(|t| t.contains("10.0.9.17")), "{after:?}");
+
+    // Once: the ticks on Overview read them no more.
+    for i in 1..=20u64 {
+        let at = std::time::Instant::now() + std::time::Duration::from_secs(i * 30);
+        let effects = app.apply(Msg::TickAt(at));
+        assert!(slow_and_clients(&effects).is_empty(), "{effects:?}");
+    }
+}
+
+/// `[` on another screen than Overview (Search) reads nothing for Overview until
+/// Overview is shown; a refused `SLOWLOG` is never sent, and Overview says it is off.
+#[test]
+fn the_findings_read_waits_for_overview_and_skips_a_refused_command() {
+    let mut app = cluster_on_overview(fixtures::perms_probes_off());
+    show(&mut app, Screen::Search);
+    let effects = app.handle_key(ch('['));
+    assert_eq!(app.session.as_ref().unwrap().picked, 2);
+    assert!(slow_and_clients(&effects).is_empty(), "{effects:?}");
+    let effects = super::app::views::testing::show(&mut app, Screen::Overview);
+    let reads = slow_and_clients(&effects);
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert!(
+        matches!(&reads[0], (d, LiveRequest::Server(ServerRequest::Clients)) if d.to == To::Node(2)),
+        "{reads:?}"
+    );
+    let effects = app.apply(Msg::TickAt(std::time::Instant::now()));
+    assert!(slow_and_clients(&effects).is_empty(), "{effects:?}");
+    let off = super::app::views::overview::off_reasons(&app);
+    assert!(
+        off.iter().any(|r| r.starts_with("Slow log is off")),
+        "{off:?}"
+    );
 }
 
 /// A live cluster whose third node discovery has no connection to: it refused the
@@ -993,8 +1161,9 @@ fn the_key_list_walks_every_primary_in_slot_order_one_node_at_a_time() {
     }
     let wide = text(&render(&app, 120, 36));
     assert!(wide.contains("3 of 3 nodes"), "{wide}");
+    // At 80 the NODE column is a `v` one; the right pane names the selected key's.
     let t = render(&app, 80, 24);
-    assert!(text(&t).contains("NODE"));
+    assert!(text(&t).contains("on node 10.0.1.11:6379"), "{}", text(&t));
     insta::assert_snapshot!(t.backend());
 }
 
@@ -1363,10 +1532,12 @@ fn streams_poll_one_request_per_owning_node_and_show_each_streams_node() {
             })),
         );
     }
-    let t = render(&app, 80, 24);
-    let all = text(&t);
+    // The NODE column from 120 columns; at 80 the right pane names the selected one's.
+    let all = text(&render(&app, 120, 36));
     assert!(all.contains("NODE"), "{all}");
     assert!(all.contains("10.0.1.13:6379"), "{all}");
+    let t = render(&app, 80, 24);
+    assert!(text(&t).contains("on node 10.0.1.13:6379"), "{}", text(&t));
     insta::assert_snapshot!(t.backend());
 }
 
@@ -1430,7 +1601,10 @@ fn pubsub_counts_classic_channels_on_the_picked_node_and_shard_channels_on_every
     let t = render(&app, 80, 24);
     let all = text(&t);
     assert!(all.contains("SHARD CHANNEL"), "{all}");
-    assert!(all.contains("subscribers on 10.0.1.11:6379"), "{all}");
+    assert!(
+        all.contains("Counted on") && all.contains("10.0.1.11:6379"),
+        "{all}"
+    );
     insta::assert_snapshot!(t.backend());
     // SPUBLISH goes to the channel's slot owner, through the gate: the profile is
     // read-only, so `P` on a shard channel sends nothing to any node.
