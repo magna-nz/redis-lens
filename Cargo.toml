@@ -79,6 +79,8 @@ insta = "1.49.0"
 # The value tests compress their fixtures.
 lz4_flex = { version = "0.14.0", default-features = false, features = ["frame", "safe-encode"] }
 proptest = "1.12.0"
+# The value tests compress Snappy fixtures with it (redis-lens decodes Snappy itself).
+snap = "1.1.2"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
 testcontainers = "0.28.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "io-util", "test-util"] }

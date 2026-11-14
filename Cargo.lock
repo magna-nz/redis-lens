@@ -3236,6 +3236,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "snap",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -3821,6 +3822,12 @@ name = "smallvec"
 version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
+
+[[package]]
+name = "snap"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "socket2"

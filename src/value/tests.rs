@@ -951,3 +951,359 @@ fn nested_map_keys_stay_small() {
     assert!(r.lines().len() < 50);
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }
+
+// ---- structured formats and Snappy ----------------------------------------------
+
+const PHP: &[u8] = br#"a:2:{s:4:"name";s:3:"bob";s:3:"ids";a:2:{i:0;i:1;i:1;i:2;}}"#;
+/// CPython 3.9: `pickle.dumps({'name': 'bob', 'tags': ['a', 'b'], 'n': 3, 'ok': True,
+/// 'x': None, 'f': 1.5, 'b': b'\x00ab'}, protocol=4)`.
+const PICKLE: &[u8] = b"\x80\x04\x95K\x00\x00\x00\x00\x00\x00\x00}\x94(\x8c\x04name\x94\x8c\x03bob\x94\x8c\x04tags\x94]\x94(\x8c\x01a\x94\x8c\x01b\x94e\x8c\x01n\x94K\x03\x8c\x02ok\x94\x88\x8c\x01x\x94N\x8c\x01f\x94G?\xf8\x00\x00\x00\x00\x00\x00h\x06C\x03\x00ab\x94u.";
+/// `class Point implements Serializable { int x = 3; int y = -4; String label = "p1"; }`,
+/// assembled by hand after the Java Object Serialization Stream Protocol.
+const JAVA: &[u8] = b"\xac\xed\x00\x05sr\x00\x05Point\x00\x00\x00\x00\x00\x00\x00\x01\x02\x00\x03I\x00\x01xI\x00\x01yL\x00\x05labelt\x00\x12Ljava/lang/String;xp\x00\x00\x00\x03\xff\xff\xff\xfct\x00\x02p1";
+/// `1: 150, 2: "hi", 3: {1: 1}`.
+const PROTOBUF: &[u8] = &[
+    0x08, 0x96, 0x01, 0x12, 0x02, b'h', b'i', 0x1a, 0x02, 0x08, 0x01,
+];
+
+fn snappy_raw(data: &[u8]) -> Vec<u8> {
+    snap::raw::Encoder::new().compress_vec(data).unwrap()
+}
+
+fn snappy_framed(data: &[u8]) -> Vec<u8> {
+    let mut w = snap::write::FrameEncoder::new(Vec::new());
+    w.write_all(data).unwrap();
+    w.into_inner().unwrap()
+}
+
+#[test]
+fn the_structured_formats_are_detected_by_their_magic() {
+    assert_eq!(decode(PHP).detected, Format::Php);
+    assert_eq!(decode(PICKLE).detected, Format::Pickle);
+    assert_eq!(decode(JAVA).detected, Format::Java);
+    // Protobuf is never detected; PHP scalars are just text.
+    assert_ne!(decode(PROTOBUF).detected, Format::Protobuf);
+    assert_eq!(decode(b"i:5;").detected, Format::Text);
+    assert_eq!(decode(b"s:1:\"a\";").detected, Format::Text);
+    // Inside a compression too.
+    let d = decode(&gzip(PICKLE));
+    assert_eq!(
+        (d.compression, d.detected),
+        (Some(Compression::Gzip), Format::Pickle)
+    );
+    // A PHP string can hold bytes that are not UTF-8.
+    assert_eq!(decode(b"a:1:{i:0;s:2:\"\xff\xfe\";}").detected, Format::Php);
+}
+
+#[test]
+fn f_steps_through_all_eight_formats() {
+    let mut f = Format::Text;
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        seen.push(f.label());
+        f = f.next();
+    }
+    assert_eq!(f, Format::Text);
+    assert_eq!(
+        seen,
+        [
+            "text",
+            "hex",
+            "JSON",
+            "MessagePack",
+            "PHP",
+            "Pickle",
+            "Protobuf",
+            "Java"
+        ]
+    );
+}
+
+#[test]
+fn tree_formats_render_preview_and_copy() {
+    assert_eq!(
+        lines_of(PHP, Format::Php, 80),
+        [
+            "array(2)",
+            "  [\"name\"] => string(3) \"bob\"",
+            "  [\"ids\"] => array(2)",
+            "    [0] => int(1)",
+            "    [1] => int(2)",
+        ]
+    );
+    let r = render(&decode(PROTOBUF), Format::Protobuf, 80);
+    assert_eq!((r.format, r.note), (Format::Protobuf, None));
+    assert_eq!(
+        r.lines(),
+        [
+            "1: varint 150",
+            "2: \"hi\"",
+            "3: message (1 fields)",
+            "  1: varint 1"
+        ]
+    );
+    assert_eq!(
+        preview(PHP, 200),
+        "array(2) {[\"name\"] => string(3) \"bob\", [\"ids\"] => array(2) {[0] => int(1), [1] => int(2)}}"
+    );
+    assert_eq!(
+        preview(JAVA, 200),
+        "object Point {x: int 3, y: int -4, label: \"p1\"}"
+    );
+    assert!(preview(PICKLE, 20).chars().count() <= 20);
+    // Copied on one line, control characters escaped.
+    let c = copy_text(&decode(PICKLE), Format::Pickle).unwrap();
+    assert!(
+        c.starts_with("dict (7) {'name': 'bob', 'tags': list (2) {'a', 'b'}"),
+        "{c}"
+    );
+    assert!(c.contains("b'\\x00ab'"));
+    assert_safe(&c, "copy");
+    let c = copy_text(&decode(PROTOBUF), Format::Protobuf).unwrap();
+    assert_eq!(
+        c,
+        "1: varint 150, 2: \"hi\", 3: message (1 fields) {1: varint 1}"
+    );
+}
+
+#[test]
+fn picking_a_tree_format_that_does_not_fit_falls_back_with_a_note() {
+    let text = decode(b"just text");
+    let bin = decode(&[0xc1, 0xff, 0x00]);
+    for (d, f, used, note) in [
+        (
+            &text,
+            Format::Php,
+            Format::Text,
+            "not valid PHP serialize, shown as text",
+        ),
+        (
+            &bin,
+            Format::Pickle,
+            Format::Hex,
+            "not valid Pickle, shown as hex",
+        ),
+        (
+            &bin,
+            Format::Protobuf,
+            Format::Hex,
+            "not valid Protobuf, shown as hex",
+        ),
+        (
+            &text,
+            Format::Java,
+            Format::Text,
+            "not Java serialization, shown as text",
+        ),
+    ] {
+        let r = render(d, f, 80);
+        assert_eq!((r.format, r.note), (used, Some(note)));
+    }
+    // Text that happens to be valid Protobuf is shown as Protobuf when picked.
+    let r = render(&decode(b"hi"), Format::Protobuf, 80);
+    assert_eq!((r.format, r.note), (Format::Protobuf, None));
+}
+
+#[test]
+fn a_cut_tree_says_so() {
+    let mut php = format!("a:{}:{{", 20_000);
+    for i in 0..20_000 {
+        php.push_str(&format!("i:{i};N;"));
+    }
+    php.push('}');
+    let r = render(&decode(php.as_bytes()), Format::Php, 80);
+    assert_eq!(r.format, Format::Php);
+    assert!(r.lines().len() <= MAX_LINES);
+    let last = r.lines().last().unwrap();
+    assert!(last.contains("not shown"), "{last}");
+}
+
+#[test]
+fn snappy_raw_and_framed_decompress() {
+    let text = "hello snappy ".repeat(40);
+    for packed in [snappy_raw(text.as_bytes()), snappy_framed(text.as_bytes())] {
+        let d = decode(&packed);
+        assert_eq!(d.compression, Some(Compression::Snappy));
+        assert_eq!(d.bytes(), text.as_bytes());
+        assert_eq!(d.detected, Format::Text);
+    }
+    // A pickle in a raw block: not much shorter, but a format of its own.
+    let d = decode(&snappy_raw(PICKLE));
+    assert_eq!(
+        (d.compression, d.detected),
+        (Some(Compression::Snappy), Format::Pickle)
+    );
+    // Short binary that happens to be a valid raw block is left as it is.
+    let d = decode(&[0x02, 0x04, 0xff, 0xfe]);
+    assert_eq!((d.compression, d.detected), (None, Format::Hex));
+    // Text is never tried as a raw block.
+    assert_eq!(decode(b"\x05\x10hello").compression, None);
+}
+
+#[test]
+fn a_snappy_bomb_stops_at_the_cap() {
+    let zeros = vec![0u8; 8 * MAX_DECOMPRESSED];
+    for packed in [snappy_raw(&zeros), snappy_framed(&zeros)] {
+        assert!(packed.len() < MAX_DECOMPRESSED);
+        let d = decode(&packed);
+        assert_eq!(d.compression, Some(Compression::Snappy));
+        assert!(d.truncated);
+        assert_eq!(d.bytes().len(), MAX_DECOMPRESSED);
+    }
+}
+
+/// Every caller-visible output of the tree readers is bounded and terminal safe.
+fn check_tree_formats(raw: &[u8]) -> Result<(), TestCaseError> {
+    let d = decode(raw);
+    for f in [Format::Php, Format::Pickle, Format::Protobuf, Format::Java] {
+        let mut t = tree::Tree::new();
+        tree_of(d.bytes(), f, &mut t);
+        prop_assert!(t.lines().len() <= tree::MAX_NODES);
+        let bytes: usize = t.lines().iter().map(|(_, s)| s.len()).sum();
+        prop_assert!(bytes <= tree::MAX_TREE_BYTES);
+        let r = render(&d, f, 60);
+        prop_assert!(r.lines().len() <= MAX_LINES);
+        for line in r.lines() {
+            prop_assert!(!line.chars().any(unsafe_char));
+            prop_assert!(display_width(line) <= 60usize.max(MAX_ESCAPE_WIDTH));
+        }
+        if let Ok(s) = copy_text(&d, f) {
+            prop_assert!(!s.chars().any(unsafe_char));
+        }
+    }
+    let p = preview(raw, 40);
+    prop_assert!(p.chars().count() <= 40);
+    prop_assert!(!p.chars().any(unsafe_char));
+    Ok(())
+}
+
+/// Pickle opcodes with small arguments, so random streams get past the first byte.
+fn arb_pickle_ops() -> impl Strategy<Value = Vec<u8>> {
+    let simple: Vec<u8> = b"(N]})aesutldRb201".to_vec();
+    let more: Vec<u8> = vec![0x85, 0x86, 0x87, 0x81, 0x92, 0x93, 0x94, 0x8f, 0x90, 0x91];
+    let op = prop_oneof![
+        proptest::sample::select(simple).prop_map(|c| vec![c]),
+        proptest::sample::select(more).prop_map(|c| vec![c]),
+        any::<u8>().prop_map(|k| vec![b'q', k]),
+        any::<u8>().prop_map(|k| vec![b'h', k]),
+        any::<u8>().prop_map(|k| vec![b'K', k]),
+        ".{0,6}".prop_map(|s| {
+            let mut v = vec![0x8c, s.len() as u8];
+            v.extend(s.as_bytes());
+            v
+        }),
+        Just(b"cos\nsystem\n".to_vec()),
+    ];
+    proptest::collection::vec(op, 0..60).prop_map(|ops| {
+        let mut b = vec![0x80, 0x04];
+        b.extend(ops.into_iter().flatten());
+        b.push(b'.');
+        b
+    })
+}
+
+/// PHP values in random nesting.
+fn arb_php() -> impl Strategy<Value = Vec<u8>> {
+    let leaf = prop_oneof![
+        Just("N;".to_string()),
+        any::<i64>().prop_map(|i| format!("i:{i};")),
+        any::<bool>().prop_map(|b| format!("b:{};", u8::from(b))),
+        ".{0,8}".prop_map(|s| format!("s:{}:\"{s}\";", s.len())),
+        Just("d:0.5;".to_string()),
+    ];
+    leaf.prop_recursive(4, 40, 5, |inner| {
+        prop_oneof![
+            proptest::collection::vec(inner.clone(), 0..5).prop_map(|v| {
+                let mut s = format!("a:{}:{{", v.len());
+                for (i, x) in v.iter().enumerate() {
+                    s.push_str(&format!("i:{i};{x}"));
+                }
+                s.push('}');
+                s
+            }),
+            proptest::collection::vec(inner, 0..4).prop_map(|v| {
+                let mut s = format!("O:1:\"C\":{}:{{", v.len());
+                for (i, x) in v.iter().enumerate() {
+                    s.push_str(&format!("s:2:\"p{}\";{x}", i % 10));
+                }
+                s.push('}');
+                s
+            }),
+        ]
+    })
+    .prop_map(String::into_bytes)
+}
+
+/// Prefixes that send random bytes into each reader.
+const TREE_PREFIXES: [&[u8]; 7] = [
+    b"",
+    &[0x80, 0x02],
+    &[0x80, 0x05],
+    &[0xac, 0xed, 0x00, 0x05],
+    &[0xac, 0xed, 0x00, 0x05, 0x73, 0x72],
+    b"a:3:{",
+    &snappy::FRAMED_MAGIC,
+];
+
+proptest! {
+    #[test]
+    fn tree_readers_never_panic_and_stay_bounded(
+        k in 0usize..TREE_PREFIXES.len(),
+        tail in proptest::collection::vec(any::<u8>(), 0..800),
+    ) {
+        let mut raw = TREE_PREFIXES[k].to_vec();
+        raw.extend(tail);
+        check_tree_formats(&raw)?;
+    }
+
+    #[test]
+    fn random_pickles_never_panic(raw in arb_pickle_ops()) {
+        check_tree_formats(&raw)?;
+    }
+
+    #[test]
+    fn php_values_are_read_and_detected(raw in arb_php()) {
+        let d = decode(&raw);
+        if raw.starts_with(b"a:") || raw.starts_with(b"O:") {
+            prop_assert_eq!(d.detected, Format::Php);
+        }
+        prop_assert!(render(&d, Format::Php, 80).note.is_none());
+        check_tree_formats(&raw)?;
+    }
+
+    #[test]
+    fn corrupted_structured_values_never_panic(
+        k in 0usize..4,
+        flips in proptest::collection::vec((any::<usize>(), any::<u8>()), 1..6),
+    ) {
+        let mut raw = [PHP, PICKLE, JAVA, PROTOBUF][k].to_vec();
+        for (at, x) in flips {
+            let n = raw.len();
+            raw[at % n] ^= x;
+        }
+        check_tree_formats(&raw)?;
+    }
+
+    /// The Snappy decoder agrees with the `snap` crate's encoder.
+    #[test]
+    fn snappy_matches_the_reference(data in proptest::collection::vec(any::<u8>(), 0..3000)) {
+        let packed = snappy_raw(&data);
+        prop_assert_eq!(snappy::raw(&packed, MAX_DECOMPRESSED), Some((data.clone(), false)));
+        let framed = snappy_framed(&data);
+        prop_assert_eq!(snappy::framed(&framed, MAX_DECOMPRESSED), Some((data, false)));
+    }
+
+    #[test]
+    fn random_snappy_input_never_panics(
+        framed in any::<bool>(),
+        tail in proptest::collection::vec(any::<u8>(), 0..600),
+    ) {
+        let mut raw = if framed { snappy::FRAMED_MAGIC.to_vec() } else { Vec::new() };
+        raw.extend(tail);
+        let d = decode(&raw);
+        prop_assert!(d.bytes().len() <= MAX_DECOMPRESSED.max(raw.len()));
+        if let Some((b, _)) = snappy::raw(&raw, 1000) {
+            prop_assert!(b.len() <= 1000);
+        }
+    }
+}

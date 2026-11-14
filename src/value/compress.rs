@@ -16,6 +16,7 @@ pub(super) fn sniff(raw: &[u8]) -> Option<Compression> {
         [0x1f, 0x8b, ..] => Some(Compression::Gzip),
         [0x28, 0xb5, 0x2f, 0xfd, ..] => Some(Compression::Zstd),
         [0x04, 0x22, 0x4d, 0x18, ..] => Some(Compression::Lz4),
+        b if b.starts_with(&super::snappy::FRAMED_MAGIC) => Some(Compression::Snappy),
         [0x78, b1, ..] if u16::from_be_bytes([0x78, *b1]).is_multiple_of(31) => {
             Some(Compression::Zlib)
         }
@@ -24,7 +25,8 @@ pub(super) fn sniff(raw: &[u8]) -> Option<Compression> {
 }
 
 /// The decompressed bytes and whether they were cut at [`MAX_DECOMPRESSED`], or `None`
-/// when `raw` has no known magic or does not decompress.
+/// when `raw` has no known magic or does not decompress. Raw Snappy has no magic: see
+/// [`raw_snappy`].
 pub(super) fn decompress(raw: &[u8]) -> Option<(Compression, Vec<u8>, bool)> {
     let c = sniff(raw)?;
     let out = match c {
@@ -36,6 +38,10 @@ pub(super) fn decompress(raw: &[u8]) -> Option<(Compression, Vec<u8>, bool)> {
                 ruzstd::decoding::StreamingDecoder::new_with_max_window_size(raw, MAX_ZSTD_WINDOW)
                     .ok()?;
             read_capped(dec)
+        }
+        Compression::Snappy => {
+            let (bytes, truncated) = super::snappy::framed(raw, MAX_DECOMPRESSED)?;
+            return Some((c, bytes, truncated));
         }
     };
     let (bytes, truncated) = out.ok()?;
@@ -50,4 +56,12 @@ pub(super) fn read_capped(r: impl Read) -> io::Result<(Vec<u8>, bool)> {
     let truncated = buf.len() > MAX_DECOMPRESSED;
     buf.truncate(MAX_DECOMPRESSED);
     Ok((buf, truncated))
+}
+
+/// `raw` as a raw Snappy block, decompressed up to [`MAX_DECOMPRESSED`]: `None` when
+/// it is not one. A raw block has no magic, so [`super::decode`] tries it only on bytes
+/// that are not text and not any other format, and keeps the result only when it is
+/// longer than `raw` or is a format of its own.
+pub(super) fn raw_snappy(raw: &[u8]) -> Option<(Vec<u8>, bool)> {
+    super::snappy::raw(raw, MAX_DECOMPRESSED)
 }
