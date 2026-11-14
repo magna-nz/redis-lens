@@ -278,7 +278,7 @@ pub fn render_table_for(
         "Memory:  {} used of {}   eviction: {}",
         format::bytes(s.used_memory),
         limit,
-        s.maxmemory_policy
+        s.policy_label()
     ));
     let share = if s.total_keys == 0 {
         0.0
@@ -299,7 +299,7 @@ pub fn render_table_for(
     if !s.lfu_enabled() {
         degraded.push(format!(
             "hot keys unavailable: eviction policy is {}",
-            s.maxmemory_policy
+            s.policy_label()
         ));
     } else if perms
         .checks

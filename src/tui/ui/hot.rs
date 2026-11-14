@@ -70,7 +70,7 @@ fn is_hot_big(k: &KeySample) -> bool {
 }
 
 fn policy(report: &ScanReport) -> String {
-    format!("policy {}", report.server.maxmemory_policy)
+    format!("policy {}", report.server.policy_label())
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {

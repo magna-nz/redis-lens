@@ -1708,7 +1708,7 @@ impl App {
             format!(
                 "The eviction policy is {}, so Redis keeps no LFU counters. Set \
                  maxmemory-policy to allkeys-lfu or volatile-lfu to see hot keys.",
-                r.server.maxmemory_policy
+                r.server.policy_label()
             )
         } else if r.sampled_keys == 0 {
             "The analysis sampled no keys.".to_string()

@@ -200,7 +200,7 @@ pub fn parse_info(server: &str, memory: &str, dbsize: u64) -> Result<ServerInfo,
         used_memory: number("used_memory")?,
         maxmemory: number("maxmemory")?,
         maxmemory_policy: info_field(memory, "maxmemory_policy")
-            .unwrap_or("noeviction")
+            .unwrap_or("")
             .to_string(),
         total_keys: dbsize,
     })
@@ -2198,6 +2198,17 @@ mod tests {
         assert_eq!(info.version, "8.1.3");
         assert_eq!(info.maxmemory, 0);
         assert_eq!(info.maxmemory_policy, "noeviction");
+        assert!(!info.lfu_enabled());
+    }
+
+    /// A missing `maxmemory_policy` stays unknown: no guessed `noeviction`, which
+    /// would set off the eviction findings on a policy the server never named.
+    #[test]
+    fn a_missing_policy_is_unknown_not_noeviction() {
+        let memory = "# Memory\r\nused_memory:943120\r\nmaxmemory:0\r\n";
+        let info = parse_info(VALKEY_SERVER, memory, 7).unwrap();
+        assert_eq!(info.maxmemory_policy, "");
+        assert_eq!(info.policy_label(), "unknown");
         assert!(!info.lfu_enabled());
     }
 

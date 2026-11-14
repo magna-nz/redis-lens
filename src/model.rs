@@ -192,6 +192,15 @@ impl ServerInfo {
     pub fn lfu_enabled(&self) -> bool {
         self.maxmemory_policy.contains("lfu")
     }
+
+    /// The eviction policy as shown: "unknown" when `INFO memory` had no
+    /// `maxmemory_policy` field (it is then empty, never a guessed default).
+    pub fn policy_label(&self) -> &str {
+        match self.maxmemory_policy.trim() {
+            "" => "unknown",
+            p => p,
+        }
+    }
 }
 
 /// The result of one scan. Serialized to disk as a snapshot for the Diff view.
