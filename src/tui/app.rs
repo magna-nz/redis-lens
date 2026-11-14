@@ -889,6 +889,17 @@ impl Session {
         !self.nodes.is_empty()
     }
 
+    /// True when a cluster-mode server is read as a standalone one because the profile
+    /// says so (`force_standalone`): only that node's keys are seen. Shown as the
+    /// `standalone` mark.
+    pub fn read_alone(&self) -> bool {
+        self.profile.force_standalone
+            && self
+                .server
+                .as_ref()
+                .is_some_and(|i| i.mode == crate::model::ServerMode::Cluster)
+    }
+
     /// The picked node, on a cluster.
     pub fn picked_node(&self) -> Option<&crate::live::nodes::NodeInfo> {
         self.nodes.get(self.picked)
@@ -1740,9 +1751,10 @@ impl App {
     pub fn is_cluster(&self) -> bool {
         self.session.as_ref().is_some_and(|s| {
             s.is_cluster()
-                || s.server
-                    .as_ref()
-                    .is_some_and(|i| i.mode == crate::model::ServerMode::Cluster)
+                || (!s.profile.force_standalone
+                    && s.server
+                        .as_ref()
+                        .is_some_and(|i| i.mode == crate::model::ServerMode::Cluster))
                 || s.report.as_ref().is_some_and(|r| r.nodes.is_some())
         })
     }
@@ -3048,6 +3060,7 @@ impl App {
             token_command: None,
             ssh: None,
             sentinel: None,
+            force_standalone: false,
             tags: Vec::new(),
         };
         if let Some(add) = self.add.as_mut() {

@@ -357,6 +357,7 @@ mod tests {
 
     fn report(profile: &str, patterns: Vec<PatternStats>, total: u64, sampled: u64) -> ScanReport {
         ScanReport {
+            note: None,
             profile: profile.into(),
             taken_at_unix: 1_794_319_331,
             server: ServerInfo {

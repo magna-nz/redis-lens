@@ -523,6 +523,14 @@ fn entry_detail(frame: &mut Frame, inner: Rect, app: &App, e: &ConnEntry) {
                 address_style = style::amber();
             }
         }
+        (Some(s), _)
+            if e.profile.force_standalone && s.mode == crate::model::ServerMode::Cluster =>
+        {
+            address.push_str(&format!(
+                " · {}, cluster node read as standalone",
+                server_label(s)
+            ));
+        }
         (Some(s), _) => address.push_str(&format!(" · {}, {}", server_label(s), mode(s.mode))),
         (None, _) => {}
     }

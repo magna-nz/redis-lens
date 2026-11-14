@@ -509,7 +509,9 @@ impl<'a> Ctx<'a> {
 
     /// True on a cluster: the server line says so, or the nodes are known.
     pub fn is_cluster(&self) -> bool {
-        self.session.is_cluster() || self.server().is_some_and(|s| s.mode == ServerMode::Cluster)
+        self.session.is_cluster()
+            || (!self.session.profile.force_standalone
+                && self.server().is_some_and(|s| s.mode == ServerMode::Cluster))
     }
 
     /// `node 127.0.0.1:7001 · 1 of 3` for the right of a title on the views that read

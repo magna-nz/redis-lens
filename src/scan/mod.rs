@@ -813,6 +813,7 @@ pub async fn scan_with_figures<C: ConnectionLike + Send>(
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     Ok(ScanReport {
+        note: None,
         profile: profile_name.to_string(),
         taken_at_unix,
         server,
@@ -1064,6 +1065,7 @@ mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            force_standalone: false,
             tags: Vec::new(),
         };
         assert_eq!(ScanOptions::for_profile(&p).max_commands_per_sec, None);
@@ -1101,6 +1103,7 @@ mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            force_standalone: false,
             tags: Vec::new(),
         };
         for env in [Env::Prod, Env::Stage, Env::Other, Env::Local] {

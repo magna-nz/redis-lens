@@ -593,6 +593,7 @@ mod tests {
 
     fn report(profile: &str, at: i64) -> ScanReport {
         ScanReport {
+            note: None,
             profile: profile.into(),
             taken_at_unix: at,
             server: ServerInfo {
@@ -1327,5 +1328,61 @@ mod tests {
         let t = trend(&[]);
         assert!(t.points.is_empty() && t.patterns.is_empty());
         assert_eq!(t.metric, TrendMetric::Keys);
+    }
+
+    /// The note of a cluster node read alone is additive: no key without it, an older
+    /// snapshot loads, a newer one round-trips and an older build ignores the key.
+    #[test]
+    fn one_node_note_is_additive_in_snapshots() {
+        let plain = serde_json::to_string(&report("p", 1)).unwrap();
+        assert!(!plain.contains("\"note\""), "{plain}");
+        let back: ScanReport = serde_json::from_str(&plain).unwrap();
+        assert_eq!(back.note, None);
+
+        let mut forced = report("p", 2);
+        forced.server.mode = ServerMode::Cluster;
+        let mut profile = crate::model::Profile {
+            name: "p".into(),
+            env: crate::model::Env::Local,
+            endpoint: crate::model::Endpoint {
+                host: "h".into(),
+                port: 1,
+                tls: false,
+            },
+            db: 0,
+            auth: crate::model::Auth::None,
+            read_only: None,
+            prefer_replica: false,
+            provider: None,
+            token_command: None,
+            ssh: None,
+            sentinel: None,
+            force_standalone: false,
+            tags: Vec::new(),
+        };
+        // Off: no note, even on a cluster node.
+        let mut r = forced.clone();
+        r.note_standalone_read(&profile);
+        assert_eq!(r.note, None);
+        // On, and the server is a cluster node: noted.
+        profile.force_standalone = true;
+        let mut r = forced.clone();
+        r.note_standalone_read(&profile);
+        assert_eq!(r.note.as_deref(), Some(crate::model::NOTE_ONE_NODE));
+        // On, but the server is a plain standalone one: nothing to say.
+        let mut s = report("p", 3);
+        s.note_standalone_read(&profile);
+        assert_eq!(s.note, None);
+
+        let text = serde_json::to_string(&r).unwrap();
+        assert!(text.contains("\"note\""), "{text}");
+        let back: ScanReport = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, r);
+        // The saved file keeps it too.
+        let dir = temp_dir("note");
+        save(&dir, &r).unwrap();
+        let got = latest_before(&dir, "p", 999, None).unwrap().unwrap();
+        assert_eq!(got.note.as_deref(), Some(crate::model::NOTE_ONE_NODE));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

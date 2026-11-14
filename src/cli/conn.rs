@@ -72,6 +72,8 @@ pub async fn run(config: Option<PathBuf>, cmd: ConnCommand) -> anyhow::Result<()
             yes,
             tag,
             untag,
+            standalone,
+            no_standalone,
         } => println!(
             "{}",
             set(
@@ -83,6 +85,11 @@ pub async fn run(config: Option<PathBuf>, cmd: ConnCommand) -> anyhow::Result<()
                     yes,
                     tag: &tag,
                     untag: &untag,
+                    standalone: match (standalone, no_standalone) {
+                        (true, _) => Some(true),
+                        (_, true) => Some(false),
+                        _ => None,
+                    },
                 },
                 &ask_on_terminal
             )?
@@ -592,6 +599,11 @@ pub fn import(
         {
             refused.push(format!("{shown}: the token command has no program"));
         }
+        if p.force_standalone && p.sentinel.is_some() {
+            refused.push(format!(
+                "{shown}: force_standalone conflicts with a Sentinel table"
+            ));
+        }
         if let Some(s) = &p.sentinel
             && (s.nodes.is_empty()
                 || s.master.is_empty()
@@ -795,6 +807,8 @@ pub struct SetChanges<'a> {
     pub yes: bool,
     pub tag: &'a [String],
     pub untag: &'a [String],
+    /// `--standalone` (`true`) or `--no-standalone` (`false`).
+    pub standalone: Option<bool>,
 }
 
 /// `conn set <name> [--writes on|off] [--tag T]... [--untag T]...`: sets `read_only`
@@ -807,8 +821,12 @@ pub fn set(
     changes: &SetChanges<'_>,
     ask: &dyn Fn(&str, &str) -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
-    if changes.writes.is_none() && changes.tag.is_empty() && changes.untag.is_empty() {
-        bail!("nothing to change: give --writes, --tag or --untag");
+    if changes.writes.is_none()
+        && changes.tag.is_empty()
+        && changes.untag.is_empty()
+        && changes.standalone.is_none()
+    {
+        bail!("nothing to change: give --writes, --tag, --untag, --standalone or --no-standalone");
     }
     let mut config = Config::load(path)?;
     let profile = config
@@ -816,6 +834,9 @@ pub fn set(
         .ok_or_else(|| crate::config::ConfigError::NotFound(name.to_string()))?
         .clone();
     let tags = checked_tags(&profile.tags, changes.tag, changes.untag)?;
+    if changes.standalone == Some(true) && profile.sentinel.is_some() {
+        bail!(STANDALONE_SENTINEL);
+    }
     if changes.writes == Some(true) && profile.is_read_only() {
         confirm_writes_on(&profile, changes.confirm, changes.yes, ask)?;
     }
@@ -838,9 +859,21 @@ pub fn set(
             format!("Tags of {name}: {}.", tags.join(", "))
         });
     }
+    if let Some(on) = changes.standalone {
+        config.set_force_standalone(name, on)?;
+        lines.push(if on {
+            format!("{name} is read as a standalone server: a cluster node is read alone.")
+        } else {
+            format!("{name} is no longer forced standalone.")
+        });
+    }
     config.save(path)?;
     Ok(lines.join("\n"))
 }
+
+/// The refusal for `--standalone` on a Sentinel profile.
+const STANDALONE_SENTINEL: &str =
+    "--standalone conflicts with a Sentinel profile: Sentinel already names one primary";
 
 /// `conn set <name> --writes on|off` alone.
 pub fn set_writes(
@@ -914,6 +947,9 @@ pub async fn add_asking(
     }
 
     // Checked before anything is written.
+    if args.standalone && args.sentinel.is_some() {
+        bail!(STANDALONE_SENTINEL);
+    }
     let ssh = ssh_from_args(args)?;
     // Standard input holds the Sentinel password only with --sentinel-password-stdin
     // (which can't be given with --password-stdin).
@@ -1012,6 +1048,9 @@ pub async fn add_asking(
         (Env::Local, Some(_)) => Env::Other,
         (guess, _) => guess,
     };
+    if args.standalone && sentinel.is_some() {
+        bail!(STANDALONE_SENTINEL);
+    }
     let profile = Profile {
         name: args.name.clone(),
         env: args.env.map(Into::into).unwrap_or(env_guess),
@@ -1024,6 +1063,7 @@ pub async fn add_asking(
         token_command,
         ssh: tunnel,
         sentinel,
+        force_standalone: args.standalone,
         tags,
     };
     if args.confirm.is_some() && args.writes != Some(WritesArg::On) {
@@ -1187,6 +1227,8 @@ pub fn list(path: &Path) -> anyhow::Result<String> {
     let any_ssh = config.profiles.iter().any(|p| p.ssh.is_some());
     // The SENTINEL column only when some profile asks Sentinels.
     let any_sentinel = config.profiles.iter().any(|p| p.sentinel.is_some());
+    // The MODE column only when some profile is forced standalone.
+    let any_standalone = config.profiles.iter().any(|p| p.force_standalone);
     // The TAGS column only when some profile has one.
     let any_tags = config.profiles.iter().any(|p| !p.tags.is_empty());
     let rows: Vec<Vec<String>> = config
@@ -1206,6 +1248,9 @@ pub fn list(path: &Path) -> anyhow::Result<String> {
             if any_sentinel {
                 row.push(p.sentinel.as_ref().map(sentinel_label).unwrap_or_default());
             }
+            if any_standalone {
+                row.push(if p.force_standalone { "standalone" } else { "" }.to_string());
+            }
             row.push(p.provider.map_or("", provider::label).to_string());
             if any_tags {
                 row.push(p.tags.join(","));
@@ -1219,6 +1264,9 @@ pub fn list(path: &Path) -> anyhow::Result<String> {
     }
     if any_sentinel {
         header.push("SENTINEL");
+    }
+    if any_standalone {
+        header.push("MODE");
     }
     header.push("PROVIDER");
     if any_tags {
@@ -1368,6 +1416,7 @@ mod tests {
             ssh_identity: None,
             ssh_known_hosts: None,
             sentinel: None,
+            standalone: false,
             sentinel_master: None,
             sentinel_tls: false,
             sentinel_user: None,
@@ -2656,6 +2705,7 @@ mod tests {
                 token_command: None,
                 ssh: None,
                 sentinel: None,
+                force_standalone: false,
                 tags: Vec::new(),
             },
             credentials: Some(Credentials {
@@ -3622,5 +3672,204 @@ mod tests {
         let e = run(a, &no_question).await.unwrap_err();
         assert!(e.to_string().contains("--writes on"), "{e}");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // -- Force standalone ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn add_standalone_is_saved_only_when_set_and_listed() {
+        let path = temp_path("standalone-add");
+        let store = MemoryStore::default();
+        let mut a = args("s", "redis://localhost:7000");
+        a.standalone = true;
+        add(&path, &store, &a, None).await.unwrap();
+        add(&path, &store, &args("n", "redis://localhost:7001"), None)
+            .await
+            .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.get("s").unwrap().force_standalone);
+        assert!(!cfg.get("n").unwrap().force_standalone);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("force_standalone").count(), 1, "{text}");
+        let listed = list(&path).unwrap();
+        assert!(listed.contains("MODE"), "{listed}");
+        let row = |name: &str| listed.lines().find(|l| l.starts_with(name)).unwrap();
+        assert!(row("s ").contains("standalone"), "{listed}");
+        assert!(!row("n ").contains("standalone"), "{listed}");
+        // No profile is forced: no MODE column.
+        let other = temp_path("standalone-none");
+        add(&other, &store, &args("n", "redis://localhost:7001"), None)
+            .await
+            .unwrap();
+        assert!(!list(&other).unwrap().contains("MODE"));
+    }
+
+    #[tokio::test]
+    async fn add_standalone_with_sentinel_is_refused_in_one_line() {
+        let path = temp_path("standalone-sentinel");
+        let store = MemoryStore::default();
+        let mut a = args("s", "redis://localhost:7000");
+        a.standalone = true;
+        a.sentinel = Some("s1:26379".into());
+        a.sentinel_master = Some("m".into());
+        let e = add(&path, &store, &a, None).await.unwrap_err().to_string();
+        assert_eq!(e, STANDALONE_SENTINEL);
+        assert!(!e.contains('\n'));
+        assert!(Config::load(&path).unwrap().profiles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_standalone_and_no_standalone_touch_only_that_field() {
+        let path = temp_path("standalone-set");
+        let store = MemoryStore::default();
+        add(&path, &store, &args("c", "redis://localhost:7000"), None)
+            .await
+            .unwrap();
+        let before = Config::load(&path).unwrap().get("c").unwrap().clone();
+        let on = SetChanges {
+            standalone: Some(true),
+            ..SetChanges::default()
+        };
+        let msg = set(&path, "c", &on, &no_question).unwrap();
+        assert!(msg.contains("standalone"), "{msg}");
+        let got = Config::load(&path).unwrap().get("c").unwrap().clone();
+        assert!(got.force_standalone);
+        let mut expect = before.clone();
+        expect.force_standalone = true;
+        assert_eq!(got, expect);
+        let off = SetChanges {
+            standalone: Some(false),
+            ..SetChanges::default()
+        };
+        set(&path, "c", &off, &no_question).unwrap();
+        assert_eq!(Config::load(&path).unwrap().get("c").unwrap(), &before);
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("force_standalone")
+        );
+        // It counts as a change on its own.
+        assert!(set(&path, "c", &SetChanges::default(), &no_question).is_err());
+        assert!(set(&path, "nope", &on, &no_question).is_err());
+    }
+
+    #[tokio::test]
+    async fn set_standalone_on_a_sentinel_profile_is_refused() {
+        let path = temp_path("standalone-set-sentinel");
+        write_file(
+            &path,
+            &format!(
+                "{}[profile.sentinel]\nmaster = \"m\"\nnodes = [\"s1\"]\n",
+                profile_text("s", "")
+            ),
+        );
+        let on = SetChanges {
+            standalone: Some(true),
+            ..SetChanges::default()
+        };
+        let e = set(&path, "s", &on, &no_question).unwrap_err().to_string();
+        assert_eq!(e, STANDALONE_SENTINEL);
+        assert!(
+            !Config::load(&path)
+                .unwrap()
+                .get("s")
+                .unwrap()
+                .force_standalone
+        );
+        // Turning it off is always allowed.
+        let off = SetChanges {
+            standalone: Some(false),
+            ..SetChanges::default()
+        };
+        set(&path, "s", &off, &no_question).unwrap();
+    }
+
+    #[test]
+    fn clap_standalone_flags() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| crate::cli::Cli::try_parse_from(argv);
+        let add = parse(&[
+            "redis-lens",
+            "conn",
+            "add",
+            "p",
+            "--url",
+            "redis://h",
+            "--standalone",
+        ])
+        .unwrap();
+        let Some(crate::cli::Command::Conn(crate::cli::ConnCommand::Add(a))) = add.command else {
+            panic!("not conn add");
+        };
+        assert!(a.standalone);
+        let set_on = parse(&["redis-lens", "conn", "set", "p", "--standalone"]).unwrap();
+        assert!(matches!(
+            set_on.command,
+            Some(crate::cli::Command::Conn(crate::cli::ConnCommand::Set {
+                standalone: true,
+                no_standalone: false,
+                ..
+            }))
+        ));
+        let set_off = parse(&["redis-lens", "conn", "set", "p", "--no-standalone"]).unwrap();
+        assert!(matches!(
+            set_off.command,
+            Some(crate::cli::Command::Conn(crate::cli::ConnCommand::Set {
+                standalone: false,
+                no_standalone: true,
+                ..
+            }))
+        ));
+        // Both together are a usage error.
+        let e = parse(&[
+            "redis-lens",
+            "conn",
+            "set",
+            "p",
+            "--standalone",
+            "--no-standalone",
+        ])
+        .unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[tokio::test]
+    async fn export_and_import_keep_force_standalone() {
+        let src = temp_path("standalone-exp");
+        let store = MemoryStore::default();
+        let mut a = args("a", "redis://10.0.0.5:7000");
+        a.standalone = true;
+        add(&src, &store, &a, None).await.unwrap();
+        add(&src, &store, &args("b", "redis://10.0.0.6"), None)
+            .await
+            .unwrap();
+        let file = src.parent().unwrap().join("out.toml");
+        export(&src, Some(&file), false, &mut Vec::new()).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(text.matches("force_standalone = true").count(), 1, "{text}");
+        let dst = temp_path("standalone-imp");
+        import(&dst, &store, &file, false, true, &no_confirm).unwrap();
+        let got = Config::load(&dst).unwrap();
+        assert!(got.get("a").unwrap().force_standalone);
+        assert!(!got.get("b").unwrap().force_standalone);
+        assert_eq!(got.profiles, Config::load(&src).unwrap().profiles);
+        // A hand-written file with the field and a Sentinel table is refused whole.
+        write_file(
+            &file,
+            &format!(
+                "{}[profile.sentinel]\nmaster = \"m\"\nnodes = [\"s1\"]\n",
+                profile_text("s", "force_standalone = true")
+            ),
+        );
+        let dst2 = temp_path("standalone-imp-2");
+        let e = import(&dst2, &store, &file, false, true, &no_confirm).unwrap_err();
+        assert!(
+            e.to_string().contains("s: force_standalone conflicts"),
+            "{e}"
+        );
+        assert!(Config::load(&dst2).unwrap().profiles.is_empty());
+        let _ = std::fs::remove_dir_all(src.parent().unwrap());
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+        let _ = std::fs::remove_dir_all(dst2.parent().unwrap());
     }
 }

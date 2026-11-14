@@ -1,0 +1,8 @@
+---
+source: src/tui/keymap.rs
+expression: "show(FooterCtx { writes: true, ..base })"
+---
+[
+    "d Delete",
+    "esc Back",
+]

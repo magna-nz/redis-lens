@@ -35,6 +35,7 @@ fn profile(name: &str, env: Env, host: &str, port: u16, tls: bool, auth: Auth) -
         token_command: None,
         ssh: None,
         sentinel: None,
+        force_standalone: false,
         tags: Vec::new(),
     }
 }
@@ -455,6 +456,7 @@ pub fn report(sizes: bool) -> ScanReport {
         patterns.sort_by_key(|p| std::cmp::Reverse(p.est_keys));
     }
     ScanReport {
+        note: None,
         profile: "prod-cache-01".into(),
         // 2026-11-10 14:02:11 UTC
         taken_at_unix: 1_794_319_331,

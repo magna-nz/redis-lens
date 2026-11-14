@@ -330,6 +330,7 @@ fn start_live(
     scan: ScanId,
     conn: conn::Connection,
     budget: Arc<Budget>,
+    forced_standalone: bool,
     tx: &Tx,
 ) -> bool {
     // Before the live task, so a subscribe that follows `LiveReady` finds the budget.
@@ -345,7 +346,12 @@ fn start_live(
         // Held until the task ends: through SSH the forward stays open only while a
         // `Connection` that uses it is alive, and the scan's is dropped when it ends.
         let route = conn.clone();
-        live::spawn_with_close(
+        let spawn = if forced_standalone {
+            live::spawn_forced_standalone
+        } else {
+            live::spawn_with_close
+        };
+        spawn(
             conn.into_inner(),
             budget,
             move |req_id, result| {
@@ -1422,9 +1428,15 @@ async fn connect_and_scan(
     // preferred). The live task keeps its clone open after the scan ends. On a cluster,
     // the views learn the nodes first, then the live task starts over all of them.
     let started = match &targets {
-        ScanTargets::Single { conn, .. } => {
-            start_live(&live, id, scan_id, conn.clone(), Arc::clone(&budget), &tx)
-        }
+        ScanTargets::Single { conn, .. } => start_live(
+            &live,
+            id,
+            scan_id,
+            conn.clone(),
+            Arc::clone(&budget),
+            profile.force_standalone,
+            &tx,
+        ),
         ScanTargets::Cluster(c) => {
             let nodes = c.nodes.iter().map(node_info).collect();
             send(
@@ -1493,6 +1505,10 @@ async fn connect_and_scan(
             // Each target kind is read its own way above.
             _ => Err(scan::ScanError::Protocol("the targets changed kind".into())),
         }
+        .map(|mut report| {
+            report.note_standalone_read(&profile);
+            report
+        })
         .map_err(|e| clean(e.to_string()))
     })
     .await;
@@ -1771,6 +1787,7 @@ mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            force_standalone: false,
             tags: Vec::new(),
         }
     }
