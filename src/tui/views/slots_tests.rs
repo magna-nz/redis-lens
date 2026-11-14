@@ -151,8 +151,18 @@ fn showing_the_panel_asks_each_node_for_its_own_ranges() {
     for (_, i, ranges) in &got {
         assert_eq!(*ranges, nodes[*i].slots);
     }
-    // Nothing else is sent.
-    assert_eq!(testing::requests(&out).len(), 3);
+    // Nothing else is sent for this panel. (Getting here passes the Big keys panel,
+    // which reads its keys' lengths on their slot owners.)
+    let others: Vec<_> = testing::requests(&out)
+        .into_iter()
+        .filter(|(_, r)| !matches!(r, LiveRequest::Slots(_)))
+        .collect();
+    assert!(
+        others
+            .iter()
+            .all(|(_, r)| matches!(r, LiveRequest::Keys(_))),
+        "{others:?}"
+    );
 }
 
 #[test]

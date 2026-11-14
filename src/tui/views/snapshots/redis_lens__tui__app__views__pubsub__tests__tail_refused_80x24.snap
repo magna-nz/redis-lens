@@ -1,6 +1,5 @@
 ---
 source: src/tui/views/pubsub.rs
-assertion_line: 1032
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "

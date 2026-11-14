@@ -16,6 +16,13 @@
 //!
 //! Every command takes from the session's [`Budget`]; per-key commands are pipelined
 //! [`BATCH`] at a time. `KEYS` is never sent.
+//!
+//! **On a cluster** (spec "Cluster live views (P4)") each step runs on one primary,
+//! with that node's budget, and the caller walks the primaries one at a time in slot
+//! order. A step never follows a redirect: a key that moved to another node during
+//! the run answers `MOVED` (or `ASK`), is left alone and counted ([`Batch::moved`]).
+//! The key file's lines then start with the node's announced address and a tab
+//! ([`KeyFile::append_on`]).
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -27,7 +34,7 @@ use redis::aio::ConnectionLike;
 use super::{LiveConn, LiveError, error_for};
 use crate::analysis::{key_in_pattern, match_glob};
 use crate::budget::Budget;
-use crate::model::{ServerFlavor, ServerInfo, ServerMode};
+use crate::model::{ServerFlavor, ServerInfo};
 use crate::write::{BulkAction, Permit, WriteOp};
 
 /// Keys per batch, and per pipeline.
@@ -42,9 +49,10 @@ pub const DEFAULT_TTL_SECS: u64 = 86_400;
 /// The longest TTL accepted (about 136 years).
 pub const MAX_TTL_SECS: u64 = u32::MAX as u64;
 
-/// Why bulk actions are off on a cluster.
-pub const CLUSTER_OFF: &str = "Not available on a cluster: bulk actions walk one server's \
-     keys, and a cluster spreads its keys over its nodes.";
+/// Why bulk actions are off on a cluster whose shards were read on replicas
+/// (`prefer_replica`): no primary connection is open, and a replica takes no writes.
+pub const CLUSTER_REPLICA_OFF: &str = "Not available on a cluster read on replicas: they take \
+     no writes. Connect without prefer_replica to change keys.";
 /// Why bulk actions are off when the session reads a replica.
 pub const REPLICA_OFF: &str = "Not available on a replica: it takes no writes. Connect to \
      the primary (turn off prefer_replica) to change keys.";
@@ -76,6 +84,10 @@ pub enum Request {
         /// Keys of the pattern found by the previous batch but not sent yet.
         carry: Vec<String>,
         file: FileAt,
+        /// On a cluster, the announced address of the node the batch runs on: each
+        /// line of the key file starts with it and a tab. `None` on a standalone
+        /// server.
+        node: Option<String>,
     },
 }
 
@@ -154,6 +166,9 @@ pub struct Batch {
     /// Some of those errors were `NOPERM`: the server refused the command for this
     /// user (or for those keys).
     pub denied: bool,
+    /// Keys that moved to another node of the cluster since the `SCAN` found them
+    /// (`MOVED` or `ASK`): left alone, since a bulk run follows no redirect.
+    pub moved: u64,
     /// Keys that could not be read (a name that is not UTF-8, or `PTTL` refused).
     pub unreadable: u64,
     /// The key file, once a batch has created it.
@@ -186,6 +201,7 @@ pub async fn run(
             walk,
             carry,
             file,
+            node,
         } => {
             let mut file = match file {
                 FileAt::Path(p) => KeyFile::at(p),
@@ -201,9 +217,17 @@ pub async fn run(
                     KeyFile::new(&dir, &profile, action, now_unix())
                 }
             };
-            batch(conn, budget, &permit, walk, carry, &mut file)
-                .await
-                .map(Reply::Batch)
+            batch_on(
+                conn,
+                budget,
+                &permit,
+                walk,
+                carry,
+                &mut file,
+                node.as_deref(),
+            )
+            .await
+            .map(Reply::Batch)
         }
     }
 }
@@ -296,21 +320,21 @@ async fn walk_keys<C: ConnectionLike + Send>(
 enum Answer {
     Int(i64),
     Denied,
+    /// `MOVED` or `ASK`: the key is on another node now.
+    Moved,
     Error,
 }
 
 fn answer(v: &Value) -> Answer {
     match v {
         Value::Int(n) => Answer::Int(*n),
-        Value::ServerError(e) => {
-            if redis::RedisError::from(e.clone()).kind()
-                == redis::ErrorKind::Server(redis::ServerErrorKind::NoPerm)
-            {
-                Answer::Denied
-            } else {
-                Answer::Error
-            }
-        }
+        Value::ServerError(e) => match redis::RedisError::from(e.clone()).kind() {
+            redis::ErrorKind::Server(redis::ServerErrorKind::NoPerm) => Answer::Denied,
+            redis::ErrorKind::Server(
+                redis::ServerErrorKind::Moved | redis::ServerErrorKind::Ask,
+            ) => Answer::Moved,
+            _ => Answer::Error,
+        },
         _ => Answer::Error,
     }
 }
@@ -372,7 +396,8 @@ pub async fn count<C: ConnectionLike + Send>(
     let (mut matched, mut with_ttl) = (0, 0);
     for a in pttls(conn, budget, &found).await? {
         match a {
-            Answer::Int(-2) => {}
+            // Gone, or moved to another node (that node's own walk may count it).
+            Answer::Int(-2) | Answer::Moved => {}
             Answer::Int(-1) => matched += 1,
             Answer::Int(_) => {
                 matched += 1;
@@ -424,6 +449,20 @@ pub async fn batch<C: ConnectionLike + Send>(
     carry: Vec<String>,
     file: &mut KeyFile,
 ) -> Result<Batch, LiveError> {
+    batch_on(conn, budget, permit, walk, carry, file, None).await
+}
+
+/// [`batch`] on one node of a cluster: the key file's lines start with `node`, the
+/// node's announced address, and a tab.
+pub async fn batch_on<C: ConnectionLike + Send>(
+    conn: &mut C,
+    budget: &Budget,
+    permit: &Permit,
+    walk: Walk,
+    carry: Vec<String>,
+    file: &mut KeyFile,
+    node: Option<&str>,
+) -> Result<Batch, LiveError> {
     let WriteOp::Bulk {
         pattern,
         glob,
@@ -450,6 +489,7 @@ pub async fn batch<C: ConnectionLike + Send>(
         skipped: 0,
         failed: 0,
         denied: false,
+        moved: 0,
         unreadable: 0,
         file: None,
     };
@@ -462,6 +502,7 @@ pub async fn batch<C: ConnectionLike + Send>(
                 match a {
                     Answer::Int(-1) => send.push(k),
                     Answer::Int(_) => out.skipped += 1,
+                    Answer::Moved => out.moved += 1,
                     Answer::Denied | Answer::Error => unreadable += 1,
                 }
             }
@@ -472,7 +513,7 @@ pub async fn batch<C: ConnectionLike + Send>(
     if send.is_empty() {
         return Ok(out);
     }
-    file.append(&send).map_err(|e| {
+    file.append_on(node, &send).map_err(|e| {
         LiveError::Failed(format!(
             "Not sent: the key file {} could not be written ({})",
             file.path().display(),
@@ -489,6 +530,8 @@ pub async fn batch<C: ConnectionLike + Send>(
                 out.failed += 1;
                 out.denied = true;
             }
+            // Moved since the SCAN found it: not followed, left alone.
+            Answer::Moved => out.moved += 1,
             Answer::Error => out.failed += 1,
         }
     }
@@ -542,6 +585,12 @@ impl KeyFile {
     /// first call creates it; a file of that name made meanwhile is never written to:
     /// the name gets `-2`, `-3` … instead.
     pub fn append(&mut self, keys: &[String]) -> std::io::Result<()> {
+        self.append_on(None, keys)
+    }
+
+    /// [`KeyFile::append`] for a batch of one cluster node: each line is the node's
+    /// announced address, a tab, then the escaped name ([`key_line`]).
+    pub fn append_on(&mut self, node: Option<&str>, keys: &[String]) -> std::io::Result<()> {
         let mut f = if self.created {
             std::fs::OpenOptions::new().append(true).open(&self.path)?
         } else {
@@ -551,7 +600,7 @@ impl KeyFile {
         };
         let mut text = String::new();
         for k in keys {
-            text.push_str(&escape_name(k));
+            text.push_str(&key_line(node, k));
             text.push('\n');
         }
         f.write_all(text.as_bytes())?;
@@ -640,6 +689,23 @@ pub fn escape_name(name: &str) -> String {
         }
     }
     out
+}
+
+/// One line of the key file, without its newline: the escaped name, after the node's
+/// announced address and a tab on a cluster. A tab in a name is escaped, so the line
+/// splits at its first tab ([`split_key_line`]).
+pub fn key_line(node: Option<&str>, name: &str) -> String {
+    match node {
+        Some(n) => format!("{}\t{}", escape_name(n), escape_name(name)),
+        None => escape_name(name),
+    }
+}
+
+/// A cluster key file line split into the node's address and the key name. `None`
+/// when the line is not one.
+pub fn split_key_line(line: &str) -> Option<(String, String)> {
+    let (node, name) = line.split_once('\t')?;
+    Some((unescape_name(node)?, unescape_name(name)?))
 }
 
 /// The name an [`escape_name`] line stands for. `None` when the line is not one.
@@ -738,7 +804,7 @@ pub fn ttl_text(secs: u64) -> String {
 }
 
 /// `7.4.2` → (7, 4); `8` → (8, 0).
-fn major_minor(version: &str) -> Option<(u64, u64)> {
+pub(crate) fn major_minor(version: &str) -> Option<(u64, u64)> {
     let mut nums = version
         .split(|c: char| !c.is_ascii_digit())
         .filter(|s| !s.is_empty())
@@ -766,14 +832,20 @@ pub fn expire_off(server: &ServerInfo) -> Option<String> {
     })
 }
 
-/// Why bulk actions are off on `server` whatever the action: a cluster.
-pub fn server_off(server: &ServerInfo) -> Option<&'static str> {
-    (server.mode == ServerMode::Cluster).then_some(CLUSTER_OFF)
+/// The `MOVED` text of a bulk run: keys that moved during it were left alone.
+pub fn moved_text(n: u64) -> String {
+    format!(
+        "{} {} moved to another node during the run and {} left alone",
+        crate::format::grouped(n),
+        if n == 1 { "key" } else { "keys" },
+        if n == 1 { "was" } else { "were" }
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ServerMode;
     use proptest::prelude::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -969,10 +1041,183 @@ mod tests {
                 "{v}"
             );
         }
+    }
+
+    // -- clusters (P4) -------------------------------------------------------------
+
+    #[test]
+    fn cluster_key_file_lines_start_with_the_node_and_a_tab() {
+        assert_eq!(key_line(None, "a\tb"), "a\\tb");
         assert_eq!(
-            server_off(&server(ServerFlavor::Redis, "7.4.2", ServerMode::Cluster)),
-            Some(CLUSTER_OFF)
+            key_line(Some("10.0.1.11:6379"), "user:1\tx\n"),
+            "10.0.1.11:6379\tuser:1\\tx\\n"
         );
-        assert_eq!(server_off(&s62), None);
+        // A tab in the name is escaped: the line splits at its first tab.
+        let line = key_line(Some("10.0.1.11:6379"), "a\tb");
+        assert_eq!(line.matches('\t').count(), 1);
+        assert_eq!(
+            split_key_line(&line),
+            Some(("10.0.1.11:6379".into(), "a\tb".into()))
+        );
+        assert_eq!(split_key_line("no tab"), None);
+        let dir = temp_dir("cluster");
+        let mut f = KeyFile::new(&dir, "p", &BulkAction::Delete, 0);
+        f.append_on(Some("[::1]:7001"), &["k1".into(), "k\n2".into()])
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(f.path()).unwrap(),
+            "[::1]:7001\tk1\n[::1]:7001\tk\\n2\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_moved_or_ask_reply_is_a_moved_key() {
+        let error =
+            |line: &str| redis::parse_redis_value(format!("-{line}\r\n").as_bytes()).unwrap();
+        assert_eq!(answer(&error("MOVED 5061 10.0.0.1:7001")), Answer::Moved);
+        assert_eq!(answer(&error("ASK 5061 10.0.0.1:7001")), Answer::Moved);
+        assert_eq!(
+            moved_text(12),
+            "12 keys moved to another node during the run and were left alone"
+        );
+        assert_eq!(
+            moved_text(1),
+            "1 key moved to another node during the run and was left alone"
+        );
+    }
+
+    /// A fake node: answers `SCAN` with `keys` once, `PTTL` with -1, and `MOVED` to
+    /// `UNLINK`/`EXPIRE` of the keys in `moved`; logs every command.
+    #[derive(Clone)]
+    struct Node {
+        keys: Vec<&'static str>,
+        moved: Vec<&'static str>,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Node {
+        fn answer(&self, cmd: &redis::Cmd) -> Value {
+            let words: Vec<String> = cmd
+                .args_iter()
+                .map(|a| match a {
+                    redis::Arg::Simple(b) => String::from_utf8_lossy(b).into_owned(),
+                    _ => String::new(),
+                })
+                .collect();
+            self.log.lock().unwrap().push(words.join(" "));
+            let key = words.get(1).cloned().unwrap_or_default();
+            match words[0].as_str() {
+                "SCAN" => Value::Array(vec![
+                    Value::BulkString(b"0".to_vec()),
+                    Value::Array(
+                        self.keys
+                            .iter()
+                            .map(|k| Value::BulkString(k.as_bytes().to_vec()))
+                            .collect(),
+                    ),
+                ]),
+                "PTTL" => Value::Int(-1),
+                _ if self.moved.contains(&key.as_str()) => {
+                    redis::parse_redis_value(b"-MOVED 1 10.0.0.1:7001\r\n").unwrap()
+                }
+                _ => Value::Int(1),
+            }
+        }
+    }
+
+    impl ConnectionLike for Node {
+        fn req_packed_command<'a>(
+            &'a mut self,
+            cmd: &'a redis::Cmd,
+        ) -> redis::RedisFuture<'a, Value> {
+            let v = self.answer(cmd);
+            Box::pin(async move { Ok(v) })
+        }
+
+        fn req_packed_commands<'a>(
+            &'a mut self,
+            pipe: &'a redis::Pipeline,
+            offset: usize,
+            count: usize,
+        ) -> redis::RedisFuture<'a, Vec<Value>> {
+            let all: Vec<Value> = pipe.cmd_iter().map(|c| self.answer(c)).collect();
+            Box::pin(async move { Ok(all.into_iter().skip(offset).take(count).collect()) })
+        }
+
+        fn get_db(&self) -> i64 {
+            0
+        }
+    }
+
+    fn permit(action: BulkAction) -> Permit {
+        let profile = crate::model::Profile {
+            name: "p".into(),
+            env: crate::model::Env::Stage,
+            endpoint: crate::model::Endpoint {
+                host: "127.0.0.1".into(),
+                port: 6379,
+                tls: false,
+            },
+            db: 0,
+            auth: crate::model::Auth::None,
+            read_only: Some(false),
+            prefer_replica: false,
+            provider: None,
+            token_command: None,
+            ssh: None,
+            sentinel: None,
+            tags: Vec::new(),
+        };
+        let op = WriteOp::Bulk {
+            pattern: "user:{id}".into(),
+            glob: match_glob("user:{id}"),
+            action,
+        };
+        Permit::grant(
+            op,
+            &profile,
+            &crate::write::Settings::default(),
+            &crate::write::Refusals::default(),
+            &crate::write::Answer::Yes,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn keys_that_moved_during_a_run_are_left_alone_and_counted() {
+        let log = std::sync::Arc::default();
+        let mut node = Node {
+            keys: vec!["user:1", "user:2", "user:3"],
+            moved: vec!["user:2"],
+            log: std::sync::Arc::clone(&log),
+        };
+        let dir = temp_dir("moved");
+        for action in [BulkAction::Delete, BulkAction::Expire { seconds: 60 }] {
+            let mut f = KeyFile::new(&dir, "p", &action, 0);
+            let b = batch_on(
+                &mut node,
+                &Budget::new(None),
+                &permit(action),
+                Walk::Start,
+                Vec::new(),
+                &mut f,
+                Some("10.0.0.1:7000"),
+            )
+            .await
+            .unwrap();
+            assert_eq!((b.sent, b.changed, b.moved, b.failed), (3, 2, 1, 0));
+            assert!(b.finished());
+            let text = std::fs::read_to_string(f.path()).unwrap();
+            assert!(
+                text.lines().all(|l| l.starts_with("10.0.0.1:7000\t")),
+                "{text}"
+            );
+        }
+        // Nothing is sent again elsewhere: one write per key, no ASKING.
+        let sent = log.lock().unwrap().clone();
+        assert!(!sent.iter().any(|c| c.starts_with("ASKING")), "{sent:?}");
+        assert_eq!(sent.iter().filter(|c| c.starts_with("UNLINK")).count(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1664,7 +1664,22 @@ impl App {
                 })
             }
             TailCmd::Subscribe { tail, to } => {
-                let node = s.picked;
+                // A shard channel is subscribed on its slot's owner; the classic tail runs
+                // on the picked node (a message published anywhere reaches every node).
+                let node = match &to {
+                    crate::live::pubsub::Subscription::Shard(ch) if s.is_cluster() => {
+                        match s.owner_of(ch.as_bytes()) {
+                            Some(i) => i,
+                            None => {
+                                self.views
+                                    .pubsub
+                                    .tail_closed(tail, Some(crate::live::nodes::NO_OWNER.into()));
+                                return None;
+                            }
+                        }
+                    }
+                    _ => s.picked,
+                };
                 let profile = s.profile.clone();
                 let Some(secrets) = self.entry(id).map(secret_source) else {
                     self.views
@@ -2500,8 +2515,20 @@ impl App {
 
     /// `enter` on a pattern: the key list of `pattern`, one level down.
     fn open_keys(&mut self, pattern: String) -> Vec<Effect> {
+        // On a cluster narrowed to a node, the key list walks that node only (the node of
+        // the session's table with the same ID, or the same address).
+        let narrowed = self.narrowed_node().and_then(|(_, n)| {
+            self.session
+                .as_ref()?
+                .nodes
+                .iter()
+                .position(|i| (!n.id.is_empty() && i.id == n.id) || i.endpoint == n.endpoint)
+        });
         let mut out = self
-            .with_views(Owner::Keys, "open", |v, act| v.keys.open(pattern, act))
+            .with_views(Owner::Keys, "open", |v, act| {
+                let nodes = act.session.nodes.clone();
+                v.keys.open(pattern, &nodes, narrowed, act)
+            })
             .map_or_else(Vec::new, |(_, e)| e);
         out.extend(self.switch(Screen::KeyList));
         out

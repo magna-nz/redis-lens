@@ -132,6 +132,14 @@ fn entry_rows(e: &Entry, w: usize, tick: u64) -> Vec<Line<'static>> {
         Body::Note(why) => plain(&mut out, why, style::amber()),
         Body::Failed(why) => plain(&mut out, &format!("(error) {why}"), style::warn()),
         Body::Out(o) => {
+            // On a cluster: the node it ran on, then why it went there if that needs
+            // saying (spec "Cluster live views (P4)", Command line).
+            if let Some(node) = &e.node {
+                plain(&mut out, &format!("{node}>"), style::dim());
+            }
+            if let Some(why) = e.route_note {
+                plain(&mut out, why, style::amber());
+            }
             let s = if o.error { style::warn() } else { style::fg() };
             for l in o.lines() {
                 plain(&mut out, l, s);

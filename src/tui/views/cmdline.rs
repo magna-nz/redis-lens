@@ -31,7 +31,7 @@ use crate::live::cmdline::{self, Args, CommandInfo, Docs, Gate, Output, Reply, R
 use crate::live::command::{self, MASK, Secret};
 use crate::live::keys::KeyRow;
 use crate::live::{CANCELLED, LiveError, LiveReply, LiveRequest, ReqId};
-use crate::model::{Env, ServerMode};
+use crate::model::Env;
 use crate::tui::app::{App, Effect};
 use crate::value;
 use crate::write::{Decision, WriteOp};
@@ -49,9 +49,6 @@ pub const SCROLL_STEP: usize = 5;
 
 /// Why the helper is off on a server without `COMMAND DOCS`.
 pub const HELPER_OLD: &str = "The helper is off: this server has no COMMAND DOCS (Redis 7.0 and later, and Valkey, have it).";
-/// Why the command line is off on a cluster.
-pub const CLUSTER_OFF: &str = "The command line is not available on a cluster yet: it talks to \
-     one server, and a cluster spreads its keys over its nodes.";
 
 /// One argument of the input line: where it is in the text, and what it says.
 #[derive(Clone, PartialEq, Eq)]
@@ -209,6 +206,11 @@ pub(crate) struct Entry {
     /// The command as [`command::masked_line`] writes it; `None` for a note alone.
     pub line: Option<String>,
     pub body: Body,
+    /// On a cluster, the address of the node the command was sent to: its reply is
+    /// headed `<address>>` (spec "Cluster live views (P4)", Command line).
+    pub node: Option<String>,
+    /// Why it went where it went, when that needs saying ([`super::KEYS_UNFOUND`]).
+    pub route_note: Option<&'static str>,
 }
 
 impl Entry {
@@ -368,7 +370,13 @@ impl CmdlineState {
     fn push_entry(&mut self, line: Option<String>, body: Body) -> u64 {
         let id = self.next_entry;
         self.next_entry += 1;
-        self.entries.push(Entry { id, line, body });
+        self.entries.push(Entry {
+            id,
+            line,
+            body,
+            node: None,
+            route_note: None,
+        });
         self.scroll.set(0);
         self.trim();
         id
@@ -400,6 +408,34 @@ impl CmdlineState {
 
     fn note(&mut self, text: impl Into<String>) {
         self.push_entry(None, Body::Note(text.into()));
+    }
+
+    /// Where `args` goes on a cluster ([`super::command_to`]), written on `entry` so
+    /// its reply is headed by the node. `None`, with the refusal on `entry`, when its
+    /// keys are in different slots.
+    fn route(
+        &mut self,
+        args: &Args,
+        info: &CommandInfo,
+        entry: u64,
+        act: &Act<'_>,
+    ) -> Option<crate::live::Dest> {
+        let to = match super::command_to(act.session, args.as_slice(), info) {
+            Ok(to) => to,
+            Err(why) => {
+                self.set_body(entry, Body::Note(why));
+                return None;
+            }
+        };
+        let node = to
+            .node
+            .and_then(|i| act.session.nodes.get(i))
+            .map(|n| value::escape(&n.endpoint.to_string()));
+        if let Some(e) = self.entries.iter_mut().find(|e| e.id == entry) {
+            e.node = node;
+            e.route_note = to.note;
+        }
+        Some(to.dest)
     }
 
     /// Sends one of the panel's own requests.
@@ -742,7 +778,16 @@ impl CmdlineState {
                 let Some(info) = info else {
                     return;
                 };
+                // On a cluster: keys in one slot, on a node that takes writes; the
+                // write gate routes it the same way (`write_dest`).
+                if self.route(&args, &info, entry, act).is_none() {
+                    return;
+                }
                 let op = WriteOp::Command { args, info };
+                if let Err(why) = super::write_dest(act.session, &op) {
+                    self.set_body(entry, Body::Note(why));
+                    return;
+                }
                 // The read-only reason, or a command the server refused, in the panel.
                 if let Decision::Refuse(why) = act.write_decision(&op) {
                     self.set_body(entry, Body::Note(why));
@@ -773,6 +818,10 @@ impl CmdlineState {
                 let Some(info) = info else {
                     return;
                 };
+                // Keys in different slots: refused before asking.
+                if self.route(&args, &info, entry, act).is_none() {
+                    return;
+                }
                 let p = act.profile();
                 let cmd = args
                     .as_slice()
@@ -802,12 +851,19 @@ impl CmdlineState {
         entry: u64,
         act: &mut Act<'_>,
     ) {
+        let Some(dest) = self.route(&args, &info, entry, act) else {
+            return;
+        };
         let req = Request::Run {
             args,
             info,
             confirmed,
         };
-        match self.ask(req, Asked::Run, act) {
+        let sent = act.send_to(dest, LiveRequest::Command(req));
+        if let Some(id) = sent {
+            self.asked.insert(id, Asked::Run);
+        }
+        match sent {
             Some(id) => {
                 self.pending = Some(Pending::Run { id, entry });
                 self.set_body(entry, Body::Waiting);
@@ -1150,12 +1206,6 @@ impl App {
                     .into(),
             );
         };
-        if s.server
-            .as_ref()
-            .is_some_and(|i| i.mode == ServerMode::Cluster)
-        {
-            return Some(CLUSTER_OFF.into());
-        }
         match &s.live {
             LiveState::Ready => None,
             LiveState::Waiting => Some(
@@ -1307,6 +1357,8 @@ mod tests {
             flags: flags.iter().map(|s| (*s).into()).collect(),
             categories: cats.iter().map(|s| (*s).into()).collect(),
             subcommands: Vec::new(),
+            keys: Vec::new(),
+            keys_partial: false,
         }
     }
 
@@ -1389,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn off_before_the_live_connection_is_ready_and_on_a_cluster() {
+    fn off_before_the_live_connection_is_ready() {
         let mut app = App::new(crate::tui::fixtures::profiles());
         app.handle_key(ch(':'));
         assert!(!app.views.cmdline.open);
@@ -1398,11 +1450,6 @@ mod tests {
         app.handle_key(ch(':'));
         assert!(!app.views.cmdline.open);
         assert!(notice(&app).contains("once the live connection is ready"));
-        testing::live_ready(&mut app);
-        app.session.as_mut().unwrap().server.as_mut().unwrap().mode = ServerMode::Cluster;
-        app.handle_key(ch(':'));
-        assert!(!app.views.cmdline.open);
-        assert_eq!(notice(&app), CLUSTER_OFF);
     }
 
     #[test]

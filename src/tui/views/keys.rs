@@ -13,7 +13,7 @@
 //! overwrites one. Once added, `App` lists it and opens its detail ([`KeysState::opened`]).
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -22,7 +22,7 @@ use super::value::{Form, FormKey};
 use super::{Act, Ctx, Input, ViewState};
 use crate::live::keys::{KeyRow, Page, Reply, Request};
 use crate::live::write::Reply as WriteReply;
-use crate::live::{CANCELLED, LiveError, LiveReply, LiveRequest, ReqId};
+use crate::live::{CANCELLED, Dest, Follow, LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::{KeyType, PERM_FREQ, PERM_MEMORY, PermStatus, Ttl};
 use crate::tui::app::Screen;
 use crate::tui::clipboard::CopyText;
@@ -220,21 +220,70 @@ pub struct KeysState {
     writing: Option<(ReqId, KeyRow)>,
     /// A key `N` added, for `App` to list and open (`key_edits.rs`).
     pub opened: Option<KeyRow>,
+    /// On a cluster, the nodes the walk reads, one at a time, in slot order (indices
+    /// into the session's nodes): every connected node, or the one Patterns is narrowed
+    /// to (spec "Cluster live views (P4)", Key list). Empty on a standalone server.
+    pub walk: Vec<usize>,
+    /// The nodes of the cluster left out of the walk: discovery has no connection.
+    pub missing: Vec<usize>,
+    /// Where the walk is in [`KeysState::walk`]: the node whose `SCAN` goes on.
+    at: usize,
+    /// Nodes walked to the end.
+    pub nodes_done: usize,
+    /// Keys loaded since the page was asked for (`n` or the first): a node that ends
+    /// before a page is full goes on to the next node.
+    page_rows: usize,
+    /// The node each loaded key came from, by key (cluster only).
+    pub row_node: HashMap<String, usize>,
+    /// The node the page in flight reads.
+    loading_node: Option<usize>,
 }
 
 impl KeysState {
     /// `enter` on a pattern on Patterns: list `pattern`'s keys. `App` calls this, then
     /// [`ViewState::on_show`]. It runs every time, also for the pattern already open:
     /// that one keeps its loaded keys, filter and sort; another starts afresh.
-    pub fn open(&mut self, pattern: String, act: &mut Act<'_>) {
-        if self.pattern.as_deref() == Some(pattern.as_str()) {
+    ///
+    /// `nodes` is the cluster's node table as `App` has it (empty on a standalone
+    /// server) and `narrowed` the node Patterns is narrowed to, if any: the walk reads
+    /// that node only, or every connected node in slot order. A pattern opened again on
+    /// another set of nodes starts afresh.
+    pub fn open(
+        &mut self,
+        pattern: String,
+        nodes: &[crate::live::nodes::NodeInfo],
+        narrowed: Option<usize>,
+        act: &mut Act<'_>,
+    ) {
+        let all: Vec<usize> = match narrowed {
+            Some(i) if i < nodes.len() => vec![i],
+            _ => (0..nodes.len()).collect(),
+        };
+        let (walk, missing): (Vec<usize>, Vec<usize>) =
+            all.into_iter().partition(|&i| nodes[i].connected);
+        if self.pattern.as_deref() == Some(pattern.as_str())
+            && self.walk == walk
+            && self.missing == missing
+        {
             return;
         }
         *self = Self {
             pattern: Some(pattern),
             sel_since: act.tick,
+            walk,
+            missing,
             ..Self::default()
         };
+    }
+
+    /// True on a cluster: the walk goes node by node.
+    pub fn by_node(&self) -> bool {
+        !self.walk.is_empty() || !self.missing.is_empty()
+    }
+
+    /// The node the walk reads now, on a cluster.
+    pub fn current_node(&self) -> Option<usize> {
+        self.walk.get(self.at).copied()
     }
 
     /// Indices into [`KeysState::rows`] after the filter, in the sort order.
@@ -313,9 +362,21 @@ impl KeysState {
             sizes: self.sizes,
             freq: self.freq,
         });
-        match act.send(req) {
+        let node = self.current_node();
+        if self.by_node() && node.is_none() {
+            // Every node of the walk is done, or none is connected.
+            return false;
+        }
+        // On a cluster the `SCAN` and the metadata pipeline run on one node, and a
+        // redirect is never followed: the cursor belongs to that node.
+        let sent = match node {
+            Some(i) => act.send_to(Dest::node(i).follow(Follow::Never), req),
+            None => act.send(req),
+        };
+        match sent {
             Some(id) => {
                 self.loading = Some(id);
+                self.loading_node = node;
                 self.error = None;
                 true
             }
@@ -331,21 +392,50 @@ impl KeysState {
         }
         let first = self.pages == 0 && !self.done && self.error.is_none();
         if first && self.loading.is_none() && act.live_ready() {
+            if self.by_node() && self.walk.is_empty() {
+                // No node of the cluster is connected: nothing to walk.
+                self.done = true;
+                return;
+            }
+            self.page_rows = 0;
             self.load(act);
         }
     }
 
-    fn take_page(&mut self, page: Page, tick: u64) {
+    /// A page came. True when the node it read was walked to the end and the walk goes
+    /// on with the next node now, the page not being full yet.
+    fn take_page(&mut self, page: Page, tick: u64) -> bool {
         let keep = self.selected().map(|r| r.key.clone());
+        let node = self.loading_node.take();
         for row in page.rows {
             if self.seen.insert(row.key.clone()) {
+                if let Some(n) = node {
+                    self.row_node.insert(row.key.clone(), n);
+                }
                 self.rows.push(row);
+                self.page_rows += 1;
             }
         }
         self.pages += 1;
         self.cursor = page.cursor;
         self.carry = page.carry;
-        self.done = self.cursor == 0 && self.carry.is_empty();
+        let node_done = self.cursor == 0 && self.carry.is_empty();
+        let mut next = false;
+        if !self.by_node() {
+            self.done = node_done;
+        } else if node_done {
+            self.nodes_done = (self.at + 1).min(self.walk.len());
+            if self.at + 1 < self.walk.len() {
+                // The next node, from the start of its own keyspace.
+                self.at += 1;
+                self.done = false;
+                next = self.page_rows < crate::live::keys::PAGE_KEYS;
+            } else {
+                self.done = true;
+            }
+        } else {
+            self.done = false;
+        }
         self.other_pattern += page.other_pattern;
         self.unreadable += page.unreadable;
         for e in page.refused {
@@ -354,6 +444,7 @@ impl KeysState {
             }
         }
         self.reselect(keep, tick);
+        next
     }
 
     /// Drops `key`, deleted on the key detail.
@@ -361,6 +452,7 @@ impl KeysState {
         let keep = self.selected().map(|r| r.key.clone());
         self.rows.retain(|r| r.key != key);
         self.seen.remove(key);
+        self.row_node.remove(key);
         let tick = self.sel_since;
         self.reselect(keep, tick);
     }
@@ -372,6 +464,10 @@ impl KeysState {
         }
         if self.seen.remove(old) {
             self.seen.insert(new.to_string());
+        }
+        // `RENAMENX` keeps the key on its node: both names share a slot.
+        if let Some(n) = self.row_node.remove(old) {
+            self.row_node.insert(new.to_string(), n);
         }
     }
 
@@ -478,6 +574,10 @@ impl KeysState {
             )),
             Ok(LiveReply::Write(_)) => {
                 act.info(format!("Added {name}."));
+                // On a cluster it went to its slot's owner.
+                if let Some(n) = act.session.owner_of(row.key.as_bytes()) {
+                    self.row_node.insert(row.key.clone(), n);
+                }
                 self.opened = Some(row);
             }
             Ok(_) => {}
@@ -612,8 +712,11 @@ impl ViewState for KeysState {
                         "All {} matching keys are loaded.",
                         crate::format::grouped(self.rows.len() as u64)
                     ));
-                } else if !self.load(act) {
-                    act.info("The live connection is not open, so no more keys can be loaded.");
+                } else {
+                    self.page_rows = 0;
+                    if !self.load(act) {
+                        act.info("The live connection is not open, so no more keys can be loaded.");
+                    }
                 }
                 true
             }
@@ -645,9 +748,16 @@ impl ViewState for KeysState {
         }
         self.loading = None;
         match result {
-            Ok(LiveReply::Keys(Reply::Page(page))) => self.take_page(page, act.tick),
+            Ok(LiveReply::Keys(Reply::Page(page))) => {
+                if self.take_page(page, act.tick) {
+                    self.load(act);
+                }
+            }
             Ok(_) => {}
-            Err(e) => self.error = Some(load_error(&e)),
+            Err(e) => {
+                self.loading_node = None;
+                self.error = Some(load_error(&e));
+            }
         }
     }
 

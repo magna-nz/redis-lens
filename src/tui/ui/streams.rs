@@ -131,17 +131,26 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &StreamsState, ctx: &Ctx<'_>) 
     let inner = panel(frame, main, TITLE, &right);
     let w = usize::from(inner.width);
     let wide = w >= WIDE;
-    let kw = key_width(w, wide);
+    // On a cluster, a NODE column after the key: each stream's slot owner.
+    let by_node = ctx.session.is_cluster();
+    let node_w = if by_node { super::keys::NODE_W } else { 0 };
+    let kw = key_width(w.saturating_sub(node_w), wide);
 
-    let mut head = vec![
-        Span::styled(pad_r(" KEY", kw), style::hd()),
+    let mut head = vec![Span::styled(pad_r(" KEY", kw), style::hd())];
+    if by_node {
+        head.push(Span::styled(
+            format!(" {}", pad_r("NODE", node_w - 1)),
+            style::hd(),
+        ));
+    }
+    head.extend([
         Span::styled(format!(" {}", pad_l("LEN", LEN_W)), style::hd()),
         Span::styled(format!(" {}", pad_l("SIZE", SIZE_W)), style::hd()),
         Span::styled(format!(" {}", pad_l("OLDEST", AGE_W)), style::hd()),
         Span::styled(format!(" {}", pad_l("GRP", GROUPS_W)), style::hd()),
         Span::styled(format!(" {}", pad_l("LAG", LAG_W)), style::hd()),
         Span::styled(format!(" {}", pad_l("PEND", PEND_W)), style::hd()),
-    ];
+    ]);
     if wide {
         head.push(Span::styled(
             format!(" {}", pad_r("LAST ID", ID_W)),
@@ -167,7 +176,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &StreamsState, ctx: &Ctx<'_>) 
         .iter()
         .skip(off)
         .take(usize::from(body.height))
-        .map(|r| list_row(r, kw, wide))
+        .map(|r| {
+            let node = by_node
+                .then(|| super::keys::node_name(ctx, ctx.session.owner_of(r.key.as_bytes())));
+            list_row(r, kw, node, wide)
+        })
         .collect();
     rows(frame, body, lines, Some(sel - off));
     if let Some(e) = &state.error {
@@ -227,12 +240,19 @@ fn total_pending(info: &StreamInfo) -> Option<u64> {
         .map(|gs| gs.iter().map(|g| g.pending).sum())
 }
 
-fn list_row(r: &StreamRow, kw: usize, wide: bool) -> Line<'static> {
+fn list_row(r: &StreamRow, kw: usize, node: Option<String>, wide: bool) -> Line<'static> {
     let dash = || "—".to_string();
     let mut spans = fit(
         vec![Span::styled(format!(" {}", escape(&r.key)), style::fg())],
         kw,
     );
+    if let Some(node) = node {
+        let w = super::keys::NODE_W - 1;
+        spans.push(Span::styled(
+            format!(" {}", pad_r(&trunc(&node, w), w)),
+            style::dim(),
+        ));
+    }
     let Some(i) = &r.info else {
         spans.push(Span::styled(" gone since the scan", style::dim()));
         return Line::from(spans);

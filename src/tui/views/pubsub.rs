@@ -11,7 +11,12 @@
 //!   filter or stops the tail.
 //! - **Publish (P3):** `P` opens a form for a channel (the selected one to start with)
 //!   and a message, and sends `PUBLISH` through [`Act::write`], the one gate. The
-//!   message is a value: it is drawn in the form and nowhere else.
+//!   message is a value: it is drawn in the form and nowhere else. On a shard channel
+//!   it sends `SPUBLISH`, to the channel's slot owner.
+//! - **Shard channels (P4):** a second list under the classic one, from every node of a
+//!   cluster (one on a standalone server) on each counts poll (Redis 7.0 and later,
+//!   Valkey). `S` subscribes to the selected one, or asks for one, with `SSUBSCRIBE` on
+//!   its slot's owner. On a cluster the classic counts are the picked node's own.
 //!
 //! See [`super`] for the interface `App` calls.
 
@@ -25,11 +30,20 @@ use crossterm::event::{KeyCode, KeyEvent};
 use super::streams::form::{self, Field, Form, Step, write_failed, write_off};
 use super::streams::{list_move, off_text, plain};
 use super::{Act, Input, ViewState};
-use crate::live::pubsub::{Counts, Reply, Request, Subscription, TAIL_KEPT, TailMessage};
+use crate::live::pubsub::{
+    Counts, Reply, Request, ShardCounts, Subscription, TAIL_KEPT, TailMessage,
+};
 use crate::live::write::Reply as WriteReply;
-use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
+use crate::live::{Dest, Follow, LiveError, LiveReply, LiveRequest, ReqId};
 use crate::value::Raw;
 use crate::write::WriteOp;
+
+/// Why the shard channels are left out when the server lacks `PUBSUB SHARDCHANNELS`.
+pub const SHARDS_UNSUPPORTED: &str =
+    "The server does not support PUBSUB SHARDCHANNELS, so shard channels are left out.";
+/// Why they are left out when the server refused it for this user.
+pub const SHARDS_DENIED: &str =
+    "The server refused PUBSUB SHARDCHANNELS for this user, so shard channels are left out.";
 
 /// How often the counts are polled while the view is shown (spec "Shared command budget").
 pub const POLL: Duration = Duration::from_secs(5);
@@ -38,6 +52,10 @@ pub const RATE_WINDOW: Duration = Duration::from_secs(5);
 pub use crate::live::pubsub::{PAYLOAD_KEPT, PREVIEW_CHARS};
 /// The longest text the `s` and `/` inputs take.
 const MAX_INPUT: usize = 256;
+/// The `S` prompt's hint once it was given a pattern
+/// ([`crate::live::pubsub::SHARD_PATTERN`]), until the next key.
+const SHARD_PATTERN_HINT: &str =
+    "   a pattern can't be shard-subscribed: type a channel name · esc to cancel";
 
 /// The channels with their subscriber counts, and the live tail.
 #[derive(Debug, Default)]
@@ -56,21 +74,58 @@ pub struct PubSubState {
     pending: Option<ReqId>,
     last_sent: Option<Instant>,
     editing: Option<Editing>,
+    /// The `S` prompt was given a pattern: its hint says why until the next key.
+    shard_refused: bool,
     /// The publish form (`P`), while it is open.
     pub publish: Option<Form>,
-    /// The `PUBLISH` in flight.
-    write: Option<ReqId>,
+    /// The form publishes to a shard channel (`SPUBLISH`).
+    pub publish_shard: bool,
+    /// The `PUBLISH` or `SPUBLISH` in flight, and the shard channel's node.
+    write: Option<(ReqId, Option<usize>)>,
+    /// The shard channels of every node, most subscribers first (P4).
+    pub shards: Vec<ShardRow>,
+    /// How many shard channels the nodes have, over all of them.
+    pub shards_total: usize,
+    /// Why the shard channels are left out (an old server, or refused).
+    pub shards_off: Option<String>,
+    /// Why a shard count is missing, in redis-lens's own words.
+    pub shards_notes: Vec<String>,
+    /// The shard channels have been read once.
+    pub shards_loaded: bool,
+    /// The shard poll in flight: one request per node.
+    shard_pending: Vec<(ReqId, usize)>,
+    shard_gather: Vec<ShardRow>,
+    shard_notes: Vec<String>,
+    shard_total_acc: usize,
 }
 
-/// The `PUBLISH` of the publish form.
-pub fn publish_op(form: &Form) -> Result<WriteOp, String> {
+/// One shard channel, on the node that answered for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardRow {
+    pub name: String,
+    pub subscribers: Option<u64>,
+    /// The node's index in the session's nodes (0 on a standalone server).
+    pub node: usize,
+}
+
+/// The selected row of the view: a classic channel or a shard channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selected<'a> {
+    Channel(&'a crate::live::pubsub::Channel),
+    Shard(&'a ShardRow),
+}
+
+/// The `PUBLISH` of the publish form, or `SPUBLISH` for a shard channel.
+pub fn publish_op(form: &Form, shard: bool) -> Result<WriteOp, String> {
     let channel = form.value("channel");
     if channel.is_empty() {
         return Err("Type the channel to publish to.".into());
     }
-    Ok(WriteOp::Publish {
-        channel: channel.to_string(),
-        message: Raw::from(form.raw("message")),
+    let (channel, message) = (channel.to_string(), Raw::from(form.raw("message")));
+    Ok(if shard {
+        WriteOp::SPublish { channel, message }
+    } else {
+        WriteOp::Publish { channel, message }
     })
 }
 
@@ -79,6 +134,8 @@ pub fn publish_op(form: &Form) -> Result<WriteOp, String> {
 enum Editing {
     /// `s`: the channel or pattern to subscribe to.
     Subscribe(String),
+    /// `S`: the shard channel to subscribe to.
+    ShardSubscribe(String),
     /// `/`: edits [`Tail::filter`] in place.
     Filter,
 }
@@ -242,34 +299,99 @@ impl PubSubState {
     pub fn form_sends(&self) -> Option<Result<String, String>> {
         self.publish
             .as_ref()
-            .map(|f| publish_op(f).map(|op| op.shown()))
+            .map(|f| publish_op(f, self.publish_shard).map(|op| op.shown()))
     }
 
-    /// `P`: opens the publish form, on the selected channel.
+    /// The rows of the list: the classic channels, then the shard channels.
+    pub fn rows_len(&self) -> usize {
+        self.counts.channels.len() + self.shards.len()
+    }
+
+    /// The selected row, if any.
+    pub fn selected(&self) -> Option<Selected<'_>> {
+        let n = self.counts.channels.len();
+        match self.counts.channels.get(self.sel) {
+            Some(c) => Some(Selected::Channel(c)),
+            None => self
+                .shards
+                .get(self.sel.checked_sub(n)?)
+                .map(Selected::Shard),
+        }
+    }
+
+    /// The selected row as (shard, name, node), to find it again after a poll.
+    fn selected_key(&self) -> Option<(bool, String, usize)> {
+        match self.selected()? {
+            Selected::Channel(c) => Some((false, c.name.clone(), 0)),
+            Selected::Shard(r) => Some((true, r.name.clone(), r.node)),
+        }
+    }
+
+    /// Selects `key`'s row again, else keeps the position in range.
+    fn reselect(&mut self, key: Option<(bool, String, usize)>) {
+        let n = self.counts.channels.len();
+        let at = key.and_then(|(shard, name, node)| {
+            if shard {
+                self.shards
+                    .iter()
+                    .position(|r| r.name == name && r.node == node)
+                    .map(|i| n + i)
+            } else {
+                self.counts.channels.iter().position(|c| c.name == name)
+            }
+        });
+        self.sel = at
+            .unwrap_or(self.sel)
+            .min(self.rows_len().saturating_sub(1));
+    }
+
+    /// `P`: opens the publish form, on the selected channel: `SPUBLISH` on a shard
+    /// channel, `PUBLISH` otherwise.
     fn open_publish(&mut self, act: &mut Act<'_>) {
-        let channel = self
-            .counts
-            .channels
-            .get(self.sel)
-            .map(|c| c.name.clone())
-            .unwrap_or_default();
-        let sample = WriteOp::Publish {
-            channel: "c".into(),
-            message: Raw::from(""),
+        let (channel, shard) = match self.selected() {
+            Some(Selected::Channel(c)) => (c.name.clone(), false),
+            Some(Selected::Shard(r)) => (r.name.clone(), true),
+            None => (String::new(), false),
+        };
+        let sample = if shard {
+            WriteOp::SPublish {
+                channel: "c".into(),
+                message: Raw::from(""),
+            }
+        } else {
+            WriteOp::Publish {
+                channel: "c".into(),
+                message: Raw::from(""),
+            }
         };
         if write_off(act, &sample) {
             return;
         }
+        let (title, about, hint) = if shard {
+            (
+                "Publish to a shard channel",
+                "SPUBLISH sends the message to the shard channel's subscribers now, on the \
+                 node that owns its slot.",
+                "the shard channel; the selected one to start with",
+            )
+        } else {
+            (
+                "Publish a message",
+                "PUBLISH sends the message to the channel's subscribers now.",
+                "the channel; the selected one to start with",
+            )
+        };
         let mut f = Form::new(
-            "Publish a message",
-            vec!["PUBLISH sends the message to the channel's subscribers now.".to_string()],
+            title,
+            vec![about.to_string()],
             vec![
-                Field::text("channel", "the channel; the selected one to start with").with(channel),
+                Field::text("channel", hint).with(channel),
                 Field::text("message", "the message, as typed; it is shown here only"),
             ],
         );
         f.focus = 1;
         self.publish = Some(f);
+        self.publish_shard = shard;
     }
 
     /// A key while the publish form is open.
@@ -280,22 +402,57 @@ impl PubSubState {
         match f.key(key) {
             Step::Typed => {}
             Step::Cancel => self.publish = None,
-            Step::Submit => match publish_op(f) {
+            Step::Submit => match publish_op(f, self.publish_shard) {
                 Err(why) => act.error(why),
                 Ok(op) => {
                     self.publish = None;
-                    self.write = act.write(op);
+                    let node = match &op {
+                        WriteOp::SPublish { channel, .. } => {
+                            act.session.owner_of(channel.as_bytes())
+                        }
+                        _ => None,
+                    };
+                    self.write = act.write(op).map(|id| (id, node));
                 }
             },
         }
     }
 
+    /// A counts poll: the classic counts on the picked node, and the shard channels on
+    /// every node (each from its own node's budget), each part only when its last
+    /// request answered.
     fn fetch(&mut self, act: &mut Act<'_>) {
         self.last_sent = act.now;
-        self.pending = act.send(LiveRequest::PubSub(Request::Counts));
+        if !self.classic_in_flight(act) {
+            self.pending = act.send(LiveRequest::PubSub(Request::Counts));
+        }
+        if self.shards_off.is_none()
+            && let Some(why) = act.server().and_then(crate::live::pubsub::shards_off)
+        {
+            self.shards_off = Some(why);
+        }
+        if self.shards_off.is_some() || self.shards_in_flight(act) {
+            return;
+        }
+        let nodes: Vec<usize> = if act.session.is_cluster() {
+            (0..act.session.nodes.len())
+                .filter(|&i| act.session.nodes[i].connected)
+                .collect()
+        } else {
+            vec![0]
+        };
+        self.shard_gather.clear();
+        self.shard_notes.clear();
+        self.shard_total_acc = 0;
+        for i in nodes {
+            let dest = Dest::node(i).follow(Follow::Never);
+            if let Some(id) = act.send_to(dest, LiveRequest::PubSub(Request::ShardCounts)) {
+                self.shard_pending.push((id, i));
+            }
+        }
     }
 
-    fn in_flight(&mut self, act: &Act<'_>) -> bool {
+    fn classic_in_flight(&mut self, act: &Act<'_>) -> bool {
         match self.pending {
             Some(id) if act.in_flight(id) => true,
             Some(_) => {
@@ -304,6 +461,81 @@ impl PubSubState {
             }
             None => false,
         }
+    }
+
+    fn shards_in_flight(&mut self, act: &Act<'_>) -> bool {
+        if self.shard_pending.iter().any(|(id, _)| act.in_flight(*id)) {
+            return true;
+        }
+        self.shard_pending.clear();
+        false
+    }
+
+    /// Both parts of the poll are still in flight: nothing to send. Each part is sent
+    /// again only once its own last request answered.
+    fn all_in_flight(&mut self, act: &Act<'_>) -> bool {
+        let classic = self.classic_in_flight(act);
+        let shards = self.shards_in_flight(act) || self.shards_off.is_some();
+        classic && shards
+    }
+
+    /// One node's shard channels. The list is replaced once every node answered.
+    fn shard_reply(&mut self, at: usize, result: Result<LiveReply, LiveError>) {
+        let (_, node) = self.shard_pending.remove(at);
+        match result {
+            Ok(LiveReply::PubSub(Reply::ShardCounts(ShardCounts {
+                channels,
+                total_channels,
+                notes,
+            }))) => {
+                self.shard_total_acc += total_channels;
+                self.shard_gather
+                    .extend(channels.into_iter().map(|c| ShardRow {
+                        name: c.name,
+                        subscribers: c.subscribers,
+                        node,
+                    }));
+                for n in notes {
+                    if !self.shard_notes.contains(&n) {
+                        self.shard_notes.push(n);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(LiveError::Unsupported(_)) => {
+                self.shards_off = Some(SHARDS_UNSUPPORTED.into());
+            }
+            Err(LiveError::Denied(_)) => {
+                self.shards_off = Some(SHARDS_DENIED.into());
+            }
+            Err(LiveError::Closed) => {}
+            Err(LiveError::Failed(why)) => {
+                let why = format!("one node's shard channels are left out: {why}");
+                if !self.shard_notes.contains(&why) {
+                    self.shard_notes.push(why);
+                }
+            }
+        }
+        if !self.shard_pending.is_empty() {
+            return;
+        }
+        let key = self.selected_key();
+        let mut rows = std::mem::take(&mut self.shard_gather);
+        rows.sort_by(|a, b| {
+            b.subscribers
+                .cmp(&a.subscribers)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.node.cmp(&b.node))
+        });
+        self.shards = if self.shards_off.is_some() {
+            Vec::new()
+        } else {
+            rows
+        };
+        self.shards_total = std::mem::take(&mut self.shard_total_acc);
+        self.shards_notes = std::mem::take(&mut self.shard_notes);
+        self.shards_loaded = true;
+        self.reselect(key);
     }
 
     /// Subscribes to `to`, replacing the tail there was: a new subscription starts with
@@ -364,8 +596,9 @@ impl PubSubState {
         let Some(editing) = self.editing.as_mut() else {
             return;
         };
+        self.shard_refused = false;
         let text = match editing {
-            Editing::Subscribe(t) => t,
+            Editing::Subscribe(t) | Editing::ShardSubscribe(t) => t,
             Editing::Filter => &mut self.tail.filter,
         };
         match key.code {
@@ -375,14 +608,23 @@ impl PubSubState {
                 }
                 self.editing = None;
             }
-            KeyCode::Enter => {
-                if let Some(Editing::Subscribe(t)) = self.editing.take() {
-                    match Subscription::parse(&t) {
-                        Some(to) => self.start(to, act),
-                        None => act.info("Type a channel or a pattern to subscribe to."),
+            KeyCode::Enter => match self.editing.take() {
+                Some(Editing::Subscribe(t)) => match Subscription::parse(&t) {
+                    Some(to) => self.start(to, act),
+                    None => act.info("Type a channel or a pattern to subscribe to."),
+                },
+                Some(Editing::ShardSubscribe(t)) => match Subscription::parse_shard(&t) {
+                    Ok(Some(to)) => self.start(to, act),
+                    Ok(None) => act.info("Type a shard channel to subscribe to."),
+                    Err(why) => {
+                        // The prompt stays open: a pattern is never sent.
+                        act.error(form::sentence(why));
+                        self.shard_refused = true;
+                        self.editing = Some(Editing::ShardSubscribe(t));
                     }
-                }
-            }
+                },
+                Some(Editing::Filter) | None => {}
+            },
             KeyCode::Backspace => {
                 text.pop();
             }
@@ -471,14 +713,14 @@ impl ViewState for PubSubState {
         if self.tail.active() {
             self.tail.restart_rate(act.now);
         }
-        if self.off.is_none() && !self.in_flight(act) && (!self.paused || !self.loaded) {
+        if self.off.is_none() && !self.all_in_flight(act) && (!self.paused || !self.loaded) {
             self.fetch(act);
         }
     }
 
     fn on_tick(&mut self, now: Instant, act: &mut Act<'_>) {
         self.tail.tick(now);
-        if self.off.is_some() || self.paused || !act.live_ready() || self.in_flight(act) {
+        if self.off.is_some() || self.paused || !act.live_ready() || self.all_in_flight(act) {
             return;
         }
         if self.last_sent.is_none_or(|t| now.duration_since(t) >= POLL) {
@@ -489,9 +731,9 @@ impl ViewState for PubSubState {
 
     fn refresh(&mut self, act: &mut Act<'_>) {
         self.off = None;
-        if !self.in_flight(act) {
-            self.fetch(act);
-        }
+        // A refusal of the shard channels is asked again (the ACL may have changed).
+        self.shards_off = None;
+        self.fetch(act);
     }
 
     fn input(&self) -> Option<Input> {
@@ -503,6 +745,15 @@ impl ViewState for PubSubState {
                 label: "s",
                 text: text.clone(),
                 hint: "   channel, or pattern with * ? [ · enter to subscribe · esc to cancel",
+            }),
+            Editing::ShardSubscribe(text) => Some(Input {
+                label: "S",
+                text: text.clone(),
+                hint: if self.shard_refused {
+                    SHARD_PATTERN_HINT
+                } else {
+                    "   shard channel (no pattern) · enter to subscribe · esc to cancel"
+                },
             }),
             Editing::Filter => Some(Input {
                 label: "/",
@@ -518,7 +769,7 @@ impl ViewState for PubSubState {
             return;
         }
         match self.editing.as_mut() {
-            Some(Editing::Subscribe(t)) => push_text(t, text),
+            Some(Editing::Subscribe(t) | Editing::ShardSubscribe(t)) => push_text(t, text),
             Some(Editing::Filter) => push_text(&mut self.tail.filter, text),
             None => {}
         }
@@ -552,14 +803,30 @@ impl ViewState for PubSubState {
                 return true;
             }
             KeyCode::Enter => {
-                match self.counts.channels.get(self.sel) {
-                    Some(ch) => self.start(Subscription::Channel(ch.name.clone()), act),
+                let to = match self.selected() {
+                    Some(Selected::Channel(ch)) => Some(Subscription::Channel(ch.name.clone())),
+                    Some(Selected::Shard(r)) => Some(Subscription::Shard(r.name.clone())),
+                    None => None,
+                };
+                match to {
+                    Some(to) => self.start(to, act),
                     None => act.info("No channel selected: press s to type one."),
                 }
                 return true;
             }
             KeyCode::Char('s') => {
                 self.editing = Some(Editing::Subscribe(String::new()));
+                return true;
+            }
+            KeyCode::Char('S') => {
+                if let Some(why) = self.shards_off.clone() {
+                    act.error(why);
+                } else if let Some(Selected::Shard(r)) = self.selected() {
+                    let to = Subscription::Shard(r.name.clone());
+                    self.start(to, act);
+                } else {
+                    self.editing = Some(Editing::ShardSubscribe(String::new()));
+                }
                 return true;
             }
             KeyCode::Char(' ') => {
@@ -591,7 +858,7 @@ impl ViewState for PubSubState {
             }
             _ => {}
         }
-        let Some(to) = list_move(&key, self.sel, self.counts.channels.len(), act.page) else {
+        let Some(to) = list_move(&key, self.sel, self.rows_len(), act.page) else {
             return false;
         };
         self.sel = to;
@@ -599,16 +866,23 @@ impl ViewState for PubSubState {
     }
 
     fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
-        if self.write == Some(id) {
-            self.write = None;
+        if let Some((_, node)) = self.write.take_if(|(w, _)| *w == id) {
+            // A shard channel's subscribers are counted on its own node.
+            let on = node
+                .and_then(|i| act.session.nodes.get(i))
+                .map_or_else(String::new, |n| format!(" on {}", n.endpoint));
             match result {
                 Ok(LiveReply::Write(WriteReply::Int(n))) => act.info(format!(
-                    "Published to {}.",
+                    "Published to {}{on}.",
                     form::count(n, "subscriber", "subscribers")
                 )),
                 Ok(_) => act.info("Published."),
                 Err(e) => write_failed(act, &e),
             }
+            return;
+        }
+        if let Some(at) = self.shard_pending.iter().position(|(p, _)| *p == id) {
+            self.shard_reply(at, result);
             return;
         }
         // Only the answer to the request in flight; an older one is stale.
@@ -619,12 +893,9 @@ impl ViewState for PubSubState {
         match result {
             Ok(LiveReply::PubSub(Reply::Counts(counts))) => {
                 // The selection stays on its channel when the list moves.
-                let name = self.counts.channels.get(self.sel).map(|c| c.name.clone());
+                let key = self.selected_key();
                 self.counts = counts;
-                self.sel = name
-                    .and_then(|n| self.counts.channels.iter().position(|c| c.name == n))
-                    .unwrap_or(self.sel)
-                    .min(self.counts.channels.len().saturating_sub(1));
+                self.reselect(key);
                 self.loaded = true;
                 self.error = None;
             }
@@ -668,12 +939,21 @@ mod tests {
         }
     }
 
+    /// The live requests among `effects`, without the shard channel polls (their own
+    /// tests are below).
+    fn classic_requests(effects: &[Effect]) -> Vec<(ReqId, LiveRequest)> {
+        testing::requests(effects)
+            .into_iter()
+            .filter(|(_, r)| *r != LiveRequest::PubSub(Request::ShardCounts))
+            .collect()
+    }
+
     fn at(base: Instant, ms: u64) -> Msg {
         Msg::TickAt(base + Duration::from_millis(ms))
     }
 
     fn tick(app: &mut App, t0: Instant, ms: u64) -> Option<ReqId> {
-        let reqs = testing::requests(&app.apply(at(t0, ms)));
+        let reqs = classic_requests(&app.apply(at(t0, ms)));
         assert!(reqs.len() <= 1, "{reqs:?}");
         reqs.first().map(|r| r.0)
     }
@@ -688,7 +968,7 @@ mod tests {
         testing::live_ready(&mut app);
         app.apply(Msg::TickAt(t0));
         let effects = testing::show(&mut app, Screen::PubSub);
-        let reqs = testing::requests(&effects);
+        let reqs = classic_requests(&effects);
         let [(id, LiveRequest::PubSub(Request::Counts))] = &reqs[..] else {
             panic!("expected one Counts request, got {reqs:?}");
         };
@@ -701,7 +981,7 @@ mod tests {
         let mut app = testing::scanned();
         testing::live_ready(&mut app);
         let effects = testing::show(&mut app, Screen::PubSub);
-        let reqs = testing::requests(&effects);
+        let reqs = classic_requests(&effects);
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].1, LiveRequest::PubSub(Request::Counts));
     }
@@ -722,7 +1002,7 @@ mod tests {
         assert!(app.views.pubsub.paused);
         assert_eq!(tick(&mut app, t0, 60_000), None);
         let effects = app.handle_key(key(KeyCode::Char('r')));
-        assert_eq!(testing::requests(&effects).len(), 1);
+        assert_eq!(classic_requests(&effects).len(), 1);
     }
 
     #[test]
@@ -759,7 +1039,7 @@ mod tests {
         let mut app = testing::scanned();
         testing::live_ready(&mut app);
         let effects = testing::show(&mut app, Screen::PubSub);
-        let (id, _) = testing::requests(&effects).remove(0);
+        let (id, _) = classic_requests(&effects).remove(0);
         testing::reply(
             &mut app,
             id,
@@ -774,7 +1054,7 @@ mod tests {
         assert_eq!(tick(&mut app, t0, 60_000), None);
         insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
         let effects = app.handle_key(key(KeyCode::Char('r')));
-        assert_eq!(testing::requests(&effects).len(), 1);
+        assert_eq!(classic_requests(&effects).len(), 1);
     }
 
     #[test]
@@ -1367,13 +1647,13 @@ mod tests {
             }]
         );
         assert!(app.views.pubsub.publish.is_none());
-        let (id, _) = testing::requests(&e)[0].clone();
+        let (id, _) = classic_requests(&e)[0].clone();
         testing::reply(&mut app, id, Ok(LiveReply::Write(WriteReply::Int(3))));
         assert_eq!(notice(&app), "Published to 3 subscribers.");
         let (id, _) = {
             app.handle_key(ch('P'));
             type_text(&mut app, "x");
-            testing::requests(&press(&mut app, KeyCode::Enter))[0].clone()
+            classic_requests(&press(&mut app, KeyCode::Enter))[0].clone()
         };
         testing::reply(&mut app, id, Ok(LiveReply::Write(WriteReply::Int(1))));
         assert_eq!(notice(&app), "Published to 1 subscriber.");

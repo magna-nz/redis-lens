@@ -129,22 +129,6 @@ pub fn probe_of(screen: Screen) -> Option<&'static str> {
     }
 }
 
-/// Why a live view is off on a cluster.
-pub const CLUSTER_OFF: &str = "Not available on a cluster yet: this view reads one server, \
-     and a cluster spreads its keys, clients and channels over its nodes.";
-
-/// The screens that read the live connection to one server and are still off on a
-/// cluster. The key list is one of them: it walks the keys with `SCAN`, which on a
-/// cluster covers one node; and so is the key detail, which reads its value over the
-/// same connection. The Server panels and Search read the picked node instead
-/// ([`picks_node`]).
-pub fn reads_one_server(screen: Screen) -> bool {
-    matches!(
-        screen,
-        Screen::KeyList | Screen::KeyDetail | Screen::Streams | Screen::PubSub
-    )
-}
-
 /// The screens that read the picked node of a cluster (spec "Cluster live views (P4)"),
 /// where `[` and `]` pick another.
 pub fn picks_node(screen: Screen) -> bool {
@@ -192,9 +176,12 @@ fn op_keys(op: &WriteOp) -> (Vec<&str>, bool) {
         | XAutoClaim { key, .. }
         | XAck { key, .. }
         | XTrim { key, .. } => (vec![key], false),
+        // A shard channel lives on the owner of its slot, like a key.
+        SPublish { channel, .. } => (vec![channel], false),
         Rename { key, new } => (vec![key, new], false),
-        // Keyless: the picked node. The command line and bulk actions are still off on
-        // a cluster; they route their own keys when they come on.
+        // Keyless: the picked node. A typed command is routed by the keys its key
+        // specs find ([`command_to`], in [`write_dest`]), and a bulk action sends each
+        // batch to its primary.
         ClientKill { .. }
         | SlowlogConfig(_)
         | SlowlogReset
@@ -220,19 +207,20 @@ pub(crate) fn write_dest(session: &Session, op: &WriteOp) -> Result<Dest, String
     if !session.is_cluster() {
         return Ok(Dest::node(0).follow(follow));
     }
-    let slots: Vec<u16> = keys
-        .iter()
-        .map(|k| crate::conn::slot::key_slot(k.as_bytes()))
-        .collect();
-    if slots.windows(2).any(|w| w[0] != w[1]) {
-        return Err(format!("Not sent: {}.", crate::live::CROSSSLOT));
-    }
-    let (node, dest) = match keys.first() {
-        Some(k) => (
-            session.owner_of(k.as_bytes()),
-            Dest::key(k.as_bytes().to_vec()),
-        ),
-        None => (Some(session.picked), Dest::node(session.picked)),
+    let (node, dest) = match op {
+        // A typed command: routed by the keys its key specs find.
+        WriteOp::Command { args, info } => {
+            let to = command_to(session, args.as_slice(), info)?;
+            (to.node, to.dest)
+        }
+        _ => {
+            let keys: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
+            one_slot(&keys)?;
+            match keys.first() {
+                Some(k) => (session.owner_of(k), Dest::key(k.to_vec())),
+                None => (Some(session.picked), Dest::node(session.picked)),
+            }
+        }
     };
     if node
         .and_then(|i| session.nodes.get(i))
@@ -241,6 +229,74 @@ pub(crate) fn write_dest(session: &Session, op: &WriteOp) -> Result<Dest, String
         return Err(format!("Not sent: {REPLICA_NO_WRITES}."));
     }
     Ok(dest.follow(follow))
+}
+
+/// Refused, with the CROSSSLOT sentence, when `keys` hash to more than one slot.
+fn one_slot(keys: &[&[u8]]) -> Result<(), String> {
+    let slots: Vec<u16> = keys
+        .iter()
+        .map(|k| crate::conn::slot::key_slot(k))
+        .collect();
+    if slots.windows(2).any(|w| w[0] != w[1]) {
+        return Err(format!("Not sent: {}.", crate::live::CROSSSLOT));
+    }
+    Ok(())
+}
+
+/// Why a typed command went to the picked node of a cluster although it takes keys.
+pub const KEYS_UNFOUND: &str = "Its keys could not be found from its key specs (that needs \
+     COMMAND GETKEYS, which redis-lens never sends), so it was sent to the picked node.";
+
+/// Where a typed command of the command line goes ([`command_to`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandTo {
+    pub dest: Dest,
+    /// The node it goes to, by its index in `session.nodes`: `None` on a standalone
+    /// server, or when no node serves its slot.
+    pub node: Option<usize>,
+    /// [`KEYS_UNFOUND`], when its keys could not be found.
+    pub note: Option<&'static str>,
+}
+
+/// Where the command line sends `args` (spec "Cluster live views (P4)", Command line):
+/// on a standalone server its one node; on a cluster the owner of its keys' slot, and
+/// the picked node for a keyless command or one whose keys can't be found (with
+/// [`KEYS_UNFOUND`]). Refused before anything is sent when its keys are in different
+/// slots.
+pub(crate) fn command_to(
+    session: &Session,
+    args: &[Vec<u8>],
+    info: &crate::live::cmdline::CommandInfo,
+) -> Result<CommandTo, String> {
+    use crate::live::cmdline::{Keys, command_keys};
+    if !session.is_cluster() {
+        return Ok(CommandTo {
+            dest: Dest::node(0),
+            node: None,
+            note: None,
+        });
+    }
+    let picked = CommandTo {
+        dest: Dest::node(session.picked),
+        node: Some(session.picked),
+        note: None,
+    };
+    match command_keys(args, info) {
+        Keys::None => Ok(picked),
+        Keys::Unfound => Ok(CommandTo {
+            note: Some(KEYS_UNFOUND),
+            ..picked
+        }),
+        Keys::Found(keys) => {
+            let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+            one_slot(&refs)?;
+            Ok(CommandTo {
+                node: session.owner_of(&keys[0]),
+                dest: Dest::key(keys[0].clone()),
+                note: None,
+            })
+        }
+    }
 }
 
 /// Which view state a screen, or a live request, belongs to.
@@ -468,9 +524,6 @@ impl<'a> Ctx<'a> {
     /// or not checked (yet). Never the server's own error text, which can name the
     /// ACL user.
     pub fn off_reason(&self) -> Option<String> {
-        if reads_one_server(self.screen) && self.is_cluster() {
-            return Some(CLUSTER_OFF.to_string());
-        }
         let label = probe_of(self.screen)?;
         match self.check(label)? {
             PermStatus::Allowed => None,

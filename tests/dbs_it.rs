@@ -226,7 +226,7 @@ async fn a_tail_subscribed_again_after_the_switch_receives_what_is_published_aft
             Subscription::Pattern("orders:*".into()),
         ] {
             let channel = match &to {
-                Subscription::Channel(c) => c.clone(),
+                Subscription::Channel(c) | Subscription::Shard(c) => c.clone(),
                 Subscription::Pattern(_) => "orders:eu".to_string(),
             };
             // The tail before the switch, on the profile's db 0.

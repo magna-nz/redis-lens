@@ -480,7 +480,7 @@ static STREAMS: [KeyHelp; 14] = [
     k("X", "X", "Trim", "Trim the stream", false),
 ];
 
-static PUBSUB: [KeyHelp; 13] = [
+static PUBSUB: [KeyHelp; 14] = [
     MOVE,
     PAGE,
     ENDS,
@@ -492,6 +492,13 @@ static PUBSUB: [KeyHelp; 13] = [
         true,
     ),
     k("s", "s", "Sub", "Subscribe to a channel or pattern", false),
+    k(
+        "S",
+        "S",
+        "Shard",
+        "Subscribe to a shard channel (SSUBSCRIBE)",
+        false,
+    ),
     k("space", "space", "Pause", "Pause or resume the tail", true),
     k("c", "c", "Clear", "Clear the tail", false),
     k("/", "/", "Filter", "Filter the tail", true),
@@ -504,7 +511,13 @@ static PUBSUB: [KeyHelp; 13] = [
     ),
     PAUSE,
     REFRESH,
-    k("P", "P", "Publish", "Publish a message", false),
+    k(
+        "P",
+        "P",
+        "Publish",
+        "Publish a message (SPUBLISH on a shard channel)",
+        false,
+    ),
     PICK_NODE,
 ];
 
