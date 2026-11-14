@@ -262,7 +262,7 @@ static OVERVIEW: [KeyHelp; 9] = [
     PICK_NODE,
 ];
 
-static PATTERNS: [KeyHelp; 15] = [
+static PATTERNS: [KeyHelp; 16] = [
     MOVE,
     PAGE,
     ENDS,
@@ -282,6 +282,13 @@ static PATTERNS: [KeyHelp; 15] = [
         false,
     ),
     k("/", "/", "Filter", "Filter patterns by name", true),
+    k(
+        "n",
+        "n",
+        "More names",
+        "Before an analysis: read 1,000 more key names",
+        true,
+    ),
     k(
         "esc",
         "esc",
@@ -585,7 +592,7 @@ static STREAMS: [KeyHelp; 16] = [
         "r",
         "r",
         "Refresh",
-        "Refresh this panel now, or read the entries again",
+        "Refresh this panel or the entries; before an analysis, analyze",
         false,
     ),
     k(
@@ -802,7 +809,7 @@ pub fn footer(screen: Screen, c: FooterCtx) -> Vec<(&'static str, &'static str)>
         Screen::Overview if c.analyzed => &[MOVE, "enter", "r", "v"],
         Screen::Overview if c.ready => &["r", MOVE, "enter", "v"],
         Screen::Patterns if c.analyzed => &[MOVE, OPEN, "/", "o", "v"],
-        Screen::Patterns => &[MOVE, OPEN, "/", "r", TAB],
+        Screen::Patterns => &[MOVE, OPEN, "/", "n", "r"],
         Screen::KeyList => &[MOVE, OPEN, "/", "n", BACK],
         Screen::KeyDetail if c.writes => &[MOVE, "e", "+", "d", "f"],
         Screen::KeyDetail => &[MOVE, "→ l", "f", "y", BACK],
@@ -1094,7 +1101,7 @@ mod tests {
         );
         assert_eq!(
             names(Screen::Patterns, connected),
-            ["Move", "Open", "Filter", "Analyze", "Next panel"]
+            ["Move", "Open", "Filter", "More names", "Analyze"]
         );
         assert_eq!(
             names(Screen::Patterns, analyzed),

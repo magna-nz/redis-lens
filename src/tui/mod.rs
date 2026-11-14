@@ -177,13 +177,15 @@ async fn event_loop(
                 terminal.clear()?;
             }
         }
-        let mut list_rows = 0;
+        let (mut list_rows, mut browse_rows) = (0, 0);
         terminal.draw(|f| {
             list_rows = ui::list_rows(f.area());
+            browse_rows = ui::browse_rows(f.area());
             ui::draw(f, &app);
         })?;
         // The page for PgUp and PgDn, from the area just drawn.
         app.set_list_rows(list_rows);
+        app.set_browse_rows(browse_rows);
         tokio::select! {
             incoming = rx.recv() => match incoming {
                 Some(Incoming::Input(Event::Key(k))) => pending = app.handle_key(k),
@@ -1556,6 +1558,126 @@ pub async fn run_connect_for_tests(
     // is left, then ends.
     drop(lock(&slot).take());
     let _ = forward.await;
+}
+
+/// What [`run_browse_for_tests`] saw of Browse › Keys before an analysis.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct BrowseForTests {
+    /// The names tree's patterns and their key counts (estimated, or exact once every
+    /// name is read), sorted by pattern.
+    pub patterns: Vec<(String, u64)>,
+    /// Distinct key names read.
+    pub names_read: u64,
+    /// Pages of key names read: one `SCAN` each.
+    pub pages: u64,
+    /// Every node was walked to the end.
+    pub complete: bool,
+    /// What the app asked of the live connection, as `Debug` text, in order.
+    pub requests: Vec<String>,
+    /// Why the names stopped, if they did.
+    pub error: Option<String>,
+}
+
+/// Connects `profile` without an analysis exactly as the TUI does, goes to Browse ›
+/// Keys, and carries out what the app asks of the live connection until the key names
+/// it reads first are in; then presses `n` `more` times, each time until its page is
+/// in. Returns what the tree shows. The live connection is closed again at the end.
+#[doc(hidden)]
+pub async fn run_browse_for_tests(
+    profile: Profile,
+    credentials: Option<Credentials>,
+    more: usize,
+) -> BrowseForTests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let press = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+    let mut app = App::new(vec![profile.clone()]);
+    let effects = app.handle_key(press(KeyCode::Enter));
+    let (id, scan) = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::Connect { id, scan, .. } => Some((*id, *scan)),
+            _ => None,
+        })
+        .expect("enter connects");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let slot: LiveSlot = Arc::new(Mutex::new(Some(LiveSession::new(id, scan))));
+    connect_and_scan(
+        Run { id, scan },
+        profile,
+        SecretSource::Container(credentials),
+        None,
+        StopFlag::new(),
+        tx,
+        Arc::clone(&slot),
+    )
+    .await;
+    let mut requests = Vec::new();
+    // What the runtime does with an effect, for the live requests: the rest (history,
+    // the clipboard) has no part in reading names.
+    let carry_out = |effects: Vec<Effect>, requests: &mut Vec<String>| {
+        for e in effects {
+            if let Effect::Live {
+                req_id, to, req, ..
+            } = e
+            {
+                requests.push(format!("{req:?}"));
+                let guard = lock(&slot);
+                let handle = guard.as_ref().and_then(|s| s.handle.as_ref());
+                assert!(
+                    handle.is_some_and(|h| h.send_to(req_id, to, req)),
+                    "the live connection is open"
+                );
+            }
+        }
+    };
+    let mut left = more;
+    let mut on_browse = false;
+    loop {
+        let incoming = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("the app gets an answer in time");
+        let Some(Incoming::Msg(m)) = incoming else {
+            break;
+        };
+        let connected = matches!(*m, Msg::Connected { .. });
+        let effects = app.apply(*m);
+        carry_out(effects, &mut requests);
+        // The connect lands on Overview; Browse is `2`, as a user goes there.
+        if connected && !on_browse {
+            on_browse = true;
+            let effects = app.handle_key(press(KeyCode::Char('2')));
+            carry_out(effects, &mut requests);
+        }
+        let names = &app.patterns.names;
+        if !names.started() || names.is_reading() {
+            continue;
+        }
+        if left > 0 && !names.done() && names.error.is_none() {
+            left -= 1;
+            let effects = app.handle_key(press(KeyCode::Char('n')));
+            carry_out(effects, &mut requests);
+            continue;
+        }
+        break;
+    }
+    let names = &app.patterns.names;
+    let mut patterns: Vec<(String, u64)> = names
+        .stats
+        .iter()
+        .map(|p| (p.pattern.clone(), p.est_keys))
+        .collect();
+    patterns.sort();
+    let out = BrowseForTests {
+        patterns,
+        names_read: names.names_read(),
+        pages: names.pages,
+        complete: names.complete(),
+        requests,
+        error: names.error.clone(),
+    };
+    drop(lock(&slot).take());
+    out
 }
 
 #[cfg(test)]

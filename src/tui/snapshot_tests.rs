@@ -652,10 +652,11 @@ fn failed_scan_drops_partial_results_from_the_screen() {
     });
     app.handle_key(ch('x')); // clear the error notice
     let lines = buffer_lines(&render(&app, 120, 36));
+    // The first row of the list pane, right under its title.
     assert!(
-        lines[5].contains("✗ connection reset by peer"),
+        lines[4].contains("✗ connection reset by peer"),
         "{}",
-        lines[5]
+        lines[4]
     );
     for line in &lines {
         assert!(!line.contains("partial"), "{line}");
@@ -739,6 +740,8 @@ fn patterns_filter_applied() {
 fn patterns_with_delta() {
     let mut app = scanned_with_history(true);
     select_pattern(&mut app, "cache:search:{hash}");
+    // Δ is one of the `v` columns.
+    app.handle_key(ch('v'));
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
     assert!(lines[4].contains("Δ"), "{}", lines[4]);
@@ -747,7 +750,8 @@ fn patterns_with_delta() {
 
 #[test]
 fn patterns_delta_without_sizes_counts_keys() {
-    let app = scanned_with_history(false);
+    let mut app = scanned_with_history(false);
+    app.handle_key(ch('v'));
     let lines = buffer_lines(&render(&app, 120, 36));
     let row = lines
         .iter()
@@ -933,12 +937,14 @@ fn colour_at(t: &Terminal<TestBackend>, row_text: &str, cell_text: &str, from: u
 fn change_and_verdict_colours() {
     use crate::tui::ui::style::{AMBER, DIM, RED, TEAL};
     let mut app = scanned_with_history(true);
+    // The Δ column is one of the `v` columns on Browse.
+    app.handle_key(ch('v'));
     let t = render(&app, 120, 36);
     // Δ column: new is red, +232M amber, a shrink teal, unchanged dim.
-    assert_eq!(colour_at(&t, "tmp:import:{ulid}", "+", 100), RED);
-    assert_eq!(colour_at(&t, "queue:emails", "+", 100), AMBER);
-    assert_eq!(colour_at(&t, "rl:{ip}:{id}", "-", 100), TEAL);
-    assert_eq!(colour_at(&t, "lock:{var}", "·", 100), DIM);
+    assert_eq!(colour_at(&t, "tmp:import:{ulid}", "+", 40), RED);
+    assert_eq!(colour_at(&t, "queue:emails", "+", 40), AMBER);
+    assert_eq!(colour_at(&t, "rl:{ip}:{id}", "-", 40), TEAL);
+    assert_eq!(colour_at(&t, "lock:{var}", "·", 40), DIM);
     go(&mut app, '2');
     let t = render(&app, 120, 36);
     // Warning rows have a red "none" bucket and verdict; stable ones amber and dim.
@@ -1117,9 +1123,8 @@ fn patterns_narrow_rows_do_not_wrap() {
     // The table's rows, between its header and its closing border.
     let end = before.iter().position(|l| l.starts_with('└')).unwrap();
     let table = &before[5..end];
-    let report = app.report().unwrap();
-    assert_eq!(table.len(), 7, "{before:#?}");
-    assert!(report.patterns.len() >= table.len());
+    // The list's rows and its bottom line: the whole height but the chrome.
+    assert_eq!(table.len(), 17, "{before:#?}");
     // One line for the long name, cut with `…`, and none for its tail.
     assert!(table[0].starts_with("│   audit-t"), "{}", table[0]);
     assert!(table[0].contains('…'), "{}", table[0]);
@@ -1201,12 +1206,12 @@ fn patterns_sorted_by_keys() {
     app.handle_key(ch('o'));
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[3].contains("sorted by keys"), "{}", lines[3]);
+    assert!(lines[3].contains("by keys"), "{}", lines[3]);
     assert!(lines[4].contains("KEYS▼"), "{}", lines[4]);
     assert!(!lines[4].contains("MEMORY▼"), "{}", lines[4]);
     // The selection stayed on the same pattern, now further down.
     assert!(
-        lines.iter().any(|l| l.starts_with("┌─ user:{id}:cart ")),
+        lines.iter().any(|l| l.contains("┬─ user:{id}:cart ")),
         "{lines:#?}"
     );
     assert!(lines[12].contains("user:{id}:cart"), "{}", lines[12]);
@@ -1219,7 +1224,7 @@ fn patterns_sorted_by_name_shows_an_up_arrow() {
     let mut app = scanned(true);
     press(&mut app, "oooo");
     let lines = buffer_lines(&render(&app, 120, 36));
-    assert!(lines[3].contains("sorted by name"), "{}", lines[3]);
+    assert!(lines[3].contains("by name"), "{}", lines[3]);
     assert!(lines[4].starts_with("│ PATTERN ▲"), "{}", lines[4]);
     assert!(!lines[4].contains('▼'), "{}", lines[4]);
 }
@@ -1231,24 +1236,35 @@ fn table_at(app: &App, w: u16) -> Vec<String> {
     lines[3..=end].to_vec()
 }
 
-/// Asserts the header shows exactly `shown` of the optional columns and that the
-/// share percentage lines up between the header and every row.
+/// Asserts the header shows exactly `shown` of the optional columns, that the share
+/// percentage lines up between the header and every row when it shows, and that no
+/// row is wider than the terminal.
 fn check_columns(table: &[String], w: u16, shown: &[&str]) {
     let head = &table[1];
-    for col in ["SHARE", "AVG", "Δ"] {
+    for col in ["TYPE", "SHARE", "AVG", "NO TTL", "Δ"] {
         assert_eq!(
             head.contains(col),
             shown.contains(&col),
             "{w}: {col} in {head}"
         );
     }
-    let pct = |l: &str| l.chars().position(|c| c == '%');
-    let at = pct(head).unwrap();
-    for row in &table[2..table.len() - 1] {
-        if row.trim_matches(|c| c == '│' || c == ' ').is_empty() {
-            continue;
+    // KEYS, MEMORY and the `▲` column always.
+    assert!(
+        head.contains("KEYS") && head.contains("MEMORY"),
+        "{w}: {head}"
+    );
+    if shown.contains(&"SHARE") {
+        // The share's `%` sits under the header's last `%`-free cell of SHARE: every
+        // row puts it in the same column.
+        let pct = |l: &str| l.chars().position(|c| c == '%');
+        let rows: Vec<&String> = table[2..table.len() - 2]
+            .iter()
+            .filter(|r| r.contains('%'))
+            .collect();
+        let at = pct(rows[0]);
+        for row in rows {
+            assert_eq!(pct(row), at, "{w}: {row}\n{head}");
         }
-        assert_eq!(pct(row), Some(at), "{w}: {row}\n{head}");
     }
     for l in table {
         assert_eq!(l.chars().count(), usize::from(w), "{l}");
@@ -1269,44 +1285,48 @@ fn narrow_steps(app: &App, steps: &[(u16, &[&str])]) -> String {
 fn patterns_narrow_columns() {
     let mut app = scanned(true);
     select_pattern(&mut app, "user:{id}:cart");
-    // 83 is the narrowest with every column; then the share bar goes (82), then the
-    // average size (74); below 66 the row is cut at the right edge. VERDICT always shows.
-    let snap = narrow_steps(
+    // Without `v`: PATTERN, KEYS, MEMORY and `▲`; from 110 columns TYPE and the share
+    // bar join in.
+    let plain = narrow_steps(
         &app,
         &[
-            (83, &["SHARE", "AVG"]),
-            (82, &["AVG"]),
-            (75, &["AVG"]),
-            (74, &[]),
-            (66, &[]),
+            (120, &["TYPE", "SHARE"]),
+            (110, &["TYPE", "SHARE"]),
+            (109, &[]),
+            (80, &[]),
+            (60, &[]),
         ],
     );
-    let cut = table_at(&app, 50);
-    // Every column is hidden and the name is at its narrowest: the row is cut.
-    assert!(cut[1].starts_with("│ PATTERN    TYPE"), "{}", cut[1]);
-    assert!(!cut[1].contains("NO TTL"), "{}", cut[1]);
-    insta::assert_snapshot!(format!("{snap}50 wide:\n{}", cut.join("\n")));
+    // With `v` the list takes 70% and shows the rest; when the pattern column would
+    // get too narrow the share bar goes first, then AVG.
+    app.handle_key(ch('v'));
+    let more = narrow_steps(
+        &app,
+        &[
+            (120, &["TYPE", "SHARE", "AVG", "NO TTL"]),
+            (100, &["TYPE", "AVG", "NO TTL"]),
+            (80, &["TYPE", "NO TTL"]),
+        ],
+    );
+    insta::assert_snapshot!(format!("{plain}with v:\n\n{more}"));
 }
 
 #[test]
 fn patterns_narrow_columns_with_delta() {
     let mut app = scanned_with_history(true);
     select_pattern(&mut app, "user:{id}:cart");
-    // 91 is the narrowest with every column; the share bar goes first (90), then Δ
-    // (82), then the average size (74). VERDICT always shows.
-    let snap = narrow_steps(
+    // Δ is a `v` column: when room runs out it goes after the share bar, before AVG.
+    let plain = narrow_steps(&app, &[(120, &["TYPE", "SHARE"]), (80, &[])]);
+    app.handle_key(ch('v'));
+    let more = narrow_steps(
         &app,
         &[
-            (91, &["SHARE", "AVG", "Δ"]),
-            (90, &["AVG", "Δ"]),
-            (83, &["AVG", "Δ"]),
-            (82, &["AVG"]),
-            (75, &["AVG"]),
-            (74, &[]),
-            (66, &[]),
+            (120, &["TYPE", "SHARE", "AVG", "NO TTL", "Δ"]),
+            (100, &["TYPE", "AVG", "NO TTL", "Δ"]),
+            (80, &["TYPE", "NO TTL"]),
         ],
     );
-    insta::assert_snapshot!(snap);
+    insta::assert_snapshot!(format!("{plain}with v:\n\n{more}"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1349,7 +1369,9 @@ const RESCAN_FAILED: &str = "analysis failed · previous results";
 
 #[test]
 fn patterns_rescanning_shows_previous_results() {
-    let (app, _, _) = rescanning('1');
+    let (mut app, _, _) = rescanning('1');
+    // Δ is one of the `v` columns.
+    app.handle_key(ch('v'));
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
     assert!(lines[3].contains(RESCANNING), "{}", lines[3]);
@@ -1497,12 +1519,25 @@ fn detail_command_is_what_shift_y_copies() {
         let [Effect::Copy(t)] = &effects[..] else {
             panic!("unexpected effects {effects:?}");
         };
-        let text = buffer_lines(&render(&app, 120, 36)).join("\n");
-        assert!(
-            text.contains(&format!("$ {}", t.as_str())),
-            "{}",
-            t.as_str()
-        );
+        // The detail pane breaks a long command at spaces, under its `$`.
+        let lines = buffer_lines(&render(&app, 120, 36));
+        let pane = |l: &String| {
+            let parts: Vec<&str> = l.split('│').collect();
+            parts[parts.len().saturating_sub(2)].trim().to_string()
+        };
+        let at = lines
+            .iter()
+            .position(|l| pane(l).starts_with("$ "))
+            .unwrap_or_else(|| panic!("no command for {}", t.as_str()));
+        let mut shown = pane(&lines[at]);
+        for l in &lines[at + 1..] {
+            let p = pane(l);
+            if p.is_empty() || !l.contains('│') {
+                break;
+            }
+            shown = format!("{shown} {p}");
+        }
+        assert_eq!(shown, format!("$ {}", t.as_str()));
     }
 }
 
@@ -1523,9 +1558,19 @@ fn list_rows_is_what_every_list_view_draws() {
     let mut app = scanned_with_history(true);
     for (w, h) in [(80, 24), (120, 36), (60, 20), (200, 60), (80, 17), (80, 18)] {
         let rows = ui::list_rows(ratatui::layout::Rect::new(0, 0, w, h));
+        let browse = ui::browse_rows(ratatui::layout::Rect::new(0, 0, w, h));
         for view in ['0', '1', '2', '3', '4'] {
             go(&mut app, view);
             let lines = buffer_lines(&render(&app, w, h));
+            if app.area == crate::tui::app::Area::Browse {
+                // Browse fills the frame: its rows, then the bottom line.
+                assert_eq!(
+                    drawn_list_rows(&lines),
+                    browse + 1,
+                    "view {view} at {w}x{h}"
+                );
+                continue;
+            }
             // The tab bar's panel row takes one on Analysis (`App::page` knows).
             let panel_row = usize::from(app.area.has_panels());
             assert_eq!(

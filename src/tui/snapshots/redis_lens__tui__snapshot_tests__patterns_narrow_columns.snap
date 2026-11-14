@@ -1,76 +1,181 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 1108
-expression: "format!(\"{snap}50 wide:\\n{}\", cut.join(\"\\n\"))"
+expression: "format!(\"{plain}with v:\\n\\n{more}\")"
 ---
-83 wide:
-┌─ Patterns ───────────────────────────────────── 11 patterns · sorted by memory ─┐
-│ PATTERN    TYPE       KEYS   MEMORY▼ SHARE       %      AVG  NO TTL  VERDICT    │
-│   session… string    1.84M     6.1G  ███▋░░░░  46%     3.5K      0%  ok         │
-│ ▾ cache:*  string    1.34M     3.6G  ██▏░░░░░  27%     2.8K     10%  mixed      │
-│     cache… string    1.12M     2.2G  █▍░░░░░░  16%     2.1K   ▲ 12%  mixed      │
-│     cache… string     220K     1.4G  ▉░░░░░░░  10%     6.7K      0%  ok         │
-│ ▾ user:{i… mixed      896K     1.9G  █▏░░░░░░  14%     2.2K     59%  mixed      │
-│     user:… hash       388K     1.2G  ▊░░░░░░░   9%     3.2K   ▲ 31%  mixed      │
-│     user:… hash       412K     553M  ▍░░░░░░░   4%     1.4K    100%  persistent │
-└─────────────────────────────────────────────────────────────────────────────────┘
+120 wide:
+┌─ Patterns ────────────────────────────────────────────────── by memory ─┬─ user:{id}:cart ──────────────────── hash ─┐
+│ PATTERN                       TYPE     KEYS MEMORY▼ SHARE               │ 388K keys · 1.2G · 9% of memory            │
+│   session:{uuid}              string  1.84M    6.1G █████▌░░░░░░  46%   │ Typical key 2.8K · 99% under 41K           │
+│ ▾ cache:*                     string  1.34M    3.6G ███▎░░░░░░░░  27% ▲ │ Largest 212K                               │
+│     cache:search:{hash}       string  1.12M    2.2G ██░░░░░░░░░░  16% ▲ │                                            │
+│     cache:product:{id}        string   220K    1.4G █▎░░░░░░░░░░  10%   │ ▲ 31% of 388K keys never expire, while the │
+│ ▾ user:{id}:*                 mixed    896K    1.9G █▊░░░░░░░░░░  14% ▲ │   rest expire in about 7 days. A write     │
+│     user:{id}:cart            hash     388K    1.2G █▏░░░░░░░░░░   9% ▲ │   path probably skips EXPIRE.              │
+│     user:{id}:profile         hash     412K    553M ▌░░░░░░░░░░░   4%   │                                            │
+│     user:{id}:feed            zset      96K    184M ▏░░░░░░░░░░░   1%   │ EXPIRES IN                                 │
+│   tmp:import:{ulid}           string    48K    737M ▋░░░░░░░░░░░   5%   │ none <1m  <1h  <1d  <7d  <30d >30d         │
+│   queue:emails                list        1    612M ▌░░░░░░░░░░░   4% ▲ │ ▅▅▅  ·    ▁▁▁  ▁▁▁  ███  ·    ·            │
+│   rl:{ip}:{id}                string  2.31M    420M ▍░░░░░░░░░░░   3%   │                                            │
+│   feature:{var}               string    212    302K ▏░░░░░░░░░░░  <1%   │ EXAMPLE KEYS                SIZE   EXPIRES │
+│   lock:{var}                  string     14    2.1K ▏░░░░░░░░░░░  <1%   │ user:10442:cart             212K     never │
+│                                                                         │                                            │
+│                                                                         │ $ redis-cli --scan --pattern "user:*:cart" │
+│                                                                         │                                            │
+│ Estimated from 100,000 sampled keys of 7.92M. v shows more columns.     │ → lists its keys   y copies the pattern    │
+└─────────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────┘
 
-82 wide:
-┌─ Patterns ──────────────────────────────────── 11 patterns · sorted by memory ─┐
-│ PATTERN           TYPE       KEYS   MEMORY▼     %      AVG  NO TTL  VERDICT    │
-│   session:{uuid}  string    1.84M     6.1G    46%     3.5K      0%  ok         │
-│ ▾ cache:*         string    1.34M     3.6G    27%     2.8K     10%  mixed      │
-│     cache:search… string    1.12M     2.2G    16%     2.1K   ▲ 12%  mixed      │
-│     cache:produc… string     220K     1.4G    10%     6.7K      0%  ok         │
-│ ▾ user:{id}:*     mixed      896K     1.9G    14%     2.2K     59%  mixed      │
-│     user:{id}:ca… hash       388K     1.2G     9%     3.2K   ▲ 31%  mixed      │
-│     user:{id}:pr… hash       412K     553M     4%     1.4K    100%  persistent │
-└────────────────────────────────────────────────────────────────────────────────┘
+110 wide:
+┌─ Patterns ─────────────────────────────────────────── by memory ─┬─ user:{id}:cart ───────────────── hash ─┐
+│ PATTERN                TYPE     KEYS MEMORY▼ SHARE               │ 388K keys · 1.2G · 9% of memory         │
+│   session:{uuid}       string  1.84M    6.1G █████▌░░░░░░  46%   │ Typical key 2.8K · 99% under 41K        │
+│ ▾ cache:*              string  1.34M    3.6G ███▎░░░░░░░░  27% ▲ │ Largest 212K                            │
+│     cache:search:{has… string  1.12M    2.2G ██░░░░░░░░░░  16% ▲ │                                         │
+│     cache:product:{id} string   220K    1.4G █▎░░░░░░░░░░  10%   │ ▲ 31% of 388K keys never expire, while  │
+│ ▾ user:{id}:*          mixed    896K    1.9G █▊░░░░░░░░░░  14% ▲ │   the rest expire in about 7 days. A    │
+│     user:{id}:cart     hash     388K    1.2G █▏░░░░░░░░░░   9% ▲ │   write path probably skips EXPIRE.     │
+│     user:{id}:profile  hash     412K    553M ▌░░░░░░░░░░░   4%   │                                         │
+│     user:{id}:feed     zset      96K    184M ▏░░░░░░░░░░░   1%   │ EXPIRES IN                              │
+│   tmp:import:{ulid}    string    48K    737M ▋░░░░░░░░░░░   5%   │ none <1m  <1h  <1d  <7d  <30d >30d      │
+│   queue:emails         list        1    612M ▌░░░░░░░░░░░   4% ▲ │ ▅▅▅  ·    ▁▁▁  ▁▁▁  ███  ·    ·         │
+│   rl:{ip}:{id}         string  2.31M    420M ▍░░░░░░░░░░░   3%   │                                         │
+│   feature:{var}        string    212    302K ▏░░░░░░░░░░░  <1%   │ $ redis-cli --scan --pattern            │
+│   lock:{var}           string     14    2.1K ▏░░░░░░░░░░░  <1%   │   "user:*:cart"                         │
+│                                                                  │                                         │
+│                                                                  │ → lists its keys   y copies the pattern │
+│                                                                  │                                         │
+│ Estimated from 100,000 sampled keys of 7.92M. v shows more colum…│                                         │
+└──────────────────────────────────────────────────────────────────┴─────────────────────────────────────────┘
 
-75 wide:
-┌─ Patterns ───────────────────────────── 11 patterns · sorted by memory ─┐
-│ PATTERN    TYPE       KEYS   MEMORY▼     %      AVG  NO TTL  VERDICT    │
-│   session… string    1.84M     6.1G    46%     3.5K      0%  ok         │
-│ ▾ cache:*  string    1.34M     3.6G    27%     2.8K     10%  mixed      │
-│     cache… string    1.12M     2.2G    16%     2.1K   ▲ 12%  mixed      │
-│     cache… string     220K     1.4G    10%     6.7K      0%  ok         │
-│ ▾ user:{i… mixed      896K     1.9G    14%     2.2K     59%  mixed      │
-│     user:… hash       388K     1.2G     9%     3.2K   ▲ 31%  mixed      │
-│     user:… hash       412K     553M     4%     1.4K    100%  persistent │
-└─────────────────────────────────────────────────────────────────────────┘
+109 wide:
+┌─ Patterns ─────────────────────────────── by memory ─┬─ user:{id}:cart ──────────────────────────── hash ─┐
+│ PATTERN                               KEYS MEMORY▼   │ 388K keys · 1.2G · 9% of memory                    │
+│   session:{uuid}                     1.84M    6.1G   │ Typical key 2.8K · 99% under 41K                   │
+│ ▾ cache:*                            1.34M    3.6G ▲ │ Largest 212K                                       │
+│     cache:search:{hash}              1.12M    2.2G ▲ │                                                    │
+│     cache:product:{id}                220K    1.4G   │ ▲ 31% of 388K keys never expire, while the rest    │
+│ ▾ user:{id}:*                         896K    1.9G ▲ │   expire in about 7 days. A write path probably    │
+│     user:{id}:cart                    388K    1.2G ▲ │   skips EXPIRE.                                    │
+│     user:{id}:profile                 412K    553M   │                                                    │
+│     user:{id}:feed                     96K    184M   │ EXPIRES IN                                         │
+│   tmp:import:{ulid}                    48K    737M   │ none <1m  <1h  <1d  <7d  <30d >30d                 │
+│   queue:emails                           1    612M ▲ │ ▅▅▅  ·    ▁▁▁  ▁▁▁  ███  ·    ·                    │
+│   rl:{ip}:{id}                       2.31M    420M   │                                                    │
+│   feature:{var}                        212    302K   │ EXAMPLE KEYS                        SIZE   EXPIRES │
+│   lock:{var}                            14    2.1K   │ user:10442:cart                     212K     never │
+│                                                      │                                                    │
+│                                                      │ $ redis-cli --scan --pattern "user:*:cart"         │
+│                                                      │                                                    │
+│ from 100,000 sampled keys · v more                   │ → lists its keys   y copies the pattern            │
+└──────────────────────────────────────────────────────┴────────────────────────────────────────────────────┘
 
-74 wide:
-┌─ Patterns ──────────────────────────── 11 patterns · sorted by memory ─┐
-│ PATTERN            TYPE       KEYS   MEMORY▼     %  NO TTL  VERDICT    │
-│   session:{uuid}   string    1.84M     6.1G    46%      0%  ok         │
-│ ▾ cache:*          string    1.34M     3.6G    27%     10%  mixed      │
-│     cache:search:… string    1.12M     2.2G    16%   ▲ 12%  mixed      │
-│     cache:product… string     220K     1.4G    10%      0%  ok         │
-│ ▾ user:{id}:*      mixed      896K     1.9G    14%     59%  mixed      │
-│     user:{id}:cart hash       388K     1.2G     9%   ▲ 31%  mixed      │
-│     user:{id}:pro… hash       412K     553M     4%    100%  persistent │
-└────────────────────────────────────────────────────────────────────────┘
+80 wide:
+┌─ Patterns ───────────────── by memory ─┬─ user:{id}:cart ───────────── hash ─┐
+│ PATTERN                 KEYS MEMORY▼   │ 388K keys · 1.2G · 9% of memory     │
+│   session:{uuid}       1.84M    6.1G   │ Typical key 2.8K, largest 212K      │
+│ ▾ cache:*              1.34M    3.6G ▲ │                                     │
+│     cache:search:{ha…  1.12M    2.2G ▲ │ ▲ 31% of 388K keys never expire,    │
+│     cache:product:{i…   220K    1.4G   │   while the rest expire in about 7  │
+│ ▾ user:{id}:*           896K    1.9G ▲ │   days. A write path probably skips │
+│     user:{id}:cart      388K    1.2G ▲ │   EXPIRE.                           │
+│     user:{id}:profile   412K    553M   │                                     │
+│     user:{id}:feed       96K    184M   │ EXPIRES IN                          │
+│   tmp:import:{ulid}      48K    737M   │ none <1m  <1h  <1d  <7d  <30d >30d  │
+│   queue:emails             1    612M ▲ │ ▅▅▅  ·    ▁▁▁  ▁▁▁  ███  ·    ·     │
+│   rl:{ip}:{id}         2.31M    420M   │                                     │
+│   feature:{var}          212    302K   │ EXAMPLE KEYS         SIZE   EXPIRES │
+│   lock:{var}              14    2.1K   │ user:10442:cart      212K     never │
+│                                        │ user:331870:cart     4.4K    6d 11h │
+│                                        │ user:88213:cart      3.1K    6d 23h │
+│                                        │                                     │
+│ from 100,000 sampled keys · v more     │ → lists its keys                    │
+└────────────────────────────────────────┴─────────────────────────────────────┘
 
-66 wide:
-┌─ Patterns ──────────────────── 11 patterns · sorted by memory ─┐
-│ PATTERN    TYPE       KEYS   MEMORY▼     %  NO TTL  VERDICT    │
-│   session… string    1.84M     6.1G    46%      0%  ok         │
-│ ▾ cache:*  string    1.34M     3.6G    27%     10%  mixed      │
-│     cache… string    1.12M     2.2G    16%   ▲ 12%  mixed      │
-│     cache… string     220K     1.4G    10%      0%  ok         │
-│ ▾ user:{i… mixed      896K     1.9G    14%     59%  mixed      │
-│     user:… hash       388K     1.2G     9%   ▲ 31%  mixed      │
-│     user:… hash       412K     553M     4%    100%  persistent │
-└────────────────────────────────────────────────────────────────┘
+60 wide:
+┌─ Patterns ────── by memory ─┬─ user:{id}:cart ──── hash ─┐
+│ PATTERN      KEYS MEMORY▼   │ 388K keys · 1.2G · 9% of m…│
+│   session…  1.84M    6.1G   │ Typical key 2.8K, largest …│
+│ ▾ cache:*   1.34M    3.6G ▲ │                            │
+│     cache…  1.12M    2.2G ▲ │ ▲ 31% of 388K keys never   │
+│     cache…   220K    1.4G   │   expire, while the rest   │
+│ ▾ user:{i…   896K    1.9G ▲ │   expire in about 7 days.  │
+│     user:…   388K    1.2G ▲ │   A write path probably    │
+│     user:…   412K    553M   │   skips EXPIRE.            │
+│     user:…    96K    184M   │                            │
+│   tmp:imp…    48K    737M   │ EXPIRES IN                 │
+│   queue:e…      1    612M ▲ │ none <1m  <1h  <1d  <7d  <…│
+│   rl:{ip}…  2.31M    420M   │ ▅▅▅  ·    ▁▁▁  ▁▁▁  ███  ·…│
+│   feature…    212    302K   │                            │
+│   lock:{v…     14    2.1K   │ EXAMPLE K…  SIZE   EXPIRES │
+│                             │ user:1044…  212K     never │
+│                             │ user:3318…  4.4K    6d 11h │
+│                             │                            │
+│ from 100,000 sampled keys ·…│ → lists its keys           │
+└─────────────────────────────┴────────────────────────────┘
 
-50 wide:
-┌─ Patterns ──── 11 patterns · sorted by memory ─┐
-│ PATTERN    TYPE       KEYS   MEMORY▼     %  NO │
-│   session… string    1.84M     6.1G    46%     │
-│ ▾ cache:*  string    1.34M     3.6G    27%     │
-│     cache… string    1.12M     2.2G    16%   ▲ │
-│     cache… string     220K     1.4G    10%     │
-│ ▾ user:{i… mixed      896K     1.9G    14%     │
-│     user:… hash       388K     1.2G     9%   ▲ │
-│     user:… hash       412K     553M     4%    1│
-└────────────────────────────────────────────────┘
+with v:
+
+120 wide:
+┌─ Patterns ──────────────────────────────────────────────────────────── by memory ─┬─ user:{id}:cart ────────── hash ─┐
+│ PATTERN                  TYPE     KEYS MEMORY▼ SHARE                AVG  NO TTL   │ 388K keys · 1.2G · 9% of memory  │
+│   session:{uuid}         string  1.84M    6.1G █████▌░░░░░░  46%   3.5K      0%   │ Typical key 2.8K, largest 212K   │
+│ ▾ cache:*                string  1.34M    3.6G ███▎░░░░░░░░  27%   2.8K     10% ▲ │                                  │
+│     cache:search:{hash}  string  1.12M    2.2G ██░░░░░░░░░░  16%   2.1K     12% ▲ │ ▲ 31% of 388K keys never expire, │
+│     cache:product:{id}   string   220K    1.4G █▎░░░░░░░░░░  10%   6.7K      0%   │   while the rest expire in about │
+│ ▾ user:{id}:*            mixed    896K    1.9G █▊░░░░░░░░░░  14%   2.2K     59% ▲ │   7 days. A write path probably  │
+│     user:{id}:cart       hash     388K    1.2G █▏░░░░░░░░░░   9%   3.2K     31% ▲ │   skips EXPIRE.                  │
+│     user:{id}:profile    hash     412K    553M ▌░░░░░░░░░░░   4%   1.4K    100%   │                                  │
+│     user:{id}:feed       zset      96K    184M ▏░░░░░░░░░░░   1%   2.0K      0%   │ EXPIRES IN                       │
+│   tmp:import:{ulid}      string    48K    737M ▋░░░░░░░░░░░   5%    16K    100%   │ none <1m  <1h  <1d  <7d  <30d >3…│
+│   queue:emails           list        1    612M ▌░░░░░░░░░░░   4%   612M    100% ▲ │ ▅▅▅  ·    ▁▁▁  ▁▁▁  ███  ·    · …│
+│   rl:{ip}:{id}           string  2.31M    420M ▍░░░░░░░░░░░   3%   190B      0%   │                                  │
+│   feature:{var}          string    212    302K ▏░░░░░░░░░░░  <1%   1.4K    100%   │ EXAMPLE KEYS      SIZE   EXPIRES │
+│   lock:{var}             string     14    2.1K ▏░░░░░░░░░░░  <1%   150B      0%   │ user:10442:cart   212K     never │
+│                                                                                   │ user:331870:cart  4.4K    6d 11h │
+│                                                                                   │ user:88213:cart   3.1K    6d 23h │
+│                                                                                   │                                  │
+│ Estimated from 100,000 sampled keys of 7.92M. v shows fewer columns.              │ → lists its keys                 │
+└───────────────────────────────────────────────────────────────────────────────────┴──────────────────────────────────┘
+
+100 wide:
+┌─ Patterns ────────────────────────────────────────────── by memory ─┬─ user:{id}:cart ──── hash ─┐
+│ PATTERN                      TYPE     KEYS MEMORY▼    AVG  NO TTL   │ 388K keys · 1.2G · 9% of m…│
+│   session:{uuid}             string  1.84M    6.1G   3.5K      0%   │ Typical key 2.8K, largest …│
+│ ▾ cache:*                    string  1.34M    3.6G   2.8K     10% ▲ │                            │
+│     cache:search:{hash}      string  1.12M    2.2G   2.1K     12% ▲ │ ▲ 31% of 388K keys never   │
+│     cache:product:{id}       string   220K    1.4G   6.7K      0%   │   expire, while the rest   │
+│ ▾ user:{id}:*                mixed    896K    1.9G   2.2K     59% ▲ │   expire in about 7 days.  │
+│     user:{id}:cart           hash     388K    1.2G   3.2K     31% ▲ │   A write path probably    │
+│     user:{id}:profile        hash     412K    553M   1.4K    100%   │   skips EXPIRE.            │
+│     user:{id}:feed           zset      96K    184M   2.0K      0%   │                            │
+│   tmp:import:{ulid}          string    48K    737M    16K    100%   │ EXPIRES IN                 │
+│   queue:emails               list        1    612M   612M    100% ▲ │ none <1m  <1h  <1d  <7d  <…│
+│   rl:{ip}:{id}               string  2.31M    420M   190B      0%   │ ▅▅▅  ·    ▁▁▁  ▁▁▁  ███  ·…│
+│   feature:{var}              string    212    302K   1.4K    100%   │                            │
+│   lock:{var}                 string     14    2.1K   150B      0%   │ EXAMPLE K…  SIZE   EXPIRES │
+│                                                                     │ user:1044…  212K     never │
+│                                                                     │ user:3318…  4.4K    6d 11h │
+│                                                                     │                            │
+│ Estimated from 100,000 sampled keys of 7.92M. v shows fewer columns.│ → lists its keys           │
+└─────────────────────────────────────────────────────────────────────┴────────────────────────────┘
+
+80 wide:
+┌─ Patterns ──────────────────────────────── by memory ─┬─ user:{id}:cart ─────┐
+│ PATTERN               TYPE     KEYS MEMORY▼  NO TTL   │ 388K keys · 1.2G · 9…│
+│   session:{uuid}      string  1.84M    6.1G      0%   │ Typical key 2.8K, la…│
+│ ▾ cache:*             string  1.34M    3.6G     10% ▲ │                      │
+│     cache:search:{ha… string  1.12M    2.2G     12% ▲ │ ▲ 31% of 388K keys   │
+│     cache:product:{i… string   220K    1.4G      0%   │   never expire,      │
+│ ▾ user:{id}:*         mixed    896K    1.9G     59% ▲ │   while the rest     │
+│     user:{id}:cart    hash     388K    1.2G     31% ▲ │   expire in about 7  │
+│     user:{id}:profile hash     412K    553M    100%   │   days. A write path │
+│     user:{id}:feed    zset      96K    184M      0%   │   probably skips     │
+│   tmp:import:{ulid}   string    48K    737M    100%   │   EXPIRE.            │
+│   queue:emails        list        1    612M    100% ▲ │                      │
+│   rl:{ip}:{id}        string  2.31M    420M      0%   │ EXPIRES IN           │
+│   feature:{var}       string    212    302K    100%   │ none <1m  <1h  <1d  …│
+│   lock:{var}          string     14    2.1K      0%   │ ▅▅▅  ·    ▁▁▁  ▁▁▁  …│
+│                                                       │                      │
+│                                                       │ → lists its keys     │
+│                                                       │                      │
+│ from 100,000 sampled keys · v fewer                   │                      │
+└───────────────────────────────────────────────────────┴──────────────────────┘

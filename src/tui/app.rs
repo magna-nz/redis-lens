@@ -996,6 +996,9 @@ pub struct PatternData<'a> {
     pub sizes_available: bool,
     /// `Some` while these are partial results of a running scan.
     pub partial: Option<&'a PartialPatterns>,
+    /// The rows come from key names alone, before an analysis
+    /// ([`views::names::NamesState`]): estimated counts, no type, size or TTL.
+    pub names: bool,
 }
 
 /// The add-connection input. Holds what the user typed, which may include a
@@ -1045,6 +1048,9 @@ pub struct PatternsState {
     /// instead of the merged ones; `esc` goes back. Cleared when the node is not in the
     /// report shown, or partial results (always merged) replace that report.
     pub node: Option<NodeKey>,
+    /// The key names read before an analysis, and the pattern tree they make: what
+    /// Browse › Keys shows until an analysis has results.
+    pub names: views::names::NamesState,
 }
 
 /// The selected row of the TTL, Diff, Hot keys and Nodes views. Each view keeps its own.
@@ -1158,6 +1164,9 @@ pub struct App {
     /// List rows visible on screen, set by the runtime from the terminal size (see
     /// [`App::set_list_rows`]). PgUp and PgDn move this far.
     list_rows: usize,
+    /// The same for Browse, whose lists fill the frame's height (see
+    /// [`App::set_browse_rows`]).
+    browse_rows: usize,
     /// The value of `tick` when the selected row last changed. The marquee that scrolls
     /// a long selected name counts from here (see [`App::sel_ticks`]).
     sel_since: u64,
@@ -1225,8 +1234,13 @@ impl Default for SelId {
 }
 
 /// What the Patterns view shows for `s`, narrowed to `node` when it is set and in the
-/// report: see [`App::pattern_data`].
-fn pattern_data_of<'a>(s: &'a Session, node: Option<&NodeKey>) -> Option<PatternData<'a>> {
+/// report: see [`App::pattern_data`]. Before any analysis results, the patterns from
+/// the key names read so far (`names`), once their reading started.
+fn pattern_data_of<'a>(
+    s: &'a Session,
+    node: Option<&NodeKey>,
+    names: &'a views::names::NamesState,
+) -> Option<PatternData<'a>> {
     if let Some(r) = &s.report {
         if let Some(n) = node
             .and_then(|k| k.find(r))
@@ -1236,20 +1250,41 @@ fn pattern_data_of<'a>(s: &'a Session, node: Option<&NodeKey>) -> Option<Pattern
                 patterns: &n.patterns,
                 sizes_available: n.sizes_available,
                 partial: None,
+                names: false,
             });
         }
         return Some(PatternData {
             patterns: &r.patterns,
             sizes_available: r.sizes_available,
             partial: None,
+            names: false,
         });
     }
-    let p = s.partial.as_deref()?;
-    Some(PatternData {
-        patterns: &p.patterns,
-        sizes_available: p.sizes_available,
-        partial: Some(p),
+    if let Some(p) = s.partial.as_deref() {
+        return Some(PatternData {
+            patterns: &p.patterns,
+            sizes_available: p.sizes_available,
+            partial: Some(p),
+            names: false,
+        });
+    }
+    names.started().then_some(PatternData {
+        patterns: &names.stats,
+        sizes_available: false,
+        partial: None,
+        names: true,
     })
+}
+
+/// The key count Browse's name estimates scale to: `DBSIZE` from the connect's figures
+/// (summed over a cluster's nodes), or the server line's.
+fn names_dbsize(s: &Session) -> u64 {
+    s.figures
+        .as_ref()
+        .and_then(|f| f.server.as_ref())
+        .map(|f| f.headline().keys)
+        .or_else(|| s.server.as_ref().map(|i| i.total_keys))
+        .unwrap_or(0)
 }
 
 fn is_press(key: &KeyEvent) -> bool {
@@ -1372,6 +1407,7 @@ impl App {
             wall: None,
             tick: 0,
             list_rows: 0,
+            browse_rows: 0,
             sel_since: 0,
             sel_id: SelId::default(),
             now: None,
@@ -1544,7 +1580,11 @@ impl App {
     /// narrowed to it), or the partial results while the scan runs, or `None`.
     /// `self.patterns.tree` is always built from these.
     pub fn pattern_data(&self) -> Option<PatternData<'_>> {
-        pattern_data_of(self.session.as_ref()?, self.patterns.node.as_ref())
+        pattern_data_of(
+            self.session.as_ref()?,
+            self.patterns.node.as_ref(),
+            &self.patterns.names,
+        )
     }
 
     /// The node the Patterns view is narrowed to, with its index in the report's nodes:
@@ -1603,17 +1643,19 @@ impl App {
     /// (see [`PatternTree::find`]). When that row is gone the index stays, clamped to
     /// the rows.
     fn rebuild_patterns(&mut self, anchor: Option<(RowId, Vec<String>)>) {
-        let node = self.patterns.node.clone();
-        let Some(d) = self
-            .session
+        let App {
+            session,
+            patterns: p,
+            ..
+        } = self;
+        let Some(d) = session
             .as_ref()
-            .and_then(|s| pattern_data_of(s, node.as_ref()))
+            .and_then(|s| pattern_data_of(s, p.node.as_ref(), &p.names))
         else {
-            self.patterns.tree = PatternTree::default();
-            self.patterns.sel = 0;
+            p.tree = PatternTree::default();
+            p.sel = 0;
             return;
         };
-        let p = &mut self.patterns;
         p.tree = PatternTree::build_sorted(d.patterns, d.sizes_available, p.sort);
         p.collapsed.reconcile(&p.tree, d.patterns);
         let rows = p.tree.visible(d.patterns, &p.collapsed, &p.filter);
@@ -1692,9 +1734,19 @@ impl App {
         self.list_rows = rows;
     }
 
+    /// Sets how many list rows a Browse list shows, the page for PgUp and PgDn there.
+    /// The runtime calls it on every frame with `ui::browse_rows` of the terminal area.
+    pub fn set_browse_rows(&mut self, rows: usize) {
+        self.browse_rows = rows;
+    }
+
     /// How far PgUp and PgDn move: the visible list rows, at least one. On an area
-    /// with panels the sub-tab row takes one of the rows `ui::list_rows` counts.
+    /// with panels the sub-tab row takes one of the rows `ui::list_rows` counts; Browse
+    /// has its own count.
     fn page(&self) -> usize {
+        if self.area == Area::Browse && self.browse_rows > 0 {
+            return self.browse_rows;
+        }
         let panel_row = usize::from(self.area.has_panels());
         self.list_rows.saturating_sub(panel_row).max(1)
     }
@@ -2066,6 +2118,9 @@ impl App {
         let mut out = self.on_active("hide", |v, act| v.on_hide(act));
         self.set_screen(to);
         out.extend(self.on_active("show", |v, act| v.on_show(act)));
+        if to == Screen::Patterns {
+            out.extend(self.read_names());
+        }
         out
     }
 
@@ -2206,6 +2261,10 @@ impl App {
             Some(c @ ('[' | ']')) if views::picks_node(screen) => return self.pick_node(c == ']'),
             Some('s') if screen.is_scan_view() => return self.save_snapshot(),
             Some('r') if screen.analyzes() => return self.open_analyze(),
+            // Streams are found by an analysis: before one, `r` starts it.
+            Some('r') if screen == Screen::Streams && self.report().is_none() => {
+                return self.open_analyze();
+            }
             Some('r') if screen.is_live_view() => return self.refresh(),
             Some('y') if copies(screen) => {
                 return self.copy(false);
@@ -2666,7 +2725,11 @@ impl App {
                 s.trend = None;
             }
         }
+        // A page of names in flight goes with the replaced connection: it is asked
+        // again. A run that reads no key (a database switch) starts the names afresh.
+        self.patterns.names.lost();
         if analysis.is_none() {
+            self.patterns.names = Default::default();
             self.rebuild_patterns(None);
         }
         self.live_pending.clear();
@@ -2689,8 +2752,9 @@ impl App {
     }
 
     /// The notice when an analysis's report arrives: `✓ Analysis done: 10,000 keys in
-    /// 7 s. 5 things to look at on 1 Overview.`, or what a stopped one kept. `None` for
-    /// a run that did not analyze.
+    /// 7 s. 5 things to look at on 1 Overview.`, or what a stopped one kept. On Browse:
+    /// `✓ Analysis done: 10,000 keys. Overview lists 5 things to look at: press 1.`
+    /// `None` for a run that did not analyze.
     fn done_notice(&self) -> Option<String> {
         let s = self.session.as_ref()?;
         s.analysis?;
@@ -2714,6 +2778,15 @@ impl App {
             ));
         }
         let n = self.overview_findings();
+        if self.area == Area::Browse {
+            // Browse shows the new tree: the notice points to Overview's findings.
+            let things = match n {
+                0 => "Nothing stands out on Overview (1).".to_string(),
+                1 => "Overview lists 1 thing to look at: press 1.".to_string(),
+                n => format!("Overview lists {n} things to look at: press 1."),
+            };
+            return Some(format!("✓ Analysis done: {keys} keys. {things}"));
+        }
         let things = match n {
             0 => "Nothing stands out".to_string(),
             1 => "1 thing to look at".to_string(),
@@ -3198,6 +3271,7 @@ impl App {
             }
             (KeyCode::Esc, _) if self.patterns.node.is_some() => return self.leave_node(),
             (_, Some('o')) => self.cycle_sort(),
+            (_, Some('n')) => return self.more_names(),
             (_, Some('x')) => return self.bulk_start(false),
             (_, Some('D')) => return self.bulk_start(true),
             _ => {}
@@ -3257,11 +3331,101 @@ impl App {
         out
     }
 
-    /// `o`: the next sort (see [`SortBy::next`]). The selected row stays selected.
+    /// The key names before an analysis (brief, decision 3): starts reading them the
+    /// first time Browse › Keys shows with the live connection open, then asks for the
+    /// next page while the first [`views::names::FIRST_PAGES`] (or one more after `n`)
+    /// are not read. One page at a time, each one `SCAN` through the budget. Nothing
+    /// once an analysis has results, or while one runs.
+    fn read_names(&mut self) -> Vec<Effect> {
+        let Some(s) = self.session.as_ref() else {
+            return Vec::new();
+        };
+        if s.live != LiveState::Ready
+            || s.report.is_some()
+            || s.partial.is_some()
+            || matches!(s.phase, Phase::Scanning | Phase::Connecting)
+        {
+            return Vec::new();
+        }
+        let id = s.id;
+        if !self.patterns.names.started() {
+            if self.screen() != Screen::Patterns {
+                return Vec::new();
+            }
+            let dbsize = names_dbsize(s);
+            let nodes = s.nodes.clone();
+            self.patterns.names.start(&nodes, dbsize);
+            self.rebuild_patterns(None);
+        }
+        let Some(ask) = self.patterns.names.next_page() else {
+            return Vec::new();
+        };
+        let req_id = ReqId(self.next_req);
+        self.next_req += 1;
+        let effect = Effect::Live {
+            id,
+            req_id,
+            to: ask.dest.clone(),
+            req: ask.req.clone(),
+        };
+        self.patterns.names.sent(Some(req_id), ask);
+        vec![effect]
+    }
+
+    /// The answer to a page of key names ([`Self::read_names`]): the tree grows, the
+    /// selection stays on its row, and the next page is asked for if one is due.
+    fn names_reply(
+        &mut self,
+        result: Result<crate::live::LiveReply, crate::live::LiveError>,
+    ) -> Vec<Effect> {
+        let shown = self.pattern_data().is_some_and(|d| d.names);
+        let anchor = if shown { self.selection_anchor() } else { None };
+        self.patterns.names.reply(result);
+        if shown {
+            self.rebuild_patterns(anchor);
+        }
+        self.read_names()
+    }
+
+    /// `n` on Browse › Keys: 1,000 more key names. Once an analysis has results the
+    /// tree is the analysis's, so it says so instead.
+    fn more_names(&mut self) -> Vec<Effect> {
+        if self.pattern_data().is_some_and(|d| !d.names) {
+            let text = if self.analysis_running() {
+                "An analysis is running: its patterns replace the key names."
+            } else {
+                "These patterns come from the analysis. r analyzes again."
+            };
+            self.set_info(text);
+            return Vec::new();
+        }
+        if self.analysis_running() {
+            self.set_info("An analysis is running: its patterns replace the key names.");
+            return Vec::new();
+        }
+        match self.patterns.names.more() {
+            Ok(()) => self.read_names(),
+            Err(why) => {
+                self.set_info(why);
+                Vec::new()
+            }
+        }
+    }
+
+    /// `o`: the next sort (see [`SortBy::next`]). The selected row stays selected. On
+    /// the rows from key names, only keys and name: nothing else is known.
     fn cycle_sort(&mut self) {
-        let sizes = self.pattern_data().is_none_or(|d| d.sizes_available);
+        let data = self.pattern_data();
+        let sizes = data.is_none_or(|d| d.sizes_available);
+        let names = data.is_some_and(|d| d.names);
         let anchor = self.selection_anchor();
-        self.patterns.sort = self.patterns.sort.next(sizes);
+        self.patterns.sort = if !names {
+            self.patterns.sort.next(sizes)
+        } else if self.patterns.sort.effective(false) == SortBy::Name {
+            SortBy::Keys
+        } else {
+            SortBy::Name
+        };
         self.rebuild_patterns(anchor);
         let label = self.patterns.sort.effective(sizes).label();
         self.set_info(format!("Sorted by {label}"));
@@ -3276,9 +3440,16 @@ impl App {
 
     /// Collapses `g`, remembering its patterns (see [`Collapsed`]).
     fn collapse_group(&mut self, g: &Group) {
-        let node = self.patterns.node.as_ref();
-        if let Some(d) = self.session.as_ref().and_then(|s| pattern_data_of(s, node)) {
-            self.patterns.collapsed.collapse(g, d.patterns);
+        let App {
+            session,
+            patterns: p,
+            ..
+        } = self;
+        if let Some(d) = session
+            .as_ref()
+            .and_then(|s| pattern_data_of(s, p.node.as_ref(), &p.names))
+        {
+            p.collapsed.collapse(g, d.patterns);
         }
     }
 
@@ -3354,6 +3525,9 @@ impl App {
                 let mut out = self.apply_inner(Msg::Tick);
                 // Only the view on screen polls.
                 out.extend(self.on_active("tick", |v, act| v.on_tick(now, act)));
+                if self.screen() == Screen::Patterns {
+                    out.extend(self.read_names());
+                }
                 out.extend(self.cmdline_tick(now));
                 return out;
             }
@@ -3697,7 +3871,10 @@ impl App {
                 {
                     s.live = LiveState::Ready;
                     // A tail a database switch ended subscribes again.
-                    return self.resubscribe_after_switch();
+                    let mut out = self.resubscribe_after_switch();
+                    // Browse › Keys on screen reads its key names now.
+                    out.extend(self.read_names());
+                    return out;
                 }
             }
             Msg::Live {
@@ -3717,6 +3894,10 @@ impl App {
                 if self.dbs_waits_for(req_id) {
                     self.dbs_reply(req_id, result);
                     return Vec::new();
+                }
+                // And a page of key names (Browse › Keys before an analysis).
+                if self.patterns.names.waits_for(req_id) {
+                    return self.names_reply(result);
                 }
                 // Back to the view that sent it; an id no view waits for any more (its
                 // connection closed in between) is dropped.
@@ -3741,6 +3922,7 @@ impl App {
                 }
                 self.live_pending.clear();
                 self.live_writes.clear();
+                self.patterns.names.lost();
                 self.close_write_question();
                 self.bulk_closed();
                 self.dbs_closed();
@@ -8485,5 +8667,408 @@ mod tests {
         assert_eq!(app.screen(), Screen::Patterns);
         assert!(app.confirm.is_none());
         assert!(app.bulk.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Browse before an analysis: the tree from key names
+    // -----------------------------------------------------------------------
+
+    use crate::live::names::{Page as NamesPage, Reply as NamesReply, Request as NamesRequest};
+    use crate::live::{Dest, LiveReply, LiveRequest};
+
+    /// The SCAN pages among `effects`: request id, where it goes, the cursor.
+    fn name_pages(effects: &[Effect]) -> Vec<(ReqId, Dest, u64)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Live {
+                    req_id,
+                    to,
+                    req: LiveRequest::Names(NamesRequest::Page { cursor, glob: None }),
+                    ..
+                } => Some((*req_id, to.clone(), *cursor)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every live request among `effects` that is not a page of key names.
+    fn other_requests(effects: &[Effect]) -> Vec<LiveRequest> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Live { req, .. } if !matches!(req, LiveRequest::Names(_)) => {
+                    Some(req.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn names_reply(app: &mut App, req_id: ReqId, names: &[&str], cursor: u64) -> Vec<Effect> {
+        let id = app.session.as_ref().unwrap().id;
+        app.apply(Msg::Live {
+            id,
+            scan: scan_of(app),
+            req_id,
+            result: Ok(LiveReply::Names(NamesReply::Page(NamesPage {
+                names: names.iter().map(|n| (*n).to_string()).collect(),
+                cursor,
+                unreadable: 0,
+            }))),
+        })
+    }
+
+    /// The names tree's rows as `(pattern, estimated keys)`.
+    fn name_rows(app: &App) -> Vec<(String, u64)> {
+        let d = app.pattern_data().expect("names rows");
+        assert!(d.names, "the rows come from key names");
+        let mut out: Vec<(String, u64)> = d
+            .patterns
+            .iter()
+            .map(|p| (p.pattern.clone(), p.est_keys))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn screen_text(app: &App, w: u16, h: u16) -> String {
+        let t = views::testing::render(app, w, h);
+        let b = t.backend().buffer();
+        let mut out = String::new();
+        for y in 0..b.area.height {
+            for x in 0..b.area.width {
+                out.push_str(b[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Ten names a page: four carts, three profiles, two sessions and the queue.
+    fn ten_names(page: u64) -> Vec<String> {
+        let mut v: Vec<String> = (0..4)
+            .map(|i| format!("user:{}:cart", page * 10 + i))
+            .collect();
+        v.extend((0..3).map(|i| format!("user:{}:profile", page * 10 + i)));
+        v.extend((0..2).map(|i| format!("session:{page}a{i}f0e9a2d6b47e8c")));
+        v.push("queue:emails".into());
+        v
+    }
+
+    #[test]
+    fn browse_reads_key_names_one_scan_page_at_a_time_and_n_reads_more() {
+        let (mut app, _) = just_connected();
+        let effects = app.handle_key(ch('2'));
+        assert_eq!(app.screen(), Screen::Patterns);
+        // One SCAN at a time, from cursor 0, and nothing else.
+        let mut pages = name_pages(&effects);
+        assert_eq!(pages.len(), 1, "{effects:?}");
+        assert_eq!(pages[0].2, 0);
+        assert!(other_requests(&effects).is_empty());
+        // Eight pages first, each asked for when the one before is in.
+        for page in 1..=views::names::FIRST_PAGES {
+            let (req_id, _, _) = pages[0].clone();
+            let names = ten_names(page);
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let effects = names_reply(&mut app, req_id, &refs, 100 + page);
+            assert!(other_requests(&effects).is_empty());
+            pages = name_pages(&effects);
+            if page < views::names::FIRST_PAGES {
+                assert_eq!(pages.len(), 1, "page {page}");
+                assert_eq!(pages[0].2, 100 + page, "the walk goes on from the cursor");
+            } else {
+                assert!(pages.is_empty(), "eight pages, then it waits for n");
+            }
+        }
+        assert_eq!(app.patterns.names.pages, 8);
+        assert_eq!(app.patterns.names.names_read(), 73);
+        let text = screen_text(&app, 80, 24);
+        assert!(text.contains("73 names read · n reads more"), "{text}");
+        assert!(text.contains("names only, no analysis yet"), "{text}");
+        assert!(text.contains("n More names"), "{text}");
+        // Ticks do not read more on their own.
+        assert!(name_pages(&app.apply(Msg::Tick)).is_empty());
+        // `n`: one page more, then it waits again.
+        let pages = name_pages(&app.handle_key(ch('n')));
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].2, 108);
+        let names = ten_names(9);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let effects = names_reply(&mut app, pages[0].0, &refs, 0);
+        assert!(name_pages(&effects).is_empty());
+        // Cursor 0: every name is read, and `n` says so.
+        assert!(app.patterns.names.complete());
+        assert!(name_pages(&app.handle_key(ch('n'))).is_empty());
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("Every key name is read")
+        );
+    }
+
+    #[test]
+    fn name_counts_are_estimated_from_dbsize_and_exact_once_every_name_is_read() {
+        let (mut app, _) = just_connected();
+        let dbsize = names_dbsize(app.session.as_ref().unwrap());
+        assert_eq!(dbsize, 7_920_000);
+        let pages = name_pages(&app.handle_key(ch('2')));
+        // 3 carts and 1 profile of 4 names: 3/4 and 1/4 of DBSIZE.
+        let next = name_pages(&names_reply(
+            &mut app,
+            pages[0].0,
+            &[
+                "user:1:cart",
+                "user:2:cart",
+                "user:3:cart",
+                "user:1:profile",
+            ],
+            7,
+        ));
+        assert_eq!(
+            name_rows(&app),
+            [
+                ("user:{id}:cart".to_string(), 5_940_000),
+                ("user:{id}:profile".to_string(), 1_980_000)
+            ]
+        );
+        let text = screen_text(&app, 80, 24);
+        assert!(text.contains("~5.94M"), "{text}");
+        assert!(text.contains("(estimated from names)"), "{text}");
+        // No type, size, TTL or ▲ on a row from names.
+        for word in ["TYPE", "MEMORY", "TTL", "▲"] {
+            let rows: Vec<&str> = text.lines().filter(|l| l.contains("user:{id}:")).collect();
+            assert!(rows.iter().all(|l| !l.contains(word)), "{word}: {rows:?}");
+        }
+        // The rest of the walk: cursor 0, so the counts are the names seen.
+        assert_eq!(next.len(), 1);
+        names_reply(&mut app, next[0].0, &["user:4:cart"], 0);
+        assert_eq!(
+            name_rows(&app),
+            [
+                ("user:{id}:cart".to_string(), 4),
+                ("user:{id}:profile".to_string(), 1)
+            ]
+        );
+        assert!(screen_text(&app, 80, 24).contains("All 5 names read"));
+    }
+
+    #[test]
+    fn a_cluster_walk_reads_every_connected_primary_and_names_a_missing_one() {
+        let (mut app, _) = just_connected();
+        {
+            let s = app.session.as_mut().unwrap();
+            s.nodes = fixtures::live_nodes();
+            s.nodes[1].connected = false;
+        }
+        let missing = app.session.as_ref().unwrap().nodes[1].endpoint.to_string();
+        let pages = name_pages(&app.handle_key(ch('2')));
+        assert_eq!(pages.len(), 1);
+        // Each node on its own, never following a redirect.
+        let never = |i| Dest {
+            to: crate::live::To::Node(i),
+            follow: crate::live::Follow::Never,
+        };
+        assert_eq!(pages[0].1, never(0));
+        // Node 0 is done: the walk goes on with node 2, never node 1.
+        let pages = name_pages(&names_reply(&mut app, pages[0].0, &["user:1:cart"], 0));
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].1, never(2));
+        let effects = names_reply(&mut app, pages[0].0, &["user:2:cart"], 0);
+        assert!(name_pages(&effects).is_empty());
+        assert!(app.patterns.names.done());
+        assert!(!app.patterns.names.complete(), "a node was left out");
+        let text = screen_text(&app, 120, 36);
+        assert!(text.contains(&missing), "{text}");
+        assert!(
+            text.contains(&format!("▲ {missing}: not connected")),
+            "{text}"
+        );
+        assert!(text.contains("some nodes left out"), "{text}");
+    }
+
+    #[test]
+    fn a_refused_scan_turns_the_names_off_and_says_why() {
+        let (mut app, _) = just_connected();
+        let pages = name_pages(&app.handle_key(ch('2')));
+        let id = app.session.as_ref().unwrap().id;
+        let effects = app.apply(Msg::Live {
+            id,
+            scan: scan_of(&app),
+            req_id: pages[0].0,
+            result: Err(crate::live::LiveError::Denied("SCAN".into())),
+        });
+        // Not asked again, on a tick or `n`.
+        assert!(name_pages(&effects).is_empty());
+        assert!(name_pages(&app.apply(Msg::Tick)).is_empty());
+        assert!(name_pages(&app.handle_key(ch('n'))).is_empty());
+        assert_eq!(
+            app.patterns.names.error.as_deref(),
+            Some(views::names::SCAN_REFUSED)
+        );
+        let text = screen_text(&app, 120, 36);
+        assert!(
+            text.contains("The server refused SCAN for this user"),
+            "{text}"
+        );
+        assert!(!text.contains("NOPERM"));
+    }
+
+    #[test]
+    fn an_analysis_replaces_the_names_and_n_says_so() {
+        let (mut app, id) = just_connected();
+        let pages = name_pages(&app.handle_key(ch('2')));
+        names_reply(&mut app, pages[0].0, &["user:1:cart"], 5);
+        // A finished analysis: its patterns, sorted by memory.
+        app.handle_key(ch('r'));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { scan, .. }] = effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        connected(&mut app, id, scan);
+        app.apply(Msg::ScanDone {
+            id,
+            scan,
+            report: Box::new(fixtures::report(true)),
+        });
+        let d = app.pattern_data().unwrap();
+        assert!(!d.names);
+        assert_eq!(app.patterns.sort.effective(true), SortBy::Memory);
+        assert!(name_pages(&app.handle_key(ch('n'))).is_empty());
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("These patterns come from the analysis")
+        );
+        let text = screen_text(&app, 80, 24);
+        assert!(text.contains("sampled keys · v more"), "{text}");
+        assert!(!text.contains("names only"), "{text}");
+    }
+
+    #[test]
+    fn the_done_notice_on_browse_points_to_overview() {
+        let (mut app, id) = just_connected();
+        app.handle_key(ch('2'));
+        app.handle_key(ch('r'));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { scan, .. }] = effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        connected(&mut app, id, scan);
+        app.apply(Msg::ScanDone {
+            id,
+            scan,
+            report: sampled(10_000),
+        });
+        assert_eq!(app.area, Area::Browse);
+        let n = app.overview_findings();
+        assert!(n > 1);
+        assert_eq!(
+            app.notice.as_ref().unwrap().text,
+            format!("✓ Analysis done: 10,000 keys. Overview lists {n} things to look at: press 1.")
+        );
+    }
+
+    #[test]
+    fn v_shows_more_columns_on_browse() {
+        let mut app = views::testing::scanned();
+        let head = |app: &App, w| screen_text(app, w, 24).lines().nth(4).unwrap().to_string();
+        // 80: PATTERN, KEYS, MEMORY; 120: TYPE and SHARE too.
+        let h = head(&app, 80);
+        assert!(h.contains("KEYS") && h.contains("MEMORY"), "{h}");
+        assert!(!h.contains("TYPE") && !h.contains("AVG"), "{h}");
+        let h = head(&app, 120);
+        assert!(h.contains("TYPE") && h.contains("SHARE"), "{h}");
+        assert!(!h.contains("AVG") && !h.contains("NO TTL"), "{h}");
+        // `v`: AVG and NO TTL join in, and the bottom line says how to go back.
+        app.handle_key(ch('v'));
+        let h = head(&app, 120);
+        assert!(h.contains("AVG") && h.contains("NO TTL"), "{h}");
+        assert!(screen_text(&app, 120, 24).contains("v shows fewer columns"));
+        app.handle_key(ch('v'));
+        assert!(!head(&app, 120).contains("AVG"));
+    }
+
+    #[test]
+    fn search_is_dimmed_with_its_reason_when_the_module_is_missing() {
+        let (mut app, _) = views::testing::app_on(Screen::Search);
+        let id = app.session.as_ref().unwrap().id;
+        let entry = app.entries.iter_mut().find(|e| e.id == id).unwrap();
+        for c in &mut entry.perms.as_mut().unwrap().checks {
+            if c.label == crate::tui::app::views::PROBE_FT_LIST {
+                c.status = crate::model::PermStatus::Skipped("no search module".into());
+            }
+        }
+        let t = views::testing::render(&app, 80, 24);
+        let text = screen_text(&app, 80, 24);
+        // The reason, wrapped in the list pane.
+        assert!(
+            text.contains("FT._LIST is not available: no search"),
+            "{text}"
+        );
+        assert!(text.contains("Search is off: no search module"), "{text}");
+        // Dimmed: the reason, and Search on the sub-tab row.
+        let b = t.backend().buffer();
+        let y = text
+            .lines()
+            .position(|l| l.contains("FT._LIST is not"))
+            .unwrap() as u16;
+        let x = (0..80).find(|&x| b[(x, y)].symbol() == "F").unwrap();
+        assert_eq!(b[(x, y)].fg, crate::tui::ui::style::DIM);
+        insta::assert_snapshot!("search_dimmed_80x24", t.backend());
+        insta::assert_snapshot!(
+            "search_dimmed_120x36",
+            views::testing::render(&app, 120, 36).backend()
+        );
+    }
+
+    #[test]
+    fn browse_names_only_80x24_and_120x36() {
+        let (mut app, _) = just_connected();
+        let mut pages = name_pages(&app.handle_key(ch('2')));
+        let names = [
+            "session:c41f0e9a",
+            "session:7a2d9b14",
+            "session:9f1c2a7e",
+            "cache:search:3f9a6c0d",
+            "cache:search:a17e4d9b",
+            "cache:product:88410",
+            "user:10442:cart",
+            "user:331870:cart",
+            "user:73:profile",
+            "user:88213:feed",
+            "tmp:import:01HV3Y",
+            "rl:10.0.0.1:44",
+            "queue:emails",
+        ];
+        for page in 1..=views::names::FIRST_PAGES {
+            let (req_id, _, _) = pages[0].clone();
+            pages = name_pages(&names_reply(&mut app, req_id, &names, page));
+            if pages.is_empty() {
+                break;
+            }
+        }
+        insta::assert_snapshot!(
+            "browse_names_only_80x24",
+            views::testing::render(&app, 80, 24).backend()
+        );
+        insta::assert_snapshot!(
+            "browse_names_only_120x36",
+            views::testing::render(&app, 120, 36).backend()
+        );
+    }
+
+    #[test]
+    fn key_names_are_drawn_escaped() {
+        let (mut app, _) = just_connected();
+        let pages = name_pages(&app.handle_key(ch('2')));
+        names_reply(&mut app, pages[0].0, &["evil\u{1b}[2J", "user:1:cart"], 0);
+        let text = screen_text(&app, 120, 36);
+        assert!(text.contains("evil\\x1b[2J"), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
     }
 }

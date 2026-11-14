@@ -158,6 +158,7 @@ A panel of 2 Analysis, after Expiry.
 | `→` `l` `enter` | Open a pattern's keys, or expand a group and go in |
 | `←` `h` | Collapse a group, or go up to it |
 | `/` | Filter patterns by name |
+| `n` | Before an analysis: read 1,000 more key names |
 | `esc` | Clear the filter, or show all nodes again |
 | `o` | Sort by memory, keys, avg size, no-TTL % or name |
 | `y` | Copy the selected pattern to the clipboard |
@@ -220,7 +221,7 @@ A panel of 2 Analysis, after Expiry.
 | `y` | Copy the selected value as shown to the clipboard |
 | `esc` | Close the entries, or back to the list |
 | `p` | Pause or resume polling |
-| `r` | Refresh this panel now, or read the entries again |
+| `r` | Refresh this panel or the entries; before an analysis, analyze |
 | `c` | Claim pending entries for another consumer (writes) |
 | `A` | Acknowledge the selected pending entry (writes) |
 | `X` | Trim the stream (writes) |

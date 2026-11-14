@@ -86,6 +86,13 @@ pub fn list_rows(area: Rect) -> usize {
     usize::from(Block::bordered().inner(main).height.saturating_sub(1))
 }
 
+/// List rows a Browse list (Patterns, a pattern's keys, Streams, Search) shows on a
+/// screen of `area`: the body under the sub-tab row less the frame's two borders, the
+/// header row and the bottom line.
+pub fn browse_rows(area: Rect) -> usize {
+    usize::from(body_of(area, true).height.saturating_sub(4))
+}
+
 /// True while a dialog is open over the screen: the screen behind it is dimmed.
 pub fn dialog_open(app: &App) -> bool {
     app.help
@@ -165,6 +172,17 @@ fn view_state(frame: &mut Frame, area: Rect, app: &App, screen: Screen) {
         );
         return;
     };
+    // Browse › Streams and Search: dimmed in their two-pane frame, with the reason.
+    if let Some(why) = ctx.off_reason().filter(|_| screen.area() == Area::Browse) {
+        streams::browse_notice(
+            frame,
+            area,
+            title,
+            "off",
+            &[(format!(" {why}"), style::dim())],
+        );
+        return;
+    }
     if let Some(why) = ctx.off_reason() {
         let lines = vec![Line::from(Span::styled(
             format!(" ▲ {why}"),
@@ -178,8 +196,9 @@ fn view_state(frame: &mut Frame, area: Rect, app: &App, screen: Screen) {
     };
     let v = &app.views;
     match owner {
-        Owner::Keys => keys::draw(frame, area, &v.keys, &ctx),
-        Owner::Value => value::draw(frame, area, &v.value, &ctx),
+        // Browse › Keys, a pattern's keys and a key's value: two panes of one frame.
+        Owner::Keys => keys::draw(frame, area, app),
+        Owner::Value => value::draw(frame, area, app),
         Owner::Analysis => {
             if report_or_wait(frame, area, app, title).is_some() {
                 analysis::draw(frame, area, &v.analysis, &ctx);
@@ -713,7 +732,14 @@ fn sub_tabs(frame: &mut Frame, area: Rect, app: &App) {
     }
     // Old results kept during an analysis are marked in the panels' own titles
     // ([`mark_previous`]), not here.
-    let note = if app.area == Area::Browse && search_off(app) {
+    let names = current == Some(Panel::Keys) && app.pattern_data().is_some_and(|d| d.names);
+    let note = if app.area != Area::Browse {
+        String::new()
+    } else if names && app.analyzing() {
+        "names only until the analysis has results".to_string()
+    } else if names {
+        "names only, no analysis yet".to_string()
+    } else if search_off(app) {
         "Search is off: no search module".to_string()
     } else {
         String::new()

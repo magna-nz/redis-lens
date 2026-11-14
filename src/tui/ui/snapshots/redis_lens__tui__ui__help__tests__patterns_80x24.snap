@@ -1,6 +1,5 @@
 ---
 source: src/tui/ui/help.rs
-assertion_line: 163
 expression: "render(Screen::Patterns, \"\", 80, 24).backend()"
 ---
 "    ┌─ Help · Browse › Keys ────────────────────────────────── esc closes ─┐    "
@@ -14,6 +13,7 @@ expression: "render(Screen::Patterns, \"\", 80, 24).backend()"
 "    │ → l enter      Open a pattern's keys, or expand a group and go in    │    "
 "    │ ← h            Collapse a group, or go up to it                      │    "
 "    │ /              Filter patterns by name                               │    "
+"    │ n              Before an analysis: read 1,000 more key names         │    "
 "    │ esc            Clear the filter, or show all nodes again             │    "
 "    │ o              Sort by memory, keys, avg size, no-TTL % or name      │    "
 "    │ y              Copy the selected pattern to the clipboard            │    "
@@ -25,5 +25,4 @@ expression: "render(Screen::Patterns, \"\", 80, 24).backend()"
 "    │                                                                      │    "
 "    │ EVERYWHERE                                                           │    "
 "    │ 0              Connections, the home screen                          │    "
-"    │ 1 2 3 4 5      Overview, Browse, Analyze, Server, Pub/Sub            │    "
 "    └──────────────────────────────────────────────────────────────────────┘    "

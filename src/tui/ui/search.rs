@@ -1,10 +1,11 @@
 //! Draws [`SearchState`]. Owner: wave B, with `views/search.rs`.
 //!
-//! The indexes `FT._LIST` names, one row each, and the selected index's schema below,
-//! or the results of the query last run on it. Figures the module does not return are
-//! left out, with the reason, never shown as errors. One level deeper, over the whole
-//! body: a result's fields (the key detail's value panel), or the `FT.EXPLAIN` or
-//! `FT.PROFILE` text.
+//! Browse › Search: the indexes `FT._LIST` names on the left, one row each, and on the
+//! right the selected index's schema or the results of the query last run on it.
+//! Figures the module does not return are left out, with the reason, never shown as
+//! errors. One level deeper, in the right pane: a result's fields (the body of a key's
+//! value), or the `FT.EXPLAIN` or `FT.PROFILE` text. Without the module the panel is
+//! dimmed and says why.
 //!
 //! Every server string is escaped before it is drawn: index names, prefixes, field
 //! names, keys, and (through the value renderer) values.
@@ -22,15 +23,20 @@ use crate::tui::app::views::Ctx;
 use crate::tui::app::views::search::{Cmd, Deeper, Focus, Outcome, QueryRun, SearchState};
 use crate::value::{self, escape};
 
+use super::streams::browse_notice;
 use super::streams::live_wait;
-use super::widgets::{fit, pad_l, pad_r, panel, rows, scroll_offset, trunc, width};
-use super::{notice_panels, spinner, split_body, style};
+use super::widgets::{
+    Pane, Title, fit, pad_l, pad_r, rows, scroll_offset, split_frame, trunc, width,
+};
+use super::{spinner, style};
 
 const ON_W: usize = 5;
 const DOCS_W: usize = 7;
 const SIZE_W: usize = 6;
 const INDEXED_W: usize = 8;
 const FAILS_W: usize = 6;
+/// From this inner width on, the index list shows PREFIXES, ON, SIZE and FAILS without `v`.
+const WIDE_LIST: usize = 60;
 
 /// Which search module the server runs, for the reasons.
 fn module(ctx: &Ctx<'_>) -> &'static str {
@@ -71,104 +77,182 @@ fn on_node(ctx: &Ctx<'_>, right: &str) -> String {
 fn draw_view(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) {
     const TITLE: &str = "Search";
     if let Some(off) = &state.off {
-        let lines = vec![Line::from(Span::styled(
-            format!(" ▲ {off}"),
-            style::amber(),
-        ))];
-        notice_panels(frame, area, TITLE, &on_node(ctx, "off"), lines);
+        browse_notice(
+            frame,
+            area,
+            TITLE,
+            &on_node(ctx, "off"),
+            &[(format!(" ▲ {off}"), style::dim())],
+        );
         return;
     }
     if state.no_module {
-        let lines = vec![
-            Line::from(Span::styled(
-                " The Search module is not loaded on this server.",
-                style::fgb(),
-            )),
-            Line::from(Span::styled(
-                " FT._LIST is unknown, so there is no Redis Search (built into Redis 8)",
-                style::dim(),
-            )),
-            Line::from(Span::styled(
-                " or valkey-search to list indexes from. Press r to look again.",
-                style::dim(),
-            )),
-        ];
-        notice_panels(frame, area, TITLE, &on_node(ctx, "module missing"), lines);
+        browse_notice(
+            frame,
+            area,
+            TITLE,
+            &on_node(ctx, "module missing"),
+            &[
+                (
+                    " The Search module is not loaded on this server.".to_string(),
+                    style::dim(),
+                ),
+                (
+                    " FT._LIST is unknown, so there is no Redis Search (built into Redis 8) \
+                     or valkey-search to list indexes from. Press r to look again."
+                        .to_string(),
+                    style::dim(),
+                ),
+            ],
+        );
         return;
     }
     if !state.loaded
         && let Some(e) = &state.error
     {
-        let lines = vec![
-            Line::from(Span::styled(format!(" ▲ {}.", sentence(e)), style::amber())),
-            Line::from(Span::styled(" Press r to read again.", style::dim())),
-        ];
-        notice_panels(frame, area, TITLE, &on_node(ctx, "failed"), lines);
+        browse_notice(
+            frame,
+            area,
+            TITLE,
+            &on_node(ctx, "failed"),
+            &[
+                (format!(" ▲ {}.", sentence(e)), style::amber()),
+                (" Press r to read again.".to_string(), style::dim()),
+            ],
+        );
         return;
     }
     if !state.loaded {
         let text = live_wait(ctx).unwrap_or_else(|| "Reading the indexes with FT._LIST…".into());
-        let lines = vec![Line::from(Span::styled(format!(" {text}"), style::dim()))];
-        notice_panels(frame, area, TITLE, &on_node(ctx, ""), lines);
+        browse_notice(
+            frame,
+            area,
+            TITLE,
+            &on_node(ctx, ""),
+            &[(format!(" {text}"), style::dim())],
+        );
         return;
     }
     let name = module(ctx);
     if state.list.indexes.is_empty() {
-        let lines = vec![
-            Line::from(Span::styled(" The module has no indexes.", style::fgb())),
-            Line::from(Span::styled(
-                format!(" {name} is loaded; nothing was created with FT.CREATE yet."),
-                style::dim(),
-            )),
-        ];
-        notice_panels(frame, area, TITLE, &on_node(ctx, name), lines);
+        browse_notice(
+            frame,
+            area,
+            TITLE,
+            &on_node(ctx, name),
+            &[
+                (" The module has no indexes.".to_string(), style::fgb()),
+                (
+                    format!(" {name} is loaded; nothing was created with FT.CREATE yet."),
+                    style::dim(),
+                ),
+            ],
+        );
         return;
     }
 
-    if let Some(deeper) = &state.deeper {
-        draw_deeper(frame, area, state, deeper, ctx);
-        return;
-    }
-    let shown = state.shown_results();
-    let (main, detail) = match shown {
-        Some(_) => results_split(area, state.list.indexes.len()),
-        None => split_body(area),
-    };
     let list = &state.list;
-    let cut = if list.total > list.indexes.len() {
-        format!(" · first {} of {}", list.indexes.len(), list.total)
-    } else {
-        String::new()
-    };
+    let shown = state.shown_results();
     let live = if ctx.live_ready() { "" } else { "not live · " };
-    // On a cluster an index covers the picked node's keys: name it first.
-    let node = ctx
-        .node_title()
-        .map_or_else(String::new, |n| format!("{n} · "));
-    let inner = panel(frame, main, TITLE, &format!("{node}{live}{name}{cut}"));
-    let w = usize::from(inner.width);
+    let left_right = on_node(ctx, &format!("{live}{name}"));
+    let sel = state.sel.min(list.indexes.len() - 1);
+    let index = &list.indexes[sel];
+    let (right_title, right_right) = match (&state.deeper, shown) {
+        (Some(Deeper::Document(doc)), _) => {
+            let key = doc.row.as_ref().map_or("", |r| r.key.as_str());
+            let n = doc.loaded();
+            let mut right = Vec::new();
+            if let Some(raw) = doc.format_source() {
+                let d = doc.memo.decode(raw);
+                right.push(doc.shown_format(&d).label().to_string());
+            }
+            right.push(format!(
+                "{} field{}",
+                format::grouped(n as u64),
+                if n == 1 { "" } else { "s" }
+            ));
+            (format!("Result · {}", escape(key)), right.join(" · "))
+        }
+        (Some(Deeper::Text { cmd, index, .. }), _) => {
+            let what = match cmd {
+                Cmd::Profile => "Profile",
+                _ => "Explain",
+            };
+            (format!("{what} · {}", escape(index)), String::new())
+        }
+        (None, Some(run)) => (
+            format!("Results · {}", escape(&run.index)),
+            if run.cmd == Cmd::Profile {
+                "profiled".to_string()
+            } else {
+                String::new()
+            },
+        ),
+        (None, None) => (escape(&index.name), String::new()),
+    };
+    let focus = if state.deeper.is_some() || state.focus == Focus::Schema {
+        Pane::Right
+    } else {
+        Pane::Left
+    };
+    let (left, right) = split_frame(
+        frame,
+        area,
+        // Results and what is opened from them get the room of a key's value.
+        if shown.is_some() || state.deeper.is_some() {
+            super::value::list_width(area.width)
+        } else {
+            super::keys::list_width(area.width, ctx.more)
+        },
+        Title::new(TITLE, &left_right),
+        Title::new(&right_title, &right_right),
+        focus,
+    );
+    index_list(frame, left, state, ctx.more, state.deeper.is_some());
+    match (&state.deeper, shown) {
+        (Some(deeper), _) => draw_deeper(frame, right, state, deeper, ctx),
+        (None, Some(run)) => results_pane(frame, right, state, run, ctx),
+        (None, None) => detail_pane(frame, right, state, name),
+    }
+}
 
+/// The left pane: the indexes, one row each; INDEX and DOCS always, the rest the
+/// module returns from [`WIDE_LIST`] on or with `v`. Dimmed (but the selected one)
+/// while a result or a text is open on the right.
+fn index_list(frame: &mut Frame, inner: Rect, state: &SearchState, more: bool, dimmed: bool) {
+    let list = &state.list;
+    let w = usize::from(inner.width);
+    let all = w >= WIDE_LIST || more;
     let any = |f: fn(&IndexInfo) -> bool| list.indexes.iter().any(f);
-    let show_size = any(|i| i.bytes.is_some());
-    let show_indexed = any(|i| i.progress.is_some() || i.indexing.is_some());
-    let show_fails = any(|i| i.failures.is_some());
-    let fixed = ON_W
-        + 1
+    let show_size = all && any(|i| i.bytes.is_some());
+    // Beside results or a result, the list is narrow: INDEXED goes when the name
+    // would get fewer than 10 cells.
+    let show_indexed =
+        any(|i| i.progress.is_some() || i.indexing.is_some()) && w >= 1 + DOCS_W + INDEXED_W + 13;
+    let show_fails = all && any(|i| i.failures.is_some());
+    let fixed = 1
         + DOCS_W
-        + 1
+        + if all { ON_W } else { 0 }
         + if show_size { SIZE_W + 1 } else { 0 }
         + if show_indexed { INDEXED_W + 1 } else { 0 }
         + if show_fails { FAILS_W + 1 } else { 0 };
-    let avail = w.saturating_sub(1 + fixed).max(10);
-    let pw = avail / 2;
+    // One cell of margin on the right.
+    let avail = w.saturating_sub(fixed + 1).max(10);
+    let pw = if all { avail / 2 } else { 0 };
     let nw = avail - pw;
 
-    let mut head = vec![
-        Span::styled(pad_r(" INDEX", nw), style::hd()),
-        Span::styled(pad_r("PREFIXES", pw), style::hd()),
-        Span::styled(format!(" {}", pad_r("ON", ON_W - 1)), style::hd()),
-        Span::styled(format!(" {}", pad_l("DOCS", DOCS_W)), style::hd()),
-    ];
+    let mut head = vec![Span::styled(pad_r(" INDEX", nw), style::hd())];
+    if all {
+        head.push(Span::styled(pad_r("PREFIXES", pw), style::hd()));
+        head.push(Span::styled(
+            format!(" {}", pad_r("ON", ON_W - 1)),
+            style::hd(),
+        ));
+    }
+    head.push(Span::styled(
+        format!(" {}", pad_l("DOCS", DOCS_W)),
+        style::hd(),
+    ));
     if show_size {
         head.push(Span::styled(
             format!(" {}", pad_l("SIZE", SIZE_W)),
@@ -188,10 +272,9 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) 
         ));
     }
     rows(frame, inner, vec![Line::from(head)], None);
-    let has_error = state.error.is_some();
     let body = Rect {
         y: inner.y + 1,
-        height: inner.height.saturating_sub(1 + u16::from(has_error)),
+        height: inner.height.saturating_sub(2),
         ..inner
     };
     let sel = state.sel.min(list.indexes.len() - 1);
@@ -199,47 +282,41 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) 
     let lines: Vec<Line<'static>> = list
         .indexes
         .iter()
+        .enumerate()
         .skip(off)
         .take(usize::from(body.height))
-        .map(|i| list_row(i, nw, pw, [show_size, show_indexed, show_fails]))
+        .map(|(n, i)| {
+            let line = list_row(i, nw, pw, [all, show_size, show_indexed, show_fails]);
+            if dimmed && n != sel {
+                Line::from(
+                    line.spans
+                        .into_iter()
+                        .map(|s| Span::styled(s.content, style::dim()))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                line
+            }
+        })
         .collect();
     rows(frame, body, lines, Some(sel - off));
-    if let Some(e) = &state.error {
-        let r = Rect {
-            y: inner.y + inner.height - 1,
-            height: 1,
-            ..inner
-        };
-        let note = format!(" ▲ {e}; showing the previous reading.");
-        rows(
-            frame,
-            r,
-            vec![Line::from(fit(vec![Span::styled(note, style::amber())], w))],
-            None,
-        );
-    }
-    match shown {
-        Some(run) => results_panel(frame, detail, state, run, ctx),
-        None => detail_panel(frame, detail, state, name),
-    }
-}
-
-/// With results shown, the index list takes what it needs (at least 5 rows, at most
-/// half) and the results the rest.
-fn results_split(area: Rect, indexes: usize) -> (Rect, Rect) {
-    let h = usize::from(area.height);
-    let list_h = (indexes + 3).clamp(5, (h / 2).max(5)).min(h);
-    let list_h = u16::try_from(list_h).unwrap_or(area.height);
-    let main = Rect {
-        height: list_h,
-        ..area
+    let bottom = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: u16::from(inner.height >= 2),
+        ..inner
     };
-    let detail = Rect {
-        y: area.y + list_h,
-        height: area.height - list_h,
-        ..area
+    let note = match &state.error {
+        Some(e) => Span::styled(
+            format!(" ▲ {e}; showing the previous reading."),
+            style::amber(),
+        ),
+        None if list.total > list.indexes.len() => Span::styled(
+            format!(" first {} of {} indexes", list.indexes.len(), list.total),
+            style::dim(),
+        ),
+        None => Span::styled(" / runs a query", style::dim()),
     };
-    (main, detail)
+    rows(frame, bottom, vec![Line::from(fit(vec![note], w))], None);
 }
 
 /// `took` for the results line: `3 ms`, `<1 ms`.
@@ -284,25 +361,16 @@ fn fields_preview(doc: &Doc, w: usize, memo: &value::Memo) -> String {
     trunc(&out, w)
 }
 
-fn results_panel(
+/// The right pane with a query's results: the query, how many and how long, and the
+/// keys with a preview of their fields; the bottom row says what the keys do.
+fn results_pane(
     frame: &mut Frame,
-    area: Rect,
+    inner: Rect,
     state: &SearchState,
     run: &QueryRun,
     ctx: &Ctx<'_>,
 ) {
     let focused = state.focus == Focus::Schema;
-    let hint = if focused {
-        "↑↓ select · tab back"
-    } else {
-        "tab: results"
-    };
-    let what = if run.cmd == Cmd::Profile {
-        format!("Results · {} · FT.PROFILE", escape(&run.index))
-    } else {
-        format!("Results · {}", escape(&run.index))
-    };
-    let inner = panel(frame, area, &what, hint);
     let w = usize::from(inner.width);
     let h = usize::from(inner.height);
     if w == 0 || h == 0 {
@@ -449,38 +517,19 @@ fn wrap_text(text: &str, w: usize) -> Vec<String> {
     out
 }
 
-/// One level deeper, over the whole body: a result's fields, or an explain or profile.
-fn draw_deeper(frame: &mut Frame, area: Rect, state: &SearchState, deeper: &Deeper, ctx: &Ctx<'_>) {
+/// One level deeper, in the right pane: a result's fields, or an explain or profile.
+fn draw_deeper(
+    frame: &mut Frame,
+    inner: Rect,
+    state: &SearchState,
+    deeper: &Deeper,
+    ctx: &Ctx<'_>,
+) {
     match deeper {
-        Deeper::Document(doc) => {
-            let key = doc.row.as_ref().map_or("", |r| r.key.as_str());
-            let n = doc.loaded();
-            let mut right = Vec::new();
-            if let Some(raw) = doc.format_source() {
-                let d = doc.memo.decode(raw);
-                right.push(doc.shown_format(&d).label().to_string());
-            }
-            right.push(format!(
-                "{} field{}",
-                format::grouped(n as u64),
-                if n == 1 { "" } else { "s" }
-            ));
-            right.push("esc back".to_string());
-            let title = format!("Result · {}", escape(key));
-            super::value::draw_value_panel(frame, area, doc, ctx, &title, Some(&right.join(" · ")));
-        }
+        Deeper::Document(doc) => super::value::draw_value_body(frame, inner, doc, ctx),
         Deeper::Text {
-            cmd,
-            index,
-            query,
-            text,
+            cmd, query, text, ..
         } => {
-            let what = match cmd {
-                Cmd::Profile => "Profile",
-                _ => "Explain",
-            };
-            let title = format!("{what} · {}", escape(index));
-            let inner = panel(frame, area, &title, "↑↓ scroll · esc back");
             let w = usize::from(inner.width);
             if w == 0 || inner.height == 0 {
                 return;
@@ -539,23 +588,26 @@ fn progress_cell(i: &IndexInfo) -> (String, bool) {
     }
 }
 
-fn list_row(i: &IndexInfo, nw: usize, pw: usize, shown: [bool; 3]) -> Line<'static> {
+fn list_row(i: &IndexInfo, nw: usize, pw: usize, shown: [bool; 4]) -> Line<'static> {
     let dash = || "—".to_string();
+    let [all, size, indexed, fails] = shown;
     let mut spans = fit(
         vec![Span::styled(format!(" {}", escape(&i.name)), style::fg())],
         nw,
     );
-    spans.extend(fit(
-        vec![Span::styled(escape(&i.prefixes.join(", ")), style::ph())],
-        pw,
-    ));
-    spans.push(Span::styled(
-        format!(
-            " {}",
-            pad_r(&escape(i.on.as_deref().unwrap_or("—")), ON_W - 1)
-        ),
-        style::dim(),
-    ));
+    if all {
+        spans.extend(fit(
+            vec![Span::styled(escape(&i.prefixes.join(", ")), style::ph())],
+            pw,
+        ));
+        spans.push(Span::styled(
+            format!(
+                " {}",
+                pad_r(&escape(i.on.as_deref().unwrap_or("—")), ON_W - 1)
+            ),
+            style::dim(),
+        ));
+    }
     spans.push(Span::styled(
         format!(
             " {}",
@@ -563,7 +615,6 @@ fn list_row(i: &IndexInfo, nw: usize, pw: usize, shown: [bool; 3]) -> Line<'stat
         ),
         style::fgb(),
     ));
-    let [size, indexed, fails] = shown;
     if size {
         spans.push(Span::styled(
             format!(
@@ -616,18 +667,13 @@ fn left_out(i: &IndexInfo, module: &str) -> Vec<String> {
     out
 }
 
-fn detail_panel(frame: &mut Frame, area: Rect, state: &SearchState, module: &str) {
+/// The right pane without results: the selected index's facts, what the module left
+/// out, and its schema (→ moves the selection there).
+fn detail_pane(frame: &mut Frame, inner: Rect, state: &SearchState, module: &str) {
     let Some(i) = state.selected() else {
-        panel(frame, area, "Details", "");
         return;
     };
     let focused = state.focus == Focus::Schema;
-    let hint = if focused {
-        "↑↓ select · tab back"
-    } else {
-        "tab: schema · / query"
-    };
-    let inner = panel(frame, area, &escape(&i.name), hint);
     let w = usize::from(inner.width);
     let dash = || "—".to_string();
     let info_read = i.docs.is_some() || !i.schema.is_empty() || i.on.is_some();
@@ -715,7 +761,11 @@ fn detail_panel(frame: &mut Frame, area: Rect, state: &SearchState, module: &str
         0
     };
     for f in i.schema.iter().skip(off).take(room) {
-        lines.push(field_line(f, fw));
+        // One cell of margin on the right.
+        lines.push(Line::from(fit(
+            field_line(f, fw).spans,
+            w.saturating_sub(1),
+        )));
     }
     if i.schema.is_empty() {
         lines.push(Line::from(Span::styled(

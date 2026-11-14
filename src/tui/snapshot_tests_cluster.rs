@@ -279,6 +279,8 @@ fn patterns_narrowed_to_a_node() {
         taken_at_unix,
         result: Ok(Some(fixtures::history(true))),
     });
+    // Δ is one of the `v` columns.
+    app.handle_key(ch('v'));
     assert!(buffer_lines(&render(&app, 120, 36))[4].contains('Δ'));
     show(&mut app, Screen::Nodes);
     press(&mut app, "j");
@@ -994,8 +996,9 @@ fn the_key_list_walks_every_primary_in_slot_order_one_node_at_a_time() {
     }
     let wide = text(&render(&app, 120, 36));
     assert!(wide.contains("3 of 3 nodes"), "{wide}");
+    // At 80 the NODE column is a `v` one; the right pane names the selected key's.
     let t = render(&app, 80, 24);
-    assert!(text(&t).contains("NODE"));
+    assert!(text(&t).contains("on node 10.0.1.11:6379"), "{}", text(&t));
     insta::assert_snapshot!(t.backend());
 }
 
@@ -1364,10 +1367,12 @@ fn streams_poll_one_request_per_owning_node_and_show_each_streams_node() {
             })),
         );
     }
-    let t = render(&app, 80, 24);
-    let all = text(&t);
+    // The NODE column from 120 columns; at 80 the right pane names the selected one's.
+    let all = text(&render(&app, 120, 36));
     assert!(all.contains("NODE"), "{all}");
     assert!(all.contains("10.0.1.13:6379"), "{all}");
+    let t = render(&app, 80, 24);
+    assert!(text(&t).contains("on node 10.0.1.13:6379"), "{}", text(&t));
     insta::assert_snapshot!(t.backend());
 }
 

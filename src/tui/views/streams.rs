@@ -1424,10 +1424,12 @@ mod tests {
         let effects: Vec<Effect> = testing::show(&mut app, Screen::Streams);
         assert!(testing::requests(&effects).is_empty());
         let screen = format!("{}", testing::render(&app, 80, 24).backend());
+        // Wrapped in the list pane.
         assert!(
-            screen.contains("The server refused XINFO for this user"),
+            screen.contains("The server refused XINFO for this"),
             "{screen}"
         );
+        assert!(screen.contains("user, so this view is off."), "{screen}");
         assert!(!screen.contains("lens-ro"), "{screen}");
     }
 
@@ -2048,5 +2050,53 @@ mod tests {
         assert!(format!("{:?}", app.views.streams).contains("value: <3 chars>"));
         let e = press(&mut app, KeyCode::Esc);
         assert!(writes(&e).is_empty() && app.views.streams.form.is_none());
+    }
+
+    #[test]
+    fn before_an_analysis_the_list_says_so_and_r_analyzes() {
+        use crate::tui::fixtures;
+        let mut app = App::new(fixtures::profiles());
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { id, scan, .. }] = effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        app.apply(Msg::Connected {
+            id,
+            scan,
+            server: Some(fixtures::server()),
+            perms: fixtures::perms_with_probes(),
+            target: crate::conn::ScanTarget::Primary,
+        });
+        app.apply(Msg::LiveReady { id, scan });
+        let effects = testing::show(&mut app, Screen::Streams);
+        // Nothing is asked for the streams: they come from an analysis. (Going
+        // through Browse › Keys starts its key names.)
+        assert!(
+            testing::requests(&effects)
+                .iter()
+                .all(|(_, r)| matches!(r, crate::live::LiveRequest::Names(_))),
+            "{effects:?}"
+        );
+        let screen = format!("{}", testing::render(&app, 80, 24).backend());
+        assert!(
+            screen.contains("Streams are found by an analysis"),
+            "{screen}"
+        );
+        assert!(screen.contains("r analyzes."), "{screen}");
+        assert!(app.analyze.is_none());
+        app.handle_key(key(KeyCode::Char('r')));
+        assert!(app.analyze.is_some(), "r opens the analyze dialog");
+        insta::assert_snapshot!(
+            "streams_before_an_analysis_120x36",
+            testing::render(
+                &{
+                    app.handle_key(key(KeyCode::Esc));
+                    app
+                },
+                120,
+                36
+            )
+            .backend()
+        );
     }
 }

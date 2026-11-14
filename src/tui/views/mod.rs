@@ -100,6 +100,7 @@ pub mod analysis;
 pub mod cmdline;
 pub mod dbs;
 pub mod keys;
+pub mod names;
 pub mod overview;
 pub mod pubsub;
 pub mod search;
