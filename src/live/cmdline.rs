@@ -178,6 +178,52 @@ impl fmt::Debug for Keys {
     }
 }
 
+/// The positions of keys that a command's key specs can miss, for the commands that
+/// write to a destination key: the keys after the `numkeys` of `ZUNIONSTORE`,
+/// `ZINTERSTORE` and `ZDIFFSTORE`, and the `STORE` / `STOREDIST` destination of `SORT`,
+/// `GEORADIUS` and `GEORADIUSBYMEMBER`. Other commands: none.
+fn extra_key_positions(name: &str, args: &[Vec<u8>]) -> Vec<usize> {
+    let word = |i: usize| {
+        args.get(i)
+            .map(|a| String::from_utf8_lossy(a).to_ascii_lowercase())
+    };
+    let sort = name == "sort";
+    let mut out = Vec::new();
+    match name {
+        "zunionstore" | "zinterstore" | "zdiffstore" => {
+            let n: usize = word(2).and_then(|n| n.parse().ok()).unwrap_or(0);
+            out.extend((3..3usize.saturating_add(n)).take(args.len()));
+        }
+        "sort" | "georadius" | "georadiusbymember" => {
+            // Options start after the fixed arguments; skip each one's operands.
+            let mut i = match name {
+                "sort" => 2,
+                "georadius" => 6,
+                _ => 5,
+            };
+            while let Some(w) = word(i) {
+                match w.as_str() {
+                    "store" => {
+                        out.push(i + 1);
+                        i += 2;
+                    }
+                    "storedist" if !sort => {
+                        out.push(i + 1);
+                        i += 2;
+                    }
+                    "limit" if sort => i += 3,
+                    "by" | "get" if sort => i += 2,
+                    "count" if !sort => i += 2,
+                    _ => i += 1,
+                }
+            }
+        }
+        _ => {}
+    }
+    out.retain(|i| *i < args.len());
+    out
+}
+
 /// The keys of `args` (`args[0]` is the command), from the key specs of `info`, or of
 /// the subcommand typed when `info` is a container.
 pub fn command_keys(args: &[Vec<u8>], info: &CommandInfo) -> Keys {
@@ -186,7 +232,15 @@ pub fn command_keys(args: &[Vec<u8>], info: &CommandInfo) -> Keys {
         .filter(|_| !info.subcommands.is_empty())
         .and_then(|s| info.subcommand(s))
         .unwrap_or(info);
-    let found: Vec<Vec<u8>> = super::server::key_positions(&info.keys, args)
+    let mut at = super::server::key_positions(&info.keys, args);
+    if info.keys_partial {
+        // The specs may find only some keys (Redis 6.2's first/last/step, and SORT
+        // on every version): look for the rest where the command puts them.
+        at.extend(extra_key_positions(&info.name, args));
+        at.sort_unstable();
+        at.dedup();
+    }
+    let found: Vec<Vec<u8>> = at
         .into_iter()
         .filter_map(|i| args.get(i).cloned())
         .collect();
@@ -1167,6 +1221,167 @@ mod tests {
             keys: Vec::new(),
             keys_partial: false,
         }
+    }
+
+    /// A connection that records every command it is sent.
+    struct Recorder {
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl redis::aio::ConnectionLike for Recorder {
+        fn req_packed_command<'a>(
+            &'a mut self,
+            cmd: &'a redis::Cmd,
+        ) -> redis::RedisFuture<'a, Value> {
+            let words: Vec<String> = cmd
+                .args_iter()
+                .map(|a| match a {
+                    redis::Arg::Simple(b) => String::from_utf8_lossy(b).into_owned(),
+                    _ => String::new(),
+                })
+                .collect();
+            self.log.lock().unwrap().push(words.join(" "));
+            Box::pin(async { Ok(Value::Okay) })
+        }
+
+        fn req_packed_commands<'a>(
+            &'a mut self,
+            _pipe: &'a redis::Pipeline,
+            _offset: usize,
+            _count: usize,
+        ) -> redis::RedisFuture<'a, Vec<Value>> {
+            self.log.lock().unwrap().push("PIPELINE".into());
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn get_db(&self) -> i64 {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn run_sends_nothing_that_is_a_write_or_refused_or_unconfirmed() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut conn = Recorder {
+            log: std::sync::Arc::clone(&log),
+        };
+        let budget = Budget::new(None);
+        let get = info("get", &["readonly", "fast"], &["@read", "@string"]);
+        let set = info("set", &["write", "denyoom"], &["@write", "@string"]);
+        let keys = info("keys", &["readonly"], &["@keyspace", "@read", "@dangerous"]);
+        let plain = |name: &str| info(name, &["fast"], &["@fast", "@connection"]);
+        let run = |line: &str, info: CommandInfo, confirmed: bool| Request::Run {
+            args: Args::new(args(line)),
+            info,
+            confirmed,
+        };
+        // A write has no Permit here: never sent, confirmed or not.
+        for confirmed in [false, true] {
+            let r = super::run(&mut conn, &budget, run("SET k v", set.clone(), confirmed)).await;
+            assert_eq!(r.unwrap_err(), LiveError::Failed(NOT_SENT.into()));
+        }
+        // The refusal list is checked again here: handed straight to `run`, these
+        // are not sent (the info says readonly, which must not matter).
+        for line in [
+            "SUBSCRIBE c",
+            "MONITOR",
+            "SELECT 1",
+            "MULTI",
+            "WATCH k",
+            "READONLY",
+            "ASKING",
+            "CLIENT SETNAME x",
+        ] {
+            let name = line.split(' ').next().unwrap().to_ascii_lowercase();
+            let r = super::run(
+                &mut conn,
+                &budget,
+                run(line, info(&name, &["readonly"], &["@read"]), true),
+            )
+            .await;
+            assert!(r.is_err(), "{line}");
+            let r = super::run(&mut conn, &budget, run(line, plain(&name), true)).await;
+            assert!(r.is_err(), "{line}");
+        }
+        // A dangerous readonly command is sent only once confirmed.
+        let r = super::run(&mut conn, &budget, run("KEYS *", keys.clone(), false)).await;
+        assert!(r.is_err());
+        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+        // A readonly one is sent, and takes from the budget.
+        let r = super::run(&mut conn, &budget, run("GET k", get, false)).await;
+        assert!(r.is_ok(), "{r:?}");
+        let r = super::run(&mut conn, &budget, run("KEYS *", keys, true)).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(*log.lock().unwrap(), ["GET k", "KEYS *"]);
+        assert_eq!(budget.taken(), 2);
+    }
+
+    #[test]
+    fn keys_a_spec_misses_are_found_where_the_command_puts_them() {
+        let partial = |name: &str| CommandInfo {
+            keys: vec![KeySpec {
+                begin: server::Begin::Index(1),
+                find: server::Find::Range {
+                    last: 0,
+                    step: 1,
+                    limit: 0,
+                },
+            }],
+            keys_partial: true,
+            ..info(name, &["write", "movablekeys"], &["@write"])
+        };
+        let found = |line: &str, name: &str| command_keys(&args(line), &partial(name));
+        // Redis 6.2 finds only the destination of these.
+        assert_eq!(
+            found("ZUNIONSTORE d 2 a b", "zunionstore"),
+            Keys::Found(args("d a b"))
+        );
+        assert_eq!(
+            found("ZINTERSTORE d 3 a b c WEIGHTS 1 2 3", "zinterstore"),
+            Keys::Found(args("d a b c"))
+        );
+        // SORT on every version finds only the key.
+        assert_eq!(
+            found("SORT k BY w_* GET # STORE d", "sort"),
+            Keys::Found(args("k d"))
+        );
+        // A pattern named STORE is not a destination; LIMIT's operands are skipped.
+        assert_eq!(
+            found("SORT k BY store LIMIT 0 5", "sort"),
+            Keys::Found(args("k"))
+        );
+        assert_eq!(
+            found("GEORADIUS k 1 2 5 km COUNT 3 STORE d", "georadius"),
+            Keys::Found(args("k d"))
+        );
+        assert_eq!(
+            found(
+                "GEORADIUSBYMEMBER k m 5 km STOREDIST d",
+                "georadiusbymember"
+            ),
+            Keys::Found(args("k d"))
+        );
+        // Where the specs found them all, nothing is added twice.
+        let mut full = partial("zunionstore");
+        full.keys.push(KeySpec {
+            begin: server::Begin::Index(2),
+            find: server::Find::KeyNum {
+                idx: 0,
+                first: 1,
+                step: 1,
+            },
+        });
+        assert_eq!(
+            command_keys(&args("ZUNIONSTORE d 2 a b"), &full),
+            Keys::Found(args("d a b"))
+        );
+        // Not partial: no guessing.
+        let mut exact = partial("sort");
+        exact.keys_partial = false;
+        assert_eq!(
+            command_keys(&args("SORT k STORE d"), &exact),
+            Keys::Found(args("k"))
+        );
     }
 
     #[test]

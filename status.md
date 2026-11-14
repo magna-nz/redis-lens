@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** Redis Insight parity phase 4 (topology and connections), in one PR from branch `claude/insight-phase4-289a4c`. Phases 1 to 3 are on main (#15, #16, #17, #18).
-**Last updated:** 2026-11-14 (phase 4: parts 1a, 2, 3, 4 and 5 built; part 1b, the rest of the cluster views, in progress)
+**Current milestone:** Redis Insight parity phase 4 (topology and connections) is on main (#19, merged at `2140f95`), with phases 1 to 3 (#15, #16, #17, #18). A follow-up PR from branch `claude/insight-phase4-followups` carries what #19 was merged without: the fixes for what the cluster verifier noted beyond its blocking finding, tests for the mutations that survived, and this file's phase 4 section.
+**Last updated:** 2026-11-15 (phase 4 merged as #19; the follow-up PR with the verifier's other fixes is open for the owner)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -507,19 +507,35 @@ Tests on Redis 7.4, Valkey 8.1 and Redis 6.2: `acl_dryrun_it`, `write_keys_it`, 
 
 ## Phase 4 (2026-11-14): topology and connections
 
-Built unattended on `claude/insight-phase4-289a4c`, one PR for the phase. Not merged: the owner merges. The spec is spec.md "Topology and connections (P4)".
+Built unattended on `claude/insight-phase4-289a4c` and merged by the owner as #19 (2026-11-14, at `2140f95`). #19 went in before three commits were pushed, so they are a follow-up PR from `claude/insight-phase4-followups`: `345d9f5` (below), its merge, and the status, spec and parity-doc update. Until that PR is merged, main has the blocking fix (`2140f95`) but not the fixes listed under "Also fixed from that review". The spec is spec.md "Topology and connections (P4)".
 
 | Part | Content | Commits | State |
 |---|---|---|---|
 | 0 | Spec: the P4 section, milestones, the parity roadmap | | **done** |
 | 1a | Cluster live core: node connections kept with their budgets, routing by slot (local CRC16), `MOVED`/`ASK` once, the picked node (`[` `]`), per-shard summary on Overview, Search and Monitor per node | `cbf01f7` | **done**; `tests/cluster_live_it.rs` |
-| 1b | The other views on a cluster: key list and detail, edits, Big keys lengths, Streams per slot owner, classic and sharded Pub/Sub, bulk and `redis-lens expire` per primary, the command line by key specs with CROSSSLOT refused | | in progress |
+| 1b | The other views on a cluster: key list and detail, edits, Big keys lengths, Streams per slot owner, classic and sharded Pub/Sub (`S`, `SPUBLISH` through the gate), bulk and `redis-lens expire` per primary, the command line by key specs with CROSSSLOT refused | `b0f48ae`, `2140f95` (in #19); `345d9f5` (follow-up PR) | **done**; `tests/cluster_views_it.rs` 7 tests on Redis 7.4, Valkey 8.1 and Redis 6.2 (shard tests gated on 7.0). The verifier blocked on one finding, fixed in `2140f95` and merged with #19; what else it noted is fixed in `345d9f5`, in the follow-up PR |
 | 2 | Sentinel: `[profile.sentinel]`, `sentinel:profile:<name>` keychain entry, `GET-MASTER-ADDR-BY-NAME` with the primary checked, `SENTINEL REPLICAS` for `prefer_replica`, `conn add`/`test`/`list`, Connections detail | `a2d467b`, `c53f2dd` | **done**; `tests/sentinel_it.rs` 14 tests on Redis 7.4, Valkey 8.1 and Redis 6.2. The verifier approved it; what it noted is fixed in `c53f2dd`, each with a test |
 | 3 | Database switch (`b`): the list from `INFO keyspace`, a session rescan on the other index, `s` saves after asking | `103f09b` | **done**; `tests/dbs_it.rs` 5 tests |
 | 4 | Slots panel (`CLUSTER SLOT-STATS`), read on show and `r` | `29b53f2` | **done**; `tests/slots_it.rs` 3 tests (Valkey 8.1 counts against `CLUSTER COUNTKEYSINSLOT`; Redis 7.4 and 6.2 are off as too old; a Redis 8.2 run behind `REDIS_LENS_IT_REDIS82=1`) |
 | 5 | Type filter (`t`), `conn export`/`import`, tags, light theme and `NO_COLOR` | `57f1be8`, merge `5a52009` | **done**; unit tests only (nothing here talks to a server) |
 
-Parts landed out of order (2, 1a, 5, 4, 3, then 1b) because they were built in parallel by separate agents, each in its own worktree, and merged as each one passed its checks.
+Parts landed out of order (2, 1a, 5, 4, 3, then 1b) because they were built in parallel by separate agents, each in its own worktree, and merged as each one passed its checks. Part 1b is seven features over the same routing code, so it was one agent and came last.
+
+### Verifier reviews (phase 4)
+
+- **Sentinel credentials (part 2): approved.** Fixed afterwards, each with a test (`c53f2dd`): a server's error text, which can name the ACL user, reached the replica fallback reason; a Sentinel keychain entry left under a name was read by a new profile of that name; Monitor sent its check before refusing a TLS host-name primary; the connecting line showed the configured address, not the primary the Sentinel named.
+- **Cluster routing and write paths (part 1): blocked on one finding, fixed in `2140f95`.** `[` `]` can pick a node discovery has no connection to, and a shard channel's slot can be owned by one. Monitor or a Pub/Sub tail then opened a connection of their own to it with the profile's credentials, which breaks the loopback rule when a remote cluster announces a node on 127.0.0.1. Refused now at three places: the app, the runner, and discovery's credentials flag. Four unit tests fail without the fix, and `tests/cluster_it.rs` asserts the flag on a stopped node. Not checked end to end: that needs a remote seed announcing a loopback node (two hosts).
+- **Also fixed from that review (`345d9f5`, in the follow-up PR, not in #19), each with a test:** bulk actions and `redis-lens expire` ran on the seed alone when the slot map could not be read; `expire` treated a failed `INFO cluster` as a standalone server; `ASKING` was not refused on the command line; the `ASKING` of a redirect retry took nothing from the budget; `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE` and the `STORE` forms of `SORT` and `GEORADIUS` asked before refusing keys in different slots.
+- **What the verifier confirmed:** `key_slot` against 3,016 answers from a real `CLUSTER KEYSLOT`; a `Permit` is only made by the gate and only three places send writes; redirects go only to connected nodes and no write can run twice; the command line's refusals run before `COMMAND INFO` and before routing. It ran 48 mutations: 37 were killed, and tests were added for the survivors (budget per node, `MovedOnFirst`, a second redirect, the gate re-check for typed writes, the command line's own re-check, a keyless write on a picked replica, the subscribe family).
+
+### Left for later (phase 4)
+
+- A test that shard channel counts are not asked of an unconnected node (the verifier's M34; the request is answered "not connected" without being sent).
+- `write_dest` checks the replica role on the slot map discovery read, while routing follows the map a `MOVED` updates. It only matters after a promotion, and a rescan reads the map again.
+- The runner's reconnect and resubscribe after a database switch has no end-to-end test: unit tests check the effects, and `tests/dbs_it.rs` makes the same calls.
+- No end-to-end test of Sentinel behind SSH, or of Monitor refusing a TLS host-name primary before `MONITOR` (it needs a TLS fake primary); `monitor_addr_pinned` is unit-tested.
+- The permission check still shows a server's text for an error that is not `NOPERM` (`PermStatus::Denied`, from before phase 4).
+
 
 ### Decisions taken alone (phase 4)
 
@@ -541,7 +557,13 @@ Parts landed out of order (2, 1a, 5, 4, 3, then 1b) because they were built in p
 - **Database switch:** a failed save still switches the session and says so; `s` on a Docker container only says it can't save; `s` on the current database saves without a rescan.
 - **Slots panel has no permission probe:** each node gets one `INFO server` for the version gate, and a refusal is read from the first real request, which is read-only and sent only when the panel is shown. `↑↓` move through the hottest slots; the range table is not selectable.
 - **`NO_COLOR`** draws no colour at all; selection and badges use reverse video and bold.
+- **Bulk actions and `redis-lens expire` refuse a cluster whose slot map is not read in full** (a primary with no slots, or slots no primary covers, as during a broken resharding), and `expire` stops when `INFO cluster` can't be read. Both would otherwise write to some nodes and report success.
+- **`SPUBLISH` has no `ACL DRYRUN` probe**; the server checks it when it is sent. The command line's reply header names the node the command was sent to, not one a `MOVED` led to.
+- **A stream with no slot owner goes to the picked node** on a cluster; unconnected primaries are left out of the key list with a note.
 
 ### Open questions (phase 4)
 
 - From phases 2 and 3, still the owner's: the command-line allow-list for `INFO`, `PING` and the like, and a reply-size check before whole-key reads.
+- New: should `[` `]` skip a node discovery has no connection to? Today they can pick it, and every view then says it is not connected.
+- New: `conn import --force` deletes stored credentials when the profile's address, auth, bastion or Sentinels differ. Is that the wanted default, or should it ask first?
+- New: the Slots panel reads every slot of every primary on show (16,384 entries across the cluster). Fine on a rate-limited profile, but is a `LIMIT` or a per-node page wanted?

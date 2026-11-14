@@ -320,9 +320,10 @@ pub fn refused(args: &[Vec<u8>]) -> Option<&'static str> {
         }
         // A transaction or WATCH left open would queue, or abort, every view's
         // commands and redis-lens's own edits; SYNC turns the connection into a replica
-        // link; READONLY/READWRITE switch its cluster mode.
+        // link; READONLY/READWRITE switch its cluster mode; ASKING sets a one-shot flag
+        // that the next command of any view would meet.
         "auth" | "hello" | "reset" | "quit" | "multi" | "exec" | "discard" | "watch"
-        | "unwatch" | "sync" | "psync" | "readonly" | "readwrite" => {
+        | "unwatch" | "sync" | "psync" | "readonly" | "readwrite" | "asking" => {
             "Not sent: it would change the connection every view shares."
         }
         "client"
@@ -528,12 +529,28 @@ mod tests {
             &["PSYNC", "?", "-1"],
             &["READONLY"],
             &["READWRITE"],
+            &["ASKING"],
+            &["asking"],
             &["CLIENT", "SETNAME", "x"],
             &["client", "tracking", "on"],
             &["CLIENT", "NO-EVICT", "on"],
         ] {
             let why = refused(&words(w)).unwrap_or_else(|| panic!("{w:?}"));
             assert!(why.contains("connection every view shares"), "{w:?}");
+        }
+        // Every subscribe-family name goes to Pub/Sub, in either case.
+        for n in [
+            "SUBSCRIBE",
+            "PSUBSCRIBE",
+            "SSUBSCRIBE",
+            "UNSUBSCRIBE",
+            "PUNSUBSCRIBE",
+            "SUNSUBSCRIBE",
+        ] {
+            for name in [n.to_string(), n.to_ascii_lowercase()] {
+                let why = refused(&words(&[name.as_str(), "c"])).unwrap_or_else(|| panic!("{n}"));
+                assert!(why.contains("Pub/Sub"), "{n}");
+            }
         }
         assert!(refused(&words(&["GET", "k"])).is_none());
         assert!(refused(&words(&["POST"])).is_some());
