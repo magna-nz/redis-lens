@@ -206,7 +206,13 @@ pub async fn open_monitor(
         (None, None) => (auth.open(&route, &profile.endpoint).await?, None),
         (None, Some(s)) => {
             let p = sentinel::open_primary(profile, s, secrets, &route, &auth).await?;
-            (p.conn, Some(p.addrs))
+            // Refused before anything is sent for MONITOR (not even the check below, or
+            // a budget token): a TLS host name can't be pinned.
+            let addr = match (route.as_ref(), p.conn.sentinel()) {
+                (Route::Direct, Some(a)) => Some(monitor_addr_pinned(&a.primary, &p.addrs)?),
+                _ => None,
+            };
+            (p.conn, addr)
         }
     };
     let primary = check.sentinel().map(|a| a.primary.clone());
@@ -228,7 +234,7 @@ pub async fn open_monitor(
         (Route::Direct, None) => connection_addr(ep, tls::tls_roots),
         // redis-rs resolves the monitor connection's host itself, so it is given an
         // address: the one checked, or (TLS) the IP address Sentinel gave.
-        (Route::Direct, Some(addrs)) => monitor_addr_pinned(ep, &addrs)?,
+        (Route::Direct, Some(addr)) => addr,
         (Route::Ssh(_), _) => {
             let reached = route.reach(ep).await.map_err(Unusable::into_conn_error)?;
             let Some(local) = reached.addrs.first() else {
@@ -1048,7 +1054,32 @@ fn unusable_reason(ep: &Endpoint, why: Unusable, ssh: bool) -> String {
              is not the primary's host"
         ),
         Unusable::Resolve(e) => format!("{ep}: could not resolve the host: {e}"),
-        Unusable::Conn(e) => format!("{ep}: {e}"),
+        Unusable::Conn(e) => format!("{ep}: {}", conn_error_text(&e)),
+    }
+}
+
+/// A fixed text for a failed connection or check, in redis-lens's own words. A server's
+/// error text can name the ACL user (`NOPERM User <name> has no permissions...`), so a
+/// server error is only ever described by its category (CLAUDE.md rule 1). Other
+/// [`ConnError`]s already hold fixed texts.
+pub(crate) fn conn_error_text(e: &ConnError) -> String {
+    let ConnError::Redis(r) = e else {
+        return e.to_string();
+    };
+    if is_noperm(r) {
+        noperm_text("INFO replication")
+    } else if r.kind() == redis::ErrorKind::AuthenticationFailed
+        || matches!(r.code(), Some("WRONGPASS" | "NOAUTH"))
+    {
+        "the replica refused the credentials".to_string()
+    } else if r.code().is_some() || matches!(r.kind(), redis::ErrorKind::Server(_)) {
+        "the replica refused the connection".to_string()
+    } else if r.is_timeout() {
+        "timed out".to_string()
+    } else if r.is_io_error() || r.is_connection_refusal() || r.is_connection_dropped() {
+        "could not connect".to_string()
+    } else {
+        "the replica's reply could not be read".to_string()
     }
 }
 
@@ -1855,6 +1886,35 @@ mod tests {
         assert!(may_send_credentials(own_tunnel, candidate));
     }
 
+    /// Monitor's address for a Sentinel's primary: the first checked address without TLS
+    /// (never the host name, which redis-rs would look up again); with TLS only an IP
+    /// host, kept as the certificate's name; a host name is refused with the fixed text.
+    #[test]
+    fn monitor_addr_for_a_sentinel_primary() {
+        let addrs: Vec<SocketAddr> = vec![
+            "10.9.8.7:7000".parse().unwrap(),
+            "10.9.8.6:1".parse().unwrap(),
+        ];
+        // Without TLS the pin is used, not the name.
+        let a = monitor_addr_pinned(&ep("primary.example", 6379, false), &addrs).unwrap();
+        assert_eq!(a, ConnectionAddr::Tcp("10.9.8.7".into(), 7000));
+        assert!(matches!(
+            monitor_addr_pinned(&ep("primary.example", 6379, false), &[]),
+            Err(ConnError::Redis(_))
+        ));
+        // With TLS an IP host is dialled as named (its own port), not as `addrs`.
+        let a = monitor_addr_pinned(&ep("10.0.0.5", 6380, true), &addrs).unwrap();
+        match a {
+            ConnectionAddr::TcpTls { host, port, .. } => {
+                assert_eq!((host.as_str(), port), ("10.0.0.5", 6380));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A TLS host name is refused with the fixed text.
+        let e = monitor_addr_pinned(&ep("primary.example", 6379, true), &addrs).unwrap_err();
+        assert_eq!(e.to_string(), MONITOR_SENTINEL_TLS_NAME);
+    }
+
     #[test]
     fn fallback_reasons_say_where_loopback_was_judged() {
         let e = ep("127.0.0.1", 6380, false);
@@ -2052,6 +2112,69 @@ mod tests {
         ])
         .await;
         (primary, replica)
+    }
+
+    /// The `PrimaryFallback` reason for a replica that errors never carries the
+    /// server's text, which can name the ACL user (rule 1): a fixed text per kind.
+    #[tokio::test]
+    async fn a_replica_fallback_reason_never_holds_the_servers_text() {
+        use crate::secrets::MemoryStore;
+        const USER: &str = "secretuser";
+        let noperm = format!("-NOPERM User {USER} has no permissions to run the 'info' command");
+        let err = format!("-ERR something with {USER}");
+        let noauth = "-NOAUTH Authentication required.".to_string();
+        // (the replica's INFO replication, its AUTH reply, expected words)
+        let cases = [
+            (
+                noperm.clone(),
+                None,
+                "NOPERM INFO replication is not allowed",
+            ),
+            (err.clone(), None, "the replica refused the connection"),
+            // redis-rs reads any refusal of AUTH as a failed login.
+            (
+                noauth.clone(),
+                Some(noperm),
+                "the replica refused the credentials",
+            ),
+            (noauth, Some(err), "the replica refused the credentials"),
+        ];
+        for (info, auth, expected) in cases {
+            let mut entries = vec![("server", STANDALONE.to_string()), ("replication", info)];
+            if let Some(a) = auth {
+                entries.push(("reply:auth", format!("{a}\r\n")));
+            }
+            let replica = FakeServer::start(&entries).await;
+            let primary = FakeServer::start(&[
+                ("server", STANDALONE.to_string()),
+                (
+                    "replication",
+                    format!(
+                        "role:master\r\nslave0:ip=127.0.0.1,port={},state=online,offset=1,lag=0\r\nmaster_replid:abc123\r\n",
+                        replica.addr.port()
+                    ),
+                ),
+            ])
+            .await;
+            let mut p = fake_profile(primary.addr.port(), true);
+            p.auth = Auth::Keychain;
+            let store = MemoryStore::default();
+            store
+                .set(
+                    &p.secret_ref(),
+                    &crate::model::Credentials {
+                        username: Some("lens".into()),
+                        password: secrecy::SecretString::from("hunter2".to_string()),
+                    },
+                )
+                .unwrap();
+            let (_, target) = connect_for_scan(&p, &store).await.unwrap();
+            let ScanTarget::PrimaryFallback(why) = target else {
+                panic!("a replica that errors was used");
+            };
+            assert!(!why.contains(USER), "{why}");
+            assert!(why.contains(expected), "{why}");
+        }
     }
 
     /// A connection of its own to a cluster node that discovery reached without

@@ -68,6 +68,8 @@ pub enum SentinelError {
     WontSendCredentials(String),
     #[error("the primary Sentinel gave ({0}) refused the profile's credentials")]
     PrimaryRefused(String),
+    #[error("the primary Sentinel gave ({0}) could not be connected to or answered an error")]
+    PrimaryFailed(String),
     #[error("the primary refused INFO replication, so redis-lens can't check it is a primary")]
     NoReplicationInfo,
     #[error("the address Sentinel gave is not a primary (a failover may be running); try again")]
@@ -303,6 +305,8 @@ pub(super) async fn open_primary(
     let c = match open(&ep, auth.settings.clone(), &config).await {
         Ok(c) => c,
         Err(e) if conn_refusal(&e) => return Err(SentinelError::PrimaryRefused(shown).into()),
+        // Any other server error, or an I/O failure: a fixed text, never the server's.
+        Err(ConnError::Redis(_)) => return Err(SentinelError::PrimaryFailed(shown).into()),
         Err(e) => return Err(e),
     };
     let mut conn = Connection::new(c, route);
@@ -641,6 +645,7 @@ mod tests {
             SentinelError::BadAddress(BAD_HOST),
             SentinelError::WontSendCredentials("127.0.0.1:6379".into()),
             SentinelError::PrimaryRefused("10.0.0.5:6379".into()),
+            SentinelError::PrimaryFailed("10.0.0.5:6379".into()),
             SentinelError::NoReplicationInfo,
             SentinelError::NotPrimary,
             SentinelError::Cluster,
@@ -1088,3 +1093,7 @@ while (my $c = $l->accept) {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "sentinel_followup_tests.rs"]
+mod followup_tests;

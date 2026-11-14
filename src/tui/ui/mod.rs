@@ -233,7 +233,8 @@ fn waiting(frame: &mut Frame, main: Rect, detail: Rect, app: &App, s: &Session, 
                 Span::styled(
                     format!(
                         " Connecting to {} ({}) and checking permissions…",
-                        p.name, p.endpoint
+                        p.name,
+                        s.endpoint()
                     ),
                     style::dim(),
                 ),
@@ -507,10 +508,7 @@ fn server_line(app: &App, s: &Session, w: usize) -> Line<'static> {
                 None => vec![
                     Span::raw(" "),
                     Span::styled(spin, style::amber()),
-                    Span::styled(
-                        format!(" Connecting to {}…", s.profile.endpoint),
-                        style::dim(),
-                    ),
+                    Span::styled(format!(" Connecting to {}…", s.endpoint()), style::dim()),
                 ],
             },
         });
