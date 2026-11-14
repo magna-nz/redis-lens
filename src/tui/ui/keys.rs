@@ -144,9 +144,10 @@ fn title_right(state: &KeysState, ctx: &Ctx<'_>, pattern: &str, shown: usize) ->
     if typed {
         right = format!("type {} · {right}", state.type_filter.label());
     }
+    // First, so a title cut short at 80 columns still says how far the walk is.
     if state.by_node() {
         right = format!(
-            "{right} · {} of {} nodes",
+            "{} of {} nodes · {right}",
             state.nodes_done,
             state.walk.len() + state.missing.len()
         );
