@@ -1409,7 +1409,7 @@ flowchart LR
 <tr><td>Browse, view values, readonly commands</td><td>runs</td><td>runs</td><td>runs</td></tr>
 <tr><td>Edit, add, set a TTL, rename, publish, ack, claim, create an index</td><td>not sent</td><td>runs</td><td>asks <code>y</code>/<code>n</code></td></tr>
 <tr><td>Delete a key, field or element, trim a stream, drop an index</td><td>not sent</td><td>asks <code>y</code>/<code>n</code></td><td>type the key or index name</td></tr>
-<tr><td>Bulk expire or delete by pattern</td><td>not sent <span class="new">New</span> <code>expire</code> dry runs allowed</td><td>dry run, then <code>y</code>/<code>n</code></td><td>dry run, then type the pattern</td></tr>
+<tr><td>Bulk expire or delete by pattern</td><td>not sent</td><td>dry run, then <code>y</code>/<code>n</code></td><td>dry run, then type the pattern</td></tr>
 <tr><td><code>@dangerous</code> commands (<code>FLUSHDB</code>, <code>CONFIG SET</code>, <code>CLIENT KILL</code>, <code>SLOWLOG RESET</code>, <code>KEYS</code> …)</td><td>readonly ones (<code>KEYS</code>) ask as in the next columns; the rest are not sent</td><td>asks <code>y</code>/<code>n</code></td><td>type the profile name</td></tr>
 <tr><td><code>MONITOR</code></td><td>asks (<code>prod</code>: type the name)</td><td>asks <code>y</code>/<code>n</code></td><td>type the profile name</td></tr>
 </tbody></table></div>
@@ -1819,7 +1819,7 @@ redis-lens scan prod-cache --json &gt; report.json</code></pre></div></div>
 <div class="prose">
 <h3><code>redis-lens expire</code></h3>
 <p>Sets a TTL on every key of a pattern that has none, the command-line form of <kbd>x</kbd> in Browse. Without <code>--apply</code> it is a dry run that counts the keys. With <code>--apply</code> it sends <code>EXPIRE key seconds NX</code> (Redis 7.0 and later) in pipelines of 500 within the budget, and logs every key it sent to a file. A <code>prod</code> profile needs <code>--confirm</code> with the exact pattern; other profiles ask <code>y</code>/<code>n</code>, or need <code>--yes</code> without a terminal. It always connects to the profile's own endpoint, never a replica, and on a cluster runs per primary.</p>
-<p><span class="new">New</span> Dry runs are allowed on read-only profiles; <code>--apply</code> still needs writes on.</p>
+<p>A read-only profile refuses <code>expire</code> with exit code 2, dry run included.</p>
 </div>
 <div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">expire</span><span class="cb-lang">bash</span></div><pre><code class="language-bash"># dry run: how many keys of the pattern have no TTL
 redis-lens expire staging 'user:{id}:cart' --ttl 7d
