@@ -5,7 +5,16 @@
 //! - `COMMAND DOCS <name>`: the helper (Redis 7.0 and later, and Valkey). An older
 //!   server answers with an unknown subcommand: [`LiveError::Unsupported`].
 //! - `COMMAND LIST`: the command names, for `tab`. Asked once a session.
-//! - The typed command itself, only when [`gate`] lets it through.
+//! - The typed command itself, only when [`gate`] lets it through; for a repeat with
+//!   pipeline mode on, up to [`MAX_REPEAT`] copies of it in one pipeline
+//!   ([`Request::Batch`]), each copy checked by [`gate`] before any is sent, all of
+//!   them taken from the budget at once. The panel reads the repeat count with
+//!   [`parse_repeat`] and sizes pipelines with [`pipeline_batch`].
+//!
+//! **Views.** Each reply is drawn four ways when it comes back ([`Output::of`]): text
+//! like `redis-cli` ([`format_reply`]), a table ([`format_table`]), JSON
+//! ([`format_json`]) and RESP-like with types ([`format_raw`]), every one escaped and
+//! cut at [`MAX_REPLY_BYTES`] the same way.
 //!
 //! **No writes.** Phase 2 sends only commands with the `readonly` flag, on any profile;
 //! `@dangerous` ones (`KEYS`) only once the user confirmed. Commands that block
@@ -22,6 +31,7 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use redis::{ErrorKind, RedisError, RedisResult, ServerErrorKind, Value};
+use unicode_width::UnicodeWidthStr;
 
 use super::command;
 use super::server::{self, KeySpec};
@@ -81,6 +91,15 @@ pub enum Request {
         info: CommandInfo,
         confirmed: bool,
     },
+    /// `times` copies of the command in one pipeline, for a repeat with pipeline mode
+    /// on: each one checked by [`gate`] as [`Request::Run`] is, before any is sent, and
+    /// all of them taken from the budget at once. 1 to [`MAX_REPEAT`].
+    Batch {
+        args: Args,
+        info: CommandInfo,
+        confirmed: bool,
+        times: u32,
+    },
 }
 
 /// The typed name is the user's text: `Debug` leaves it out.
@@ -97,6 +116,17 @@ impl fmt::Debug for Request {
                 .field("args", args)
                 .field("confirmed", confirmed)
                 .finish_non_exhaustive(),
+            Request::Batch {
+                args,
+                confirmed,
+                times,
+                ..
+            } => f
+                .debug_struct("Batch")
+                .field("args", args)
+                .field("confirmed", confirmed)
+                .field("times", times)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -110,6 +140,8 @@ pub enum Reply {
     /// Lower-case, sorted.
     Names(Vec<String>),
     Ran(Output),
+    /// A [`Request::Batch`]'s replies, in order: one per command.
+    Batch(Vec<Output>),
 }
 
 /// What `COMMAND INFO` says about a command: the server's own names, lower-case.
@@ -539,11 +571,54 @@ impl Docs {
     }
 }
 
-/// A reply drawn like `redis-cli`: lines safe to draw. They are values, so `Debug`
+/// How the panel draws replies (spec "Command line panel", result views). Every view
+/// escapes every string and stops at [`MAX_REPLY_BYTES`], like the text view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum View {
+    /// Like `redis-cli`: [`format_reply`].
+    #[default]
+    Text,
+    /// Pairs as two columns, arrays of arrays as rows: [`format_table`].
+    Table,
+    /// The reply as JSON: [`format_json`].
+    Json,
+    /// RESP-like, each value with its type: [`format_raw`].
+    Raw,
+}
+
+impl View {
+    /// The view after this one: text, table, JSON, raw, then text again.
+    pub fn next(self) -> Self {
+        match self {
+            View::Text => View::Table,
+            View::Table => View::Json,
+            View::Json => View::Raw,
+            View::Raw => View::Text,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            View::Text => "text",
+            View::Table => "table",
+            View::Json => "JSON",
+            View::Raw => "raw",
+        }
+    }
+}
+
+/// A reply drawn in every [`View`]: lines safe to draw. They are values, so `Debug`
 /// shows only how many there are.
 #[derive(Clone, PartialEq, Default)]
 pub struct Output {
+    /// [`View::Text`].
     lines: Vec<String>,
+    table: Vec<String>,
+    /// [`View::Table`] for a command whose flat array holds pairs (`HGETALL`,
+    /// `CONFIG GET`): only when the reply is a flat array of an even length.
+    table_pairs: Option<Vec<String>>,
+    json: Vec<String>,
+    raw: Vec<String>,
     /// The reply was over [`MAX_REPLY_BYTES`]: the last line says so.
     pub cut: bool,
     /// The reply is the server's error.
@@ -553,27 +628,63 @@ pub struct Output {
 }
 
 impl Output {
+    /// The text view's lines.
     pub fn lines(&self) -> &[String] {
         &self.lines
     }
 
-    /// One error line (from [`run_error`]), as the reply.
+    /// The lines of `view`. `pairs`: the command's flat array holds pairs
+    /// ([`pairs_hint`]), so the table shows it as two columns.
+    pub fn lines_in(&self, view: View, pairs: bool) -> &[String] {
+        match view {
+            View::Text => &self.lines,
+            View::Table => match &self.table_pairs {
+                Some(p) if pairs => p,
+                _ => &self.table,
+            },
+            View::Json => &self.json,
+            View::Raw => &self.raw,
+        }
+    }
+
+    /// The bytes held, every view counted.
+    pub fn bytes(&self) -> usize {
+        let sum = |l: &[String]| l.iter().map(String::len).sum::<usize>();
+        sum(&self.lines)
+            + sum(&self.table)
+            + self.table_pairs.as_deref().map_or(0, sum)
+            + sum(&self.json)
+            + sum(&self.raw)
+    }
+
+    /// One error line (from [`run_error`]), as the reply: the same in every view.
     pub fn error_line(line: String, took: Duration) -> Self {
         Self {
-            lines: vec![line],
+            lines: vec![line.clone()],
+            table: vec![line.clone()],
+            table_pairs: None,
+            json: vec![line.clone()],
+            raw: vec![line],
             cut: false,
             error: true,
             took,
         }
     }
 
-    /// `v` formatted by [`format_reply`].
+    /// `v` formatted for every view.
     pub fn of(v: &Value, took: Duration) -> Self {
         let (lines, cut) = format_reply(v);
+        let flat_even = items(v).is_some_and(|i| {
+            !i.is_empty() && i.len() % 2 == 0 && i.iter().all(|x| items(x).is_none())
+        });
         Self {
             lines,
+            table: format_table(v, false).0,
+            table_pairs: flat_even.then(|| format_table(v, true).0),
+            json: format_json(v).0,
+            raw: format_raw(v).0,
             cut,
-            error: false,
+            error: matches!(v, Value::ServerError(_)),
             took,
         }
     }
@@ -590,6 +701,138 @@ impl fmt::Debug for Output {
             self.took
         )
     }
+}
+
+/// Commands whose flat array reply holds pairs, field then value: the table view shows
+/// them as two columns. Those always, and the ones in [`PAIRS_WITH`] given that
+/// option.
+const PAIRS: &[&str] = &[
+    "hgetall",
+    "config|get",
+    "memory|stats",
+    "xinfo|stream",
+    "ft.info",
+    "ts.info",
+    "bf.info",
+    "cf.info",
+    "cms.info",
+    "topk.info",
+    "tdigest.info",
+];
+
+/// Commands whose flat array holds pairs with the option given.
+const PAIRS_WITH: &[(&str, &str)] = &[
+    ("hrandfield", "withvalues"),
+    ("zrandmember", "withscores"),
+    ("zrange", "withscores"),
+    ("zrangebyscore", "withscores"),
+    ("zrevrange", "withscores"),
+    ("zrevrangebyscore", "withscores"),
+    ("zunion", "withscores"),
+    ("zinter", "withscores"),
+    ("zdiff", "withscores"),
+];
+
+/// Whether `args`' reply, when it is a flat array, holds pairs (`HGETALL`, `CONFIG
+/// GET`, `ZRANGE … WITHSCORES`): the table view shows it as two columns.
+pub fn pairs_hint(args: &[Vec<u8>]) -> bool {
+    let word = |i: usize| {
+        args.get(i)
+            .map(|a| String::from_utf8_lossy(a).to_ascii_lowercase())
+    };
+    let Some(first) = word(0) else {
+        return false;
+    };
+    if PAIRS.contains(&first.as_str()) {
+        return true;
+    }
+    if let Some(sub) = word(1)
+        && PAIRS.contains(&format!("{first}|{sub}").as_str())
+    {
+        return true;
+    }
+    PAIRS_WITH.iter().any(|(c, opt)| {
+        *c == first
+            && args
+                .iter()
+                .skip(1)
+                .any(|a| a.eq_ignore_ascii_case(opt.as_bytes()))
+    })
+}
+
+/// The most commands one `N cmd` line repeats (spec "Command line panel", repeat).
+pub const MAX_REPEAT: u32 = 100;
+
+/// Whether `w` reads as a repeat count: digits, perhaps signed. Such a first word is
+/// never a command, so it is taken for a count, and a bad one is refused.
+pub fn is_count_word(w: &[u8]) -> bool {
+    let digits = w
+        .strip_prefix(b"-")
+        .or_else(|| w.strip_prefix(b"+"))
+        .unwrap_or(w);
+    !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+}
+
+/// Words a line's leading count takes: 1 when its first word reads as a count and a
+/// command follows, else 0. The command is the rest.
+pub fn count_words(args: &[Vec<u8>]) -> usize {
+    usize::from(args.len() > 1 && is_count_word(&args[0]))
+}
+
+/// The repeat count of a typed line, as `redis-cli` reads it: a leading integer before
+/// the command (`5 INCR counter`). `Ok(None)` when there is none; `Ok(Some(n))` for 1
+/// to [`MAX_REPEAT`]; otherwise why it is not sent, safe to draw. The command is
+/// `&args[count_words(args)..]`.
+pub fn parse_repeat(args: &[Vec<u8>]) -> Result<Option<u32>, String> {
+    if count_words(args) == 0 {
+        return Ok(None);
+    }
+    let w = &args[0];
+    let bad = || {
+        format!(
+            "Not sent: a repeat count is a whole number from 1 to {MAX_REPEAT}, before the command."
+        )
+    };
+    if !w.iter().all(u8::is_ascii_digit) {
+        return Err(bad());
+    }
+    let digits = std::str::from_utf8(w).map_err(|_| bad())?;
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() {
+        return Err("Not sent: a repeat count of 0 sends nothing.".into());
+    }
+    match trimmed.parse::<u32>() {
+        Ok(n) if n <= MAX_REPEAT => Ok(Some(n)),
+        _ => Err(format!(
+            "Not sent: at most {MAX_REPEAT} repeats a line; {} is more.",
+            cut_chars(trimmed, 24)
+        )),
+    }
+}
+
+/// The line as the history and the output keep it: [`command::masked_line`] of the
+/// command, after its repeat count if it has one.
+pub fn masked_with_count(args: &[Vec<u8>]) -> String {
+    let skip = count_words(args);
+    let rest = command::masked_line(&args[skip..]);
+    if skip == 0 {
+        return rest;
+    }
+    let mut out = String::new();
+    command::push_word(&args[0], &mut out);
+    out.push(' ');
+    out.push_str(&rest);
+    out
+}
+
+/// How many of a repeat's `left` commands one pipeline holds: at most a tenth of a
+/// second of the budget (`per_sec / 10`, at least 1), so `esc` stops a run between
+/// batches and no batch is a burst bigger than that; without a limit, all of them.
+pub fn pipeline_batch(per_sec: Option<u32>, left: u32) -> u32 {
+    let cap = per_sec
+        .filter(|r| *r > 0)
+        .map_or(MAX_REPEAT, |r| (r / 10).max(1));
+    left.min(cap).min(MAX_REPEAT)
 }
 
 /// Runs one request. Every command takes one from `budget`.
@@ -644,14 +887,65 @@ pub async fn run(
                 Ok(v) => Ok(Reply::Ran(Output::of(&v, took))),
                 Err(e) => {
                     let line = run_error(&name, &e)?;
-                    Ok(Reply::Ran(Output {
-                        lines: vec![line],
-                        cut: false,
-                        error: true,
-                        took,
-                    }))
+                    Ok(Reply::Ran(Output::error_line(line, took)))
                 }
             }
+        }
+        Request::Batch {
+            args,
+            info,
+            confirmed,
+            times,
+        } => {
+            if times == 0 || times > MAX_REPEAT {
+                return Err(LiveError::Failed(format!(
+                    "not sent: a pipeline holds 1 to {MAX_REPEAT} commands"
+                )));
+            }
+            // Each command is checked before the batch is sent, the same check as a
+            // single one: one that is not let through sends none of them.
+            for _ in 0..times {
+                match gate(args.as_slice(), Some(&info)) {
+                    Gate::Send => {}
+                    Gate::Ask if confirmed => {}
+                    Gate::Ask | Gate::Write | Gate::Refuse(_) => {
+                        return Err(LiveError::Failed(NOT_SENT.into()));
+                    }
+                }
+            }
+            let name = sent_name(args.as_slice(), &info);
+            let mut pipe = redis::pipe();
+            pipe.ignore_errors();
+            for _ in 0..times {
+                let mut c = redis::Cmd::new();
+                for a in args.as_slice() {
+                    c.arg(a.as_slice());
+                }
+                pipe.add_command(c);
+            }
+            budget.take(times).await;
+            let start = Instant::now();
+            let r: RedisResult<Vec<Value>> = pipe.query_async(conn).await;
+            let took = start.elapsed();
+            let replies = r.map_err(|e| error_for(&name, &e))?;
+            if replies.len() != times as usize {
+                return Err(LiveError::Failed(
+                    "the pipeline's replies came back incomplete".into(),
+                ));
+            }
+            let mut out = Vec::with_capacity(replies.len());
+            for v in &replies {
+                out.push(match v {
+                    // An error of one command: as a single command's would be. A
+                    // NOPERM fails the batch, in redis-lens's words.
+                    Value::ServerError(e) => {
+                        let e = RedisError::from(e.clone());
+                        Output::error_line(run_error(&name, &e)?, took)
+                    }
+                    v => Output::of(v, took),
+                });
+            }
+            Ok(Reply::Batch(out))
         }
     }
 }
@@ -887,6 +1181,25 @@ impl Sink {
         self.cut = true;
     }
 
+    fn new() -> Self {
+        Self {
+            out: String::new(),
+            cut: false,
+        }
+    }
+
+    /// The lines, the last one [`CUT_NOTE`] when it was cut, and whether it was.
+    fn finish(self) -> (Vec<String>, bool) {
+        let mut lines: Vec<String> = self.out.split('\n').map(str::to_string).collect();
+        if lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        if self.cut {
+            lines.push(CUT_NOTE.to_string());
+        }
+        (lines, self.cut)
+    }
+
     /// Removes the last newline, before ` => ` and a map's value.
     fn unline(&mut self) {
         if !self.cut && self.out.ends_with('\n') {
@@ -911,19 +1224,417 @@ pub const CUT_NOTE: &str = "(cut: the reply is over 1 MiB, so the rest is not sh
 /// each line is safe to draw. Past [`MAX_REPLY_BYTES`] the rest is left out and the last
 /// line is [`CUT_NOTE`]; the second value says it was cut.
 pub fn format_reply(v: &Value) -> (Vec<String>, bool) {
-    let mut sink = Sink {
-        out: String::new(),
-        cut: false,
-    };
+    let mut sink = Sink::new();
     tty(v, "", &mut sink, 0);
-    let mut lines: Vec<String> = sink.out.split('\n').map(str::to_string).collect();
-    if lines.last().is_some_and(String::is_empty) {
-        lines.pop();
+    sink.finish()
+}
+
+/// Draws `v` as a table (spec "Command line panel", result views), every cell escaped:
+///
+/// - a map, an array of two-item arrays, or with `pairs` ([`pairs_hint`]) a flat array
+///   of an even length: `#`, `field` and `value` columns, one row a pair;
+/// - an array of arrays: one row each, a column per item;
+/// - another array or set: `#` and `value`;
+/// - anything else as [`format_reply`] draws it.
+///
+/// A cell of an aggregate says what it holds (`(array of 3)`). Every column but the
+/// last is cut at [`CELL_CHARS`] characters. Past [`MAX_REPLY_BYTES`] it stops like
+/// [`format_reply`].
+pub fn format_table(v: &Value, pairs: bool) -> (Vec<String>, bool) {
+    let v = match v {
+        Value::Attribute { data, .. } => data,
+        v => v,
+    };
+    let mut sink = Sink::new();
+    let rows: Option<(Vec<String>, Vec<Vec<String>>)> = match v {
+        Value::Map(m) if !m.is_empty() => Some((
+            vec!["#".into(), "field".into(), "value".into()],
+            rows_of(m.iter().map(|(k, v)| vec![cell(k), cell(v)])),
+        )),
+        Value::Array(i) | Value::Set(i) | Value::Push { data: i, .. } if !i.is_empty() => {
+            let inner: Option<Vec<&[Value]>> = i.iter().map(items).collect();
+            match inner {
+                Some(inner) if inner.iter().all(|r| r.len() == 2) => Some((
+                    vec!["#".into(), "field".into(), "value".into()],
+                    rows_of(inner.iter().map(|r| vec![cell(&r[0]), cell(&r[1])])),
+                )),
+                Some(inner) => {
+                    let cols = inner.iter().map(|r| r.len()).max().unwrap_or(0);
+                    let mut head = vec!["#".to_string()];
+                    head.extend((1..=cols).map(|c| c.to_string()));
+                    Some((
+                        head,
+                        rows_of(inner.iter().map(|r| r.iter().map(cell).collect())),
+                    ))
+                }
+                None if pairs && i.len() % 2 == 0 => {
+                    let (two, _) = i.as_chunks::<2>();
+                    Some((
+                        vec!["#".into(), "field".into(), "value".into()],
+                        rows_of(two.iter().map(|[k, v]| vec![cell(k), cell(v)])),
+                    ))
+                }
+                None => Some((
+                    vec!["#".into(), "value".into()],
+                    rows_of(i.iter().map(|x| vec![cell(x)])),
+                )),
+            }
+        }
+        _ => None,
+    };
+    let Some((head, rows)) = rows else {
+        tty(v, "", &mut sink, 0);
+        return sink.finish();
+    };
+    let cols = head.len();
+    let mut widths: Vec<usize> = head.iter().map(|h| h.width()).collect();
+    for r in &rows {
+        for (c, text) in r.iter().enumerate() {
+            if c + 1 < cols {
+                widths[c] = widths[c].max(text.width());
+            }
+        }
     }
-    if sink.cut {
-        lines.push(CUT_NOTE.to_string());
+    let line = |cells: &[String], sink: &mut Sink| {
+        let mut out = String::new();
+        for (c, text) in cells.iter().enumerate() {
+            if c > 0 {
+                out.push_str("  ");
+            }
+            out.push_str(text);
+            if c + 1 < cells.len() {
+                out.push_str(&" ".repeat(widths[c].saturating_sub(text.width())));
+            }
+        }
+        sink.push(out.trim_end());
+        sink.push("\n");
+    };
+    line(&head, &mut sink);
+    let mut cut = false;
+    for r in &rows {
+        if sink.cut {
+            break;
+        }
+        if r.first().is_some_and(|c| c == ROWS_CUT) {
+            cut = true;
+            break;
+        }
+        line(r, &mut sink);
     }
-    (lines, sink.cut)
+    if cut {
+        sink.cut = true;
+    }
+    sink.finish()
+}
+
+/// Characters a table cell keeps, but in the last column.
+pub const CELL_CHARS: usize = 60;
+
+/// Marks where [`rows_of`] stopped: the rows held the most a reply shows.
+const ROWS_CUT: &str = "\u{0}cut";
+
+/// The rows of a table, the row number first, each cell but the last cut at
+/// [`CELL_CHARS`]. Stops past [`MAX_REPLY_BYTES`] of cells, with a [`ROWS_CUT`] row.
+fn rows_of(rows: impl Iterator<Item = Vec<String>>) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    for (i, r) in rows.enumerate() {
+        if bytes > MAX_REPLY_BYTES {
+            out.push(vec![ROWS_CUT.to_string()]);
+            break;
+        }
+        let last = r.len().saturating_sub(1);
+        let mut row = vec![(i + 1).to_string()];
+        for (c, text) in r.into_iter().enumerate() {
+            row.push(if c < last {
+                cut_chars(&text, CELL_CHARS)
+            } else {
+                text
+            });
+        }
+        bytes += row.iter().map(String::len).sum::<usize>() + 2 * row.len();
+        out.push(row);
+    }
+    out
+}
+
+/// One value as a table cell, on one line and safe to draw: strings escaped (`\n` as
+/// two characters) and not quoted, but the empty one as `""`; an aggregate as what it
+/// holds.
+fn cell(v: &Value) -> String {
+    let count = |what: &str, n: usize| match n {
+        0 => format!("(empty {what})"),
+        n => format!("({what} of {n})"),
+    };
+    match v {
+        Value::Nil => "(nil)".into(),
+        Value::Int(i) => i.to_string(),
+        Value::Double(d) => double(*d),
+        Value::Boolean(b) => b.to_string(),
+        Value::BigNumber(n) => escaped_bytes(n),
+        Value::BulkString(b) if b.is_empty() => "\"\"".into(),
+        Value::BulkString(b) => {
+            let b = &b[..b.len().min(MAX_REPLY_BYTES)];
+            escaped_bytes(b)
+        }
+        Value::SimpleString(s) => value::escape(s),
+        Value::Okay => "OK".into(),
+        Value::VerbatimString { text, .. } => value::escape(text),
+        Value::ServerError(e) => error_line(e.code(), e.details().unwrap_or("")),
+        Value::Array(i) => count("array", i.len()),
+        Value::Set(i) => count("set", i.len()),
+        Value::Push { data, .. } => count("push", data.len()),
+        Value::Map(m) => count("map", m.len()),
+        Value::Attribute { data, .. } => cell(data),
+        _ => "(a reply redis-lens cannot show)".into(),
+    }
+}
+
+/// Draws `v` as JSON, two spaces an indent (spec "Command line panel", result views):
+/// arrays, sets and pushes as arrays; a map as an object when every key is a string,
+/// otherwise as an array of `[key, value]` pairs; nil as `null`; integers and doubles
+/// as numbers, but `nan` and `±inf` as strings; a big number as a string, so no
+/// digit is lost; booleans as they are; a server error as `{"error": "…"}`. Strings
+/// are JSON strings with every control and bidi character as `\uXXXX`, and invalid
+/// UTF-8 as the text `\xNN`. Past [`MAX_REPLY_BYTES`] it stops like [`format_reply`].
+pub fn format_json(v: &Value) -> (Vec<String>, bool) {
+    let mut sink = Sink::new();
+    json(v, "", &mut sink, 0);
+    sink.push("\n");
+    sink.finish()
+}
+
+fn json(v: &Value, indent: &str, out: &mut Sink, depth: usize) {
+    if out.cut {
+        return;
+    }
+    if depth > MAX_DEPTH {
+        out.push("\"…\"");
+        return;
+    }
+    let inner = format!("{indent}  ");
+    match v {
+        Value::Nil => out.push("null"),
+        Value::Int(i) => out.push(&i.to_string()),
+        Value::Double(d) if d.is_finite() => out.push(&d.to_string()),
+        Value::Double(d) => out.push(&json_str(double(*d).as_bytes())),
+        Value::Boolean(b) => out.push(if *b { "true" } else { "false" }),
+        Value::BigNumber(n) => out.push(&json_str(n)),
+        Value::BulkString(b) => {
+            let room = MAX_REPLY_BYTES.saturating_sub(out.out.len());
+            out.push(&json_str(&b[..b.len().min(room.saturating_add(8))]));
+        }
+        Value::SimpleString(s) => out.push(&json_str(s.as_bytes())),
+        Value::Okay => out.push("\"OK\""),
+        Value::VerbatimString { text, .. } => out.push(&json_str(text.as_bytes())),
+        Value::ServerError(e) => {
+            let line = error_line(e.code(), e.details().unwrap_or(""));
+            let msg = line.strip_prefix("(error) ").unwrap_or(&line);
+            out.push(&format!("{{\"error\": {}}}", json_str(msg.as_bytes())));
+        }
+        Value::Array(i) | Value::Set(i) | Value::Push { data: i, .. } => {
+            json_list(i.iter(), i.len(), indent, &inner, out, |x, out| {
+                json(x, &inner, out, depth + 1);
+            });
+        }
+        Value::Map(m) => {
+            let keyed = m.iter().all(|(k, _)| {
+                matches!(
+                    k,
+                    Value::BulkString(_) | Value::SimpleString(_) | Value::VerbatimString { .. }
+                )
+            });
+            if m.is_empty() {
+                out.push("{}");
+            } else if keyed {
+                out.push("{\n");
+                for (n, (k, val)) in m.iter().enumerate() {
+                    if out.cut {
+                        return;
+                    }
+                    out.push(&inner);
+                    let key = match k {
+                        Value::BulkString(b) => json_str(b),
+                        Value::SimpleString(s) => json_str(s.as_bytes()),
+                        Value::VerbatimString { text, .. } => json_str(text.as_bytes()),
+                        _ => String::new(),
+                    };
+                    out.push(&key);
+                    out.push(": ");
+                    json(val, &inner, out, depth + 1);
+                    out.push(if n + 1 < m.len() { ",\n" } else { "\n" });
+                }
+                out.push(indent);
+                out.push("}");
+            } else {
+                let pair_indent = format!("{inner}  ");
+                json_list(m.iter(), m.len(), indent, &inner, out, |(k, val), out| {
+                    out.push("[\n");
+                    out.push(&pair_indent);
+                    json(k, &pair_indent, out, depth + 2);
+                    out.push(",\n");
+                    out.push(&pair_indent);
+                    json(val, &pair_indent, out, depth + 2);
+                    out.push("\n");
+                    out.push(&inner);
+                    out.push("]");
+                });
+            }
+        }
+        Value::Attribute { data, .. } => json(data, indent, out, depth),
+        _ => out.push("\"(a reply redis-lens cannot show)\""),
+    }
+}
+
+/// `[` the items, one a line, `]`; `[]` when there are none.
+fn json_list<T>(
+    items: impl Iterator<Item = T>,
+    len: usize,
+    indent: &str,
+    inner: &str,
+    out: &mut Sink,
+    mut each: impl FnMut(T, &mut Sink),
+) {
+    if len == 0 {
+        out.push("[]");
+        return;
+    }
+    out.push("[\n");
+    for (n, x) in items.enumerate() {
+        if out.cut {
+            return;
+        }
+        out.push(inner);
+        each(x, out);
+        out.push(if n + 1 < len { ",\n" } else { "\n" });
+    }
+    out.push(indent);
+    out.push("]");
+}
+
+/// `b` as a JSON string, safe to draw: `\"`, `\\`, `\n`, `\r`, `\t`, `\b`, `\f`, every
+/// other control and bidi character as `\uXXXX`, and invalid UTF-8 as the text `\xNN`.
+fn json_str(b: &[u8]) -> String {
+    let mut out = String::with_capacity(b.len() + 2);
+    out.push('"');
+    for chunk in b.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{8}' => out.push_str("\\b"),
+                '\u{c}' => out.push_str("\\f"),
+                c if c.is_control() || value::is_bidi_control(c) => {
+                    let _ = write!(out, "\\u{:04x}", c as u32);
+                }
+                c => out.push(c),
+            }
+        }
+        for x in chunk.invalid() {
+            let _ = write!(out, "\\\\x{x:02x}");
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Draws `v` RESP-like, each value on a line of its own with its type first (spec
+/// "Command line panel", result views): `[bulk string] $5 "hello"`, `[integer] :5`,
+/// `[null] _`, `[simple string] +OK`, `[error] -ERR …`, `[double] ,1.5`, `[boolean]
+/// #t`, `[big number] (1…`, `[verbatim string] =9 txt "…"`, and aggregates as `[array]
+/// *2`, `[set] ~2`, `[map] %1` (its keys and values in turn), `[push] >2`, with their
+/// items indented under them. Strings are quoted and escaped as in [`format_reply`];
+/// the lengths are the server's, in bytes. Past [`MAX_REPLY_BYTES`] it stops like
+/// [`format_reply`].
+pub fn format_raw(v: &Value) -> (Vec<String>, bool) {
+    let mut sink = Sink::new();
+    raw(v, "", &mut sink, 0);
+    sink.finish()
+}
+
+fn raw(v: &Value, indent: &str, out: &mut Sink, depth: usize) {
+    if out.cut {
+        return;
+    }
+    out.push(indent);
+    if depth > MAX_DEPTH {
+        out.push("…\n");
+        return;
+    }
+    let inner = format!("{indent}  ");
+    let list = |label: &str, mark: char, items: &[Value], out: &mut Sink| {
+        out.push(&format!("[{label}] {mark}{}\n", items.len()));
+        for x in items {
+            if out.cut {
+                return;
+            }
+            raw(x, &inner, out, depth + 1);
+        }
+    };
+    match v {
+        Value::Nil => out.push("[null] _\n"),
+        Value::Int(i) => out.push(&format!("[integer] :{i}\n")),
+        Value::Double(d) => out.push(&format!("[double] ,{}\n", double(*d))),
+        Value::Boolean(b) => out.push(if *b {
+            "[boolean] #t\n"
+        } else {
+            "[boolean] #f\n"
+        }),
+        Value::BigNumber(n) => out.push(&format!("[big number] ({}\n", escaped_bytes(n))),
+        Value::BulkString(b) => {
+            out.push(&format!("[bulk string] ${} ", b.len()));
+            let room = MAX_REPLY_BYTES.saturating_sub(out.out.len());
+            out.push(&quoted(b, room.saturating_add(8)));
+            out.push("\n");
+        }
+        Value::SimpleString(s) => out.push(&format!("[simple string] +{}\n", value::escape(s))),
+        Value::Okay => out.push("[simple string] +OK\n"),
+        Value::VerbatimString { format, text } => {
+            let f = match format {
+                redis::VerbatimFormat::Text => "txt".to_string(),
+                redis::VerbatimFormat::Markdown => "mkd".to_string(),
+                redis::VerbatimFormat::Unknown(u) => value::escape(u),
+                _ => "?".to_string(),
+            };
+            out.push(&format!("[verbatim string] ={} {f} ", text.len() + 4));
+            let room = MAX_REPLY_BYTES.saturating_sub(out.out.len());
+            out.push(&quoted(text.as_bytes(), room.saturating_add(8)));
+            out.push("\n");
+        }
+        Value::ServerError(e) => {
+            let line = error_line(e.code(), e.details().unwrap_or(""));
+            let msg = line.strip_prefix("(error) ").unwrap_or(&line);
+            out.push(&format!("[error] -{msg}\n"));
+        }
+        Value::Array(i) => list("array", '*', i, out),
+        Value::Set(i) => list("set", '~', i, out),
+        Value::Push { data, .. } => list("push", '>', data, out),
+        Value::Map(m) => {
+            out.push(&format!("[map] %{}\n", m.len()));
+            for (k, val) in m {
+                if out.cut {
+                    return;
+                }
+                raw(k, &inner, out, depth + 1);
+                raw(val, &inner, out, depth + 1);
+            }
+        }
+        Value::Attribute { data, attributes } => {
+            out.push(&format!("[attribute] |{}\n", attributes.len()));
+            for (k, val) in attributes {
+                if out.cut {
+                    return;
+                }
+                raw(k, &inner, out, depth + 1);
+                raw(val, &inner, out, depth + 1);
+            }
+            raw(data, indent, out, depth);
+        }
+        _ => out.push("[unknown] (a reply redis-lens cannot show)\n"),
+    }
 }
 
 /// How deep a reply is drawn; deeper parts show as `…`.
@@ -1985,5 +2696,545 @@ mod tests {
             run_error("FOO", &unknown).unwrap_err(),
             LiveError::Unsupported("FOO".into())
         );
+    }
+}
+
+/// The result views, the repeat count and the pipeline (spec "Command line panel").
+#[cfg(test)]
+mod views_and_repeat_tests {
+    use std::sync::{Arc, Mutex};
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn b(s: &str) -> Value {
+        Value::BulkString(s.as_bytes().to_vec())
+    }
+
+    fn err(line: &str) -> Value {
+        redis::parse_redis_value(format!("-{line}\r\n").as_bytes()).unwrap()
+    }
+
+    fn words(line: &str) -> Vec<Vec<u8>> {
+        command::split(line).unwrap()
+    }
+
+    /// The replies each view is checked on: a name, the reply, and whether its
+    /// command's flat array holds pairs.
+    fn samples() -> Vec<(&'static str, Value, bool)> {
+        vec![
+            (
+                "HGETALL user:1 (RESP2, flat pairs)",
+                Value::Array(vec![b("name"), b("Ada"), b("visits"), b("12")]),
+                true,
+            ),
+            (
+                "LRANGE l 0 -1 (flat, even, not pairs)",
+                Value::Array(vec![b("a"), b("b"), b("c"), b("d")]),
+                false,
+            ),
+            (
+                "HGETALL over RESP3 (a map)",
+                Value::Map(vec![(b("name"), b("Ada")), (b("visits"), Value::Int(12))]),
+                false,
+            ),
+            (
+                "ZRANGE z 0 -1 WITHSCORES over RESP3 (pairs)",
+                Value::Array(vec![
+                    Value::Array(vec![b("ada"), Value::Double(1.5)]),
+                    Value::Array(vec![b("cyd"), Value::Double(2.0)]),
+                ]),
+                true,
+            ),
+            (
+                "XRANGE s - + (arrays of arrays)",
+                Value::Array(vec![
+                    Value::Array(vec![
+                        b("1-0"),
+                        Value::Array(vec![b("f"), b("v")]),
+                        b("extra"),
+                    ]),
+                    Value::Array(vec![b("2-0"), Value::Array(vec![])]),
+                ]),
+                false,
+            ),
+            (
+                "scalars",
+                Value::Array(vec![
+                    Value::Nil,
+                    Value::Int(-7),
+                    Value::Double(f64::INFINITY),
+                    Value::Boolean(true),
+                    Value::BigNumber(b"123456789012345678901234567890".to_vec()),
+                    Value::Okay,
+                    Value::SimpleString("PONG".into()),
+                    Value::VerbatimString {
+                        format: redis::VerbatimFormat::Text,
+                        text: "line 1\nline 2".into(),
+                    },
+                    b(""),
+                ]),
+                false,
+            ),
+            (
+                "a set, an error and a NOPERM inside a reply",
+                Value::Array(vec![
+                    Value::Set(vec![b("x"), b("y")]),
+                    err("ERR syntax error"),
+                    err("NOPERM User bob has no permissions to run the 'get' command"),
+                ]),
+                false,
+            ),
+            (
+                "a map with a key that is not a string",
+                Value::Map(vec![(Value::Int(1), b("one"))]),
+                false,
+            ),
+            (
+                "control and bidi characters",
+                Value::Array(vec![
+                    b("tab\there\u{1b}[31m red \u{202e}evil"),
+                    Value::BulkString(vec![0xff, b'a', 0x07]),
+                ]),
+                true,
+            ),
+            ("one integer", Value::Int(42), false),
+            ("an empty array", Value::Array(vec![]), false),
+        ]
+    }
+
+    fn sampled(view: View) -> String {
+        let mut out = String::new();
+        for (name, v, pairs) in samples() {
+            let o = Output::of(&v, Duration::ZERO);
+            out.push_str(&format!("## {name}\n"));
+            for l in o.lines_in(view, pairs) {
+                out.push_str(l);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn table_view() {
+        insta::assert_snapshot!("table_view", sampled(View::Table));
+    }
+
+    #[test]
+    fn json_view() {
+        insta::assert_snapshot!("json_view", sampled(View::Json));
+    }
+
+    #[test]
+    fn raw_view() {
+        insta::assert_snapshot!("raw_view", sampled(View::Raw));
+    }
+
+    #[test]
+    fn views_cycle_and_the_text_view_is_today_s() {
+        let mut v = View::default();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(v.label());
+            v = v.next();
+        }
+        assert_eq!(seen, ["text", "table", "JSON", "raw"]);
+        assert_eq!(v, View::Text);
+        for (_, v, pairs) in samples() {
+            let o = Output::of(&v, Duration::ZERO);
+            assert_eq!(o.lines_in(View::Text, pairs), format_reply(&v).0);
+            assert_eq!(o.lines(), o.lines_in(View::Text, !pairs));
+        }
+        // An error line is the same in every view.
+        let e = Output::error_line("(error) ERR x".into(), Duration::ZERO);
+        for view in [View::Text, View::Table, View::Json, View::Raw] {
+            assert_eq!(e.lines_in(view, true), ["(error) ERR x"]);
+        }
+    }
+
+    /// No view lets a terminal control byte, a C1 control or a bidi control through,
+    /// and the NOPERM text (which names the user) never shows.
+    #[test]
+    fn every_view_escapes_and_hides_the_noperm_text() {
+        for view in [View::Text, View::Table, View::Json, View::Raw] {
+            let all = sampled(view);
+            for c in all.chars() {
+                assert!(
+                    c == '\n' || !(c.is_control() || value::is_bidi_control(c)),
+                    "{view:?}: {c:?} in {all}"
+                );
+            }
+            assert!(!all.contains("bob"), "{view:?}: {all}");
+        }
+    }
+
+    #[test]
+    fn the_json_view_is_json() {
+        for (name, v, _) in samples() {
+            let text = format_json(&v).0.join("\n");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name}: {e}\n{text}"));
+            if name == "HGETALL over RESP3 (a map)" {
+                assert_eq!(parsed, serde_json::json!({"name": "Ada", "visits": 12}));
+            }
+        }
+        let j = |v: Value| serde_json::from_str::<serde_json::Value>(&format_json(&v).0.join(""));
+        assert_eq!(j(Value::Nil).unwrap(), serde_json::Value::Null);
+        assert_eq!(j(Value::Double(f64::NAN)).unwrap(), "nan");
+        assert_eq!(j(Value::Double(-0.25)).unwrap(), -0.25);
+        assert_eq!(
+            j(Value::BigNumber(b"99999999999999999999999".to_vec())).unwrap(),
+            "99999999999999999999999"
+        );
+        assert_eq!(
+            j(Value::Set(vec![b("a")])).unwrap(),
+            serde_json::json!(["a"])
+        );
+        assert_eq!(
+            j(err("ERR nope")).unwrap(),
+            serde_json::json!({"error": "ERR nope"})
+        );
+    }
+
+    #[test]
+    fn every_view_is_cut_past_one_mib_and_says_so() {
+        let big = Value::Array(vec![Value::BulkString(vec![b'x'; 2 * MAX_REPLY_BYTES])]);
+        let many = Value::Array((0..40_000).map(|i| b(&format!("{i:>40}"))).collect());
+        for v in [&big, &many] {
+            for (name, (lines, cut)) in [
+                ("table", format_table(v, false)),
+                ("table pairs", format_table(v, true)),
+                ("json", format_json(v)),
+                ("raw", format_raw(v)),
+            ] {
+                assert!(cut, "{name}");
+                assert_eq!(lines.last().map(String::as_str), Some(CUT_NOTE), "{name}");
+                let bytes: usize = lines.iter().map(String::len).sum();
+                assert!(bytes <= MAX_REPLY_BYTES + 1024, "{name}: {bytes}");
+            }
+        }
+    }
+
+    #[test]
+    fn pairs_come_from_the_command() {
+        for line in [
+            "HGETALL h",
+            "hgetall h",
+            "CONFIG GET maxmemory*",
+            "MEMORY STATS",
+            "ZRANGE z 0 -1 WITHSCORES",
+            "HRANDFIELD h 3 withvalues",
+            "FT.INFO idx",
+        ] {
+            assert!(pairs_hint(&words(line)), "{line}");
+        }
+        for line in [
+            "LRANGE l 0 -1",
+            "ZRANGE z 0 -1",
+            "CONFIG SET a b",
+            "SMEMBERS s",
+            "",
+        ] {
+            assert!(!pairs_hint(&words(line)), "{line}");
+        }
+    }
+
+    #[test]
+    fn repeat_counts() {
+        let p = |line: &str| parse_repeat(&words(line));
+        assert_eq!(p("5 INCR counter"), Ok(Some(5)));
+        assert_eq!(p("007 GET k"), Ok(Some(7)));
+        assert_eq!(p("100 PING"), Ok(Some(100)));
+        assert_eq!(p("1 PING"), Ok(Some(1)));
+        assert_eq!(p("GET 5"), Ok(None));
+        assert_eq!(p("5"), Ok(None));
+        assert_eq!(p(""), Ok(None));
+        assert!(p("0 PING").unwrap_err().contains("of 0 sends nothing"));
+        for line in ["101 PING", "99999999999999999999999999 PING"] {
+            let e = p(line).unwrap_err();
+            assert!(e.contains("at most 100"), "{line}: {e}");
+            assert!(!e.contains('\n'), "one line: {e}");
+        }
+        for line in ["-1 PING", "+5 PING", "-0 PING"] {
+            assert!(p(line).unwrap_err().contains("1 to 100"), "{line}");
+        }
+        assert_eq!(count_words(&words("5 GET k")), 1);
+        assert_eq!(count_words(&words("GET k")), 0);
+        assert_eq!(count_words(&words("5")), 0);
+    }
+
+    #[test]
+    fn a_counted_line_is_masked_after_its_count() {
+        assert_eq!(
+            masked_with_count(&words("3 CONFIG SET requirepass hunter2")),
+            "3 CONFIG SET requirepass ***"
+        );
+        assert_eq!(masked_with_count(&words("2 AUTH hunter2")), "2 AUTH ***");
+        assert_eq!(masked_with_count(&words("AUTH hunter2")), "AUTH ***");
+        assert_eq!(masked_with_count(&words("-3 AUTH hunter2")), "-3 AUTH ***");
+    }
+
+    #[test]
+    fn pipelines_hold_a_tenth_of_a_second_of_the_budget() {
+        assert_eq!(pipeline_batch(None, 100), 100);
+        assert_eq!(pipeline_batch(Some(0), 100), 100);
+        assert_eq!(pipeline_batch(Some(5_000), 100), 100);
+        assert_eq!(pipeline_batch(Some(100), 100), 10);
+        assert_eq!(pipeline_batch(Some(20), 7), 2);
+        assert_eq!(pipeline_batch(Some(5), 7), 1);
+        assert_eq!(pipeline_batch(Some(1_000), 3), 3);
+        assert_eq!(pipeline_batch(None, 500), MAX_REPEAT);
+    }
+
+    proptest! {
+        /// A leading number is always read as the count: 1 to 100 repeat, anything
+        /// else is refused with one line, and the command is what follows.
+        #[test]
+        fn a_leading_number_is_the_count(
+            n in 0u64..10_000_000,
+            zeros in 0usize..3,
+            cmd in "[A-Za-z]{1,10}",
+            rest in proptest::collection::vec("[a-z0-9]{0,6}", 0..4),
+        ) {
+            let mut args = vec![
+                format!("{}{n}", "0".repeat(zeros)).into_bytes(),
+                cmd.clone().into_bytes(),
+            ];
+            args.extend(rest.iter().map(|r| r.clone().into_bytes()));
+            prop_assert_eq!(count_words(&args), 1);
+            match parse_repeat(&args) {
+                Ok(Some(t)) => prop_assert!((1..=100).contains(&t) && u64::from(t) == n),
+                Ok(None) => prop_assert!(false, "a number was not read as a count"),
+                Err(why) => {
+                    prop_assert!(n == 0 || n > 100);
+                    prop_assert!(!why.contains('\n') && why.starts_with("Not sent:"));
+                }
+            }
+            prop_assert_eq!(&args[count_words(&args)..][0], &cmd.into_bytes());
+        }
+
+        /// A first word that is not a number is the command: no count.
+        #[test]
+        fn a_word_is_never_a_count(
+            first in "[A-Za-z_.][A-Za-z0-9_.|-]{0,10}",
+            rest in proptest::collection::vec(any::<Vec<u8>>(), 0..4),
+        ) {
+            let mut args = vec![first.into_bytes()];
+            args.extend(rest);
+            prop_assert_eq!(parse_repeat(&args), Ok(None));
+            prop_assert_eq!(count_words(&args), 0);
+        }
+
+        /// Any words at all: no panic, and a count is only ever 1 to 100.
+        #[test]
+        fn parsing_any_line_never_panics(
+            args in proptest::collection::vec(any::<Vec<u8>>(), 0..5),
+        ) {
+            if let Ok(Some(n)) = parse_repeat(&args) {
+                prop_assert!((1..=MAX_REPEAT).contains(&n));
+            }
+        }
+
+        /// Whatever a reply holds, no view draws a control or bidi character, and the
+        /// JSON view is JSON.
+        #[test]
+        fn no_view_draws_a_control_character(s in any::<Vec<u8>>(), t in "\\PC*") {
+            let v = Value::Array(vec![
+                Value::BulkString(s.clone()),
+                Value::Map(vec![(Value::BulkString(s), Value::SimpleString(t.clone()))]),
+                Value::Array(vec![Value::BulkString(t.into_bytes()), Value::Int(1)]),
+            ]);
+            let o = Output::of(&v, Duration::ZERO);
+            for view in [View::Text, View::Table, View::Json, View::Raw] {
+                for pairs in [false, true] {
+                    for l in o.lines_in(view, pairs) {
+                        prop_assert!(
+                            !l.chars().any(|c| c.is_control() || value::is_bidi_control(c)),
+                            "{:?}: {:?}",
+                            view,
+                            l
+                        );
+                    }
+                }
+            }
+            let json = o.lines_in(View::Json, false).join("\n");
+            prop_assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok(), "{}", json);
+        }
+    }
+
+    /// A connection that answers a pipeline of `n` with `n` replies (the second an
+    /// error when `fail_second`) and records what it was sent.
+    struct Piped {
+        log: Arc<Mutex<Vec<String>>>,
+        fail_second: bool,
+    }
+
+    impl redis::aio::ConnectionLike for Piped {
+        fn req_packed_command<'a>(
+            &'a mut self,
+            _cmd: &'a redis::Cmd,
+        ) -> redis::RedisFuture<'a, Value> {
+            self.log.lock().unwrap().push("ONE".into());
+            Box::pin(async { Ok(Value::Int(1)) })
+        }
+
+        fn req_packed_commands<'a>(
+            &'a mut self,
+            pipe: &'a redis::Pipeline,
+            _offset: usize,
+            count: usize,
+        ) -> redis::RedisFuture<'a, Vec<Value>> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("PIPELINE {}", pipe.len()));
+            let fail = self.fail_second;
+            Box::pin(async move {
+                Ok((0..count)
+                    .map(|i| {
+                        if fail && i == 1 {
+                            err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                        } else {
+                            Value::Int(i64::try_from(i).unwrap() + 1)
+                        }
+                    })
+                    .collect())
+            })
+        }
+
+        fn get_db(&self) -> i64 {
+            0
+        }
+    }
+
+    fn info(name: &str, flags: &[&str], cats: &[&str]) -> CommandInfo {
+        CommandInfo {
+            name: name.into(),
+            flags: flags.iter().map(|s| (*s).into()).collect(),
+            categories: cats.iter().map(|s| (*s).into()).collect(),
+            ..CommandInfo::default()
+        }
+    }
+
+    fn batch(line: &str, info: CommandInfo, confirmed: bool, times: u32) -> Request {
+        Request::Batch {
+            args: Args::new(words(line)),
+            info,
+            confirmed,
+            times,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_one_pipeline_checked_command_by_command() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = Piped {
+            log: Arc::clone(&log),
+            fail_second: true,
+        };
+        let budget = Budget::new(None);
+        let get = info("get", &["readonly", "fast"], &["@read"]);
+        let r = super::run(&mut conn, &budget, batch("GET k", get.clone(), false, 5)).await;
+        let Ok(Reply::Batch(outs)) = r else {
+            panic!("{r:?}")
+        };
+        assert_eq!(outs.len(), 5);
+        assert_eq!(outs[0].lines(), ["(integer) 1"]);
+        assert!(outs[1].error && outs[1].lines()[0].starts_with("(error) WRONGTYPE"));
+        assert_eq!(outs[4].lines(), ["(integer) 5"]);
+        assert_eq!(*log.lock().unwrap(), ["PIPELINE 5"]);
+        assert_eq!(budget.taken(), 5);
+
+        // Not let through: nothing is sent, and nothing taken from the budget.
+        log.lock().unwrap().clear();
+        let set = info("set", &["write", "denyoom"], &["@write"]);
+        let keys = info("keys", &["readonly"], &["@read", "@dangerous"]);
+        let script = info("eval_ro", &["readonly"], &["@scripting"]);
+        for req in [
+            batch("SET k v", set, true, 3),
+            batch("KEYS *", keys.clone(), false, 3),
+            batch("EVAL_RO \"return 1\" 0", script, true, 3),
+            batch(
+                "SUBSCRIBE c",
+                info("subscribe", &["readonly"], &[]),
+                true,
+                3,
+            ),
+            batch("GET k", get.clone(), false, 0),
+            batch("GET k", get.clone(), false, MAX_REPEAT + 1),
+        ] {
+            let r = super::run(&mut conn, &budget, req).await;
+            assert!(matches!(r, Err(LiveError::Failed(_))), "{r:?}");
+        }
+        assert!(log.lock().unwrap().is_empty());
+        assert_eq!(budget.taken(), 5);
+        // A confirmed @dangerous readonly one is sent.
+        let r = super::run(&mut conn, &budget, batch("KEYS *", keys, true, 2)).await;
+        assert!(
+            matches!(r, Ok(Reply::Batch(ref o)) if o.len() == 2),
+            "{r:?}"
+        );
+    }
+
+    /// The budget holds for a repeat as for single commands: 10 commands at 10 a
+    /// second take a second, in pipelines or one by one.
+    #[tokio::test(start_paused = true)]
+    async fn the_budget_limits_a_repeat_in_pipelines_and_one_by_one() {
+        let get = info("get", &["readonly"], &["@read"]);
+        for (rate, pipelined, trips) in [(10, false, 10), (10, true, 10), (40, true, 3)] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut conn = Piped {
+                log: Arc::clone(&log),
+                fail_second: false,
+            };
+            let budget = Budget::new(Some(rate));
+            let t0 = tokio::time::Instant::now();
+            let mut left = 10;
+            while left > 0 {
+                let n = if pipelined {
+                    pipeline_batch(budget.per_sec(), left)
+                } else {
+                    1
+                };
+                let req = if n > 1 {
+                    batch("GET k", get.clone(), false, n)
+                } else {
+                    Request::Run {
+                        args: Args::new(words("GET k")),
+                        info: get.clone(),
+                        confirmed: false,
+                    }
+                };
+                super::run(&mut conn, &budget, req).await.unwrap();
+                left -= n;
+            }
+            assert_eq!(budget.taken(), 10);
+            let want = Duration::from_secs_f64(10.0 / f64::from(rate));
+            assert!(
+                t0.elapsed() >= want,
+                "{rate} {pipelined}: {:?}",
+                t0.elapsed()
+            );
+            // At 10 a second a pipeline holds one command (a tenth of a second); at 40
+            // it holds 4.
+            assert_eq!(log.lock().unwrap().len(), trips, "{rate} {pipelined}");
+        }
+    }
+
+    #[test]
+    fn batch_debug_shows_no_value() {
+        let r = batch(
+            "GET hunter2-mark",
+            info("get", &["readonly"], &[]),
+            false,
+            3,
+        );
+        let d = format!("{r:?}");
+        assert!(!d.contains("hunter2"), "{d}");
+        assert!(d.contains("times: 3"), "{d}");
+        let o = Output::of(&b("hunter2-mark"), Duration::ZERO);
+        assert!(!format!("{:?}", Reply::Batch(vec![o])).contains("hunter2"));
     }
 }
