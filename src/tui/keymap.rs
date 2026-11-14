@@ -54,7 +54,15 @@ const QUIT: KeyHelp = k("q ctrl-c", "q", "Quit", "Quit", true);
 
 const COMMAND_LINE_KEY: KeyHelp = k(":", ":", "Command", "Open the command line", false);
 
-static GLOBAL: [KeyHelp; 5] = [VIEW_KEYS, HELP, ADD, COMMAND_LINE_KEY, QUIT];
+const DATABASES_KEY: KeyHelp = k(
+    "b",
+    "b",
+    "Databases",
+    "Switch the database (once connected)",
+    false,
+);
+
+static GLOBAL: [KeyHelp; 6] = [VIEW_KEYS, HELP, ADD, COMMAND_LINE_KEY, DATABASES_KEY, QUIT];
 
 /// The keys of the command line panel while it is open (`:`). Its input line replaces
 /// the footer, so none of them is in a footer.

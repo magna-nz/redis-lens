@@ -51,6 +51,7 @@ use crate::budget::Budget;
 pub mod bulk;
 pub mod cmdline;
 pub mod command;
+pub mod dbs;
 pub mod keys;
 pub mod monitor;
 pub mod nodes;
@@ -356,6 +357,8 @@ pub enum LiveRequest {
     /// A step of a bulk action (spec "Bulk actions"): the dry run, or a batch of a
     /// bulk op the gate let through.
     Bulk(bulk::Request),
+    /// `INFO keyspace`, for the database list.
+    Dbs(dbs::Request),
 }
 
 /// The answer to a [`LiveRequest`], from the same group.
@@ -370,6 +373,7 @@ pub enum LiveReply {
     Command(cmdline::Reply),
     Write(write::Reply),
     Bulk(bulk::Reply),
+    Dbs(dbs::Reply),
 }
 
 /// Why a request failed. The text is always redis-lens's own fixed wording, never the
@@ -411,6 +415,7 @@ pub async fn run(
         LiveRequest::Command(r) => cmdline::run(conn, budget, r).await.map(LiveReply::Command),
         LiveRequest::Write(p) => write::run(conn, budget, p).await.map(LiveReply::Write),
         LiveRequest::Bulk(r) => bulk::run(conn, budget, r).await.map(LiveReply::Bulk),
+        LiveRequest::Dbs(r) => dbs::run(conn, budget, r).await.map(LiveReply::Dbs),
     }
 }
 
