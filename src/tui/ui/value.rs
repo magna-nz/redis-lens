@@ -13,7 +13,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Clear;
 
 use crate::format;
-use crate::live::values::{Items, JSON_MAX_SIZE, JSON_SHOWN, Kind, MAX_ITEMS, STRING_BYTES};
+use crate::live::values::{
+    Items, JSON_MAX_SIZE, JSON_SHOWN, Kind, MAX_ITEMS, Module, STRING_BYTES, Sample,
+};
 use crate::model::Ttl;
 use crate::tui::app::App;
 use crate::tui::app::views::value::{Focus, Form, ValueState};
@@ -338,8 +340,8 @@ fn length_label(kind: Option<&Kind>, n: u64) -> &'static str {
         Some(Kind::Set | Kind::ZSet) => "members",
         Some(Kind::Stream) if one => "entry",
         Some(Kind::Stream) => "entries",
-        Some(Kind::Vector) if one => "element",
-        Some(Kind::Vector) => "elements",
+        Some(Kind::Vector | Kind::Array) if one => "element",
+        Some(Kind::Vector | Kind::Array) => "elements",
         _ => "long",
     }
 }
@@ -400,7 +402,10 @@ pub fn title_right(state: &ValueState, ctx: &Ctx<'_>) -> String {
                 parts.push(format!("first 64 KiB of {}", format::bytes(n)));
             }
         }
-        Some(Items::Json { .. } | Items::JsonNotRead { .. } | Items::NotRead) | None => {}
+        Some(
+            Items::Json { .. } | Items::JsonNotRead { .. } | Items::NotRead | Items::Module(_),
+        )
+        | None => {}
         // How much is loaded, while not all of it is.
         Some(items) => {
             let n = items.len() as u64;
@@ -485,6 +490,7 @@ pub fn draw_value_body(frame: &mut Frame, inner: Rect, state: &ValueState, ctx: 
             };
             value_pane(frame, inner, state, "document".into(), doc, notes);
         }
+        Items::Module(m) => module_pane(frame, inner, state, m),
         _ => collection(frame, inner, state, items),
     }
 }
@@ -666,6 +672,7 @@ fn collection(frame: &mut Frame, area: Rect, state: &ValueState, items: &Items) 
             let label = match items {
                 Items::Hash(f) => name_text(f[sel].name.as_bytes()),
                 Items::List(_) => format!("#{sel}"),
+                Items::Array(v) => format!("#{}", v[sel].index),
                 Items::ZSet(m) => {
                     format!("member · score {}", state.memo.preview(&m[sel].score, 24))
                 }
@@ -781,6 +788,28 @@ fn list_rows(
                 .collect();
             (head, rows)
         }
+        Items::Array(v) => {
+            let iw_ = v
+                .last()
+                .map_or(0, |e| e.index.to_string().len())
+                .clamp(5, 20);
+            let ew = w.saturating_sub(iw_ + 1);
+            let head = vec![sp(), sp(), hd_r("INDEX", iw_), sp(), hd("ELEMENT", ew)];
+            let rows = v
+                .iter()
+                .skip(off)
+                .take(n)
+                .map(|e| {
+                    vec![
+                        sp(),
+                        Span::styled(pad_l(&e.index.to_string(), iw_), style::dim()),
+                        sp(),
+                        cell(state.memo.preview(&e.value, ew), ew),
+                    ]
+                })
+                .collect();
+            (head, rows)
+        }
         Items::Set(v) | Items::Vector(v) => {
             let title = if matches!(items, Items::Set(_)) {
                 "MEMBER"
@@ -850,4 +879,207 @@ fn list_rows(
         }
         _ => (Vec::new(), Vec::new()),
     }
+}
+
+/// A module type's summary: its `*.INFO` fields, a note for each part left out, then by
+/// type the last samples (a sparkline and the list), the top items or the quantiles.
+/// Scrolls like a value. When `*.INFO` was refused or is unknown, just the one line
+/// saying why. Every text from the server is escaped.
+fn module_pane(frame: &mut Frame, area: Rect, state: &ValueState, m: &Module) {
+    let w = usize::from(area.width);
+    if let Some(why) = &m.unavailable {
+        let lines: Vec<Line<'static>> = wrap(&format!(" {why}"), w)
+            .into_iter()
+            .map(|l| Line::from(fit(vec![Span::styled(l, style::amber())], w)))
+            .collect();
+        state.drawn.set(lines.len(), usize::from(area.height));
+        rows(frame, area, lines, None);
+        return;
+    }
+    let kind = state.kind();
+    let mut body: Vec<Line<'static>> = Vec::new();
+    let names: Vec<String> = m
+        .info
+        .iter()
+        .map(|(n, _)| name_text(n.as_bytes()))
+        .collect();
+    let nw = names
+        .iter()
+        .map(|n| width(n))
+        .max()
+        .unwrap_or(0)
+        .clamp(8, 24);
+    let vw = w.saturating_sub(nw + 3).max(1);
+    for (name, (_, v)) in names.iter().zip(&m.info) {
+        let mut shown = state.memo.preview(v, vw);
+        if kind == Some(Kind::TimeSeries)
+            && matches!(name.as_str(), "firstTimestamp" | "lastTimestamp")
+            && let Some(t) = std::str::from_utf8(v.as_bytes())
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .and_then(utc_ms)
+        {
+            shown = format!("{t} · {shown}");
+        }
+        body.push(Line::from(fit(
+            vec![
+                Span::styled(format!(" {}", pad_r(&trunc(name, nw), nw)), style::dim()),
+                Span::raw("  "),
+                Span::styled(shown, style::fg()),
+            ],
+            w,
+        )));
+    }
+    for note in &m.missing {
+        for l in wrap(&format!(" ▲ {note}"), w) {
+            body.push(Line::from(fit(vec![Span::styled(l, style::amber())], w)));
+        }
+    }
+    let section = |body: &mut Vec<Line<'static>>, text: String| {
+        body.push(Line::default());
+        body.push(Line::from(fit(
+            vec![Span::styled(format!(" {text}"), style::hd())],
+            w,
+        )));
+    };
+    match kind {
+        Some(Kind::TimeSeries) if !m.samples.is_empty() => {
+            let n = m.samples.len();
+            section(
+                &mut body,
+                format!(
+                    "Last {} {}, oldest to newest",
+                    format::grouped(n as u64),
+                    if n == 1 { "sample" } else { "samples" }
+                ),
+            );
+            body.push(Line::from(fit(
+                vec![Span::styled(
+                    format!(" {}", spark(&m.samples, w.saturating_sub(2))),
+                    style::ok(),
+                )],
+                w,
+            )));
+            let tw = 23;
+            body.push(Line::from(fit(
+                vec![Span::styled(
+                    format!(" {}  VALUE", pad_r("TIME (UTC)", tw)),
+                    style::hd(),
+                )],
+                w,
+            )));
+            let value_w = w.saturating_sub(tw + 4).max(1);
+            for s in &m.samples {
+                let t = utc_ms(s.ts).unwrap_or_else(|| s.ts.to_string());
+                body.push(Line::from(fit(
+                    vec![
+                        Span::styled(format!(" {}", pad_r(&t, tw)), style::dim()),
+                        Span::raw("  "),
+                        Span::styled(state.memo.preview(&s.value, value_w), style::fg()),
+                    ],
+                    w,
+                )));
+            }
+        }
+        Some(Kind::TimeSeries) if m.missing.is_empty() => {
+            section(&mut body, "No samples.".to_string());
+        }
+        Some(Kind::TopK) if !m.top.is_empty() || m.missing.is_empty() => {
+            section(
+                &mut body,
+                format!("Top {} items", format::grouped(m.top.len() as u64)),
+            );
+            let cw = 12;
+            let iw = w.saturating_sub(cw + 4).max(1);
+            for (item, count) in &m.top {
+                body.push(Line::from(fit(
+                    vec![
+                        Span::styled(
+                            format!(" {}", pad_r(&state.memo.preview(item, iw), iw)),
+                            style::fg(),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(pad_l(&state.memo.preview(count, cw), cw), style::fg()),
+                    ],
+                    w,
+                )));
+            }
+        }
+        Some(Kind::TDigest) if !m.stats.is_empty() => {
+            section(&mut body, "Quantiles".to_string());
+            let vw = w.saturating_sub(10).max(1);
+            for (label, v) in &m.stats {
+                body.push(Line::from(fit(
+                    vec![
+                        Span::styled(format!(" {}", pad_r(label, 6)), style::dim()),
+                        Span::raw("  "),
+                        Span::styled(state.memo.preview(v, vw), style::fg()),
+                    ],
+                    w,
+                )));
+            }
+        }
+        _ => {}
+    }
+    let height = usize::from(area.height);
+    state.drawn.set(body.len(), height);
+    let off = state.scroll.min(body.len().saturating_sub(height));
+    let shown: Vec<Line<'static>> = body.into_iter().skip(off).take(height).collect();
+    rows(frame, area, shown, None);
+}
+
+/// A sample's time in UTC with milliseconds, `2023-11-14 22:13:20.000`, for times from
+/// 1970 to 9999. `None` outside them.
+fn utc_ms(ms: i64) -> Option<String> {
+    if !(0..=253_402_300_799_999).contains(&ms) {
+        return None;
+    }
+    let s = crate::snapshot::format_utc(ms / 1000);
+    let base = s.strip_suffix(" UTC").unwrap_or(&s);
+    Some(format!("{base}.{:03}", ms % 1000))
+}
+
+/// The samples' values as a sparkline at most `w` cells wide, oldest on the left: when
+/// there are more samples than cells, each cell is the mean of its share. Values that
+/// are not numbers are gaps.
+fn spark(samples: &[Sample], w: usize) -> String {
+    let values: Vec<Option<f64>> = samples
+        .iter()
+        .rev()
+        .map(|s| {
+            std::str::from_utf8(s.value.as_bytes())
+                .ok()
+                .and_then(|t| t.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite())
+        })
+        .collect();
+    let w = w.max(1);
+    let cells: Vec<Option<f64>> = if values.len() <= w {
+        values
+    } else {
+        (0..w)
+            .map(|c| {
+                let from = c * values.len() / w;
+                let to = ((c + 1) * values.len() / w).max(from + 1);
+                let part: Vec<f64> = values[from..to].iter().flatten().copied().collect();
+                (!part.is_empty()).then(|| part.iter().sum::<f64>() / part.len() as f64)
+            })
+            .collect()
+    };
+    let present = cells.iter().flatten();
+    let min = present.clone().copied().fold(f64::INFINITY, f64::min);
+    let max = present.copied().fold(f64::NEG_INFINITY, f64::max);
+    let scaled: Vec<Option<u64>> = cells
+        .iter()
+        .map(|v| {
+            v.map(|v| {
+                if max > min {
+                    ((v - min) / (max - min) * 1_000_000.0) as u64
+                } else {
+                    0
+                }
+            })
+        })
+        .collect();
+    format::sparkline(&scaled)
 }
