@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** Redis Insight parity phase 4 (topology and connections), in one PR from branch `claude/insight-phase4-289a4c`. Phases 1 to 3 are on main (#15, #16, #17, #18).
-**Last updated:** 2026-11-14 (phase 4 built: all five parts, both verifier reviews done and what they found fixed; the PR is open for the owner)
+**Current milestone:** Redis Insight parity phase 4 (topology and connections) is on main (#19, merged at `2140f95`), with phases 1 to 3 (#15, #16, #17, #18). A follow-up PR from branch `claude/insight-phase4-followups` carries what #19 was merged without: the fixes for what the cluster verifier noted beyond its blocking finding, tests for the mutations that survived, and this file's phase 4 section.
+**Last updated:** 2026-11-15 (phase 4 merged as #19; the follow-up PR with the verifier's other fixes is open for the owner)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -507,13 +507,13 @@ Tests on Redis 7.4, Valkey 8.1 and Redis 6.2: `acl_dryrun_it`, `write_keys_it`, 
 
 ## Phase 4 (2026-11-14): topology and connections
 
-Built unattended on `claude/insight-phase4-289a4c`, one PR for the phase. Not merged: the owner merges. The spec is spec.md "Topology and connections (P4)".
+Built unattended on `claude/insight-phase4-289a4c` and merged by the owner as #19 (2026-11-14, at `2140f95`). #19 went in before three commits were pushed, so they are a follow-up PR from `claude/insight-phase4-followups`: `345d9f5` (below), its merge, and the status, spec and parity-doc update. Until that PR is merged, main has the blocking fix (`2140f95`) but not the fixes listed under "Also fixed from that review". The spec is spec.md "Topology and connections (P4)".
 
 | Part | Content | Commits | State |
 |---|---|---|---|
 | 0 | Spec: the P4 section, milestones, the parity roadmap | | **done** |
 | 1a | Cluster live core: node connections kept with their budgets, routing by slot (local CRC16), `MOVED`/`ASK` once, the picked node (`[` `]`), per-shard summary on Overview, Search and Monitor per node | `cbf01f7` | **done**; `tests/cluster_live_it.rs` |
-| 1b | The other views on a cluster: key list and detail, edits, Big keys lengths, Streams per slot owner, classic and sharded Pub/Sub (`S`, `SPUBLISH` through the gate), bulk and `redis-lens expire` per primary, the command line by key specs with CROSSSLOT refused | `b0f48ae`, `2140f95`, `345d9f5` | **done**; `tests/cluster_views_it.rs` 7 tests on Redis 7.4, Valkey 8.1 and Redis 6.2 (shard tests gated on 7.0). The verifier blocked on one finding, fixed in `2140f95`; what else it noted is fixed in `345d9f5` |
+| 1b | The other views on a cluster: key list and detail, edits, Big keys lengths, Streams per slot owner, classic and sharded Pub/Sub (`S`, `SPUBLISH` through the gate), bulk and `redis-lens expire` per primary, the command line by key specs with CROSSSLOT refused | `b0f48ae`, `2140f95` (in #19); `345d9f5` (follow-up PR) | **done**; `tests/cluster_views_it.rs` 7 tests on Redis 7.4, Valkey 8.1 and Redis 6.2 (shard tests gated on 7.0). The verifier blocked on one finding, fixed in `2140f95` and merged with #19; what else it noted is fixed in `345d9f5`, in the follow-up PR |
 | 2 | Sentinel: `[profile.sentinel]`, `sentinel:profile:<name>` keychain entry, `GET-MASTER-ADDR-BY-NAME` with the primary checked, `SENTINEL REPLICAS` for `prefer_replica`, `conn add`/`test`/`list`, Connections detail | `a2d467b`, `c53f2dd` | **done**; `tests/sentinel_it.rs` 14 tests on Redis 7.4, Valkey 8.1 and Redis 6.2. The verifier approved it; what it noted is fixed in `c53f2dd`, each with a test |
 | 3 | Database switch (`b`): the list from `INFO keyspace`, a session rescan on the other index, `s` saves after asking | `103f09b` | **done**; `tests/dbs_it.rs` 5 tests |
 | 4 | Slots panel (`CLUSTER SLOT-STATS`), read on show and `r` | `29b53f2` | **done**; `tests/slots_it.rs` 3 tests (Valkey 8.1 counts against `CLUSTER COUNTKEYSINSLOT`; Redis 7.4 and 6.2 are off as too old; a Redis 8.2 run behind `REDIS_LENS_IT_REDIS82=1`) |
@@ -525,7 +525,7 @@ Parts landed out of order (2, 1a, 5, 4, 3, then 1b) because they were built in p
 
 - **Sentinel credentials (part 2): approved.** Fixed afterwards, each with a test (`c53f2dd`): a server's error text, which can name the ACL user, reached the replica fallback reason; a Sentinel keychain entry left under a name was read by a new profile of that name; Monitor sent its check before refusing a TLS host-name primary; the connecting line showed the configured address, not the primary the Sentinel named.
 - **Cluster routing and write paths (part 1): blocked on one finding, fixed in `2140f95`.** `[` `]` can pick a node discovery has no connection to, and a shard channel's slot can be owned by one. Monitor or a Pub/Sub tail then opened a connection of their own to it with the profile's credentials, which breaks the loopback rule when a remote cluster announces a node on 127.0.0.1. Refused now at three places: the app, the runner, and discovery's credentials flag. Four unit tests fail without the fix, and `tests/cluster_it.rs` asserts the flag on a stopped node. Not checked end to end: that needs a remote seed announcing a loopback node (two hosts).
-- **Also fixed from that review (`345d9f5`), each with a test:** bulk actions and `redis-lens expire` ran on the seed alone when the slot map could not be read; `expire` treated a failed `INFO cluster` as a standalone server; `ASKING` was not refused on the command line; the `ASKING` of a redirect retry took nothing from the budget; `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE` and the `STORE` forms of `SORT` and `GEORADIUS` asked before refusing keys in different slots.
+- **Also fixed from that review (`345d9f5`, in the follow-up PR, not in #19), each with a test:** bulk actions and `redis-lens expire` ran on the seed alone when the slot map could not be read; `expire` treated a failed `INFO cluster` as a standalone server; `ASKING` was not refused on the command line; the `ASKING` of a redirect retry took nothing from the budget; `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE` and the `STORE` forms of `SORT` and `GEORADIUS` asked before refusing keys in different slots.
 - **What the verifier confirmed:** `key_slot` against 3,016 answers from a real `CLUSTER KEYSLOT`; a `Permit` is only made by the gate and only three places send writes; redirects go only to connected nodes and no write can run twice; the command line's refusals run before `COMMAND INFO` and before routing. It ran 48 mutations: 37 were killed, and tests were added for the survivors (budget per node, `MovedOnFirst`, a second redirect, the gate re-check for typed writes, the command line's own re-check, a keyless write on a picked replica, the subscribe family).
 
 ### Left for later (phase 4)
