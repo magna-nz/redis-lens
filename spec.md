@@ -16,7 +16,7 @@ Planned (see [Browsing, server views and writes](#browsing-server-views-and-writ
 - Managing Redis Data Integration pipelines.
 - A GUI, a web UI or a REST API.
 
-Until the write phase lands, redis-lens writes nothing to a server.
+redis-lens writes to a server only through the one write gate ([Write permissions](#write-permissions)): never on a read-only profile, which is the default for `prod`.
 
 ## Supported servers and platforms
 
