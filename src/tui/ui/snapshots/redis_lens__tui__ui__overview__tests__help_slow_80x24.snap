@@ -1,6 +1,5 @@
 ---
 source: src/tui/ui/overview.rs
-assertion_line: 1154
 expression: "snap(&app, 80, 24)"
 ---
 " prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
@@ -8,13 +7,13 @@ expression: "snap(&app, 80, 24)"
 "┌─ Now ──────────────────────────────────────────── INFO every 2 s · p pauses ─┐"
 "│ ops/s         100 ·▄▄▄                 clients        10 ▁█▅▁                │"
 "│ memory       982K ▁▃▆█ of 3.8M         hit rate      90% ·▄▄▄                │"
-"│ evicted     0.5/s ·▄▄▄                 expired     5.0/s ·▄▄▄                │"
-"│ Re┌─ Help · Overview ─────────────────────────────────────── esc closes ─┐-l…│"
-"├─ K│ › slow▏                                                              │C ─┤"
-"│ 7.│                                                                      │   │"
-"│   │   Go to Server › Slow log                          Server › Slow log │   │"
-"│ TH│ › Pause or resume polling                              p on Slow log │   │"
-"│ › │   Refresh this panel now                               r on Slow log │   │"
+"│ ev┌─ Help · Overview ─────────────────────────────────────── esc closes ─┐   │"
+"│ Re│ › slow▏                                                              │-l…│"
+"├─ K│                                                                      │C ─┤"
+"│ 7.│   Go to Server › Slow log                          Server › Slow log │   │"
+"│   │ › Pause or resume polling                              p on Slow log │   │"
+"│ TH│   Refresh this panel now                               r on Slow log │   │"
+"│ › │   Copy the selected command line, masked               y on Slow log │   │"
 "│   │   Change the slow log threshold or length (writes)     c on Slow log │   │"
 "│   │   Reset the slow log (writes)                          R on Slow log │   │"
 "│   │   Pick the previous or next node (cluster only)        [ on Slow log │   │"

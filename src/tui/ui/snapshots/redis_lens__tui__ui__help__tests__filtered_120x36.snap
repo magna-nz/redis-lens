@@ -1,6 +1,5 @@
 ---
 source: src/tui/ui/help.rs
-assertion_line: 183
 expression: "render(Screen::Overview, \"slow\", 120, 36).backend()"
 ---
 "                                                                                                                        "
@@ -20,6 +19,7 @@ expression: "render(Screen::Overview, \"slow\", 120, 36).backend()"
 "                        │ › Go to Server › Slow log                          Server › Slow log │                        "
 "                        │   Pause or resume polling                              p on Slow log │                        "
 "                        │   Refresh this panel now                               r on Slow log │                        "
+"                        │   Copy the selected command line, masked               y on Slow log │                        "
 "                        │   Change the slow log threshold or length (writes)     c on Slow log │                        "
 "                        │   Reset the slow log (writes)                          R on Slow log │                        "
 "                        │   Pick the previous or next node (cluster only)        [ on Slow log │                        "
@@ -27,7 +27,6 @@ expression: "render(Screen::Overview, \"slow\", 120, 36).backend()"
 "                        │ enter goes there or runs it, as if you pressed its key.              │                        "
 "                        │ Writes still ask first. esc clears the search.                       │                        "
 "                        └──────────────────────────────────────────────────────────────────────┘                        "
-"                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "

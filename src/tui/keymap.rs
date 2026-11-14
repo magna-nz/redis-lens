@@ -469,13 +469,14 @@ static CLIENTS: [KeyHelp; 10] = [
     PICK_NODE,
 ];
 
-static SLOW_LOG: [KeyHelp; 9] = [
+static SLOW_LOG: [KeyHelp; 10] = [
     MOVE,
     PAGE,
     ENDS,
     PANEL,
     PAUSE,
     REFRESH,
+    COPY_LINE,
     k(
         "c",
         "c",
@@ -487,7 +488,7 @@ static SLOW_LOG: [KeyHelp; 9] = [
     PICK_NODE,
 ];
 
-static MONITOR: [KeyHelp; 7] = [
+static MONITOR: [KeyHelp; 8] = [
     k("↑↓ j k", "↑↓", "Scroll", "Scroll the lines", true),
     PAGE,
     ENDS,
@@ -500,6 +501,7 @@ static MONITOR: [KeyHelp; 7] = [
         true,
     ),
     k("esc", "esc", "Stop", "Stop MONITOR now", true),
+    COPY_LINE,
     PICK_NODE,
 ];
 
@@ -517,6 +519,14 @@ const COPY_VALUE: KeyHelp = k(
     "y",
     "Copy",
     "Copy the selected value as shown to the clipboard",
+    false,
+);
+/// `y` on the Slow log and Monitor.
+const COPY_LINE: KeyHelp = k(
+    "y",
+    "y",
+    "Copy",
+    "Copy the selected command line, masked",
     false,
 );
 /// `←` `h` on Streams and Search.
