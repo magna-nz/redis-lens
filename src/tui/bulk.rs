@@ -15,9 +15,14 @@
 //!    keys undoes it. Any key closes it.
 //!
 //! Before anything is sent, the action must be possible: a pattern (not a group) is
-//! selected, the server is not a cluster and not a replica, the gate does not refuse
-//! the op (a read-only profile, a command the server refused), the server has
-//! `EXPIRE … NX` for `x`, and the live connection is open.
+//! selected, the server is not a replica (nor a cluster read on replicas), the gate does
+//! not refuse the op (a read-only profile, a command the server refused), the server
+//! has `EXPIRE … NX` for `x`, and the live connection is open.
+//!
+//! **On a cluster** (P4) the dry run and the run walk the primaries one at a time, in
+//! slot order, each with its own `SCAN` and its node's budget; a step never follows a
+//! redirect, and keys that moved meanwhile are left alone and counted. The dry run says
+//! how many keys each primary holds, and the key file's lines start with the node.
 
 use std::path::PathBuf;
 
@@ -48,6 +53,13 @@ pub struct Bulk {
     /// container), as snapshots are.
     files_as: String,
     pub stage: Stage,
+    /// On a cluster, the primaries walked one at a time in slot order (indices into the
+    /// session's nodes) and their announced addresses; empty on a standalone server.
+    pub nodes: Vec<(usize, String)>,
+    /// Where the walk is in `nodes`.
+    pub at: usize,
+    /// The dry run's counts per primary, in the order of `nodes`.
+    pub per_node: Vec<Count>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +99,8 @@ pub struct Run {
     pub skipped: u64,
     pub failed: u64,
     pub unreadable: u64,
+    /// Keys that moved to another node during the run: left alone.
+    pub moved: u64,
     pub file: Option<PathBuf>,
     /// `esc` was pressed: no batch after the one on its way.
     pub stopping: bool,
@@ -137,6 +151,35 @@ fn n(v: u64) -> String {
 
 fn keys_word(v: u64) -> &'static str {
     if v == 1 { "key" } else { "keys" }
+}
+
+/// The first letter in upper case.
+fn capital(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
+}
+
+/// On a cluster, how many keys of the pattern each primary holds, from the dry run:
+/// one line per primary, in slot order.
+pub fn per_node_lines(b: &Bulk) -> Vec<String> {
+    if b.nodes.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![format!(
+        "Run on each of the {} primaries in turn, in slot order:",
+        b.nodes.len()
+    )];
+    for ((_, addr), c) in b.nodes.iter().zip(&b.per_node) {
+        out.push(format!(
+            "  {}: {} {}",
+            crate::value::escape(addr),
+            n(c.matched),
+            keys_word(c.matched)
+        ));
+    }
+    out
 }
 
 /// The dry run's result, for the confirm dialog: lines safe to draw.
@@ -195,15 +238,42 @@ impl App {
             return Vec::new();
         };
         let cluster = matches!(s.target, Some(ScanTarget::Cluster(_)))
-            || s.server.as_ref().and_then(bulk::server_off).is_some()
-            || self.report().is_some_and(|r| r.nodes.is_some());
-        if cluster {
-            self.set_error(bulk::CLUSTER_OFF);
-            return Vec::new();
-        }
+            || s.server
+                .as_ref()
+                .is_some_and(|i| i.mode == crate::model::ServerMode::Cluster)
+            || self.report().is_some_and(|r| r.nodes.is_some())
+            || s.is_cluster();
         if matches!(s.target, Some(ScanTarget::Replica(_))) {
             self.set_error(bulk::REPLICA_OFF);
             return Vec::new();
+        }
+        // On a cluster: every primary, in slot order, each one connected.
+        let mut nodes = Vec::new();
+        if cluster {
+            if s.nodes.is_empty() {
+                self.set_error("Not available yet: the cluster's nodes are not known.");
+                return Vec::new();
+            }
+            if s.nodes
+                .iter()
+                .any(|n| n.role == crate::model::NodeRole::Replica)
+            {
+                self.set_error(bulk::CLUSTER_REPLICA_OFF);
+                return Vec::new();
+            }
+            if let Some(n) = s.nodes.iter().find(|n| !n.connected) {
+                let why = crate::live::nodes::not_connected(&n.endpoint);
+                self.set_error(format!(
+                    "Not available: {why}, so the pattern can't be walked on every primary."
+                ));
+                return Vec::new();
+            }
+            nodes = s
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (i, n.endpoint.to_string()))
+                .collect();
         }
         let glob = crate::analysis::match_glob(&pattern);
         let action = if delete {
@@ -246,6 +316,9 @@ impl App {
                 input: bulk::ttl_text(bulk::DEFAULT_TTL_SECS),
                 error: None,
             },
+            nodes,
+            at: 0,
+            per_node: Vec::new(),
         });
         if delete {
             return self.bulk_count(BulkAction::Delete);
@@ -260,6 +333,12 @@ impl App {
         if s.live != LiveState::Ready {
             return None;
         }
+        // On a cluster, the primary the walk is on, never following a redirect; on a
+        // standalone server its one node.
+        let to = match self.bulk.as_ref().and_then(|b| b.nodes.get(b.at)) {
+            Some((i, _)) => crate::live::Dest::node(*i).follow(crate::live::Follow::Never),
+            None => crate::live::Dest::node(0),
+        };
         let id = ReqId(self.next_req);
         self.next_req += 1;
         Some((
@@ -267,16 +346,26 @@ impl App {
             Effect::Live {
                 id: s.id,
                 req_id: id,
+                to,
                 req: LiveRequest::Bulk(req),
             },
         ))
     }
 
+    /// The announced address of the node the walk is on, for the key file (cluster
+    /// only).
+    fn bulk_node(&self) -> Option<String> {
+        let b = self.bulk.as_ref()?;
+        b.nodes.get(b.at).map(|(_, a)| a.clone())
+    }
+
     /// Starts the dry run of `action`.
     fn bulk_count(&mut self, action: BulkAction) -> Vec<Effect> {
-        let Some(b) = self.bulk.as_ref() else {
+        let Some(b) = self.bulk.as_mut() else {
             return Vec::new();
         };
+        b.at = 0;
+        b.per_node = vec![Count::default(); b.nodes.len()];
         let req = Request::Count {
             pattern: b.pattern.clone(),
             glob: b.glob.clone(),
@@ -406,6 +495,16 @@ impl App {
         match (&mut b.stage, result) {
             (Stage::Counting { action, count, .. }, Ok(LiveReply::Bulk(Reply::Count(c)))) => {
                 count.add(&c);
+                if let Some(p) = b.per_node.get_mut(b.at) {
+                    p.add(&c);
+                }
+                let mut walk = c.walk.unwrap_or(Walk::Done);
+                if walk == Walk::Done && b.at + 1 < b.nodes.len() {
+                    // This primary is counted: the next one, from its own start.
+                    b.at += 1;
+                    walk = Walk::Start;
+                    count.walk = Some(Walk::Start);
+                }
                 let (action, count) = (*action, *count);
                 if count.finished() {
                     return self.bulk_counted(action, count);
@@ -413,7 +512,7 @@ impl App {
                 let req = Request::Count {
                     pattern: b.pattern.clone(),
                     glob: b.glob.clone(),
-                    walk: c.walk.unwrap_or(Walk::Done),
+                    walk,
                 };
                 match self.bulk_send(req) {
                     Some((id, effect)) => {
@@ -506,11 +605,10 @@ impl App {
             Decision::Type(name) => Expect::Type(name),
         };
         b.stage = Stage::Asking { action, count };
+        let mut lines = summary(&count, &action);
+        lines.extend(per_node_lines(b));
         self.confirm = Some(Confirm {
-            what: ConfirmFor::Bulk {
-                summary: summary(&count, &action),
-                op,
-            },
+            what: ConfirmFor::Bulk { summary: lines, op },
             expect,
             typed: String::new(),
             profile: b.profile.clone(),
@@ -558,13 +656,17 @@ impl App {
             Stage::Asking { count, .. } => count.matched,
             _ => 0,
         };
+        let files_as = b.files_as.clone();
+        if let Some(b) = self.bulk.as_mut() {
+            // The run walks the primaries again from the first.
+            b.at = 0;
+        }
         let req = Request::Batch {
             permit: permit.clone(),
             walk: Walk::Start,
             carry: Vec::new(),
-            file: FileAt::New {
-                profile: b.files_as.clone(),
-            },
+            file: FileAt::New { profile: files_as },
+            node: self.bulk_node(),
         };
         let Some((id, effect)) = self.bulk_send(req) else {
             return self.bulk_end_error("Not sent: the live connection is not open.".into());
@@ -581,6 +683,7 @@ impl App {
                 skipped: 0,
                 failed: 0,
                 unreadable: 0,
+                moved: 0,
                 file: None,
                 stopping: false,
             });
@@ -593,11 +696,14 @@ impl App {
         let Some(Bulk {
             stage: Stage::Running(r),
             files_as,
+            nodes,
+            at,
             ..
         }) = self.bulk.as_mut()
         else {
             return Vec::new();
         };
+        r.moved += batch.moved;
         r.seen += batch.seen;
         r.sent += batch.sent;
         r.changed += batch.changed;
@@ -626,6 +732,13 @@ impl App {
             self.bulk_finish(Some(why));
             return Vec::new();
         }
+        // This primary is done: the next one, from the start of its own keyspace.
+        let mut batch = batch;
+        if batch.finished() && *at + 1 < nodes.len() {
+            *at += 1;
+            batch.walk = Walk::Start;
+            batch.carry = Vec::new();
+        }
         if r.stopping || batch.finished() {
             self.bulk_finish(None);
             return Vec::new();
@@ -638,16 +751,19 @@ impl App {
             self.bulk_finish(Some(why));
             return Vec::new();
         }
+        let file = r.file.clone().map_or_else(
+            || FileAt::New {
+                profile: files_as.clone(),
+            },
+            FileAt::Path,
+        );
+        let permit = r.permit.clone();
         let req = Request::Batch {
-            permit: r.permit.clone(),
+            permit,
             walk: batch.walk,
             carry: batch.carry,
-            file: r.file.clone().map_or_else(
-                || FileAt::New {
-                    profile: files_as.clone(),
-                },
-                FileAt::Path,
-            ),
+            file,
+            node: self.bulk_node(),
         };
         match self.bulk_send(req) {
             Some((id, effect)) => {
@@ -718,12 +834,20 @@ impl App {
                 keys_word(r.unreadable)
             ));
         }
+        if r.moved > 0 {
+            lines.push(format!("{}.", capital(&bulk::moved_text(r.moved))));
+        }
         if r.failed > 0 {
             lines.push(format!("{} {} failed.", n(r.failed), keys_word(r.failed)));
         }
         if let Some(f) = &r.file {
+            let what = if b.nodes.is_empty() {
+                "Key names"
+            } else {
+                "Key names, each after its node and a tab"
+            };
             lines.push(format!(
-                "Key names: {}",
+                "{what}: {}",
                 crate::value::escape(&f.display().to_string())
             ));
             if matches!(r.action, BulkAction::Expire { .. }) {
@@ -863,6 +987,7 @@ mod tests {
             skipped: 0,
             failed: 0,
             denied: false,
+            moved: 0,
             unreadable: 0,
             file: Some(PathBuf::from(
                 "/data/bulk/p-0123/20250101T000000Z-expire.txt",
@@ -962,6 +1087,7 @@ mod tests {
             walk,
             carry,
             file,
+            node,
         } = &s[0].1
         else {
             panic!("a batch");
@@ -975,6 +1101,8 @@ mod tests {
             }
         );
         assert_eq!((*walk, carry.len()), (Walk::Start, 0));
+        // A standalone server: key file lines are the names alone.
+        assert_eq!(node, &None);
         assert_eq!(
             file,
             &FileAt::New {
@@ -1261,14 +1389,38 @@ mod tests {
     }
 
     #[test]
-    fn off_on_a_cluster_and_on_a_replica() {
+    fn off_on_a_cluster_read_on_replicas_and_on_a_replica() {
+        // A cluster whose nodes are not known yet: nothing to walk.
         let mut app = app_with(Env::Local, None);
         app.session.as_mut().unwrap().server.as_mut().unwrap().mode = ServerMode::Cluster;
         for k in ['x', 'D'] {
             assert!(app.handle_key(ch(k)).is_empty());
             assert!(app.bulk.is_none());
-            assert_eq!(app.notice.as_ref().unwrap().text, bulk::CLUSTER_OFF);
+            assert!(
+                app.notice
+                    .as_ref()
+                    .unwrap()
+                    .text
+                    .contains("nodes are not known"),
+                "{:?}",
+                app.notice
+            );
         }
+        // Read on replicas (prefer_replica): no write, no dry run.
+        let s = app.session.as_mut().unwrap();
+        s.nodes = crate::tui::fixtures::live_nodes();
+        s.nodes[1].role = crate::model::NodeRole::Replica;
+        for k in ['x', 'D'] {
+            assert!(app.handle_key(ch(k)).is_empty());
+            assert!(app.bulk.is_none());
+            assert_eq!(app.notice.as_ref().unwrap().text, bulk::CLUSTER_REPLICA_OFF);
+        }
+        // A primary without a connection: refused, naming it.
+        let s = app.session.as_mut().unwrap();
+        s.nodes = crate::tui::fixtures::live_nodes();
+        s.nodes[2].connected = false;
+        assert!(app.handle_key(ch('D')).is_empty());
+        assert!(app.notice.as_ref().unwrap().text.contains("10.0.1.13:6379"));
         let mut app = app_with(Env::Local, None);
         app.session.as_mut().unwrap().target = Some(ScanTarget::Replica(crate::model::Endpoint {
             host: "r".into(),
@@ -1277,6 +1429,132 @@ mod tests {
         }));
         assert!(app.handle_key(ch('D')).is_empty());
         assert_eq!(app.notice.as_ref().unwrap().text, bulk::REPLICA_OFF);
+    }
+
+    /// Where each bulk step among `effects` goes.
+    fn step_dests(effects: &[Effect]) -> Vec<(ReqId, crate::live::Dest, Request)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Live {
+                    req_id,
+                    to,
+                    req: LiveRequest::Bulk(r),
+                    ..
+                } => Some((*req_id, to.clone(), r.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn on_a_cluster_each_primary_is_walked_in_turn_with_no_redirect_followed() {
+        use crate::live::{Dest, Follow};
+        let never = |i| Dest::node(i).follow(Follow::Never);
+        let mut app = app_with(Env::Local, None);
+        let s = app.session.as_mut().unwrap();
+        s.server.as_mut().unwrap().mode = ServerMode::Cluster;
+        s.nodes = crate::tui::fixtures::live_nodes();
+        // The dry run: each primary's own walk, one node at a time, from the start.
+        assert!(app.handle_key(ch('x')).is_empty());
+        let mut e = app.handle_key(key(KeyCode::Enter));
+        for (node, (matched, with_ttl)) in [(300, 0), (500, 100), (400, 100)].iter().enumerate() {
+            let s = step_dests(&e);
+            assert_eq!(s.len(), 1, "{s:?}");
+            assert_eq!(s[0].1, never(node));
+            assert!(
+                matches!(
+                    s[0].2,
+                    Request::Count {
+                        walk: Walk::Start,
+                        ..
+                    }
+                ),
+                "{:?}",
+                s[0].2
+            );
+            e = testing::reply(&mut app, s[0].0, counted(Walk::Done, *matched, *with_ttl));
+        }
+        assert!(step_dests(&e).is_empty());
+        let lines = app.confirm.as_ref().expect("the question").lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "Dry run: 1,200 keys of the pattern, 200 with a TTL already."),
+            "{lines:?}"
+        );
+        for want in [
+            "Run on each of the 3 primaries in turn, in slot order:",
+            "  10.0.1.11:6379: 300 keys",
+            "  10.0.1.12:6379: 500 keys",
+            "  10.0.1.13:6379: 400 keys",
+        ] {
+            assert!(lines.iter().any(|l| l == want), "{want}: {lines:?}");
+        }
+        // The run: node by node, each batch naming its node for the key file.
+        let mut e = app.handle_key(ch('y'));
+        for node in 0..3 {
+            let s = step_dests(&e);
+            assert_eq!(s.len(), 1, "{s:?}");
+            assert_eq!(s[0].1, never(node));
+            let Request::Batch {
+                walk, node: addr, ..
+            } = &s[0].2
+            else {
+                panic!("a batch");
+            };
+            assert_eq!(*walk, Walk::Start);
+            assert_eq!(
+                addr.as_deref(),
+                Some(format!("10.0.1.{}:6379", 11 + node).as_str())
+            );
+            let mut b = batch(Walk::Done, 300, Vec::new());
+            if node == 1
+                && let Ok(LiveReply::Bulk(Reply::Batch(b))) = &mut b
+            {
+                b.moved = 12;
+            }
+            e = testing::reply(&mut app, s[0].0, b);
+        }
+        assert!(step_dests(&e).is_empty());
+        let Some(Bulk {
+            stage: Stage::Done(d),
+            ..
+        }) = &app.bulk
+        else {
+            panic!("done");
+        };
+        assert!(
+            d.lines
+                .iter()
+                .any(|l| l == "12 keys moved to another node during the run and were left alone."),
+            "{:?}",
+            d.lines
+        );
+        assert!(
+            d.lines
+                .iter()
+                .any(|l| l.contains("each after its node and a tab")),
+            "{:?}",
+            d.lines
+        );
+    }
+
+    #[test]
+    fn a_read_only_cluster_profile_sends_no_bulk_step_to_any_node() {
+        let mut app = app_with(Env::Prod, None);
+        let s = app.session.as_mut().unwrap();
+        s.server.as_mut().unwrap().mode = ServerMode::Cluster;
+        s.nodes = crate::tui::fixtures::live_nodes();
+        for k in ['x', 'D'] {
+            let mut all = app.handle_key(ch(k));
+            for c in ['y', '\n', 'x', 'D'] {
+                all.extend(app.handle_key(ch(c)));
+            }
+            all.extend(app.handle_key(key(KeyCode::Enter)));
+            assert!(steps(&all).is_empty(), "{all:?}");
+            assert_eq!(writes(&all), 0);
+        }
     }
 
     #[test]

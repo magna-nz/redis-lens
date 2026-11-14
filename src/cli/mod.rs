@@ -146,6 +146,8 @@ pub struct CompareArgs {
     pub json: bool,
 }
 
+// Parsed once per run and matched at once: the size of `Add` costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum ConnCommand {
     /// Save a connection.
@@ -166,20 +168,55 @@ pub enum ConnCommand {
         /// Profile name.
         name: String,
     },
-    /// Change a saved connection. Only `--writes` for now.
+    /// Write the saved connections as TOML `[[profile]]` tables, to FILE or standard
+    /// output. No credential is in them: those stay in the OS keychain, which is never
+    /// read here.
+    Export {
+        /// The file to write (mode 0600). Standard output without it.
+        file: Option<std::path::PathBuf>,
+        /// Replace FILE when it exists.
+        #[arg(long, requires = "file")]
+        force: bool,
+    },
+    /// Add the connections of a file written by `conn export`. All or none: nothing is
+    /// saved when any is refused. Credentials are not in the file; store them with
+    /// `conn add <name> --force ...` afterwards.
+    Import {
+        /// The file to read.
+        file: std::path::PathBuf,
+        /// Replace a profile that has the same name.
+        #[arg(long)]
+        force: bool,
+        /// Answer yes to the question asked for a profile with a token command.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Change a saved connection: turn writes on or off, add or remove tags.
+    #[command(group(
+        clap::ArgGroup::new("change")
+            .required(true)
+            .multiple(true)
+            .args(["writes", "tag", "untag"])
+    ))]
     Set {
         /// Profile name.
         name: String,
         /// Turn writes on or off (`read_only` in the config file). Turning them on asks
         /// first; on a prod profile you type the profile name.
         #[arg(long, value_enum)]
-        writes: WritesArg,
+        writes: Option<WritesArg>,
         /// The profile name, given instead of typing it when writes are turned on.
-        #[arg(long, value_name = "NAME")]
+        #[arg(long, value_name = "NAME", requires = "writes")]
         confirm: Option<String>,
         /// Turn writes on without asking. Never enough on a prod profile: give --confirm.
-        #[arg(long)]
+        #[arg(long, requires = "writes")]
         yes: bool,
+        /// Add a tag (1 to 32 letters, digits, `-`, `_`, `.` or `/`). Repeatable.
+        #[arg(long, value_name = "TAG")]
+        tag: Vec<String>,
+        /// Remove a tag. Repeatable.
+        #[arg(long, value_name = "TAG")]
+        untag: Vec<String>,
     },
 }
 
@@ -235,6 +272,9 @@ pub struct ConnAddArgs {
     /// The profile name, given instead of typing it when writes are turned on.
     #[arg(long, value_name = "NAME")]
     pub confirm: Option<String>,
+    /// Tag the profile (1 to 32 letters, digits, `-`, `_`, `.` or `/`). Repeatable.
+    #[arg(long = "tag", value_name = "TAG")]
+    pub tags: Vec<String>,
     /// Reach the server, and its cluster nodes and replicas, through an SSH bastion:
     /// `[USER@]HOST[:PORT]`, or a `Host` alias from ~/.ssh/config. Uses the system ssh
     /// with strict host-key checking; the username goes to the OS keychain.
@@ -247,6 +287,31 @@ pub struct ConnAddArgs {
     /// A known_hosts file to check the bastion's host key against, instead of ssh's own.
     #[arg(long, requires = "ssh", value_name = "FILE")]
     pub ssh_known_hosts: Option<std::path::PathBuf>,
+    /// Ask these Sentinels where the primary is, at every connect:
+    /// `HOST:PORT[,HOST:PORT…]` (port 26379 when left out, an IPv6 address in brackets).
+    /// The URL still gives the server's username, password, TLS and database.
+    #[arg(long, requires = "sentinel_master", value_name = "HOST:PORT[,…]")]
+    pub sentinel: Option<String>,
+    /// The name the Sentinels monitor the primary under.
+    #[arg(long, requires = "sentinel", value_name = "NAME")]
+    pub sentinel_master: Option<String>,
+    /// The Sentinels themselves speak TLS.
+    #[arg(long, requires = "sentinel")]
+    pub sentinel_tls: bool,
+    /// The Sentinels' own ACL user (not the server's). Goes to the OS keychain.
+    #[arg(long, requires = "sentinel", value_name = "USER")]
+    pub sentinel_user: Option<String>,
+    /// Read the Sentinels' own password from standard input. Without --sentinel-user it
+    /// is a password-only Sentinel (requirepass).
+    #[arg(
+        long,
+        requires = "sentinel",
+        conflicts_with_all = ["sentinel_ask_password", "password_stdin"]
+    )]
+    pub sentinel_password_stdin: bool,
+    /// Prompt for the Sentinels' own password without echoing it.
+    #[arg(long, requires = "sentinel")]
+    pub sentinel_ask_password: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -415,6 +480,48 @@ mod tests {
             );
         }
         assert!(parse(&["redis-lens", "scan", "p", "--save", "--keep", "1"]).is_ok());
+    }
+
+    #[test]
+    fn sentinel_flags_go_together() {
+        let add = |extra: &[&str]| {
+            let mut argv = vec!["redis-lens", "conn", "add", "s", "--url", "redis://h"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let kind = |extra: &[&str]| add(extra).unwrap_err().kind();
+        use clap::error::ErrorKind::{ArgumentConflict, MissingRequiredArgument};
+        assert!(add(&["--sentinel", "s1,s2:26380", "--sentinel-master", "m"]).is_ok());
+        assert!(
+            add(&[
+                "--sentinel",
+                "s1",
+                "--sentinel-master",
+                "m",
+                "--sentinel-tls",
+                "--sentinel-user",
+                "u",
+                "--sentinel-password-stdin",
+                "--ask-password",
+            ])
+            .is_ok()
+        );
+        assert_eq!(kind(&["--sentinel", "s1"]), MissingRequiredArgument);
+        assert_eq!(kind(&["--sentinel-master", "m"]), MissingRequiredArgument);
+        for lone in [
+            &["--sentinel-tls"][..],
+            &["--sentinel-user", "u"][..],
+            &["--sentinel-password-stdin"][..],
+            &["--sentinel-ask-password"][..],
+        ] {
+            assert_eq!(kind(lone), MissingRequiredArgument, "{lone:?}");
+        }
+        let both = ["--sentinel", "s1", "--sentinel-master", "m"];
+        for second in ["--password-stdin", "--sentinel-ask-password"] {
+            let mut argv = both.to_vec();
+            argv.extend(["--sentinel-password-stdin", second]);
+            assert_eq!(kind(&argv), ArgumentConflict, "{second}");
+        }
     }
 
     #[test]

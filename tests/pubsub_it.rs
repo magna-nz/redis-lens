@@ -22,6 +22,7 @@ use tokio::time::{Instant, sleep, timeout};
 async fn counts(conn: &mut MultiplexedConnection, budget: &Budget) -> Result<Counts, LiveError> {
     match pubsub::run(conn, budget, Request::Counts).await? {
         Reply::Counts(c) => Ok(c),
+        other => panic!("not counts: {other:?}"),
     }
 }
 
@@ -190,6 +191,8 @@ fn profile(port: u16, auth: Auth) -> Profile {
         provider: None,
         token_command: None,
         ssh: None,
+        sentinel: None,
+        tags: Vec::new(),
     }
 }
 
@@ -215,7 +218,7 @@ async fn subscriber(
             p
         }
     };
-    conn::open_subscriber(&p, &secrets)
+    conn::open_subscriber(&p, &secrets, None)
         .await
         .expect("open the subscriber")
 }

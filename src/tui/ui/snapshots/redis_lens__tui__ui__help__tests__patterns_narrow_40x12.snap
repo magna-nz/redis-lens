@@ -1,6 +1,5 @@
 ---
 source: src/tui/ui/help.rs
-assertion_line: 106
 expression: "render(Screen::Patterns, 40, 12).backend()"
 ---
 "┌─ Keys · Patterns ─── ? or esc clos… ─┐"
@@ -9,9 +8,9 @@ expression: "render(Screen::Patterns, 40, 12).backend()"
 "│?              Show or hide this key …│"
 "│a              Add a connection       │"
 "│:              Open the command line  │"
+"│b              Switch the database (o…│"
 "│q ctrl-c       Quit                   │"
 "│Patterns                              │"
 "│↑↓ j k         Move the selection     │"
 "│PgUp PgDn      Move one page          │"
-"│Home End g G   Jump to the first or l…│"
 "└──────────────────────────────────────┘"

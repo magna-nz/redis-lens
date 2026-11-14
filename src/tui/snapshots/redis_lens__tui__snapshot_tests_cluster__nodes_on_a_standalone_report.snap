@@ -6,7 +6,7 @@ expression: t.backend()
 " redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
 " Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
 "  0   1   2 Analysis   3   4   5   6                                            "
-"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  tab next panel "
+"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  ·  Slots       "
 "┌─ Nodes ───────────────────────────────────────────────────────── standalone ─┐"
 "│                                                                              │"
 "│ Not a cluster: this scan read one standalone server.                         │"

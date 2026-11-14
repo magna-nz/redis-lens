@@ -44,6 +44,8 @@ fn temp_config(port: u16) -> PathBuf {
         provider: None,
         token_command: None,
         ssh: None,
+        sentinel: None,
+        tags: Vec::new(),
     };
     let path = temp_dir("diff-it-config").join("config.toml");
     Config {

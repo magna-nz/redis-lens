@@ -156,7 +156,19 @@ Effort is a rough total for each phase.
 - Bulk expire and delete by pattern: dry run first, budgeted `UNLINK`, never on prod.
 - Publish, stream ack and claim.
 
-**Already planned, which Redis Insight also has:** cluster (v0.3), Sentinel, SSH tunnels.
+**Phase 4: topology and connections (planned 2026-11-14; spec.md "Topology and connections (P4)")**
+
+Phases 1 to 3 cover the roadmap above. Cluster (v0.3) and SSH tunnels have landed since. Phase 4 takes the next gaps from the matrix: the "Cluster, including force-standalone", "Per-shard overview on cluster", "Sentinel", "Switch DB index while connected", "Import and export a connection list", "Tags and aliases on connections", "Filter by name and type" and "Themes" rows, plus feature idea 13.
+
+| # | Feature | Effort | Notes |
+|---|---|---|---|
+| 1 | **Live views on a cluster**: routing by slot, a picked node for keyless reads, a per-shard summary on Server, sharded Pub/Sub, bulk actions and the command line per node | L | The largest gap left. Each node keeps its own command budget; no new node is connected to after discovery. |
+| 2 | **Sentinel** connections, with Sentinel credentials kept apart in the keychain | M | Redis Insight has it. `--prefer-replica` uses `SENTINEL REPLICAS`. |
+| 3 | **DB index switch** in the TUI | S | A rescan on the other database; the profile's saved `db` changes only when asked. |
+| 4 | **Slots panel** from `CLUSTER SLOT-STATS` (Redis 8.2+, Valkey 8.0+) | M | Feature idea 13. Redis Insight has no per-slot view. |
+| 5 | Type filter on the key list, `conn export`/`import`, tags, a light theme and `NO_COLOR` | S each | Export and import carry profiles only, never credentials. |
+
+**Already planned, which Redis Insight also has:** cluster (v0.3, live views in Phase 4), Sentinel (Phase 4), SSH tunnels (v0.3).
 
 **Where we already lead, and should keep leading:** pattern inference, sampling budget, TTL verdicts, snapshots, diff, trend and compare, `--check` for CI, hot keys, a strict prod mode with no writes at all, keychain-only credentials.
 

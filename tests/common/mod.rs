@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod cluster;
+pub mod sentinel;
 pub mod ssh;
 
 use testcontainers::core::{IntoContainerPort, WaitFor};

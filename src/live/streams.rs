@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use redis::{RedisError, RedisResult, ServerErrorKind, Value};
 
-use super::{Conn, LiveError, error_for, query, query_pipe};
+use super::{LiveConn, LiveError, error_for, query, query_pipe};
 use crate::budget::Budget;
 
 /// The most streams one request reads.
@@ -225,7 +225,11 @@ pub fn verdicts(s: &StreamInfo) -> Vec<Verdict> {
 }
 
 /// Runs one request. Every command goes through `budget`.
-pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply, LiveError> {
+pub async fn run(
+    conn: &mut impl LiveConn,
+    budget: &Budget,
+    req: Request,
+) -> Result<Reply, LiveError> {
     match req {
         Request::Info { keys, mut refused } => {
             let now_ms = server_time_ms(conn, budget, &mut refused).await?;
@@ -261,7 +265,7 @@ pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply
 /// `XPENDING key group - + 100 [consumer]`. A refusal or a missing group is said in
 /// [`Pending::error`]; only a closed connection fails the request.
 async fn pending(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     key: &str,
     group: String,
@@ -311,7 +315,7 @@ pub fn parse_pending(v: &Value) -> Vec<PendingEntry> {
 /// made, with the server's own clock. Falls back to ours when `TIME` fails, and stops
 /// asking once it is refused.
 async fn server_time_ms(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     refused: &mut Refused,
 ) -> Result<u64, LiveError> {
@@ -353,7 +357,7 @@ fn failure(name: &str, e: &RedisError) -> Failure {
 }
 
 async fn fetch(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     key: &str,
     now_ms: u64,

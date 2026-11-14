@@ -315,7 +315,9 @@ pub fn refused(args: &[Vec<u8>]) -> Option<&'static str> {
         // Redis flags these readonly; they are its guard against HTTP requests sent to
         // it, and POST closes the connection every view shares.
         "post" | "host:" => "Not sent: it would close the connection every view shares.",
-        "select" => "Not sent here: SELECT would switch the database under every view.",
+        "select" => {
+            "Not sent here: SELECT would switch the database under every view. Press b to switch it."
+        }
         // A transaction or WATCH left open would queue, or abort, every view's
         // commands and redis-lens's own edits; SYNC turns the connection into a replica
         // link; READONLY/READWRITE switch its cluster mode.
@@ -507,6 +509,12 @@ mod tests {
             refused(&words(&["select", "1"]))
                 .unwrap()
                 .contains("SELECT")
+        );
+        // The reason points to the database list.
+        assert!(
+            refused(&words(&["SELECT", "1"]))
+                .unwrap()
+                .contains("Press b")
         );
         assert!(refused(&words(&["CLIENT", "REPLY", "OFF"])).is_some());
         assert!(refused(&words(&["CLIENT", "LIST"])).is_none());

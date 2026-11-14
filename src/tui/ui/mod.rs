@@ -23,6 +23,7 @@ mod bulk;
 mod cmdline;
 mod confirm;
 mod connections;
+mod dbs;
 mod delta;
 mod diff;
 pub mod help;
@@ -33,6 +34,7 @@ mod patterns;
 mod pubsub;
 mod search;
 mod server;
+mod slots;
 mod streams;
 pub mod style;
 mod ttl;
@@ -98,6 +100,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(b) = &app.bulk {
         bulk::draw(frame, body, b, app.tick);
     }
+    if let Some(l) = &app.dbs {
+        dbs::draw(frame, body, l);
+    }
     if let Some(c) = &app.confirm {
         confirm::draw(frame, body, c);
     }
@@ -145,6 +150,7 @@ fn view_state(frame: &mut Frame, area: Rect, app: &App, screen: Screen) {
         Owner::Streams => streams::draw(frame, area, &v.streams, &ctx),
         Owner::PubSub => pubsub::draw(frame, area, &v.pubsub, &ctx),
         Owner::Search => search::draw(frame, area, &v.search, &ctx),
+        Owner::Slots => slots::draw(frame, area, &v.slots, &ctx),
         // Not a screen: drawn over the body by `draw`.
         Owner::Cmdline => {}
     }
@@ -233,7 +239,8 @@ fn waiting(frame: &mut Frame, main: Rect, detail: Rect, app: &App, s: &Session, 
                 Span::styled(
                     format!(
                         " Connecting to {} ({}) and checking permissions…",
-                        p.name, p.endpoint
+                        p.name,
+                        s.endpoint()
                     ),
                     style::dim(),
                 ),
@@ -419,7 +426,7 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
             let endpoint = Span::styled(
                 format!(
                     "  {}",
-                    trunc(&p.endpoint.to_string(), if w >= 100 { 30 } else { 18 })
+                    trunc(&s.endpoint().to_string(), if w >= 100 { 30 } else { 18 })
                 ),
                 style::dim(),
             );
@@ -433,6 +440,9 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
             });
             if show_endpoint {
                 left.push(endpoint);
+            }
+            if p.db != 0 {
+                left.push(Span::styled(format!("  db {}", p.db), style::amber()));
             }
             match &s.target {
                 Some(ScanTarget::Replica(ep)) => left.push(Span::styled(
@@ -507,10 +517,7 @@ fn server_line(app: &App, s: &Session, w: usize) -> Line<'static> {
                 None => vec![
                     Span::raw(" "),
                     Span::styled(spin, style::amber()),
-                    Span::styled(
-                        format!(" Connecting to {}…", s.profile.endpoint),
-                        style::dim(),
-                    ),
+                    Span::styled(format!(" Connecting to {}…", s.endpoint()), style::dim()),
                 ],
             },
         });
@@ -614,6 +621,13 @@ fn tabs(app: &App, w: usize) -> Line<'static> {
             Span::styled("  (esc to clear)", style::dim()),
         ]);
     }
+    if app.screen() == Screen::Connections && !app.conn_filter.is_empty() && !app.conn_filtering {
+        spans.extend([
+            Span::styled("   filter: ", style::dim()),
+            Span::styled(app.conn_filter.clone(), style::amber()),
+            Span::styled("  (esc to clear)", style::dim()),
+        ]);
+    }
     Line::from(spans)
 }
 
@@ -690,6 +704,8 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
         confirm::footer(c)
     } else if let Some(b) = &app.bulk {
         bulk::footer(b)
+    } else if let Some(l) = &app.dbs {
+        dbs::footer(l)
     } else if let Some(add) = &app.add {
         match &add.password {
             Some(_) => input_line(
@@ -710,6 +726,13 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
             "/",
             app.patterns.filter.clone(),
             "   type to filter patterns · enter to apply · esc to clear",
+            w,
+        )
+    } else if app.screen() == Screen::Connections && app.conn_filtering {
+        input_line(
+            "/",
+            app.conn_filter.clone(),
+            "   type a name or tag · enter to apply · esc to clear",
             w,
         )
     } else if let Some(input) = app.cmdline_input() {

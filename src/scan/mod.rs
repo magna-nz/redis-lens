@@ -137,7 +137,9 @@ pub fn parse_info(server: &str, memory: &str, dbsize: u64) -> Result<ServerInfo,
             "INFO server has no redis_version or valkey_version".into(),
         ));
     };
-    let mode = match info_field(server, "redis_mode") {
+    // Valkey 8 names the field `server_mode`; Redis and Valkey 7 `redis_mode`.
+    let mode = match info_field(server, "redis_mode").or_else(|| info_field(server, "server_mode"))
+    {
         None | Some("standalone") => ServerMode::Standalone,
         Some("cluster") => ServerMode::Cluster,
         Some("sentinel") => ServerMode::Sentinel,
@@ -966,6 +968,8 @@ mod tests {
             provider: None,
             token_command: None,
             ssh: None,
+            sentinel: None,
+            tags: Vec::new(),
         };
         assert_eq!(ScanOptions::for_profile(&p).max_commands_per_sec, None);
         p.env = Env::Prod;
@@ -1001,6 +1005,8 @@ mod tests {
             provider: Some(Provider::ElasticacheServerless),
             token_command: None,
             ssh: None,
+            sentinel: None,
+            tags: Vec::new(),
         };
         for env in [Env::Prod, Env::Stage, Env::Other, Env::Local] {
             p.env = env;
@@ -1908,6 +1914,18 @@ mod tests {
         assert_eq!(info.maxmemory_policy, "allkeys-lfu");
         assert_eq!(info.total_keys, 1234);
         assert!(info.lfu_enabled());
+    }
+
+    /// Valkey 8 says `server_mode` where Redis says `redis_mode`: a Valkey 8 cluster
+    /// node must not read as a standalone server.
+    #[test]
+    fn valkey_8_server_mode_is_read() {
+        let server = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nvalkey_version:8.1.3\r\nserver_mode:cluster\r\n";
+        let info = parse_info(server, VALKEY_MEMORY, 7).unwrap();
+        assert_eq!(info.mode, ServerMode::Cluster);
+        let server = server.replace("server_mode:cluster", "server_mode:standalone");
+        let info = parse_info(&server, VALKEY_MEMORY, 7).unwrap();
+        assert_eq!(info.mode, ServerMode::Standalone);
     }
 
     #[test]

@@ -240,6 +240,17 @@ fn meta(frame: &mut Frame, area: Rect, state: &ValueState, ctx: &Ctx<'_>) {
         };
         lines.push(vec![label("Field TTL"), Span::styled(text, style::fg())]);
     }
+    if let Some(n) = ctx
+        .session
+        .owner_of(row.key.as_bytes())
+        .and_then(|i| ctx.session.nodes.get(i))
+    {
+        // On a cluster, the node the key is read on (its slot's owner), in full.
+        lines.push(vec![
+            label("Node"),
+            Span::styled(n.endpoint.to_string(), style::fg()),
+        ]);
+    }
     if ctx.server().is_some_and(|s| s.lfu_enabled()) {
         lines.push(vec![
             label("LFU"),

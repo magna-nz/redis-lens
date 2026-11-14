@@ -4,7 +4,7 @@
 //!
 //! The list loads [`PAGE_KEYS`](crate::live::keys::PAGE_KEYS) keys of the pattern when
 //! it opens and as many more with each `n`. Only keys that infer to the pattern are
-//! listed. `/` filters the loaded keys by name, `o` sorts them, `y` copies the selected
+//! listed. `/` filters the loaded keys by name, `t` by type, `o` sorts them, `y` copies the selected
 //! key name, `esc` clears the filter and then goes back to Patterns. `enter` on a key is
 //! left to `App`, which opens the selected key's detail ([`super::value`]). See
 //! [`super`] for the interface `App` calls.
@@ -13,7 +13,7 @@
 //! overwrites one. Once added, `App` lists it and opens its detail ([`KeysState::opened`]).
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -22,7 +22,7 @@ use super::value::{Form, FormKey};
 use super::{Act, Ctx, Input, ViewState};
 use crate::live::keys::{KeyRow, Page, Reply, Request};
 use crate::live::write::Reply as WriteReply;
-use crate::live::{CANCELLED, LiveError, LiveReply, LiveRequest, ReqId};
+use crate::live::{CANCELLED, Dest, Follow, LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::{KeyType, PERM_FREQ, PERM_MEMORY, PermStatus, Ttl};
 use crate::tui::app::Screen;
 use crate::tui::clipboard::CopyText;
@@ -112,6 +112,66 @@ impl KeySort {
     }
 }
 
+/// The type `t` shows: all, or one of the types, with JSON and the unknown ones as
+/// `other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TypeFilter {
+    #[default]
+    All,
+    String,
+    Hash,
+    List,
+    Set,
+    ZSet,
+    Stream,
+    Other,
+}
+
+impl TypeFilter {
+    const ORDER: [TypeFilter; 8] = [
+        Self::All,
+        Self::String,
+        Self::Hash,
+        Self::List,
+        Self::Set,
+        Self::ZSet,
+        Self::Stream,
+        Self::Other,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::String => "string",
+            Self::Hash => "hash",
+            Self::List => "list",
+            Self::Set => "set",
+            Self::ZSet => "zset",
+            Self::Stream => "stream",
+            Self::Other => "other",
+        }
+    }
+
+    /// The next one in the cycle, `other` going back to `all`.
+    pub fn next(self) -> Self {
+        let at = Self::ORDER.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ORDER[(at + 1) % Self::ORDER.len()]
+    }
+
+    pub fn matches(self, t: KeyType) -> bool {
+        match self {
+            Self::All => true,
+            Self::String => t == KeyType::String,
+            Self::Hash => t == KeyType::Hash,
+            Self::List => t == KeyType::List,
+            Self::Set => t == KeyType::Set,
+            Self::ZSet => t == KeyType::ZSet,
+            Self::Stream => t == KeyType::Stream,
+            Self::Other => matches!(t, KeyType::Json | KeyType::Other),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct KeysState {
     /// The pattern whose keys are listed, as `PatternStats::pattern`.
@@ -145,6 +205,8 @@ pub struct KeysState {
     /// The policy is LFU, so the LFU column shows, even when `OBJECT FREQ` is refused.
     pub lfu: bool,
     pub filter: String,
+    /// `t`: only keys of this type, together with the name filter.
+    pub type_filter: TypeFilter,
     /// The filter input is open.
     pub filtering: bool,
     pub sort: KeySort,
@@ -158,28 +220,80 @@ pub struct KeysState {
     writing: Option<(ReqId, KeyRow)>,
     /// A key `N` added, for `App` to list and open (`key_edits.rs`).
     pub opened: Option<KeyRow>,
+    /// On a cluster, the nodes the walk reads, one at a time, in slot order (indices
+    /// into the session's nodes): every connected node, or the one Patterns is narrowed
+    /// to (spec "Cluster live views (P4)", Key list). Empty on a standalone server.
+    pub walk: Vec<usize>,
+    /// The nodes of the cluster left out of the walk: discovery has no connection.
+    pub missing: Vec<usize>,
+    /// Where the walk is in [`KeysState::walk`]: the node whose `SCAN` goes on.
+    at: usize,
+    /// Nodes walked to the end.
+    pub nodes_done: usize,
+    /// Keys loaded since the page was asked for (`n` or the first): a node that ends
+    /// before a page is full goes on to the next node.
+    page_rows: usize,
+    /// The node each loaded key came from, by key (cluster only).
+    pub row_node: HashMap<String, usize>,
+    /// The node the page in flight reads.
+    loading_node: Option<usize>,
 }
 
 impl KeysState {
     /// `enter` on a pattern on Patterns: list `pattern`'s keys. `App` calls this, then
     /// [`ViewState::on_show`]. It runs every time, also for the pattern already open:
     /// that one keeps its loaded keys, filter and sort; another starts afresh.
-    pub fn open(&mut self, pattern: String, act: &mut Act<'_>) {
-        if self.pattern.as_deref() == Some(pattern.as_str()) {
+    ///
+    /// `nodes` is the cluster's node table as `App` has it (empty on a standalone
+    /// server) and `narrowed` the node Patterns is narrowed to, if any: the walk reads
+    /// that node only, or every connected node in slot order. A pattern opened again on
+    /// another set of nodes starts afresh.
+    pub fn open(
+        &mut self,
+        pattern: String,
+        nodes: &[crate::live::nodes::NodeInfo],
+        narrowed: Option<usize>,
+        act: &mut Act<'_>,
+    ) {
+        let all: Vec<usize> = match narrowed {
+            Some(i) if i < nodes.len() => vec![i],
+            _ => (0..nodes.len()).collect(),
+        };
+        let (walk, missing): (Vec<usize>, Vec<usize>) =
+            all.into_iter().partition(|&i| nodes[i].connected);
+        if self.pattern.as_deref() == Some(pattern.as_str())
+            && self.walk == walk
+            && self.missing == missing
+        {
             return;
         }
         *self = Self {
             pattern: Some(pattern),
             sel_since: act.tick,
+            walk,
+            missing,
             ..Self::default()
         };
+    }
+
+    /// True on a cluster: the walk goes node by node.
+    pub fn by_node(&self) -> bool {
+        !self.walk.is_empty() || !self.missing.is_empty()
+    }
+
+    /// The node the walk reads now, on a cluster.
+    pub fn current_node(&self) -> Option<usize> {
+        self.walk.get(self.at).copied()
     }
 
     /// Indices into [`KeysState::rows`] after the filter, in the sort order.
     pub fn visible(&self) -> Vec<usize> {
         let f = self.filter.to_lowercase();
         let mut idx: Vec<usize> = (0..self.rows.len())
-            .filter(|&i| f.is_empty() || self.rows[i].key.to_lowercase().contains(&f))
+            .filter(|&i| {
+                self.type_filter.matches(self.rows[i].key_type)
+                    && (f.is_empty() || self.rows[i].key.to_lowercase().contains(&f))
+            })
             .collect();
         let sort = self.sort.effective(self.sizes, self.freq);
         idx.sort_by(|&a, &b| sort.cmp(&self.rows[a], &self.rows[b]));
@@ -248,9 +362,21 @@ impl KeysState {
             sizes: self.sizes,
             freq: self.freq,
         });
-        match act.send(req) {
+        let node = self.current_node();
+        if self.by_node() && node.is_none() {
+            // Every node of the walk is done, or none is connected.
+            return false;
+        }
+        // On a cluster the `SCAN` and the metadata pipeline run on one node, and a
+        // redirect is never followed: the cursor belongs to that node.
+        let sent = match node {
+            Some(i) => act.send_to(Dest::node(i).follow(Follow::Never), req),
+            None => act.send(req),
+        };
+        match sent {
             Some(id) => {
                 self.loading = Some(id);
+                self.loading_node = node;
                 self.error = None;
                 true
             }
@@ -266,21 +392,50 @@ impl KeysState {
         }
         let first = self.pages == 0 && !self.done && self.error.is_none();
         if first && self.loading.is_none() && act.live_ready() {
+            if self.by_node() && self.walk.is_empty() {
+                // No node of the cluster is connected: nothing to walk.
+                self.done = true;
+                return;
+            }
+            self.page_rows = 0;
             self.load(act);
         }
     }
 
-    fn take_page(&mut self, page: Page, tick: u64) {
+    /// A page came. True when the node it read was walked to the end and the walk goes
+    /// on with the next node now, the page not being full yet.
+    fn take_page(&mut self, page: Page, tick: u64) -> bool {
         let keep = self.selected().map(|r| r.key.clone());
+        let node = self.loading_node.take();
         for row in page.rows {
             if self.seen.insert(row.key.clone()) {
+                if let Some(n) = node {
+                    self.row_node.insert(row.key.clone(), n);
+                }
                 self.rows.push(row);
+                self.page_rows += 1;
             }
         }
         self.pages += 1;
         self.cursor = page.cursor;
         self.carry = page.carry;
-        self.done = self.cursor == 0 && self.carry.is_empty();
+        let node_done = self.cursor == 0 && self.carry.is_empty();
+        let mut next = false;
+        if !self.by_node() {
+            self.done = node_done;
+        } else if node_done {
+            self.nodes_done = (self.at + 1).min(self.walk.len());
+            if self.at + 1 < self.walk.len() {
+                // The next node, from the start of its own keyspace.
+                self.at += 1;
+                self.done = false;
+                next = self.page_rows < crate::live::keys::PAGE_KEYS;
+            } else {
+                self.done = true;
+            }
+        } else {
+            self.done = false;
+        }
         self.other_pattern += page.other_pattern;
         self.unreadable += page.unreadable;
         for e in page.refused {
@@ -289,6 +444,7 @@ impl KeysState {
             }
         }
         self.reselect(keep, tick);
+        next
     }
 
     /// Drops `key`, deleted on the key detail.
@@ -296,6 +452,7 @@ impl KeysState {
         let keep = self.selected().map(|r| r.key.clone());
         self.rows.retain(|r| r.key != key);
         self.seen.remove(key);
+        self.row_node.remove(key);
         let tick = self.sel_since;
         self.reselect(keep, tick);
     }
@@ -307,6 +464,10 @@ impl KeysState {
         }
         if self.seen.remove(old) {
             self.seen.insert(new.to_string());
+        }
+        // `RENAMENX` keeps the key on its node: both names share a slot.
+        if let Some(n) = self.row_node.remove(old) {
+            self.row_node.insert(new.to_string(), n);
         }
     }
 
@@ -413,6 +574,10 @@ impl KeysState {
             )),
             Ok(LiveReply::Write(_)) => {
                 act.info(format!("Added {name}."));
+                // On a cluster it went to its slot's owner.
+                if let Some(n) = act.session.owner_of(row.key.as_bytes()) {
+                    self.row_node.insert(row.key.clone(), n);
+                }
                 self.opened = Some(row);
             }
             Ok(_) => {}
@@ -511,9 +676,10 @@ impl ViewState for KeysState {
             return true;
         }
         match (key.code, plain(&key)) {
-            (KeyCode::Esc, _) if !self.filter.is_empty() => {
+            (KeyCode::Esc, _) if !self.filter.is_empty() || self.type_filter != TypeFilter::All => {
                 let keep = self.selected().map(|r| r.key.clone());
                 self.filter.clear();
+                self.type_filter = TypeFilter::All;
                 self.reselect(keep, tick);
                 true
             }
@@ -531,6 +697,13 @@ impl ViewState for KeysState {
                 act.info(format!("Keys sorted by {}.", self.sort.label()));
                 true
             }
+            (_, Some('t')) => {
+                let keep = self.selected().map(|r| r.key.clone());
+                self.type_filter = self.type_filter.next();
+                self.reselect(keep, tick);
+                act.info(format!("Showing {} keys.", self.type_filter.label()));
+                true
+            }
             (_, Some('n')) => {
                 if self.loading.is_some_and(|id| act.in_flight(id)) {
                     act.info("Still loading keys…");
@@ -539,8 +712,11 @@ impl ViewState for KeysState {
                         "All {} matching keys are loaded.",
                         crate::format::grouped(self.rows.len() as u64)
                     ));
-                } else if !self.load(act) {
-                    act.info("The live connection is not open, so no more keys can be loaded.");
+                } else {
+                    self.page_rows = 0;
+                    if !self.load(act) {
+                        act.info("The live connection is not open, so no more keys can be loaded.");
+                    }
                 }
                 true
             }
@@ -572,9 +748,16 @@ impl ViewState for KeysState {
         }
         self.loading = None;
         match result {
-            Ok(LiveReply::Keys(Reply::Page(page))) => self.take_page(page, act.tick),
+            Ok(LiveReply::Keys(Reply::Page(page))) => {
+                if self.take_page(page, act.tick) {
+                    self.load(act);
+                }
+            }
             Ok(_) => {}
-            Err(e) => self.error = Some(load_error(&e)),
+            Err(e) => {
+                self.loading_node = None;
+                self.error = Some(load_error(&e));
+            }
         }
     }
 
@@ -752,6 +935,111 @@ mod tests {
         let mut app = loaded();
         app.handle_key(key(KeyCode::Down));
         insta::assert_snapshot!(testing::render(&app, 120, 36).backend());
+    }
+
+    /// The carts with a few keys of other types mixed in.
+    fn mixed() -> App {
+        let (mut app, effects) = open("user:{id}:cart");
+        let (id, _) = page_request(&effects);
+        let mut rows = carts();
+        for (i, t) in [
+            KeyType::String,
+            KeyType::String,
+            KeyType::Json,
+            KeyType::Other,
+            KeyType::Stream,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut r = row(&format!("user:9{i}:cart"), None, 10, "raw", 1, 0);
+            r.key_type = t;
+            rows.push(r);
+        }
+        testing::reply(&mut app, id, page(rows, 4_242));
+        app
+    }
+
+    fn type_of(app: &App) -> Vec<KeyType> {
+        let k = &app.views.keys;
+        k.visible().iter().map(|&i| k.rows[i].key_type).collect()
+    }
+
+    #[test]
+    fn t_cycles_the_types_and_sends_nothing() {
+        let mut app = mixed();
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            let effects = app.handle_key(ch('t'));
+            assert!(testing::requests(&effects).is_empty());
+            seen.push(app.views.keys.type_filter.label());
+        }
+        assert_eq!(
+            seen,
+            [
+                "string", "hash", "list", "set", "zset", "stream", "other", "all"
+            ]
+        );
+        assert_eq!(app.views.keys.visible().len(), 14);
+    }
+
+    #[test]
+    fn the_type_filter_combines_with_the_name_filter() {
+        let mut app = mixed();
+        app.handle_key(ch('t'));
+        assert_eq!(type_of(&app), [KeyType::String; 2]);
+        app.handle_key(ch('t'));
+        assert_eq!(app.views.keys.visible().len(), 9);
+        // other takes JSON and unknown types.
+        for _ in 0..5 {
+            app.handle_key(ch('t'));
+        }
+        assert_eq!(app.views.keys.type_filter, TypeFilter::Other);
+        let mut other = type_of(&app);
+        other.sort_by_key(|t| t.as_str());
+        assert_eq!(other, [KeyType::Json, KeyType::Other]);
+        // Back to strings, then a name filter on top.
+        for _ in 0..2 {
+            app.handle_key(ch('t'));
+        }
+        assert_eq!(app.views.keys.type_filter, TypeFilter::String);
+        app.handle_key(ch('/'));
+        app.handle_key(ch('1'));
+        app.handle_key(key(KeyCode::Enter));
+        let k = &app.views.keys;
+        assert_eq!(k.visible().len(), 1);
+        assert_eq!(k.selected().map(|r| r.key.as_str()), Some("user:91:cart"));
+    }
+
+    #[test]
+    fn t_is_text_in_the_filter_input_and_esc_clears_both_filters() {
+        let mut app = mixed();
+        app.handle_key(ch('/'));
+        app.handle_key(ch('t'));
+        assert_eq!(app.views.keys.type_filter, TypeFilter::All);
+        assert_eq!(app.views.keys.filter, "t");
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(ch('t'));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::KeyList);
+        assert_eq!(app.views.keys.type_filter, TypeFilter::All);
+        assert_eq!(app.views.keys.visible().len(), 14);
+        app.handle_key(key(KeyCode::Esc));
+        assert_ne!(app.screen(), Screen::KeyList);
+    }
+
+    #[test]
+    fn key_list_with_a_type_filter_80x24() {
+        let mut app = mixed();
+        app.handle_key(ch('t'));
+        insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
+    }
+
+    #[test]
+    fn key_list_with_a_type_and_nothing_of_it_80x24() {
+        let mut app = loaded();
+        app.handle_key(ch('t'));
+        insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
     }
 
     #[test]

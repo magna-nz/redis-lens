@@ -542,6 +542,154 @@ pub struct Profile {
     /// Reach the server (and its cluster nodes and replicas) through an SSH bastion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshTunnel>,
+    /// Ask these Sentinels where the primary is at every connect, instead of
+    /// connecting to `endpoint` (spec "Sentinel (P4)"). `endpoint` then only holds the
+    /// address given to `conn add`, shown until the first connect, and is never dialled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sentinel: Option<Sentinel>,
+    /// Labels to group and find profiles by, see [`valid_tag`]. Never secret.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+/// A tag is 1 to 32 characters of letters, digits, `-`, `_`, `.` and `/`.
+pub fn valid_tag(tag: &str) -> bool {
+    (1..=32).contains(&tag.chars().count())
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+}
+
+/// The Sentinels a profile asks for its primary (`[profile.sentinel]`). Nothing secret
+/// lives here: a Sentinel's own username and password, when it has them, are in the OS
+/// keychain under [`Profile::sentinel_secret_ref`], apart from the data node's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sentinel {
+    /// The name the Sentinels monitor the primary under.
+    pub master: String,
+    /// The Sentinels, asked in this order. Never empty in a profile `conn add` writes.
+    pub nodes: Vec<SentinelNode>,
+    /// Whether the Sentinels themselves speak TLS (the data node's TLS is the
+    /// endpoint's).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tls: bool,
+}
+
+/// One Sentinel's address, written as `host:port` in the config file (an IPv6 address
+/// in brackets, `[::1]:26379`). The port is 26379 when left out.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SentinelNode {
+    /// A host name or an IP address, an IPv6 address without brackets.
+    pub host: String,
+    pub port: u16,
+}
+
+/// The port a Sentinel listens on when none is given.
+pub const SENTINEL_DEFAULT_PORT: u16 = 26379;
+
+/// Why a `host:port` could not be read as a Sentinel's address. Fixed texts that never
+/// repeat the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SentinelAddrError {
+    #[error("a Sentinel address is empty")]
+    Empty,
+    #[error("a Sentinel's port must be a number from 1 to 65535")]
+    Port,
+    #[error(
+        "a Sentinel's host has a '[' without its ']', or something that is not an IPv6 address in brackets"
+    )]
+    Brackets,
+    #[error("put a Sentinel's IPv6 address in brackets to give a port: [ADDRESS]:PORT")]
+    BareIpv6,
+    #[error(
+        "a Sentinel's host must be a host name or an address of at most 253 bytes, with no \
+         spaces, '@', '/' or leading '-'"
+    )]
+    Host,
+}
+
+impl std::str::FromStr for SentinelNode {
+    type Err = SentinelAddrError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(SentinelAddrError::Empty);
+        }
+        let port = |p: &str| match p.parse::<u16>() {
+            Ok(n) if n != 0 => Ok(n),
+            _ => Err(SentinelAddrError::Port),
+        };
+        let (host, port) = if let Some(inner) = s.strip_prefix('[') {
+            let (h, after) = inner.split_once(']').ok_or(SentinelAddrError::Brackets)?;
+            if h.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err(SentinelAddrError::Brackets);
+            }
+            let p = match after {
+                "" => SENTINEL_DEFAULT_PORT,
+                a => port(a.strip_prefix(':').ok_or(SentinelAddrError::Brackets)?)?,
+            };
+            (h, p)
+        } else if s.matches(':').count() > 1 {
+            if s.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err(SentinelAddrError::BareIpv6);
+            }
+            (s, SENTINEL_DEFAULT_PORT)
+        } else if let Some((h, p)) = s.split_once(':') {
+            (h, port(p)?)
+        } else {
+            (s, SENTINEL_DEFAULT_PORT)
+        };
+        let ok = !host.is_empty()
+            && host.len() <= 253
+            && !host.starts_with('-')
+            && !host
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '@' | '/' | '[' | ']'));
+        if !ok {
+            return Err(SentinelAddrError::Host);
+        }
+        Ok(Self {
+            host: host.to_string(),
+            port,
+        })
+    }
+}
+
+/// `host:port`, with an IPv6 address in brackets, as [`Endpoint`] shows it.
+impl fmt::Display for SentinelNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
+    }
+}
+
+impl TryFrom<String> for SentinelNode {
+    type Error = SentinelAddrError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<SentinelNode> for String {
+    fn from(n: SentinelNode) -> Self {
+        n.to_string()
+    }
+}
+
+impl SentinelNode {
+    /// This Sentinel as an endpoint to connect to, with the Sentinels' TLS setting.
+    pub fn endpoint(&self, tls: bool) -> Endpoint {
+        Endpoint {
+            host: self.host.clone(),
+            port: self.port,
+            tls,
+        }
+    }
 }
 
 /// An SSH bastion that a profile's connections go through, with the system `ssh`
@@ -584,6 +732,16 @@ impl Profile {
         SecretRef {
             service: SECRET_SERVICE.to_string(),
             account: format!("ssh:profile:{}", self.name),
+        }
+    }
+
+    /// Where the username and password of this profile's Sentinels live in the OS
+    /// keychain, apart from the data node's (spec "Sentinel (P4)"). A prefix of its
+    /// own, so no profile name can make it collide with another entry.
+    pub fn sentinel_secret_ref(&self) -> SecretRef {
+        SecretRef {
+            service: SECRET_SERVICE.to_string(),
+            account: format!("sentinel:profile:{}", self.name),
         }
     }
 
@@ -686,6 +844,16 @@ mod tests {
     }
 
     #[test]
+    fn tag_validation() {
+        for ok in ["a", "team-a", "a_b.c/d", "X9", &"x".repeat(32)] {
+            assert!(valid_tag(ok), "{ok}");
+        }
+        for bad in ["", "a b", "a,b", "é", "a:b", "a\n", &"x".repeat(33)] {
+            assert!(!valid_tag(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn pttl_parsing() {
         assert_eq!(Ttl::from_pttl(-2), None);
         assert_eq!(Ttl::from_pttl(-1), Some(Ttl::Persistent));
@@ -730,6 +898,8 @@ mod tests {
             provider: None,
             token_command: None,
             ssh: None,
+            sentinel: None,
+            tags: Vec::new(),
         };
         assert!(p.is_read_only());
         p.env = Env::Local;
@@ -775,6 +945,8 @@ mod tests {
             provider: None,
             token_command: None,
             ssh: None,
+            sentinel: None,
+            tags: Vec::new(),
         };
         let text = toml::to_string(&p).unwrap();
         for word in ["password", "username", "user", "secret", "token"] {
@@ -850,6 +1022,8 @@ mod tests {
             provider: None,
             token_command: None,
             ssh: None,
+            sentinel: None,
+            tags: Vec::new(),
         };
         let ssh = p.ssh_secret_ref();
         assert_eq!(ssh.service, SECRET_SERVICE);
@@ -857,6 +1031,68 @@ mod tests {
         // No profile name gives a `profile:` entry equal to another's `ssh:` entry.
         p.name = "ssh:profile:a".into();
         assert!(!p.secret_ref().account.starts_with("ssh:"));
+    }
+
+    #[test]
+    fn sentinel_secret_ref_is_its_own_entry() {
+        let p: Profile =
+            toml::from_str("name = \"a\"\n[endpoint]\nhost = \"h\"\nport = 6379\n").unwrap();
+        let s = p.sentinel_secret_ref();
+        assert_eq!(s.service, SECRET_SERVICE);
+        assert_eq!(s.account, "sentinel:profile:a");
+        assert_ne!(s, p.secret_ref());
+        assert_ne!(s, p.ssh_secret_ref());
+        assert_eq!(p.sentinel, None);
+        assert!(!toml::to_string(&p).unwrap().contains("sentinel"));
+    }
+
+    #[test]
+    fn sentinel_addresses_parse() {
+        let n = |h: &str, port: u16| SentinelNode {
+            host: h.into(),
+            port,
+        };
+        let ok = |s: &str| s.parse::<SentinelNode>();
+        assert_eq!(ok("s1"), Ok(n("s1", 26379)));
+        assert_eq!(ok(" s1:5000 "), Ok(n("s1", 5000)));
+        assert_eq!(ok("10.0.0.1:26380"), Ok(n("10.0.0.1", 26380)));
+        assert_eq!(ok("[::1]:26380"), Ok(n("::1", 26380)));
+        assert_eq!(ok("[2001:db8::1]"), Ok(n("2001:db8::1", 26379)));
+        assert_eq!(ok("2001:db8::1"), Ok(n("2001:db8::1", 26379)));
+        assert_eq!(ok(""), Err(SentinelAddrError::Empty));
+        assert_eq!(ok("s1:0"), Err(SentinelAddrError::Port));
+        assert_eq!(ok("s1:x"), Err(SentinelAddrError::Port));
+        assert_eq!(ok("s1:"), Err(SentinelAddrError::Port));
+        assert_eq!(ok("[s1]:1"), Err(SentinelAddrError::Brackets));
+        assert_eq!(ok("[::1"), Err(SentinelAddrError::Brackets));
+        assert_eq!(ok("[::1]x"), Err(SentinelAddrError::Brackets));
+        assert_eq!(ok("a:b:c"), Err(SentinelAddrError::BareIpv6));
+        for bad in ["-oProxyCommand", "u@h", "a b", "a/b", ":1"] {
+            assert_eq!(ok(bad), Err(SentinelAddrError::Host), "{bad}");
+        }
+        assert_eq!(n("::1", 1).to_string(), "[::1]:1");
+        assert_eq!(n("s1", 26379).to_string(), "s1:26379");
+    }
+
+    proptest::proptest! {
+        /// Every address round-trips through its text, and parsing never panics.
+        #[test]
+        fn sentinel_addresses_round_trip(
+            host in "[a-z0-9][a-z0-9.-]{0,30}|[0-9a-f:]{2,20}",
+            port in 1u16..,
+        ) {
+            if let Ok(n) = format!("{host}:{port}").parse::<SentinelNode>() {
+                let back: SentinelNode = n.to_string().parse().unwrap();
+                proptest::prop_assert_eq!(back, n);
+            }
+            let v6 = SentinelNode { host: "2001:db8::5".into(), port };
+            proptest::prop_assert_eq!(v6.to_string().parse::<SentinelNode>().unwrap(), v6);
+        }
+
+        #[test]
+        fn sentinel_address_parsing_never_panics(text in "\\PC{0,40}") {
+            let _ = text.parse::<SentinelNode>();
+        }
     }
 
     #[test]
@@ -876,6 +1112,8 @@ mod tests {
             provider: None,
             token_command: None,
             ssh: None,
+            sentinel: None,
+            tags: Vec::new(),
         };
         assert!(!toml::to_string(&p).unwrap().contains("ssh"));
         p.ssh = Some(SshTunnel {

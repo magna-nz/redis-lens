@@ -33,10 +33,29 @@ use crate::value::Raw;
 /// `[settings]` in the config file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
+    /// The colour theme: `"dark"` (the default) or `"light"`, for light terminals.
+    /// `NO_COLOR` overrides both (see `tui::ui::style`).
+    #[serde(default, skip_serializing_if = "Theme::is_default")]
+    pub theme: Theme,
     /// Turn off the `y`/`n` prompts of check 3 on profiles that aren't `prod`. It never
     /// applies to `prod`, to bulk actions, or to a prompt where a name is typed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_non_prod_confirm: bool,
+}
+
+/// `[settings] theme`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Theme {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Settings {
@@ -398,6 +417,9 @@ pub enum WriteOp {
     // Pub/Sub.
     /// `p`: `PUBLISH channel message`.
     Publish { channel: String, message: Raw },
+    /// `P` on a shard channel: `SPUBLISH channel message`, sent to the channel's slot
+    /// owner (spec "Cluster live views (P4)", 5 Pub/Sub).
+    SPublish { channel: String, message: Raw },
 
     // Search.
     /// `C`: `FT.CREATE index ON HASH|JSON PREFIX n p… SCHEMA field [AS alias] type …`.
@@ -577,6 +599,7 @@ impl WriteOp {
             | XAutoClaim { .. }
             | XAck { .. }
             | Publish { .. }
+            | SPublish { .. }
             | FtCreate { .. } => Kind::Edit,
             HDel { .. }
             | SRem { .. }
@@ -642,6 +665,7 @@ impl WriteOp {
             XAck { .. } => "XACK",
             XTrim { .. } => "XTRIM",
             Publish { .. } => "PUBLISH",
+            SPublish { .. } => "SPUBLISH",
             FtCreate { .. } => "FT.CREATE",
             FtDropIndex { .. } => "FT.DROPINDEX",
             Bulk {
@@ -694,7 +718,7 @@ impl WriteOp {
             | XAutoClaim { key, .. }
             | XAck { key, .. }
             | XTrim { key, .. } => key.clone(),
-            Publish { channel, .. } => channel.clone(),
+            Publish { channel, .. } | SPublish { channel, .. } => channel.clone(),
             FtCreate { index, .. } | FtDropIndex { index } => index.clone(),
             Bulk { pattern, .. } => pattern.clone(),
             ClientKill { id } => id.to_string(),
@@ -873,6 +897,9 @@ impl WriteOp {
                 trim: Trim::MinId(id),
             } => vec![vec![b("XTRIM"), b(key), b("MINID"), b("~"), b(id)]],
             Publish { channel, message } => vec![vec![b("PUBLISH"), b(channel), r(message)]],
+            SPublish { channel, message } => {
+                vec![vec![b("SPUBLISH"), b(channel), r(message)]]
+            }
             FtCreate {
                 index,
                 on,
@@ -972,14 +999,18 @@ mod tests {
             provider: None,
             token_command: None,
             ssh: None,
+            sentinel: None,
+            tags: Vec::new(),
         }
     }
 
     const ON: Settings = Settings {
         skip_non_prod_confirm: false,
+        theme: Theme::Dark,
     };
     const SKIP: Settings = Settings {
         skip_non_prod_confirm: true,
+        theme: Theme::Dark,
     };
 
     #[test]
@@ -1171,6 +1202,10 @@ mod tests {
                 channel: "ch".into(),
                 message: v(),
             },
+            WriteOp::SPublish {
+                channel: "ch".into(),
+                message: v(),
+            },
             WriteOp::FtCreate {
                 index: "idx".into(),
                 on: IndexOn::Hash,
@@ -1201,6 +1236,8 @@ mod tests {
                     flags: vec!["write".into()],
                     categories: vec!["@write".into()],
                     subcommands: vec![],
+                    keys: Vec::new(),
+                    keys_partial: false,
                 },
             },
         ]
@@ -1314,6 +1351,8 @@ mod tests {
             flags: vec!["write".into()],
             categories: cats.iter().map(|c| c.to_string()).collect(),
             subcommands: vec![],
+            keys: Vec::new(),
+            keys_partial: false,
         };
         let args = |s: &str| {
             s.split(' ')
@@ -1435,7 +1474,11 @@ mod tests {
                 flags: vec![],
                 categories: vec!["@dangerous".into()],
                 subcommands: vec![],
+                keys: Vec::new(),
+                keys_partial: false,
             }],
+            keys: Vec::new(),
+            keys_partial: false,
         };
         let op = WriteOp::Command {
             args: Args::new(vec![

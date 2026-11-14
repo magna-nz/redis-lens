@@ -19,7 +19,7 @@ use crate::snapshot::format_utc;
 use crate::tui::app::Screen;
 use crate::tui::app::views::server::{
     CLIENTS_EVERY, Clients, Group, HISTORY, IDLE_FLAG_SECS, Metric, Monitor, Overview, Poll,
-    Prompt, SLOWLOG_EVERY, ServerState, SlowLog, lib_label, note_of, sparkline,
+    Prompt, SLOWLOG_EVERY, ServerState, ShardRow, SlowLog, lib_label, note_of, sparkline,
 };
 use crate::tui::app::views::{Ctx, LiveState};
 use crate::value::escape;
@@ -52,7 +52,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
 fn gate(frame: &mut Frame, area: Rect, title: &str, poll: &Poll, ctx: &Ctx<'_>) -> bool {
     if let Some(off) = &poll.off {
         let line = Line::from(Span::styled(format!(" ▲ {off}"), style::amber()));
-        notice_panels(frame, area, title, "off", vec![line]);
+        let right = with_node(ctx.node_title(), "off".to_string());
+        notice_panels(frame, area, title, &right, vec![line]);
         return true;
     }
     if poll.got {
@@ -75,7 +76,8 @@ fn gate(frame: &mut Frame, area: Rect, title: &str, poll: &Poll, ctx: &Ctx<'_>) 
             None => Line::from(Span::styled(" Waiting for the server…", style::dim())),
         },
     };
-    notice_panels(frame, area, title, "", vec![line]);
+    let right = with_node(ctx.node_title(), String::new());
+    notice_panels(frame, area, title, &right, vec![line]);
     true
 }
 
@@ -94,16 +96,28 @@ fn trouble(poll: &Poll, ctx: &Ctx<'_>) -> Option<Line<'static>> {
     )))
 }
 
-fn right_title(state: &ServerState, every: &str, extra: &str) -> String {
+/// The right of a polling panel's title: on a cluster the picked node first (spec
+/// "Cluster live views (P4)"), then `extra` and how often it polls.
+fn right_title(state: &ServerState, ctx: &Ctx<'_>, every: &str, extra: &str) -> String {
     let when = if state.paused {
         "paused · r fetches".to_string()
     } else {
         format!("every {every}")
     };
-    if extra.is_empty() {
+    let text = if extra.is_empty() {
         when
     } else {
         format!("{extra} · {when}")
+    };
+    with_node(ctx.node_title(), text)
+}
+
+/// `node · text` when there is a node.
+fn with_node(node: Option<String>, text: String) -> String {
+    match node {
+        Some(n) if text.is_empty() => n,
+        Some(n) => format!("{n} · {text}"),
+        None => text,
     }
 }
 
@@ -120,8 +134,24 @@ fn overview(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
     if gate(frame, area, "Overview", &o.poll, ctx) {
         return;
     }
-    let [main, server] = Layout::vertical([Constraint::Min(0), Constraint::Length(4)]).areas(area);
-    let right = right_title(state, &secs(state.interval()), "");
+    // A cluster's per-shard summary sits between the figures and the server line.
+    let shard_rows = if ctx.session.is_cluster() {
+        u16::try_from(ctx.session.nodes.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+    } else {
+        0
+    };
+    let [main, shards, server] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(shard_rows),
+        Constraint::Length(4),
+    ])
+    .areas(area);
+    if shard_rows > 0 {
+        shard_summary(frame, shards, state, ctx);
+    }
+    let right = right_title(state, ctx, &secs(state.interval()), "");
     let right = if state.paused {
         right
     } else {
@@ -145,6 +175,88 @@ fn overview(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
         server_lines(o.last.as_ref(), usize::from(inner.width)),
         None,
     );
+}
+
+const SHARD_ADDR_W: usize = 22;
+const SHARD_OPS_W: usize = 10;
+const SHARD_MEM_W: usize = 22;
+const SHARD_CLIENTS_W: usize = 12;
+
+/// One row per shard's node, in slot order: address, ops/s, used memory against
+/// `maxmemory`, clients and `db0` keys, or ✗ for a node that did not answer.
+fn shard_summary(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
+    let every = secs(
+        state
+            .interval()
+            .max(crate::tui::app::views::server::SHARDS_EVERY),
+    );
+    let right = if state.paused {
+        "paused".to_string()
+    } else {
+        format!("ops/s · memory · clients · keys · every {every}")
+    };
+    let inner = panel(frame, area, "Shards", &right);
+    let w = usize::from(inner.width);
+    let lines = ctx
+        .session
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let row = state.shards.rows.get(i);
+            let picked = i == ctx.session.picked;
+            let mark = if picked { "›" } else { " " };
+            let mut spans = vec![
+                Span::styled(mark, style::ok()),
+                Span::styled(
+                    pad_r(&n.endpoint.to_string(), SHARD_ADDR_W),
+                    if n.role == crate::model::NodeRole::Replica {
+                        style::dim()
+                    } else {
+                        style::fg()
+                    },
+                ),
+            ];
+            match row {
+                _ if !n.connected => spans.push(Span::styled("✗ not connected", style::warn())),
+                Some(r) if r.failed => spans.push(Span::styled("✗ no answer", style::warn())),
+                Some(ShardRow { last: Some(s), .. }) => spans.extend(shard_cells(s)),
+                _ => spans.push(Span::styled("…", style::dim())),
+            }
+            Line::from(fit(spans, w))
+        })
+        .collect();
+    rows(frame, inner, lines, None);
+}
+
+fn shard_cells(s: &InfoSample) -> Vec<Span<'static>> {
+    let ops = s
+        .ops_now
+        .map_or_else(|| "—".to_string(), |o| format!("{}/s", format::count(o)));
+    let mem = match (s.used_memory, s.maxmemory.filter(|m| *m > 0)) {
+        (Some(u), Some(m)) => format!(
+            "{} / {} {}",
+            format::bytes(u),
+            format::bytes(m),
+            format::percent(u as f64 / m as f64)
+        ),
+        (Some(u), None) => format!("{} (no limit)", format::bytes(u)),
+        (None, _) => "—".to_string(),
+    };
+    let clients = s.clients.map_or_else(
+        || "—".to_string(),
+        |c| format!("{} clients", format::count(c)),
+    );
+    let keys = s
+        .keys
+        .map_or_else(|| "—".to_string(), |k| format!("{} keys", format::count(k)));
+    vec![
+        Span::styled(pad_l(&ops, SHARD_OPS_W - 1), style::fgb()),
+        Span::raw("  "),
+        Span::styled(pad_r(&mem, SHARD_MEM_W), style::fg()),
+        Span::styled(pad_r(&clients, SHARD_CLIENTS_W), style::fg()),
+        Span::styled(keys, style::fg()),
+    ]
 }
 
 fn metric_line(m: Metric, o: &Overview, spark_w: usize, w: usize) -> Line<'static> {
@@ -329,6 +441,7 @@ fn groups(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
     let c = &state.clients;
     let right = right_title(
         state,
+        ctx,
         &secs(CLIENTS_EVERY),
         &format!("{} connections · {} groups", c.conns.len(), c.groups.len()),
     );
@@ -417,6 +530,7 @@ fn connections(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>
     let kind = key.map_or("", |k| k.kind());
     let right = right_title(
         state,
+        ctx,
         &secs(CLIENTS_EVERY),
         &format!("{kind} {name} · {} connections · esc back", conns.len()),
     );
@@ -535,6 +649,7 @@ fn slow_log(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
     let [main, detail] = Layout::vertical([Constraint::Min(0), Constraint::Length(7)]).areas(area);
     let right = right_title(
         state,
+        ctx,
         &secs(SLOWLOG_EVERY),
         &format!("{} entries · UTC", s.entries.len()),
     );
@@ -681,7 +796,17 @@ fn line_time(e: &Entry) -> String {
     )
 }
 
+/// The Monitor's title: on a cluster, the node its run went to (it stays there), or
+/// the picked node before any run.
 fn monitor_right(m: &Monitor, ctx: &Ctx<'_>) -> String {
+    let node = match &m.node {
+        Some(ep) if m.running() || m.stopped.is_some() => Some(format!("node {ep}")),
+        _ => ctx.node_title(),
+    };
+    with_node(node, monitor_state(m, ctx))
+}
+
+fn monitor_state(m: &Monitor, ctx: &Ctx<'_>) -> String {
     let lines = format::grouped(m.lines.len() as u64);
     if m.prompt.is_some() {
         "asking first".to_string()

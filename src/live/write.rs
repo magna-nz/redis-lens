@@ -17,7 +17,7 @@ use redis::{ErrorKind, RedisError, ServerErrorKind, Value};
 use tokio::sync::Mutex;
 
 use super::cmdline::{Output, run_error};
-use super::{Conn, LiveError, error_for, is_unknown_command};
+use super::{LiveConn, LiveError, error_for, is_unknown_command};
 use crate::budget::Budget;
 use crate::value::{self, Raw};
 use crate::write::{NewKey, Permit, WriteOp};
@@ -48,7 +48,11 @@ pub enum Reply {
 }
 
 /// Runs `permit`'s op.
-pub async fn run(conn: &mut Conn, budget: &Budget, permit: Permit) -> Result<Reply, LiveError> {
+pub async fn run(
+    conn: &mut impl LiveConn,
+    budget: &Budget,
+    permit: Permit,
+) -> Result<Reply, LiveError> {
     let op = permit.op();
     if matches!(op, WriteOp::Bulk { .. }) {
         return Err(LiveError::Failed(
@@ -183,7 +187,7 @@ fn cmd_of(words: &[Vec<u8>]) -> redis::Cmd {
 }
 
 async fn send_pipe(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     name: &str,
     pipe: &redis::Pipeline,
@@ -199,7 +203,7 @@ async fn send_pipe(
 /// Sends `WATCH key` and the check read after it, and reads them. When that fails
 /// (the key holds another type now, say) the connection stops watching.
 async fn watched<T: redis::FromRedisValue>(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     check: &redis::Pipeline,
 ) -> Result<T, LiveError> {
@@ -214,14 +218,14 @@ async fn watched<T: redis::FromRedisValue>(
 
 /// Sends `UNWATCH`, after a check found the value changed. A failure is ignored: the
 /// next `EXEC` or the connection's next `WATCH` clears it anyway.
-async fn unwatch(conn: &mut Conn, budget: &Budget) {
+async fn unwatch(conn: &mut impl LiveConn, budget: &Budget) {
     budget.take(1).await;
     let _: Result<Value, _> = redis::cmd("UNWATCH").query_async(conn).await;
 }
 
 /// Sends the op's one command and reads its reply.
 async fn send_one(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     name: &str,
     op: &WriteOp,
@@ -238,7 +242,7 @@ async fn send_one(
 }
 
 async fn single(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     name: &str,
     op: &WriteOp,
@@ -251,7 +255,7 @@ async fn single(
 /// member's replacement). An aborted `EXEC` (the watched key changed) is
 /// [`Reply::Changed`].
 async fn transaction(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     name: &str,
     op: &WriteOp,

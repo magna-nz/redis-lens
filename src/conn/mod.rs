@@ -22,6 +22,8 @@ pub mod cluster;
 pub mod docker;
 pub mod parse;
 pub mod provider;
+pub mod sentinel;
+pub mod slot;
 pub mod ssh;
 mod tls;
 pub mod token;
@@ -48,6 +50,10 @@ pub enum ConnError {
     /// The SSH tunnel could not be opened. Never holds ssh's own output.
     #[error(transparent)]
     Ssh(#[from] ssh::SshError),
+    /// Asking the Sentinels for the primary, or checking their answer, failed. Fixed
+    /// texts only: never a server's error text or a credential.
+    #[error(transparent)]
+    Sentinel(#[from] sentinel::SentinelError),
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -67,21 +73,51 @@ pub async fn connect(
 ) -> Result<Connection, ConnError> {
     let route = Route::for_profile(profile, secrets).await?;
     let auth = ResolvedAuth::new(profile, secrets).await?;
-    auth.open(&route, &profile.endpoint).await
+    open_server(profile, secrets, &route, &auth).await
+}
+
+/// The connection to the profile's own server: its endpoint, or for a Sentinel profile
+/// the primary the Sentinels name, checked (see [`sentinel::open_primary`]). Every entry
+/// point opens the profile's server here or through `open_primary`, so a Sentinel
+/// profile's `endpoint` is never dialled.
+async fn open_server(
+    profile: &Profile,
+    secrets: &dyn SecretStore,
+    route: &Arc<Route>,
+    auth: &ResolvedAuth,
+) -> Result<Connection, ConnError> {
+    match &profile.sentinel {
+        None => auth.open(route, &profile.endpoint).await,
+        Some(s) => Ok(sentinel::open_primary(profile, s, secrets, route, auth)
+            .await?
+            .conn),
+    }
+}
+
+/// A cluster node that a connection of its own (Monitor, the Pub/Sub tail) goes to:
+/// one discovery connected to, at its announced address, and whether discovery's
+/// connection to it sent the profile's credentials
+/// ([`cluster::NodeTarget::credentials`]). Without them, the new connection sends none
+/// either, as discovery decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeAddr {
+    pub endpoint: Endpoint,
+    pub credentials: bool,
 }
 
 /// Open the Pub/Sub live tail's own connection to the profile's endpoint (never a
-/// replica): like [`connect`], through the same route and credentials (SSH, TLS, token
-/// command and Entra ID included), but speaking RESP3, so `SUBSCRIBE` and `PSUBSCRIBE`
-/// work on a multiplexed connection. What the server pushes (messages, subscribe
-/// confirmations, and a `Disconnection` when the connection is lost) arrives on the
-/// returned receiver.
+/// replica), or to cluster node `node`: like [`connect`], through the same route and
+/// credentials (SSH, TLS, token command and Entra ID included), but speaking RESP3, so
+/// `SUBSCRIBE` and `PSUBSCRIBE` work on a multiplexed connection. What the server pushes
+/// (messages, subscribe confirmations, and a `Disconnection` when the connection is
+/// lost) arrives on the returned receiver.
 ///
 /// Errors never contain the password or token, as for [`connect`]. A server that refuses
 /// RESP3 fails with [`redis::ErrorKind::RESP3NotSupported`].
 pub async fn open_subscriber(
     profile: &Profile,
     secrets: &dyn SecretStore,
+    node: Option<&NodeAddr>,
 ) -> Result<
     (
         Connection,
@@ -90,11 +126,16 @@ pub async fn open_subscriber(
     ConnError,
 > {
     let route = Route::for_profile(profile, secrets).await?;
-    let mut auth = ResolvedAuth::new(profile, secrets).await?;
+    let mut auth = ResolvedAuth::new(profile, secrets).await?.for_node(node);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     auth.settings = auth.settings.set_protocol(redis::ProtocolVersion::RESP3);
     auth.config = auth.config.set_push_sender(tx);
-    let conn = auth.open(&route, &profile.endpoint).await?;
+    // A cluster node is reached as discovery reached it; a server is reached as a
+    // connect reaches it (through the Sentinels for a Sentinel profile).
+    let conn = match node {
+        Some(n) => auth.open(&route, &n.endpoint).await?,
+        None => open_server(profile, secrets, &route, &auth).await?,
+    };
     Ok((conn, rx))
 }
 
@@ -135,9 +176,10 @@ impl std::fmt::Debug for MonitorConn {
     }
 }
 
-/// Opens `MONITOR` for `profile` (spec "Monitor (P2)"), with the same credentials,
-/// database, TLS trust roots and SSH tunnel as [`connect`] (see [`monitor_unsupported`]
-/// for the routes it refuses). Each `MONITOR` it sends takes one from `budget`.
+/// Opens `MONITOR` for `profile` (spec "Monitor (P2)"), or on cluster node `node`, with
+/// the same credentials, database, TLS trust roots and SSH tunnel as [`connect`] (see
+/// [`monitor_unsupported`] for the routes it refuses). Each `MONITOR` it sends takes one
+/// from `budget`.
 ///
 /// redis-rs's monitor connection swallows the server's answer to `MONITOR`, so a refusal
 /// would look like a quiet server. It is asked first on an ordinary connection, which is
@@ -147,6 +189,7 @@ pub async fn open_monitor(
     profile: &Profile,
     secrets: &dyn SecretStore,
     budget: &crate::budget::Budget,
+    node: Option<&NodeAddr>,
 ) -> Result<Result<MonitorConn, redis::RedisError>, ConnError> {
     if let Some(why) = monitor_unsupported(profile) {
         return Err(ConnError::Redis(redis::RedisError::from(
@@ -154,10 +197,30 @@ pub async fn open_monitor(
         )));
     }
     let route = Route::for_profile(profile, secrets).await?;
-    let auth = ResolvedAuth::new(profile, secrets).await?;
-    let ep = &profile.endpoint;
+    let auth = ResolvedAuth::new(profile, secrets).await?.for_node(node);
+    // A Sentinel profile's server is the primary the Sentinels name, at the addresses
+    // found for it once: the monitor connection below goes there too. A cluster node is
+    // reached as discovery reached it.
+    let (mut check, pinned) = match (node, &profile.sentinel) {
+        (Some(n), _) => (auth.open(&route, &n.endpoint).await?, None),
+        (None, None) => (auth.open(&route, &profile.endpoint).await?, None),
+        (None, Some(s)) => {
+            let p = sentinel::open_primary(profile, s, secrets, &route, &auth).await?;
+            // Refused before anything is sent for MONITOR (not even the check below, or
+            // a budget token): a TLS host name can't be pinned.
+            let addr = match (route.as_ref(), p.conn.sentinel()) {
+                (Route::Direct, Some(a)) => Some(monitor_addr_pinned(&a.primary, &p.addrs)?),
+                _ => None,
+            };
+            (p.conn, addr)
+        }
+    };
+    let primary = check.sentinel().map(|a| a.primary.clone());
+    let ep = match node {
+        Some(n) => &n.endpoint,
+        None => primary.as_ref().unwrap_or(&profile.endpoint),
+    };
     {
-        let mut check = auth.open(&route, ep).await?;
         budget.take(1).await;
         let answer: redis::RedisResult<redis::Value> =
             redis::cmd("MONITOR").query_async(&mut check).await;
@@ -165,10 +228,14 @@ pub async fn open_monitor(
             return Ok(Err(e));
         }
         // Dropped here: its MONITOR ends with it.
+        drop(check);
     }
-    let addr = match route.as_ref() {
-        Route::Direct => connection_addr(ep, tls::tls_roots),
-        Route::Ssh(_) => {
+    let addr = match (route.as_ref(), pinned) {
+        (Route::Direct, None) => connection_addr(ep, tls::tls_roots),
+        // redis-rs resolves the monitor connection's host itself, so it is given an
+        // address: the one checked, or (TLS) the IP address Sentinel gave.
+        (Route::Direct, Some(addr)) => addr,
+        (Route::Ssh(_), _) => {
             let reached = route.reach(ep).await.map_err(Unusable::into_conn_error)?;
             let Some(local) = reached.addrs.first() else {
                 return Err(
@@ -200,6 +267,29 @@ pub async fn open_monitor(
         _route: route,
     }))
 }
+
+/// The monitor connection's address for a Sentinel's primary at `ep`, reached directly
+/// at `addrs` (resolved once): without TLS the first of them; with TLS `ep`'s host when
+/// it is an IP address (nothing to look up then), else refused, since the certificate is
+/// checked against a name that redis-rs would look up again.
+fn monitor_addr_pinned(ep: &Endpoint, addrs: &[SocketAddr]) -> Result<ConnectionAddr, ConnError> {
+    if ep.tls {
+        if ep.host.parse::<IpAddr>().is_err() {
+            return Err(ConnError::Redis(redis::RedisError::from(
+                std::io::Error::other(MONITOR_SENTINEL_TLS_NAME),
+            )));
+        }
+        return Ok(connection_addr(ep, tls::tls_roots));
+    }
+    let Some(first) = addrs.first() else {
+        return Err(Unusable::Resolve(std::io::Error::other("no address")).into_conn_error());
+    };
+    Ok(ConnectionAddr::Tcp(first.ip().to_string(), first.port()))
+}
+
+/// Why `MONITOR` can't run on a Sentinel's primary named by host name over TLS.
+pub const MONITOR_SENTINEL_TLS_NAME: &str =
+    "MONITOR is not available yet when Sentinel names a TLS primary by host name.";
 
 /// How connections reach servers: directly, or through the profile's SSH bastion.
 pub enum Route {
@@ -260,6 +350,8 @@ pub struct Connection {
     /// `INFO server` instead of sending it again (see [`Self::keep_info_server`]).
     /// Shared by clones; taken once.
     info_server: Arc<std::sync::Mutex<Option<(std::time::Instant, redis::Value)>>>,
+    /// For a Sentinel profile: which Sentinel named this server's primary, and where.
+    sentinel: Option<Arc<sentinel::SentinelAnswer>>,
 }
 
 /// How long a kept `INFO server` reply may answer the next `INFO server`.
@@ -271,7 +363,19 @@ impl Connection {
             conn,
             _route: Arc::clone(route),
             info_server: Arc::default(),
+            sentinel: None,
         }
+    }
+
+    /// For a Sentinel profile, what the Sentinels answered: the Sentinel that named the
+    /// primary, the master name and the primary's address (also on a verified replica's
+    /// connection). `None` for any other profile. Holds no credential.
+    pub fn sentinel(&self) -> Option<&sentinel::SentinelAnswer> {
+        self.sentinel.as_deref()
+    }
+
+    fn set_sentinel(&mut self, answer: &Arc<sentinel::SentinelAnswer>) {
+        self.sentinel = Some(Arc::clone(answer));
     }
 
     /// Keep `reply`, an `INFO server` reply just read on this connection, so that the
@@ -458,6 +562,22 @@ impl ResolvedAuth {
             config,
             sends_credentials,
         })
+    }
+
+    /// For a connection of its own to cluster node `node`: without credentials when
+    /// discovery's connection to it had none (see [`NodeAddr`]), as discovery's
+    /// no-credentials probe connects; otherwise unchanged.
+    fn for_node(self, node: Option<&NodeAddr>) -> Self {
+        if node.is_none_or(|n| n.credentials) {
+            return self;
+        }
+        Self {
+            settings: RedisConnectionInfo::default()
+                .set_skip_set_lib_name()
+                .set_db(self.settings.db()),
+            config: base_config(),
+            sends_credentials: false,
+        }
     }
 
     /// Connect to `ep` over `route` with these credentials, the endpoint's TLS setting
@@ -756,7 +876,8 @@ async fn info_replication(c: &mut MultiplexedConnection) -> Result<String, redis
 /// and passes is scanned on that same connection and never gets credentials. Only a
 /// candidate that answers `NOAUTH` may get them, and only when the profile has some and
 /// [`may_send_credentials`] allows; it is then checked again on the authenticated
-/// connection, which is the one returned.
+/// connection, which is the one returned. The flag says whether the connection returned
+/// sent credentials.
 async fn verified_replica(
     auth: &ResolvedAuth,
     route: &Arc<Route>,
@@ -764,7 +885,7 @@ async fn verified_replica(
     primary: &Endpoint,
     primary_replid: &str,
     ep: &Endpoint,
-) -> Result<Connection, Unusable> {
+) -> Result<(Connection, bool), Unusable> {
     let candidate = route.reach(ep).await?;
     let pinned =
         |config: AsyncConnectionConfig| config.set_dns_resolver(Pinned(candidate.addrs.clone()));
@@ -779,7 +900,7 @@ async fn verified_replica(
                     .query_async::<()>(&mut probe)
                     .await?;
             }
-            return Ok(Connection::new(probe, route));
+            return Ok((Connection::new(probe, route), false));
         }
         Ok(_) => return Err(Unusable::NotAReplica),
         Err(e) if auth.sends_credentials && e.code() == Some("NOAUTH") => {}
@@ -796,7 +917,7 @@ async fn verified_replica(
     let mut c = open(ep, auth.settings.clone(), &pinned(auth.config.clone())).await?;
     let info = info_replication(&mut c).await?;
     if is_replica_of(&info, primary_replid) {
-        Ok(Connection::new(c, route))
+        Ok((Connection::new(c, route), true))
     } else {
         Err(Unusable::NotAReplica)
     }
@@ -825,16 +946,24 @@ pub async fn connect_for_scan(
 ) -> Result<(Connection, ScanTarget), ConnError> {
     let route = Route::for_profile(profile, secrets).await?;
     let auth = ResolvedAuth::new(profile, secrets).await?;
-    connect_for_scan_with(profile, &route, &auth).await
+    connect_for_scan_with(profile, secrets, &route, &auth).await
 }
 
 /// [`connect_for_scan`] with the route and credentials already resolved, so a caller
 /// (cluster discovery) can reuse them for further connections.
 async fn connect_for_scan_with(
     profile: &Profile,
+    secrets: &dyn SecretStore,
     route: &Arc<Route>,
     auth: &ResolvedAuth,
 ) -> Result<(Connection, ScanTarget), ConnError> {
+    if let Some(s) = &profile.sentinel {
+        let primary = sentinel::open_primary(profile, s, secrets, route, auth).await?;
+        if !profile.prefer_replica {
+            return Ok((primary.conn, ScanTarget::Primary));
+        }
+        return Ok(sentinel::replica_step(profile, route, auth, primary).await);
+    }
     let primary = auth.open(route, &profile.endpoint).await?;
     if !profile.prefer_replica {
         return Ok((primary, ScanTarget::Primary));
@@ -855,7 +984,11 @@ async fn replica_step(
     let info = match info_replication(&mut primary).await {
         Ok(i) => i,
         Err(e) if is_noperm(&e) => return fallback(primary, noperm_text("INFO replication")),
-        Err(e) => return fallback(primary, format!("INFO replication: {}", server_message(&e))),
+        // Only the error's code word: the rest of a server's text can name the user.
+        Err(e) => {
+            let code = e.code().unwrap_or("no reply");
+            return fallback(primary, format!("INFO replication failed ({code})"));
+        }
     };
     match parse_replication(&info) {
         Replication::Replica => (primary, ScanTarget::Replica(profile.endpoint.clone())),
@@ -876,21 +1009,38 @@ async fn replica_step(
                 port,
                 tls: profile.endpoint.tls,
             };
-            // Through SSH the candidate's forward is started first, within ssh's own
-            // readiness limit, so the 2 s below covers the check, not ssh's login.
-            if route.is_ssh()
-                && let Err(why) = route.reach(&ep).await
-            {
-                return fallback(primary, unusable_reason(&ep, why, true));
-            }
-            let attempt =
-                verified_replica(auth, route, profile.db, &profile.endpoint, &replid, &ep);
-            match tokio::time::timeout(REPLICA_TIMEOUT, attempt).await {
-                Ok(Ok(c)) => (c, ScanTarget::Replica(ep)),
-                Ok(Err(why)) => fallback(primary, unusable_reason(&ep, why, route.is_ssh())),
-                Err(_) => fallback(primary, format!("{ep}: timed out")),
+            let primary_ep = &profile.endpoint;
+            match verify_candidate(route, auth, profile.db, primary_ep, &replid, &ep).await {
+                Ok(c) => (c, ScanTarget::Replica(ep)),
+                Err(why) => fallback(primary, why),
             }
         }
+    }
+}
+
+/// Verify the replica candidate at `ep` against the primary at `primary` (whose
+/// `master_replid` is `replid`) as [`verified_replica`] does, within the 2 s replica
+/// timeout. Through SSH the candidate's forward is started first, within ssh's own
+/// readiness limit, so the 2 s covers the check, not ssh's login. `Err` is the
+/// `PrimaryFallback` reason. Shared by the standalone and the Sentinel replica steps.
+async fn verify_candidate(
+    route: &Arc<Route>,
+    auth: &ResolvedAuth,
+    db: u32,
+    primary: &Endpoint,
+    replid: &str,
+    ep: &Endpoint,
+) -> Result<Connection, String> {
+    if route.is_ssh()
+        && let Err(why) = route.reach(ep).await
+    {
+        return Err(unusable_reason(ep, why, true));
+    }
+    let attempt = verified_replica(auth, route, db, primary, replid, ep);
+    match tokio::time::timeout(REPLICA_TIMEOUT, attempt).await {
+        Ok(Ok((c, _))) => Ok(c),
+        Ok(Err(why)) => Err(unusable_reason(ep, why, route.is_ssh())),
+        Err(_) => Err(format!("{ep}: timed out")),
     }
 }
 
@@ -908,7 +1058,36 @@ fn unusable_reason(ep: &Endpoint, why: Unusable, ssh: bool) -> String {
              is not the primary's host"
         ),
         Unusable::Resolve(e) => format!("{ep}: could not resolve the host: {e}"),
-        Unusable::Conn(e) => format!("{ep}: {e}"),
+        Unusable::Conn(e) => format!("{ep}: {}", conn_error_text(&e)),
+    }
+}
+
+/// A fixed text for a failed connection or check, in redis-lens's own words. A server's
+/// error text can name the ACL user (`NOPERM User <name> has no permissions...`), so a
+/// server error is only ever described by its category (CLAUDE.md rule 1). Other
+/// [`ConnError`]s already hold fixed texts.
+pub(crate) fn conn_error_text(e: &ConnError) -> String {
+    let ConnError::Redis(r) = e else {
+        return e.to_string();
+    };
+    if is_noperm(r) {
+        noperm_text("INFO replication")
+    } else if r.kind() == redis::ErrorKind::AuthenticationFailed
+        || matches!(r.code(), Some("WRONGPASS" | "NOAUTH"))
+    {
+        "the replica refused the credentials".to_string()
+    } else if r.code().is_some() || matches!(r.kind(), redis::ErrorKind::Server(_)) {
+        "the replica refused the connection".to_string()
+    } else if r.is_timeout() {
+        "timed out".to_string()
+    } else if r.is_io_error() {
+        // From the operating system or the certificate check, never from the server:
+        // it says why (a refused connection, an unknown issuer, a wrong name).
+        r.to_string()
+    } else if r.is_connection_refusal() || r.is_connection_dropped() {
+        "could not connect".to_string()
+    } else {
+        "the replica's reply could not be read".to_string()
     }
 }
 
@@ -1715,6 +1894,35 @@ mod tests {
         assert!(may_send_credentials(own_tunnel, candidate));
     }
 
+    /// Monitor's address for a Sentinel's primary: the first checked address without TLS
+    /// (never the host name, which redis-rs would look up again); with TLS only an IP
+    /// host, kept as the certificate's name; a host name is refused with the fixed text.
+    #[test]
+    fn monitor_addr_for_a_sentinel_primary() {
+        let addrs: Vec<SocketAddr> = vec![
+            "10.9.8.7:7000".parse().unwrap(),
+            "10.9.8.6:1".parse().unwrap(),
+        ];
+        // Without TLS the pin is used, not the name.
+        let a = monitor_addr_pinned(&ep("primary.example", 6379, false), &addrs).unwrap();
+        assert_eq!(a, ConnectionAddr::Tcp("10.9.8.7".into(), 7000));
+        assert!(matches!(
+            monitor_addr_pinned(&ep("primary.example", 6379, false), &[]),
+            Err(ConnError::Redis(_))
+        ));
+        // With TLS an IP host is dialled as named (its own port), not as `addrs`.
+        let a = monitor_addr_pinned(&ep("10.0.0.5", 6380, true), &addrs).unwrap();
+        match a {
+            ConnectionAddr::TcpTls { host, port, .. } => {
+                assert_eq!((host.as_str(), port), ("10.0.0.5", 6380));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A TLS host name is refused with the fixed text.
+        let e = monitor_addr_pinned(&ep("primary.example", 6379, true), &addrs).unwrap_err();
+        assert_eq!(e.to_string(), MONITOR_SENTINEL_TLS_NAME);
+    }
+
     #[test]
     fn fallback_reasons_say_where_loopback_was_judged() {
         let e = ep("127.0.0.1", 6380, false);
@@ -1764,7 +1972,11 @@ mod tests {
         assert!(fake.accepts(pids[0]) >= 2);
 
         let before = fake.accepts(pids[0]);
-        assert!(connect_for_scan_with(&p, &route, &auth).await.is_err());
+        assert!(
+            connect_for_scan_with(&p, &MemoryStore::default(), &route, &auth)
+                .await
+                .is_err()
+        );
         assert_eq!(fake.starts().len(), 1, "the forward is reused");
         assert!(fake.accepts(pids[0]) > before);
 
@@ -1782,19 +1994,25 @@ mod tests {
     }
 
     /// A minimal RESP server for tests: answers `INFO <section>` from `info` (an empty
-    /// text for a section it doesn't have), a command `X` with the raw RESP in an
-    /// `info` entry named `reply:X` when there is one, and `+OK` to anything else, and
-    /// records every connection and command.
-    struct FakeServer {
-        addr: SocketAddr,
+    /// text for a section it doesn't have; a text starting with `-` is sent as an error
+    /// reply), a command `X` with the raw RESP in an
+    /// `info` entry named `reply:X Y` (its first two words) or `reply:X` when there is
+    /// one, and `+OK` to anything else, and records every connection and command.
+    pub(super) struct FakeServer {
+        pub(super) addr: SocketAddr,
         connections: Arc<std::sync::atomic::AtomicUsize>,
-        commands: Arc<std::sync::Mutex<Vec<String>>>,
+        pub(super) commands: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl FakeServer {
-        async fn start(info: &[(&str, String)]) -> Self {
+        pub(super) async fn start(info: &[(&str, String)]) -> Self {
+            Self::start_on(std::net::Ipv4Addr::LOCALHOST.into(), info).await
+        }
+
+        /// [`Self::start`], listening on `ip`.
+        pub(super) async fn start_on(ip: IpAddr, info: &[(&str, String)]) -> Self {
             use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
             let addr = listener.local_addr().unwrap();
             let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1836,11 +2054,20 @@ mod tests {
                                     .find(|(k, _)| Some(k) == section.as_ref())
                                     .map(|(_, v)| v.clone())
                                     .unwrap_or_default();
-                                format!("${}\r\n{text}\r\n", text.len())
+                                if text.starts_with('-') {
+                                    // An error reply, as given.
+                                    format!("{text}\r\n")
+                                } else {
+                                    format!("${}\r\n{text}\r\n", text.len())
+                                }
                             } else {
                                 let key = format!("reply:{}", args[0].to_ascii_lowercase());
+                                let two = args
+                                    .get(1)
+                                    .map(|a| format!("{key} {}", a.to_ascii_lowercase()));
                                 info.iter()
-                                    .find(|(k, _)| *k == key)
+                                    .find(|(k, _)| Some(k) == two.as_ref())
+                                    .or_else(|| info.iter().find(|(k, _)| *k == key))
                                     .map_or_else(|| "+OK\r\n".to_string(), |(_, v)| v.clone())
                             };
                             if s.get_mut().write_all(reply.as_bytes()).await.is_err() {
@@ -1857,17 +2084,18 @@ mod tests {
             }
         }
 
-        fn connections(&self) -> usize {
+        pub(super) fn connections(&self) -> usize {
             self.connections.load(std::sync::atomic::Ordering::SeqCst)
         }
 
-        fn count(&self, cmd: &str) -> usize {
+        pub(super) fn count(&self, cmd: &str) -> usize {
             let cmds = self.commands.lock().unwrap();
             cmds.iter().filter(|c| c.eq_ignore_ascii_case(cmd)).count()
         }
     }
 
-    const STANDALONE: &str = "# Server\r\nredis_version:7.4.0\r\nredis_mode:standalone\r\n";
+    pub(super) const STANDALONE: &str =
+        "# Server\r\nredis_version:7.4.0\r\nredis_mode:standalone\r\n";
 
     /// A primary at a fake server announcing one online replica at `replica_port`, and
     /// that replica.
@@ -1892,6 +2120,120 @@ mod tests {
         ])
         .await;
         (primary, replica)
+    }
+
+    /// The server's own `INFO replication` failing gives its code word only.
+    #[tokio::test]
+    async fn a_primary_fallback_reason_never_holds_the_servers_text() {
+        use crate::secrets::MemoryStore;
+        let primary = FakeServer::start(&[
+            ("server", STANDALONE.to_string()),
+            ("replication", "-ERR something with secretuser".to_string()),
+        ])
+        .await;
+        let p = fake_profile(primary.addr.port(), true);
+        let (_, target) = connect_for_scan(&p, &MemoryStore::default()).await.unwrap();
+        let ScanTarget::PrimaryFallback(why) = target else {
+            panic!("a primary whose INFO replication fails was not the fallback");
+        };
+        assert_eq!(why, "INFO replication failed (ERR)");
+    }
+
+    /// The `PrimaryFallback` reason for a replica that errors never carries the
+    /// server's text, which can name the ACL user (rule 1): a fixed text per kind.
+    #[tokio::test]
+    async fn a_replica_fallback_reason_never_holds_the_servers_text() {
+        use crate::secrets::MemoryStore;
+        const USER: &str = "secretuser";
+        let noperm = format!("-NOPERM User {USER} has no permissions to run the 'info' command");
+        let err = format!("-ERR something with {USER}");
+        let noauth = "-NOAUTH Authentication required.".to_string();
+        // (the replica's INFO replication, its AUTH reply, expected words)
+        let cases = [
+            (
+                noperm.clone(),
+                None,
+                "NOPERM INFO replication is not allowed",
+            ),
+            (err.clone(), None, "the replica refused the connection"),
+            // redis-rs reads any refusal of AUTH as a failed login.
+            (
+                noauth.clone(),
+                Some(noperm),
+                "the replica refused the credentials",
+            ),
+            (noauth, Some(err), "the replica refused the credentials"),
+        ];
+        for (info, auth, expected) in cases {
+            let mut entries = vec![("server", STANDALONE.to_string()), ("replication", info)];
+            if let Some(a) = auth {
+                entries.push(("reply:auth", format!("{a}\r\n")));
+            }
+            let replica = FakeServer::start(&entries).await;
+            let primary = FakeServer::start(&[
+                ("server", STANDALONE.to_string()),
+                (
+                    "replication",
+                    format!(
+                        "role:master\r\nslave0:ip=127.0.0.1,port={},state=online,offset=1,lag=0\r\nmaster_replid:abc123\r\n",
+                        replica.addr.port()
+                    ),
+                ),
+            ])
+            .await;
+            let mut p = fake_profile(primary.addr.port(), true);
+            p.auth = Auth::Keychain;
+            let store = MemoryStore::default();
+            store
+                .set(
+                    &p.secret_ref(),
+                    &crate::model::Credentials {
+                        username: Some("lens".into()),
+                        password: secrecy::SecretString::from("hunter2".to_string()),
+                    },
+                )
+                .unwrap();
+            let (_, target) = connect_for_scan(&p, &store).await.unwrap();
+            let ScanTarget::PrimaryFallback(why) = target else {
+                panic!("a replica that errors was used");
+            };
+            assert!(!why.contains(USER), "{why}");
+            assert!(why.contains(expected), "{why}");
+        }
+    }
+
+    /// A connection of its own to a cluster node that discovery reached without
+    /// credentials sends none either; one that had them keeps them.
+    #[tokio::test]
+    async fn a_node_without_credentials_gets_none() {
+        use crate::secrets::MemoryStore;
+        let mut p = fake_profile(6379, false);
+        p.auth = Auth::Keychain;
+        let store = MemoryStore::default();
+        store
+            .set(
+                &p.secret_ref(),
+                &crate::model::Credentials {
+                    username: Some("lens".into()),
+                    password: secrecy::SecretString::from("hunter2".to_string()),
+                },
+            )
+            .unwrap();
+        let node = |credentials| NodeAddr {
+            endpoint: ep("10.0.0.2", 7001, false),
+            credentials,
+        };
+        let auth = ResolvedAuth::new(&p, &store).await.unwrap();
+        assert!(auth.sends_credentials);
+        let kept = ResolvedAuth::new(&p, &store)
+            .await
+            .unwrap()
+            .for_node(Some(&node(true)));
+        assert_eq!(kept.settings.username(), Some("lens"));
+        let none = auth.for_node(Some(&node(false)));
+        assert!(!none.sends_credentials);
+        assert_eq!(none.settings.username(), None);
+        assert_eq!(none.settings.password(), None);
     }
 
     fn fake_profile(port: u16, prefer_replica: bool) -> Profile {
@@ -2080,7 +2422,9 @@ while (my $c = $l->accept) {
             .await
             .unwrap();
         let started = std::time::Instant::now();
-        let (c, target) = connect_for_scan_with(&p, &route, &auth).await.unwrap();
+        let (c, target) = connect_for_scan_with(&p, &MemoryStore::default(), &route, &auth)
+            .await
+            .unwrap();
         assert_eq!(
             target,
             ScanTarget::Replica(ep("127.0.0.1", replica.addr.port(), false)),
@@ -2141,6 +2485,8 @@ while (my $c = $l->accept) {
             provider: None,
             token_command: Some(cmd.iter().map(|s| s.to_string()).collect()),
             ssh: None,
+            sentinel: None,
+            tags: Vec::new(),
         }
     }
 
@@ -2305,7 +2651,7 @@ while (my $c = $l->accept) {
         assert!(!report.allowed(PERM_TYPE_TTL), "{report:?}");
     }
 
-    fn ep(host: &str, port: u16, tls: bool) -> Endpoint {
+    pub(super) fn ep(host: &str, port: u16, tls: bool) -> Endpoint {
         Endpoint {
             host: host.to_string(),
             port,

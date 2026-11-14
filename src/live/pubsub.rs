@@ -2,6 +2,9 @@
 //!
 //! - **Counts** (phase 1): `PUBSUB CHANNELS`, `PUBSUB NUMSUB` and `PUBSUB NUMPAT`, on the
 //!   live connection. They read no payload.
+//! - **Shard channels** (P4): `PUBSUB SHARDCHANNELS` (the first [`MAX_CHANNELS`]) and
+//!   `PUBSUB SHARDNUMSUB` in batches of 100, on one node (Redis 7.0 and later, Valkey).
+//!   On a cluster the view sends one request to each node.
 //! - **The live tail** (phase 2): [`subscribe`] sends `SUBSCRIBE` or `PSUBSCRIBE` on a
 //!   connection of its own (`conn::open_subscriber`, RESP3), and [`parse_push`] turns
 //!   what it pushes into [`TailMessage`]s. A payload is a value ([`Raw`]): shown on
@@ -10,7 +13,7 @@
 use redis::{PushInfo, PushKind, RedisResult, Value};
 
 use super::streams::{text, uint};
-use super::{CONNECTION_LOST, Conn, LiveError, error_for, query_pipe};
+use super::{CONNECTION_LOST, LiveConn, LiveError, error_for, query_pipe};
 use crate::budget::Budget;
 use crate::conn::ConnError;
 use crate::value::Raw;
@@ -24,11 +27,25 @@ const NUMSUB_BATCH: usize = 100;
 pub enum Request {
     /// The active channels with their subscriber counts, and the pattern count.
     Counts,
+    /// The node's active shard channels with their subscriber counts.
+    ShardCounts,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reply {
     Counts(Counts),
+    ShardCounts(ShardCounts),
+}
+
+/// What one node says of its shard channels.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ShardCounts {
+    /// The first [`MAX_CHANNELS`] shard channels, most subscribers first, then by name.
+    pub channels: Vec<Channel>,
+    /// How many are active on the node.
+    pub total_channels: usize,
+    /// Why a count is missing, in redis-lens's own words.
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -52,13 +69,106 @@ pub struct Channel {
 }
 
 /// Runs one request. Every command goes through `budget`.
-pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply, LiveError> {
+pub async fn run(
+    conn: &mut impl LiveConn,
+    budget: &Budget,
+    req: Request,
+) -> Result<Reply, LiveError> {
     match req {
         Request::Counts => counts(conn, budget).await.map(Reply::Counts),
+        Request::ShardCounts => shard_counts(conn, budget).await.map(Reply::ShardCounts),
     }
 }
 
-async fn counts(conn: &mut Conn, budget: &Budget) -> Result<Counts, LiveError> {
+/// `PUBSUB SHARDCHANNELS`, then `PUBSUB SHARDNUMSUB` in batches of 100. A refused or
+/// unknown `SHARDCHANNELS` fails the request (the view leaves the list out and says
+/// why); a refused `SHARDNUMSUB` leaves the counts out with a note.
+async fn shard_counts(conn: &mut impl LiveConn, budget: &Budget) -> Result<ShardCounts, LiveError> {
+    let mut cmd = redis::cmd("PUBSUB");
+    cmd.arg("SHARDCHANNELS");
+    let channels: Value = super::query(conn, budget, "PUBSUB SHARDCHANNELS", &cmd).await?;
+    let mut names = parse_channels(&channels);
+    let mut out = ShardCounts {
+        total_channels: names.len(),
+        ..ShardCounts::default()
+    };
+    names.truncate(MAX_CHANNELS);
+    let subs = numsub(conn, budget, "SHARDNUMSUB", &names, &mut out.notes).await?;
+    out.channels = merge(&names, subs.as_deref());
+    Ok(out)
+}
+
+/// `PUBSUB <sub> …` for `names` in batches of [`NUMSUB_BATCH`], in one pipeline. `None`
+/// when a batch was refused, with the reason in `notes`.
+async fn numsub(
+    conn: &mut impl LiveConn,
+    budget: &Budget,
+    sub: &str,
+    names: &[Vec<u8>],
+    notes: &mut Vec<String>,
+) -> Result<Option<Vec<(String, u64)>>, LiveError> {
+    let mut subs: Option<Vec<(String, u64)>> = Some(Vec::new());
+    if names.is_empty() {
+        return Ok(subs);
+    }
+    let name = format!("PUBSUB {sub}");
+    let pipe = numsub_pipe(sub, names);
+    let replies: Vec<RedisResult<Value>> = query_pipe(conn, budget, &name, &pipe).await?;
+    for r in replies {
+        match r {
+            Ok(v) => {
+                if let Some(s) = subs.as_mut() {
+                    s.extend(parse_numsub(&v));
+                }
+            }
+            Err(e) => match error_for(&name, &e) {
+                LiveError::Closed => return Err(LiveError::Closed),
+                other => {
+                    if subs.is_some() {
+                        notes.push(other.to_string());
+                    }
+                    subs = None;
+                }
+            },
+        }
+    }
+    Ok(subs)
+}
+
+/// One `PUBSUB <sub> c1 … c100` per batch of [`NUMSUB_BATCH`] names.
+pub fn numsub_pipe(sub: &str, names: &[Vec<u8>]) -> redis::Pipeline {
+    let mut pipe = redis::pipe();
+    pipe.ignore_errors();
+    for batch in names.chunks(NUMSUB_BATCH) {
+        let mut c = redis::cmd("PUBSUB");
+        c.arg(sub);
+        for n in batch {
+            c.arg(n.as_slice());
+        }
+        pipe.add_command(c);
+    }
+    pipe
+}
+
+/// Why the shard channels are left out on `server`: they need Redis 7.0 or later
+/// (every Valkey has them). `None` when they are read.
+pub fn shards_off(server: &crate::model::ServerInfo) -> Option<String> {
+    use crate::model::ServerFlavor;
+    let new_enough = match server.flavor {
+        ServerFlavor::Valkey => true,
+        ServerFlavor::Redis | ServerFlavor::Unknown => {
+            super::bulk::major_minor(&server.version).is_some_and(|v| v >= (7, 0))
+        }
+    };
+    (!new_enough).then(|| {
+        format!(
+            "Shard channels need Redis 7.0 or later (this is {}), so they are left out.",
+            crate::value::escape(&server.version)
+        )
+    })
+}
+
+async fn counts(conn: &mut impl LiveConn, budget: &Budget) -> Result<Counts, LiveError> {
     let mut pipe = redis::pipe();
     pipe.ignore_errors();
     pipe.cmd("PUBSUB").arg("CHANNELS");
@@ -85,39 +195,7 @@ async fn counts(conn: &mut Conn, budget: &Budget) -> Result<Counts, LiveError> {
         },
     }
 
-    let mut subs: Option<Vec<(String, u64)>> = Some(Vec::new());
-    if !names.is_empty() {
-        let mut pipe = redis::pipe();
-        pipe.ignore_errors();
-        for batch in names.chunks(NUMSUB_BATCH) {
-            let mut c = redis::cmd("PUBSUB");
-            c.arg("NUMSUB");
-            for n in batch {
-                c.arg(n.as_slice());
-            }
-            pipe.add_command(c);
-        }
-        let replies: Vec<RedisResult<Value>> =
-            query_pipe(conn, budget, "PUBSUB NUMSUB", &pipe).await?;
-        for r in replies {
-            match r {
-                Ok(v) => {
-                    if let Some(s) = subs.as_mut() {
-                        s.extend(parse_numsub(&v));
-                    }
-                }
-                Err(e) => match error_for("PUBSUB NUMSUB", &e) {
-                    LiveError::Closed => return Err(LiveError::Closed),
-                    other => {
-                        if subs.is_some() {
-                            out.notes.push(other.to_string());
-                        }
-                        subs = None;
-                    }
-                },
-            }
-        }
-    }
+    let subs = numsub(conn, budget, "NUMSUB", &names, &mut out.notes).await?;
     out.channels = merge(&names, subs.as_deref());
     Ok(out)
 }
@@ -190,7 +268,13 @@ pub enum Subscription {
     Channel(String),
     /// `PSUBSCRIBE` to a glob-style pattern.
     Pattern(String),
+    /// `SSUBSCRIBE` to one shard channel by name, on its slot's owner.
+    Shard(String),
 }
+
+/// Why a pattern can't be subscribed to as a shard channel.
+pub const SHARD_PATTERN: &str =
+    "a pattern can't be shard-subscribed: SSUBSCRIBE takes channel names only";
 
 impl Subscription {
     /// What `s` typed means: a pattern when it has `*`, `?` or `[`, otherwise a channel.
@@ -208,8 +292,21 @@ impl Subscription {
     /// The channel or pattern, as typed.
     pub fn name(&self) -> &str {
         match self {
-            Self::Channel(n) | Self::Pattern(n) => n,
+            Self::Channel(n) | Self::Pattern(n) | Self::Shard(n) => n,
         }
+    }
+
+    /// What `S` typed means: a shard channel, or why it can't be one (a pattern).
+    pub fn parse_shard(text: &str) -> Result<Option<Self>, &'static str> {
+        match Self::parse(text) {
+            None => Ok(None),
+            Some(Self::Pattern(_)) => Err(SHARD_PATTERN),
+            Some(_) => Ok(Some(Self::Shard(text.to_string()))),
+        }
+    }
+
+    pub fn is_shard(&self) -> bool {
+        matches!(self, Self::Shard(_))
     }
 
     pub fn is_pattern(&self) -> bool {
@@ -221,6 +318,7 @@ impl Subscription {
         match self {
             Self::Channel(_) => "SUBSCRIBE",
             Self::Pattern(_) => "PSUBSCRIBE",
+            Self::Shard(_) => "SSUBSCRIBE",
         }
     }
 
@@ -232,6 +330,9 @@ impl Subscription {
             Self::Channel(_) => "the server refused SUBSCRIBE on that channel for this user".into(),
             Self::Pattern(_) => {
                 "the server refused PSUBSCRIBE on that pattern for this user".into()
+            }
+            Self::Shard(_) => {
+                "the server refused SSUBSCRIBE on that shard channel for this user".into()
             }
         }
     }
@@ -323,7 +424,7 @@ pub fn parse_push(push: PushInfo, at_unix_ms: i64) -> Push {
     let mut data = push.data.into_iter();
     let (pattern, channel, payload) = match (push.kind, data.len()) {
         (PushKind::Disconnection, _) => return Push::Lost,
-        (PushKind::Message, 2) => (None, data.next(), data.next()),
+        (PushKind::Message | PushKind::SMessage, 2) => (None, data.next(), data.next()),
         (PushKind::PMessage, 3) => (data.next(), data.next(), data.next()),
         _ => return Push::Other,
     };
@@ -341,11 +442,22 @@ pub fn parse_push(push: PushInfo, at_unix_ms: i64) -> Push {
 /// Sends `SUBSCRIBE` or `PSUBSCRIBE` for `to` on `conn`, a connection from
 /// `conn::open_subscriber`, taking one command from `budget`. The messages then arrive
 /// on that connection's push receiver. The error is in redis-lens's own words.
-pub async fn subscribe(conn: &mut Conn, budget: &Budget, to: &Subscription) -> Result<(), String> {
+pub async fn subscribe(
+    conn: &mut redis::aio::MultiplexedConnection,
+    budget: &Budget,
+    to: &Subscription,
+) -> Result<(), String> {
     budget.take(1).await;
     let sent = match to {
         Subscription::Channel(c) => conn.subscribe(c.as_str()).await,
         Subscription::Pattern(p) => conn.psubscribe(p.as_str()).await,
+        // redis-rs has no `ssubscribe` on this connection; over RESP3 the server's
+        // confirmation is a push that answers the command (one per channel).
+        Subscription::Shard(c) => redis::cmd("SSUBSCRIBE")
+            .arg(c.as_str())
+            .query_async::<Value>(conn)
+            .await
+            .map(|_| ()),
     };
     sent.map_err(|e| match error_for(to.command(), &e) {
         LiveError::Denied(_) => to.denied(),
@@ -441,6 +553,90 @@ mod tests {
         assert_eq!(
             parse_push(push(PushKind::Message, vec![b("a"), Value::Nil]), 0),
             Push::Other
+        );
+    }
+
+    #[test]
+    fn a_shard_message_is_a_message_of_its_channel() {
+        let m = parse_push(push(PushKind::SMessage, vec![b("orders"), b("hi")]), 9);
+        assert_eq!(
+            m,
+            Push::Message(TailMessage::new(9, "orders".into(), None, b"hi".to_vec()))
+        );
+    }
+
+    #[test]
+    fn a_shard_subscription_takes_channel_names_only() {
+        assert_eq!(Subscription::parse_shard(""), Ok(None));
+        assert_eq!(
+            Subscription::parse_shard("orders:eu"),
+            Ok(Some(Subscription::Shard("orders:eu".into())))
+        );
+        for p in ["orders:*", "news?", "[ab]"] {
+            assert_eq!(Subscription::parse_shard(p), Err(SHARD_PATTERN), "{p}");
+        }
+        let s = Subscription::Shard("orders".into());
+        assert!(s.is_shard());
+        assert!(!Subscription::parse("orders").unwrap().is_shard());
+    }
+
+    #[test]
+    fn shard_numsub_is_asked_in_batches_of_100() {
+        let names: Vec<Vec<u8>> = (0..250).map(|i| format!("ch:{i}").into_bytes()).collect();
+        let pipe = numsub_pipe("SHARDNUMSUB", &names);
+        let cmds: Vec<Vec<Vec<u8>>> = pipe
+            .cmd_iter()
+            .map(|c| {
+                c.args_iter()
+                    .map(|a| match a {
+                        redis::Arg::Simple(b) => b.to_vec(),
+                        _ => Vec::new(),
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            cmds.iter().map(Vec::len).collect::<Vec<_>>(),
+            [102, 102, 52]
+        );
+        for c in &cmds {
+            assert_eq!(
+                (&c[0][..], &c[1][..]),
+                (&b"PUBSUB"[..], &b"SHARDNUMSUB"[..])
+            );
+        }
+        assert_eq!(cmds[2][51], b"ch:249");
+        assert_eq!(numsub_pipe("NUMSUB", &[]).cmd_iter().count(), 0);
+    }
+
+    #[test]
+    fn shard_channels_are_left_out_before_redis_7_only() {
+        use crate::model::ServerFlavor;
+        let mut s = crate::model::ServerInfo {
+            flavor: ServerFlavor::Redis,
+            version: String::new(),
+            mode: crate::model::ServerMode::Standalone,
+            used_memory: 0,
+            maxmemory: 0,
+            maxmemory_policy: String::new(),
+            total_keys: 0,
+        };
+        for (flavor, version, off) in [
+            (ServerFlavor::Redis, "6.2.14", true),
+            (ServerFlavor::Redis, "7.0.0", false),
+            (ServerFlavor::Redis, "7.4.2", false),
+            (ServerFlavor::Valkey, "7.2.5", false),
+            (ServerFlavor::Valkey, "8.1.0", false),
+        ] {
+            s.flavor = flavor;
+            s.version = version.into();
+            assert_eq!(shards_off(&s).is_some(), off, "{version}");
+        }
+        s.flavor = ServerFlavor::Redis;
+        s.version = "6.2.14".into();
+        assert_eq!(
+            shards_off(&s).unwrap(),
+            "Shard channels need Redis 7.0 or later (this is 6.2.14), so they are left out."
         );
     }
 

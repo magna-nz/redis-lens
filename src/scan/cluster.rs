@@ -16,8 +16,8 @@
 //! that one assignment: a node's rows always add up to the merged rows (see
 //! [`crate::pattern::aggregate_nodes`]).
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
@@ -106,6 +106,7 @@ pub async fn scan_cluster(
             // tried, as for a standalone scan without one).
             perms: t.perms.clone().unwrap_or_default(),
             conn: t.conn.as_mut(),
+            budget: t.budget.clone(),
         })
         .collect();
     scan_nodes(profile_name, nodes, opts, progress, partial).await
@@ -128,6 +129,9 @@ pub(crate) struct NodeIn<'c, C> {
     pub meta: NodeMeta,
     pub perms: PermissionReport,
     pub conn: Option<&'c mut C>,
+    /// The node's budget, shared with the live views on it; `None`: the scan makes one
+    /// of its own for the node.
+    pub budget: Option<Arc<Budget>>,
 }
 
 /// Split `limit` samples across nodes in proportion to their `sizes` (`DBSIZE`):
@@ -361,9 +365,9 @@ pub(crate) async fn scan_nodes<C: ConnectionLike + Send>(
         .filter_map(|(i, ((n, info), quota))| {
             let info = info.as_ref()?;
             let conn = n.conn.as_deref_mut()?;
-            Some((i, conn, info, *quota, &n.perms))
+            Some((i, conn, info, *quota, &n.perms, n.budget.clone()))
         })
-        .map(|(i, conn, info, quota, perms)| {
+        .map(|(i, conn, info, quota, perms, budget)| {
             let counts = &counts;
             let shared = shared.as_ref();
             async move {
@@ -379,8 +383,9 @@ pub(crate) async fn scan_nodes<C: ConnectionLike + Send>(
                     }
                 };
                 let mut hook = shared.map(|shared| NodeHook { node: i, shared });
-                // The budget is per node: each node is its own server.
-                let budget = Budget::new(node_opts.max_commands_per_sec);
+                // The budget is per node: each node is its own server. Shared with the
+                // live views on that node when the caller gave one.
+                let budget = budget.unwrap_or_else(|| Budget::new(node_opts.max_commands_per_sec));
                 let sample = sample_server(
                     conn,
                     info,
@@ -799,6 +804,7 @@ mod tests {
             .map(|(i, s)| NodeIn {
                 meta: meta(i, slots[i % 3].clone()),
                 perms: perms_all(),
+                budget: None,
                 conn: Some(s),
             })
             .collect()
@@ -966,16 +972,19 @@ mod tests {
             NodeIn {
                 meta: meta(0, slots[0].clone()),
                 perms: perms_all(),
+                budget: None,
                 conn: Some(&mut a),
             },
             NodeIn {
                 meta: meta(1, slots[1].clone()),
                 perms: perms_all(),
+                budget: None,
                 conn: Some(&mut b),
             },
             NodeIn {
                 meta: meta(2, slots[2].clone()),
                 perms: perms_all(),
+                budget: None,
                 conn: Some(&mut c),
             },
             NodeIn {
@@ -984,12 +993,14 @@ mod tests {
                     ..meta(3, vec![])
                 },
                 perms: perms_all(),
+                budget: None,
                 conn: None,
             },
         ];
         nodes.push(NodeIn {
             meta: meta(4, vec![]),
             perms: perms_all(),
+            budget: None,
             conn: None,
         });
         let r = run(scan_nodes("c", nodes, &opts(10_000, 50), None, None)).unwrap();
@@ -1026,11 +1037,13 @@ mod tests {
             NodeIn {
                 meta: meta(0, vec![(0, 16383)]),
                 perms: perms_all(),
+                budget: None,
                 conn: Some(&mut a),
             },
             NodeIn {
                 meta: meta(1, vec![]),
                 perms: perms_all(),
+                budget: None,
                 conn: None,
             },
         ];
@@ -1047,6 +1060,7 @@ mod tests {
             let nodes = vec![NodeIn {
                 meta: meta(0, slots),
                 perms: perms_all(),
+                budget: None,
                 conn: Some(&mut a),
             }];
             let r = run(scan_nodes("c", nodes, &opts(100, 50), None, None)).unwrap();

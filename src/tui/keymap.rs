@@ -54,7 +54,15 @@ const QUIT: KeyHelp = k("q ctrl-c", "q", "Quit", "Quit", true);
 
 const COMMAND_LINE_KEY: KeyHelp = k(":", ":", "Command", "Open the command line", false);
 
-static GLOBAL: [KeyHelp; 5] = [VIEW_KEYS, HELP, ADD, COMMAND_LINE_KEY, QUIT];
+const DATABASES_KEY: KeyHelp = k(
+    "b",
+    "b",
+    "Databases",
+    "Switch the database (once connected)",
+    false,
+);
+
+static GLOBAL: [KeyHelp; 6] = [VIEW_KEYS, HELP, ADD, COMMAND_LINE_KEY, DATABASES_KEY, QUIT];
 
 /// The keys of the command line panel while it is open (`:`). Its input line replaces
 /// the footer, so none of them is in a footer.
@@ -145,12 +153,29 @@ const RESCAN: KeyHelp = k(
 const SNAPSHOT: KeyHelp = k("s", "s", "Snapshot", "Save a scan snapshot file", true);
 const REFRESH: KeyHelp = k("r", "r", "Refresh", "Refresh this panel now", true);
 const PAUSE: KeyHelp = k("p", "p", "Pause", "Pause or resume polling", true);
+/// `[` `]` on the views that read the picked node of a cluster: only in the overlay,
+/// so the key bars still fit 80 columns.
+const PICK_NODE: KeyHelp = k(
+    "[ ]",
+    "[ ]",
+    "Node",
+    "Pick the previous or next node (cluster only)",
+    false,
+);
 
-static CONNECTIONS: [KeyHelp; 6] = [
+static CONNECTIONS: [KeyHelp; 8] = [
     MOVE,
     PAGE,
     ENDS,
     k("enter", "enter", "Connect", "Connect and scan", true),
+    k(
+        "/",
+        "/",
+        "Filter",
+        "Filter the profiles by name or tag",
+        false,
+    ),
+    k("esc", "esc", "Clear", "Clear the filter", false),
     k(
         "r",
         "r",
@@ -214,12 +239,13 @@ static PATTERNS: [KeyHelp; 14] = [
     k("D", "D", "Delete", "Delete every key of the pattern", false),
 ];
 
-static KEY_LIST: [KeyHelp; 10] = [
+static KEY_LIST: [KeyHelp; 11] = [
     MOVE,
     PAGE,
     ENDS,
     k("/", "/", "Filter", "Filter the loaded keys by name", true),
     k("o", "o", "Sort", "Sort the loaded keys", true),
+    k("t", "t", "Type", "Show one type of the loaded keys", false),
     k("n", "n", "More", "Load 1,000 more keys", true),
     k(
         "enter",
@@ -233,7 +259,7 @@ static KEY_LIST: [KeyHelp; 10] = [
         "esc",
         "esc",
         "Back",
-        "Clear the filter, or go back to Patterns",
+        "Clear the filters, or go back to Patterns",
         true,
     ),
     k("N", "N", "New key", "Add a key", false),
@@ -317,7 +343,7 @@ static BIG_KEYS: [KeyHelp; 7] = [MOVE, PAGE, ENDS, PANEL, COPY_KEY, RESCAN, SNAP
 
 static EXPIRY: [KeyHelp; 3] = [PANEL, RESCAN, SNAPSHOT];
 
-static OVERVIEW: [KeyHelp; 4] = [
+static OVERVIEW: [KeyHelp; 5] = [
     PANEL,
     PAUSE,
     k(
@@ -328,9 +354,10 @@ static OVERVIEW: [KeyHelp; 4] = [
         true,
     ),
     REFRESH,
+    PICK_NODE,
 ];
 
-static CLIENTS: [KeyHelp; 9] = [
+static CLIENTS: [KeyHelp; 10] = [
     MOVE,
     PAGE,
     ENDS,
@@ -346,9 +373,10 @@ static CLIENTS: [KeyHelp; 9] = [
     PAUSE,
     REFRESH,
     k("K", "K", "Kill", "Kill the selected connection", false),
+    PICK_NODE,
 ];
 
-static SLOW_LOG: [KeyHelp; 8] = [
+static SLOW_LOG: [KeyHelp; 9] = [
     MOVE,
     PAGE,
     ENDS,
@@ -363,9 +391,10 @@ static SLOW_LOG: [KeyHelp; 8] = [
         false,
     ),
     k("R", "R", "Reset", "Reset the slow log", false),
+    PICK_NODE,
 ];
 
-static MONITOR: [KeyHelp; 6] = [
+static MONITOR: [KeyHelp; 7] = [
     k("↑↓ j k", "↑↓", "Scroll", "Scroll the lines", true),
     PAGE,
     ENDS,
@@ -378,6 +407,7 @@ static MONITOR: [KeyHelp; 6] = [
         true,
     ),
     k("esc", "esc", "Stop", "Stop MONITOR now", true),
+    PICK_NODE,
 ];
 
 /// `f` on the screens that show a value: the key detail, stream entries, a Search result.
@@ -450,7 +480,7 @@ static STREAMS: [KeyHelp; 14] = [
     k("X", "X", "Trim", "Trim the stream", false),
 ];
 
-static PUBSUB: [KeyHelp; 12] = [
+static PUBSUB: [KeyHelp; 14] = [
     MOVE,
     PAGE,
     ENDS,
@@ -462,6 +492,13 @@ static PUBSUB: [KeyHelp; 12] = [
         true,
     ),
     k("s", "s", "Sub", "Subscribe to a channel or pattern", false),
+    k(
+        "S",
+        "S",
+        "Shard",
+        "Subscribe to a shard channel (SSUBSCRIBE)",
+        false,
+    ),
     k("space", "space", "Pause", "Pause or resume the tail", true),
     k("c", "c", "Clear", "Clear the tail", false),
     k("/", "/", "Filter", "Filter the tail", true),
@@ -474,10 +511,17 @@ static PUBSUB: [KeyHelp; 12] = [
     ),
     PAUSE,
     REFRESH,
-    k("P", "P", "Publish", "Publish a message", false),
+    k(
+        "P",
+        "P",
+        "Publish",
+        "Publish a message (SPUBLISH on a shard channel)",
+        false,
+    ),
+    PICK_NODE,
 ];
 
-static SEARCH: [KeyHelp; 14] = [
+static SEARCH: [KeyHelp; 15] = [
     k(
         "↑↓ j k",
         "↑↓",
@@ -516,6 +560,7 @@ static SEARCH: [KeyHelp; 14] = [
         "Drop the selected index (its documents stay)",
         false,
     ),
+    PICK_NODE,
 ];
 
 static NODES: [KeyHelp; 7] = [
@@ -532,6 +577,33 @@ static NODES: [KeyHelp; 7] = [
     ),
     RESCAN,
     SNAPSHOT,
+];
+
+static SLOTS: [KeyHelp; 6] = [
+    k(
+        "↑↓ j k",
+        "↑↓",
+        "Move",
+        "Move through the hottest slots",
+        true,
+    ),
+    PAGE,
+    ENDS,
+    PANEL,
+    k(
+        "o",
+        "o",
+        "Order",
+        "Order the hottest slots by keys, CPU, network in or network out",
+        true,
+    ),
+    k(
+        "r",
+        "r",
+        "Refresh",
+        "Read CLUSTER SLOT-STATS again on every node",
+        true,
+    ),
 ];
 
 /// Keys that work in every view.
@@ -563,6 +635,7 @@ pub fn for_screen(screen: Screen) -> &'static [KeyHelp] {
         Screen::PubSub => &PUBSUB,
         Screen::Search => &SEARCH,
         Screen::Nodes => &NODES,
+        Screen::Slots => &SLOTS,
     }
 }
 
@@ -602,6 +675,7 @@ pub fn footer(screen: Screen, ready: bool) -> Vec<(&'static str, &'static str)> 
         Screen::PubSub if ready => &[MOVE, "enter", "space", "/", "0-6", "?", "q ctrl-c"],
         Screen::Search if ready => &[MOVE, TAB, "/", "enter", "0-6", "?", "q ctrl-c"],
         Screen::Nodes if ready => &[MOVE, TAB, "enter", "r", "0-6", "?", "q ctrl-c"],
+        Screen::Slots if ready => &[MOVE, TAB, "o", "r", "0-6", "?", "q ctrl-c"],
         s if s.view().panels().is_empty() => &["0-6", "a", "?", "q ctrl-c"],
         _ => &[TAB, "0-6", "a", "?", "q ctrl-c"],
     };
@@ -785,6 +859,10 @@ mod tests {
         assert_eq!(
             names(Screen::Monitor, false),
             ["Panel", "View", "Add", "Help", "Quit"]
+        );
+        assert_eq!(
+            names(Screen::Slots, true),
+            ["Move", "Panel", "Order", "Refresh", "View", "Help", "Quit"]
         );
         assert_eq!(
             names(Screen::Nodes, true),

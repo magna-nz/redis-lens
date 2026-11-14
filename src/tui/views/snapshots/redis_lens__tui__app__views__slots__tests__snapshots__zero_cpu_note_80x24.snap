@@ -1,0 +1,29 @@
+---
+source: src/tui/views/slots_tests.rs
+assertion_line: 464
+expression: render(&app)
+---
+" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
+" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
+"  0   1   2 Analysis   3   4   5   6                                            "
+"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  ·  Slots       "
+"┌─ Slot ranges ────────── CPU and network need cluster-slot-stats-enabled yes ─┐"
+"│ RANGE       NODE                  KEYS   CPU µs   NET IN  NET OUT            │"
+"│ 0-5460      10.0.1.11:6379          40        0       0B       0B            │"
+"│ 5461-10922  10.0.1.12:6379           9        0       0B       0B            │"
+"│ 10923-16383 10.0.1.13:6379           —        —        —        —            │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"┌─ Hottest slots ────────────────────────────── by keys · o changes the order ─┐"
+"│ SLOT   NODE                  KEYS   CPU µs   NET IN  NET OUT                 │"
+"│ 10     10.0.1.11:6379          40        0       0B       0B                 │"
+"│ 6000   10.0.1.12:6379           9        0       0B       0B                 │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"┌─ Slot 10 ─────────────────────────────────────────────────── 10.0.1.11:6379 ─┐"
+"│ No example, big or hot key of the scan hashes to this slot.                  │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" ↑↓ Move   tab Panel   o Order   r Refresh   0-6 View   ? Help   q Quit         "

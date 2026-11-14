@@ -40,6 +40,8 @@ fn profile(port: u16) -> Profile {
         provider: None,
         token_command: None,
         ssh: None,
+        sentinel: None,
+        tags: Vec::new(),
     }
 }
 
@@ -301,6 +303,15 @@ async fn stopped_node(valkey: bool) {
     assert_eq!(t.summary(), "cluster · 3 shards · 1 unreachable");
     let down = t.nodes.iter().find(|n| n.endpoint.port == victim).unwrap();
     assert!(down.conn.is_none());
+    // A node discovery could not use is never one the credentials may go to: Monitor
+    // and the Pub/Sub tail open nothing to it.
+    assert!(!down.credentials);
+    assert!(
+        t.nodes
+            .iter()
+            .filter(|n| n.conn.is_some())
+            .all(|n| n.credentials)
+    );
     let note = down.note.clone().unwrap();
     assert!(
         note.contains("could not connect") || note.contains("timed out"),

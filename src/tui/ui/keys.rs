@@ -14,7 +14,7 @@ use crate::format;
 use crate::live::LiveError;
 use crate::live::keys::KeyRow;
 use crate::model::Ttl;
-use crate::tui::app::views::keys::{KeySort, KeysState};
+use crate::tui::app::views::keys::{KeySort, KeysState, TypeFilter};
 use crate::tui::app::views::{Ctx, LiveState};
 
 use super::widgets::{fit, marquee_spans, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset};
@@ -26,6 +26,8 @@ const SIZE_W: usize = 6;
 const ENC_W: usize = 10;
 const LEN_W: usize = 7;
 const LFU_W: usize = 3;
+/// The NODE column on a cluster: the address cut with `…` to 15 cells, and a space.
+pub const NODE_W: usize = 16;
 /// The narrowest the key column gets before the encoding column is hidden.
 const KEY_MIN: usize = 16;
 
@@ -35,12 +37,15 @@ struct Cols {
     key: usize,
     enc: bool,
     lfu: bool,
+    /// The NODE column after the key (a cluster).
+    node: bool,
 }
 
 impl Cols {
-    fn new(inner: usize, lfu: bool) -> Self {
+    fn new(inner: usize, lfu: bool, node: bool) -> Self {
         let fixed = |enc: bool| {
-            (TYPE_W + 1)
+            (if node { NODE_W } else { 0 })
+                + (TYPE_W + 1)
                 + (TTL_W + 2)
                 + (SIZE_W + 2)
                 + if enc { ENC_W + 1 } else { 0 }
@@ -52,8 +57,16 @@ impl Cols {
             key: inner.saturating_sub(fixed(enc)).max(8),
             enc,
             lfu,
+            node,
         }
     }
+}
+
+/// The announced address of node `i` of the session, for a NODE column or a detail
+/// line; `—` when unknown.
+pub fn node_name(ctx: &Ctx<'_>, i: Option<usize>) -> String {
+    i.and_then(|i| ctx.session.nodes.get(i))
+        .map_or_else(|| "—".to_string(), |n| n.endpoint.to_string())
 }
 
 /// The command a refused column is named by, and whether `e` is about it.
@@ -80,7 +93,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &KeysState, ctx: &Ctx<'_>) {
         &format!("Patterns › {pattern}"),
         &title_right(state, ctx, &pattern, visible.len()),
     );
-    let c = Cols::new(usize::from(inner.width), state.lfu);
+    let c = Cols::new(usize::from(inner.width), state.lfu, state.by_node());
     let sort = state.sort.effective(state.sizes, state.freq);
     rows(frame, inner, vec![header(&c, sort)], None);
     let body = Rect {
@@ -98,11 +111,17 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &KeysState, ctx: &Ctx<'_>) {
             .enumerate()
             .skip(off)
             .take(usize::from(body.height))
-            .map(|(i, &r)| key_row(&state.rows[r], &c, state, (i == sel).then_some(ticks)))
+            .map(|(i, &r)| {
+                let row = &state.rows[r];
+                let node = c
+                    .node
+                    .then(|| node_name(ctx, state.row_node.get(&row.key).copied()));
+                key_row(row, &c, state, node, (i == sel).then_some(ticks))
+            })
             .collect();
         rows(frame, body, lines, Some(sel - off));
     }
-    detail_panel(frame, detail, state);
+    detail_panel(frame, detail, state, ctx);
     if let Some(form) = &state.form {
         super::value::draw_form(frame, area, form);
     }
@@ -116,8 +135,22 @@ fn title_right(state: &KeysState, ctx: &Ctx<'_>, pattern: &str, shown: usize) ->
     let loaded = format::grouped(state.rows.len() as u64);
     let of = est.map_or_else(String::new, |n| format!(" of ~{}", format::count(n)));
     let mut right = format!("{loaded} loaded{of}");
+    let typed = state.type_filter != TypeFilter::All;
     if !state.filter.is_empty() {
         right = format!("filter \"{}\" · {shown} rows · {right}", state.filter);
+    } else if typed {
+        right = format!("{shown} rows · {right}");
+    }
+    if typed {
+        right = format!("type {} · {right}", state.type_filter.label());
+    }
+    // First, so a title cut short at 80 columns still says how far the walk is.
+    if state.by_node() {
+        right = format!(
+            "{} of {} nodes · {right}",
+            state.nodes_done,
+            state.walk.len() + state.missing.len()
+        );
     }
     if state.is_loading() {
         right = format!("{} loading · {right}", spinner(ctx.tick));
@@ -132,8 +165,11 @@ fn header(c: &Cols, sort: KeySort) -> Line<'static> {
         _ => " ",
     };
     let key = format!(" KEY{}", if sort == KeySort::Name { " ▲" } else { "" });
-    let mut spans = vec![
-        Span::styled(pad_r(&key, c.key), style::hd()),
+    let mut spans = vec![Span::styled(pad_r(&key, c.key), style::hd())];
+    if c.node {
+        spans.push(Span::styled(pad_r("NODE", NODE_W), style::hd()));
+    }
+    spans.extend([
         Span::styled(pad_r("TYPE", TYPE_W + 1), style::hd()),
         Span::styled(
             format!("{}{} ", pad_l("TTL", TTL_W), arrow(KeySort::Ttl)),
@@ -143,7 +179,7 @@ fn header(c: &Cols, sort: KeySort) -> Line<'static> {
             format!("{}{} ", pad_l("SIZE", SIZE_W), arrow(KeySort::Size)),
             style::hd(),
         ),
-    ];
+    ]);
     if c.enc {
         spans.push(Span::styled(pad_r("ENCODING", ENC_W + 1), style::hd()));
     }
@@ -167,7 +203,13 @@ fn ttl_text(t: Ttl) -> String {
     }
 }
 
-fn key_row(r: &KeyRow, c: &Cols, state: &KeysState, scroll: Option<u64>) -> Line<'static> {
+fn key_row(
+    r: &KeyRow,
+    c: &Cols,
+    state: &KeysState,
+    node: Option<String>,
+    scroll: Option<u64>,
+) -> Line<'static> {
     let dash = || "—".to_string();
     let text = vec![Span::styled(format!(" {}", r.key), style::fg())];
     let w = c.key.saturating_sub(1);
@@ -176,6 +218,12 @@ fn key_row(r: &KeyRow, c: &Cols, state: &KeysState, scroll: Option<u64>) -> Line
         None => fit(text, w),
     };
     spans.push(Span::raw(" "));
+    if let Some(node) = node {
+        spans.push(Span::styled(
+            pad_r(&super::widgets::trunc(&node, NODE_W - 1), NODE_W),
+            style::dim(),
+        ));
+    }
     let ttl_style = match r.ttl {
         Ttl::Persistent => style::dim(),
         Ttl::Expires(_) => style::fg(),
@@ -225,6 +273,11 @@ fn empty_lines(state: &KeysState, ctx: &Ctx<'_>) -> Vec<Line<'static>> {
             " No loaded key matches \"{}\". Press esc to clear the filter.",
             state.filter
         )
+    } else if state.type_filter != TypeFilter::All && !state.rows.is_empty() {
+        format!(
+            " No loaded key is of type {}. Press t for another type, esc to clear.",
+            state.type_filter.label()
+        )
     } else if state.done {
         " No key of this pattern was found.".to_string()
     } else if state.pages > 0 && !state.is_loading() {
@@ -237,7 +290,7 @@ fn empty_lines(state: &KeysState, ctx: &Ctx<'_>) -> Vec<Line<'static>> {
     vec![Line::from(Span::styled(text, style::dim()))]
 }
 
-fn detail_panel(frame: &mut Frame, area: Rect, state: &KeysState) {
+fn detail_panel(frame: &mut Frame, area: Rect, state: &KeysState, ctx: &Ctx<'_>) {
     let row = state.selected();
     let (title, right) = match row {
         Some(r) => (r.key.clone(), r.key_type.as_str().to_string()),
@@ -284,6 +337,14 @@ fn detail_panel(frame: &mut Frame, area: Rect, state: &KeysState) {
         let mut third = vec![label("PATTERN")];
         let p = state.pattern.clone().unwrap_or_default();
         third.extend(pattern_spans(&p, style::fg(), style::ph()));
+        if state.by_node() {
+            // The node in full: the column cuts it.
+            third.push(Span::styled("   NODE ", style::dim()));
+            third.push(Span::styled(
+                node_name(ctx, state.row_node.get(&r.key).copied()),
+                style::fgb(),
+            ));
+        }
         lines.push(Line::from(third));
         lines.push(Line::default());
     }
@@ -308,6 +369,18 @@ fn detail_panel(frame: &mut Frame, area: Rect, state: &KeysState) {
     }
     for e in off_notes(state) {
         lines.push(Line::from(Span::styled(e, style::amber())));
+    }
+    for &i in &state.missing {
+        if let Some(n) = ctx.session.nodes.get(i) {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " ▲ {}",
+                    crate::live::nodes::not_connected(&n.endpoint)
+                        .replace("so nothing is sent to it", "so its keys are not listed")
+                ),
+                style::amber(),
+            )));
+        }
     }
     if let (Some(e), false) = (&state.error, state.rows.is_empty()) {
         lines.push(Line::from(Span::styled(format!(" ✗ {e}"), style::warn())));

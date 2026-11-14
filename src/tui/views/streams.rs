@@ -36,7 +36,7 @@ use crate::live::streams::{
     StreamInfo, Verdict, verdicts,
 };
 use crate::live::write::Reply as WriteReply;
-use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
+use crate::live::{Dest, Follow, LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::{KeyType, PatternStats, ScanReport, Ttl};
 use crate::value::escape;
 use crate::write::{Trim, WriteOp};
@@ -220,7 +220,15 @@ pub struct StreamsState {
     pub off: Option<String>,
     /// Why the last poll failed. The previous rows stay.
     pub error: Option<String>,
-    pending: Option<ReqId>,
+    /// The poll in flight: one request per node that owns a listed stream (one on a
+    /// standalone server), with the keys each reads.
+    pending: Vec<(ReqId, Vec<String>)>,
+    /// The poll's answers so far, its refusals, and its first failure.
+    gathered: Vec<crate::live::streams::Fetched>,
+    gathered_refused: Refused,
+    gathered_error: Option<LiveError>,
+    /// The keys the poll in flight reads, in scan order.
+    poll_keys: Vec<String>,
     last_sent: Option<Instant>,
     /// Optional commands the server refused, not asked again until `r`.
     refused: Refused,
@@ -558,13 +566,15 @@ impl StreamsState {
         consumer: Option<String>,
         act: &mut Act<'_>,
     ) -> bool {
+        // On a cluster, the stream's slot owner.
+        let dest = Dest::key(key.as_bytes().to_vec());
         let req = Request::Pending {
             key,
             group,
             consumer,
             refused: self.refused,
         };
-        match act.send(LiveRequest::Streams(req)) {
+        match act.send_to(dest, LiveRequest::Streams(req)) {
             Some(id) => {
                 self.pending_read = Some(id);
                 true
@@ -679,21 +689,61 @@ impl StreamsState {
         let keys: Vec<String> = keys.into_iter().take(MAX_STREAMS).collect();
         self.refused_sent = self.refused;
         self.reread = false;
-        self.pending = act.send(LiveRequest::Streams(Request::Info {
-            keys,
-            refused: self.refused,
-        }));
+        self.gathered.clear();
+        self.gathered_refused = self.refused;
+        self.gathered_error = None;
+        self.pending.clear();
+        for (dest, keys) in streams_by_node(act.session, &keys) {
+            let req = LiveRequest::Streams(Request::Info {
+                keys: keys.clone(),
+                refused: self.refused,
+            });
+            if let Some(id) = act.send_to(dest, req) {
+                self.pending.push((id, keys));
+            }
+        }
+        self.poll_keys = keys;
     }
 
     fn in_flight(&mut self, act: &Act<'_>) -> bool {
-        match self.pending {
-            Some(id) if act.in_flight(id) => true,
-            Some(_) => {
-                self.pending = None;
-                false
-            }
-            None => false,
+        if self.pending.iter().any(|(id, _)| act.in_flight(*id)) {
+            return true;
         }
+        self.pending.clear();
+        false
+    }
+
+    /// One node's answer to the poll. The poll is applied once every node answered:
+    /// a node that failed keeps its streams' rows from the last poll.
+    fn take_poll(&mut self, at: usize, result: Result<LiveReply, LiveError>) -> bool {
+        let (_, keys) = self.pending.remove(at);
+        match result {
+            Ok(LiveReply::Streams(Reply::Info { streams, refused })) => {
+                let g = &mut self.gathered_refused;
+                g.time |= refused.time;
+                g.groups |= refused.groups;
+                g.consumers |= refused.consumers;
+                g.memory |= refused.memory;
+                self.gathered.extend(streams);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // The streams of that node keep what the last poll said.
+                for k in keys {
+                    if let Some(r) = self.rows.iter().find(|r| r.key == k) {
+                        self.gathered.push(crate::live::streams::Fetched {
+                            key: k,
+                            info: r.info.clone(),
+                        });
+                    }
+                }
+                let worse = matches!(e, LiveError::Denied(_) | LiveError::Unsupported(_));
+                if self.gathered_error.is_none() || worse {
+                    self.gathered_error = Some(e);
+                }
+            }
+        }
+        self.pending.is_empty()
     }
 
     fn apply(&mut self, list: Vec<crate::live::streams::Fetched>) {
@@ -884,17 +934,29 @@ impl ViewState for StreamsState {
             self.pending_reply(result, act);
             return;
         }
-        // Only the answer to the request in flight; an older one is stale. Any other is
+        // Only the answers to the poll in flight; an older one is stale. Any other is
         // a page of entries, or stale too (the entries state checks).
-        if self.pending != Some(id) {
+        let Some(at) = self.pending.iter().position(|(p, _)| *p == id) else {
             if let Some(entries) = self.entries.as_mut() {
                 entries.on_reply(id, result, act);
             }
             return;
+        };
+        if !self.take_poll(at, result) {
+            return;
         }
-        self.pending = None;
-        match result {
-            Ok(LiveReply::Streams(Reply::Info { streams, refused })) => {
+        let refused = self.gathered_refused;
+        let mut streams = std::mem::take(&mut self.gathered);
+        if act.session.is_cluster() {
+            // Back in scan order, whichever node answered first.
+            let order = |k: &str| self.poll_keys.iter().position(|p| p == k);
+            streams.sort_by_key(|f| order(&f.key));
+        }
+        match self.gathered_error.take() {
+            Some(e @ (LiveError::Denied(_) | LiveError::Unsupported(_))) => {
+                self.off = Some(off_text(&e));
+            }
+            other => {
                 self.refused = if self.reread {
                     // Keep only what this poll found refused; what it skipped is asked again.
                     let sent = self.refused_sent;
@@ -907,20 +969,50 @@ impl ViewState for StreamsState {
                 } else {
                     refused
                 };
-                self.apply(streams);
+                if !streams.is_empty() || other.is_none() {
+                    self.apply(streams);
+                }
+                match other {
+                    // `App` says the connection closed.
+                    Some(LiveError::Closed) | None => {}
+                    Some(e) => self.error = Some(e.to_string()),
+                }
             }
-            Ok(_) => {}
-            Err(e @ (LiveError::Denied(_) | LiveError::Unsupported(_))) => {
-                self.off = Some(off_text(&e));
-            }
-            // `App` says the connection closed.
-            Err(LiveError::Closed) => {}
-            Err(LiveError::Failed(why)) => self.error = Some(why),
         }
         if self.reread && self.off.is_none() {
             self.fetch(act);
         }
     }
+}
+
+/// The streams `keys` grouped by the node that owns each one's slot, in node order, for
+/// one request per node (spec "Cluster live views (P4)", 4 Streams); on a standalone
+/// server one group. A stream whose slot no node serves goes to the first group's node,
+/// whose answer says so.
+pub(crate) fn streams_by_node(
+    session: &crate::tui::app::Session,
+    keys: &[String],
+) -> Vec<(Dest, Vec<String>)> {
+    if !session.is_cluster() {
+        return vec![(Dest::node(0), keys.to_vec())];
+    }
+    let mut by: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
+    for k in keys {
+        let i = session.owner_of(k.as_bytes()).unwrap_or(session.picked);
+        by.entry(i).or_default().push(k.clone());
+    }
+    // Each stream on its own owner: a redirect is followed only for a one-stream
+    // request, since the others of the request belong where they are.
+    by.into_iter()
+        .map(|(i, keys)| {
+            let follow = if keys.len() == 1 {
+                Follow::Redirects
+            } else {
+                Follow::Never
+            };
+            (Dest::node(i).follow(follow), keys)
+        })
+        .collect()
 }
 
 /// Why a view is off, in redis-lens's own words ([`LiveError`]'s texts never hold the

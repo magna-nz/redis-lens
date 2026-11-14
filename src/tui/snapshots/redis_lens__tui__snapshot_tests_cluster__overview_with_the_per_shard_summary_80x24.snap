@@ -1,0 +1,29 @@
+---
+source: src/tui/snapshot_tests_cluster.rs
+assertion_line: 810
+expression: t.backend()
+---
+" redis-lens 0.1.0    PROD   prod-cache-01  cluster · 3 shards  read-only        "
+" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
+"  0   1   2   3 Server   4   5   6                                              "
+"    Overview  ·  Clients  ·  Slow log  ·  Monitor                tab next panel "
+"┌─ Overview ───────── node 10.0.1.11:6379 · 1 of 3 · every 2 s · + - interval ─┐"
+"│                                                                              │"
+"│ ops/s     —                  ·                                               │"
+"│ memory    300M / 1.0G 29%    ▄                                               │"
+"│ hit rate  —                  ·                                               │"
+"│ clients   10                 ▄                                               │"
+"│ blocked   —                  ·                                               │"
+"│ net in    —                  ·                                               │"
+"│ net out   —                  ·                                               │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"┌─ Shards ─────────────────────── ops/s · memory · clients · keys · every 5 s ─┐"
+"│›10.0.1.11:6379           1.2K/s  300M / 1.0G 29%       10 clients  400K keys │"
+"│ 10.0.1.12:6379           2.4K/s  600M / 1.0G 59%       11 clients  401K keys │"
+"│ 10.0.1.13:6379        ✗ no answer                                            │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"┌─ Server ─────────────────────────────────────────────────────────────────────┐"
+"│ up 1d 00h · primary · RDB — · AOF —                                          │"
+"│ maxmemory-policy —                                                           │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" tab Panel   p Pause   +- Interval   r Refresh   0-6 View   ? Help   q Quit     "

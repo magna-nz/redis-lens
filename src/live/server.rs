@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use redis::Value;
 
-use super::{Conn, LiveError, query};
+use super::{LiveConn, LiveError, query};
 use crate::budget::Budget;
 use crate::value::Raw;
 
@@ -78,7 +78,11 @@ pub enum Reply {
 }
 
 /// Runs one request. Every command goes through `budget`.
-pub async fn run(conn: &mut Conn, budget: &Budget, req: Request) -> Result<Reply, LiveError> {
+pub async fn run(
+    conn: &mut impl LiveConn,
+    budget: &Budget,
+    req: Request,
+) -> Result<Reply, LiveError> {
     match req {
         Request::Ping => {
             let _: String = query(conn, budget, "PING", &redis::cmd("PING")).await?;
@@ -194,6 +198,12 @@ pub struct InfoSample {
     pub aof_on: Option<bool>,
     /// `aof_last_write_status` is `ok`.
     pub aof_ok: Option<bool>,
+    /// `instantaneous_ops_per_sec`: the server's own recent rate, for the per-shard
+    /// summary of a cluster's Overview.
+    pub ops_now: Option<u64>,
+    /// `keys=` of `db0` in the keyspace section; `Some(0)` when the section is there
+    /// without `db0` (an empty database).
+    pub keys: Option<u64>,
 }
 
 /// Parses the text of `INFO`. Never fails: what is missing or unreadable is `None`.
@@ -240,6 +250,14 @@ pub fn parse_info(text: &str) -> InfoSample {
         rdb_ok: word("rdb_last_bgsave_status").map(|s| s == "ok"),
         aof_on: uint("aof_enabled").map(|n| n != 0),
         aof_ok: word("aof_last_write_status").map(|s| s == "ok"),
+        ops_now: uint("instantaneous_ops_per_sec"),
+        keys: word("db0")
+            .and_then(|v| {
+                v.split(',')
+                    .find_map(|kv| kv.strip_prefix("keys="))
+                    .and_then(|n| n.trim().parse().ok())
+            })
+            .or_else(|| text.contains("# Keyspace").then_some(0)),
     }
 }
 
@@ -324,13 +342,13 @@ pub enum CommandKeys {
 }
 
 /// One key spec: where the search starts, and how the keys follow from there.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeySpec {
     pub begin: Begin,
     pub find: Find,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Begin {
     /// At this argument (0 is the command name).
     Index(i64),
@@ -339,7 +357,7 @@ pub enum Begin {
     Keyword { word: String, from: i64 },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Find {
     /// From the start to `last` (relative to the start; `-1` is the last argument, and
     /// with `limit` the last of the first `1/limit` of the arguments), every `step`.
@@ -458,7 +476,7 @@ fn int_at(p: &[(String, &Value)], key: &str) -> Option<i64> {
     find(p, key).and_then(int_of)
 }
 
-fn parse_spec(v: &Value) -> Option<KeySpec> {
+pub(crate) fn parse_spec(v: &Value) -> Option<KeySpec> {
     let top = pairs(v);
     let bs = pairs(find(&top, "begin_search")?);
     let bs_spec = pairs(find(&bs, "spec")?);
@@ -768,7 +786,7 @@ pub fn names_to_learn<'a>(
 }
 
 async fn slowlog(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     mut known: HashMap<String, CommandKeys>,
     want_config: bool,
@@ -838,7 +856,7 @@ async fn slowlog(
 }
 
 async fn command_info(
-    conn: &mut Conn,
+    conn: &mut impl LiveConn,
     budget: &Budget,
     names: &[String],
 ) -> Result<Vec<(String, CommandKeys)>, LiveError> {
@@ -858,7 +876,7 @@ async fn command_info(
         .collect())
 }
 
-async fn slow_config(conn: &mut Conn, budget: &Budget) -> Result<SlowConfig, LiveError> {
+async fn slow_config(conn: &mut impl LiveConn, budget: &Budget) -> Result<SlowConfig, LiveError> {
     let mut c = redis::cmd("CONFIG");
     // One pattern: Redis before 7.0 takes a single parameter or pattern.
     c.arg("GET").arg("slowlog-*");
@@ -903,6 +921,10 @@ mod tests {
             (Some(true), Some(false), None)
         );
         assert_eq!(s.link_up, None);
+        assert_eq!(s.keys, Some(3));
+        assert_eq!(s.ops_now, None);
+        let s = parse_info("instantaneous_ops_per_sec:42\r\n# Keyspace\r\n");
+        assert_eq!((s.ops_now, s.keys), (Some(42), Some(0)), "no db0: empty");
     }
 
     #[test]

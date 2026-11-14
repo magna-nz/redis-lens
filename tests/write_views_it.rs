@@ -43,6 +43,8 @@ fn profile() -> Profile {
         provider: None,
         token_command: None,
         ssh: None,
+        sentinel: None,
+        tags: Vec::new(),
     }
 }
 

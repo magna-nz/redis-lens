@@ -580,6 +580,8 @@ pub(super) mod tests {
             provider: None,
             token_command: None,
             ssh: t,
+            sentinel: None,
+            tags: Vec::new(),
         }
     }
 
@@ -1174,13 +1176,16 @@ while (my $conn = $l->accept) { open(my $x, '>>', "$dir/accepts-$$"); print $x "
     #[tokio::test]
     async fn a_forward_that_never_gets_ready_times_out_and_is_killed() {
         let fake = fake::Fake::new("hang");
-        let b = fake.bastion("hang", None, Duration::from_millis(400));
+        // Long enough for a loaded CI runner to start the fake and record its pid
+        // before the readiness timeout kills it (400 ms was not).
+        let b = fake.bastion("hang", None, Duration::from_secs(2));
         let started = std::time::Instant::now();
         let e = ssh_err(b.reach(&ep("10.0.0.5", 6379)).await);
         assert_eq!(e, SshError::Timeout);
-        assert!(started.elapsed() < Duration::from_secs(5));
-        let pid = fake.starts()[0];
-        assert!(!fake::alive(pid), "the timed-out ssh is still running");
+        assert!(started.elapsed() < Duration::from_secs(8));
+        let pids = fake.starts();
+        assert_eq!(pids.len(), 1, "the fake ssh never recorded its start");
+        assert!(!fake::alive(pids[0]), "the timed-out ssh is still running");
     }
 
     #[cfg(unix)]

@@ -235,7 +235,7 @@ fn entry_line(app: &App, e: &ConnEntry, c: &Cols) -> Line<'static> {
         ),
         Span::styled(format!(" {env} "), style::env_badge(e.profile.env)),
         Span::raw(" ".repeat(c.env.saturating_sub(env.len() + 2))),
-        Span::styled(cell(&e.profile.endpoint.to_string(), c.ep), style::dim()),
+        Span::styled(cell(&e.endpoint().to_string(), c.ep), style::dim()),
         Span::styled(pad_r(auth_label(e), c.auth), style::fg()),
         Span::styled(pad_r(writes, c.writes), writes_style),
         Span::styled(pad_r(st, c.status), st_style),
@@ -244,9 +244,18 @@ fn entry_line(app: &App, e: &ConnEntry, c: &Cols) -> Line<'static> {
 }
 
 fn table(frame: &mut Frame, area: Rect, app: &App) {
-    let n_saved = app.saved().count();
-    let n_docker = app.docker_entries().count();
-    let right = format!("{n_saved} saved · {n_docker} found in Docker");
+    let n_saved = app.saved_shown().count();
+    let n_docker = app.docker_shown().count();
+    let filtered = !app.conn_filter.is_empty();
+    let right = if filtered {
+        format!(
+            "{n_saved} of {} saved · {n_docker} of {} found in Docker",
+            app.saved().count(),
+            app.docker_entries().count()
+        )
+    } else {
+        format!("{n_saved} saved · {n_docker} found in Docker")
+    };
     let inner = panel(frame, area, "Connections", &right);
     let c = cols(usize::from(inner.width));
     let head = Line::from(vec![
@@ -262,12 +271,16 @@ fn table(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<(Line<'static>, Option<ConnSel>)> = Vec::new();
     let group = |t: String| (Line::from(Span::styled(t, style::dim())), None);
     lines.push(group(" SAVED".into()));
-    if n_saved == 0 {
+    if n_saved == 0 && filtered && app.saved().next().is_some() {
+        lines.push(group(
+            "   No saved connection matches the filter. Press esc to clear it.".into(),
+        ));
+    } else if n_saved == 0 {
         lines.push(group(
             "   No saved connections yet. Press a to add one.".into(),
         ));
     }
-    for e in app.saved() {
+    for e in app.saved_shown() {
         lines.push((entry_line(app, e, &c), Some(ConnSel::Entry(e.id))));
     }
     lines.push(group(match app.docker {
@@ -279,7 +292,7 @@ fn table(frame: &mut Frame, area: Rect, app: &App) {
             if n_docker == 1 { "" } else { "s" }
         ),
     }));
-    for e in app.docker_entries() {
+    for e in app.docker_shown() {
         lines.push((entry_line(app, e, &c), Some(ConnSel::Entry(e.id))));
     }
     lines.push((
@@ -341,7 +354,8 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
     let inner = panel(frame, area, &p.name, &right);
     let (lw, rw) = split_cols(usize::from(inner.width));
 
-    let mut endpoint = p.endpoint.to_string();
+    // A Sentinel profile shows the primary the Sentinels named, once they have.
+    let mut endpoint = e.endpoint().to_string();
     if p.db != 0 {
         endpoint.push_str(&format!(" · db {}", p.db));
     }
@@ -398,13 +412,20 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
         kv("Server", server.0, server.1),
         kv("Auth", auth.into(), style::fg()),
         kv("Credential", cred.into(), style::fg()),
-        kv(
-            "TLS",
-            if p.endpoint.tls { "on" } else { "off" }.into(),
-            style::fg(),
-        ),
+        kv("TLS", tls_row(p), style::fg()),
         writes_row(p, e.perms.as_ref()),
-        kv("Values", "shown on screen, never saved".into(), style::fg()),
+        // The panel has seven rows. A Sentinel profile's row, or else the tags, take
+        // the place of the fixed Values row; a Sentinel profile's tags share the TLS
+        // row above.
+        match &p.sentinel {
+            Some(s) => kv(
+                "Sentinel",
+                sentinel_row(s, e.sentinel.as_ref()),
+                style::fg(),
+            ),
+            None if !p.tags.is_empty() => kv("Tags", p.tags.join(", "), style::fg()),
+            None => kv("Values", "shown on screen, never saved".into(), style::fg()),
+        },
     ];
 
     let mut right: Vec<Vec<Span<'static>>> =
@@ -431,6 +452,38 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
     }
     lines.push(Line::from(note(app, e, docker.map(|(c, i, _)| (c, i)))));
     rows(frame, inner, lines, None);
+}
+
+/// The TLS row. A Sentinel profile has no row left for its tags (the Sentinel row takes
+/// the Values row), so they follow the TLS setting here.
+fn tls_row(p: &crate::model::Profile) -> String {
+    let tls = if p.endpoint.tls { "on" } else { "off" };
+    if p.sentinel.is_some() && !p.tags.is_empty() {
+        format!("{tls} · tags {}", p.tags.join(", "))
+    } else {
+        tls.to_string()
+    }
+}
+
+/// The Sentinel row: the master name and the Sentinel that answered the last connect, or
+/// before that the Sentinels it will ask. Never a credential.
+fn sentinel_row(
+    s: &crate::model::Sentinel,
+    answer: Option<&crate::conn::sentinel::SentinelAnswer>,
+) -> String {
+    match answer {
+        Some(a) => format!("{} · named by {}", a.master, a.sentinel),
+        None => {
+            let mut out = s.master.clone();
+            if let Some(first) = s.nodes.first() {
+                out.push_str(&format!(" · asks {first}"));
+            }
+            if s.nodes.len() > 1 {
+                out.push_str(&format!(" (+{})", s.nodes.len() - 1));
+            }
+            out
+        }
+    }
 }
 
 fn mode(m: crate::model::ServerMode) -> &'static str {

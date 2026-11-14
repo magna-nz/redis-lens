@@ -12,7 +12,7 @@ use crate::analysis::{
     length_unit, pattern_of, recommendations,
 };
 use crate::format;
-use crate::model::{KeySample, ScanReport, ServerMode, Ttl};
+use crate::model::{KeySample, ScanReport, Ttl};
 use crate::tui::app::Screen;
 use crate::tui::app::views::Ctx;
 use crate::tui::app::views::analysis::AnalysisState;
@@ -246,14 +246,8 @@ fn recommendations_panel(
             w,
         )));
     }
-    let cluster = ctx.server().is_some_and(|s| s.mode == ServerMode::Cluster);
     if !ctx.live_ready() && state.facts.is_empty() && !state.is_loading() {
-        let why = if cluster {
-            // A cluster opens no live connection (see `views::CLUSTER_OFF`).
-            " Lengths and encodings are not read on a cluster yet, so the rules that need them are skipped."
-        } else {
-            " Lengths and encodings are read once the live connection is open."
-        };
+        let why = " Lengths and encodings are read once the live connection is open.";
         notes.push(Line::from(fit(vec![Span::styled(why, style::dim())], w)));
     }
     let mut lines: Vec<Line<'static>> = Vec::new();

@@ -43,6 +43,8 @@ fn profile(name: &str, env: Env, port: u16) -> Profile {
         provider: None,
         token_command: None,
         ssh: None,
+        sentinel: None,
+        tags: Vec::new(),
     }
 }
 

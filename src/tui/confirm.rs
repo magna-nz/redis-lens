@@ -167,6 +167,7 @@ pub fn op_title(op: &WriteOp) -> &'static str {
         XAck { .. } => "Acknowledge entry",
         XTrim { .. } => "Trim stream",
         Publish { .. } => "Publish message",
+        SPublish { .. } => "Publish to a shard channel",
         FtCreate { .. } => "Create index",
         FtDropIndex { .. } => "Drop index",
         Bulk {
@@ -193,7 +194,7 @@ fn op_target(op: &WriteOp) -> Option<String> {
         return None;
     }
     let what = match op {
-        WriteOp::Publish { .. } => "Channel",
+        WriteOp::Publish { .. } | WriteOp::SPublish { .. } => "Channel",
         WriteOp::FtCreate { .. } | WriteOp::FtDropIndex { .. } => "Index",
         WriteOp::Bulk { .. } => "Pattern",
         WriteOp::ClientKill { .. } => "Client ID",
@@ -331,12 +332,21 @@ impl App {
                         "Not sent: the live connection is not open.".into(),
                     );
                 }
+                // Checked when it was asked; the node table is the same.
+                let to = match super::views::write_dest(s, &op) {
+                    Ok(to) => to,
+                    Err(why) => {
+                        self.set_error(why.clone());
+                        return self.write_failed(id, owner, why);
+                    }
+                };
                 match Permit::grant(op, &s.profile, &self.settings, &s.refusals, &answer) {
                     Ok(permit) => {
                         self.live_writes.insert(id, permit.op().command());
                         vec![Effect::Live {
                             id: s.id,
                             req_id: id,
+                            to,
                             req: LiveRequest::Write(permit),
                         }]
                     }
@@ -542,6 +552,10 @@ mod tests {
             hset(),
             unlink(),
             WriteOp::ClientKill { id: 3 },
+            WriteOp::SPublish {
+                channel: "orders".into(),
+                message: Raw::from("hi"),
+            },
             WriteOp::Bulk {
                 pattern: "user:{id}:cart".into(),
                 glob: "user:*:cart".into(),
@@ -571,6 +585,26 @@ mod tests {
                 for k in ['y', 'p', '\n'] {
                     let e = app.handle_key(ch(k));
                     assert!(writes(&e).is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_reaches_any_node_of_a_read_only_cluster() {
+        for op in every_kind() {
+            let mut app = app_with(Env::Prod, None);
+            let s = app.session.as_mut().unwrap();
+            s.server.as_mut().unwrap().mode = crate::model::ServerMode::Cluster;
+            s.nodes = crate::tui::fixtures::live_nodes();
+            for picked in 0..3 {
+                app.session.as_mut().unwrap().picked = picked;
+                let (id, effects) = write(&mut app, op.clone());
+                assert_eq!(id, None, "{op:?}");
+                assert!(effects.is_empty(), "{op:?}: {effects:?}");
+                assert!(app.confirm.is_none());
+                for k in ['y', 'p', '\n'] {
+                    assert!(writes(&app.handle_key(ch(k))).is_empty());
                 }
             }
         }
@@ -679,6 +713,7 @@ mod tests {
         let mut app = app_with(Env::Local, None);
         app.settings = Settings {
             skip_non_prod_confirm: true,
+            ..Settings::default()
         };
         let (_, e) = write(&mut app, unlink());
         assert_eq!(writes(&e).len(), 1);

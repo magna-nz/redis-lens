@@ -16,7 +16,7 @@ use super::keys::{list_move, plain};
 use super::{Act, ViewState};
 use crate::analysis::{KeyFacts, keys_to_check};
 use crate::live::keys::{FactKey, Reply, Request};
-use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
+use crate::live::{Dest, Follow, LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::ScanReport;
 use crate::tui::app::Screen;
 use crate::tui::clipboard::CopyText;
@@ -41,7 +41,9 @@ pub struct AnalysisState {
     pub refused: Vec<LiveError>,
     /// Why reading them failed, in redis-lens's own words.
     pub error: Option<String>,
-    loading: Option<(ReqId, ReportId)>,
+    /// The requests in flight, one per node on a cluster (each key is read on its
+    /// slot's owner), for the report they read.
+    loading: Option<(Vec<ReqId>, ReportId)>,
     loaded_for: Option<ReportId>,
 }
 
@@ -64,7 +66,7 @@ impl AnalysisState {
         if self
             .loading
             .as_ref()
-            .is_some_and(|(id, _)| !act.in_flight(*id))
+            .is_some_and(|(ids, _)| !ids.iter().any(|id| act.in_flight(*id)))
         {
             self.loading = None;
         }
@@ -87,8 +89,38 @@ impl AnalysisState {
             self.reset_for(rid);
             return;
         }
-        if let Some(id) = act.send(LiveRequest::Keys(Request::Facts { keys })) {
-            self.loading = Some((id, rid));
+        let mut ids = Vec::new();
+        for (dest, keys) in split_by_node(act.session, keys) {
+            if let Some(id) = act.send_to(dest, LiveRequest::Keys(Request::Facts { keys })) {
+                ids.push(id);
+            }
+        }
+        if !ids.is_empty() {
+            self.facts.clear();
+            self.refused.clear();
+            self.error = None;
+            self.loading = Some((ids, rid));
+        }
+    }
+
+    /// One node's answer: its facts are added; the report counts as read once every
+    /// node answered.
+    fn take(&mut self, result: Result<LiveReply, LiveError>) {
+        match result {
+            Ok(LiveReply::Keys(Reply::Facts { facts, refused })) => {
+                self.facts.extend(facts);
+                for e in refused {
+                    if !self.refused.contains(&e) {
+                        self.refused.push(e);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                if self.error.is_none() {
+                    self.error = Some(format!("Could not read the lengths: {e}."));
+                }
+            }
         }
     }
 
@@ -137,20 +169,41 @@ impl ViewState for AnalysisState {
     }
 
     fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, _act: &mut Act<'_>) {
-        let Some((want, rid)) = self.loading.take_if(|(want, _)| *want == id) else {
+        let Some((ids, _)) = self.loading.as_mut() else {
             return;
         };
-        debug_assert_eq!(want, id);
-        self.reset_for(rid);
-        match result {
-            Ok(LiveReply::Keys(Reply::Facts { facts, refused })) => {
-                self.facts = facts.into_iter().collect();
-                self.refused = refused;
-            }
-            Ok(_) => {}
-            Err(e) => self.error = Some(format!("Could not read the lengths: {e}.")),
+        let Some(at) = ids.iter().position(|w| *w == id) else {
+            return;
+        };
+        ids.remove(at);
+        let last = ids.is_empty();
+        self.take(result);
+        if last && let Some((_, rid)) = self.loading.take() {
+            self.loaded_for = Some(rid);
         }
     }
+}
+
+/// `keys` grouped by the node that owns each key's slot, in node order, each group sent
+/// without following a redirect (a key that moved is left without facts): on a
+/// standalone server one group for its one node. Keys whose slot no node serves are
+/// left out.
+pub(crate) fn split_by_node(
+    session: &crate::tui::app::Session,
+    keys: Vec<FactKey>,
+) -> Vec<(Dest, Vec<FactKey>)> {
+    if !session.is_cluster() {
+        return vec![(Dest::node(0), keys)];
+    }
+    let mut by: std::collections::BTreeMap<usize, Vec<FactKey>> = Default::default();
+    for k in keys {
+        if let Some(i) = session.owner_of(k.key.as_bytes()) {
+            by.entry(i).or_default().push(k);
+        }
+    }
+    by.into_iter()
+        .map(|(i, keys)| (Dest::node(i).follow(Follow::Never), keys))
+        .collect()
 }
 
 #[cfg(test)]

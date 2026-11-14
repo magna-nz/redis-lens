@@ -12,6 +12,7 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::conn::ScanTarget;
 use crate::conn::docker::{DiscoveredAuth, DiscoveredInstance};
 use crate::conn::parse::{ParsedConnection, mask, parse_connection_string};
+use crate::conn::sentinel::SentinelAnswer;
 use crate::diff::ReportDiff;
 use crate::live::ReqId;
 use crate::model::{
@@ -48,6 +49,10 @@ pub mod confirm;
 /// `x` and `D` on Patterns: bulk expire and delete, the dry run and the run.
 #[path = "bulk.rs"]
 pub mod bulk;
+
+/// `b`: the database list and the database switch.
+#[path = "dbs.rs"]
+mod dbs;
 
 /// What the key detail's and key list's edits ask of `App`: going back after `D`, the
 /// new key after `N`, `$EDITOR`.
@@ -107,6 +112,7 @@ impl View {
                 Screen::BigKeys,
                 Screen::Expiry,
                 Screen::Nodes,
+                Screen::Slots,
             ],
             Self::Server => &[
                 Screen::Overview,
@@ -137,6 +143,8 @@ pub enum Screen {
     Expiry,
     /// The shards of a cluster scan (empty on a standalone one).
     Nodes,
+    /// What each slot range holds, from `CLUSTER SLOT-STATS` ([`views::slots`]).
+    Slots,
     Overview,
     Clients,
     SlowLog,
@@ -148,7 +156,7 @@ pub enum Screen {
 }
 
 impl Screen {
-    pub const ALL: [Screen; 17] = [
+    pub const ALL: [Screen; 18] = [
         Screen::Connections,
         Screen::Patterns,
         Screen::KeyList,
@@ -159,6 +167,7 @@ impl Screen {
         Screen::BigKeys,
         Screen::Expiry,
         Screen::Nodes,
+        Screen::Slots,
         Screen::Overview,
         Screen::Clients,
         Screen::SlowLog,
@@ -173,9 +182,13 @@ impl Screen {
         match self {
             Self::Connections => View::Connections,
             Self::Patterns | Self::KeyList | Self::KeyDetail => View::Patterns,
-            Self::Ttl | Self::Diff | Self::HotKeys | Self::BigKeys | Self::Expiry | Self::Nodes => {
-                View::Analysis
-            }
+            Self::Ttl
+            | Self::Diff
+            | Self::HotKeys
+            | Self::BigKeys
+            | Self::Expiry
+            | Self::Nodes
+            | Self::Slots => View::Analysis,
             Self::Overview | Self::Clients | Self::SlowLog | Self::Monitor => View::Server,
             Self::Streams => View::Streams,
             Self::PubSub => View::PubSub,
@@ -194,6 +207,7 @@ impl Screen {
             Self::BigKeys => "Big keys",
             Self::Expiry => "Expiry",
             Self::Nodes => "Nodes",
+            Self::Slots => "Slots",
             Self::Overview => "Overview",
             Self::Clients => "Clients",
             Self::SlowLog => "Slow log",
@@ -214,6 +228,7 @@ impl Screen {
             Self::BigKeys => "Analysis · Big keys",
             Self::Expiry => "Analysis · Expiry",
             Self::Nodes => "Analysis · Nodes",
+            Self::Slots => "Analysis · Slots",
             Self::Overview => "Server · Overview",
             Self::Clients => "Server · Clients",
             Self::SlowLog => "Server · Slow log",
@@ -237,6 +252,7 @@ impl Screen {
             Self::KeyList => Owner::Keys,
             Self::KeyDetail => Owner::Value,
             Self::BigKeys | Self::Expiry => Owner::Analysis,
+            Self::Slots => Owner::Slots,
             Self::Overview | Self::Clients | Self::SlowLog | Self::Monitor => Owner::Server,
             Self::Streams => Owner::Streams,
             Self::PubSub => Owner::PubSub,
@@ -248,15 +264,16 @@ impl Screen {
     /// Patterns and every Analysis panel.
     pub fn is_scan_view(self) -> bool {
         matches!(self.view(), View::Patterns | View::Analysis)
-            && !matches!(self, Self::KeyList | Self::KeyDetail)
+            && !matches!(self, Self::KeyList | Self::KeyDetail | Self::Slots)
     }
 
     /// Screens that work on the live connection (`r` refreshes the panel).
     pub fn is_live_view(self) -> bool {
-        matches!(
-            self.view(),
-            View::Server | View::Streams | View::PubSub | View::Search
-        )
+        self == Self::Slots
+            || matches!(
+                self.view(),
+                View::Server | View::Streams | View::PubSub | View::Search
+            )
     }
 }
 
@@ -301,6 +318,9 @@ pub struct ConnEntry {
     pub perms: Option<PermissionReport>,
     /// Which server the last connect reached.
     pub target: Option<ScanTarget>,
+    /// For a Sentinel profile: what the Sentinels answered at the last connect. Holds no
+    /// credential.
+    pub sentinel: Option<SentinelAnswer>,
     /// The last connect error. Never holds credentials.
     pub error: Option<String>,
     /// Added in this session through the add flow.
@@ -308,6 +328,14 @@ pub struct ConnEntry {
 }
 
 impl ConnEntry {
+    /// The address shown for this connection: for a Sentinel profile the primary the
+    /// Sentinels named at the last connect, else (and until then) the profile's endpoint.
+    pub fn endpoint(&self) -> &Endpoint {
+        self.sentinel
+            .as_ref()
+            .map_or(&self.profile.endpoint, |a| &a.primary)
+    }
+
     pub fn is_docker(&self) -> bool {
         matches!(self.source, Source::Docker { .. })
     }
@@ -365,11 +393,13 @@ pub enum Effect {
     /// Put the text on the clipboard with the terminal's OSC 52 sequence. Only a
     /// pattern, a key name or the suggested command can be built (see [`CopyText`]).
     Copy(CopyText),
-    /// Send `req` on the live connection of session `id` ([`crate::live`]). The answer
-    /// comes back as [`Msg::Live`].
+    /// Send `req` to `to` on the live connection of session `id` ([`crate::live`]): a
+    /// node of a cluster, or the owner of a key's slot; on a standalone server always
+    /// its one node. The answer comes back as [`Msg::Live`].
     Live {
         id: ConnId,
         req_id: crate::live::ReqId,
+        to: crate::live::Dest,
         req: crate::live::LiveRequest,
     },
     /// Start the Pub/Sub live tail `tail` of session `id`'s run `scan` on `to`, on a
@@ -377,7 +407,8 @@ pub enum Effect {
     /// from that run's command budget. It replaces the session's other tail, if any.
     /// Its messages come back as [`Msg::TailReady`], [`Msg::Tail`] and
     /// [`Msg::TailClosed`]. A new connect or rescan of the session, and quitting, end it
-    /// too.
+    /// too. `node`: the node of the session's table it runs on (0 on a standalone
+    /// server).
     Subscribe {
         id: ConnId,
         scan: ScanId,
@@ -385,6 +416,7 @@ pub enum Effect {
         profile: Profile,
         secrets: SecretSource,
         to: crate::live::pubsub::Subscription,
+        node: usize,
     },
     /// End session `id`'s live tail `tail` and drop its connection.
     Unsubscribe {
@@ -397,13 +429,14 @@ pub enum Effect {
     /// messages come back as [`Msg::MonitorReady`], [`Msg::MonitorLines`] and
     /// [`Msg::MonitorClosed`]. It ends by itself after `crate::live::monitor::Limits`;
     /// [`Effect::StopMonitor`], a new connect or rescan of the session, and quitting end
-    /// it too.
+    /// it too. `node`: the node it runs on, as for [`Effect::Subscribe`].
     Monitor {
         id: ConnId,
         scan: ScanId,
         run: u64,
         profile: Profile,
         secrets: SecretSource,
+        node: usize,
     },
     /// End session `id`'s Monitor run `run` and drop its connection.
     StopMonitor {
@@ -416,6 +449,13 @@ pub enum Effect {
     SetWrites {
         name: String,
         on: bool,
+    },
+    /// Save database `db` as the `db` of the saved profile `name` in the config file,
+    /// and nothing else ([`crate::config::Config::set_db`]). Answered with
+    /// [`Msg::DbSaved`] or [`Msg::DbSaveFailed`].
+    SaveDb {
+        name: String,
+        db: u32,
     },
     /// Edit a value in `$EDITOR` on a temporary file ([`crate::tui::editor`]), out of
     /// the TUI until it exits. Answered with [`Msg::Edited`].
@@ -442,6 +482,17 @@ pub enum Msg {
         on: bool,
         error: String,
     },
+    /// [`Effect::SaveDb`] saved the database.
+    DbSaved {
+        name: String,
+        db: u32,
+    },
+    /// [`Effect::SaveDb`] could not save it: why.
+    DbSaveFailed {
+        name: String,
+        db: u32,
+        error: String,
+    },
     Tick,
     /// A tick that also carries the time, so the app can tell how long a connect has taken.
     TickAt(Instant),
@@ -453,6 +504,21 @@ pub enum Msg {
         server: Option<ServerInfo>,
         perms: PermissionReport,
         target: ScanTarget,
+    },
+    /// A Sentinel profile's connect asked the Sentinels: which one named the primary,
+    /// and where. Sent before [`Msg::Connected`]. Holds no credential.
+    SentinelResolved {
+        id: ConnId,
+        scan: ScanId,
+        answer: SentinelAnswer,
+    },
+    /// A cluster's nodes, as discovery found them, after [`Msg::Connected`] and before
+    /// [`Msg::LiveReady`]: the order of the live task's node table. Never sent for a
+    /// standalone server.
+    Nodes {
+        id: ConnId,
+        scan: ScanId,
+        nodes: Vec<crate::live::nodes::NodeInfo>,
     },
     ConnectFailed {
         id: ConnId,
@@ -627,9 +693,71 @@ pub struct Session {
     /// connect and every `NOPERM` since: those actions are off (spec "Write
     /// permissions", check 1).
     pub refusals: crate::write::Refusals,
+    /// For a Sentinel profile: which Sentinel named the primary of this run, and where.
+    pub sentinel: Option<SentinelAnswer>,
+    /// A cluster's nodes ([`Msg::Nodes`]), in the live task's order; empty on a
+    /// standalone server. Kept across a rescan until the new run's list arrives.
+    pub nodes: Vec<crate::live::nodes::NodeInfo>,
+    /// The picked node: an index into `nodes` (spec "Cluster live views (P4)"). 0 on a
+    /// standalone server.
+    pub picked: usize,
 }
 
 impl Session {
+    /// The address this session's server is at: the primary the Sentinels named, or the
+    /// profile's endpoint.
+    pub fn endpoint(&self) -> &Endpoint {
+        self.sentinel
+            .as_ref()
+            .map_or(&self.profile.endpoint, |a| &a.primary)
+    }
+
+    /// True on a cluster whose nodes are known.
+    pub fn is_cluster(&self) -> bool {
+        !self.nodes.is_empty()
+    }
+
+    /// The picked node, on a cluster.
+    pub fn picked_node(&self) -> Option<&crate::live::nodes::NodeInfo> {
+        self.nodes.get(self.picked)
+    }
+
+    /// `node 127.0.0.1:7001 · 1 of 3`, for the right of a title, on a cluster only.
+    pub fn node_title(&self) -> Option<String> {
+        let n = self.picked_node()?;
+        Some(format!(
+            "node {} · {} of {}",
+            n.endpoint,
+            self.picked + 1,
+            self.nodes.len()
+        ))
+    }
+
+    /// The index of the node that serves `key`'s slot, from the slot map discovery
+    /// read; `None` on a standalone server or when no node serves it.
+    pub fn owner_of(&self, key: &[u8]) -> Option<usize> {
+        let slot = crate::conn::slot::key_slot(key);
+        self.nodes
+            .iter()
+            .position(|n| n.slots.iter().any(|&(a, b)| a <= slot && slot <= b))
+    }
+
+    /// Why Monitor or a Pub/Sub tail may not open a connection of its own to node
+    /// `node`: discovery has no connection to it. It may have refused the node (a
+    /// loopback address announced by a remote cluster, which must never be sent the
+    /// credentials) or failed to reach it, and either way nothing new is opened to a
+    /// node discovery did not use. `None` when it may, and on a standalone server.
+    pub fn own_connection_refused(&self, node: usize) -> Option<String> {
+        if !self.is_cluster() {
+            return None;
+        }
+        match self.nodes.get(node) {
+            Some(n) if n.connected => None,
+            Some(n) => Some(crate::live::nodes::not_connected(&n.endpoint)),
+            None => Some(crate::live::nodes::NO_OWNER.to_string()),
+        }
+    }
+
     /// The diff against the previous snapshot, when there is one.
     pub fn diff(&self) -> Option<&ReportDiff> {
         match &self.history {
@@ -807,6 +935,10 @@ pub struct App {
     pub entries: Vec<ConnEntry>,
     pub docker: DockerState,
     pub conn_sel: ConnSel,
+    /// `/` on Connections: only the profiles whose name or tag holds this text show.
+    pub conn_filter: String,
+    /// The Connections filter input is open.
+    pub conn_filtering: bool,
     pub add: Option<AddState>,
     pub session: Option<Session>,
     pub patterns: PatternsState,
@@ -845,6 +977,12 @@ pub struct App {
     /// The bulk action's dialog (`x` or `D` on Patterns), if open. While it is open
     /// every key goes to it, after the confirm dialog.
     pub bulk: Option<bulk::Bulk>,
+    /// The database list (`b`), if open. While it is open every key goes to it, after
+    /// the bulk dialog.
+    pub dbs: Option<views::dbs::DbList>,
+    /// The Pub/Sub tail a database switch ended: it subscribes again once the new
+    /// run's live connection is ready.
+    db_resub: Option<crate::live::pubsub::Subscription>,
     /// Writes sent and not answered yet, with their command names: a `NOPERM` answer
     /// adds the name to the session's refusals.
     live_writes: HashMap<ReqId, String>,
@@ -970,6 +1108,8 @@ impl App {
             entries: Vec::new(),
             docker: DockerState::Searching,
             conn_sel: ConnSel::Add,
+            conn_filter: String::new(),
+            conn_filtering: false,
             add: None,
             session: None,
             patterns: PatternsState::default(),
@@ -991,6 +1131,8 @@ impl App {
             settings: crate::write::Settings::default(),
             confirm: None,
             bulk: None,
+            dbs: None,
+            db_resub: None,
             live_writes: HashMap::new(),
             #[cfg(test)]
             calls: Vec::new(),
@@ -1005,6 +1147,7 @@ impl App {
                 server: None,
                 perms: None,
                 target: None,
+                sentinel: None,
                 error: None,
                 just_saved: false,
             });
@@ -1079,12 +1222,62 @@ impl App {
         self.entries.iter().filter(|e| e.is_docker())
     }
 
-    /// Selectable rows on the Connections view, in display order.
+    /// Whether `e` passes the Connections filter: its name or one of its tags holds the
+    /// filter text, ignoring case. Everything passes without a filter.
+    pub fn conn_matches(&self, e: &ConnEntry) -> bool {
+        let f = self.conn_filter.to_lowercase();
+        f.is_empty()
+            || e.profile.name.to_lowercase().contains(&f)
+            || e.profile.tags.iter().any(|t| t.to_lowercase().contains(&f))
+    }
+
+    /// The saved profiles the filter shows.
+    pub fn saved_shown(&self) -> impl Iterator<Item = &ConnEntry> {
+        self.saved().filter(|e| self.conn_matches(e))
+    }
+
+    /// The Docker containers the filter shows.
+    pub fn docker_shown(&self) -> impl Iterator<Item = &ConnEntry> {
+        self.docker_entries().filter(|e| self.conn_matches(e))
+    }
+
+    /// Selectable rows on the Connections view, in display order, after the filter.
     pub fn selectable(&self) -> Vec<ConnSel> {
-        let mut out: Vec<ConnSel> = self.saved().map(|e| ConnSel::Entry(e.id)).collect();
-        out.extend(self.docker_entries().map(|e| ConnSel::Entry(e.id)));
+        let mut out: Vec<ConnSel> = self.saved_shown().map(|e| ConnSel::Entry(e.id)).collect();
+        out.extend(self.docker_shown().map(|e| ConnSel::Entry(e.id)));
         out.push(ConnSel::Add);
         out
+    }
+
+    /// After the filter changed: keeps the selection when it still shows, else takes the
+    /// first row shown.
+    fn conn_reselect(&mut self) {
+        let items = self.selectable();
+        // The add row, left selected while nothing matched, gives way to a match.
+        if !items.contains(&self.conn_sel) || (self.conn_sel == ConnSel::Add && items.len() > 1) {
+            self.conn_sel = items[0];
+        }
+    }
+
+    fn conn_filter_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.conn_filter.clear();
+                self.conn_filtering = false;
+            }
+            KeyCode::Enter => self.conn_filtering = false,
+            KeyCode::Backspace => {
+                self.conn_filter.pop();
+            }
+            _ => {
+                if let Some(c) = plain_char(&key)
+                    && self.conn_filter.chars().count() < MAX_FILTER
+                {
+                    self.conn_filter.push(c);
+                }
+            }
+        }
+        self.conn_reselect();
     }
 
     pub fn selected_entry(&self) -> Option<&ConnEntry> {
@@ -1472,6 +1665,13 @@ impl App {
             TailCmd::StopMonitor { run } => Some(Effect::StopMonitor { id, run }),
             TailCmd::Monitor { run } => {
                 let profile = s.profile.clone();
+                let node = s.picked;
+                if let Some(why) = s.own_connection_refused(node) {
+                    self.views
+                        .server
+                        .end_monitor(views::server::Stop::Failed(why));
+                    return None;
+                }
                 let Some(secrets) = self.entry(id).map(secret_source) else {
                     self.views.server.end_monitor(views::server::Stop::Unlisted);
                     return None;
@@ -1482,9 +1682,30 @@ impl App {
                     run,
                     profile,
                     secrets,
+                    node,
                 })
             }
             TailCmd::Subscribe { tail, to } => {
+                // A shard channel is subscribed on its slot's owner; the classic tail runs
+                // on the picked node (a message published anywhere reaches every node).
+                let node = match &to {
+                    crate::live::pubsub::Subscription::Shard(ch) if s.is_cluster() => {
+                        match s.owner_of(ch.as_bytes()) {
+                            Some(i) => i,
+                            None => {
+                                self.views
+                                    .pubsub
+                                    .tail_closed(tail, Some(crate::live::nodes::NO_OWNER.into()));
+                                return None;
+                            }
+                        }
+                    }
+                    _ => s.picked,
+                };
+                if let Some(why) = s.own_connection_refused(node) {
+                    self.views.pubsub.tail_closed(tail, Some(why));
+                    return None;
+                }
                 let profile = s.profile.clone();
                 let Some(secrets) = self.entry(id).map(secret_source) else {
                     self.views
@@ -1499,6 +1720,7 @@ impl App {
                     profile,
                     secrets,
                     to,
+                    node,
                 })
             }
         }
@@ -1627,6 +1849,10 @@ impl App {
         if self.bulk.is_some() {
             return self.bulk_key(key);
         }
+        // So does the database list (dbs.rs).
+        if self.dbs.is_some() {
+            return self.dbs_key(key);
+        }
         // The command line panel takes every key while it is open (views/cmdline.rs).
         if self.views.cmdline.open {
             return self.cmdline_key(key);
@@ -1637,6 +1863,10 @@ impl App {
         let screen = self.screen();
         if screen == Screen::Patterns && self.patterns.filtering {
             self.filter_key(key);
+            return Vec::new();
+        }
+        if screen == Screen::Connections && self.conn_filtering {
+            self.conn_filter_key(key);
             return Vec::new();
         }
         // A view's own text input takes every key, as the Patterns filter does.
@@ -1651,10 +1881,12 @@ impl App {
                 return self.switch(self.screen_of(view));
             }
             Some('a') => return self.start_add(),
+            Some('b') => return self.open_dbs(),
             Some('?') => {
                 self.help = true;
                 return Vec::new();
             }
+            Some(c @ ('[' | ']')) if views::picks_node(screen) => return self.pick_node(c == ']'),
             Some('s') if screen.is_scan_view() => return self.save_snapshot(),
             Some('r') if screen.is_scan_view() => return self.rescan(),
             Some('r') if screen.is_live_view() => return self.refresh(),
@@ -1697,6 +1929,59 @@ impl App {
                 effects
             }
         }
+    }
+
+    /// `[` and `]` on the views that read the picked node: the previous or next node of
+    /// the cluster (spec "Cluster live views (P4)"). Nothing on a standalone server.
+    fn pick_node(&mut self, next: bool) -> Vec<Effect> {
+        let Some(s) = self.session.as_mut() else {
+            return Vec::new();
+        };
+        let n = s.nodes.len();
+        if n < 2 {
+            return Vec::new();
+        }
+        s.picked = if next {
+            (s.picked + 1) % n
+        } else {
+            (s.picked + n - 1) % n
+        };
+        self.node_changed()
+    }
+
+    /// The picked node changed: the Server panels and Search drop what they read from
+    /// the last one, and the view on screen reads the new one.
+    fn node_changed(&mut self) -> Vec<Effect> {
+        let mut out = self.on_active("hide", |v, act| v.on_hide(act));
+        self.views.server.node_changed();
+        self.views.search = Default::default();
+        out.extend(self.on_active("show", |v, act| v.on_show(act)));
+        out
+    }
+
+    /// [`Msg::Nodes`]: the cluster's nodes. The picked node stays when the list still
+    /// has it (same ID and address, after a rescan), otherwise it is the first primary.
+    fn set_nodes(&mut self, nodes: Vec<crate::live::nodes::NodeInfo>) -> Vec<Effect> {
+        let Some(s) = self.session.as_mut() else {
+            return Vec::new();
+        };
+        let old = s.picked_node().cloned();
+        let kept = old.as_ref().and_then(|o| {
+            nodes
+                .iter()
+                .position(|n| n.id == o.id && n.endpoint == o.endpoint)
+        });
+        s.picked = kept.unwrap_or_else(|| {
+            nodes
+                .iter()
+                .position(|n| n.role == crate::model::NodeRole::Primary)
+                .unwrap_or(0)
+        });
+        s.nodes = nodes;
+        if old.is_some() && kept.is_none() {
+            return self.node_changed();
+        }
+        Vec::new()
     }
 
     /// `r` on Server, Streams, Pub/Sub and Search: the panel on screen fetches now.
@@ -1753,10 +2038,13 @@ impl App {
             return Vec::new();
         }
         let id = s.id;
-        let Some((scan, profile, secrets)) = self.start_run(id) else {
+        // A database switch lasts for the session: a rescan stays on it.
+        let db = s.profile.db;
+        let Some((scan, mut profile, secrets)) = self.start_run(id) else {
             self.set_info("This connection is no longer listed. Pick one on 0 Connections.");
             return Vec::new();
         };
+        profile.db = db;
         if let Some(s) = self.session.as_mut() {
             // The report on screen: an earlier rescan's kept one, or this run's own.
             s.previous = s.report.as_ref().and(s.previous.or(Some(s.scan)));
@@ -1773,6 +2061,8 @@ impl App {
         self.live_writes.clear();
         self.confirm = None;
         self.bulk = None;
+        self.dbs = None;
+        self.db_resub = None;
         // The live tail belongs to the replaced run: the runner drops it with it.
         self.views.pubsub.end_tail();
         // So does a Monitor run.
@@ -1921,6 +2211,10 @@ impl App {
             let room = MAX_FILTER.saturating_sub(p.filter.chars().count());
             p.filter.extend(text.chars().take(room));
             p.sel = 0;
+        } else if self.screen() == Screen::Connections && self.conn_filtering {
+            let room = MAX_FILTER.saturating_sub(self.conn_filter.chars().count());
+            self.conn_filter.extend(text.chars().take(room));
+            self.conn_reselect();
         } else if self.view_input().is_some() {
             return self.on_active("paste", |v, act| v.on_paste(&text, act));
         } else if self.view == View::Connections {
@@ -2048,6 +2342,8 @@ impl App {
             provider: None,
             token_command: None,
             ssh: None,
+            sentinel: None,
+            tags: Vec::new(),
         };
         if let Some(add) = self.add.as_mut() {
             add.saving = true;
@@ -2080,7 +2376,11 @@ impl App {
                 ConnSel::Add => return self.start_add(),
                 ConnSel::Entry(id) => return self.connect(id),
             },
+            KeyCode::Esc if !self.conn_filter.is_empty() => {
+                self.conn_filter.clear();
+            }
             _ => match plain_char(&key) {
+                Some('/') => self.conn_filtering = true,
                 Some('r') => return self.rescan_docker(),
                 Some('w') => return self.toggle_writes(),
                 _ => {}
@@ -2146,6 +2446,9 @@ impl App {
             rescan: false,
             live: LiveState::Waiting,
             refusals: crate::write::Refusals::default(),
+            sentinel: None,
+            nodes: Vec::new(),
+            picked: 0,
         });
         self.patterns = PatternsState::default();
         self.sel = ViewSel::default();
@@ -2156,6 +2459,8 @@ impl App {
         self.live_writes.clear();
         self.confirm = None;
         self.bulk = None;
+        self.dbs = None;
+        self.db_resub = None;
         self.view = View::Patterns;
         vec![Effect::Connect {
             id,
@@ -2236,8 +2541,20 @@ impl App {
 
     /// `enter` on a pattern: the key list of `pattern`, one level down.
     fn open_keys(&mut self, pattern: String) -> Vec<Effect> {
+        // On a cluster narrowed to a node, the key list walks that node only (the node of
+        // the session's table with the same ID, or the same address).
+        let narrowed = self.narrowed_node().and_then(|(_, n)| {
+            self.session
+                .as_ref()?
+                .nodes
+                .iter()
+                .position(|i| (!n.id.is_empty() && i.id == n.id) || i.endpoint == n.endpoint)
+        });
         let mut out = self
-            .with_views(Owner::Keys, "open", |v, act| v.keys.open(pattern, act))
+            .with_views(Owner::Keys, "open", |v, act| {
+                let nodes = act.session.nodes.clone();
+                v.keys.open(pattern, &nodes, narrowed, act)
+            })
             .map_or_else(Vec::new, |(_, e)| e);
         out.extend(self.switch(Screen::KeyList));
         out
@@ -2383,10 +2700,23 @@ impl App {
             Msg::Edited { job, result } => return self.edited(job, result),
             Msg::WritesSaved { name, on } => self.writes_saved(&name, on),
             Msg::WritesFailed { name, on, error } => self.writes_failed(&name, on, &error),
+            Msg::DbSaved { name, db } => self.db_saved(&name, db),
+            Msg::DbSaveFailed { name, db, error } => self.db_save_failed(&name, db, &error),
             Msg::DockerFound(found) => self.set_docker(found),
             Msg::DockerFailed(_) => {
                 self.set_docker(Vec::new());
                 self.docker = DockerState::Unavailable;
+            }
+            Msg::SentinelResolved { id, scan, answer } => {
+                if !self.is_session(id, scan) {
+                    return Vec::new();
+                }
+                if let Some(e) = self.entry_mut(id) {
+                    e.sentinel = Some(answer.clone());
+                }
+                if let Some(s) = self.session.as_mut() {
+                    s.sentinel = Some(answer);
+                }
             }
             Msg::Connected {
                 id,
@@ -2439,6 +2769,12 @@ impl App {
                     }
                     return out;
                 }
+            }
+            Msg::Nodes { id, scan, nodes } => {
+                if !self.is_session(id, scan) {
+                    return Vec::new();
+                }
+                return self.set_nodes(nodes);
             }
             Msg::ConnectFailed { id, scan, error } => {
                 if !self.is_session(id, scan) {
@@ -2605,6 +2941,8 @@ impl App {
                     && s.scan == scan
                 {
                     s.live = LiveState::Ready;
+                    // A tail a database switch ended subscribes again.
+                    return self.resubscribe_after_switch();
                 }
             }
             Msg::Live {
@@ -2619,6 +2957,11 @@ impl App {
                 // A bulk action's step goes to its dialog (bulk.rs).
                 if self.bulk_waits_for(req_id) {
                     return self.bulk_reply(req_id, result);
+                }
+                // So does the database list's `INFO keyspace` (dbs.rs).
+                if self.dbs_waits_for(req_id) {
+                    self.dbs_reply(req_id, result);
+                    return Vec::new();
                 }
                 // Back to the view that sent it; an id no view waits for any more (its
                 // connection closed in between) is dropped.
@@ -2645,6 +2988,7 @@ impl App {
                 self.live_writes.clear();
                 self.close_write_question();
                 self.bulk_closed();
+                self.dbs_closed();
                 if let Some(e) = &error {
                     self.set_error(format!(
                         "The live connection closed: {e}. The server views stop until the next scan."
@@ -2764,11 +3108,15 @@ impl App {
                         server: None,
                         perms: None,
                         target: None,
+                        sentinel: None,
                         error: None,
                         just_saved: true,
                     },
                 );
                 self.add = None;
+                // The new profile shows, whatever the filter was.
+                self.conn_filter.clear();
+                self.conn_filtering = false;
                 self.conn_sel = ConnSel::Entry(id);
                 self.set_info(line);
             }
@@ -2818,6 +3166,7 @@ impl App {
                     server: None,
                     perms: None,
                     target: None,
+                    sentinel: None,
                     error: None,
                     just_saved: false,
                 },
@@ -2827,10 +3176,7 @@ impl App {
         // Keep the selection, unless it vanished or nothing could be picked before.
         let nothing_before = old.is_empty() && self.saved().next().is_none() && self.add.is_none();
         if !self.selectable().contains(&self.conn_sel) || nothing_before {
-            self.conn_sel = self
-                .entries
-                .first()
-                .map_or(ConnSel::Add, |e| ConnSel::Entry(e.id));
+            self.conn_sel = self.selectable()[0];
         }
     }
 }
@@ -3422,7 +3768,7 @@ mod tests {
         // Analysis starts on TTL; tab and shift-tab cycle its panels, both ways round.
         app.handle_key(ch('2'));
         let mut seen = vec![app.screen()];
-        for _ in 0..6 {
+        for _ in 0..7 {
             app.handle_key(key(KeyCode::Tab));
             seen.push(app.screen());
         }
@@ -3435,11 +3781,12 @@ mod tests {
                 Screen::BigKeys,
                 Screen::Expiry,
                 Screen::Nodes,
+                Screen::Slots,
                 Screen::Ttl
             ]
         );
         app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(app.screen(), Screen::Nodes);
+        assert_eq!(app.screen(), Screen::Slots);
         // Each view keeps its panel while you are elsewhere.
         app.handle_key(ch('3'));
         assert_eq!(app.screen(), Screen::Overview);
@@ -3448,7 +3795,7 @@ mod tests {
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.screen(), Screen::SlowLog);
         app.handle_key(ch('2'));
-        assert_eq!(app.screen(), Screen::Nodes);
+        assert_eq!(app.screen(), Screen::Slots);
         app.handle_key(ch('3'));
         assert_eq!(app.screen(), Screen::SlowLog);
         // Monitor is Server's fourth panel, and tab wraps around after it.
@@ -3512,6 +3859,94 @@ mod tests {
             app.handle_key(ch('k'));
         }
         assert_eq!(app.conn_sel, ids[0]);
+    }
+
+    fn tagged_profiles() -> Vec<Profile> {
+        let mut ps = fixtures::profiles();
+        ps[0].tags = vec!["team-a".into(), "eu".into()];
+        ps[1].tags = vec!["team-b".into()];
+        ps
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(ch(c));
+        }
+    }
+
+    fn shown_names(app: &App) -> Vec<String> {
+        app.selectable()
+            .iter()
+            .filter_map(|s| match s {
+                ConnSel::Entry(id) => app.entry(*id).map(|e| e.profile.name.clone()),
+                ConnSel::Add => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn slash_filters_connections_by_name_or_tag_and_esc_clears() {
+        let mut app = App::new(tagged_profiles());
+        app.apply(Msg::DockerFound(vec![fixtures::docker_instance()]));
+        assert_eq!(shown_names(&app).len(), 4);
+        app.handle_key(ch('/'));
+        assert!(app.conn_filtering);
+        // Every key is text in the input: digits, q, ? and a included.
+        type_text(&mut app, "q0?a");
+        assert_eq!(app.conn_filter, "q0?a");
+        assert_eq!(app.screen(), Screen::Connections);
+        assert!(app.add.is_none() && !app.help);
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        // By tag, ignoring case.
+        type_text(&mut app, "TEAM-A");
+        assert_eq!(shown_names(&app), ["prod-cache-01"]);
+        assert_eq!(app.conn_sel, app.selectable()[0]);
+        // Enter applies: keys work again, and the filter stays.
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.conn_filtering);
+        assert_eq!(shown_names(&app), ["prod-cache-01"]);
+        // By name.
+        app.handle_key(ch('/'));
+        for _ in 0.."TEAM-A".len() {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        type_text(&mut app, "stag");
+        assert_eq!(shown_names(&app), ["staging-cache"]);
+        assert_eq!(
+            app.selected_entry().map(|e| e.profile.name.as_str()),
+            Some("staging-cache")
+        );
+        app.handle_key(key(KeyCode::Enter));
+        // esc clears the filter, and the list is whole again.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.conn_filter.is_empty());
+        assert_eq!(shown_names(&app).len(), 4);
+        // esc inside the input clears and closes it.
+        app.handle_key(ch('/'));
+        type_text(&mut app, "zzz");
+        assert_eq!(shown_names(&app).len(), 0);
+        assert_eq!(app.selectable(), [ConnSel::Add]);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.conn_filtering && app.conn_filter.is_empty());
+        assert_eq!(shown_names(&app).len(), 4);
+    }
+
+    #[test]
+    fn the_connections_filter_sends_nothing_and_a_paste_goes_into_it() {
+        let mut app = App::new(tagged_profiles());
+        assert!(app.handle_key(ch('/')).is_empty());
+        assert!(app.handle_paste("eu\n".into()).is_empty());
+        assert_eq!(app.conn_filter, "eu");
+        assert!(app.add.is_none());
+        assert_eq!(shown_names(&app), ["prod-cache-01"]);
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
+        // enter on the shown profile connects it.
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&effects[..], [Effect::Connect { profile, .. }] if profile.name == "prod-cache-01")
+        );
     }
 
     #[test]
@@ -5773,9 +6208,11 @@ mod tests {
         let n = app.calls.len();
         app.handle_key(ch('3'));
         app.handle_key(key(KeyCode::Tab));
-        // TTL and Nodes are App's own: nothing to tell.
+        // TTL and Nodes are App's own: nothing to tell. Slots has a state of its own.
         app.handle_key(ch('2'));
         assert_eq!(app.screen(), Screen::Ttl);
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.screen(), Screen::Slots);
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.screen(), Screen::Nodes);
         app.handle_key(key(KeyCode::BackTab));
@@ -5791,6 +6228,8 @@ mod tests {
                 (Owner::Server, "hide"),
                 (Owner::Server, "show"),
                 (Owner::Server, "hide"),
+                (Owner::Slots, "show"),
+                (Owner::Slots, "hide"),
                 (Owner::Analysis, "show"),
                 (Owner::Analysis, "hide"),
                 (Owner::Analysis, "show"),
@@ -6140,6 +6579,7 @@ mod tests {
             (
                 app.screen(),
                 app.conn_sel,
+                (&app.conn_filter, app.conn_filtering),
                 app.add
                     .as_ref()
                     .map(|a| (a.input.clone(), a.password.is_some())),
@@ -6148,7 +6588,9 @@ mod tests {
                 &app.patterns,
                 app.sel,
                 &app.docker,
-                app.session.as_ref().map(|s| (s.scan, s.phase.clone())),
+                app.session
+                    .as_ref()
+                    .map(|s| (s.scan, s.phase.clone(), s.picked)),
                 &app.views,
                 &app.confirm,
             )
@@ -6231,8 +6673,22 @@ mod tests {
             for token in tokens(screen) {
                 for k in events_of(token) {
                     let mut app = busy_app(screen);
+                    if matches!(token, "[" | "]") {
+                        // They pick a node of a cluster and do nothing on a standalone
+                        // server (spec "Cluster live views (P4)"): give it nodes.
+                        app.apply(Msg::Nodes {
+                            id: app.session.as_ref().unwrap().id,
+                            scan: scan_of(&app),
+                            nodes: fixtures::live_nodes(),
+                        });
+                    }
                     if screen == Screen::Patterns && token == "esc" {
                         // Esc clears a filter: set one first.
+                        app.handle_key(ch('/'));
+                        app.handle_key(ch('e'));
+                        app.handle_key(key(KeyCode::Enter));
+                    }
+                    if screen == Screen::Connections && token == "esc" {
                         app.handle_key(ch('/'));
                         app.handle_key(ch('e'));
                         app.handle_key(key(KeyCode::Enter));

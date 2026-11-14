@@ -494,46 +494,1004 @@ fn a_seed_only_scan_is_amber_everywhere_it_is_summed_up() {
     }
 }
 
-/// The views that read one server are off on a cluster, say why, and ask nothing.
+// -- Cluster live views (P4): the picked node --------------------------------------
+
+use crate::live::server::{InfoSample, Reply as ServerReply, Request as ServerRequest};
+use crate::live::{Dest, LiveReply, LiveRequest, To};
+
+/// [`cluster_scanned`] with the node table and the live connection ready, as a cluster
+/// connect sends them.
+fn live_cluster() -> (App, ConnId) {
+    let (mut app, id) = cluster_scanned(fixtures::cluster_report(), HEALTHY);
+    let scan = scan_of(&app);
+    app.apply(Msg::Nodes {
+        id,
+        scan,
+        nodes: fixtures::live_nodes(),
+    });
+    app.apply(Msg::LiveReady { id, scan });
+    (app, id)
+}
+
+/// The live requests among `effects`, with where each goes.
+fn sent(effects: &[Effect]) -> Vec<(crate::live::ReqId, Dest, LiveRequest)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Live {
+                req_id, to, req, ..
+            } => Some((*req_id, to.clone(), req.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn info_reply(app: &mut App, req_id: crate::live::ReqId, sample: InfoSample) -> Vec<Effect> {
+    super::app::views::testing::reply(
+        app,
+        req_id,
+        Ok(LiveReply::Server(ServerReply::Info {
+            at: std::time::Instant::now(),
+            sample: Box::new(sample),
+        })),
+    )
+}
+
+fn shard_sample(i: u64) -> InfoSample {
+    InfoSample {
+        clients: Some(10 + i),
+        used_memory: Some((i + 1) * 300 * 1024 * 1024),
+        maxmemory: Some(1024 * 1024 * 1024),
+        ops_now: Some(1200 * (i + 1)),
+        keys: Some(400_000 + i * 1000),
+        commands: Some(1_000),
+        uptime_secs: Some(86_400),
+        role: Some(crate::live::server::Role::Primary),
+        ..InfoSample::default()
+    }
+}
+
 #[test]
-fn live_views_are_off_on_a_cluster_and_send_nothing() {
-    let (mut app, _) = cluster_scanned(fixtures::cluster_report(), HEALTHY);
-    for screen in [
-        Screen::KeyList,
-        Screen::KeyDetail,
-        Screen::Overview,
-        Screen::Clients,
-        Screen::SlowLog,
-        Screen::Streams,
-        Screen::PubSub,
-        Screen::Search,
-    ] {
+fn the_server_panels_and_search_read_the_picked_node() {
+    let (mut app, _) = live_cluster();
+    assert_eq!(app.session.as_ref().unwrap().picked, 0, "the first primary");
+    let effects = super::app::views::testing::show(&mut app, Screen::Overview);
+    let reqs = sent(&effects);
+    // The Overview's INFO on the picked node, and one INFO per shard for the summary.
+    let to: Vec<To> = reqs.iter().map(|(_, d, _)| d.to.clone()).collect();
+    assert_eq!(
+        to,
+        [To::Node(0), To::Node(0), To::Node(1), To::Node(2)],
+        "{reqs:?}"
+    );
+    assert!(
+        reqs.iter()
+            .all(|(_, _, r)| *r == LiveRequest::Server(ServerRequest::Info))
+    );
+    for screen in [Screen::Clients, Screen::SlowLog, Screen::Search] {
         let effects = super::app::views::testing::show(&mut app, screen);
-        assert_eq!(app.screen(), screen);
+        let reqs = sent(&effects);
+        assert!(!reqs.is_empty(), "{screen:?}");
         assert!(
-            !effects.iter().any(|e| matches!(e, Effect::Live { .. })),
-            "{screen:?}: {effects:?}"
+            reqs.iter().all(|(_, d, _)| d.to == To::Node(0)),
+            "{screen:?}: {reqs:?}"
         );
         let all = text(&render(&app, 120, 36));
         assert!(
-            all.contains("Not available on a cluster yet: this view reads one server"),
+            all.contains("node 10.0.1.11:6379 · 1 of 3"),
             "{screen:?}: {all}"
         );
-        // `r` on a live view says the same and sends nothing either.
-        let effects = app.handle_key(ch('r'));
-        assert!(
-            !effects.iter().any(|e| matches!(e, Effect::Live { .. })),
-            "{screen:?}: {effects:?}"
+        assert!(!all.contains("Not available on a cluster"), "{screen:?}");
+    }
+    // `]` picks the next node: Search reads it at once, and names it.
+    let effects = app.handle_key(ch(']'));
+    assert_eq!(app.session.as_ref().unwrap().picked, 1);
+    let reqs = sent(&effects);
+    assert!(!reqs.is_empty());
+    assert!(reqs.iter().all(|(_, d, _)| d.to == To::Node(1)), "{reqs:?}");
+    assert!(text(&render(&app, 120, 36)).contains("node 10.0.1.12:6379 · 2 of 3"));
+    // `[` twice goes round to the last.
+    app.handle_key(ch('['));
+    app.handle_key(ch('['));
+    assert_eq!(app.session.as_ref().unwrap().picked, 2);
+    // Elsewhere `[` does nothing.
+    show(&mut app, Screen::Patterns);
+    assert!(app.handle_key(ch('[')).is_empty());
+    assert_eq!(app.session.as_ref().unwrap().picked, 2);
+}
+
+#[test]
+fn picking_a_node_restarts_the_overview_and_keeps_a_monitor_run_on_its_node() {
+    let (mut app, _) = live_cluster();
+    let effects = super::app::views::testing::show(&mut app, Screen::Overview);
+    let (first, _, _) = sent(&effects)[0].clone();
+    info_reply(&mut app, first, shard_sample(0));
+    assert_eq!(app.views.server.overview.history.len(), 1);
+    let effects = app.handle_key(ch(']'));
+    // The sparklines start again, on the new node.
+    assert!(app.views.server.overview.history.is_empty());
+    assert!(
+        sent(&effects)
+            .iter()
+            .any(|(_, d, r)| d.to == To::Node(1) && *r == LiveRequest::Server(ServerRequest::Info))
+    );
+    // A Monitor run started on node 1 stays there when the pick moves on.
+    show(&mut app, Screen::Monitor);
+    app.handle_key(key(KeyCode::Enter));
+    let mut effects = press_all(&mut app, "prod-cache-01");
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    let node = effects.iter().find_map(|e| match e {
+        Effect::Monitor { node, .. } => Some(*node),
+        _ => None,
+    });
+    assert_eq!(node, Some(1), "{effects:?}");
+    let effects = app.handle_key(ch(']'));
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::StopMonitor { .. })),
+        "{effects:?}"
+    );
+    assert!(app.views.server.monitor.run.is_some());
+    let all = text(&render(&app, 120, 36));
+    assert!(all.contains("node 10.0.1.12:6379"), "{all}");
+}
+
+/// A live cluster whose third node discovery has no connection to: it refused the
+/// address (a loopback address announced by a remote cluster) or could not reach it.
+fn live_cluster_without_node_3() -> App {
+    let (mut app, id) = cluster_scanned(fixtures::cluster_report(), HEALTHY);
+    let scan = scan_of(&app);
+    let mut nodes = fixtures::live_nodes();
+    nodes[2].connected = false;
+    app.apply(Msg::Nodes { id, scan, nodes });
+    app.apply(Msg::LiveReady { id, scan });
+    app
+}
+
+fn opens_its_own_connection(effects: &[Effect]) -> bool {
+    effects
+        .iter()
+        .any(|e| matches!(e, Effect::Subscribe { .. } | Effect::Monitor { .. }))
+}
+
+const NODE_3_NOT_CONNECTED: &str = "10.0.1.13:6379 is not connected";
+
+/// The loopback rule and "no new node after discovery": a Pub/Sub tail opens no
+/// connection of its own (which would carry the profile's credentials) to a node
+/// discovery did not connect to. The picked node for a classic tail.
+#[test]
+fn a_classic_tail_is_not_opened_on_a_node_discovery_did_not_use() {
+    let mut app = live_cluster_without_node_3();
+    show(&mut app, Screen::PubSub);
+    app.handle_key(ch(']'));
+    app.handle_key(ch(']'));
+    assert_eq!(app.session.as_ref().unwrap().picked, 2);
+    let mut effects = app.handle_key(ch('s'));
+    effects.extend(press_all(&mut app, "news"));
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    assert!(!opens_its_own_connection(&effects), "{effects:?}");
+    let all = text(&render(&app, 120, 36));
+    assert!(all.contains(NODE_3_NOT_CONNECTED), "{all}");
+    // On a connected node the same keys do subscribe.
+    app.handle_key(ch('['));
+    let mut effects = app.handle_key(ch('s'));
+    effects.extend(press_all(&mut app, "news"));
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Subscribe { node: 1, .. })),
+        "{effects:?}"
+    );
+}
+
+/// The slot owner for a shard tail (`foo` is served by the third node).
+#[test]
+fn a_shard_tail_is_not_opened_on_a_node_discovery_did_not_use() {
+    let mut app = live_cluster_without_node_3();
+    show(&mut app, Screen::PubSub);
+    let mut effects = app.handle_key(ch('S'));
+    effects.extend(press_all(&mut app, "foo"));
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    assert!(!opens_its_own_connection(&effects), "{effects:?}");
+    let all = text(&render(&app, 120, 36));
+    assert!(all.contains(NODE_3_NOT_CONNECTED), "{all}");
+}
+
+/// The picked node for Monitor: refused after the question, with nothing opened.
+#[test]
+fn monitor_is_not_opened_on_a_node_discovery_did_not_use() {
+    let mut app = live_cluster_without_node_3();
+    show(&mut app, Screen::Monitor);
+    app.handle_key(ch(']'));
+    app.handle_key(ch(']'));
+    assert_eq!(app.session.as_ref().unwrap().picked, 2);
+    let mut effects = app.handle_key(key(KeyCode::Enter));
+    effects.extend(press_all(&mut app, "prod-cache-01"));
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    assert!(!opens_its_own_connection(&effects), "{effects:?}");
+    assert!(app.views.server.monitor.run.is_none());
+    let all = text(&render(&app, 120, 36));
+    assert!(all.contains(NODE_3_NOT_CONNECTED), "{all}");
+}
+
+fn press_all(app: &mut App, s: &str) -> Vec<Effect> {
+    s.chars().flat_map(|c| app.handle_key(ch(c))).collect()
+}
+
+#[test]
+fn the_pick_lasts_across_a_rescan_that_keeps_its_node() {
+    let (mut app, id) = live_cluster();
+    show(&mut app, Screen::Overview);
+    app.handle_key(ch(']'));
+    app.handle_key(ch(']'));
+    assert_eq!(app.session.as_ref().unwrap().picked, 2);
+    // A rescan whose list still has the node (same ID and address): kept.
+    show(&mut app, Screen::Patterns);
+    app.handle_key(ch('r'));
+    let scan = scan_of(&app);
+    app.apply(Msg::Nodes {
+        id,
+        scan,
+        nodes: fixtures::live_nodes(),
+    });
+    assert_eq!(app.session.as_ref().unwrap().picked, 2);
+    // A list without it (the node moved): back to the first primary.
+    let mut moved = fixtures::live_nodes();
+    moved[2].endpoint.port = 7000;
+    moved[0].role = crate::model::NodeRole::Replica;
+    app.apply(Msg::Nodes {
+        id,
+        scan,
+        nodes: moved,
+    });
+    assert_eq!(app.session.as_ref().unwrap().picked, 1);
+    // A replaced run's list is ignored.
+    app.apply(Msg::Nodes {
+        id,
+        scan: scan - 1,
+        nodes: Vec::new(),
+    });
+    assert_eq!(app.session.as_ref().unwrap().nodes.len(), 3);
+}
+
+#[test]
+fn writes_go_to_the_slot_owner_and_are_refused_across_slots_or_on_a_replica() {
+    use super::app::views::write_dest;
+    use crate::write::WriteOp;
+    let (mut app, _) = live_cluster();
+    let s = app.session.as_ref().unwrap();
+    let hset = |key: &str| WriteOp::HSet {
+        key: key.into(),
+        field: crate::value::Raw::from("f"),
+        value: crate::value::Raw::from("v"),
+    };
+    // "bar" is slot 5061, node 0's; "foo" 12182, node 2's: routed by key.
+    assert_eq!(write_dest(s, &hset("bar")), Ok(Dest::key("bar")));
+    assert_eq!(write_dest(s, &hset("foo")), Ok(Dest::key("foo")));
+    // Keyless writes go to the picked node.
+    assert_eq!(write_dest(s, &WriteOp::SlowlogReset), Ok(Dest::node(0)));
+    // A WATCH write follows only a MOVED of its WATCH.
+    let set = WriteOp::SetString {
+        key: "bar".into(),
+        old: crate::value::Raw::from("a"),
+        value: crate::value::Raw::from("b"),
+    };
+    assert_eq!(
+        write_dest(s, &set),
+        Ok(Dest::key("bar").follow(crate::live::Follow::MovedOnFirst))
+    );
+    // Rename across slots: refused before asking; within one hash tag it goes.
+    let rename = |a: &str, b: &str| WriteOp::Rename {
+        key: a.into(),
+        new: b.into(),
+    };
+    let err = write_dest(s, &rename("foo", "bar")).unwrap_err();
+    assert!(err.contains(crate::live::CROSSSLOT), "{err}");
+    assert_eq!(
+        write_dest(s, &rename("{u}a", "{u}b")),
+        Ok(Dest::key("{u}a"))
+    );
+    // A shard read on a replica takes no writes.
+    let s = app.session.as_mut().unwrap();
+    s.nodes[2].role = crate::model::NodeRole::Replica;
+    let err = write_dest(s, &hset("foo")).unwrap_err();
+    assert!(
+        err.contains("this shard was read on a replica; connect without prefer_replica to write"),
+        "{err}"
+    );
+    assert!(write_dest(s, &hset("bar")).is_ok());
+}
+
+#[test]
+fn a_read_only_cluster_profile_sends_no_write_to_any_node() {
+    let (mut app, _) = live_cluster();
+    assert!(app.session.as_ref().unwrap().profile.is_read_only());
+    for node in 0..3 {
+        show(&mut app, Screen::SlowLog);
+        while app.session.as_ref().unwrap().picked != node {
+            app.handle_key(ch(']'));
+        }
+        for k in ['R', 'c'] {
+            let effects = app.handle_key(ch(k));
+            assert!(
+                !effects.iter().any(|e| matches!(
+                    e,
+                    Effect::Live {
+                        req: LiveRequest::Write(_),
+                        ..
+                    }
+                )),
+                "{k} on node {node}: {effects:?}"
+            );
+            app.handle_key(key(KeyCode::Esc));
+        }
+    }
+}
+
+#[test]
+fn overview_with_the_per_shard_summary_80x24() {
+    let (mut app, _) = live_cluster();
+    let effects = super::app::views::testing::show(&mut app, Screen::Overview);
+    let reqs = sent(&effects);
+    // The Overview's own poll, then the summary's three; the third shard never answers.
+    info_reply(&mut app, reqs[0].0, shard_sample(0));
+    info_reply(&mut app, reqs[1].0, shard_sample(0));
+    info_reply(&mut app, reqs[2].0, shard_sample(1));
+    super::app::views::testing::reply(
+        &mut app,
+        reqs[3].0,
+        Err(crate::live::LiveError::Failed("INFO failed".into())),
+    );
+    let t = render(&app, 80, 24);
+    let all = text(&t);
+    assert!(all.contains("✗ no answer"), "{all}");
+    assert!(all.contains("node 10.0.1.11:6379 · 1 of 3"), "{all}");
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn the_per_shard_summary_polls_at_most_every_5_s_only_while_shown() {
+    let (mut app, _) = live_cluster();
+    let t0 = std::time::Instant::now();
+    app.apply(Msg::TickAt(t0));
+    let effects = super::app::views::testing::show(&mut app, Screen::Overview);
+    let reqs = sent(&effects);
+    assert_eq!(reqs.len(), 4);
+    for (id, _, _) in &reqs {
+        info_reply(&mut app, *id, shard_sample(0));
+    }
+    let summary = |effects: &[Effect]| {
+        sent(effects)
+            .iter()
+            .filter(|(_, d, _)| d.to != To::Node(0))
+            .count()
+    };
+    // At 2 s the Overview polls again, the summary does not.
+    let effects = app.apply(Msg::TickAt(t0 + std::time::Duration::from_secs(2)));
+    assert_eq!(summary(&effects), 0, "{effects:?}");
+    let effects = app.apply(Msg::TickAt(t0 + std::time::Duration::from_secs(5)));
+    assert_eq!(summary(&effects), 2, "{effects:?}");
+    // Off screen: nothing.
+    show(&mut app, Screen::Patterns);
+    let effects = app.apply(Msg::TickAt(t0 + std::time::Duration::from_secs(60)));
+    assert!(sent(&effects).is_empty());
+}
+
+// -- Cluster live views (P4): the views that work node by node ---------------------
+
+use crate::live::Follow;
+use crate::live::keys::{KeyRow, Page, Reply as KeysReply, Request as KeysRequest};
+
+/// Node `i`, following no redirect: how a page, facts or a bulk step is sent.
+fn never(i: usize) -> Dest {
+    Dest::node(i).follow(Follow::Never)
+}
+
+fn key_row(name: &str) -> KeyRow {
+    KeyRow {
+        key: name.into(),
+        key_type: crate::model::KeyType::Hash,
+        ttl: crate::model::Ttl::Persistent,
+        bytes: Some(512),
+        encoding: Some("listpack".into()),
+        length: Some(4),
+        freq: None,
+    }
+}
+
+fn page_reply(rows: Vec<KeyRow>, cursor: u64) -> Result<LiveReply, crate::live::LiveError> {
+    Ok(LiveReply::Keys(KeysReply::Page(Page {
+        rows,
+        cursor,
+        carry: Vec::new(),
+        other_pattern: 0,
+        unreadable: 0,
+        refused: Vec::new(),
+    })))
+}
+
+/// The key list pages among `effects`: id, where it goes, and its cursor.
+fn pages(effects: &[Effect]) -> Vec<(crate::live::ReqId, Dest, u64)> {
+    sent(effects)
+        .into_iter()
+        .filter_map(|(id, to, r)| match r {
+            LiveRequest::Keys(KeysRequest::Page { cursor, .. }) => Some((id, to, cursor)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn answer(
+    app: &mut App,
+    id: crate::live::ReqId,
+    r: Result<LiveReply, crate::live::LiveError>,
+) -> Vec<Effect> {
+    super::app::views::testing::reply(app, id, r)
+}
+
+#[test]
+fn the_key_list_walks_every_primary_in_slot_order_one_node_at_a_time() {
+    let (mut app, _) = live_cluster();
+    let effects = super::app::views::testing::show(&mut app, Screen::KeyList);
+    let p = pages(&effects);
+    assert_eq!(
+        p.iter()
+            .map(|(_, d, c)| (d.clone(), *c))
+            .collect::<Vec<_>>(),
+        [(never(0), 0)]
+    );
+    // Node 0 is walked out before the page is full: node 1 is read right away.
+    let effects = answer(
+        &mut app,
+        p[0].0,
+        page_reply(vec![key_row("user:1:cart")], 0),
+    );
+    let p = pages(&effects);
+    assert_eq!((p[0].1.clone(), p[0].2), (never(1), 0));
+    assert_eq!(app.views.keys.nodes_done, 1);
+    // Node 1 has more: its cursor is kept, and nothing is sent until `n`.
+    let effects = answer(
+        &mut app,
+        p[0].0,
+        page_reply(vec![key_row("user:2:cart")], 77),
+    );
+    assert!(pages(&effects).is_empty(), "{effects:?}");
+    let effects = app.handle_key(ch('n'));
+    let p = pages(&effects);
+    assert_eq!(
+        p.iter()
+            .map(|(_, d, c)| (d.clone(), *c))
+            .collect::<Vec<_>>(),
+        [(never(1), 77)]
+    );
+    let effects = answer(
+        &mut app,
+        p[0].0,
+        page_reply(vec![key_row("user:3:cart")], 0),
+    );
+    let p = pages(&effects);
+    assert_eq!((p[0].1.clone(), p[0].2), (never(2), 0));
+    let effects = answer(
+        &mut app,
+        p[0].0,
+        page_reply(vec![key_row("user:4:cart"), key_row("user:5:cart")], 0),
+    );
+    // Every node is done: nothing more is sent, `n` included.
+    assert!(pages(&effects).is_empty(), "{effects:?}");
+    assert!(pages(&app.handle_key(ch('n'))).is_empty());
+    let k = &app.views.keys;
+    assert_eq!(k.nodes_done, 3);
+    for (key, node) in [
+        ("user:1:cart", 0),
+        ("user:2:cart", 1),
+        ("user:3:cart", 1),
+        ("user:4:cart", 2),
+    ] {
+        assert_eq!(k.row_node.get(key), Some(&node), "{key}");
+    }
+    let wide = text(&render(&app, 120, 36));
+    assert!(wide.contains("3 of 3 nodes"), "{wide}");
+    let t = render(&app, 80, 24);
+    assert!(text(&t).contains("NODE"));
+    insta::assert_snapshot!(t.backend());
+}
+
+#[test]
+fn the_key_list_of_a_pattern_narrowed_to_a_node_reads_only_that_node() {
+    let (mut app, _) = live_cluster();
+    show(&mut app, Screen::Nodes);
+    press(&mut app, "j");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.screen(), Screen::Patterns);
+    let rows = app.pattern_rows();
+    app.patterns.sel = rows
+        .iter()
+        .position(|r| matches!(r, crate::tui::tree::Row::Pattern { .. }))
+        .expect("a pattern row");
+    let effects = app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.screen(), Screen::KeyList);
+    let p = pages(&effects);
+    assert_eq!(
+        p.iter()
+            .map(|(_, d, c)| (d.clone(), *c))
+            .collect::<Vec<_>>(),
+        [(never(1), 0)]
+    );
+    let effects = answer(
+        &mut app,
+        p[0].0,
+        page_reply(vec![key_row("user:9:cart")], 0),
+    );
+    assert!(pages(&effects).is_empty(), "{effects:?}");
+    assert!(text(&render(&app, 120, 36)).contains("1 of 1 nodes"));
+}
+
+#[test]
+fn the_key_detail_reads_the_slot_owner_and_names_it() {
+    let (mut app, _) = live_cluster();
+    let effects = super::app::views::testing::show(&mut app, Screen::KeyList);
+    let p = pages(&effects);
+    answer(&mut app, p[0].0, page_reply(vec![key_row("foo")], 5));
+    let effects = app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.screen(), Screen::KeyDetail);
+    let reads = sent(&effects);
+    assert!(!reads.is_empty());
+    // "foo" is slot 12182, node 2's: every read goes to its owner.
+    for (_, to, req) in &reads {
+        assert_eq!(*to, Dest::key("foo"), "{req:?}");
+    }
+    let all = text(&render(&app, 120, 36));
+    assert!(all.contains("10.0.1.13:6379"), "{all}");
+}
+
+#[test]
+fn big_keys_lengths_are_read_on_each_owner_split_by_node() {
+    use crate::live::keys::FactKey;
+    let (mut app, _) = live_cluster();
+    let s = app.session.as_ref().unwrap();
+    let fk = |k: &str| FactKey {
+        key: k.into(),
+        key_type: crate::model::KeyType::Hash,
+        length: true,
+    };
+    // bar: slot 5061 (node 0); c: 7365 (node 1); foo 12182 and a 15495 (node 2).
+    let parts =
+        super::app::views::analysis::split_by_node(s, vec![fk("foo"), fk("bar"), fk("a"), fk("c")]);
+    let parts: Vec<(Dest, Vec<String>)> = parts
+        .into_iter()
+        .map(|(d, ks)| (d, ks.into_iter().map(|k| k.key).collect()))
+        .collect();
+    assert_eq!(
+        parts,
+        [
+            (never(0), vec!["bar".to_string()]),
+            (never(1), vec!["c".to_string()]),
+            (never(2), vec!["foo".to_string(), "a".to_string()]),
+        ]
+    );
+    // The panel no longer says lengths are left out on a cluster.
+    show(&mut app, Screen::BigKeys);
+    let body = text(&render(&app, 120, 36));
+    assert!(!body.contains("not read on a cluster"), "{body}");
+    assert!(!body.contains("Not available on a cluster"), "{body}");
+}
+
+// -- The command line on a cluster ---------------------------------------------------
+
+use crate::live::cmdline::{CommandInfo, Output, Reply as CmdReply, Request as CmdRequest};
+use crate::live::server::{Begin, Find, KeySpec};
+
+/// A command's info with the key spec `keys` (as Redis 7 lists it).
+fn cmd(name: &str, flags: &[&str], cats: &[&str], keys: Vec<KeySpec>) -> CommandInfo {
+    CommandInfo {
+        name: name.into(),
+        flags: flags.iter().map(|s| (*s).into()).collect(),
+        categories: cats.iter().map(|s| (*s).into()).collect(),
+        keys,
+        ..CommandInfo::default()
+    }
+}
+
+/// Keys from argument 1 to `last` (relative), every `step` arguments.
+fn keys_from_1(last: i64, step: i64) -> Vec<KeySpec> {
+    vec![KeySpec {
+        begin: Begin::Index(1),
+        find: Find::Range {
+            last,
+            step,
+            limit: 0,
+        },
+    }]
+}
+
+fn get_info() -> CommandInfo {
+    cmd("get", &["readonly", "fast"], &["@read"], keys_from_1(0, 1))
+}
+
+fn mget_info() -> CommandInfo {
+    cmd(
+        "mget",
+        &["readonly", "fast"],
+        &["@read"],
+        keys_from_1(-1, 1),
+    )
+}
+
+fn ran(v: redis::Value) -> Result<LiveReply, crate::live::LiveError> {
+    Ok(LiveReply::Command(CmdReply::Ran(Output::of(
+        &v,
+        std::time::Duration::from_micros(300),
+    ))))
+}
+
+/// `:` opened on the live cluster (picked node `picked`), its `COMMAND LIST` answered.
+fn cluster_cmdline(picked: usize) -> App {
+    let (mut app, _) = live_cluster();
+    app.session.as_mut().unwrap().picked = picked;
+    let effects = app.handle_key(ch(':'));
+    assert!(app.views.cmdline.open, "{:?}", app.notice);
+    for (id, to, _) in sent(&effects) {
+        assert_eq!(to, Dest::node(picked));
+        answer(
+            &mut app,
+            id,
+            Ok(LiveReply::Command(CmdReply::Names(vec!["get".into()]))),
         );
     }
-    // The Analysis panels and Patterns still show the merged results.
-    // (The notice from the last `r` is still in the key bar, so look above it.)
-    show(&mut app, Screen::BigKeys);
-    let lines = buffer_lines(&render(&app, 120, 36));
-    let body = lines[..lines.len() - 1].join("\n");
-    assert!(!body.contains("Not available on a cluster"), "{body}");
+    app
+}
+
+/// Types `line` and `enter`; answers `COMMAND INFO` with `info` and `COMMAND DOCS` with
+/// nothing (both asked on the picked node). Returns the requests that followed.
+fn run_line(
+    app: &mut App,
+    line: &str,
+    info: CommandInfo,
+) -> Vec<(crate::live::ReqId, Dest, LiveRequest)> {
+    let mut effects = Vec::new();
+    for c in line.chars() {
+        effects.extend(app.handle_key(ch(c)));
+    }
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    let picked = app.session.as_ref().unwrap().picked;
+    let mut after = Vec::new();
+    for (id, to, r) in sent(&effects) {
+        assert_eq!(to, Dest::node(picked), "{r:?}");
+        let r = match r {
+            LiveRequest::Command(CmdRequest::Info { .. }) => CmdReply::Info(Some(info.clone())),
+            LiveRequest::Command(CmdRequest::Docs { .. }) => CmdReply::Docs(None),
+            other => panic!("unexpected {other:?}"),
+        };
+        after.extend(answer(app, id, Ok(LiveReply::Command(r))));
+    }
+    sent(&after)
+}
+
+/// The typed commands among `reqs`, with where each goes.
+fn runs(reqs: &[(crate::live::ReqId, Dest, LiveRequest)]) -> Vec<(crate::live::ReqId, Dest)> {
+    reqs.iter()
+        .filter(|(_, _, r)| matches!(r, LiveRequest::Command(CmdRequest::Run { .. })))
+        .map(|(id, d, _)| (*id, d.clone()))
+        .collect()
+}
+
+fn dests(r: &[(crate::live::ReqId, Dest)]) -> Vec<Dest> {
+    r.iter().map(|(_, d)| d.clone()).collect()
+}
+
+#[test]
+fn the_command_line_sends_a_key_to_its_owner_and_heads_the_reply_with_the_node() {
+    let mut app = cluster_cmdline(0);
+    let r = runs(&run_line(&mut app, "GET foo", get_info()));
+    assert_eq!(dests(&r), [Dest::key("foo")]);
+    answer(
+        &mut app,
+        r[0].0,
+        ran(redis::Value::BulkString(b"v1".to_vec())),
+    );
+    let all = text(&render(&app, 80, 24));
+    assert!(all.contains("10.0.1.13:6379>"), "{all}");
+    assert!(all.contains("\"v1\""), "{all}");
+    // Keys in one slot (one hash tag) go together to their owner.
+    let r = runs(&run_line(&mut app, "MGET {u}a {u}b", mget_info()));
+    assert_eq!(dests(&r), [Dest::key("{u}a")]);
+}
+
+#[test]
+fn the_command_line_refuses_keys_in_different_slots_before_sending() {
+    let mut app = cluster_cmdline(0);
+    let after = run_line(&mut app, "MGET foo bar", mget_info());
+    assert!(runs(&after).is_empty(), "{after:?}");
+    let all = text(&render(&app, 120, 36));
+    assert!(all.contains("different slots (CROSSSLOT)"), "{all}");
+}
+
+#[test]
+fn the_command_line_sends_keyless_commands_and_unfound_keys_to_the_picked_node() {
+    let mut app = cluster_cmdline(1);
+    let ping = cmd("ping", &["readonly", "fast"], &["@connection"], vec![]);
+    let r = runs(&run_line(&mut app, "PING", ping));
+    assert_eq!(dests(&r), [Dest::node(1)]);
+    answer(
+        &mut app,
+        r[0].0,
+        ran(redis::Value::SimpleString("PONG".into())),
+    );
+    assert!(text(&render(&app, 120, 36)).contains("10.0.1.12:6379>"));
+    // Moving keys the key specs don't find: the picked node, and the panel says so.
+    let zunion = CommandInfo {
+        keys_partial: true,
+        ..cmd("zunion", &["readonly", "movablekeys"], &["@read"], vec![])
+    };
+    let r = runs(&run_line(&mut app, "ZUNION 2 foo bar", zunion));
+    assert_eq!(dests(&r), [Dest::node(1)]);
+    answer(&mut app, r[0].0, ran(redis::Value::Array(vec![])));
+    let all = text(&render(&app, 160, 40));
     assert!(
-        body.contains("Lengths and encodings are not read on a cluster yet"),
-        "{body}"
+        all.contains("Its keys could not be found from its key specs"),
+        "{all}"
+    );
+}
+
+#[test]
+fn the_command_lines_writes_are_routed_by_their_keys_and_read_only_sends_none() {
+    use super::app::views::write_dest;
+    use crate::write::WriteOp;
+    let set = cmd("set", &["write", "denyoom"], &["@write"], keys_from_1(0, 1));
+    let mset = cmd(
+        "mset",
+        &["write", "denyoom"],
+        &["@write"],
+        keys_from_1(-1, 2),
+    );
+    let op = |line: &str, info: &CommandInfo| WriteOp::Command {
+        args: crate::live::cmdline::Args::new(
+            line.split(' ').map(|w| w.as_bytes().to_vec()).collect(),
+        ),
+        info: info.clone(),
+    };
+    let mut app = cluster_cmdline(0);
+    let s = app.session.as_ref().unwrap();
+    assert_eq!(write_dest(s, &op("SET foo 1", &set)), Ok(Dest::key("foo")));
+    assert_eq!(
+        write_dest(s, &op("MSET {u}a 1 {u}b 2", &mset)),
+        Ok(Dest::key("{u}a"))
+    );
+    let err = write_dest(s, &op("MSET foo 1 bar 2", &mset)).unwrap_err();
+    assert!(err.contains(crate::live::CROSSSLOT), "{err}");
+    // The profile is read-only: a typed write is refused in the panel, on any node.
+    assert!(app.session.as_ref().unwrap().profile.is_read_only());
+    for line in ["SET foo 1", "SET bar 1", "SET c 1"] {
+        let after = run_line(&mut app, line, set.clone());
+        assert!(
+            !after
+                .iter()
+                .any(|(_, _, r)| matches!(r, LiveRequest::Write(_))),
+            "{line}: {after:?}"
+        );
+        assert!(runs(&after).is_empty(), "{line}: {after:?}");
+    }
+}
+
+// -- Streams and Pub/Sub on a cluster ------------------------------------------------
+
+use crate::live::pubsub::{
+    Channel, Counts, Reply as PubSubReply, Request as PubSubRequest, ShardCounts,
+};
+use crate::live::streams::{Fetched, Reply as StreamsReply, Request as StreamsRequest, StreamInfo};
+
+fn node_of(d: &Dest) -> usize {
+    match d.to {
+        To::Node(i) => i,
+        To::Key(_) => panic!("sent by key: {d:?}"),
+    }
+}
+
+fn stream_info(key: &str, length: u64) -> StreamInfo {
+    StreamInfo {
+        key: key.into(),
+        length,
+        bytes: Some(64 * 1024),
+        first_id: Some("1700000000000-0".into()),
+        last_id: "1700000900000-0".into(),
+        oldest_age_ms: Some(60 * 60 * 1000),
+        entries_added: Some(length),
+        groups: Some(Vec::new()),
+        notes: Vec::new(),
+        pending: None,
+    }
+}
+
+/// The live cluster, its scan holding the streams `bar` (node 0), `c` (node 1), `foo`
+/// and `a` (node 2) as literal stream patterns.
+fn cluster_with_streams() -> App {
+    let (mut app, _) = live_cluster();
+    let report = app
+        .session
+        .as_mut()
+        .and_then(|s| s.report.as_mut())
+        .expect("a report");
+    for name in ["foo", "bar", "c", "a"] {
+        let mut p = fixtures::report(true).patterns[0].clone();
+        p.pattern = name.into();
+        p.key_type = Some(crate::model::KeyType::Stream);
+        p.examples = Vec::new();
+        report.patterns.push(p);
+    }
+    app
+}
+
+#[test]
+fn streams_poll_one_request_per_owning_node_and_show_each_streams_node() {
+    let mut app = cluster_with_streams();
+    let effects = super::app::views::testing::show(&mut app, Screen::Streams);
+    let polls: Vec<(crate::live::ReqId, usize, Vec<String>)> = sent(&effects)
+        .into_iter()
+        .filter_map(|(id, to, r)| match r {
+            LiveRequest::Streams(StreamsRequest::Info { keys, .. }) => {
+                Some((id, node_of(&to), keys))
+            }
+            _ => None,
+        })
+        .collect();
+    // One request per node, each with the streams its node owns.
+    let mut by_node: Vec<(usize, Vec<String>)> =
+        polls.iter().map(|(_, n, k)| (*n, k.clone())).collect();
+    by_node.sort();
+    let s = |v: &[&str]| v.iter().map(|k| (*k).to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        by_node,
+        [(0, s(&["bar"])), (1, s(&["c"])), (2, s(&["foo", "a"]))]
+    );
+    for (id, _, keys) in polls {
+        let streams = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| Fetched {
+                key: k.clone(),
+                info: Some(stream_info(k, 100 * (i as u64 + 1))),
+            })
+            .collect();
+        answer(
+            &mut app,
+            id,
+            Ok(LiveReply::Streams(StreamsReply::Info {
+                streams,
+                refused: Default::default(),
+            })),
+        );
+    }
+    let t = render(&app, 80, 24);
+    let all = text(&t);
+    assert!(all.contains("NODE"), "{all}");
+    assert!(all.contains("10.0.1.13:6379"), "{all}");
+    insta::assert_snapshot!(t.backend());
+}
+
+fn counts_reply(channels: &[(&str, u64)]) -> Result<LiveReply, crate::live::LiveError> {
+    Ok(LiveReply::PubSub(PubSubReply::Counts(Counts {
+        channels: channels
+            .iter()
+            .map(|(n, s)| Channel {
+                name: (*n).into(),
+                subscribers: Some(*s),
+            })
+            .collect(),
+        total_channels: channels.len(),
+        patterns: Some(0),
+        notes: Vec::new(),
+    })))
+}
+
+fn shard_reply(channels: &[(&str, u64)]) -> Result<LiveReply, crate::live::LiveError> {
+    Ok(LiveReply::PubSub(PubSubReply::ShardCounts(ShardCounts {
+        channels: channels
+            .iter()
+            .map(|(n, s)| Channel {
+                name: (*n).into(),
+                subscribers: Some(*s),
+            })
+            .collect(),
+        total_channels: channels.len(),
+        notes: Vec::new(),
+    })))
+}
+
+#[test]
+fn pubsub_counts_classic_channels_on_the_picked_node_and_shard_channels_on_every_primary() {
+    let (mut app, _) = live_cluster();
+    let effects = super::app::views::testing::show(&mut app, Screen::PubSub);
+    let reqs = sent(&effects);
+    let classic: Vec<_> = reqs
+        .iter()
+        .filter(|(_, _, r)| matches!(r, LiveRequest::PubSub(PubSubRequest::Counts)))
+        .collect();
+    assert_eq!(classic.len(), 1);
+    assert_eq!(classic[0].1, Dest::node(0));
+    let shards: Vec<_> = reqs
+        .iter()
+        .filter(|(_, _, r)| matches!(r, LiveRequest::PubSub(PubSubRequest::ShardCounts)))
+        .collect();
+    assert_eq!(
+        shards.iter().map(|(_, d, _)| d.clone()).collect::<Vec<_>>(),
+        [never(0), never(1), never(2)]
+    );
+    answer(
+        &mut app,
+        classic[0].0,
+        counts_reply(&[("news", 3), ("alerts", 1)]),
+    );
+    let per_node: [&[(&str, u64)]; 3] = [&[("bar", 2)], &[], &[("foo", 5), ("a", 1)]];
+    for ((id, _, _), chans) in shards.iter().zip(per_node) {
+        answer(&mut app, *id, shard_reply(chans));
+    }
+    let t = render(&app, 80, 24);
+    let all = text(&t);
+    assert!(all.contains("SHARD CHANNEL"), "{all}");
+    assert!(all.contains("subscribers on 10.0.1.11:6379"), "{all}");
+    insta::assert_snapshot!(t.backend());
+    // SPUBLISH goes to the channel's slot owner, through the gate: the profile is
+    // read-only, so `P` on a shard channel sends nothing to any node.
+    let s = app.session.as_ref().unwrap();
+    let op = crate::write::WriteOp::SPublish {
+        channel: "foo".into(),
+        message: crate::value::Raw::from("hi"),
+    };
+    assert_eq!(super::app::views::write_dest(s, &op), Ok(Dest::key("foo")));
+    let rows = app.views.pubsub.rows_len();
+    for _ in 0..rows {
+        let effects = app.handle_key(ch('P'));
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                Effect::Live {
+                    req: LiveRequest::Write(_),
+                    ..
+                }
+            )),
+            "{effects:?}"
+        );
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(ch('j'));
+    }
+}
+
+#[test]
+fn a_shard_subscribe_runs_on_the_channels_owner_and_refuses_a_pattern() {
+    let (mut app, _) = live_cluster();
+    super::app::views::testing::show(&mut app, Screen::PubSub);
+    press(&mut app, "S");
+    let mut effects = Vec::new();
+    for c in "orders:*".chars() {
+        effects.extend(app.handle_key(ch(c)));
+    }
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::Subscribe { .. })),
+        "{effects:?}"
+    );
+    let all = text(&render(&app, 120, 36));
+    assert!(all.contains("a pattern can't be shard-subscribed"), "{all}");
+    // The input stays open: a channel name subscribes on its slot's owner.
+    for _ in 0.."orders:*".len() {
+        app.handle_key(key(KeyCode::Backspace));
+    }
+    let mut effects = app.handle_key(ch('f'));
+    effects.extend(press_all(&mut app, "oo"));
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    let subs: Vec<_> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Subscribe { to, node, .. } => Some((to.clone(), *node)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        subs,
+        [(crate::live::pubsub::Subscription::Shard("foo".into()), 2)]
     );
 }

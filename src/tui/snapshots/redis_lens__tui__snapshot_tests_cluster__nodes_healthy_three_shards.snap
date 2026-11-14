@@ -6,7 +6,7 @@ expression: t.backend()
 " redis-lens 0.1.0    PROD   prod-cache-01  cluster · 3 shards  read-only                   ● scan complete 14:02:11 UTC "
 " Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                           "
 "  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
-"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes                                          tab next panel "
+"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  ·  Slots                                tab next panel "
 "┌─ Nodes ────────────────────────────────────────────────────── 3 shards · slot order · enter shows a node's patterns ─┐"
 "│ SLOTS        ENDPOINT                ROLE     STATUS      KEYS  SAMPLED   MEMORY  NOTE                               │"
 "│ 0-5460       10.0.1.11:6379          primary  scanned    3.17M      40K     5.9G                                     │"

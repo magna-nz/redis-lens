@@ -1,0 +1,28 @@
+---
+source: src/tui/snapshot_tests_cluster.rs
+expression: t.backend()
+---
+" redis-lens 0.1.0    PROD   prod-cache-01  cluster · 3 shards  read-only        "
+" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
+"  0   1 Patterns   2   3   4   5   6                                            "
+"┌─ Patterns › session:{uuid} ─── SCAN MATCH session:* · 3 of 3 nodes · 5 loa… ─┐"
+"│ KEY                   NODE            TYPE         TTL    SIZE▼  LENGTH  LFU │"
+"│ user:1:cart           10.0.1.11:6379  hash        none    512B        4    — │"
+"│ user:2:cart           10.0.1.12:6379  hash        none    512B        4    — │"
+"│ user:3:cart           10.0.1.12:6379  hash        none    512B        4    — │"
+"│ user:4:cart           10.0.1.13:6379  hash        none    512B        4    — │"
+"│ user:5:cart           10.0.1.13:6379  hash        none    512B        4    — │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"┌─ user:1:cart ───────────────────────────────────────────────────────── hash ─┐"
+"│ ENCODING listpack   LENGTH 4 fields                                          │"
+"│ SIZE     512B   TTL none   LFU —                                             │"
+"│ PATTERN  session:{uuid}   NODE 10.0.1.11:6379                                │"
+"│                                                                              │"
+"│ All 5 keys of this pattern are loaded.                                       │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" All 5 matching keys are loaded.                                                "
