@@ -1,6 +1,5 @@
 ---
 source: src/tui/dbs.rs
-assertion_line: 797
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " myapp-redis-1   LOCAL   writes on   15G / 24G             ● analyzed 14:02 UTC "
@@ -11,7 +10,7 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│ 7.92M keys · 15G used                                                        │"
 "│                                                                              │"
 "│ THINGS TO LOOK AT                                                            │"
-"│ › ▲ 12┌─ Databases ────────────────────────────────────── container ─┐       │"
+"│ › ▲ 12┌─ Switch database ──────────────────────────────── container ─┐       │"
 "│   ▲ 31│ Database                                      Keys  Expires  │       │"
 "│   ● tm│ db 0 (current)                                   4        1  │       │"
 "│   ● qu│ db 3                                             7        2  │       │"

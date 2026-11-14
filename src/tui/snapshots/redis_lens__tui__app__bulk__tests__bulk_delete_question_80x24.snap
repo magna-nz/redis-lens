@@ -1,6 +1,5 @@
 ---
 source: src/tui/bulk.rs
-assertion_line: 1655
 expression: t.backend()
 ---
 " prod-cache-01   LOCAL   writes on   15G / 24G             ● analyzed 14:02 UTC "
@@ -10,18 +9,18 @@ expression: t.backend()
 "│ PATTERN         TYPE       KEYS   MEMORY▼     %      AVG  NO TTL  VERDICT    │"
 "│   session:{uui… string    1.84M     6.1G    46%     3.5K      0%  ok         │"
 "│ ▾ cache:*       string    1.34M     3.6G    27%     2.8K     10%  mixed      │"
-"│ ┌─ Delete every key of the pattern ──────────────────────── prod-cache-01 ─┐ │"
-"│ │ Pattern user:{id}:cart                                                   │ │"
-"│ │ Dry run: 3,120 keys of the pattern will be deleted with UNLINK.          │ │"
-"│ │ 2 other keys matched the glob but belong to other patterns: left alone.  │ │"
-"│ │ This can't be undone.                                                    │ │"
-"└─│                                                                          │─┘"
-"┌─│ Sends: UNLINK <key>  for each key of SCAN MATCH user:*:cart, 500 at a ti │─┐"
-"│ │ me                                                                       │ │"
-"│ │                                                                          │ │"
-"│ │                                                                          │ │"
-"│ │ y Delete   n Cancel                                                      │ │"
-"│ └──────────────────────────────────────────────────────────────────────────┘ │"
+"│ ┌─ Delete every key of the pattern? ────────────────────── prod-cache-01 ─┐  │"
+"│ │ Pattern user:{id}:cart                                                  │  │"
+"│ │ Dry run: 3,120 keys of the pattern will be deleted with UNLINK.         │  │"
+"│ │ 2 other keys matched the glob but belong to other patterns: left alone. │  │"
+"│ │ This can't be undone.                                                   │t │"
+"└─│                                                                         │──┘"
+"┌─│ Sends: UNLINK <key>  for each key of SCAN MATCH user:*:cart, 500 at a   │ ─┐"
+"│ │        time                                                             │  │"
+"│ │                                                                         │  │"
+"│ │                                                                         │  │"
+"│ │ y Delete   n Cancel                                                     │  │"
+"│ └─────────────────────────────────────────────────────────────────────────┘  │"
 "│ user:500917:cart         2.6K   4d 02h   ▅▅▅  ·    ▁▁▁  ▁▁▁  ███  ·    ·     │"
 "│ ▲ 31% never expire while the rest do. A write path probably skips EXPIRE.    │"
 "│ $ redis-cli --scan --pattern "user:*:cart"                                   │"

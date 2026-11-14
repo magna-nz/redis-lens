@@ -1,6 +1,5 @@
 ---
 source: src/tui/views/server.rs
-assertion_line: 3456
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " prod-cache-01   STAGE   writes on   15G / 24G             ● analyzed 14:02 UTC "
@@ -8,7 +7,7 @@ expression: "testing::render(&app, 80, 24).backend()"
 "    Clients  ·  Slow log  ·  Monitor                                            "
 "┌─ Monitor ────────────────────────────────────────────────────── not started ─┐"
 "│ enter starts MONITOR, after asking. It shows every command the server runs.  │"
-"│ TIME         DB  CLIENT                COMMAND                               │"
+"│ TIME          COMMAND                                                        │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
@@ -20,8 +19,8 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
-"└──────────────────────────────────────────────────────────────────────────────┘"
-"┌─ Line ───────────────────────────────────────────────────────────────────────┐"
+"├─ Line ───────────────────────────────────────────────────────────────────────┤"
+"│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"

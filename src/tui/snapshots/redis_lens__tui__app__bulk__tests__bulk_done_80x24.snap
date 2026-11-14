@@ -1,6 +1,5 @@
 ---
 source: src/tui/bulk.rs
-assertion_line: 1672
 expression: t.backend()
 ---
 " prod-cache-01   LOCAL   writes on   15G / 24G             ● analyzed 14:02 UTC "
@@ -11,15 +10,15 @@ expression: t.backend()
 "│   session:{uui… string    1.84M     6.1G    46%     3.5K      0%  ok         │"
 "│ ▾ cache:*       string    1.34M     3.6G    27%     2.8K     10%  mixed      │"
 "│     cache:sear… string    1.12M     2.2G    16%     2.1K   ▲ 12%  mixed      │"
-"│ ┌─ Set a TTL on every key of the pattern ────────────────── prod-cache-01 ─┐ │"
-"│ │ Pattern user:{id}:cart                                                   │ │"
-"│ │ Stopped with esc after the batch: set a TTL of 24h on 1,000 keys of user │ │"
-"│ │ :{id}:cart.                                                              │ │"
-"└─│ Key names: /data/bulk/p-0123/20250101T000000Z-expire.txt                 │─┘"
-"┌─│ PERSIST on those keys undoes it.                                         │─┐"
-"│ │                                                                          │ │"
-"│ │ enter esc Close                                                          │ │"
-"│ └──────────────────────────────────────────────────────────────────────────┘ │"
+"│   ┌─ Set a TTL on every key of the pattern ───────────── prod-cache-01 ─┐    │"
+"│ ▾ │ Pattern user:{id}:cart                                              │    │"
+"│   │ Stopped with esc after the batch: set a TTL of 24h on 1,000 keys of │    │"
+"│   │ user:{id}:cart.                                                     │ent │"
+"└───│ Key names: /data/bulk/p-0123/20250101T000000Z-expire.txt            │────┘"
+"┌─ u│ PERSIST on those keys undoes it.                                    │2G ─┐"
+"│ SA│                                                                     │    │"
+"│ us│ enter esc Close                                                     │    │"
+"│ us└─────────────────────────────────────────────────────────────────────┘    │"
 "│ user:88213:cart          3.1K   6d 23h   TTL REMAINING                       │"
 "│ user:73:cart             2.9K   none     none <1m  <1h  <1d  <7d  <30d >30d  │"
 "│ user:500917:cart         2.6K   4d 02h   ▅▅▅  ·    ▁▁▁  ▁▁▁  ███  ·    ·     │"

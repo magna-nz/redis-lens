@@ -196,7 +196,7 @@ fn connections_detail_shows_the_provider_notice() {
         "{text}"
     );
     assert!(
-        text.contains("PROD · saved profile · ElastiCache Serverless"),
+        text.contains("PROD · saved · ElastiCache Serverless"),
         "{text}"
     );
     insta::assert_snapshot!(t.backend());
@@ -255,7 +255,7 @@ fn no_notice_without_a_provider_that_degrades() {
     profiles[0].provider = Some(Provider::Elasticache);
     let mut app = App::new(profiles);
     let text = buffer_lines(&render(&app, 120, 36)).join("\n");
-    assert!(text.contains("saved profile · ElastiCache"), "{text}");
+    assert!(text.contains("saved · ElastiCache"), "{text}");
     assert!(!text.contains('▲'), "{text}");
     connect_selected(&mut app);
     let text = buffer_lines(&render(&app, 120, 36)).join("\n");
@@ -332,12 +332,16 @@ fn no_strip_without_a_server_context() {
 fn connections_memory_stats_only_denied() {
     let mut app = scanned(report_with_context(), perms_stats_denied());
     app.handle_key(ch('0'));
+    // One sentence by default; `v` lists each check.
+    let t = render(&app, 120, 36);
+    let text = buffer_lines(&t).join("\n");
+    assert!(
+        text.contains("Limited: the server refused MEMORY STATS, so the share of memory"),
+        "{text}"
+    );
+    app.handle_key(ch('v'));
     let t = render(&app, 120, 36);
     let text = buffer_lines(&t).join("\n");
     assert!(text.contains("✗ MEMORY STATS"), "{text}");
-    assert!(
-        text.contains("MEMORY STATS is denied, so Patterns can't say how much"),
-        "{text}"
-    );
     insta::assert_snapshot!(t.backend());
 }

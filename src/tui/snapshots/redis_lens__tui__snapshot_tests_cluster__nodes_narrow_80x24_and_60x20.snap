@@ -1,29 +1,28 @@
 ---
 source: src/tui/snapshot_tests_cluster.rs
-assertion_line: 235
 expression: snap
 ---
 80x24:
  prod-cache-01   PROD   read-only   cluster · 3 shards ·…  ● analyzed 14:02 UTC 
   0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    
     Big keys  ·  Expiry  ·  Changes  ·  Hot keys  ·  Nodes  ·  Slots            
-┌─ Nodes ─── 3 shards · 1 failed · 1 partial · slot order · enter shows a no… ─┐
-│ SLOTS        ENDPOINT         ROLE     STATUS      KEYS  SAMPLED   MEMORY    │
-│ 0-5460       10.0.1.11:6379   primary  scanned    3.17M      40K     5.9G    │
-│ 5461-10922   10.0.1.12:6379   primary  ▲ partial  2.77M     7.0K     5.2G    │
-│ 10923-16383  10.0.1.13:6379   primary  ✗ failed       —        —        —    │
+┌─ Nodes ──────────────────────────────────── 3 shards · 1 failed · 1 partial ─┐
+│ SLOTS             NODE             ROLE     STATE          KEYS  MEMORY      │
+│ 0-5460            10.0.1.11:6379   primary  ✓ analyzed    3.17M    5.9G      │
+│ 5461-10922        10.0.1.12:6379   primary  ▲ partial     2.77M    5.2G      │
+│ 10923-16383       10.0.1.13:6379   primary  ✗ failed          —       —      │
+├─ 10.0.1.11:6379 ──────────────────────────────────────── primary · analyzed ─┤
+│ Node    a1f3c9e27b4d6e8f0a2c4e6b8d0f1a3c5e7b9d21                             │
+│ Slots   0-5460 (5,461 slots)                                                 │
+│ Server  Redis 7.4.2 · 3.17M keys · 5.9G of 8.0G                              │
+│ Sample  40,000 of the 100,000 analyzed keys, 9 patterns                      │
+│                                                                              │
+│ enter shows only this node's patterns in Browse; esc there shows all again.  │
 │                                                                              │
 │                                                                              │
 │                                                                              │
 │                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-┌─ 10.0.1.11:6379 ───────────────────────────────────────── primary · scanned ─┐
-│ NODE                                                                         │
-│ ID        a1f3c9e27b4d6e8f0a2c4e6b8d0f1a3c5e7b9d21                           │
-│ Slots     0-5460 (5,461 slots)                                               │
-│ Server    Redis 7.4.2 · 3,168,000 keys · 5.9G used / 8.0G                    │
-│ Sampled   40,000 keys · 9 patterns                                           │
-│ enter shows this node's own patterns on 1 Patterns; esc there goes back.     │
+│                                                                              │
 │                                                                              │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
@@ -33,19 +32,19 @@ expression: snap
  prod-cache-01   PROD   read-only      ● analyzed 14:02 UTC 
   0  │  1   2   3 Analyze   4   5                           
   Big keys · Expiry · Changes · Hot keys · Nodes · Slots    
-┌─ Nodes ─── 3 shards · 1 failed · 1 partial · slot orde… ─┐
-│ SLOTS        ENDPOINT         ROLE     STATUS      KEYS  │
-│ 0-5460       10.0.1.11:6379   primary  scanned    3.17M  │
-│ 5461-10922   10.0.1.12:6379   primary  ▲ partial  2.77M  │
-│ 10923-16383  10.0.1.13:6379   primary  ✗ failed       —  │
-└──────────────────────────────────────────────────────────┘
-┌─ 10.0.1.11:6379 ───────────────────── primary · scanned ─┐
-│ NODE                                                     │
-│ ID        a1f3c9e27b4d6e8f0a2c4e6b8d0f1a3c5e7b9d21       │
-│ Slots     0-5460 (5,461 slots)                           │
-│ Server    Redis 7.4.2 · 3,168,000 keys · 5.9G used / 8.0G│
-│ Sampled   40,000 keys · 9 patterns                       │
-│ enter shows this node's own patterns on 1 Patterns; esc …│
+┌─ Nodes ──────────────── 3 shards · 1 failed · 1 partial ─┐
+│ SLOTS             NODE             ROLE     STATE        │
+│ 0-5460            10.0.1.11:6379   primary  ✓ analyzed   │
+│ 5461-10922        10.0.1.12:6379   primary  ▲ partial    │
+│ 10923-16383       10.0.1.13:6379   primary  ✗ failed     │
+├─ 10.0.1.11:6379 ──────────────────── primary · analyzed ─┤
+│ Node    a1f3c9e27b4d6e8f0a2c4e6b8d0f1a3c5e7b9d21         │
+│ Slots   0-5460 (5,461 slots)                             │
+│ Server  Redis 7.4.2 · 3.17M keys · 5.9G of 8.0G          │
+│ Sample  40,000 of the 100,000 analyzed keys, 9 patterns  │
+│                                                          │
+│ enter shows only this node's patterns in Browse; esc     │
+│ there shows all again.                                   │
 │                                                          │
 │                                                          │
 └──────────────────────────────────────────────────────────┘

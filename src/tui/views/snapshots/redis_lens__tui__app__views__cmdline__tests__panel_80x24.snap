@@ -1,6 +1,5 @@
 ---
 source: src/tui/views/cmdline.rs
-assertion_line: 2054
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
@@ -16,8 +15,8 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│     user:{id}:… hash       388K     1.2G     9%     3.2K   ▲ 31%  mixed      │"
 "│     user:{id}:… hash       412K     553M     4%     1.4K    100%  persistent │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-"┌─ Command line ─────────────────────────── readonly commands · prod-cache-01 ─┐"
-"│ > XREAD STREAMS s 0                                                          │"
+"┌─ : Command line ────────────── prod-cache-01 · read-only: readonly commands ─┐"
+"│ › XREAD STREAMS s 0                                                          │"
 "│ 1) 1) "s"                                                                    │"
 "│    2) 1) 1) "1-0"                                                            │"
 "│          2) 1) "f"                                                           │"

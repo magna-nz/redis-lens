@@ -367,8 +367,13 @@ mod tests {
         }));
         testing::reply(&mut app, id, reply);
         let screen = format!("{:?}", testing::render(&app, 120, 36).backend());
+        // The sentence wraps in the detail pane: its parts, not its line breaks.
         assert!(
-            screen.contains("the server refused OBJECT ENCODING for this user"),
+            screen.contains("Without it, some rules are skipped"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("server refused OBJECT ENCODING"),
             "{screen}"
         );
         assert!(!screen.contains("reading lengths"), "{screen}");

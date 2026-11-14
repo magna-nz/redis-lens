@@ -1,0 +1,28 @@
+---
+source: src/tui/ui/connections.rs
+expression: s
+---
+" redis-lens 0.1.0   not connected                 pick a connection, then enter "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"┌─ Connections ────────────────────────────────────────────────────────────────┐"
+"│                                                                              │"
+"│ No saved connections yet.                                                    │"
+"│                                                                              │"
+"│ a  Add one: paste a redis:// or rediss:// URL, or a StackExchange.Redis      │"
+"│    string. The password goes to the OS keychain, never to a file.            │"
+"│                                                                              │"
+"│ Redis and Valkey containers running in Docker show up here by themselves.    │"
+"│ DOCKER · searching…                                                          │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" ↑↓ Move   enter Connect   a Add   w Writes   / Filter                    ? Help"

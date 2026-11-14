@@ -1,6 +1,5 @@
 ---
 source: src/tui/confirm.rs
-assertion_line: 890
 expression: t.backend()
 ---
 " prod-cache-01   PROD    WRITES ON    15G / 24G            ● analyzed 14:02 UTC "
@@ -10,17 +9,17 @@ expression: t.backend()
 "│ Type        hash           ││ ⠋ Reading the value…                           │"
 "│ Encoding    listpack       ││                                                │"
 "│ Fields      12             ││                                                │"
-"│ ┌─ Delete key ────────────────────────────────────── prod-cache-01 · PROD ─┐ │"
-"│ │ Key user:10293:cart                                                      │ │"
-"│ │ This can't be undone.                                                    │ │"
-"│ │                                                                          │ │"
-"│ │ Sends: UNLINK user:10293:cart                                            │ │"
-"│ │                                                                          │ │"
-"│ │ Type user:10293:cart and press enter to send it:                         │ │"
-"│ │ › ▏                                                                      │ │"
-"│ │                                                                          │ │"
-"│ │ enter Delete   esc Cancel                                                │ │"
-"│ └──────────────────────────────────────────────────────────────────────────┘ │"
+"│ Size        ┌─ Delete this key? ──────── prod-cache-01 · PROD ─┐             │"
+"│ TTL         │ Key user:10293:cart                              │             │"
+"│ LFU         │ This can't be undone.                            │             │"
+"│ Pattern     │                                                  │             │"
+"│ Verdict     │ Sends: UNLINK user:10293:cart                    │             │"
+"│             │                                                  │             │"
+"│             │ Type user:10293:cart and press enter to send it: │             │"
+"│             │ › ▏                                              │             │"
+"│             │                                                  │             │"
+"│             │ enter Delete   esc Cancel                        │             │"
+"│             └──────────────────────────────────────────────────┘             │"
 "│                            ││                                                │"
 "│                            ││                                                │"
 "│                            ││                                                │"

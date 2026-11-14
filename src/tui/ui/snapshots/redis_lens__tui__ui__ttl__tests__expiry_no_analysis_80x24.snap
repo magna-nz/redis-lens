@@ -1,0 +1,28 @@
+---
+source: src/tui/ui/ttl.rs
+expression: s
+---
+" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys          ● connected "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys                                "
+"┌─ Expiry ───────────────────────────────────────────── waits for an analysis ─┐"
+"│                                                                              │"
+"│ No analysis yet.                                                             │"
+"│                                                                              │"
+"│ Expiry ranks patterns by TTL risk. It needs a sample of the keys:            │"
+"│                                                                              │"
+"│   r  Analyze: 10,000 keys, about 40K read-only commands, about 8 s           │"
+"│      (or 100,000 keys, about 80 s, for rare patterns and big keys)           │"
+"│                                                                              │"
+"│ What the server reports without a sample is on Overview (1): the key count,  │"
+"│ the share of keys with a TTL, and what keeps memory busy.                    │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" r Analyze   tab Next panel                                    : Command  ? Help"

@@ -1,6 +1,5 @@
 ---
 source: src/tui/views/slots_tests.rs
-assertion_line: 503
 expression: render(&app)
 ---
 " prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
@@ -15,8 +14,8 @@ expression: render(&app)
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
-"└──────────────────────────────────────────────────────────────────────────────┘"
-"┌─ Details ────────────────────────────────────────────────────────────────────┐"
+"│                                                                              │"
+"│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"

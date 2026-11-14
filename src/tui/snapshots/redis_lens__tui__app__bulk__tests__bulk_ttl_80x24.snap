@@ -1,6 +1,5 @@
 ---
 source: src/tui/bulk.rs
-assertion_line: 1634
 expression: t.backend()
 ---
 " prod-cache-01   STAGE   writes on   15G / 24G             ● analyzed 14:02 UTC "
@@ -11,16 +10,16 @@ expression: t.backend()
 "│   session:{uui… string    1.84M     6.1G    46%     3.5K      0%  ok         │"
 "│ ▾ cache:*       string    1.34M     3.6G    27%     2.8K     10%  mixed      │"
 "│     cache:sear… string    1.12M     2.2G    16%     2.1K   ▲ 12%  mixed      │"
-"│ ┌─ Set a TTL on every key of the pattern ────────────────── prod-cache-01 ─┐ │"
-"│ │ Pattern user:{id}:cart                                                   │ │"
-"│ │ Sets this TTL on each key of the pattern that has none (EXPIRE … NX). A  │ │"
-"│ │ dry run counts the keys first; nothing is written before you confirm.    │ │"
-"└─│                                                                          │─┘"
-"┌─│ TTL (90s, 10m, 24h, 7d):                                                 │─┐"
-"│ │ › 24h▏                                                                   │ │"
-"│ │                                                                          │ │"
-"│ │ enter Dry run   esc Cancel   ctrl-u Clear                                │ │"
-"│ └──────────────────────────────────────────────────────────────────────────┘ │"
+"│ ┌─ Set a TTL on every key of the pattern? ──────────────── prod-cache-01 ─┐  │"
+"│ │ Pattern user:{id}:cart                                                  │  │"
+"│ │ Sets this TTL on each key of the pattern that has none (EXPIRE … NX). A │  │"
+"│ │ dry run counts the keys first; nothing is written before you confirm.   │t │"
+"└─│                                                                         │──┘"
+"┌─│ TTL (90s, 10m, 24h, 7d):                                                │ ─┐"
+"│ │ › 24h▏                                                                  │  │"
+"│ │                                                                         │  │"
+"│ │ enter Dry run   esc Cancel   ctrl-u Clear                               │  │"
+"│ └─────────────────────────────────────────────────────────────────────────┘  │"
 "│ user:73:cart             2.9K   none     none <1m  <1h  <1d  <7d  <30d >30d  │"
 "│ user:500917:cart         2.6K   4d 02h   ▅▅▅  ·    ▁▁▁  ▁▁▁  ███  ·    ·     │"
 "│ ▲ 31% never expire while the rest do. A write path probably skips EXPIRE.    │"
