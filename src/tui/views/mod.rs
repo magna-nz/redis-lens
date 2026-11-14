@@ -939,3 +939,63 @@ pub mod testing {
         (s.id, s.scan)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::live::cmdline::{Args, CommandInfo};
+    use crate::model::NodeRole;
+
+    /// A cluster session of three primaries, `picked` as given.
+    fn cluster(picked: usize) -> crate::tui::app::App {
+        let mut app = testing::scanned();
+        let s = app.session.as_mut().unwrap();
+        s.nodes = crate::tui::fixtures::live_nodes();
+        s.picked = picked;
+        app
+    }
+
+    #[test]
+    fn a_keyless_write_is_refused_when_the_picked_node_is_a_replica() {
+        let keyless: Vec<WriteOp> = vec![
+            WriteOp::ClientKill { id: 7 },
+            WriteOp::SlowlogReset,
+            WriteOp::Publish {
+                channel: "c".into(),
+                message: crate::value::Raw::from("m"),
+            },
+            WriteOp::FtDropIndex { index: "i".into() },
+            // A typed command without keys.
+            WriteOp::Command {
+                args: Args::new(vec![b"FLUSHALL".to_vec()]),
+                info: CommandInfo {
+                    name: "flushall".into(),
+                    flags: vec!["write".into()],
+                    categories: vec!["@keyspace".into(), "@dangerous".into()],
+                    ..CommandInfo::default()
+                },
+            },
+        ];
+        let mut app = cluster(1);
+        for op in &keyless {
+            // On a primary: the picked node.
+            let s = app.session.as_ref().unwrap();
+            let dest = write_dest(s, op).unwrap_or_else(|e| panic!("{op:?}: {e}"));
+            assert_eq!(dest.to, crate::live::To::Node(1), "{op:?}");
+        }
+        app.session.as_mut().unwrap().nodes[1].role = NodeRole::Replica;
+        for op in &keyless {
+            let s = app.session.as_ref().unwrap();
+            let err = write_dest(s, op).expect_err(&format!("{op:?}"));
+            assert!(err.contains(REPLICA_NO_WRITES), "{op:?}: {err}");
+        }
+        // The other nodes still take them.
+        app.session.as_mut().unwrap().picked = 0;
+        for op in &keyless {
+            assert!(
+                write_dest(app.session.as_ref().unwrap(), op).is_ok(),
+                "{op:?}"
+            );
+        }
+    }
+}

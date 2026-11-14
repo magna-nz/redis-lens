@@ -1464,6 +1464,52 @@ mod tests {
     }
 
     #[test]
+    fn grant_re_checks_the_gate_for_a_typed_write() {
+        let op = |line: &str, name: &str| WriteOp::Command {
+            args: Args::new(line.split(' ').map(|w| w.as_bytes().to_vec()).collect()),
+            info: CommandInfo {
+                name: name.into(),
+                flags: vec!["write".into()],
+                categories: vec!["@write".into(), "@string".into()],
+                ..CommandInfo::default()
+            },
+        };
+        let none = Refusals::default();
+        let set = op("DEL k", "del");
+        // Writes off (read-only), and prod's default: no permit, whatever was answered.
+        for p in [
+            profile(Env::Local, Some(true)),
+            profile(Env::Prod, Some(true)),
+            profile(Env::Prod, None),
+        ] {
+            for a in [Answer::None, Answer::Yes, Answer::Typed("k".into())] {
+                assert!(
+                    Permit::grant(set.clone(), &p, &SKIP, &none, &a).is_err(),
+                    "{p:?} {a:?}"
+                );
+            }
+        }
+        // Prod with writes on asks for the name: not without it, not the wrong one.
+        let prod = profile(Env::Prod, Some(false));
+        for a in [Answer::None, Answer::Yes, Answer::Typed("other".into())] {
+            assert!(
+                Permit::grant(set.clone(), &prod, &ON, &none, &a).is_err(),
+                "{a:?}"
+            );
+        }
+        let ok = Permit::grant(set.clone(), &prod, &ON, &none, &Answer::Typed("k".into()));
+        assert_eq!(ok.unwrap().op(), &set);
+        // A command the server refused for this user stays refused.
+        let mut refused = Refusals::default();
+        refused.add("DEL");
+        let local = profile(Env::Local, None);
+        assert!(Permit::grant(set.clone(), &local, &ON, &refused, &Answer::Yes).is_err());
+        // The command line's own list (a script) is refused on every profile.
+        let eval = op("EVAL x 0", "eval");
+        assert!(Permit::grant(eval, &local, &SKIP, &none, &Answer::Yes).is_err());
+    }
+
+    #[test]
     fn the_prompt_line_masks_credentials_and_escapes() {
         let config = CommandInfo {
             name: "config".into(),
