@@ -141,8 +141,7 @@ impl Area {
 }
 
 /// A panel of an area: one sub-tab. A panel shows one [`Screen`] at a time; Browse ›
-/// Keys goes deeper (patterns, a pattern's keys, a key's value) and Analyze › Expiry
-/// has the forecast one level down.
+/// Keys goes deeper (patterns, a pattern's keys, a key's value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Panel {
     Keys,
@@ -243,10 +242,9 @@ pub enum Screen {
     Streams,
     Search,
     BigKeys,
-    /// Analyze › Expiry: patterns ranked by TTL risk (the former TTL panel).
+    /// Analyze › Expiry: patterns ranked by TTL risk, with the memory TTLs free over
+    /// time in the same panel.
     Ttl,
-    /// Analyze › Expiry, `→`: the expiry forecast ([`views::analysis`]).
-    Expiry,
     /// Analyze › Changes: the diff against the last snapshot.
     Diff,
     HotKeys,
@@ -262,7 +260,7 @@ pub enum Screen {
 }
 
 impl Screen {
-    pub const ALL: [Screen; 18] = [
+    pub const ALL: [Screen; 17] = [
         Screen::Connections,
         Screen::Overview,
         Screen::Patterns,
@@ -272,7 +270,6 @@ impl Screen {
         Screen::Search,
         Screen::BigKeys,
         Screen::Ttl,
-        Screen::Expiry,
         Screen::Diff,
         Screen::HotKeys,
         Screen::Nodes,
@@ -300,7 +297,7 @@ impl Screen {
             Self::Streams => Panel::Streams,
             Self::Search => Panel::Search,
             Self::BigKeys => Panel::BigKeys,
-            Self::Ttl | Self::Expiry => Panel::Expiry,
+            Self::Ttl => Panel::Expiry,
             Self::Diff => Panel::Changes,
             Self::HotKeys => Panel::HotKeys,
             Self::Nodes => Panel::Nodes,
@@ -333,7 +330,6 @@ impl Screen {
             Self::Search => "Browse › Search",
             Self::BigKeys => "Analyze › Big keys",
             Self::Ttl => "Analyze › Expiry",
-            Self::Expiry => "Analyze › Expiry › forecast",
             Self::Diff => "Analyze › Changes",
             Self::HotKeys => "Analyze › Hot keys",
             Self::Nodes => "Analyze › Nodes",
@@ -346,7 +342,7 @@ impl Screen {
     }
 
     /// The view state that owns this screen, `None` for the screens `App` draws and
-    /// handles itself (Connections, Patterns, Expiry's ranking, Changes, Hot keys and
+    /// handles itself (Connections, Patterns, Expiry, Changes, Hot keys and
     /// Nodes). Overview's live figures are the Server view state's: its poll runs while
     /// Overview is on screen.
     pub fn owner(self) -> Option<Owner> {
@@ -361,7 +357,7 @@ impl Screen {
             }
             Self::KeyList => Owner::Keys,
             Self::KeyDetail => Owner::Value,
-            Self::BigKeys | Self::Expiry => Owner::Analysis,
+            Self::BigKeys => Owner::Analysis,
             Self::Slots => Owner::Slots,
             Self::Overview | Self::Clients | Self::SlowLog | Self::Monitor => Owner::Server,
             Self::Streams => Owner::Streams,
@@ -375,13 +371,7 @@ impl Screen {
     pub fn is_scan_view(self) -> bool {
         matches!(
             self,
-            Self::Patterns
-                | Self::BigKeys
-                | Self::Ttl
-                | Self::Expiry
-                | Self::Diff
-                | Self::HotKeys
-                | Self::Nodes
+            Self::Patterns | Self::BigKeys | Self::Ttl | Self::Diff | Self::HotKeys | Self::Nodes
         )
     }
 
@@ -1130,8 +1120,6 @@ pub struct App {
     pub browse_panel: Panel,
     pub analyze_panel: Panel,
     pub server_panel: Panel,
-    /// Analyze › Expiry shows the forecast (`→` on the ranking, `←` back).
-    pub expiry_forecast: bool,
     /// `v`: more columns and details, per area. Views read it as [`Ctx::more`].
     pub more: More,
     /// Overview's own state: the selected finding.
@@ -1161,12 +1149,9 @@ pub struct App {
     /// the header shows. The app never reads a clock itself.
     wall: Option<i64>,
     pub tick: u64,
-    /// List rows visible on screen, set by the runtime from the terminal size (see
-    /// [`App::set_list_rows`]). PgUp and PgDn move this far.
+    /// List rows the screen on show draws, set by the runtime from the terminal size and
+    /// the screen (see [`App::set_list_rows`]). PgUp and PgDn move this far.
     list_rows: usize,
-    /// The same for Browse, whose lists fill the frame's height (see
-    /// [`App::set_browse_rows`]).
-    browse_rows: usize,
     /// The value of `tick` when the selected row last changed. The marquee that scrolls
     /// a long selected name counts from here (see [`App::sel_ticks`]).
     sel_since: u64,
@@ -1387,7 +1372,6 @@ impl App {
             browse_panel: Panel::Keys,
             analyze_panel: Panel::BigKeys,
             server_panel: Panel::Clients,
-            expiry_forecast: false,
             more: More::default(),
             overview: Default::default(),
             analyze: None,
@@ -1407,7 +1391,6 @@ impl App {
             wall: None,
             tick: 0,
             list_rows: 0,
-            browse_rows: 0,
             sel_since: 0,
             sel_id: SelId::default(),
             now: None,
@@ -1722,43 +1705,32 @@ impl App {
                 r.server.maxmemory_policy
             )
         } else if r.sampled_keys == 0 {
-            "The scan sampled no keys.".to_string()
+            "The analysis sampled no keys.".to_string()
         } else {
             "No sampled key has an LFU counter above 0 yet.".to_string()
         })
     }
 
-    /// Sets how many list rows the screen shows, the page for PgUp and PgDn. The
-    /// runtime calls it on every frame with `ui::list_rows` of the terminal area.
+    /// Sets how many list rows the screen on show draws, the page for PgUp and PgDn.
+    /// The runtime calls it after every frame with `ui::list_rows` of the terminal area
+    /// and the screen just drawn.
     pub fn set_list_rows(&mut self, rows: usize) {
         self.list_rows = rows;
     }
 
-    /// Sets how many list rows a Browse list shows, the page for PgUp and PgDn there.
-    /// The runtime calls it on every frame with `ui::browse_rows` of the terminal area.
-    pub fn set_browse_rows(&mut self, rows: usize) {
-        self.browse_rows = rows;
-    }
-
-    /// How far PgUp and PgDn move: the visible list rows, at least one. On an area
-    /// with panels the sub-tab row takes one of the rows `ui::list_rows` counts; Browse
-    /// has its own count.
+    /// How far PgUp and PgDn move: the visible list rows, at least one.
     fn page(&self) -> usize {
-        if self.area == Area::Browse && self.browse_rows > 0 {
-            return self.browse_rows;
-        }
-        let panel_row = usize::from(self.area.has_panels());
-        self.list_rows.saturating_sub(panel_row).max(1)
+        self.list_rows.max(1)
     }
 
-    /// Sets the wall clock, in Unix seconds. The runtime calls it with every tick; the
-    /// header shows the time a run connected from it.
     /// The wall clock from [`App::set_wall_clock`], in Unix seconds (UTC); `None`
-    /// before the first tick, and in tests that set none.
+    /// before the runtime set it, and in tests that set none.
     pub fn wall_clock(&self) -> Option<i64> {
         self.wall
     }
 
+    /// Sets the wall clock, in Unix seconds. The runtime calls it at start and with
+    /// every tick; the header shows the time a run connected from it.
     pub fn set_wall_clock(&mut self, unix: i64) {
         self.wall = Some(unix);
     }
@@ -1886,15 +1858,13 @@ impl App {
     }
 
     /// The screen `panel` shows when switched to: the key list (or the value over it)
-    /// when it was left open on Browse › Keys, the forecast on Analyze › Expiry, else
-    /// its top screen.
+    /// when it was left open on Browse › Keys, else its top screen.
     fn screen_of(&self, panel: Panel) -> Screen {
         match panel {
             Panel::Keys if self.patterns.keys_open && self.patterns.detail_open => {
                 Screen::KeyDetail
             }
             Panel::Keys if self.patterns.keys_open => Screen::KeyList,
-            Panel::Expiry if self.expiry_forecast => Screen::Expiry,
             p => p.top(),
         }
     }
@@ -1919,13 +1889,9 @@ impl App {
             Area::Analyze => self.analyze_panel = panel,
             _ => self.server_panel = panel,
         }
-        match panel {
-            Panel::Keys => {
-                self.patterns.keys_open = matches!(screen, Screen::KeyList | Screen::KeyDetail);
-                self.patterns.detail_open = screen == Screen::KeyDetail;
-            }
-            Panel::Expiry => self.expiry_forecast = screen == Screen::Expiry,
-            _ => {}
+        if panel == Panel::Keys {
+            self.patterns.keys_open = matches!(screen, Screen::KeyList | Screen::KeyDetail);
+            self.patterns.detail_open = screen == Screen::KeyDetail;
         }
     }
 
@@ -2286,18 +2252,11 @@ impl App {
             Screen::Connections => self.conn_key(key),
             Screen::Overview => self.overview_key(key),
             Screen::Patterns => self.patterns_key(key),
-            Screen::Ttl => {
-                if !self.list_key(key) && is_open(&key) {
-                    return self.switch(Screen::Expiry);
-                }
-                Vec::new()
-            }
-            Screen::Diff | Screen::HotKeys => {
+            Screen::Ttl | Screen::Diff | Screen::HotKeys => {
                 self.list_key(key);
                 Vec::new()
             }
             Screen::Nodes => self.nodes_key(key),
-            Screen::Expiry if is_back(&key) => self.switch(Screen::Ttl),
             Screen::KeyList => {
                 let (handled, mut out) = self.key_to_view(key);
                 if !handled && is_back(&key) {
@@ -2895,7 +2854,7 @@ impl App {
         };
         if n.status == NodeStatus::Failed {
             let text = format!(
-                "{} was not scanned, so it has no patterns to show.",
+                "{} was not analyzed, so it has no patterns to show.",
                 n.endpoint
             );
             self.set_info(text);
@@ -3199,7 +3158,6 @@ impl App {
         self.patterns = PatternsState::default();
         self.sel = ViewSel::default();
         self.overview = Default::default();
-        self.expiry_forecast = false;
         self.analyze = None;
         // The previous session's view states and live requests go with it; nothing is
         // shown from them, so none is told it is hidden.
@@ -3928,7 +3886,7 @@ impl App {
                 self.dbs_closed();
                 if let Some(e) = &error {
                     self.set_error(format!(
-                        "The live connection closed: {e}. The server views stop until the next scan."
+                        "The live connection closed: {e}. The live views stop until the next connect or analysis (r)."
                     ));
                 }
                 if let Some(s) = self.session.as_mut() {
@@ -4019,7 +3977,13 @@ impl App {
                         self.patterns.sel = 0;
                     }
                 }
-                self.set_error(format!("Scan failed: {error}"));
+                // A connect reads no key: only a run of `r` is an analysis.
+                let what = if self.session.as_ref().is_some_and(|s| s.analysis.is_some()) {
+                    "Analysis failed"
+                } else {
+                    "Could not connect"
+                };
+                self.set_error(format!("{what}: {error}"));
             }
             Msg::Saved(profile) => {
                 let id = self.alloc_id();
@@ -5886,7 +5850,7 @@ mod tests {
         let (app, _) = scanned_with(empty, fixtures::perms_ok());
         assert_eq!(
             app.hot_keys_reason().as_deref(),
-            Some("The scan sampled no keys.")
+            Some("The analysis sampled no keys.")
         );
 
         // Nothing to explain before a scan.
@@ -6244,7 +6208,7 @@ mod tests {
         assert_eq!(s.previous, Some(s1));
         assert_eq!(
             app.notice.as_ref().unwrap().text,
-            "Scan failed: connection reset"
+            "Analysis failed: connection reset"
         );
 
         // After partials replaced them, as any failed scan: nothing left.
@@ -7099,10 +7063,9 @@ mod tests {
                 let len = list_len(&app);
                 let last = len - 1;
                 assert!(len >= 5, "{view:?} has {len} rows");
-                // A page of 0 rows (a tiny terminal) still moves one. The panel row of
-                // the tab bar takes one of the rows on Analysis.
-                let panel_row = usize::from(view.area().has_panels());
-                let page = rows.saturating_sub(panel_row).max(1);
+                // A page of 0 rows (a tiny terminal) still moves one; otherwise the
+                // rows the screen draws, as `ui::list_rows` counts them for it.
+                let page = rows.max(1);
                 let at = |app: &App| list_index(app);
                 let ctx = format!("{view:?}, {rows} rows");
                 assert_eq!(at(&app), 0, "{ctx}");
@@ -7165,9 +7128,8 @@ mod tests {
         app.apply(Msg::Tick);
         app.apply(Msg::Tick);
         assert_eq!(app.sel_ticks(), 2);
-        // The sub-tab row of Browse takes one of the two rows.
         app.handle_key(key(KeyCode::PageDown));
-        assert_eq!(app.patterns.sel, 1);
+        assert_eq!(app.patterns.sel, 2);
         assert_eq!(app.sel_ticks(), 0);
         let id = app.selected_row_id();
         // The selected row stays selected when a partial reorders the rows (a rescan).
@@ -7212,14 +7174,11 @@ mod tests {
         app.handle_key(ch('4'));
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.screen(), Screen::SlowLog);
-        // Big keys and the Expiry forecast are the Analysis state's; the Expiry ranking
-        // is App's own: nothing to tell.
+        // Big keys is the Analysis state's; Expiry is App's own: nothing to tell.
         app.handle_key(ch('3'));
         assert_eq!(app.screen(), Screen::BigKeys);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.screen(), Screen::Ttl);
-        app.handle_key(key(KeyCode::Right));
-        assert_eq!(app.screen(), Screen::Expiry);
         app.handle_key(ch('2'));
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.screen(), Screen::Streams);
@@ -7232,8 +7191,6 @@ mod tests {
                 (Owner::Server, "hide"),
                 (Owner::Server, "show"),
                 (Owner::Server, "hide"),
-                (Owner::Analysis, "show"),
-                (Owner::Analysis, "hide"),
                 (Owner::Analysis, "show"),
                 (Owner::Analysis, "hide"),
                 (Owner::Streams, "show"),
@@ -7599,7 +7556,7 @@ mod tests {
                         app.analyze_panel,
                         app.server_panel
                     ),
-                    (app.more, app.expiry_forecast, &app.overview, app.analyze),
+                    (app.more, &app.overview, app.analyze),
                 ),
                 &app.notice,
                 &app.patterns,
@@ -7897,7 +7854,7 @@ mod tests {
         assert!(!n.error);
         assert_eq!(
             n.text,
-            "10.0.1.13:6379 was not scanned, so it has no patterns to show."
+            "10.0.1.13:6379 was not analyzed, so it has no patterns to show."
         );
         // A partial node can be narrowed to: it has results.
         app.handle_key(ch('k'));
@@ -8563,15 +8520,17 @@ mod tests {
     }
 
     #[test]
-    fn right_opens_the_expiry_forecast_and_left_goes_back() {
+    fn expiry_is_one_panel_and_right_stays_on_it() {
         let (mut app, _, _) = finished_with_history();
         show(&mut app, Screen::Ttl);
-        app.handle_key(key(KeyCode::Right));
-        assert_eq!(app.screen(), Screen::Expiry);
+        for k in [KeyCode::Right, KeyCode::Enter, KeyCode::Char('l')] {
+            let out = app.handle_key(key(k));
+            assert!(out.is_empty(), "{k:?}: {out:?}");
+            assert_eq!(app.screen(), Screen::Ttl, "{k:?}");
+        }
+        app.handle_key(ch('2'));
         app.handle_key(ch('3'));
-        assert_eq!(app.screen(), Screen::Expiry, "Analyze keeps its level");
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.screen(), Screen::Ttl);
+        assert_eq!(app.screen(), Screen::Ttl, "Analyze keeps its panel");
     }
 
     #[test]

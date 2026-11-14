@@ -1,8 +1,9 @@
 ---
 source: src/tui/ui/overview.rs
+assertion_line: 1493
 expression: t
 ---
-" prod-cache-01   PROD   read-only   cluster · 3 shards    ● connected 15:00 UTC "
+" prod-cache-01   PROD   read-only   cluster · 3 shards · 15G / 24G  ● connected "
 "  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
 "┌─ node 10.0.1.11:6379 · 1 of 3 ─────────── [ ] picks a node · INFO every 2 s ─┐"
 "│ ops/s         100 ·▄▄▄                 clients        10 ▁█▅▁                │"

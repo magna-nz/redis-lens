@@ -1,8 +1,9 @@
 ---
 source: src/tui/confirm.rs
+assertion_line: 890
 expression: t.backend()
 ---
-" prod-cache-01   PROD    WRITES ON    15G / 24G            ● analyzed 14:02 UTC "
+" prod-cache-01   PROD    WRITES ON    15G / 24G · 7.92M keys   ● analyzed 14:02 "
 "  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
 "    Keys  ·  Streams  ·  Search                                                 "
 "┌─ ‹ session:{uuid} ────────┬─ user:10293:cart ───────────── hash · ⠋ loading ─┐"
@@ -13,7 +14,7 @@ expression: t.backend()
 "│             │ Key user:10293:cart                              │             │"
 "│             │ This can't be undone.                            │             │"
 "│             │                                                  │             │"
-"│             │ Sends: UNLINK user:10293:cart                    │             │"
+"│             │ Sends   UNLINK user:10293:cart                   │             │"
 "│             │                                                  │             │"
 "│             │ Type user:10293:cart and press enter to send it: │             │"
 "│             │ › ▏                                              │             │"

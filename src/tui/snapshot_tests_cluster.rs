@@ -238,6 +238,41 @@ fn nodes_narrow_80x24_and_60x20() {
     insta::assert_snapshot!(snap);
 }
 
+/// PgUp and PgDn on Nodes move by the rows its list shows (`ui::list_rows`): with more
+/// shards than fit, the list section takes what leaves the details their rows, less the
+/// column header, at every size.
+#[test]
+fn nodes_list_rows_is_what_the_list_draws() {
+    let mut report = fixtures::cluster_report();
+    let base = report.nodes.clone().unwrap();
+    report.nodes = Some(
+        (0..60u16)
+            .map(|i| {
+                let mut n = base[usize::from(i) % base.len()].clone();
+                n.id = format!("node-{i}");
+                n.primary_id = n.id.clone();
+                n.endpoint.port = 7000 + i;
+                n
+            })
+            .collect(),
+    );
+    let (mut app, _) = cluster_scanned(report, HEALTHY);
+    show(&mut app, Screen::Nodes);
+    for (w, h) in [(80, 24), (120, 36), (60, 20), (200, 60), (80, 17), (80, 18)] {
+        let rows = ui::list_rows(ratatui::layout::Rect::new(0, 0, w, h), &app);
+        let lines = buffer_lines(&render(&app, w, h));
+        let top = lines.iter().position(|l| l.starts_with('┌')).unwrap();
+        let details = top
+            + 1
+            + lines[top + 1..]
+                .iter()
+                .position(|l| l.starts_with('├') || l.starts_with('└'))
+                .unwrap();
+        // The rows between the borders, less the column header.
+        assert_eq!(details - top - 2, rows, "{w}x{h}:\n{}", lines.join("\n"));
+    }
+}
+
 #[test]
 fn nodes_on_a_standalone_report() {
     let mut report = fixtures::report(true);

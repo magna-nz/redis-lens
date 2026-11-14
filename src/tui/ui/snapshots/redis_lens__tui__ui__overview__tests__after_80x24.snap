@@ -1,8 +1,9 @@
 ---
 source: src/tui/ui/overview.rs
+assertion_line: 1124
 expression: "snap(&app, 80, 24)"
 ---
-" prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
+" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
 "  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
 "┌─ Now ──────────────────────────────────────────── INFO every 2 s · p pauses ─┐"
 "│ ops/s         100 ·▄▄▄                 clients        10 ▁█▅▁                │"

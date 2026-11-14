@@ -1,8 +1,9 @@
 ---
 source: src/tui/views/value.rs
+assertion_line: 1888
 expression: t.backend()
 ---
-" prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
+" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
 "  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
 "    Keys  ·  Streams  ·  Search                                                 "
 "┌─ ‹ user:{id}:cart ────────┬─ board:week ────────────────────────────── zset ─┐"

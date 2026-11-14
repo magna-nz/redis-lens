@@ -1,8 +1,9 @@
 ---
 source: src/tui/ui/ttl.rs
+assertion_line: 402
 expression: small
 ---
-" prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
+" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
 "  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
 "    Big keys  ·  Expiry  ·  Changes  ·  Hot keys                                "
 "┌─ Expiry ─────────────────── riskiest first ─┬─ tmp:import:{ulid} ─── string ─┐"
@@ -25,4 +26,4 @@ expression: small
 "│                                             │ 7 d   █▋░░░░░░░     2.4G   18% │"
 "│                                             │ 30 d  █▋░░░░░░░     2.4G   18% │"
 "└─────────────────────────────────────────────┴────────────────────────────────┘"
-" ↑↓ Move   tab Next panel   → Forecast   s Snapshot            : Command  ? Help"
+" ↑↓ Move   tab Next panel   y Copy   r Analyze   s Snapshot    : Command  ? Help"

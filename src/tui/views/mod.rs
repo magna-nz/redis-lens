@@ -7,7 +7,7 @@
 //! |---|---|---|
 //! | [`keys::KeysState`] | `ui/keys.rs` | Patterns › key list ([`Screen::KeyList`]) |
 //! | [`value::ValueState`] | `ui/value.rs` | Patterns › key detail ([`Screen::KeyDetail`]) |
-//! | [`analysis::AnalysisState`] | `ui/analysis.rs` | Analysis › Big keys, Expiry |
+//! | [`analysis::AnalysisState`] | `ui/analysis.rs` | Analyze › Big keys |
 //! | [`server::ServerState`] | `ui/server.rs` | Server › Overview, Clients, Slow log, Monitor |
 //! | [`streams::StreamsState`] | `ui/streams.rs` | Streams |
 //! | [`pubsub::PubSubState`] | `ui/pubsub.rs` | Pub/Sub |
@@ -71,8 +71,8 @@
 //!
 //! `ui/<view>.rs` has `pub fn draw(frame: &mut Frame, area: Rect, state: &State,
 //! ctx: &Ctx<'_>)`. `area` is the body between the header (with the tab bar) and the
-//! key bar. `ctx.screen` says which panel to draw. Big keys and Expiry are drawn only
-//! once the scan has finished (`ctx.report()` is `Some`).
+//! key bar. `ctx.screen` says which panel to draw. Big keys is drawn only once an
+//! analysis has finished (`ctx.report()` is `Some`).
 //!
 //! # Tests
 //!
@@ -855,10 +855,9 @@ pub mod testing {
     }
 
     /// Goes to `screen` with keys, as a user would: its area's digit, then `tab` to the
-    /// panel; for the key list, `enter` on the first pattern row of Browse › Keys; for
-    /// the Expiry forecast, `→` on Analyze › Expiry. For the key detail, `enter` on the
-    /// key list's selected key; when no key is loaded, [`key_row`] is put into the list
-    /// first.
+    /// panel; for the key list, `enter` on the first pattern row of Browse › Keys. For
+    /// the key detail, `enter` on the key list's selected key; when no key is loaded,
+    /// [`key_row`] is put into the list first.
     pub fn show(app: &mut App, screen: Screen) -> Vec<Effect> {
         if screen == Screen::KeyDetail {
             let mut out = Vec::new();
@@ -893,20 +892,11 @@ pub mod testing {
             app.patterns.sel = first;
             out.extend(app.handle_key(key(KeyCode::Enter)));
         }
-        // The Expiry forecast is one level below Analyze › Expiry.
-        let target = if screen == Screen::Expiry {
-            Screen::Ttl
-        } else {
-            screen
-        };
         for _ in 0..app.panels_of(screen.area()).len() {
-            if app.screen() == target {
+            if app.screen() == screen {
                 break;
             }
             out.extend(app.handle_key(key(KeyCode::Tab)));
-        }
-        if screen == Screen::Expiry && app.screen() == Screen::Ttl {
-            out.extend(app.handle_key(key(KeyCode::Right)));
         }
         assert_eq!(app.screen(), screen);
         out

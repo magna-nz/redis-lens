@@ -1,8 +1,9 @@
 ---
 source: src/tui/snapshot_tests_cluster.rs
+assertion_line: 892
 expression: t.backend()
 ---
-" prod-cache-01   PROD   read-only   cluster · 3 shards     ● analyzed 14:02 UTC "
+" prod-cache-01   PROD   read-only   cluster · 3 shards · 15G / 24G   ● analyzed "
 "  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
 "┌─ node 10.0.1.11:6379 · 1 of 3 ─────────── [ ] picks a node · INFO every 2 s ─┐"
 "│ ops/s           — ·                    clients        10 ▄                   │"

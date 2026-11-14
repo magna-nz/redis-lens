@@ -1,8 +1,9 @@
 ---
 source: src/tui/views/cmdline.rs
+assertion_line: 2054
 expression: "testing::render(&app, 80, 24).backend()"
 ---
-" prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
+" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
 "  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
 "    Keys  ·  Streams  ·  Search                                                 "
 "┌─ Patterns ───────────────── by memory ─┬─ session:{uuid} ─────────── string ─┐"

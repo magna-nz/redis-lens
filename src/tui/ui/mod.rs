@@ -10,14 +10,11 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Block;
 
 use crate::conn::parse::mask;
 use crate::conn::{ScanTarget, provider};
 use crate::format;
-use crate::model::{
-    NodeReport, NodeStatus, PERM_MEMORY, PermStatus, ScanReport, ServerFlavor, ServerInfo,
-};
+use crate::model::{NodeReport, NodeStatus, PERM_MEMORY, PermStatus, ServerFlavor, ServerInfo};
 
 use super::app::views::{Ctx, Owner, PROBE_FT_LIST};
 use super::app::{App, Area, Panel, Phase, Screen, Session};
@@ -47,7 +44,7 @@ mod ttl;
 mod value;
 pub mod widgets;
 
-use widgets::{bar, panel, rows, trunc, width};
+use widgets::{panel, rows, trunc, width};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -76,14 +73,80 @@ pub fn body_of(area: Rect, sub_tabs: bool) -> Rect {
     layout(area, sub_tabs)[3]
 }
 
-/// List rows an area without panels shows on a screen of `area`: what PgUp and PgDn
-/// move by. Every list screen (Connections, Patterns, TTL, Diff, Hot keys, Big keys,
-/// Nodes) has the same layout: the main panel above the detail panel, its border, one
-/// header row, then the rows. On an area with panels the sub-tab row takes one more,
-/// which `App` subtracts.
-pub fn list_rows(area: Rect) -> usize {
-    let (main, _) = split_body(body_of(area, false));
-    usize::from(Block::bordered().inner(main).height.saturating_sub(1))
+/// Rows of details under the Connections list (`ui/connections.rs`).
+const CONNECTIONS_DETAIL: usize = 9;
+/// Rows of details under the Nodes list (`ui/nodes.rs`).
+const NODES_DETAIL: usize = 8;
+/// Rows of details under the Clients list, and under a group's connections
+/// (`ui/server.rs`).
+const CLIENTS_DETAIL: usize = 5;
+/// Rows of the entry under the Slow log list (`ui/server.rs`).
+const SLOW_LOG_DETAIL: usize = 6;
+/// Rows of the line under the Monitor list (`ui/server.rs`).
+const MONITOR_DETAIL: usize = 4;
+/// Rows of the selected slot under the hottest slots, and range rows shown at most
+/// above them (`ui/slots.rs`).
+const SLOTS_DETAIL: usize = 4;
+const SLOTS_RANGES: usize = 5;
+
+/// List rows the screen on show draws on a terminal of `area` when its list is longer
+/// than the screen: what PgUp and PgDn move by (`App::set_list_rows`; the runtime calls
+/// it with this after every frame). 0 when not even one row fits.
+///
+/// - Expiry, Changes, Hot keys, Big keys and Pub/Sub draw the list and the selection's
+///   details side by side in one frame over the whole body: the body less the two
+///   borders and the column header.
+/// - Browse's lists have a bottom line too ([`browse_rows`]); a key's value lists its
+///   items in the top part of the right pane.
+/// - The full-width lists (Connections, Nodes, Clients, Slow log, Monitor, Slots) have
+///   their details below them in the same frame: their own section of it, less the
+///   column header (and the status line above it where there is one).
+pub fn list_rows(area: Rect, app: &App) -> usize {
+    let screen = app.screen();
+    let h = usize::from(body_of(area, screen.area().has_panels()).height);
+    // A frame of sections ([`widgets::sections`]): one border per section and the
+    // bottom one; the first section never gets more than the body less two borders.
+    let first = |rows: usize| rows.min(h.saturating_sub(2));
+    let below = |sections: usize, fixed: usize| h.saturating_sub(sections + 1 + fixed);
+    match screen {
+        Screen::Patterns | Screen::KeyList | Screen::Streams | Screen::Search => browse_rows(area),
+        Screen::KeyDetail => value_item_rows(h),
+        Screen::Overview
+        | Screen::BigKeys
+        | Screen::Ttl
+        | Screen::Diff
+        | Screen::HotKeys
+        | Screen::PubSub => h.saturating_sub(3),
+        // The list section takes what it needs up to what leaves the details theirs.
+        Screen::Connections => first(below(2, CONNECTIONS_DETAIL).max(4)).saturating_sub(1),
+        Screen::Nodes => first(below(2, NODES_DETAIL).max(3)).saturating_sub(1),
+        // The list takes what the details leave, less its header and, when the poll is
+        // in trouble, the line saying so.
+        Screen::Clients => {
+            let trouble = app
+                .ctx()
+                .is_some_and(|ctx| server::trouble(&app.views.server.clients.poll, &ctx).is_some());
+            below(2, CLIENTS_DETAIL).saturating_sub(1 + usize::from(trouble))
+        }
+        // A status line, then the header.
+        Screen::SlowLog => below(2, SLOW_LOG_DETAIL).saturating_sub(2),
+        Screen::Monitor => below(2, MONITOR_DETAIL).saturating_sub(2),
+        // The ranges (their header and at most five), the hottest slots, the slot.
+        Screen::Slots => {
+            let ranges = app.session.as_ref().map_or(0, |s| {
+                app.views.slots.range_rows(&s.nodes).len().min(SLOTS_RANGES)
+            });
+            below(3, ranges + 1 + SLOTS_DETAIL).saturating_sub(1)
+        }
+    }
+}
+
+/// Item rows a key's value lists on a body `h` rows tall: the right pane less the facts
+/// line and the blank under it, of which the item list takes two fifths (at least three
+/// rows) with its header (`ui/value.rs`).
+fn value_item_rows(h: usize) -> usize {
+    let pane = h.saturating_sub(2).saturating_sub(2);
+    (pane * 2 / 5).max(3).min(pane).saturating_sub(1)
 }
 
 /// List rows a Browse list (Patterns, a pattern's keys, Streams, Search) shows on a
@@ -199,8 +262,10 @@ fn view_state(frame: &mut Frame, area: Rect, app: &App, screen: Screen) {
         // Browse › Keys, a pattern's keys and a key's value: two panes of one frame.
         Owner::Keys => keys::draw(frame, area, app),
         Owner::Value => value::draw(frame, area, app),
+        // Big keys: "No analysis yet." (or connecting, analyzing, failed) until there is
+        // a report, as the other Analyze panels.
         Owner::Analysis => {
-            if report_or_wait(frame, area, app, title).is_some() {
+            if !analysis::need_report(frame, area, app, title, "ranks the biggest keys.") {
                 analysis::draw(frame, area, &v.analysis, &ctx);
             }
         }
@@ -249,107 +314,6 @@ pub fn split_body(area: Rect) -> (Rect, Rect) {
     let [main, detail] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(DETAIL_ROWS + 2)]).areas(area);
     (main, detail)
-}
-
-/// The session and its finished report. Without one, draws a message (no connection
-/// yet, connecting, scanning, or failed) into the `title` panel and returns `None`.
-/// The session and its finished report. Without one, draws a message (not connected
-/// yet, connecting, no analysis yet, analyzing, or failed) into the `title` panel and
-/// returns `None`.
-pub fn report_or_wait<'a>(
-    frame: &mut Frame,
-    area: Rect,
-    app: &'a App,
-    title: &str,
-) -> Option<(&'a Session, &'a ScanReport)> {
-    let (main, detail) = split_body(area);
-    let Some(session) = &app.session else {
-        let inner = panel(frame, main, title, "");
-        let text = Span::styled(CONNECT_FIRST, style::dim());
-        rows(frame, inner, vec![Line::default(), Line::from(text)], None);
-        panel(frame, detail, "Details", "");
-        return None;
-    };
-    if let Some(report) = &session.report {
-        return Some((session, report));
-    }
-    waiting(frame, main, detail, app, session, title);
-    None
-}
-
-fn waiting(frame: &mut Frame, main: Rect, detail: Rect, app: &App, s: &Session, title: &str) {
-    let spin = spinner(app.tick);
-    let p = &s.profile;
-    let right = if s.phase == Phase::Connected {
-        "waits for an analysis"
-    } else {
-        &p.name
-    };
-    let inner = panel(frame, main, title, right);
-    let mut lines = vec![Line::default()];
-    match &s.phase {
-        Phase::Failed(e) => {
-            lines.push(Line::from(Span::styled(format!(" ✗ {e}"), style::warn())));
-            lines.push(Line::from(Span::styled(
-                " Press 0 to go back to Connections and try again.",
-                style::dim(),
-            )));
-        }
-        Phase::Connecting => {
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(spin, style::amber()),
-                Span::styled(
-                    format!(
-                        " Connecting to {} ({}) and checking permissions…",
-                        p.name,
-                        s.endpoint()
-                    ),
-                    style::dim(),
-                ),
-            ]));
-            if let Some(hint) = app.keychain_hint() {
-                lines.push(Line::from(Span::styled(format!(" {hint}"), style::amber())));
-            }
-            provider_notice(&mut lines, p);
-        }
-        Phase::Connected => {
-            lines.extend(overview::analyze_prompt(p, title));
-            provider_notice(&mut lines, p);
-        }
-        Phase::Scanning | Phase::Done => {
-            let pr = s.progress.unwrap_or_default();
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(spin, style::amber()),
-                Span::styled(" Sampled ", style::dim()),
-                Span::styled(
-                    format!(
-                        "{} / {}",
-                        format::grouped(pr.sampled),
-                        format::grouped(pr.target)
-                    ),
-                    style::fgb(),
-                ),
-                Span::styled(" keys", style::dim()),
-            ]));
-            let ratio = if pr.target == 0 {
-                0.0
-            } else {
-                pr.sampled as f64 / pr.target as f64
-            };
-            let w = usize::from(inner.width).saturating_sub(4).min(40);
-            let (fill, track) = bar(ratio, w);
-            lines.push(Line::from(vec![
-                Span::raw("   "),
-                Span::styled(fill, style::amber()),
-                Span::styled(track, style::track()),
-            ]));
-            provider_notice(&mut lines, p);
-        }
-    }
-    rows(frame, inner, lines, None);
-    panel(frame, detail, "Details", "");
 }
 
 /// A blank line and the profile's provider notice (see [`provider::notice`]), if any.
@@ -427,13 +391,24 @@ fn sizes_unavailable(app: &App, s: &Session) -> bool {
     }
 }
 
-/// The status at the right of the header: `● connected 14:02`, `⠋ analyzing 41%`,
-/// `● analyzed 14:02`. Times are UTC: the app has no time zone.
-fn status(app: &App, s: &Session) -> Vec<Span<'static>> {
+/// How the header's status shows its time ([`status`]): `14:02 UTC` when it fits, else
+/// `14:02`, else not at all, before any other part of the header gives way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Clock {
+    Utc,
+    Short,
+    Off,
+}
+
+/// The status at the right of the header: `● connected 14:02 UTC`, `⠋ analyzing 41%`,
+/// `● analyzed 14:02 UTC`. "connected" carries the time the run connected, "analyzed"
+/// the time of the report. Times are UTC: the app has no time zone.
+fn status(app: &App, s: &Session, clock: Clock) -> Vec<Span<'static>> {
     let spin = spinner(app.tick);
-    let at = |unix: Option<i64>| match unix {
-        Some(t) => format!(" {} UTC", hh_mm(t)),
-        None => String::new(),
+    let at = |unix: Option<i64>| match (unix, clock) {
+        (Some(t), Clock::Utc) => format!(" {} UTC", hh_mm(t)),
+        (Some(t), Clock::Short) => format!(" {}", hh_mm(t)),
+        _ => String::new(),
     };
     match &s.phase {
         Phase::Connecting if s.analysis.is_some() && s.previous.is_some() => {
@@ -518,7 +493,6 @@ fn connected_header(app: &App, s: &Session, w: usize) -> Line<'static> {
         Span::raw("  "),
         write_state(p),
     ];
-    let right = status(app, s);
     // The optional parts, in the order they show, each with the rank it keeps its place
     // by when the line is short (lowest first).
     let cluster = match &s.target {
@@ -589,10 +563,44 @@ fn connected_header(app: &App, s: &Session, w: usize) -> Line<'static> {
     if sizes_unavailable(app, s) {
         parts.push((4, Span::styled("▲ no sizes", style::warn())));
     }
+    // The status's time gives way first: it is cut to `14:02`, then left out, before
+    // any part but the address and the version (shown only when they fit) is dropped
+    // or cut.
+    for clock in [Clock::Utc, Clock::Short, Clock::Off] {
+        let right = status(app, s, clock);
+        let (keep, whole) = fit_parts(&mut parts.clone(), spans_width(&left), &right, w);
+        if whole || clock == Clock::Off {
+            let mut first = true;
+            for span in keep {
+                let sep = if first { "   " } else { " · " };
+                first = false;
+                left.push(Span::styled(sep, style::dim()));
+                left.push(span);
+            }
+            return justify(left, right, w);
+        }
+    }
+    unreachable!("the last clock always returns")
+}
+
+/// Parts of the header ranked at or above this are shown only when they fit (the
+/// address and the server version); the status's time gives way before the others.
+const WHEN_IT_FITS: u8 = 5;
+
+/// The header's `parts` (by rank, see [`connected_header`]) that fit on a line `w` wide
+/// after `left_w` cells and before `right`, in their order. True when every part ranked
+/// below [`WHEN_IT_FITS`] is there whole.
+fn fit_parts(
+    parts: &mut [(u8, Span<'static>)],
+    left_w: usize,
+    right: &[Span<'static>],
+    w: usize,
+) -> (Vec<Span<'static>>, bool) {
     // Keep the parts by rank while the whole line, the status, a gap of two and
     // [`justify`]'s margin fit.
-    let fixed = spans_width(&left) + spans_width(&right) + 3;
+    let fixed = left_w + spans_width(right) + 3;
     let mut keep = vec![false; parts.len()];
+    let mut whole = true;
     let mut used = 0;
     let mut order: Vec<usize> = (0..parts.len()).collect();
     order.sort_by_key(|&i| parts[i].0);
@@ -604,6 +612,9 @@ fn connected_header(app: &App, s: &Session, w: usize) -> Line<'static> {
             used += add;
             continue;
         }
+        if parts[i].0 < WHEN_IT_FITS {
+            whole = false;
+        }
         // The keychain hint and a cluster's summary (rank 0, first) are cut rather
         // than dropped.
         let room = w.saturating_sub(fixed + used + 3);
@@ -614,17 +625,13 @@ fn connected_header(app: &App, s: &Session, w: usize) -> Line<'static> {
             used += room + 3;
         }
     }
-    let mut first = true;
-    for (i, (_, span)) in parts.into_iter().enumerate() {
-        if !keep[i] {
-            continue;
-        }
-        let sep = if first { "   " } else { " · " };
-        first = false;
-        left.push(Span::styled(sep, style::dim()));
-        left.push(span);
-    }
-    justify(left, right, w)
+    let kept = parts
+        .iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|((_, span), _)| span.clone())
+        .collect();
+    (kept, whole)
 }
 
 /// The profile's write state: `read-only` (amber), `writes on` (red), or a red

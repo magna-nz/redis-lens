@@ -587,11 +587,12 @@ impl ViewState for ServerState {
             (_, KeyCode::Char('p')) => {
                 self.paused = !self.paused;
                 if self.paused {
-                    // On Overview `r` analyzes the keys; elsewhere it still fetches once.
-                    act.info(if panel == Panel::Overview {
-                        "Live figures paused. p resumes."
-                    } else {
-                        "Polling paused. r fetches once."
+                    // On Overview `r` analyzes the keys; on Clients and Slow log it
+                    // still reads the panel once.
+                    act.info(match panel {
+                        Panel::Overview => "Live figures paused. p resumes.",
+                        Panel::Clients => "Polling paused. r reads the clients once, p resumes.",
+                        _ => "Polling paused. r reads the slow log once, p resumes.",
                     });
                 } else {
                     act.info("Polling resumed.");
@@ -1320,7 +1321,7 @@ impl Stop {
             ),
             Self::Lost => "Stopped: the connection to the server was lost.".to_string(),
             Self::Closed => "Stopped: the live connection closed.".to_string(),
-            Self::Rescan => "Stopped by the rescan.".to_string(),
+            Self::Rescan => "Stopped by a new analysis or a database switch.".to_string(),
             Self::Unlisted => "Stopped: this connection is no longer listed.".to_string(),
             Self::Failed(why) => format!("MONITOR did not start: {why}."),
         }
@@ -1981,6 +1982,28 @@ mod tests {
         let out = app.handle_key(ch('p'));
         assert!(!state(&app).paused);
         assert_eq!(only_request(&out).1, Request::Info);
+    }
+
+    /// The notice `p` gives says what is true on its screen: on Overview `r` analyzes the
+    /// keys, so only `p` brings the figures back; on Clients and Slow log `r` reads once.
+    #[test]
+    fn the_pause_notice_says_what_r_does_on_each_screen() {
+        for (screen, text) in [
+            (Screen::Overview, "Live figures paused. p resumes."),
+            (
+                Screen::Clients,
+                "Polling paused. r reads the clients once, p resumes.",
+            ),
+            (
+                Screen::SlowLog,
+                "Polling paused. r reads the slow log once, p resumes.",
+            ),
+        ] {
+            let (mut app, _) = app_at(Instant::now(), screen);
+            app.handle_key(ch('p'));
+            assert!(state(&app).paused, "{screen:?}");
+            assert_eq!(app.notice.as_ref().unwrap().text, text, "{screen:?}");
+        }
     }
 
     #[test]

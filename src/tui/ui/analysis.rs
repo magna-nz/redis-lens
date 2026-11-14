@@ -1,5 +1,6 @@
-//! Draws [`AnalysisState`]: the Big keys panel with Recommendations below it, and the
-//! Expiry panel (spec "2 Analysis"). Owner: wave B2, with `views/analysis.rs`.
+//! Draws [`AnalysisState`]: the Big keys panel with Recommendations beside it (spec "2
+//! Analysis"), and the helpers the other Analyze panels share. Owner: wave B2, with
+//! `views/analysis.rs`.
 //!
 //! Drawn only once the scan has finished (`ctx.report()` is `Some`).
 
@@ -8,7 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use crate::analysis::{
-    BIG_KEY_BYTES, EXPIRY_LABELS, Expiry, NEVER_EXPIRES_SHARE, Recommendation, Severity, expiry,
+    BIG_KEY_BYTES, EXPIRY_LABELS, Expiry, NEVER_EXPIRES_SHARE, Recommendation, Severity,
     length_unit, pattern_of, recommendations,
 };
 use crate::format;
@@ -17,7 +18,7 @@ use crate::scan::ScanOptions;
 use crate::scan::estimate::{AnalysisEstimate, DEEP_SAMPLE, QUICK_SAMPLE, estimate_analysis};
 use crate::tui::app::views::Ctx;
 use crate::tui::app::views::analysis::AnalysisState;
-use crate::tui::app::{App, Phase, Screen};
+use crate::tui::app::{App, Phase};
 use crate::verdict::{TtlVerdict, explain};
 
 use super::widgets::{
@@ -456,18 +457,15 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AnalysisState, ctx: &Ctx<'_>)
     let Some(report) = ctx.report() else {
         return;
     };
-    match ctx.screen {
-        Screen::Expiry => draw_expiry(frame, area, report, ctx),
-        _ => draw_big_keys(frame, area, state, report, ctx),
-    }
+    draw_big_keys(frame, area, state, report, ctx);
 }
 
-/// `right` with the rescan marker first, as the other Analysis panels mark results
-/// kept from the previous run.
+/// `right` with the previous-results marker first, as the other Analyze panels mark
+/// results kept from the previous run (`ui::previous_marker`).
 fn mark_previous(ctx: &Ctx<'_>, right: &str) -> String {
     let marker = ctx.session.previous.map(|_| match ctx.session.phase {
-        crate::tui::app::Phase::Failed(_) => "rescan failed · previous results",
-        _ => "rescanning · previous results",
+        crate::tui::app::Phase::Failed(_) => "analysis failed · previous results",
+        _ => "analyzing · previous results",
     });
     match marker {
         Some(m) if right.is_empty() => m.to_string(),
@@ -767,7 +765,7 @@ fn big_detail(
 }
 
 // ---------------------------------------------------------------------------
-// Expiry forecast (the screen behind → on the Expiry ranking)
+// Memory freed by TTL (the bars of the Expiry panel, `ui/ttl.rs`)
 // ---------------------------------------------------------------------------
 
 const LABEL_W: usize = 14;
@@ -823,113 +821,6 @@ pub fn forecast_bars(e: &Expiry, w: usize, short: bool) -> Vec<Line<'static>> {
     bars
 }
 
-fn draw_expiry(frame: &mut Frame, area: Rect, report: &ScanReport, ctx: &Ctx<'_>) {
-    let right = mark_previous(ctx, "memory freed by TTL");
-    let Some(e) = expiry(report) else {
-        let (left, detail) = split_frame(
-            frame,
-            area,
-            left_width(area.width),
-            Title::new("Expiry", &right),
-            Title::new("Details", ""),
-            Pane::Left,
-        );
-        let text = if report.sizes_available {
-            "This analysis has no memory figures per TTL. Analyze again to get them."
-        } else {
-            "No sizes: MEMORY USAGE is not allowed for this user, so there is no memory to sum."
-        };
-        let mut lines = vec![Line::default()];
-        lines.extend(paragraph(
-            vec![Span::raw(" ")],
-            " ",
-            text,
-            style::dim(),
-            usize::from(left.width),
-        ));
-        rows(frame, left, lines, None);
-        rows(frame, detail, Vec::new(), None);
-        return;
-    };
-    let (left, detail) = split_frame(
-        frame,
-        area,
-        left_width(area.width),
-        Title::new("Expiry", &right),
-        Title::new("Details", &format!("{} in all", format::bytes(e.total))),
-        Pane::Left,
-    );
-    let w = usize::from(left.width);
-    let source = format!(
-        "{} sampled keys, sizes scaled to the keyspace",
-        format::grouped(report.sampled_keys)
-    );
-    let mut lines = vec![
-        Line::default(),
-        Line::from(fit(
-            vec![Span::styled(format!(" {source}"), style::dim())],
-            w,
-        )),
-        Line::default(),
-    ];
-    let bars = forecast_bars(&e, w, false);
-    // On a short terminal the blank lines go first, then the source line: every bar,
-    // `never` above all, stays on screen.
-    let room = usize::from(left.height).saturating_sub(bars.len());
-    if room < lines.len() {
-        lines.retain(|l| l.width() > 0);
-    }
-    lines.truncate(room);
-    lines.extend(bars);
-    rows(frame, left, lines, None);
-    expiry_detail(frame, detail, &e);
-}
-
-fn expiry_detail(frame: &mut Frame, inner: Rect, e: &Expiry) {
-    let w = usize::from(inner.width);
-    let share = format::percent(e.never_share());
-    let mut lines = paragraph(
-        vec![Span::raw(" ")],
-        " ",
-        "Each row adds up the keys that expire by then: within 1 d includes within 1 h.",
-        style::dim(),
-        w,
-    );
-    lines.push(Line::default());
-    if e.never_share() > NEVER_EXPIRES_SHARE {
-        lines.extend(paragraph(
-            vec![Span::styled(format!(" {MARK} "), style::amber())],
-            "   ",
-            &format!(
-                "{share} of memory never expires ({}): over a quarter. See Overview for what to look at.",
-                format::bytes(e.never)
-            ),
-            style::amber(),
-            w,
-        ));
-    } else {
-        lines.extend(paragraph(
-            vec![Span::raw(" ")],
-            " ",
-            &format!(
-                "{share} of memory never expires ({}).",
-                format::bytes(e.never)
-            ),
-            style::dim(),
-            w,
-        ));
-    }
-    lines.push(Line::default());
-    lines.extend(paragraph(
-        vec![Span::raw(" ")],
-        " ",
-        &format!("{} expires later than 30 days.", format::bytes(e.later)),
-        style::dim(),
-        w,
-    ));
-    rows(frame, inner, lines, None);
-}
-
 #[cfg(test)]
 /// Apps and screens for the tests of the Analyze panels.
 pub(super) mod support {
@@ -967,6 +858,7 @@ pub(super) mod support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::Screen;
     use crate::tui::app::views::testing;
 
     const COLS: [Col; 5] = [
@@ -1065,6 +957,25 @@ mod tests {
         assert_eq!(
             title_right(&app, 120, "riskiest first"),
             format!("{marker} · riskiest first")
+        );
+    }
+
+    /// Big keys marks results kept from the previous run in the words of every other
+    /// panel: analyzing, or the analysis failed.
+    #[test]
+    fn big_keys_marks_previous_results_as_the_other_panels() {
+        let (mut app, _) = testing::app_on(Screen::BigKeys);
+        let s = app.session.as_mut().unwrap();
+        s.previous = Some(s.scan);
+        s.phase = Phase::Scanning;
+        let text = format!("{:?}", testing::render(&app, 120, 36).backend());
+        assert!(text.contains("analyzing · previous results"), "{text}");
+        assert!(!text.contains("rescan"), "{text}");
+        app.session.as_mut().unwrap().phase = Phase::Failed("connection reset".into());
+        let text = format!("{:?}", testing::render(&app, 120, 36).backend());
+        assert!(
+            text.contains("analysis failed · previous results"),
+            "{text}"
         );
     }
 

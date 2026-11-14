@@ -1,8 +1,9 @@
 ---
 source: src/tui/views/slots_tests.rs
+assertion_line: 503
 expression: render(&app)
 ---
-" prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
+" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
 "  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
 "    Big keys  ·  Expiry  ·  Changes  ·  Hot keys  ·  Nodes  ·  Slots            "
 "┌─ Slots ──────────────────────────────────────────────────────────────── off ─┐"

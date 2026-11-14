@@ -161,6 +161,9 @@ async fn event_loop(
     };
     spawn_input_thread(tx.clone());
     let mut runner = Runner::new(tx, path);
+    // The clock from the start, so a connect that answers before the first tick still
+    // has its time in the header ("● connected 14:02 UTC").
+    app.set_wall_clock(unix_ms_now() / 1000);
     let mut pending = app.init();
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -177,15 +180,13 @@ async fn event_loop(
                 terminal.clear()?;
             }
         }
-        let (mut list_rows, mut browse_rows) = (0, 0);
+        let mut list_rows = 0;
         terminal.draw(|f| {
-            list_rows = ui::list_rows(f.area());
-            browse_rows = ui::browse_rows(f.area());
+            list_rows = ui::list_rows(f.area(), &app);
             ui::draw(f, &app);
         })?;
-        // The page for PgUp and PgDn, from the area just drawn.
+        // The page for PgUp and PgDn: the rows the list on screen just drew.
         app.set_list_rows(list_rows);
-        app.set_browse_rows(browse_rows);
         tokio::select! {
             incoming = rx.recv() => match incoming {
                 Some(Incoming::Input(Event::Key(k))) => pending = app.handle_key(k),

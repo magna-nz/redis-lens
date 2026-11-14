@@ -48,7 +48,7 @@ pub(super) fn live_wait(ctx: &Ctx<'_>) -> Option<String> {
         LiveState::Ready => None,
         LiveState::Waiting => Some("Waiting for the live connection…".to_string()),
         LiveState::Closed(None) => {
-            Some("The live connection is closed. Scan again to open it.".to_string())
+            Some("The live connection is closed. Analyze again (r) to open it.".to_string())
         }
         LiveState::Closed(Some(why)) => Some(format!("The live connection closed: {why}.")),
     }

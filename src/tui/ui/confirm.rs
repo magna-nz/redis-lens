@@ -35,13 +35,18 @@ fn question(title: &str) -> String {
 }
 
 /// The dialog's text lines for `c`: each wrapped to `w` cells, the first line of a
-/// `Sends:` paragraph led by a label.
+/// `Sends:` paragraph led by the label `Sends` (as the mockup: `Sends   UNLINK …`), the
+/// rest under the command.
 fn text_lines(c: &Confirm, w: usize) -> Vec<Line<'static>> {
+    const LEAD: &str = " Sends   ";
+    const UNDER: &str = "         ";
     let mut lines: Vec<Line<'static>> = Vec::new();
     for text in c.lines() {
         if let Some(cmd) = text.strip_prefix("Sends: ") {
-            for (i, part) in wrap_hard(cmd, w.saturating_sub(9)).into_iter().enumerate() {
-                let lead = if i == 0 { " Sends: " } else { "        " };
+            // One cell stays free at the right.
+            let room = w.saturating_sub(LEAD.len() + 1);
+            for (i, part) in wrap_hard(cmd, room).into_iter().enumerate() {
+                let lead = if i == 0 { LEAD } else { UNDER };
 
                 lines.push(Line::from(vec![
                     Span::styled(lead, style::dim()),

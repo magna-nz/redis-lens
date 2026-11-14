@@ -1,8 +1,9 @@
 ---
 source: src/tui/bulk.rs
+assertion_line: 1644
 expression: t.backend()
 ---
-" prod-cache-01   PROD    WRITES ON    15G / 24G            ● analyzed 14:02 UTC "
+" prod-cache-01   PROD    WRITES ON    15G / 24G · 7.92M keys   ● analyzed 14:02 "
 "  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
 "    Keys  ·  Streams  ·  Search                                                 "
 "┌─ Patterns ───────────────── by memory ─┬─ user:{id}:cart ───────────── hash ─┐"
@@ -14,8 +15,8 @@ expression: t.backend()
 "│ │ 2 other keys matched the glob but belong to other patterns: left alone. │s │"
 "│ │ PERSIST on the keys in the key file undoes it.                          │  │"
 "│ │                                                                         │  │"
-"│ │ Sends: EXPIRE <key> 86400 NX  for each key of SCAN MATCH user:*:cart,   │  │"
-"│ │        500 at a time                                                    │  │"
+"│ │ Sends   EXPIRE <key> 86400 NX  for each key of SCAN MATCH user:*:cart,  │  │"
+"│ │         500 at a time                                                   │  │"
 "│ │                                                                         │  │"
 "│ │ Type user:{id}:cart and press enter to start:                           │  │"
 "│ │ › user:{id▏                                                             │S │"

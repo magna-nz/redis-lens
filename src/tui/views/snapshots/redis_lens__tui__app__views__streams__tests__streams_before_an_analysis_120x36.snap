@@ -1,5 +1,6 @@
 ---
 source: src/tui/views/streams.rs
+assertion_line: 2089
 expression: "testing::render(&{ app.handle_key(key(KeyCode::Esc)); app }, 120,\n36).backend()"
 ---
 " prod-cache-01   PROD   read-only   prod-cache-01.internal:6380 · Redis 7.4.2 · 15G / 24G · 7.92M keys      ● connected "
@@ -37,4 +38,4 @@ expression: "testing::render(&{ app.handle_key(key(KeyCode::Esc)); app }, 120,\n
 "│                                                                       │                                              │"
 "│                                                                       │                                              │"
 "└───────────────────────────────────────────────────────────────────────┴──────────────────────────────────────────────┘"
-" ↑↓ Move   → Details   enter Entries   p Pause   esc Back                                              : Command  ? Help"
+" r Analyze   tab Next panel                                                                            : Command  ? Help"

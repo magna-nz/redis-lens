@@ -1,5 +1,5 @@
-//! Draws [`ServerState`]: the Overview, Clients, Slow log and Monitor panels. Owner: wave
-//! B, with `views/server.rs`.
+//! Draws [`ServerState`]: the Clients, Slow log and Monitor panels, and the figures of
+//! its Overview poll that `ui/overview.rs` shows. Owner: wave B, with `views/server.rs`.
 //!
 //! Every line is cut with `…` to the width of its panel, so nothing wraps at 80 columns.
 //! Text from the server (names, keys, addresses) was cleaned of control characters when
@@ -8,36 +8,30 @@
 //! `value::escape`.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::format;
 use crate::live::monitor::{Entry, MAX_LINES, MAX_TIME};
-use crate::live::server::{InfoSample, Role, SlowEntry};
+use crate::live::server::SlowEntry;
 use crate::snapshot::format_utc;
 use crate::tui::app::Screen;
 use crate::tui::app::views::server::{
-    CLIENTS_EVERY, Clients, Group, HISTORY, IDLE_FLAG_SECS, Metric, Monitor, Overview, Poll,
-    Prompt, SLOWLOG_EVERY, ServerState, ShardRow, SlowLog, lib_label, note_of, sparkline,
+    CLIENTS_EVERY, Clients, Group, IDLE_FLAG_SECS, Metric, Monitor, Overview, Poll, Prompt,
+    SLOWLOG_EVERY, ServerState, SlowLog, lib_label, note_of,
 };
 use crate::tui::app::views::{Ctx, LiveState};
 use crate::value::escape;
 
 use super::analysis::{Col, MARK, Tier, head_row_at, notice, paragraph, pick_flex};
-use super::widgets::{
-    Section, Title, fit, pad_l, pad_r, panel, rows, scroll_offset, sections, trunc,
-};
+use super::widgets::{Section, Title, fit, pad_l, pad_r, rows, scroll_offset, sections, trunc};
 use super::{style, utc_time};
-
-const LABEL_W: usize = 11;
-const VALUE_W: usize = 19;
 
 /// Draws the screen `ctx.screen` of this view into `area`, the body between the
 /// header and the key bar.
 pub fn draw(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
     match ctx.screen {
-        Screen::Overview => overview(frame, area, state, ctx),
         Screen::Clients => clients(frame, area, state, ctx),
         Screen::SlowLog => slow_log(frame, area, state, ctx),
         Screen::Monitor => monitor(frame, area, &state.monitor, ctx),
@@ -129,149 +123,8 @@ pub(super) fn secs(d: std::time::Duration) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Overview
+// Overview's figures (drawn by `ui/overview.rs`)
 // ---------------------------------------------------------------------------
-
-fn overview(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
-    let o = &state.overview;
-    if gate(frame, area, "Overview", &o.poll, ctx) {
-        return;
-    }
-    // A cluster's per-shard summary sits between the figures and the server line.
-    let shard_rows = if ctx.session.is_cluster() {
-        u16::try_from(ctx.session.nodes.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-    } else {
-        0
-    };
-    let [main, shards, server] = Layout::vertical([
-        Constraint::Min(0),
-        Constraint::Length(shard_rows),
-        Constraint::Length(4),
-    ])
-    .areas(area);
-    if shard_rows > 0 {
-        shard_summary(frame, shards, state, ctx);
-    }
-    let right = right_title(state, ctx, &secs(state.interval()), "");
-    let right = if state.paused {
-        right
-    } else {
-        format!("{right} · + - interval")
-    };
-    let inner = panel(frame, main, "Overview", &right);
-    let w = usize::from(inner.width);
-    let spark_w = w.saturating_sub(1 + LABEL_W + VALUE_W).min(HISTORY);
-    let mut lines = vec![trouble(&o.poll, ctx).unwrap_or_default()];
-    lines.extend(
-        Metric::ALL
-            .into_iter()
-            .map(|m| metric_line(m, o, spark_w, w)),
-    );
-    rows(frame, inner, lines, None);
-
-    let inner = panel(frame, server, "Server", "");
-    rows(
-        frame,
-        inner,
-        server_lines(o.last.as_ref(), usize::from(inner.width)),
-        None,
-    );
-}
-
-const SHARD_ADDR_W: usize = 22;
-const SHARD_OPS_W: usize = 10;
-const SHARD_MEM_W: usize = 22;
-const SHARD_CLIENTS_W: usize = 12;
-
-/// One row per shard's node, in slot order: address, ops/s, used memory against
-/// `maxmemory`, clients and `db0` keys, or ✗ for a node that did not answer.
-fn shard_summary(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
-    let every = secs(
-        state
-            .interval()
-            .max(crate::tui::app::views::server::SHARDS_EVERY),
-    );
-    let right = if state.paused {
-        "paused".to_string()
-    } else {
-        format!("ops/s · memory · clients · keys · every {every}")
-    };
-    let inner = panel(frame, area, "Shards", &right);
-    let w = usize::from(inner.width);
-    let lines = ctx
-        .session
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            let row = state.shards.rows.get(i);
-            let picked = i == ctx.session.picked;
-            let mark = if picked { "›" } else { " " };
-            let mut spans = vec![
-                Span::styled(mark, style::ok()),
-                Span::styled(
-                    pad_r(&n.endpoint.to_string(), SHARD_ADDR_W),
-                    if n.role == crate::model::NodeRole::Replica {
-                        style::dim()
-                    } else {
-                        style::fg()
-                    },
-                ),
-            ];
-            match row {
-                _ if !n.connected => spans.push(Span::styled("✗ not connected", style::warn())),
-                Some(r) if r.failed => spans.push(Span::styled("✗ no answer", style::warn())),
-                Some(ShardRow { last: Some(s), .. }) => spans.extend(shard_cells(s)),
-                _ => spans.push(Span::styled("…", style::dim())),
-            }
-            Line::from(fit(spans, w))
-        })
-        .collect();
-    rows(frame, inner, lines, None);
-}
-
-pub(super) fn shard_cells(s: &InfoSample) -> Vec<Span<'static>> {
-    let ops = s
-        .ops_now
-        .map_or_else(|| "—".to_string(), |o| format!("{}/s", format::count(o)));
-    let mem = match (s.used_memory, s.maxmemory.filter(|m| *m > 0)) {
-        (Some(u), Some(m)) => format!(
-            "{} / {} {}",
-            format::bytes(u),
-            format::bytes(m),
-            format::percent(u as f64 / m as f64)
-        ),
-        (Some(u), None) => format!("{} (no limit)", format::bytes(u)),
-        (None, _) => "—".to_string(),
-    };
-    let clients = s.clients.map_or_else(
-        || "—".to_string(),
-        |c| format!("{} clients", format::count(c)),
-    );
-    let keys = s
-        .keys
-        .map_or_else(|| "—".to_string(), |k| format!("{} keys", format::count(k)));
-    vec![
-        Span::styled(pad_l(&ops, SHARD_OPS_W - 1), style::fgb()),
-        Span::raw("  "),
-        Span::styled(pad_r(&mem, SHARD_MEM_W), style::fg()),
-        Span::styled(pad_r(&clients, SHARD_CLIENTS_W), style::fg()),
-        Span::styled(keys, style::fg()),
-    ]
-}
-
-fn metric_line(m: Metric, o: &Overview, spark_w: usize, w: usize) -> Line<'static> {
-    let (text, st) = metric_text(m, o);
-    let mut spans = vec![
-        Span::styled(format!(" {}", pad_r(m.label(), LABEL_W - 1)), style::dim()),
-        Span::styled(pad_r(&text, VALUE_W), st),
-        Span::styled(sparkline(&o.history, m, spark_w), style::ok()),
-    ];
-    spans = fit(spans, w);
-    Line::from(spans)
-}
 
 /// `5.0` per second as `5.0`, `120` as `120`, `0` as `0`.
 fn per_sec(v: f64) -> String {
@@ -342,66 +195,6 @@ pub(super) fn metric_text(m: Metric, o: &Overview) -> (String, Style) {
             (format!("{v:.2}"), st)
         }
     }
-}
-
-pub(super) fn server_lines(last: Option<&InfoSample>, w: usize) -> Vec<Line<'static>> {
-    let Some(s) = last else {
-        return Vec::new();
-    };
-    let sep = || Span::styled(" · ", style::dim());
-    let mut first = vec![Span::raw(" ")];
-    let part = |spans: &mut Vec<Span<'static>>, text: String, st: Style| {
-        if spans.len() > 1 {
-            spans.push(sep());
-        }
-        spans.push(Span::styled(text, st));
-    };
-    match s.uptime_secs {
-        Some(u) => part(
-            &mut first,
-            format!("up {}", format::duration(std::time::Duration::from_secs(u))),
-            style::fg(),
-        ),
-        None => part(&mut first, "up —".to_string(), style::dim()),
-    }
-    match s.role {
-        Some(Role::Primary) => part(&mut first, "primary".to_string(), style::fg()),
-        Some(Role::Replica) => {
-            let (t, st) = match s.link_up {
-                Some(false) => ("replica, link down", style::warn()),
-                _ => ("replica", style::fg()),
-            };
-            part(&mut first, t.to_string(), st);
-        }
-        None => part(&mut first, "role —".to_string(), style::dim()),
-    }
-    if let Some(n) = s.replicas {
-        let t = if n == 1 {
-            "1 replica".to_string()
-        } else {
-            format!("{n} replicas")
-        };
-        part(&mut first, t, style::fg());
-    }
-    let rdb = match s.rdb_ok {
-        Some(true) => ("RDB ok", style::fg()),
-        Some(false) => ("RDB last save failed", style::warn()),
-        None => ("RDB —", style::dim()),
-    };
-    part(&mut first, rdb.0.to_string(), rdb.1);
-    let aof = match (s.aof_on, s.aof_ok) {
-        (Some(true), Some(false)) => ("AOF write failed", style::warn()),
-        (Some(true), _) => ("AOF on", style::fg()),
-        (Some(false), _) => ("AOF off", style::fg()),
-        (None, _) => ("AOF —", style::dim()),
-    };
-    part(&mut first, aof.0.to_string(), aof.1);
-    let policy = s.policy.clone().unwrap_or_else(|| "—".to_string());
-    let second = vec![
-        Span::styled(" maxmemory-policy ", style::dim()),
-        Span::styled(policy, style::fg()),
-    ];
-    vec![Line::from(fit(first, w)), Line::from(fit(second, w))]
 }
 
 // ---------------------------------------------------------------------------

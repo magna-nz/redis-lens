@@ -1,9 +1,10 @@
 ---
 source: src/tui/snapshot_tests_cluster.rs
+assertion_line: 238
 expression: snap
 ---
 80x24:
- prod-cache-01   PROD   read-only   cluster · 3 shards ·…  ● analyzed 14:02 UTC 
+ prod-cache-01   PROD   read-only   cluster · 3 shards · 1 unreach…  ● analyzed 
   0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    
     Big keys  ·  Expiry  ·  Changes  ·  Hot keys  ·  Nodes  ·  Slots            
 ┌─ Nodes ──────────────────────────────────── 3 shards · 1 failed · 1 partial ─┐
@@ -29,7 +30,7 @@ expression: snap
  ↑↓ Move   enter This node only   tab Next panel               : Command  ? Help
 
 60x20:
- prod-cache-01   PROD   read-only      ● analyzed 14:02 UTC 
+ prod-cache-01   PROD   read-only   15G / 24G    ● analyzed 
   0  │  1   2   3 Analyze   4   5                           
   Big keys · Expiry · Changes · Hot keys · Nodes · Slots    
 ┌─ Nodes ──────────────── 3 shards · 1 failed · 1 partial ─┐

@@ -1440,7 +1440,7 @@ fn patterns_rescan_failed_keeps_previous_results_marked() {
     let t = render(&app, 80, 24);
     let lines = buffer_lines(&t);
     assert!(lines[3].contains(RESCAN_FAILED), "{}", lines[3]);
-    assert!(lines[23].contains("Scan failed: connection reset"));
+    assert!(lines[23].contains("Analysis failed: connection reset"));
     for view in ['2', '3', '4'] {
         go(&mut app, view);
         let lines = buffer_lines(&render(&app, 120, 36));
@@ -1535,69 +1535,153 @@ fn detail_command_is_what_shift_y_copies() {
     }
 }
 
-/// The list rows a view draws when the list is the whole frame (a split frame): between
-/// the top border and the bottom border, less the column header.
-fn drawn_list_rows(lines: &[String]) -> usize {
-    let top = lines.iter().position(|l| l.starts_with('┌')).unwrap();
-    let bottom = top
-        + lines[top..]
+/// The rows of the list section of the frame on screen: from the frame's top border to
+/// the next border across it (the `├` above the details, or the bottom `└`), less
+/// `above` rows of it that are not list rows (the column header, a status line, a
+/// bottom line).
+fn drawn_list_rows(lines: &[String], above: usize) -> usize {
+    let top = lines
+        .iter()
+        .position(|l| l.starts_with('┌'))
+        .unwrap_or_else(|| panic!("no frame:\n{}", lines.join("\n")));
+    let end = top
+        + 1
+        + lines[top + 1..]
             .iter()
-            .position(|l| l.starts_with('└'))
-            .unwrap();
-    (bottom - top - 1).saturating_sub(1)
+            .position(|l| l.starts_with('├') || l.starts_with('└'))
+            .unwrap_or_else(|| panic!("no frame end:\n{}", lines.join("\n")));
+    (end - top - 1).saturating_sub(above)
 }
 
-/// Expiry, Changes and Hot keys draw their list in a split frame that takes the whole
-/// body, so their rows are the body less its two borders and the column header. Needs
-/// `ui::list_rows` to say so (it still counts the older main-panel-above-details layout):
-/// the lead changes it with the Browse views, then removes the `ignore`.
+/// The sizes [`list_rows_is_what_every_list_view_draws`] checks.
+const LIST_SIZES: [(u16, u16); 6] = [(80, 24), (120, 36), (60, 20), (200, 60), (80, 17), (80, 18)];
+
+/// `ui::list_rows` of `app`'s screen at `w` × `h` is the rows its list section has, as
+/// drawn, less `above`.
+fn assert_list_rows(app: &App, w: u16, h: u16, above: usize) {
+    let rows = ui::list_rows(ratatui::layout::Rect::new(0, 0, w, h), app);
+    let lines = buffer_lines(&render(app, w, h));
+    assert_eq!(
+        drawn_list_rows(&lines, above),
+        rows,
+        "{:?} at {w}x{h}:\n{}",
+        app.screen(),
+        lines.join("\n")
+    );
+}
+
+/// PgUp and PgDn move by `ui::list_rows`: on every list screen it is the rows its list
+/// shows, at every size. Split frames (Expiry, Changes, Hot keys, Big keys, Pub/Sub)
+/// fill the body: two borders and the header. Browse's lists have a bottom line as well.
+/// The full-width lists (Connections, Clients, Slow log, Monitor) have their details
+/// below them; Connections is long enough to take all the rows it may. Nodes is checked
+/// with the cluster snapshots. Not checked here: a key's value (its items share the right
+/// pane with the value), Slots (cluster only) and Overview's findings (a few rows).
 #[test]
-#[ignore = "waits for ui::list_rows to follow the split frames (ui/mod.rs)"]
 fn list_rows_is_what_every_list_view_draws() {
+    use crate::tui::app::views::testing;
+    // Analyze and Browse › Keys, from a finished analysis with history.
     let mut app = scanned_with_history(true);
-    for (w, h) in [(80, 24), (120, 36), (60, 20), (200, 60), (80, 17), (80, 18)] {
-        let rows = ui::list_rows(ratatui::layout::Rect::new(0, 0, w, h));
-        let browse = ui::browse_rows(ratatui::layout::Rect::new(0, 0, w, h));
-        for view in ['0', '1', '2', '3', '4'] {
-            go(&mut app, view);
-            let lines = buffer_lines(&render(&app, w, h));
-            if app.area == crate::tui::app::Area::Browse {
-                // Browse fills the frame: its rows, then the bottom line.
-                assert_eq!(
-                    drawn_list_rows(&lines),
-                    browse + 1,
-                    "view {view} at {w}x{h}"
-                );
-                continue;
-            }
-            // The tab bar's panel row takes one on Analysis (`App::page` knows).
-            let panel_row = usize::from(app.area.has_panels());
-            assert_eq!(
-                drawn_list_rows(&lines),
-                rows.saturating_sub(panel_row),
-                "view {view} at {w}x{h}"
-            );
+    for (w, h) in LIST_SIZES {
+        for screen in [Screen::BigKeys, Screen::Ttl, Screen::Diff, Screen::HotKeys] {
+            assert!(show(&mut app, screen));
+            assert_list_rows(&app, w, h, 1);
+        }
+        for screen in [Screen::Patterns, Screen::KeyList] {
+            assert!(show(&mut app, screen));
+            assert_list_rows(&app, w, h, 2);
+        }
+        // Back from the key list to the patterns.
+        app.handle_key(key(KeyCode::Esc));
+    }
+    // Connections: more connections than any of the sizes shows.
+    let mut profiles = fixtures::profiles();
+    let first = profiles[0].clone();
+    profiles.extend((0..60).map(|i| {
+        let mut p = first.clone();
+        p.name = format!("cache-{i:02}");
+        p
+    }));
+    let mut conns = App::new(profiles);
+    conns.apply(Msg::DockerFound(vec![fixtures::docker_instance()]));
+    for (w, h) in LIST_SIZES {
+        assert_eq!(conns.screen(), Screen::Connections);
+        assert_list_rows(&conns, w, h, 1);
+    }
+    // The live views, with something to list.
+    let mut app = testing::scanned();
+    testing::live_ready(&mut app);
+    let v = &mut app.views;
+    v.streams.loaded = true;
+    v.streams.rows = (0..80)
+        .map(|i| super::app::views::streams::StreamRow {
+            key: format!("events:{i}"),
+            info: None,
+            verdicts: Vec::new(),
+        })
+        .collect();
+    v.search.loaded = true;
+    v.search.list.indexes = (0..80)
+        .map(|i| crate::live::search::IndexInfo {
+            name: format!("idx:{i}"),
+            ..Default::default()
+        })
+        .collect();
+    v.search.list.total = 80;
+    v.pubsub.loaded = true;
+    v.pubsub.counts.channels = (0..80)
+        .map(|i| crate::live::pubsub::Channel {
+            name: format!("news.{i}"),
+            subscribers: Some(i),
+        })
+        .collect();
+    v.pubsub.counts.total_channels = 80;
+    let conns: Vec<crate::live::server::ClientConn> = (0..80)
+        .map(|i| crate::live::server::ClientConn {
+            id: i,
+            addr: format!("10.0.{i}.1:5000"),
+            name: format!("worker-{i}"),
+            cmd: "get".into(),
+            ..Default::default()
+        })
+        .collect();
+    v.server.clients.groups = super::app::views::server::build_groups(&conns);
+    v.server.clients.conns = conns;
+    v.server.clients.poll.got = true;
+    v.server.slow.poll.got = true;
+    for (w, h) in LIST_SIZES {
+        for screen in [Screen::Streams, Screen::Search] {
+            assert!(show(&mut app, screen));
+            assert_list_rows(&app, w, h, 2);
+        }
+        assert!(show(&mut app, Screen::PubSub));
+        assert_list_rows(&app, w, h, 1);
+        assert!(show(&mut app, Screen::Clients));
+        assert_list_rows(&app, w, h, 1);
+        // A status line above the header.
+        for screen in [Screen::SlowLog, Screen::Monitor] {
+            assert!(show(&mut app, screen));
+            assert_list_rows(&app, w, h, 2);
         }
     }
-    // 80x24 shows 18 rows. Too small for any row: 0, and PgDn still moves one.
-    assert_eq!(ui::list_rows(ratatui::layout::Rect::new(0, 0, 80, 24)), 18);
-    for h in [0, 1, 6] {
-        assert_eq!(
-            ui::list_rows(ratatui::layout::Rect::new(0, 0, 80, h)),
-            0,
-            "{h}"
-        );
+    // 80x24 shows 18 rows on Analyze. Too small for any row: 0, and PgDn still moves
+    // one.
+    show(&mut app, Screen::Ttl);
+    let at = |w, h| ui::list_rows(ratatui::layout::Rect::new(0, 0, w, h), &app);
+    assert_eq!(at(80, 24), 17);
+    for h in [0, 1, 4] {
+        assert_eq!(at(80, h), 0, "{h}");
     }
 }
 
 #[test]
 fn page_down_from_the_top_selects_the_row_below_the_screen() {
-    // With a page of 8 list rows, as the runtime sets it (less the sub-tab row), PgDn
-    // from the top of the Expiry list selects row 7. The list frame takes the whole
-    // body at 80x24, so it does not scroll: the selection is the eighth row on screen.
+    // With a page of 7 list rows, as the runtime sets it, PgDn from the top of the
+    // Expiry list selects row 7. The list frame takes the whole body at 80x24, so it
+    // does not scroll: the selection is the eighth row on screen.
     let mut app = scanned_with_history(true);
     go(&mut app, '2');
-    app.set_list_rows(8);
+    app.set_list_rows(7);
     app.handle_key(key(KeyCode::PageDown));
     assert_eq!(app.sel.ttl, 7);
     let t = render(&app, 80, 24);
@@ -1808,4 +1892,112 @@ fn a_view_whose_probe_failed_says_why_it_is_off() {
     insta::assert_snapshot!(t.backend());
     show(&mut app, Screen::Search);
     insta::assert_snapshot!(render(&app, 80, 24).backend());
+}
+
+/// The header's status carries its time, UTC, "connected" as "analyzed" does: in full
+/// when it fits, `14:02` at 80 columns as the mockups, and it goes before the key count
+/// or the memory does.
+#[test]
+fn the_header_status_carries_its_time_and_gives_it_up_first() {
+    let connected = || {
+        let mut app = App::new(fixtures::profiles());
+        // 14:02 UTC.
+        app.set_wall_clock(50_520);
+        let id = connect_selected(&mut app);
+        app.apply(Msg::Connected {
+            id,
+            scan: scan_of(&app),
+            server: Some(fixtures::server()),
+            perms: fixtures::perms_ok(),
+            target: ScanTarget::Primary,
+        });
+        (app, id)
+    };
+    let (app, _) = connected();
+    let (mut analyzed, id) = connected();
+    analyzed.apply(Msg::ScanDone {
+        id,
+        scan: scan_of(&analyzed),
+        report: Box::new(fixtures::report(true)),
+    });
+    for (status, app) in [("connected", &app), ("analyzed", &analyzed)] {
+        let at = |w: u16| buffer_lines(&render(app, w, 24))[0].clone();
+        assert!(
+            at(120).ends_with(&format!("● {status} 14:02 UTC ")),
+            "{}",
+            at(120)
+        );
+        assert!(at(120).contains("15G / 24G · 7.92M keys"), "{}", at(120));
+        // 80 columns: the mockup's line.
+        assert!(
+            at(80).ends_with(&format!("● {status} 14:02 ")),
+            "{}",
+            at(80)
+        );
+        assert!(at(80).contains("15G / 24G · 7.92M keys"), "{}", at(80));
+        // Narrower: the time goes, the figures stay.
+        assert!(at(75).ends_with(&format!("● {status} ")), "{}", at(75));
+        assert!(at(75).contains("15G / 24G · 7.92M keys"), "{}", at(75));
+        for w in [50, 60, 75, 80, 120, 140] {
+            assert_eq!(at(w).chars().count(), usize::from(w));
+        }
+    }
+}
+
+/// Connected to prod-cache-01, no analysis yet, on `screen`.
+fn connected_without_analysis(screen: Screen) -> App {
+    let mut app = App::new(fixtures::profiles());
+    let id = connect_selected(&mut app);
+    app.apply(Msg::Connected {
+        id,
+        scan: scan_of(&app),
+        server: Some(fixtures::server()),
+        perms: fixtures::perms_ok(),
+        target: ScanTarget::Primary,
+    });
+    super::app::views::testing::show(&mut app, screen);
+    app
+}
+
+/// Big keys before an analysis says so as the other Analyze panels do, with the cost
+/// of `r` from the engine's estimate: never a blank panel.
+#[test]
+fn big_keys_without_an_analysis_says_what_it_needs() {
+    let app = connected_without_analysis(Screen::BigKeys);
+    for (w, h) in [(80, 24), (120, 36)] {
+        let lines = buffer_lines(&render(&app, w, h));
+        let text = lines.join("\n");
+        assert!(text.contains("No analysis yet."), "{text}");
+        assert!(text.contains("Big keys ranks the biggest keys."), "{text}");
+        assert!(text.contains("waits for an analysis"), "{text}");
+        let est = super::app::views::overview::estimate_for(
+            super::app::views::overview::Depth::Quick,
+            &app,
+        );
+        assert!(
+            text.contains(&format!(
+                "r  Analyze: {} keys",
+                crate::format::grouped(est.keys)
+            )),
+            "{text}"
+        );
+        assert!(lines[h as usize - 1].starts_with(" r Analyze"), "{text}");
+    }
+}
+
+/// Streams before an analysis: the footer offers `r Analyze`, which is what `r` does
+/// there (its key table row says Refresh, for once there are streams).
+#[test]
+fn streams_before_an_analysis_offer_r_analyze_in_the_footer() {
+    let mut app = connected_without_analysis(Screen::Streams);
+    let lines = buffer_lines(&render(&app, 80, 24));
+    assert!(
+        lines[23].starts_with(" r Analyze   tab Next panel"),
+        "{}",
+        lines[23]
+    );
+    assert!(!lines[23].contains("Refresh"), "{}", lines[23]);
+    let effects = app.handle_key(ch('r'));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(app.analyze.is_some(), "r opens Analyze the keys?");
 }

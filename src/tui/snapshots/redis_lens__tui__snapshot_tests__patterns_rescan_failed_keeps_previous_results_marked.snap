@@ -1,5 +1,6 @@
 ---
 source: src/tui/snapshot_tests.rs
+assertion_line: 1452
 expression: t.backend()
 ---
 " prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys             ✗ failed "
@@ -25,4 +26,4 @@ expression: t.backend()
 "│                                        │                                     │"
 "│ from 100,000 sampled keys · v more     │ → expands the group                 │"
 "└────────────────────────────────────────┴─────────────────────────────────────┘"
-" Scan failed: connection reset                                                  "
+" Analysis failed: connection reset                                              "

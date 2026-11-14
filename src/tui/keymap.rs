@@ -416,21 +416,11 @@ static KEY_DETAIL: [KeyHelp; 15] = [
     k("D", "D", "Delete key", "Delete the key (writes)", false),
 ];
 
-/// The forecast one level down Analyze › Expiry.
-const FORECAST: KeyHelp = k(
-    "→ l enter",
-    "→",
-    "Forecast",
-    "Expiry forecast: the memory TTLs free over time",
-    true,
-);
-
-static TTL: [KeyHelp; 9] = [
+static TTL: [KeyHelp; 8] = [
     MOVE,
     PAGE,
     ENDS,
     PANEL,
-    FORECAST,
     COPY_PATTERN,
     COPY_CMD,
     ANALYZE,
@@ -453,19 +443,6 @@ static HOT: [KeyHelp; 8] = [
 ];
 
 static BIG_KEYS: [KeyHelp; 7] = [MOVE, PAGE, ENDS, PANEL, COPY_KEY, ANALYZE, SNAPSHOT];
-
-static EXPIRY: [KeyHelp; 4] = [
-    PANEL,
-    k(
-        "← h esc",
-        "←",
-        "Back",
-        "Back to the patterns ranked by TTL risk",
-        true,
-    ),
-    ANALYZE,
-    SNAPSHOT,
-];
 
 static CLIENTS: [KeyHelp; 10] = [
     MOVE,
@@ -762,7 +739,6 @@ pub fn for_screen(screen: Screen) -> &'static [KeyHelp] {
         Screen::Search => &SEARCH,
         Screen::BigKeys => &BIG_KEYS,
         Screen::Ttl => &TTL,
-        Screen::Expiry => &EXPIRY,
         Screen::Diff => &DIFF,
         Screen::HotKeys => &HOT,
         Screen::Nodes => &NODES,
@@ -813,22 +789,17 @@ pub fn footer(screen: Screen, c: FooterCtx) -> Vec<(&'static str, &'static str)>
         Screen::KeyList => &[MOVE, OPEN, "/", "n", BACK],
         Screen::KeyDetail if c.writes => &[MOVE, "e", "+", "d", "f"],
         Screen::KeyDetail => &[MOVE, "→ l", "f", "y", BACK],
-        Screen::Ttl if c.analyzed => &[MOVE, TAB, OPEN, "s"],
-        Screen::Expiry if c.analyzed => &[TAB, BACK, "r", "s"],
-        Screen::BigKeys | Screen::Diff | Screen::HotKeys if c.analyzed => {
+        Screen::BigKeys | Screen::Ttl | Screen::Diff | Screen::HotKeys if c.analyzed => {
             &[MOVE, TAB, "y", "r", "s"]
         }
         Screen::Nodes if c.analyzed => &[MOVE, "enter", TAB],
-        Screen::BigKeys
-        | Screen::Ttl
-        | Screen::Expiry
-        | Screen::Diff
-        | Screen::HotKeys
-        | Screen::Nodes
+        Screen::BigKeys | Screen::Ttl | Screen::Diff | Screen::HotKeys | Screen::Nodes
             if c.ready =>
         {
             &["r", TAB]
         }
+        // Streams are found by an analysis: before one, `r` analyzes.
+        Screen::Streams if c.ready && !c.analyzed => &["r", TAB],
         Screen::Streams if c.ready => &[MOVE, "→ l", "enter", "p", "esc"],
         Screen::Search if c.ready => &[MOVE, "→ l", "/", "enter", "esc"],
         Screen::PubSub if c.ready => &[MOVE, "enter", "space", "/"],
@@ -839,7 +810,17 @@ pub fn footer(screen: Screen, c: FooterCtx) -> Vec<(&'static str, &'static str)>
         s if s.area().has_panels() => &[TAB, "0"],
         _ => &["0"],
     };
-    order.iter().map(|keys| find_key(screen, keys)).collect()
+    order
+        .iter()
+        .map(|keys| match find_key(screen, keys) {
+            // Streams' `r` refreshes the list; before an analysis it analyzes, and the
+            // footer says so.
+            (k, _) if screen == Screen::Streams && !c.analyzed && *keys == "r" => {
+                (k, ANALYZE.label)
+            }
+            hint => hint,
+        })
+        .collect()
 }
 
 /// The keys at the right of the footer: `: Command  ? Help`, or only `? Help` before
@@ -1044,10 +1025,14 @@ mod tests {
     fn footer_is_a_subset_of_the_table() {
         for v in Screen::ALL {
             for c in contexts() {
+                // Before an analysis Streams' `r` analyzes, and its footer says so with
+                // the label of Analyze's `r` (its own row says Refresh).
+                let analyzes = (v == Screen::Streams && !c.analyzed).then_some(&ANALYZE);
                 for (key, label) in footer(v, c).into_iter().chain(footer_right(c.ready)) {
                     let hit = global()
                         .iter()
                         .chain(for_screen(v))
+                        .chain(analyzes)
                         .find(|h| h.footer_keys == key && h.label == label)
                         .unwrap_or_else(|| panic!("{key} {label} missing in {}", v.title()));
                     assert!(hit.in_footer, "{key} {label} is not marked in_footer");
@@ -1127,11 +1112,13 @@ mod tests {
         );
         assert_eq!(
             names(Screen::Ttl, analyzed),
-            ["Move", "Next panel", "Forecast", "Snapshot"]
+            ["Move", "Next panel", "Copy", "Analyze", "Snapshot"]
         );
         assert_eq!(names(Screen::Ttl, connected), ["Analyze", "Next panel"]);
+        // Before an analysis there are no streams yet: `r` analyzes.
+        assert_eq!(names(Screen::Streams, connected), ["Analyze", "Next panel"]);
         assert_eq!(
-            names(Screen::Streams, connected),
+            names(Screen::Streams, analyzed),
             ["Move", "Details", "Entries", "Pause", "Back"]
         );
         assert_eq!(
