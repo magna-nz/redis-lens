@@ -178,6 +178,7 @@ mod tests {
             provider: None,
             token_command: None,
             ssh: None,
+            sentinel: None,
         }
     }
 
@@ -288,6 +289,70 @@ mod tests {
         let p = c.get("x").unwrap();
         assert_eq!(p.provider, None);
         assert_eq!(p.token_command, None);
+        assert_eq!(p.ssh, None);
+        assert_eq!(p.sentinel, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `[profile.sentinel]` round-trips with its nodes as `host:port` strings (IPv6 in
+    /// brackets), `tls` is absent when false, and the file holds no Sentinel
+    /// credential: those live in the keychain under `sentinel:profile:<name>`.
+    #[test]
+    fn sentinel_round_trip() {
+        use crate::model::{Sentinel, SentinelNode};
+        let dir = temp_dir("sentinel");
+        let path = dir.join("config.toml");
+        let node = |h: &str, port: u16| SentinelNode {
+            host: h.into(),
+            port,
+        };
+        let mut s = profile("watched", 6379);
+        s.sentinel = Some(Sentinel {
+            master: "mymaster".into(),
+            nodes: vec![node("10.0.0.1", 26379), node("2001:db8::7", 5000)],
+            tls: false,
+        });
+        let mut t = profile("tls", 6380);
+        t.sentinel = Some(Sentinel {
+            master: "other".into(),
+            nodes: vec![node("sentinel.example.com", 26380)],
+            tls: true,
+        });
+        let mut c = Config::default();
+        c.add(s, false).unwrap();
+        c.add(t, false).unwrap();
+        c.add(profile("plain", 1), false).unwrap();
+        c.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("[profile.sentinel]").count(), 2, "{text}");
+        for node in [r#""10.0.0.1:26379""#, r#""[2001:db8::7]:5000""#] {
+            assert!(text.contains(node), "{text}");
+        }
+        // Three endpoints with TLS, and the one Sentinel table with it.
+        assert_eq!(text.matches("tls = true").count(), 4, "{text}");
+        for word in ["user", "password", "secret"] {
+            assert!(!text.contains(word), "{word} in {text}");
+        }
+        let back = Config::load(&path).unwrap();
+        assert_eq!(back, c);
+        assert_eq!(back.get("plain").unwrap().sentinel, None);
+        // Written by hand: the port left out is 26379, and tls is false.
+        std::fs::write(
+            &path,
+            "[[profile]]\nname = \"x\"\n[profile.endpoint]\nhost = \"10.0.0.5\"\nport = 6379\n[profile.sentinel]\nmaster = \"m\"\nnodes = [\"s1\", \"[::1]\"]\n",
+        )
+        .unwrap();
+        let p = Config::load(&path).unwrap().get("x").unwrap().clone();
+        let st = p.sentinel.unwrap();
+        assert_eq!(st.nodes, vec![node("s1", 26379), node("::1", 26379)]);
+        assert!(!st.tls);
+        // A node that can't be read fails the load, without repeating it.
+        std::fs::write(
+            &path,
+            "[[profile]]\nname = \"x\"\n[profile.endpoint]\nhost = \"h\"\nport = 6379\n[profile.sentinel]\nmaster = \"m\"\nnodes = [\"s1:0\"]\n",
+        )
+        .unwrap();
+        assert!(Config::load(&path).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

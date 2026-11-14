@@ -580,6 +580,7 @@ pub(super) mod tests {
             provider: None,
             token_command: None,
             ssh: t,
+            sentinel: None,
         }
     }
 

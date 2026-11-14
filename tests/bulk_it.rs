@@ -56,6 +56,7 @@ fn profile(port: u16, env: Env, read_only: Option<bool>) -> Profile {
         provider: None,
         token_command: None,
         ssh: None,
+        sentinel: None,
     }
 }
 

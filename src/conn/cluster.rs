@@ -243,12 +243,19 @@ pub(crate) fn merge_permissions(reports: &[PermissionReport]) -> PermissionRepor
 ///
 /// A cluster only has database 0: a profile with another `db` is refused with an error
 /// before any other node is connected to.
+///
+/// A Sentinel profile is never a cluster: its primary is asked from the Sentinels and
+/// checked (a cluster node is refused), and its `endpoint` is never dialled.
 pub async fn connect_targets(
     profile: &Profile,
     secrets: &dyn SecretStore,
 ) -> Result<ScanTargets, ConnError> {
     let route = Route::for_profile(profile, secrets).await?;
     let auth = ResolvedAuth::new(profile, secrets).await?;
+    if profile.sentinel.is_some() {
+        let (conn, target) = super::connect_for_scan_with(profile, secrets, &route, &auth).await?;
+        return Ok(ScanTargets::Single { conn, target });
+    }
 
     // The seed, without the replica step yet: on a cluster, replicas are chosen per
     // shard.
@@ -344,7 +351,7 @@ pub(crate) fn cluster_mode(info: &str) -> Option<bool> {
 /// it has neither or can't be read) `INFO cluster` says `cluster_enabled:1`. A readable
 /// `INFO server` reply is kept on `c` to answer the scan's own `INFO server` (see
 /// `Connection::keep_info_server`).
-async fn is_cluster(c: &mut Connection) -> bool {
+pub(super) async fn is_cluster(c: &mut Connection) -> bool {
     let reply: Result<Value, _> = redis::cmd("INFO").arg("server").query_async(c).await;
     let server = reply.ok().and_then(|v| {
         let text = redis::from_redis_value_ref::<String>(&v).ok()?;
@@ -394,7 +401,7 @@ pub(crate) struct Shard {
     pub replicas: Vec<AnnouncedNode>,
 }
 
-fn text(v: &Value) -> Option<String> {
+pub(super) fn text(v: &Value) -> Option<String> {
     match v {
         Value::BulkString(b) => String::from_utf8(b.clone()).ok(),
         Value::SimpleString(s) => Some(s.clone()),
@@ -403,14 +410,14 @@ fn text(v: &Value) -> Option<String> {
     }
 }
 
-fn int(v: &Value) -> Option<i64> {
+pub(super) fn int(v: &Value) -> Option<i64> {
     match v {
         Value::Int(n) => Some(*n),
         other => text(other)?.trim().parse().ok(),
     }
 }
 
-fn items(v: &Value) -> Option<&[Value]> {
+pub(super) fn items(v: &Value) -> Option<&[Value]> {
     match v {
         Value::Array(a) | Value::Set(a) => Some(a),
         _ => None,
@@ -418,7 +425,7 @@ fn items(v: &Value) -> Option<&[Value]> {
 }
 
 /// Key/value pairs: a RESP3 map, or a RESP2 flat array of keys and values.
-fn pairs(v: &Value) -> Option<Vec<(String, &Value)>> {
+pub(super) fn pairs(v: &Value) -> Option<Vec<(String, &Value)>> {
     match v {
         Value::Map(m) => Some(m.iter().filter_map(|(k, v)| Some((text(k)?, v))).collect()),
         Value::Array(a) if a.len() % 2 == 0 => {

@@ -144,6 +144,7 @@ pub(crate) fn profile_in(env: crate::model::Env) -> Profile {
         provider: None,
         token_command: None,
         ssh: None,
+        sentinel: None,
     }
 }
 

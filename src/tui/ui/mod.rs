@@ -419,7 +419,7 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
             let endpoint = Span::styled(
                 format!(
                     "  {}",
-                    trunc(&p.endpoint.to_string(), if w >= 100 { 30 } else { 18 })
+                    trunc(&s.endpoint().to_string(), if w >= 100 { 30 } else { 18 })
                 ),
                 style::dim(),
             );

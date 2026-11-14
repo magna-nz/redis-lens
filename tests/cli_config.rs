@@ -41,6 +41,7 @@ fn config_with(dir: &Path, file: &str, name: &str, port: u16) -> PathBuf {
                 provider: None,
                 token_command: None,
                 ssh: None,
+                sentinel: None,
             },
             false,
         )

@@ -312,6 +312,86 @@ fn connections_view() {
     insta::assert_snapshot!(t.backend());
 }
 
+/// A Sentinel profile: the detail panel's Sentinel row takes the Values row's place, and
+/// the endpoint is the configured one until the Sentinels have answered.
+fn sentinel_app() -> App {
+    let mut p = fixtures::profiles().remove(0);
+    p.name = "orders-sentinel".into();
+    p.sentinel = Some(crate::model::Sentinel {
+        master: "orders".into(),
+        nodes: vec![
+            "10.0.2.11:26379".parse().unwrap(),
+            "10.0.2.12:26379".parse().unwrap(),
+        ],
+        tls: false,
+    });
+    App::new(vec![p])
+}
+
+#[test]
+fn connections_sentinel_before_connecting() {
+    let app = sentinel_app();
+    let t = render(&app, 120, 36);
+    let lines = buffer_lines(&t);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("orders · asks 10.0.2.11:26379 (+1)")),
+        "{lines:#?}"
+    );
+    insta::assert_snapshot!(t.backend());
+}
+
+/// After the Sentinels answered: the Endpoint row, the list and the header show the
+/// primary they named, and the Sentinel row names the Sentinel that answered.
+#[test]
+fn connections_sentinel_after_connecting() {
+    let mut app = sentinel_app();
+    let id = connect_selected(&mut app);
+    let answer = crate::conn::sentinel::SentinelAnswer {
+        sentinel: "10.0.2.12:26379".parse().unwrap(),
+        master: "orders".into(),
+        primary: crate::model::Endpoint {
+            host: "10.0.2.31".into(),
+            port: 6379,
+            tls: true,
+        },
+    };
+    // A message from another run is ignored.
+    app.apply(Msg::SentinelResolved {
+        id,
+        scan: ScanId::default(),
+        answer: crate::conn::sentinel::SentinelAnswer {
+            master: "stale".into(),
+            ..answer.clone()
+        },
+    });
+    assert!(app.session.as_ref().unwrap().sentinel.is_none());
+    app.apply(Msg::SentinelResolved {
+        id,
+        scan: scan_of(&app),
+        answer,
+    });
+    app.apply(Msg::Connected {
+        id,
+        scan: scan_of(&app),
+        server: Some(fixtures::server()),
+        perms: fixtures::perms_ok(),
+        target: ScanTarget::Primary,
+    });
+    app.handle_key(ch('0'));
+    let t = render(&app, 120, 36);
+    let lines = buffer_lines(&t);
+    assert!(lines[0].contains("10.0.2.31:6379"), "{}", lines[0]);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("orders · named by 10.0.2.12:26379")),
+        "{lines:#?}"
+    );
+    insta::assert_snapshot!(t.backend());
+}
+
 #[test]
 fn scanning_progress_header() {
     let mut app = App::new(fixtures::profiles());

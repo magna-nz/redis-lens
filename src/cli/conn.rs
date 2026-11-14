@@ -15,7 +15,9 @@ use crate::config::Config;
 use crate::conn::docker::DiscoveredInstance;
 use crate::conn::token::display_command;
 use crate::conn::{self, parse_connection_string, provider, ssh};
-use crate::model::{Auth, Credentials, Env, PermStatus, Profile, SecretRef, SshTunnel};
+use crate::model::{
+    Auth, Credentials, Env, PermStatus, Profile, SecretRef, Sentinel, SentinelNode, SshTunnel,
+};
 use crate::secrets::{KeyringStore, SecretError, SecretStore};
 
 fn config_path(config: Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -30,7 +32,9 @@ pub async fn run(config: Option<PathBuf>, cmd: ConnCommand) -> anyhow::Result<()
     let secrets = KeyringStore;
     match cmd {
         ConnCommand::Add(args) => {
-            let stdin_password = if args.password_stdin {
+            // `--password-stdin` and `--sentinel-password-stdin` can't both be given, so
+            // what standard input holds is the one asked for.
+            let stdin_password = if args.password_stdin || args.sentinel_password_stdin {
                 let mut buf = String::new();
                 std::io::stdin()
                     .read_to_string(&mut buf)
@@ -237,8 +241,104 @@ fn ssh_from_args(args: &ConnAddArgs) -> anyhow::Result<Option<(SshTunnel, Option
     )))
 }
 
+/// The Sentinels from `--sentinel` and `--sentinel-master`, with `--sentinel-tls`, and the
+/// Sentinels' own credentials for the keychain: `--sentinel-user` and a password from
+/// `--sentinel-password-stdin` (`stdin`) or `--sentinel-ask-password` (`prompt`, after a
+/// line on `warn` saying whose password it asks for). `None` without `--sentinel`.
+/// Errors are fixed texts that never repeat a credential.
+fn sentinel_from_args(
+    args: &ConnAddArgs,
+    stdin: Option<&str>,
+    warn: &mut dyn std::io::Write,
+    prompt: &dyn Fn() -> anyhow::Result<String>,
+) -> anyhow::Result<Option<(Sentinel, Option<Credentials>)>> {
+    let Some(spec) = &args.sentinel else {
+        if args.sentinel_master.is_some()
+            || args.sentinel_tls
+            || args.sentinel_user.is_some()
+            || args.sentinel_password_stdin
+            || args.sentinel_ask_password
+        {
+            bail!("--sentinel-master and the other --sentinel-* flags need --sentinel");
+        }
+        return Ok(None);
+    };
+    let Some(master) = args.sentinel_master.as_deref() else {
+        bail!("--sentinel needs --sentinel-master NAME, the name the Sentinels monitor");
+    };
+    if master.is_empty() || master.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("--sentinel-master: the name is empty or has spaces or control characters");
+    }
+    let mut nodes: Vec<SentinelNode> = Vec::new();
+    for part in spec.split(',') {
+        let node: SentinelNode = part
+            .parse()
+            .map_err(|e| anyhow::anyhow!("--sentinel: {e}"))?;
+        if !nodes.contains(&node) {
+            nodes.push(node);
+        }
+    }
+    if args.password_stdin && args.sentinel_password_stdin {
+        bail!("--password-stdin and --sentinel-password-stdin can't both read standard input");
+    }
+    if args.sentinel_password_stdin && args.sentinel_ask_password {
+        bail!("give one of --sentinel-password-stdin and --sentinel-ask-password");
+    }
+    let password = if args.sentinel_password_stdin {
+        let raw = stdin.ok_or_else(|| {
+            anyhow::anyhow!("--sentinel-password-stdin was given but nothing was read")
+        })?;
+        Some(SecretString::from(trim_newline(raw).to_string()))
+    } else if args.sentinel_ask_password {
+        let _ = writeln!(warn, "The Sentinels' own password (not the server's):");
+        Some(SecretString::from(prompt()?))
+    } else {
+        None
+    };
+    let user = args.sentinel_user.clone();
+    if user
+        .as_deref()
+        .is_some_and(|u| u.is_empty() || u.chars().any(|c| c.is_whitespace() || c.is_control()))
+    {
+        bail!("--sentinel-user: the user is empty or has spaces or control characters");
+    }
+    let creds = match password {
+        Some(p) if p.expose_secret().is_empty() => bail!("the Sentinel password is empty"),
+        Some(password) => Some(Credentials {
+            username: user,
+            password,
+        }),
+        None if user.is_some() => bail!(
+            "--sentinel-user needs the Sentinel's password: pass --sentinel-password-stdin or \
+             --sentinel-ask-password"
+        ),
+        None => None,
+    };
+    Ok(Some((
+        Sentinel {
+            master: master.to_string(),
+            nodes,
+            tls: args.sentinel_tls,
+        },
+        creds,
+    )))
+}
+
+/// `<master> via <first host:port>`, with `(+N)` for the other Sentinels.
+pub(crate) fn sentinel_label(s: &Sentinel) -> String {
+    let mut out = s.master.clone();
+    if let Some(first) = s.nodes.first() {
+        out.push_str(&format!(" via {first}"));
+    }
+    if s.nodes.len() > 1 {
+        out.push_str(&format!(" (+{})", s.nodes.len() - 1));
+    }
+    out
+}
+
 /// Save a connection. `stdin_password` is everything read from standard input when
-/// `--password-stdin` was given. Returns the line to print.
+/// `--password-stdin` (or `--sentinel-password-stdin`, which can't be given with it) was
+/// given. Returns the line to print.
 pub async fn add(
     path: &Path,
     secrets: &dyn SecretStore,
@@ -435,6 +535,13 @@ pub async fn add_asking(
 
     // Checked before anything is written.
     let ssh = ssh_from_args(args)?;
+    // Standard input holds the Sentinel password only with --sentinel-password-stdin
+    // (which can't be given with --password-stdin).
+    let sentinel_stdin = if args.sentinel_password_stdin {
+        stdin_password.clone()
+    } else {
+        None
+    };
 
     let (url_user, url_password) = match &parsed.credentials {
         Some(c) => (
@@ -508,6 +615,10 @@ pub async fn add_asking(
             None => (Auth::None, None),
         }
     };
+    // The Sentinels and their own credentials, kept apart from the server's.
+    let (sentinel, sentinel_creds) =
+        sentinel_from_args(args, sentinel_stdin.as_deref(), &mut *warn, prompt)?.unzip();
+    let sentinel_creds = sentinel_creds.flatten();
 
     let provider = args
         .provider
@@ -531,6 +642,7 @@ pub async fn add_asking(
         provider,
         token_command,
         ssh: tunnel,
+        sentinel,
     };
     if args.confirm.is_some() && args.writes != Some(WritesArg::On) {
         bail!("--confirm answers the question --writes on asks; give --writes on too");
@@ -542,6 +654,7 @@ pub async fn add_asking(
 
     let r = profile.secret_ref();
     let ssh_ref = profile.ssh_secret_ref();
+    let sentinel_ref = profile.sentinel_secret_ref();
     let mut save = || -> anyhow::Result<()> {
         config.add(profile.clone(), args.force)?;
         config.save(path)?;
@@ -558,10 +671,17 @@ pub async fn add_asking(
         username: Some(u),
         password: SecretString::from(String::new()),
     });
-    match &ssh_creds {
-        // The SSH user the same way, around the rest: put back if anything fails.
-        Some(c) => set_credentials_then_save(secrets, &ssh_ref, c, save_with_credentials)?,
-        None => save_with_credentials()?,
+    let save_with_ssh = || -> anyhow::Result<()> {
+        match &ssh_creds {
+            // The SSH user the same way, around the rest: put back if anything fails.
+            Some(c) => set_credentials_then_save(secrets, &ssh_ref, c, save_with_credentials),
+            None => save_with_credentials(),
+        }
+    };
+    match &sentinel_creds {
+        // The Sentinels' credentials the same way, around the rest.
+        Some(c) => set_credentials_then_save(secrets, &sentinel_ref, c, save_with_ssh)?,
+        None => save_with_ssh()?,
     }
     // Old entries the saved profile no longer uses go only once the config no longer
     // points at them.
@@ -577,6 +697,12 @@ pub async fn add_asking(
     if ssh_creds.is_none() && existing.as_ref().is_some_and(|e| e.ssh.is_some()) {
         secrets.delete(&ssh_ref).context(
             "the profile was saved, but its old SSH username could not be deleted from the keychain",
+        )?;
+    }
+    if sentinel_creds.is_none() && existing.as_ref().is_some_and(|e| e.sentinel.is_some()) {
+        secrets.delete(&sentinel_ref).context(
+            "the profile was saved, but its old Sentinel credentials could not be deleted from \
+             the keychain",
         )?;
     }
 
@@ -603,6 +729,16 @@ pub async fn add_asking(
         msg.push_str(&format!(" Through SSH bastion {}.", ssh::label(t)));
         if ssh_creds.is_some() {
             msg.push_str(" The SSH username is in the OS keychain.");
+        }
+    }
+    if let Some(s) = &profile.sentinel {
+        msg.push_str(&format!(
+            " Asks Sentinel for {}{}: the primary is found at every connect.",
+            sentinel_label(s),
+            if s.tls { " (TLS)" } else { "" }
+        ));
+        if sentinel_creds.is_some() {
+            msg.push_str(" The Sentinel credentials are in the OS keychain.");
         }
     }
     if let Some(p) = profile.provider {
@@ -662,6 +798,8 @@ pub fn list(path: &Path) -> anyhow::Result<String> {
     }
     // The SSH column only when some profile goes through a bastion.
     let any_ssh = config.profiles.iter().any(|p| p.ssh.is_some());
+    // The SENTINEL column only when some profile asks Sentinels.
+    let any_sentinel = config.profiles.iter().any(|p| p.sentinel.is_some());
     let rows: Vec<Vec<String>> = config
         .profiles
         .iter()
@@ -676,16 +814,22 @@ pub fn list(path: &Path) -> anyhow::Result<String> {
             if any_ssh {
                 row.push(p.ssh.as_ref().map(ssh::label).unwrap_or_default());
             }
+            if any_sentinel {
+                row.push(p.sentinel.as_ref().map(sentinel_label).unwrap_or_default());
+            }
             row.push(p.provider.map_or("", provider::label).to_string());
             row
         })
         .collect();
-    let header: &[&str] = if any_ssh {
-        &["NAME", "ENV", "ENDPOINT", "TLS", "AUTH", "SSH", "PROVIDER"]
-    } else {
-        &["NAME", "ENV", "ENDPOINT", "TLS", "AUTH", "PROVIDER"]
-    };
-    Ok(table(header, &rows))
+    let mut header = vec!["NAME", "ENV", "ENDPOINT", "TLS", "AUTH"];
+    if any_ssh {
+        header.push("SSH");
+    }
+    if any_sentinel {
+        header.push("SENTINEL");
+    }
+    header.push("PROVIDER");
+    Ok(table(&header, &rows))
 }
 
 /// Remove a profile from the config, then its keychain entry. The entry is deleted
@@ -703,9 +847,26 @@ pub fn remove(path: &Path, secrets: &dyn SecretStore, name: &str) -> anyhow::Res
         ),
         None => Ok(()),
     };
+    let sentinel = match profile.sentinel {
+        Some(_) => secrets.delete(&profile.sentinel_secret_ref()).context(
+            "the profile was removed, but its Sentinel credentials could not be deleted from the \
+             keychain",
+        ),
+        None => Ok(()),
+    };
     main?;
     ssh?;
+    sentinel?;
     Ok(format!("Removed {name}."))
+}
+
+/// `conn test`'s line for a Sentinel profile: `Sentinel: <host:port> gave <master> at
+/// <address>.`
+pub fn sentinel_line(a: &conn::sentinel::SentinelAnswer) -> String {
+    format!(
+        "Sentinel: {} gave {} at {}.",
+        a.sentinel, a.master, a.primary
+    )
 }
 
 /// Connect to a saved profile and report which commands are allowed.
@@ -716,14 +877,22 @@ pub async fn test(path: &Path, secrets: &dyn SecretStore, name: &str) -> anyhow:
         .ok_or_else(|| crate::config::ConfigError::NotFound(name.to_string()))?;
     let mut conn = conn::connect(profile, secrets).await?;
     let report = conn::check_permissions(&mut conn).await;
+    let answer = conn.sentinel().cloned();
+    // A Sentinel profile is connected to the primary the Sentinels named.
+    let at = answer
+        .as_ref()
+        .map_or(&profile.endpoint, |a| &a.primary)
+        .to_string();
     let mut lines = vec![format!(
-        "Connected to {} ({}, {}).",
+        "Connected to {} ({at}, {}).",
         profile.name,
-        profile.endpoint,
         profile.env.label()
     )];
     if let Some(t) = &profile.ssh {
         lines.push(format!("Through SSH bastion {}.", ssh::label(t)));
+    }
+    if let Some(a) = &answer {
+        lines.push(sentinel_line(a));
     }
     if let Some(p) = profile.provider {
         let mut line = format!("Provider: {}.", provider::label(p));
@@ -802,6 +971,12 @@ mod tests {
             ssh: None,
             ssh_identity: None,
             ssh_known_hosts: None,
+            sentinel: None,
+            sentinel_master: None,
+            sentinel_tls: false,
+            sentinel_user: None,
+            sentinel_password_stdin: false,
+            sentinel_ask_password: false,
         }
     }
 
@@ -1451,6 +1626,264 @@ mod tests {
 
     const SSH_USER: &str = "jump-user-x93k";
 
+    const SENTINEL_USER: &str = "watch-user-r4q";
+    const SENTINEL_PW: &str = "watch-pw-r4q";
+
+    fn sentinel_entry(store: &MemoryStore, name: &str) -> Option<(Option<String>, String)> {
+        let r = SecretRef {
+            service: crate::model::SECRET_SERVICE.to_string(),
+            account: format!("sentinel:profile:{name}"),
+        };
+        store
+            .get(&r)
+            .unwrap()
+            .map(|c| (c.username, c.password.expose_secret().to_string()))
+    }
+
+    fn sentinel_args(name: &str, url: &str, nodes: &str) -> ConnAddArgs {
+        let mut a = args(name, url);
+        a.sentinel = Some(nodes.into());
+        a.sentinel_master = Some("mymaster".into());
+        a
+    }
+
+    #[tokio::test]
+    async fn add_sentinel_keeps_its_credentials_apart_and_in_the_keychain_only() {
+        let path = temp_path("sentinel-add");
+        let store = MemoryStore::default();
+        let mut a = sentinel_args(
+            "watched",
+            "redis://u:data-pw-1@10.0.0.5:6379/2",
+            "10.0.0.1,[2001:db8::7]:5000,s3.example:26380",
+        );
+        a.sentinel_tls = true;
+        a.sentinel_user = Some(SENTINEL_USER.into());
+        a.sentinel_password_stdin = true;
+        let mut warn = Vec::new();
+        let msg = add_with(
+            &path,
+            &store,
+            &a,
+            Some(format!("{SENTINEL_PW}\n")),
+            &mut warn,
+            &|| panic!("no prompt"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            msg.contains("Asks Sentinel for mymaster via 10.0.0.1:26379 (+2) (TLS)"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("The Sentinel credentials are in the OS keychain."),
+            "{msg}"
+        );
+        for secret in [SENTINEL_USER, SENTINEL_PW, "data-pw-1"] {
+            assert!(!msg.contains(secret), "{msg}");
+        }
+        let p = Config::load(&path).unwrap().get("watched").unwrap().clone();
+        let s = p.sentinel.clone().unwrap();
+        assert_eq!(s.master, "mymaster");
+        assert!(s.tls);
+        assert_eq!(
+            s.nodes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["10.0.0.1:26379", "[2001:db8::7]:5000", "s3.example:26380"]
+        );
+        assert_eq!(p.db, 2);
+        let text = std::fs::read_to_string(&path).unwrap();
+        for secret in [SENTINEL_USER, SENTINEL_PW, "data-pw-1"] {
+            assert!(!text.contains(secret), "{text}");
+        }
+        assert!(text.contains("[profile.sentinel]"), "{text}");
+        // Two entries, each with its own credentials.
+        assert_eq!(
+            sentinel_entry(&store, "watched"),
+            Some((Some(SENTINEL_USER.into()), SENTINEL_PW.into()))
+        );
+        assert_eq!(
+            entry(&store, "watched"),
+            Some((Some("u".into()), "data-pw-1".into()))
+        );
+
+        let out = list(&path).unwrap();
+        assert!(out.lines().next().unwrap().contains("SENTINEL"), "{out}");
+        assert!(out.contains("mymaster via 10.0.0.1:26379 (+2)"), "{out}");
+        assert!(!out.contains(SENTINEL_USER), "{out}");
+
+        remove(&path, &store, "watched").unwrap();
+        assert_eq!(sentinel_entry(&store, "watched"), None);
+        assert_eq!(entry(&store, "watched"), None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn sentinel_passwords_by_prompt_or_none_and_force_replaces_or_deletes() {
+        let path = temp_path("sentinel-force");
+        let store = MemoryStore::default();
+        // Asked on the terminal, after a line saying whose password it is: a
+        // password-only Sentinel.
+        let mut a = sentinel_args("w", "redis://h", "s1");
+        a.sentinel_ask_password = true;
+        let mut warn = Vec::new();
+        add_with(&path, &store, &a, None, &mut warn, &|| {
+            Ok(SENTINEL_PW.to_string())
+        })
+        .await
+        .unwrap();
+        let said = String::from_utf8(warn).unwrap();
+        assert!(said.contains("Sentinels' own password"), "{said}");
+        assert_eq!(
+            sentinel_entry(&store, "w"),
+            Some((None, SENTINEL_PW.into()))
+        );
+        assert_eq!(entry(&store, "w"), None, "the server has no credentials");
+        // Replaced without Sentinel credentials: the entry goes.
+        let mut a = sentinel_args("w", "redis://h", "s1");
+        a.force = true;
+        add(&path, &store, &a, None).await.unwrap();
+        assert_eq!(sentinel_entry(&store, "w"), None);
+        // Back, then no Sentinel at all.
+        let mut a = sentinel_args("w", "redis://h", "s1");
+        a.sentinel_password_stdin = true;
+        a.force = true;
+        add(&path, &store, &a, Some("pw2".into())).await.unwrap();
+        assert_eq!(sentinel_entry(&store, "w"), Some((None, "pw2".into())));
+        let mut a = args("w", "redis://h");
+        a.force = true;
+        add(&path, &store, &a, None).await.unwrap();
+        assert_eq!(sentinel_entry(&store, "w"), None);
+        assert_eq!(
+            Config::load(&path).unwrap().get("w").unwrap().sentinel,
+            None
+        );
+        // Without --sentinel there is no SENTINEL column.
+        assert!(!list(&path).unwrap().contains("SENTINEL"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_puts_the_sentinel_credentials_back() {
+        let path = temp_path("sentinel-rb");
+        let store = MemoryStore::default();
+        let mut a = sentinel_args("w", "redis://u:old-pw@h", "s1");
+        a.sentinel_password_stdin = true;
+        add(&path, &store, &a, Some("old-sentinel-pw".into()))
+            .await
+            .unwrap();
+        make_unsaveable(&path);
+        let mut a = sentinel_args("w", "redis://v:new-pw@h", "s2");
+        a.sentinel_user = Some("new".into());
+        a.sentinel_password_stdin = true;
+        a.force = true;
+        assert!(
+            add(&path, &store, &a, Some("new-sentinel-pw".into()))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sentinel_entry(&store, "w"),
+            Some((None, "old-sentinel-pw".into()))
+        );
+        assert_eq!(
+            entry(&store, "w"),
+            Some((Some("u".into()), "old-pw".into()))
+        );
+        // A new profile whose save fails leaves no Sentinel entry behind.
+        let mut a = sentinel_args("n", "redis://h", "s1");
+        a.sentinel_password_stdin = true;
+        assert!(add(&path, &store, &a, Some("x".into())).await.is_err());
+        assert_eq!(sentinel_entry(&store, "n"), None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn add_sentinel_refuses_bad_values_before_saving() {
+        let path = temp_path("sentinel-bad");
+        let store = MemoryStore::default();
+        let cases: Vec<(ConnAddArgs, Option<String>, &str)> = vec![
+            (
+                sentinel_args("b", "redis://h", "s1:0"),
+                None,
+                "--sentinel: ",
+            ),
+            (sentinel_args("b", "redis://h", "s1,"), None, "--sentinel: "),
+            (sentinel_args("b", "redis://h", "::1"), None, ""),
+            (
+                sentinel_args("b", "redis://h", "[::1"),
+                None,
+                "--sentinel: ",
+            ),
+            (
+                sentinel_args("b", "redis://h", "-oProxy"),
+                None,
+                "--sentinel: ",
+            ),
+            (
+                {
+                    let mut a = sentinel_args("b", "redis://h", "s1");
+                    a.sentinel_master = Some("my master".into());
+                    a
+                },
+                None,
+                "--sentinel-master",
+            ),
+            (
+                {
+                    let mut a = sentinel_args("b", "redis://h", "s1");
+                    a.sentinel_user = Some(SENTINEL_USER.into());
+                    a
+                },
+                None,
+                "--sentinel-user needs",
+            ),
+            (
+                {
+                    let mut a = sentinel_args("b", "redis://h", "s1");
+                    a.sentinel_password_stdin = true;
+                    a
+                },
+                Some("\n".into()),
+                "the Sentinel password is empty",
+            ),
+            (
+                {
+                    let mut a = args("b", "redis://h");
+                    a.sentinel_tls = true;
+                    a
+                },
+                None,
+                "need --sentinel",
+            ),
+            (
+                {
+                    let mut a = sentinel_args("b", "redis://h", "s1");
+                    a.sentinel_password_stdin = true;
+                    a.password_stdin = true;
+                    a
+                },
+                Some("x".into()),
+                "can't both read standard input",
+            ),
+        ];
+        for (a, stdin, want) in cases {
+            let r = add(&path, &store, &a, stdin).await;
+            // A bare IPv6 Sentinel without a port is fine: the default port.
+            if a.sentinel.as_deref() == Some("::1") {
+                r.unwrap();
+                let p = Config::load(&path).unwrap().get("b").unwrap().clone();
+                assert_eq!(p.sentinel.unwrap().nodes[0].to_string(), "[::1]:26379");
+                remove(&path, &store, "b").unwrap();
+                continue;
+            }
+            let e = r.unwrap_err().to_string();
+            assert!(e.contains(want), "{want}: {e}");
+            assert!(!e.contains(SENTINEL_USER), "{e}");
+        }
+        assert!(Config::load(&path).unwrap().get("b").is_none());
+        assert_eq!(sentinel_entry(&store, "b"), None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     fn ssh_ref(name: &str) -> SecretRef {
         SecretRef {
             service: crate::model::SECRET_SERVICE.to_string(),
@@ -1788,6 +2221,7 @@ mod tests {
                 provider: None,
                 token_command: None,
                 ssh: None,
+                sentinel: None,
             },
             credentials: Some(Credentials {
                 username: None,
