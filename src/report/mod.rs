@@ -98,7 +98,7 @@ pub(crate) fn facts(report: &ScanReport) -> Vec<(&'static str, String)> {
             None => "partial sample".to_string(),
         }
     };
-    vec![
+    let mut facts = vec![
         ("Profile", report.profile.clone()),
         (
             "Server",
@@ -137,7 +137,11 @@ pub(crate) fn facts(report: &ScanReport) -> Vec<(&'static str, String)> {
                 "unavailable: MEMORY USAGE denied, so sizes are left out".to_string()
             },
         ),
-    ]
+    ];
+    if let Some(note) = &report.note {
+        facts.push(("Note", note.clone()));
+    }
+    facts
 }
 
 /// Patterns the TTL view flags (warning verdicts), with the plain-language explanation.
@@ -297,6 +301,7 @@ pub(crate) mod fixtures {
 
     pub fn report(patterns: Vec<PatternStats>, sizes: bool, at: i64) -> ScanReport {
         ScanReport {
+            note: None,
             profile: "staging".into(),
             taken_at_unix: at,
             server: ServerInfo {

@@ -133,6 +133,11 @@ impl Default for Dest {
 /// (P4)", Redirects).
 pub const MOVING: &str = "the cluster is moving that slot; try again, or rescan";
 
+/// The fixed text of a `MOVED` or `ASK` on a profile with `force_standalone`: the key is
+/// on another node, and that node is never connected to.
+pub const STANDALONE_REDIRECT: &str =
+    "this key lives on another node; the profile is set to standalone";
+
 /// The fixed text of a request whose keys hash to different slots: refused before
 /// anything is sent.
 pub const CROSSSLOT: &str =
@@ -567,6 +572,17 @@ pub fn spawn_with_close(
     spawn_nodes(nodes::Table::single(conn, budget), reply, on_close)
 }
 
+/// [`spawn_with_close`] for a cluster node read alone on purpose (`force_standalone`):
+/// a `MOVED` or `ASK` is never followed and is answered with [`STANDALONE_REDIRECT`].
+pub fn spawn_forced_standalone(
+    conn: MultiplexedConnection,
+    budget: Arc<Budget>,
+    reply: impl Fn(ReqId, Result<LiveReply, LiveError>) + Send + Sync + 'static,
+    on_close: impl FnOnce(Option<String>) + Send + 'static,
+) -> LiveHandle {
+    spawn_nodes(nodes::Table::single_forced(conn, budget), reply, on_close)
+}
+
 /// [`spawn_with_close`] over a node table: a cluster's shards, or one standalone server.
 /// On a cluster a node whose connection is lost fails the requests sent to it (with
 /// [`nodes::lost`]) and the task goes on; it ends, as on a standalone server, once no
@@ -614,6 +630,12 @@ where
     let Some(r) = conn.redirect().cloned() else {
         return (first, None);
     };
+    if table.is_forced_standalone() && dest.follow != Follow::Never {
+        return (
+            Err(LiveError::Failed(STANDALONE_REDIRECT.to_string())),
+            None,
+        );
+    }
     match dest.follow {
         Follow::Never => return (first, None),
         Follow::MovedOnFirst if r.ask || !r.first => return (moving(), None),
@@ -1262,5 +1284,75 @@ mod tests {
         let mut got = sent(&log);
         got.sort();
         assert_eq!(got, [(0, "PING".into()), (1, "PING".into())]);
+    }
+
+    /// A cluster node read alone (`force_standalone`): `MOVED` and `ASK` are answered
+    /// with the fixed line and never followed, whatever the destination asks for.
+    #[tokio::test]
+    async fn forced_standalone_never_follows_a_redirect() {
+        for kind in ["MOVED", "ASK"] {
+            for dest in [
+                Dest::key("bar"),
+                Dest::node(0),
+                Dest::key("bar").follow(Follow::MovedOnFirst),
+            ] {
+                let log: Log = Arc::default();
+                let script: Script = Arc::new(move |_, _| redirect(kind, 5061, 7001));
+                let t = Table::single_forced(
+                    Fake {
+                        node: 0,
+                        log: Arc::clone(&log),
+                        script,
+                    },
+                    Budget::new(None),
+                );
+                assert!(t.is_forced_standalone());
+                let (r, lost) = route(&t, dest, ping()).await;
+                assert_eq!(
+                    r,
+                    Err(LiveError::Failed(STANDALONE_REDIRECT.into())),
+                    "{kind}"
+                );
+                assert_eq!(lost, None);
+                assert_eq!(
+                    sent(&log),
+                    [(0, "PING".into())],
+                    "nothing sent after {kind}"
+                );
+            }
+        }
+        assert_eq!(
+            STANDALONE_REDIRECT,
+            "this key lives on another node; the profile is set to standalone"
+        );
+    }
+
+    /// Other replies pass through, and `Follow::Never` (a bulk run counts the keys that
+    /// moved) still gets the result as it came.
+    #[tokio::test]
+    async fn forced_standalone_leaves_other_replies_and_never_alone() {
+        let log: Log = Arc::default();
+        let ok: Script = Arc::new(|_, _| pong());
+        let t = Table::single_forced(
+            Fake {
+                node: 0,
+                log: Arc::clone(&log),
+                script: ok,
+            },
+            Budget::new(None),
+        );
+        let (r, _) = route(&t, Dest::key("bar"), ping()).await;
+        assert!(r.is_ok(), "{r:?}");
+        let moved: Script = Arc::new(|_, _| redirect("MOVED", 5061, 7001));
+        let t = Table::single_forced(
+            Fake {
+                node: 0,
+                log,
+                script: moved,
+            },
+            Budget::new(None),
+        );
+        let (r, _) = route(&t, Dest::key("bar").follow(Follow::Never), ping()).await;
+        assert_ne!(r, Err(LiveError::Failed(STANDALONE_REDIRECT.into())));
     }
 }

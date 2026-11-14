@@ -1,5 +1,6 @@
 ---
 source: src/tui/views/value.rs
+assertion_line: 1907
 expression: t.backend()
 ---
 " prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
@@ -25,4 +26,4 @@ expression: t.backend()
 "│                           │ 2023-11-14 22:13:59.000  24.5                    │"
 "│                           │ 2023-11-14 22:13:58.000  23.5                    │"
 "└───────────────────────────┴──────────────────────────────────────────────────┘"
-" ↑↓ Move   → Value   f Format   y Copy   esc Back              : Command  ? Help"
+" ↑↓ Move   esc Back                                            : Command  ? Help"

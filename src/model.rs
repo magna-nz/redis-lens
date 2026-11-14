@@ -246,9 +246,29 @@ pub struct ScanReport {
     /// every shard was seen completely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<NodeReport>>,
+    /// A line about how the scan was read that the figures don't show. Today only
+    /// [`NOTE_ONE_NODE`]: one node of a cluster was read (`force_standalone`). `None`
+    /// otherwise, and in snapshots written before it existed; absent from the file when
+    /// `None`, so older builds read newer files and the reverse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
+/// [`ScanReport::note`] of a cluster node read alone (`Profile::force_standalone`).
+pub const NOTE_ONE_NODE: &str = "only one node of a cluster was read (the profile is set to standalone); keys on other nodes are not counted";
+
 impl ScanReport {
+    /// Sets [`NOTE_ONE_NODE`] when `profile` forces standalone and the server it read
+    /// is a cluster node (the report then has no per-node results).
+    pub fn note_standalone_read(&mut self, profile: &Profile) {
+        if profile.force_standalone
+            && self.server.mode == ServerMode::Cluster
+            && self.nodes.is_none()
+        {
+            self.note = Some(NOTE_ONE_NODE.to_string());
+        }
+    }
+
     /// [`KeySizes::big_keys`]; empty without sizes.
     pub fn big_keys(&self) -> &[KeySample] {
         self.key_sizes.as_deref().map_or(&[], |k| &k.big_keys)
@@ -556,6 +576,10 @@ pub struct Profile {
     /// address given to `conn add`, shown until the first connect, and is never dialled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sentinel: Option<Sentinel>,
+    /// Read the seed node alone as a standalone server, even when it is a cluster node:
+    /// no discovery, no slot routing (spec "Force standalone"). Refused with `sentinel`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_standalone: bool,
     /// Labels to group and find profiles by, see [`valid_tag`]. Never secret.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
@@ -908,6 +932,7 @@ mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            force_standalone: false,
             tags: Vec::new(),
         };
         assert!(p.is_read_only());
@@ -955,6 +980,7 @@ mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            force_standalone: false,
             tags: Vec::new(),
         };
         let text = toml::to_string(&p).unwrap();
@@ -1032,6 +1058,7 @@ mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            force_standalone: false,
             tags: Vec::new(),
         };
         let ssh = p.ssh_secret_ref();
@@ -1122,6 +1149,7 @@ mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            force_standalone: false,
             tags: Vec::new(),
         };
         assert!(!toml::to_string(&p).unwrap().contains("ssh"));

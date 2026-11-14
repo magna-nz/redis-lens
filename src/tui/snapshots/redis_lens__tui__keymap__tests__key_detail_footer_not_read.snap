@@ -1,0 +1,9 @@
+---
+source: src/tui/keymap.rs
+assertion_line: 1285
+expression: show(base)
+---
+[
+    "↑↓ Move",
+    "esc Back",
+]

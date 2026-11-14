@@ -3472,4 +3472,51 @@ mod tests {
         let dbg = format!("{:?}", app.views.value);
         assert!(!crate::value::leaks(&dbg, MARK), "{dbg}");
     }
+
+    /// The footer of a module type's summary (TimeSeries and the like) has no `f Format`
+    /// and no `y Copy`: neither does anything there.
+    #[test]
+    fn a_module_summary_footer_has_no_format_or_copy() {
+        let (mut app, id, _) = open(row("ts:1", KeyType::Other, None, Some(80)));
+        testing::reply(&mut app, id, page(Some("TSDB-TYPE"), Items::NotRead, None));
+        let all = text(&testing::render(&app, 120, 36));
+        let footer = all.lines().rev().find(|l| l.contains("Back")).unwrap_or("");
+        assert!(
+            !footer.contains("Format") && !footer.contains("Copy"),
+            "{footer}"
+        );
+        snap(&app, "module_summary_footer");
+    }
+
+    /// A cluster-mode server read with `force_standalone` carries a `standalone` mark in
+    /// the header; without the field, or on a plain standalone server, there is none.
+    #[test]
+    fn header_marks_a_cluster_node_read_alone() {
+        use crate::model::ServerMode;
+        let header = |app: &App| {
+            text(&testing::render(app, 120, 36))
+                .lines()
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let (mut app, _, _) = open(row("k", KeyType::String, Some(2), Some(80)));
+        let s = app.session.as_mut().unwrap();
+        let mut server = s
+            .server
+            .clone()
+            .unwrap_or_else(crate::tui::fixtures::server);
+        server.mode = ServerMode::Cluster;
+        s.server = Some(server);
+        assert!(!header(&app).contains("standalone"), "{}", header(&app));
+        let s = app.session.as_mut().unwrap();
+        s.profile.force_standalone = true;
+        assert!(s.read_alone());
+        assert!(header(&app).contains("standalone"), "{}", header(&app));
+        // Not a cluster node: nothing to mark.
+        let s = app.session.as_mut().unwrap();
+        s.server.as_mut().unwrap().mode = ServerMode::Standalone;
+        assert!(!s.read_alone());
+        assert!(!header(&app).contains("standalone"), "{}", header(&app));
+    }
 }

@@ -609,6 +609,7 @@ fn merge(
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     ScanReport {
+        note: None,
         profile: profile_name.to_string(),
         taken_at_unix,
         server,

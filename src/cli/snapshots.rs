@@ -243,6 +243,7 @@ mod tests {
 
     fn report(profile: &str, at: i64, complete: bool, glob: Option<&str>) -> ScanReport {
         ScanReport {
+            note: None,
             profile: profile.into(),
             taken_at_unix: at,
             server: ServerInfo {

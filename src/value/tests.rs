@@ -1289,8 +1289,12 @@ proptest! {
     fn snappy_matches_the_reference(data in proptest::collection::vec(any::<u8>(), 0..3000)) {
         let packed = snappy_raw(&data);
         prop_assert_eq!(snappy::raw(&packed, MAX_DECOMPRESSED), Some((data.clone(), false)));
-        let framed = snappy_framed(&data);
-        prop_assert_eq!(snappy::framed(&framed, MAX_DECOMPRESSED), Some((data, false)));
+        // The reference encoder writes nothing at all, not even the stream identifier,
+        // for empty input, so there is no framed stream to read back.
+        if !data.is_empty() {
+            let framed = snappy_framed(&data);
+            prop_assert_eq!(snappy::framed(&framed, MAX_DECOMPRESSED), Some((data, false)));
+        }
     }
 
     #[test]

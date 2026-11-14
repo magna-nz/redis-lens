@@ -427,7 +427,7 @@ static KEY_DETAIL: [KeyHelp; 15] = [
         "Delete the selected field, element or member (writes)",
         true,
     ),
-    k("D", "D", "Delete key", "Delete the key (writes)", false),
+    k("D", "D", "Delete key", "Delete the key (writes)", true),
 ];
 
 static TTL: [KeyHelp; 8] = [
@@ -794,6 +794,10 @@ pub struct FooterCtx {
     pub analyzing: bool,
     /// Writes are on for the session's profile.
     pub writes: bool,
+    /// The key's value is a module type's summary (`Items::Module`) or a type
+    /// redis-lens does not read (`Items::NotRead`): there is nothing to format or copy
+    /// there, and `d` deletes no item (`D` deletes the key).
+    pub not_read: bool,
 }
 
 /// The 3 to 5 keys that matter on `screen`, as `(key, label)` in display order. The
@@ -811,6 +815,8 @@ pub fn footer(screen: Screen, c: FooterCtx) -> Vec<(&'static str, &'static str)>
         Screen::Patterns if c.analyzed => &[MOVE, OPEN, "/", "o", "v"],
         Screen::Patterns => &[MOVE, OPEN, "/", "n", "r"],
         Screen::KeyList => &[MOVE, OPEN, "/", "n", BACK],
+        Screen::KeyDetail if c.not_read && c.writes => &[MOVE, "D", BACK],
+        Screen::KeyDetail if c.not_read => &[MOVE, BACK],
         Screen::KeyDetail if c.writes => &[MOVE, "e", "+", "d", "f"],
         Screen::KeyDetail => &[MOVE, "→ l", "f", "y", BACK],
         Screen::BigKeys | Screen::Ttl | Screen::Diff | Screen::HotKeys if c.analyzed => {
@@ -1037,6 +1043,7 @@ mod tests {
                             analyzed,
                             analyzing,
                             writes,
+                            not_read: false,
                         });
                     }
                 }
@@ -1256,6 +1263,69 @@ mod tests {
                 .filter(|h| h.key.is_some_and(|k| k.help == ANALYZE.help))
                 .count(),
             1
+        );
+    }
+
+    /// A module type's summary has nothing to format or copy: the footer leaves out
+    /// `f Format` and `y Copy`, and offers `D` rather than `d`, which deletes no item
+    /// there. The move keys stay: a module summary scrolls.
+    #[test]
+    fn key_detail_footer_on_an_unread_module_type() {
+        let base = FooterCtx {
+            ready: true,
+            analyzed: true,
+            not_read: true,
+            ..FooterCtx::default()
+        };
+        let show = |c| {
+            footer(Screen::KeyDetail, c)
+                .iter()
+                .map(|(k, l)| format!("{k} {l}"))
+                .collect::<Vec<_>>()
+        };
+        insta::assert_debug_snapshot!("key_detail_footer_not_read", show(base));
+        insta::assert_debug_snapshot!(
+            "key_detail_footer_not_read_writes",
+            show(FooterCtx {
+                writes: true,
+                ..base
+            })
+        );
+        for c in [
+            base,
+            FooterCtx {
+                writes: true,
+                ..base
+            },
+        ] {
+            let names: Vec<_> = footer(Screen::KeyDetail, c).iter().map(|h| h.1).collect();
+            assert!(
+                !names.contains(&"Format") && !names.contains(&"Copy"),
+                "{names:?}"
+            );
+            // Every key is in the table and marked for the footer.
+            for (key, label) in footer(Screen::KeyDetail, c) {
+                assert!(
+                    for_screen(Screen::KeyDetail)
+                        .iter()
+                        .chain(global())
+                        .any(|h| h.footer_keys == key && h.label == label && h.in_footer),
+                    "{key} {label}"
+                );
+            }
+        }
+        // A readable value keeps them.
+        let readable = FooterCtx {
+            not_read: false,
+            ..base
+        };
+        let names: Vec<_> = footer(Screen::KeyDetail, readable)
+            .iter()
+            .map(|h| h.1)
+            .collect();
+        assert!(
+            names.contains(&"Format") && names.contains(&"Copy"),
+            "{names:?}"
         );
     }
 }

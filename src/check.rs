@@ -699,6 +699,7 @@ mod tests {
 
     pub(crate) fn rep(patterns: Vec<PatternStats>, sizes: bool, complete: bool) -> ScanReport {
         ScanReport {
+            note: None,
             profile: "p".into(),
             taken_at_unix: 1_000,
             server: ServerInfo {

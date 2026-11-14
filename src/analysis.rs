@@ -589,6 +589,7 @@ mod tests {
 
     fn report(patterns: Vec<PatternStats>) -> ScanReport {
         ScanReport {
+            note: None,
             profile: "p".into(),
             taken_at_unix: 0,
             server: ServerInfo {

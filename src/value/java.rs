@@ -57,6 +57,7 @@ pub(super) fn render(b: &[u8], out: &mut Tree) -> bool {
         b,
         i: MAGIC.len(),
         handles: Vec::new(),
+        spare: Handle::Pending,
         quiet: 0,
         at: MAGIC.len(),
         out,
@@ -99,11 +100,31 @@ struct Reader<'a, 'o> {
     b: &'a [u8],
     i: usize,
     handles: Vec<Handle>,
+    /// Where a write to a handle lands when a `TC_RESET` inside the item has cleared the
+    /// handle table since the handle was assigned: it is thrown away.
+    spare: Handle,
     /// Above 0, nothing is written (class annotations).
     quiet: usize,
     /// Where the item being read started: a hex tail starts there.
     at: usize,
     out: &'o mut Tree,
+}
+
+impl Reader<'_, '_> {
+    /// Handle `k`, or `Pending` when a `TC_RESET` has cleared the table since `k` was
+    /// read: corrupted or hostile bytes must never index out of bounds.
+    fn handle(&self, k: usize) -> &Handle {
+        self.handles.get(k).unwrap_or(&Handle::Pending)
+    }
+
+    /// Handle `h` to fill in, or a spare slot when a `TC_RESET` has cleared the table
+    /// since `h` was assigned.
+    fn handle_mut(&mut self, h: usize) -> &mut Handle {
+        match self.handles.get_mut(h) {
+            Some(slot) => slot,
+            None => &mut self.spare,
+        }
+    }
 }
 
 /// The stream is not understood from here.
@@ -190,7 +211,7 @@ impl<'a> Reader<'a, '_> {
             TC_REFERENCE => {
                 self.i += 1;
                 let k = self.handle_ref()?;
-                let text = match &self.handles[k] {
+                let text = match self.handle(k) {
                     Handle::Str(s) => format!("\"{s}\""),
                     Handle::Named(n) => format!("{n} (again)"),
                     Handle::Desc(d) => format!("class {}", d.name),
@@ -217,7 +238,7 @@ impl<'a> Reader<'a, '_> {
                 let name = self.string()?;
                 let class = self.desc_name(d);
                 let text = format!("enum {class}.{name}");
-                self.handles[h] = Handle::Named(text.clone());
+                *self.handle_mut(h) = Handle::Named(text.clone());
                 self.emit(depth, format!("{prefix}{text}"));
             }
             TC_CLASS => {
@@ -268,7 +289,7 @@ impl<'a> Reader<'a, '_> {
             TC_LONGSTRING => self.long_utf()?,
             TC_REFERENCE => {
                 let k = self.handle_ref()?;
-                return match &self.handles[k] {
+                return match self.handle(k) {
                     Handle::Str(s) => Ok(s.clone()),
                     _ => Err(Stop),
                 };
@@ -280,7 +301,7 @@ impl<'a> Reader<'a, '_> {
     }
 
     fn desc_name(&self, d: usize) -> String {
-        match &self.handles[d] {
+        match self.handle(d) {
             Handle::Desc(d) => d.name.clone(),
             _ => "?".to_string(),
         }
@@ -296,7 +317,7 @@ impl<'a> Reader<'a, '_> {
             TC_NULL => Ok(None),
             TC_REFERENCE => {
                 let k = self.handle_ref()?;
-                match self.handles[k] {
+                match *self.handle(k) {
                     Handle::Desc(_) => Ok(Some(k)),
                     _ => Err(Stop),
                 }
@@ -323,7 +344,7 @@ impl<'a> Reader<'a, '_> {
                 }
                 self.annotation(depth)?;
                 let sup = self.class_desc(depth + 1)?;
-                self.handles[h] = Handle::Desc(Desc {
+                *self.handle_mut(h) = Handle::Desc(Desc {
                     name,
                     flags,
                     fields,
@@ -343,7 +364,7 @@ impl<'a> Reader<'a, '_> {
                 }
                 self.annotation(depth)?;
                 let sup = self.class_desc(depth + 1)?;
-                self.handles[h] = Handle::Desc(Desc {
+                *self.handle_mut(h) = Handle::Desc(Desc {
                     name: format!("proxy({})", names.join(", ")),
                     flags: SC_SERIALIZABLE,
                     fields: Vec::new(),
@@ -387,13 +408,13 @@ impl<'a> Reader<'a, '_> {
                 return Err(Stop);
             }
             chain.push(k);
-            at = match &self.handles[k] {
+            at = match self.handle(k) {
                 Handle::Desc(desc) => desc.sup,
                 _ => None,
             };
         }
         for &k in chain.iter().rev() {
-            let (flags, fields): (u8, Vec<(u8, String)>) = match &self.handles[k] {
+            let (flags, fields): (u8, Vec<(u8, String)>) = match self.handle(k) {
                 Handle::Desc(desc) => (
                     desc.flags,
                     desc.fields
@@ -429,7 +450,7 @@ impl<'a> Reader<'a, '_> {
                 self.contents_until_end(depth + 1)?;
             }
         }
-        self.handles[h] = Handle::Named(format!("object {name}"));
+        *self.handle_mut(h) = Handle::Named(format!("object {name}"));
         Ok(())
     }
 
@@ -487,7 +508,7 @@ impl<'a> Reader<'a, '_> {
                 self.emit(depth + 1, format!("… {} more", n - ARRAY_SHOWN));
             }
         }
-        self.handles[h] = Handle::Named(shown);
+        *self.handle_mut(h) = Handle::Named(shown);
         Ok(())
     }
 }
