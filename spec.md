@@ -421,6 +421,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `tab` `shift-tab` | Next or previous panel, nothing else |
 | `p` | Pause or resume polling |
 | `r` | Refresh this panel now |
+| `y` | Copy the selected command line, masked |
 | `c` | Change the slow log threshold or length (writes) |
 | `R` | Reset the slow log (writes) |
 | `[` `]` | Pick the previous or next node (cluster only) |
@@ -435,6 +436,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `tab` `shift-tab` | Next or previous panel, nothing else |
 | `enter` | Start MONITOR (asks; stops at 30 s or 10,000 lines) |
 | `esc` | Stop MONITOR now |
+| `y` | Copy the selected command line, masked |
 | `[` `]` | Pick the previous or next node (cluster only) |
 
 #### Pub/Sub
