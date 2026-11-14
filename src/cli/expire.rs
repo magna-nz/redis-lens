@@ -168,8 +168,9 @@ pub async fn execute(
     if let Some(why) = bulk::expire_off(&server) {
         bail!("{why}");
     }
-    // A cluster node: `redis_mode:cluster`, or (Valkey 8 says `server_mode`, which
-    // `server_info` does not read) `cluster_enabled:1` in `INFO cluster`.
+    // A cluster node: `INFO server` says so (`redis_mode`, or `server_mode` on Valkey
+    // 8), or, when it names neither, `cluster_enabled:1` in `INFO cluster`. A cluster
+    // must never be mistaken for one server here: the run would write to one node only.
     let cluster = server.mode == ServerMode::Cluster || {
         budget.take(1).await;
         let info: Option<String> = redis::cmd("INFO")
