@@ -21,6 +21,8 @@ pub enum CopyKind {
     Command,
     /// A value as shown on screen (spec "Values (P2)", "Clipboard").
     Value,
+    /// A Slow log entry's or a Monitor line's command line, credentials masked.
+    CommandLine,
 }
 
 impl CopyKind {
@@ -30,6 +32,7 @@ impl CopyKind {
             Self::Key => "key",
             Self::Command => "command",
             Self::Value => "value",
+            Self::CommandLine => "command line",
         }
     }
 }
@@ -38,7 +41,8 @@ impl CopyKind {
 ///
 /// There is deliberately no constructor from an arbitrary `String`, a profile, a
 /// connection string or credentials: only a pattern name, a key name, the suggested
-/// `redis-cli --scan` command or a value as shown on screen ([`CopyText::value`]) can
+/// `redis-cli --scan` command, a value as shown on screen ([`CopyText::value`]) or a
+/// masked command line ([`CopyText::masked_line`]) can
 /// be built, so nothing credential-like can reach the clipboard (CLAUDE.md rule 1).
 /// Keep it that way.
 ///
@@ -73,6 +77,16 @@ impl CopyText {
         Self {
             kind: CopyKind::Value,
             text: shown.to_string(),
+        }
+    }
+
+    /// A command line of the Slow log or Monitor, as the masker wrote it
+    /// ([`crate::live::command::masked_line`]): credentials already masked, never the
+    /// raw arguments. Only `y` on those panels builds one.
+    pub fn masked_line(masked: &str) -> Self {
+        Self {
+            kind: CopyKind::CommandLine,
+            text: masked.to_string(),
         }
     }
 

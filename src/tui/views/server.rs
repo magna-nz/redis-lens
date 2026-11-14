@@ -42,6 +42,7 @@ use crate::live::write::Reply as WriteReply;
 use crate::live::{LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::Env;
 use crate::tui::app::Screen;
+use crate::tui::clipboard::CopyText;
 use crate::write::{SlowlogSetting, WriteOp};
 
 use super::streams::form::{Field, Form, Step, write_failed, write_off};
@@ -1328,6 +1329,15 @@ impl SlowLog {
         self.entries.get(self.sel)
     }
 
+    /// What `y` copies: the selected entry's command line, credentials masked as the
+    /// screen shows it (not the "more arguments" note). `None` with nothing selected
+    /// or no arguments kept.
+    pub fn copy_text(&self) -> Option<CopyText> {
+        let e = self.selected()?;
+        let line = String::from_utf8_lossy(e.args.as_bytes());
+        (!line.is_empty()).then(|| CopyText::masked_line(&line))
+    }
+
     fn key(&mut self, key: KeyEvent, page: usize) -> bool {
         move_selection(self.sel, self.entries.len(), key, page).is_some_and(|s| {
             self.sel = s;
@@ -1480,6 +1490,13 @@ impl Monitor {
 
     pub fn selected(&self) -> Option<&Entry> {
         self.lines.get(self.sel)
+    }
+
+    /// What `y` copies: the selected line's command and arguments, credentials masked
+    /// as the screen shows them.
+    pub fn copy_text(&self) -> Option<CopyText> {
+        let line = self.selected()?.command_line();
+        (!line.is_empty()).then(|| CopyText::masked_line(&line))
     }
 
     fn push(&mut self, lines: Vec<Entry>) -> bool {
@@ -3685,5 +3702,103 @@ mod monitor_tests {
             panic!("{effects:?}");
         };
         assert!(!value::leaks(&serde_json::to_string(report).unwrap(), MARK));
+    }
+
+    /// The copy the effects hold, if exactly one.
+    fn copied(effects: &[Effect]) -> Option<CopyText> {
+        match effects {
+            [Effect::Copy(t)] => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn y_on_monitor_copies_the_masked_line_never_the_password() {
+        let (mut app, run) = running(Instant::now());
+        lines(&mut app, run, sample_lines());
+        app.handle_key(key(KeyCode::Home));
+        // Line 1 is `AUTH lens <password>`: copied as shown.
+        let t = copied(&app.handle_key(ch('y'))).expect("a copy");
+        assert_eq!(t, CopyText::masked_line("AUTH *** ***"));
+        assert_eq!(t.what(), "command line");
+        assert!(!t.as_str().contains(PASS));
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.starts_with("Copied command line"))
+        );
+        // The CONFIG SET requirepass line, too.
+        let last_but_one = app.views.server.monitor.lines.len() - 2;
+        app.views.server.monitor.sel = last_but_one;
+        let t = copied(&app.handle_key(ch('y'))).expect("a copy");
+        assert!(!t.as_str().contains(PASS), "{t:?}");
+        assert!(t.as_str().starts_with("CONFIG SET requirepass"));
+        // `Y` has nothing to offer here.
+        assert!(app.handle_key(ch('Y')).is_empty());
+    }
+
+    #[test]
+    fn y_on_monitor_with_no_line_says_so_and_escapes_control_characters() {
+        let (mut app, run) = running(Instant::now());
+        assert!(app.handle_key(ch('y')).is_empty());
+        assert_eq!(
+            app.notice.as_ref().map(|n| n.text.as_str()),
+            Some("Nothing selected to copy.")
+        );
+        lines(&mut app, run, sample_lines());
+        // Line 7 names a key with an escape sequence: the masker writes it as `\x1b`,
+        // as the screen shows it, so what is copied holds no control character.
+        app.views.server.monitor.sel = 6;
+        let t = copied(&app.handle_key(ch('y'))).expect("a copy");
+        assert!(t.as_str().contains("\\x1b"), "{t:?}");
+        assert!(!t.as_str().chars().any(char::is_control));
+    }
+
+    #[test]
+    fn y_on_the_slow_log_copies_the_masked_args() {
+        let t0 = Instant::now();
+        let mut app = testing::scanned();
+        testing::live_ready(&mut app);
+        app.apply(Msg::TickAt(t0));
+        let out = testing::show(&mut app, Screen::SlowLog);
+        let (id, _) = testing::requests(&out).pop().unwrap();
+        let entry = |id: u64, args: &str| SlowEntry {
+            id,
+            unix: 1_763_039_045 - id as i64,
+            micros: 12_000,
+            command: "X".into(),
+            keys: vec![],
+            more_keys: 0,
+            client: "10.0.1.5:50386".into(),
+            client_name: String::new(),
+            whole_key_read: false,
+            args: Raw::new(args.as_bytes().to_vec()),
+            args_cut: 3,
+        };
+        let reply = SlowLogReply {
+            entries: vec![
+                entry(2, "CONFIG SET requirepass ***"),
+                entry(1, "SET k a\nb\r"),
+            ],
+            config: None,
+            keys_off: None,
+            learned: HashMap::new(),
+        };
+        testing::reply(
+            &mut app,
+            id,
+            Ok(LiveReply::Server(Reply::SlowLog(Box::new(reply)))),
+        );
+        let t = copied(&app.handle_key(ch('y'))).expect("a copy");
+        assert_eq!(t, CopyText::masked_line("CONFIG SET requirepass ***"));
+        assert!(app.handle_key(ch('Y')).is_empty());
+        // Control characters in the arguments: not copied.
+        app.handle_key(ch('j'));
+        assert!(app.handle_key(ch('y')).is_empty());
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("control characters"))
+        );
     }
 }
