@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** Redis Insight parity phase 5, built on branch `claude/insight-phase5` for one PR that is not merged yet ([Phase 5](#phase-5-2026-11-15-the-rest-of-redis-insight-parity)). On main: parity phases 1 to 4 (#15, #16, #17, #18, #19), the phase 4 follow-up PR #20 (merged 2026-11-14, merge commit `9e031cb`) and the TUI redesign (#21, merged 2026-11-15, merge commit `dec974e`).
-**Last updated:** 2026-11-15 (phase 5 built on its branch except force standalone, which is in progress; the PR is not merged yet)
+**Last updated:** 2026-11-15 (phase 5 built on its branch, in draft PR #22; not merged yet)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -619,7 +619,7 @@ Built on `claude/insight-phase5`, cut from main at `dec974e`, for one PR that is
 | values | Snappy; PHP, Pickle, Protobuf and Java serialization as bounded trees; detection order; arrays (Redis 8.8) and the TimeSeries, Bloom, Cuckoo, Count-Min Sketch, Top-K and t-digest values in a key's value; `f` cycles eight formats | `88cb82e`, `76e47dd`, `ec93b0f`, `c213ae2`, `534141d` (`f` text); merge `76ba274` | **done** |
 | docs | A GitHub Pages site in `docs/` (`index.html`, `site.css`, `site.js`, `.nojekyll`) and a README cut from 412 to 93 lines; the site's text on `expire` dry runs was corrected to match spec.md (a read-only profile refuses, dry run included) | `e22599c`, `6176202`; merge `1270a0c` | **done**; Pages is not enabled yet (see the questions) |
 | spec and status | spec.md, this section and the parity doc brought up to date | this commit | **done** |
-| force standalone | Connecting to one node of a cluster as a standalone server | | **in progress**, in a separate worktree; whoever merges it adds its commits, its spec.md text and this row's state |
+| force standalone | `conn add --standalone`, `conn set --standalone/--no-standalone`: one node of a cluster read as a standalone server, redirects never followed, a `standalone` mark and a report note; plus the module summary footer (`↑↓ Move`, `D`, `esc Back`) | `f77ecaf`, merge `59f2a74` (with a Java-reader fix from the proptests: a handle cleared by `TC_RESET` is no longer indexed) | **done**; `tests/cluster_standalone_it.rs` on Redis and Valkey |
 
 Tests: the keymap test `tui::keymap::tests::spec_lists_every_key` checks the key tables in spec.md against `src/tui/keymap.rs`; the key rows for the small and cmdline parts were added with their parts. Module values need no new ACL rule: their commands are in `+@read` on Redis 8 (checked on 8.10.1).
 

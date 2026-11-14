@@ -42,7 +42,7 @@ Fit: how well it works in a TUI (✓ good, ~ workable, ✗ poor). Effort: S = da
 | Azure discovery with Entra ID | Part | – | ✓ | M | Entra ID sign-in is built for developer tools (feature idea 10). Discovery across subscriptions is not built: it needs cloud accounts and can't be tested in CI. |
 | Redis Cloud and Redis Software discovery | Missing | A | ~ | M | Not built in phase 5: needs cloud accounts and can't be tested in CI. Low priority for our users. |
 | AWS ElastiCache discovery | Missing (Redis Insight lacks it too) | A | ✓ | M | Not built in phase 5, for the same reason. A token command covers ElastiCache IAM today (feature idea 9). |
-| Cluster, including force-standalone | **Have**, force-standalone in progress | A | ✓ | L | Cluster since v0.3, live views since Phase 4. Force-standalone (one node as a standalone server) is being built for Phase 5. |
+| Cluster, including force-standalone | **Have** | A | ✓ | L | Cluster since v0.3, live views since Phase 4, force standalone (`conn add --standalone`) since Phase 5. |
 | Sentinel | **Have** | A | ✓ | M | Phase 4: Sentinel credentials kept apart in the keychain; `--prefer-replica` uses `SENTINEL REPLICAS`. |
 | SSH tunnel (password or key) | Part | A | ✓ | M | Key login through a bastion since v0.3, the key passphrase in the keychain (rule 1). Password login is not built: a large change on a security-sensitive path. |
 | Switch DB index while connected | **Have** | A | ✓ | S | Phase 4: `b` lists the indexes from `INFO keyspace`. |
@@ -178,7 +178,7 @@ Phases 1 to 4 left the gaps below. Phase 5 closes the ones that fit a TUI and ar
 | 2 | **`y` on Slow log and Monitor** | S | Copies the masked command line, never the raw arguments. |
 | 3 | **Command line**: result views (text, table, JSON, raw), `N cmd` repeats, pipeline mode | M | The "Result views" and "Pipeline mode" rows. A repeat of a write that asks is refused, not asked once. |
 | 4 | **Values**: Snappy, PHP, Pickle, Protobuf and Java formats, arrays and the TimeSeries, Bloom, Cuckoo, Count-Min Sketch, Top-K and t-digest types | M | The "Formatters" and "JSON, Vector Sets, Arrays" rows. The readers are bounded, and Pickle is read, never run. |
-| 5 | **Force standalone** | M | In progress. |
+| 5 | **Force standalone** | M | Built: `conn add --standalone`; redirects are never followed. |
 | 6 | A documentation site and a shorter README | S | Not a matrix row. |
 
 Not built, with reasons: cloud discovery (needs cloud accounts, can't be tested in CI), SSH password login (a large change on a security-sensitive path), connection presets from environment variables (conflict with rule 1, the owner's call), aliases (low value), server-side `HOTKEYS` (not confirmed on any image), uploading a commands file (low value), Vector Set similarity search, and creating JSON keys.
