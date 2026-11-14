@@ -127,7 +127,11 @@ fn number(v: &Value) -> Option<u64> {
 fn metrics(slot: u16, v: &Value) -> Option<SlotStat> {
     let pairs: Vec<(&Value, &Value)> = match v {
         Value::Map(m) => m.iter().map(|(k, v)| (k, v)).collect(),
-        Value::Array(a) => a.chunks_exact(2).map(|c| (&c[0], &c[1])).collect(),
+        Value::Array(a) => a
+            .iter()
+            .step_by(2)
+            .zip(a.iter().skip(1).step_by(2))
+            .collect(),
         _ => return None,
     };
     let mut out = SlotStat {

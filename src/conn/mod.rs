@@ -1080,7 +1080,11 @@ pub(crate) fn conn_error_text(e: &ConnError) -> String {
         "the replica refused the connection".to_string()
     } else if r.is_timeout() {
         "timed out".to_string()
-    } else if r.is_io_error() || r.is_connection_refusal() || r.is_connection_dropped() {
+    } else if r.is_io_error() {
+        // From the operating system or the certificate check, never from the server:
+        // it says why (a refused connection, an unknown issuer, a wrong name).
+        r.to_string()
+    } else if r.is_connection_refusal() || r.is_connection_dropped() {
         "could not connect".to_string()
     } else {
         "the replica's reply could not be read".to_string()

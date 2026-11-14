@@ -1,6 +1,9 @@
 //! Tests added after the Sentinel verifier's review: fixed error texts, the loopback
 //! rule for a Sentinel's replica, and Monitor's address.
 
+// The loopback test needs a fake ssh, so it and its helpers are Unix only.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use super::*;
 use crate::conn::tests::{FakeServer, STANDALONE, ep};
 use crate::model::{Auth, Credentials};
