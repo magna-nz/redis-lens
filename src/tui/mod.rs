@@ -255,6 +255,25 @@ impl LiveSession {
 struct NodeRoute {
     budget: Arc<Budget>,
     addr: Option<conn::NodeAddr>,
+    /// Discovery has a connection to the node. Without one, nothing opens a connection
+    /// of its own to it ([`NodeRoute::refused`]).
+    connected: bool,
+}
+
+impl NodeRoute {
+    /// Why Monitor or a Pub/Sub tail may not open its own connection to this node:
+    /// discovery did not connect to it, because it refused the address (a loopback
+    /// address announced by a remote cluster must never be sent the credentials) or
+    /// could not reach it. The second line of defence behind the app's own check.
+    fn refused(&self) -> Option<String> {
+        if self.connected {
+            return None;
+        }
+        Some(match &self.addr {
+            Some(a) => live::nodes::not_connected(&a.endpoint),
+            None => LiveError::Closed.to_string(),
+        })
+    }
 }
 
 /// A running live tail: its id and its task, aborted when this is dropped.
@@ -309,6 +328,7 @@ fn start_live(
         s.nodes = vec![NodeRoute {
             budget: Arc::clone(&budget),
             addr: None,
+            connected: true,
         }];
     }
     install_live(slot, id, scan, tx, || {
@@ -360,6 +380,7 @@ fn start_live_cluster(
                 endpoint: t.endpoint.clone(),
                 credentials: t.credentials,
             }),
+            connected: t.conn.is_some(),
         });
         // Held until the task ends, for the SSH forwards (see `start_live`).
         held.extend(t.conn.clone());
@@ -515,6 +536,19 @@ impl Runner {
             );
             return;
         };
+        if let Some(why) = route.refused() {
+            drop(guard);
+            send(
+                &self.tx,
+                Msg::TailClosed {
+                    id,
+                    scan,
+                    tail,
+                    error: Some(why),
+                },
+            );
+            return;
+        }
         // The old tail's connection goes first.
         s.tail = None;
         let tx = self.tx.clone();
@@ -561,6 +595,19 @@ impl Runner {
             );
             return;
         };
+        if let Some(why) = route.refused() {
+            drop(guard);
+            send(
+                &self.tx,
+                Msg::MonitorClosed {
+                    id,
+                    scan,
+                    run,
+                    end: Err(why),
+                },
+            );
+            return;
+        }
         s.monitor = None;
         let tx = self.tx.clone();
         s.monitor = Some(TailTask {
@@ -2206,6 +2253,76 @@ mod tests {
         assert!(lock(&runner.live).as_ref().unwrap().tail.is_none());
     }
 
+    /// The runner's own check, behind the app's: a tail or a Monitor run asked for a
+    /// node discovery has no connection to is refused, and nothing connects to it,
+    /// although its route says credentials would go there.
+    #[tokio::test]
+    async fn nothing_connects_to_a_node_discovery_did_not_use() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = crate::model::Endpoint {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            tls: false,
+        };
+        let (mut runner, mut rx) = runner();
+        connecting(&mut runner, 1, 10);
+        lock(&runner.live).as_mut().unwrap().nodes = vec![NodeRoute {
+            budget: Budget::new(None),
+            addr: Some(conn::NodeAddr {
+                endpoint: endpoint.clone(),
+                credentials: true,
+            }),
+            connected: false,
+        }];
+        let why = live::nodes::not_connected(&endpoint);
+        runner.run(
+            Effect::Subscribe {
+                id: 1,
+                scan: 10,
+                tail: 3,
+                profile: profile("p"),
+                secrets: SecretSource::Keychain,
+                to: Subscription::Channel("news".into()),
+                node: 0,
+            },
+            &mut Recorder::default(),
+        );
+        match rx.try_recv().map(msg_of) {
+            Ok(Msg::TailClosed {
+                tail: 3,
+                error: Some(e),
+                ..
+            }) => assert_eq!(e, why),
+            _ => panic!("expected TailClosed"),
+        }
+        runner.run(
+            Effect::Monitor {
+                id: 1,
+                scan: 10,
+                run: 4,
+                profile: profile("p"),
+                secrets: SecretSource::Keychain,
+                node: 0,
+            },
+            &mut Recorder::default(),
+        );
+        match rx.try_recv().map(msg_of) {
+            Ok(Msg::MonitorClosed {
+                run: 4,
+                end: Err(e),
+                ..
+            }) => assert_eq!(e, why),
+            _ => panic!("expected MonitorClosed"),
+        }
+        {
+            let live = lock(&runner.live);
+            let s = live.as_ref().unwrap();
+            assert!(s.tail.is_none() && s.monitor.is_none());
+        }
+        let accepted = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(accepted.is_err(), "something connected to the unused node");
+    }
+
     #[tokio::test]
     async fn one_tail_per_session_and_unsubscribe_or_a_new_connect_drops_it() {
         let (mut runner, _rx) = runner();
@@ -2213,6 +2330,7 @@ mod tests {
         lock(&runner.live).as_mut().unwrap().nodes = vec![NodeRoute {
             budget: Budget::new(None),
             addr: None,
+            connected: true,
         }];
         // A tail whose task never ends, standing in for one that is subscribed.
         let install = |runner: &Runner, tail: u64| {

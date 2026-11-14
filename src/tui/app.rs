@@ -742,6 +742,22 @@ impl Session {
             .position(|n| n.slots.iter().any(|&(a, b)| a <= slot && slot <= b))
     }
 
+    /// Why Monitor or a Pub/Sub tail may not open a connection of its own to node
+    /// `node`: discovery has no connection to it. It may have refused the node (a
+    /// loopback address announced by a remote cluster, which must never be sent the
+    /// credentials) or failed to reach it, and either way nothing new is opened to a
+    /// node discovery did not use. `None` when it may, and on a standalone server.
+    pub fn own_connection_refused(&self, node: usize) -> Option<String> {
+        if !self.is_cluster() {
+            return None;
+        }
+        match self.nodes.get(node) {
+            Some(n) if n.connected => None,
+            Some(n) => Some(crate::live::nodes::not_connected(&n.endpoint)),
+            None => Some(crate::live::nodes::NO_OWNER.to_string()),
+        }
+    }
+
     /// The diff against the previous snapshot, when there is one.
     pub fn diff(&self) -> Option<&ReportDiff> {
         match &self.history {
@@ -1650,6 +1666,12 @@ impl App {
             TailCmd::Monitor { run } => {
                 let profile = s.profile.clone();
                 let node = s.picked;
+                if let Some(why) = s.own_connection_refused(node) {
+                    self.views
+                        .server
+                        .end_monitor(views::server::Stop::Failed(why));
+                    return None;
+                }
                 let Some(secrets) = self.entry(id).map(secret_source) else {
                     self.views.server.end_monitor(views::server::Stop::Unlisted);
                     return None;
@@ -1680,6 +1702,10 @@ impl App {
                     }
                     _ => s.picked,
                 };
+                if let Some(why) = s.own_connection_refused(node) {
+                    self.views.pubsub.tail_closed(tail, Some(why));
+                    return None;
+                }
                 let profile = s.profile.clone();
                 let Some(secrets) = self.entry(id).map(secret_source) else {
                     self.views

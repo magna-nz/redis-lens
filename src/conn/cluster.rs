@@ -1039,6 +1039,9 @@ async fn connect_shard(ctx: &Ctx<'_>, shard: Shard) -> NodeTarget {
         Ok(c) => c,
         Err(f) => {
             target.note = Some(f.note(&target.endpoint));
+            // Nothing was sent to it, and nothing may be: no later connection (Monitor,
+            // a Pub/Sub tail) sends the credentials to a node discovery did not use.
+            target.credentials = false;
             return target;
         }
     };

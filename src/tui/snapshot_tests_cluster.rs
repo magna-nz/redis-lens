@@ -637,6 +637,85 @@ fn picking_a_node_restarts_the_overview_and_keeps_a_monitor_run_on_its_node() {
     assert!(all.contains("node 10.0.1.12:6379"), "{all}");
 }
 
+/// A live cluster whose third node discovery has no connection to: it refused the
+/// address (a loopback address announced by a remote cluster) or could not reach it.
+fn live_cluster_without_node_3() -> App {
+    let (mut app, id) = cluster_scanned(fixtures::cluster_report(), HEALTHY);
+    let scan = scan_of(&app);
+    let mut nodes = fixtures::live_nodes();
+    nodes[2].connected = false;
+    app.apply(Msg::Nodes { id, scan, nodes });
+    app.apply(Msg::LiveReady { id, scan });
+    app
+}
+
+fn opens_its_own_connection(effects: &[Effect]) -> bool {
+    effects
+        .iter()
+        .any(|e| matches!(e, Effect::Subscribe { .. } | Effect::Monitor { .. }))
+}
+
+const NODE_3_NOT_CONNECTED: &str = "10.0.1.13:6379 is not connected";
+
+/// The loopback rule and "no new node after discovery": a Pub/Sub tail opens no
+/// connection of its own (which would carry the profile's credentials) to a node
+/// discovery did not connect to. The picked node for a classic tail.
+#[test]
+fn a_classic_tail_is_not_opened_on_a_node_discovery_did_not_use() {
+    let mut app = live_cluster_without_node_3();
+    show(&mut app, Screen::PubSub);
+    app.handle_key(ch(']'));
+    app.handle_key(ch(']'));
+    assert_eq!(app.session.as_ref().unwrap().picked, 2);
+    let mut effects = app.handle_key(ch('s'));
+    effects.extend(press_all(&mut app, "news"));
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    assert!(!opens_its_own_connection(&effects), "{effects:?}");
+    let all = text(&render(&app, 120, 36));
+    assert!(all.contains(NODE_3_NOT_CONNECTED), "{all}");
+    // On a connected node the same keys do subscribe.
+    app.handle_key(ch('['));
+    let mut effects = app.handle_key(ch('s'));
+    effects.extend(press_all(&mut app, "news"));
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Subscribe { node: 1, .. })),
+        "{effects:?}"
+    );
+}
+
+/// The slot owner for a shard tail (`foo` is served by the third node).
+#[test]
+fn a_shard_tail_is_not_opened_on_a_node_discovery_did_not_use() {
+    let mut app = live_cluster_without_node_3();
+    show(&mut app, Screen::PubSub);
+    let mut effects = app.handle_key(ch('S'));
+    effects.extend(press_all(&mut app, "foo"));
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    assert!(!opens_its_own_connection(&effects), "{effects:?}");
+    let all = text(&render(&app, 120, 36));
+    assert!(all.contains(NODE_3_NOT_CONNECTED), "{all}");
+}
+
+/// The picked node for Monitor: refused after the question, with nothing opened.
+#[test]
+fn monitor_is_not_opened_on_a_node_discovery_did_not_use() {
+    let mut app = live_cluster_without_node_3();
+    show(&mut app, Screen::Monitor);
+    app.handle_key(ch(']'));
+    app.handle_key(ch(']'));
+    assert_eq!(app.session.as_ref().unwrap().picked, 2);
+    let mut effects = app.handle_key(key(KeyCode::Enter));
+    effects.extend(press_all(&mut app, "prod-cache-01"));
+    effects.extend(app.handle_key(key(KeyCode::Enter)));
+    assert!(!opens_its_own_connection(&effects), "{effects:?}");
+    assert!(app.views.server.monitor.run.is_none());
+    let all = text(&render(&app, 120, 36));
+    assert!(all.contains(NODE_3_NOT_CONNECTED), "{all}");
+}
+
 fn press_all(app: &mut App, s: &str) -> Vec<Effect> {
     s.chars().flat_map(|c| app.handle_key(ch(c))).collect()
 }
