@@ -269,7 +269,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `tab` `shift-tab` | Next or previous panel, nothing else |
 | `→` `l` | Move into the value pane |
 | `←` `h` `esc` | Back to the items, then to the key list |
-| `f` | Show the value as text, hex, JSON or MessagePack |
+| `f` | Show the value as text, hex, JSON, MessagePack, PHP, Pickle, Protobuf or Java |
 | `n` | Load the next 100 items |
 | `y` | Copy the selected value as shown to the clipboard |
 | `e` | Edit the selected field, element or value (writes) |
@@ -291,7 +291,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `←` `h` | Back to the left pane, or close the entries or result |
 | `enter` | List the selected stream's entries |
 | `n` | Load 100 more entries |
-| `f` | Show the value as text, hex, JSON or MessagePack |
+| `f` | Show the value as text, hex, JSON, MessagePack, PHP, Pickle, Protobuf or Java |
 | `y` | Copy the selected value as shown to the clipboard |
 | `esc` | Close the entries, or back to the list |
 | `p` | Pause or resume polling |
@@ -314,7 +314,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `enter` | Open the selected result |
 | `e` | Explain the query |
 | `P` | Profile the query |
-| `f` | Show the value as text, hex, JSON or MessagePack |
+| `f` | Show the value as text, hex, JSON, MessagePack, PHP, Pickle, Protobuf or Java |
 | `y` | Copy the selected value as shown to the clipboard |
 | `esc` | Back to the indexes and results |
 | `r` | Refresh this panel now |

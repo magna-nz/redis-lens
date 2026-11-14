@@ -387,7 +387,7 @@ static KEY_DETAIL: [KeyHelp; 15] = [
         "f",
         "f",
         "Format",
-        "Show the value as text, hex, JSON or MessagePack",
+        "Show the value as text, hex, JSON, MessagePack, PHP, Pickle, Protobuf or Java",
         true,
     ),
     k("n", "n", "More", "Load the next 100 items", false),
@@ -524,7 +524,7 @@ const FORMAT: KeyHelp = k(
     "f",
     "f",
     "Format",
-    "Show the value as text, hex, JSON or MessagePack",
+    "Show the value as text, hex, JSON, MessagePack, PHP, Pickle, Protobuf or Java",
     false,
 );
 /// `y` on the screens that show a value.
