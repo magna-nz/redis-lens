@@ -268,6 +268,12 @@ impl App {
                 ));
                 return Vec::new();
             }
+            // Without the full slot map (CLUSTER SHARDS/SLOTS unreadable: the seed
+            // alone, no slots) keys on other primaries would be skipped.
+            if let Some(why) = bulk::slot_map_gap(s.nodes.iter().map(|n| n.slots.as_slice())) {
+                self.set_error(why);
+                return Vec::new();
+            }
             nodes = s
                 .nodes
                 .iter()
@@ -1429,6 +1435,28 @@ mod tests {
         }));
         assert!(app.handle_key(ch('D')).is_empty());
         assert_eq!(app.notice.as_ref().unwrap().text, bulk::REPLICA_OFF);
+    }
+
+    #[test]
+    fn off_on_a_cluster_whose_slot_map_is_unreadable() {
+        // The seed alone, marked primary, with no slots (conn::cluster `seed_alone`).
+        let mut app = app_with(Env::Local, None);
+        let s = app.session.as_mut().unwrap();
+        s.server.as_mut().unwrap().mode = ServerMode::Cluster;
+        s.nodes = crate::tui::fixtures::live_nodes();
+        s.nodes.truncate(1);
+        s.nodes[0].slots.clear();
+        for k in ['x', 'D'] {
+            assert!(app.handle_key(ch(k)).is_empty());
+            assert!(app.bulk.is_none());
+            assert_eq!(app.notice.as_ref().unwrap().text, bulk::SLOTS_UNKNOWN);
+        }
+        // Slots missing from the map: also refused.
+        let s = app.session.as_mut().unwrap();
+        s.nodes = crate::tui::fixtures::live_nodes();
+        s.nodes.truncate(2);
+        assert!(app.handle_key(ch('D')).is_empty());
+        assert_eq!(app.notice.as_ref().unwrap().text, bulk::SLOTS_UNKNOWN);
     }
 
     /// Where each bulk step among `effects` goes.

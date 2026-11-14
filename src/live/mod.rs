@@ -192,6 +192,9 @@ impl Redirect {
 pub struct Conn<C = MultiplexedConnection> {
     inner: C,
     asking: bool,
+    /// The budget of the node this connection belongs to, set with `asking`: each
+    /// `ASKING` sent takes from it before it is sent, like every other command.
+    ask_budget: Option<Arc<Budget>>,
     /// How many sends went through, to tell the first command apart.
     calls: usize,
     seen: Option<Redirect>,
@@ -202,16 +205,26 @@ impl<C: ConnectionLike + Send> Conn<C> {
         Self {
             inner,
             asking: false,
+            ask_budget: None,
             calls: 0,
             seen: None,
         }
     }
 
-    /// For a request sent again after an `ASK`.
-    pub fn asking(inner: C) -> Self {
+    /// For a request sent again after an `ASK`. `budget` is the budget of the node
+    /// `inner` is connected to: the `ASKING` commands take from it.
+    pub fn asking(inner: C, budget: Arc<Budget>) -> Self {
         Self {
             asking: true,
+            ask_budget: Some(budget),
             ..Self::new(inner)
+        }
+    }
+
+    /// Takes `n` `ASKING` commands from the node's budget, before they are sent.
+    async fn take_asking(budget: Option<Arc<Budget>>, n: usize) {
+        if let Some(b) = budget {
+            b.take(u32::try_from(n).unwrap_or(u32::MAX)).await;
         }
     }
 
@@ -258,6 +271,7 @@ impl<C: ConnectionLike + Send> ConnectionLike for Conn<C> {
         Box::pin(async move {
             let first = self.start();
             let r = if self.asking {
+                Self::take_asking(self.ask_budget.clone(), 1).await;
                 let mut p = redis::pipe();
                 p.cmd("ASKING").add_command(cmd.clone());
                 self.inner
@@ -293,6 +307,7 @@ impl<C: ConnectionLike + Send> ConnectionLike for Conn<C> {
             }
             let mut p = redis::pipe();
             if pipe.is_transaction() {
+                Self::take_asking(self.ask_budget.clone(), 1).await;
                 // `ASKING` once, in front of `MULTI` (the queued commands share a slot),
                 // sent as a plain pipeline so every reply is seen.
                 p.cmd("ASKING").cmd("MULTI");
@@ -315,6 +330,7 @@ impl<C: ConnectionLike + Send> ConnectionLike for Conn<C> {
                 }
                 Ok(all.pop().into_iter().collect())
             } else {
+                Self::take_asking(self.ask_budget.clone(), pipe.len()).await;
                 for c in pipe.cmd_iter() {
                     p.cmd("ASKING").add_command(c.clone());
                 }
@@ -608,7 +624,11 @@ where
     if !r.ask {
         table.moved(r.slot, j);
     }
-    let mut conn = if r.ask { Conn::asking(c) } else { Conn::new(c) };
+    let mut conn = if r.ask {
+        Conn::asking(c, Arc::clone(&budget))
+    } else {
+        Conn::new(c)
+    };
     let second = run(&mut conn, &budget, req).await;
     if second == Err(LiveError::Closed) {
         return (second, Some(j));
@@ -981,6 +1001,153 @@ mod tests {
         assert_eq!(sent(&log3).len(), 2);
     }
 
+    /// What node `i`'s budget has counted.
+    fn taken(t: &Table<Fake>, i: usize) -> u64 {
+        t.conn(i).unwrap().1.taken()
+    }
+
+    #[tokio::test]
+    async fn a_request_takes_from_the_budget_of_the_node_it_is_sent_to() {
+        let (t, _log) = table(Arc::new(|_, _| pong()));
+        let (r, _) = route(&t, Dest::node(1), ping()).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!((taken(&t, 0), taken(&t, 1)), (0, 1));
+        // A key goes to its slot owner's budget ("bar" is node 0's).
+        let (r, _) = route(&t, Dest::key("bar"), ping()).await;
+        assert!(r.is_ok());
+        assert_eq!((taken(&t, 0), taken(&t, 1)), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn query_and_query_pipe_take_before_sending() {
+        let (t, _log) = table(Arc::new(|_, _| pong()));
+        let (mut c, b) = t.conn(0).unwrap();
+        let _: Value = query(&mut c, &b, "PING", &redis::cmd("PING"))
+            .await
+            .unwrap();
+        assert_eq!(b.taken(), 1);
+        let mut p = redis::pipe();
+        p.cmd("PING").cmd("PING").cmd("PING");
+        let _: Vec<Value> = query_pipe(&mut c, &b, "PING", &p).await.unwrap();
+        assert_eq!(b.taken(), 4, "a pipeline takes its length");
+    }
+
+    #[tokio::test]
+    async fn a_redirected_retry_takes_from_the_node_it_is_retried_on() {
+        // MOVED: node 0 sent the first, node 1 the retry.
+        let (t, _log) = table(Arc::new(|n, _| {
+            if n == 0 {
+                redirect("MOVED", 5061, 7001)
+            } else {
+                pong()
+            }
+        }));
+        let (r, _) = route(&t, Dest::key("bar"), ping()).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!((taken(&t, 0), taken(&t, 1)), (1, 1));
+        // ASK: the retry takes its command and the ASKING in front of it.
+        let (t, _log) = table(Arc::new(|n, w| {
+            if n == 0 {
+                redirect("ASK", 5061, 7001)
+            } else if w[0] == "ASKING" {
+                Value::Okay
+            } else {
+                pong()
+            }
+        }));
+        let (r, _) = route(&t, Dest::key("bar"), ping()).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!((taken(&t, 0), taken(&t, 1)), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn asking_takes_from_the_budget_before_each_asking() {
+        let script: Script = Arc::new(|_, w| match w[0].as_str() {
+            "ASKING" | "MULTI" => Value::Okay,
+            "EXEC" => Value::Array(vec![Value::Int(1)]),
+            _ => Value::SimpleString("QUEUED".into()),
+        });
+        let (t, _log) = table(Arc::clone(&script));
+        // One command.
+        let b = Budget::new(None);
+        let mut conn = Conn::asking(t.conn(1).unwrap().0, Arc::clone(&b));
+        let _: Value = redis::cmd("GET")
+            .arg("a")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(b.taken(), 1);
+        // A pipeline: one ASKING per command.
+        let mut p = redis::pipe();
+        p.cmd("TYPE").arg("a").cmd("TTL").arg("a");
+        let _: Vec<Value> = p.query_async(&mut conn).await.unwrap();
+        assert_eq!(b.taken(), 3);
+        // A transaction: one ASKING.
+        let mut p = redis::pipe();
+        p.atomic().cmd("DEL").arg("a").cmd("DEL").arg("b");
+        let _: Vec<Value> = p.query_async(&mut conn).await.unwrap();
+        assert_eq!(b.taken(), 4);
+    }
+
+    #[tokio::test]
+    async fn moved_on_first_does_not_follow_a_moved_on_a_later_command() {
+        // `Stats` sends INFO and then CLUSTER SLOT-STATS: node 0 redirects the second.
+        let (t, log) = table(Arc::new(|n, w| {
+            if w[0] == "INFO" {
+                Value::BulkString(b"valkey_version:8.1.0\r\n".to_vec())
+            } else if n == 0 {
+                redirect("MOVED", 5061, 7001)
+            } else {
+                Value::Array(Vec::new())
+            }
+        }));
+        let req = LiveRequest::Slots(slots::Request::Stats {
+            ranges: vec![(0, 10)],
+        });
+        let dest = Dest::key("bar").follow(Follow::MovedOnFirst);
+        let (r, _) = route(&t, dest, req.clone()).await;
+        assert_eq!(r, Err(LiveError::Failed(MOVING.into())));
+        assert!(
+            sent(&log).iter().all(|(n, _)| *n == 0),
+            "nothing is retried: {:?}",
+            sent(&log)
+        );
+        assert_eq!(taken(&t, 1), 0);
+        // With Redirects the same request is retried on node 1.
+        let dest = Dest::key("bar").follow(Follow::Redirects);
+        let (r, _) = route(&t, dest, req).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert!(sent(&log).iter().any(|(n, _)| *n == 1));
+    }
+
+    #[tokio::test]
+    async fn a_redirect_answered_by_the_retry_is_not_followed_again() {
+        // The replies come back as values, not errors (INFO reads a Value): node 0
+        // redirects to node 1, and node 1 back to node 0.
+        let (t, log) = table(Arc::new(|n, _| {
+            redirect("MOVED", 5061, if n == 0 { 7001 } else { 7000 })
+        }));
+        let info = LiveRequest::Server(server::Request::Info);
+        let (r, _) = route(&t, Dest::key("bar"), info).await;
+        assert_eq!(r, Err(LiveError::Failed(MOVING.into())));
+        assert_eq!(sent(&log).len(), 2, "one retry, never two");
+        // A pipeline sent with ignore_errors comes back Ok with the redirect inside:
+        // the retry's is not followed either, and the request does not succeed.
+        let (t, log) = table(Arc::new(|n, _| {
+            redirect("MOVED", 5061, if n == 0 { 7001 } else { 7000 })
+        }));
+        let facts = LiveRequest::Keys(keys::Request::Facts {
+            keys: vec![keys::FactKey {
+                key: "bar".into(),
+                key_type: crate::model::KeyType::String,
+                length: false,
+            }],
+        });
+        let (r, _) = route(&t, Dest::key("bar"), facts).await;
+        assert_eq!(r, Err(LiveError::Failed(MOVING.into())), "{r:?}");
+        assert_eq!(sent(&log).len(), 2, "one retry, never two");
+    }
+
     #[tokio::test]
     async fn asking_goes_before_each_command_of_a_pipeline() {
         let (t, log) = table(Arc::new(|_, w| {
@@ -990,7 +1157,7 @@ mod tests {
                 Value::Int(w.len() as i64)
             }
         }));
-        let mut conn = Conn::asking(t.conn(1).unwrap().0);
+        let mut conn = Conn::asking(t.conn(1).unwrap().0, Budget::new(None));
         let mut p = redis::pipe();
         p.cmd("TYPE").arg("a").cmd("TTL").arg("a");
         let got: (i64, i64) = p.query_async(&mut conn).await.unwrap();
@@ -1011,7 +1178,7 @@ mod tests {
             "EXEC" => Value::Array(vec![Value::Int(1)]),
             _ => Value::SimpleString("QUEUED".into()),
         }));
-        let mut conn = Conn::asking(t.conn(1).unwrap().0);
+        let mut conn = Conn::asking(t.conn(1).unwrap().0, Budget::new(None));
         let mut p = redis::pipe();
         p.atomic().cmd("DEL").arg("a");
         let got: (i64,) = p.query_async(&mut conn).await.unwrap();

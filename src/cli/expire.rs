@@ -171,14 +171,15 @@ pub async fn execute(
     // A cluster node: `INFO server` says so (`redis_mode`, or `server_mode` on Valkey
     // 8), or, when it names neither, `cluster_enabled:1` in `INFO cluster`. A cluster
     // must never be mistaken for one server here: the run would write to one node only.
-    let cluster = server.mode == ServerMode::Cluster || {
+    let cluster = if server.mode == ServerMode::Cluster {
+        true
+    } else {
         budget.take(1).await;
-        let info: Option<String> = redis::cmd("INFO")
+        let info: Result<String, _> = redis::cmd("INFO")
             .arg("cluster")
             .query_async(&mut conn)
-            .await
-            .ok();
-        info.as_deref().and_then(conn::cluster::cluster_mode) == Some(true)
+            .await;
+        cluster_from_info(info.ok().as_deref()).map_err(|why| anyhow::anyhow!(why))?
     };
     // The servers the run walks, one at a time: the profile's own server, or on a
     // cluster every primary in slot order (spec "Cluster live views (P4)").
@@ -196,7 +197,7 @@ pub async fn execute(
         let found = c
             .nodes
             .into_iter()
-            .map(|n| (n.endpoint.to_string(), n.role, n.conn))
+            .map(|n| (n.endpoint.to_string(), n.role, n.slots, n.conn))
             .collect();
         primaries(found, opts.max_commands_per_sec).map_err(|why| anyhow::anyhow!(why))?
     } else {
@@ -401,6 +402,20 @@ pub async fn execute(
     })
 }
 
+/// Why the run stops when `INFO cluster` can't be read: it could be a cluster, and a
+/// run on one node would skip the keys of the others.
+const CLUSTER_UNKNOWN: &str = "Not run: INFO cluster could not be read, so it is not known \
+     whether this is a cluster, and the pattern might be expired on one node only.";
+
+/// Whether the server is a cluster node, from the text of `INFO cluster`; `None` is a
+/// failed read, which stops the run rather than counting as a standalone server.
+fn cluster_from_info(info: Option<&str>) -> Result<bool, &'static str> {
+    match info.and_then(conn::cluster::cluster_mode) {
+        Some(c) => Ok(c),
+        None => Err(CLUSTER_UNKNOWN),
+    }
+}
+
 /// One server the run walks: a cluster primary (its announced address in `node`), or
 /// the profile's standalone server (`node` is `None`), with its own budget.
 struct Shard<C> {
@@ -409,16 +424,19 @@ struct Shard<C> {
     budget: std::sync::Arc<Budget>,
 }
 
+/// A discovered shard: address, role, slot ranges and connection.
+type Found<C> = (String, crate::model::NodeRole, Vec<(u16, u16)>, Option<C>);
+
 /// The primaries of a cluster discovered on its primaries, each with a budget of its
-/// own (`rate` per node): `(address, role, connection)` per shard, in slot order.
+/// own (`rate` per node): `(address, role, slots, connection)` per shard, in slot order.
 /// Refused when a shard has no connection (the run would miss its keys) or was
 /// reached on a replica, which takes no writes.
-fn primaries<C>(
-    found: Vec<(String, crate::model::NodeRole, Option<C>)>,
-    rate: Option<u32>,
-) -> Result<Vec<Shard<C>>, String> {
+fn primaries<C>(found: Vec<Found<C>>, rate: Option<u32>) -> Result<Vec<Shard<C>>, String> {
     let mut out = Vec::with_capacity(found.len());
-    for (addr, role, conn) in found {
+    if let Some(why) = bulk::slot_map_gap(found.iter().map(|f| f.2.as_slice())) {
+        return Err(why.to_string());
+    }
+    for (addr, role, _, conn) in found {
         let addr = crate::value::escape(&addr);
         if role != crate::model::NodeRole::Primary {
             return Err(format!(
@@ -664,7 +682,15 @@ mod tests {
             roles
                 .iter()
                 .enumerate()
-                .map(|(i, &(r, c))| (format!("10.0.1.{i}:6379"), r, c.then_some(i)))
+                .map(|(i, &(r, c))| {
+                    // Two nodes, each with half of the slots.
+                    let slots = if i == 0 {
+                        vec![(0, 8191)]
+                    } else {
+                        vec![(8192, 16383)]
+                    };
+                    (format!("10.0.1.{i}:6379"), r, slots, c.then_some(i))
+                })
                 .collect::<Vec<_>>()
         };
         let all = primaries(found(&[(Primary, true), (Primary, true)]), Some(10)).unwrap();
@@ -683,6 +709,44 @@ mod tests {
             .unwrap();
         assert!(e.contains("could not be connected"), "{e}");
         assert!(primaries::<u8>(Vec::new(), None).is_err());
+    }
+
+    #[test]
+    fn a_cluster_whose_slot_map_is_unreadable_is_refused() {
+        use crate::model::NodeRole::Primary;
+        // The seed alone with no slots (conn::cluster's `seed_alone`).
+        let alone = vec![("10.0.1.0:6379".to_string(), Primary, Vec::new(), Some(0))];
+        assert_eq!(primaries(alone, None).err().unwrap(), bulk::SLOTS_UNKNOWN);
+        // Connected primaries that cover only some of the slots.
+        let part = vec![
+            (
+                "10.0.1.0:6379".to_string(),
+                Primary,
+                vec![(0, 8191)],
+                Some(0),
+            ),
+            (
+                "10.0.1.1:6379".to_string(),
+                Primary,
+                vec![(8192, 16382)],
+                Some(1),
+            ),
+        ];
+        assert_eq!(primaries(part, None).err().unwrap(), bulk::SLOTS_UNKNOWN);
+    }
+
+    #[test]
+    fn a_failed_info_cluster_stops_the_run() {
+        assert_eq!(cluster_from_info(None), Err(CLUSTER_UNKNOWN));
+        assert_eq!(cluster_from_info(Some("garbage")), Err(CLUSTER_UNKNOWN));
+        assert_eq!(
+            cluster_from_info(Some("# Cluster\r\ncluster_enabled:0\r\n")),
+            Ok(false)
+        );
+        assert_eq!(
+            cluster_from_info(Some("# Cluster\r\ncluster_enabled:1\r\n")),
+            Ok(true)
+        );
     }
 
     #[test]

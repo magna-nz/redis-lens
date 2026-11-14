@@ -57,6 +57,32 @@ pub const CLUSTER_REPLICA_OFF: &str = "Not available on a cluster read on replic
 pub const REPLICA_OFF: &str = "Not available on a replica: it takes no writes. Connect to \
      the primary (turn off prefer_replica) to change keys.";
 
+/// Why bulk actions are off when the cluster's slot map could not be read, or does not
+/// cover every slot: the run would skip the keys of the slots it cannot place.
+pub const SLOTS_UNKNOWN: &str = "Not run: the cluster's slot map could not be read in full \
+     (CLUSTER SHARDS and CLUSTER SLOTS), so the keys on every primary can't be reached.";
+
+/// `Some(SLOTS_UNKNOWN)` unless the slot ranges of the nodes (the primaries the run
+/// walks) together cover all 16,384 slots and each node has at least one range.
+pub fn slot_map_gap<'a>(nodes: impl IntoIterator<Item = &'a [(u16, u16)]>) -> Option<&'static str> {
+    let mut covered = vec![false; 16_384];
+    for ranges in nodes {
+        if ranges.is_empty() {
+            return Some(SLOTS_UNKNOWN);
+        }
+        for &(a, b) in ranges {
+            for s in a..=b.min(16_383) {
+                covered[usize::from(s)] = true;
+            }
+        }
+    }
+    if covered.iter().all(|c| *c) {
+        None
+    } else {
+        Some(SLOTS_UNKNOWN)
+    }
+}
+
 /// Where a `SCAN` walk is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Walk {
