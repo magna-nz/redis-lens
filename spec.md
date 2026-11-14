@@ -468,7 +468,9 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `PgUp` `PgDn` | Scroll the output |
 | `ctrl-l` | Clear the output |
 | `ctrl-u` | Clear the input line |
-| `esc` | Close the command line, or cancel a question |
+| `ctrl-t` | Draw replies as text, a table, JSON or raw |
+| `ctrl-p` | Pipeline mode: a repeat goes in pipelines |
+| `esc` | Close the command line, stop a repeat, or cancel a question |
 
 The footer shows 3 to 5 of these keys for the screen on show, chosen by its state (before and after an analysis, while one runs, with writes on), then `: Command  ? Help` against the right edge (only `? Help` before connecting); keys that do not fit are left out from the end. Every other key is in the `?` help ([Help](#help)). A notice or an input line replaces the footer while shown; while the command line is open, its input line does; while a dialog is open the footer says what it wants. A test checks that this table is exactly what `keymap::markdown()` renders.
 

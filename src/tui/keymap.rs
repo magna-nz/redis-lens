@@ -87,7 +87,7 @@ static GLOBAL: [KeyHelp; 7] = [
 
 /// The keys of the command line panel while it is open (`:`). Its input line replaces
 /// the footer, so none of them is in a footer.
-static COMMAND_LINE: [KeyHelp; 7] = [
+static COMMAND_LINE: [KeyHelp; 9] = [
     k(
         "enter",
         "enter",
@@ -119,10 +119,24 @@ static COMMAND_LINE: [KeyHelp; 7] = [
         false,
     ),
     k(
+        "ctrl-t",
+        "ctrl-t",
+        "View",
+        "Draw replies as text, a table, JSON or raw",
+        false,
+    ),
+    k(
+        "ctrl-p",
+        "ctrl-p",
+        "Pipeline",
+        "Pipeline mode: a repeat goes in pipelines",
+        false,
+    ),
+    k(
         "esc",
         "esc",
         "Close",
-        "Close the command line, or cancel a question",
+        "Close the command line, stop a repeat, or cancel a question",
         false,
     ),
 ];
