@@ -384,6 +384,7 @@ mod tests {
             provider: None,
             token_command: None,
             ssh: None,
+            sentinel: None,
         }
     }
 

@@ -30,6 +30,7 @@ fn profile(name: &str, port: u16, auth: Auth) -> Profile {
         provider: None,
         token_command: None,
         ssh: None,
+        sentinel: None,
     }
 }
 
@@ -321,6 +322,12 @@ async fn conn_add_keeps_credentials_out_of_the_config_file() {
         ssh: None,
         ssh_identity: None,
         ssh_known_hosts: None,
+        sentinel: None,
+        sentinel_master: None,
+        sentinel_tls: false,
+        sentinel_user: None,
+        sentinel_password_stdin: false,
+        sentinel_ask_password: false,
     };
     let msg = cli_conn::add(&path, &secrets, &args, Some("uniq-pw-4242\n".into()))
         .await
@@ -837,6 +844,12 @@ async fn token_command_with_an_acl_username_from_the_keychain() {
             ssh: None,
             ssh_identity: None,
             ssh_known_hosts: None,
+            sentinel: None,
+            sentinel_master: None,
+            sentinel_tls: false,
+            sentinel_user: None,
+            sentinel_password_stdin: false,
+            sentinel_ask_password: false,
         };
         let msg = cli_conn::add(&path, &secrets, &args, None).await.unwrap();
         assert!(msg.contains("The username is in the OS keychain"), "{msg}");

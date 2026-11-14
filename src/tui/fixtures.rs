@@ -34,6 +34,7 @@ fn profile(name: &str, env: Env, host: &str, port: u16, tls: bool, auth: Auth) -
         provider: None,
         token_command: None,
         ssh: None,
+        sentinel: None,
     }
 }
 

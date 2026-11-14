@@ -235,7 +235,7 @@ fn entry_line(app: &App, e: &ConnEntry, c: &Cols) -> Line<'static> {
         ),
         Span::styled(format!(" {env} "), style::env_badge(e.profile.env)),
         Span::raw(" ".repeat(c.env.saturating_sub(env.len() + 2))),
-        Span::styled(cell(&e.profile.endpoint.to_string(), c.ep), style::dim()),
+        Span::styled(cell(&e.endpoint().to_string(), c.ep), style::dim()),
         Span::styled(pad_r(auth_label(e), c.auth), style::fg()),
         Span::styled(pad_r(writes, c.writes), writes_style),
         Span::styled(pad_r(st, c.status), st_style),
@@ -341,7 +341,8 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
     let inner = panel(frame, area, &p.name, &right);
     let (lw, rw) = split_cols(usize::from(inner.width));
 
-    let mut endpoint = p.endpoint.to_string();
+    // A Sentinel profile shows the primary the Sentinels named, once they have.
+    let mut endpoint = e.endpoint().to_string();
     if p.db != 0 {
         endpoint.push_str(&format!(" · db {}", p.db));
     }
@@ -404,7 +405,16 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
             style::fg(),
         ),
         writes_row(p, e.perms.as_ref()),
-        kv("Values", "shown on screen, never saved".into(), style::fg()),
+        // A Sentinel profile's row takes the place of the fixed Values row, so the
+        // panel keeps seven rows.
+        match &p.sentinel {
+            Some(s) => kv(
+                "Sentinel",
+                sentinel_row(s, e.sentinel.as_ref()),
+                style::fg(),
+            ),
+            None => kv("Values", "shown on screen, never saved".into(), style::fg()),
+        },
     ];
 
     let mut right: Vec<Vec<Span<'static>>> =
@@ -431,6 +441,27 @@ fn entry_detail(frame: &mut Frame, area: Rect, app: &App, e: &ConnEntry) {
     }
     lines.push(Line::from(note(app, e, docker.map(|(c, i, _)| (c, i)))));
     rows(frame, inner, lines, None);
+}
+
+/// The Sentinel row: the master name and the Sentinel that answered the last connect, or
+/// before that the Sentinels it will ask. Never a credential.
+fn sentinel_row(
+    s: &crate::model::Sentinel,
+    answer: Option<&crate::conn::sentinel::SentinelAnswer>,
+) -> String {
+    match answer {
+        Some(a) => format!("{} · named by {}", a.master, a.sentinel),
+        None => {
+            let mut out = s.master.clone();
+            if let Some(first) = s.nodes.first() {
+                out.push_str(&format!(" · asks {first}"));
+            }
+            if s.nodes.len() > 1 {
+                out.push_str(&format!(" (+{})", s.nodes.len() - 1));
+            }
+            out
+        }
+    }
 }
 
 fn mode(m: crate::model::ServerMode) -> &'static str {

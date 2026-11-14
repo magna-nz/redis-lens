@@ -45,6 +45,7 @@ fn profile(port: u16, auth: Auth) -> Profile {
         provider: None,
         token_command: None,
         ssh: None,
+        sentinel: None,
     }
 }
 

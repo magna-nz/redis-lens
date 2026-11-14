@@ -12,6 +12,7 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::conn::ScanTarget;
 use crate::conn::docker::{DiscoveredAuth, DiscoveredInstance};
 use crate::conn::parse::{ParsedConnection, mask, parse_connection_string};
+use crate::conn::sentinel::SentinelAnswer;
 use crate::diff::ReportDiff;
 use crate::live::ReqId;
 use crate::model::{
@@ -301,6 +302,9 @@ pub struct ConnEntry {
     pub perms: Option<PermissionReport>,
     /// Which server the last connect reached.
     pub target: Option<ScanTarget>,
+    /// For a Sentinel profile: what the Sentinels answered at the last connect. Holds no
+    /// credential.
+    pub sentinel: Option<SentinelAnswer>,
     /// The last connect error. Never holds credentials.
     pub error: Option<String>,
     /// Added in this session through the add flow.
@@ -308,6 +312,14 @@ pub struct ConnEntry {
 }
 
 impl ConnEntry {
+    /// The address shown for this connection: for a Sentinel profile the primary the
+    /// Sentinels named at the last connect, else (and until then) the profile's endpoint.
+    pub fn endpoint(&self) -> &Endpoint {
+        self.sentinel
+            .as_ref()
+            .map_or(&self.profile.endpoint, |a| &a.primary)
+    }
+
     pub fn is_docker(&self) -> bool {
         matches!(self.source, Source::Docker { .. })
     }
@@ -453,6 +465,13 @@ pub enum Msg {
         server: Option<ServerInfo>,
         perms: PermissionReport,
         target: ScanTarget,
+    },
+    /// A Sentinel profile's connect asked the Sentinels: which one named the primary,
+    /// and where. Sent before [`Msg::Connected`]. Holds no credential.
+    SentinelResolved {
+        id: ConnId,
+        scan: ScanId,
+        answer: SentinelAnswer,
     },
     ConnectFailed {
         id: ConnId,
@@ -627,9 +646,19 @@ pub struct Session {
     /// connect and every `NOPERM` since: those actions are off (spec "Write
     /// permissions", check 1).
     pub refusals: crate::write::Refusals,
+    /// For a Sentinel profile: which Sentinel named the primary of this run, and where.
+    pub sentinel: Option<SentinelAnswer>,
 }
 
 impl Session {
+    /// The address this session's server is at: the primary the Sentinels named, or the
+    /// profile's endpoint.
+    pub fn endpoint(&self) -> &Endpoint {
+        self.sentinel
+            .as_ref()
+            .map_or(&self.profile.endpoint, |a| &a.primary)
+    }
+
     /// The diff against the previous snapshot, when there is one.
     pub fn diff(&self) -> Option<&ReportDiff> {
         match &self.history {
@@ -1005,6 +1034,7 @@ impl App {
                 server: None,
                 perms: None,
                 target: None,
+                sentinel: None,
                 error: None,
                 just_saved: false,
             });
@@ -2048,6 +2078,7 @@ impl App {
             provider: None,
             token_command: None,
             ssh: None,
+            sentinel: None,
         };
         if let Some(add) = self.add.as_mut() {
             add.saving = true;
@@ -2146,6 +2177,7 @@ impl App {
             rescan: false,
             live: LiveState::Waiting,
             refusals: crate::write::Refusals::default(),
+            sentinel: None,
         });
         self.patterns = PatternsState::default();
         self.sel = ViewSel::default();
@@ -2387,6 +2419,17 @@ impl App {
             Msg::DockerFailed(_) => {
                 self.set_docker(Vec::new());
                 self.docker = DockerState::Unavailable;
+            }
+            Msg::SentinelResolved { id, scan, answer } => {
+                if !self.is_session(id, scan) {
+                    return Vec::new();
+                }
+                if let Some(e) = self.entry_mut(id) {
+                    e.sentinel = Some(answer.clone());
+                }
+                if let Some(s) = self.session.as_mut() {
+                    s.sentinel = Some(answer);
+                }
             }
             Msg::Connected {
                 id,
@@ -2764,6 +2807,7 @@ impl App {
                         server: None,
                         perms: None,
                         target: None,
+                        sentinel: None,
                         error: None,
                         just_saved: true,
                     },
@@ -2818,6 +2862,7 @@ impl App {
                     server: None,
                     perms: None,
                     target: None,
+                    sentinel: None,
                     error: None,
                     just_saved: false,
                 },

@@ -1081,6 +1081,21 @@ async fn connect_and_scan(
             return;
         }
     };
+    // A Sentinel profile: which Sentinel named the primary, and where (fixed fields, no
+    // credential), for the header and the Connections detail.
+    if let ScanTargets::Single { conn, .. } = &targets
+        && let Some(answer) = conn.sentinel()
+        && !send(
+            &tx,
+            Msg::SentinelResolved {
+                id,
+                scan: scan_id,
+                answer: answer.clone(),
+            },
+        )
+    {
+        return;
+    }
     let target = clean_target(targets.target(), clean);
     // One budget for this session: the scan and the live connection both take from it.
     // The permission probes run once on connect and don't. A cluster scan gives each
@@ -1247,6 +1262,7 @@ mod tests {
             provider: None,
             token_command: None,
             ssh: None,
+            sentinel: None,
         }
     }
 
