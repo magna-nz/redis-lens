@@ -876,7 +876,8 @@ A write is sent only when all three checks allow it.
   - `DEL`, `UNLINK`, `HDEL`, `HGETDEL`, `SREM`, `ZREM`, `LREM`, `XDEL`, `XTRIM`, `GETDEL`, `LTRIM`;
   - the pops, `LPOP`, `RPOP`, `LMPOP`, `SPOP`, `ZPOPMIN`, `ZPOPMAX`, `ZMPOP`, and `ZREMRANGEBYRANK|SCORE|LEX`;
   - commands that move a value or overwrite a destination: `RPOPLPUSH`, `LMOVE`, `SMOVE`, `MOVE`, `COPY`, `RESTORE`, `BITOP`, the `*STORE` commands (`SINTERSTORE`, `ZRANGESTORE`, `GEOSEARCHSTORE` …), and `SORT`, `GEORADIUS` and `GEORADIUSBYMEMBER` with `STORE`;
-  - `EXPIRE` and `PEXPIRE` with a time that is not positive (or not a number), which delete the key, and `EXPIREAT` and `PEXPIREAT` always (the time may be past);
+  - `EXPIRE`, `PEXPIRE`, `HEXPIRE` and `HPEXPIRE` with a time that is not positive (or not a number), and `GETEX` or `SET` with `EX`/`PX` not positive, which delete the key or field; `EXPIREAT`, `PEXPIREAT`, `HEXPIREAT`, `HPEXPIREAT`, and `GETEX` or `SET` with `EXAT`/`PXAT`, always (the time may be past);
+  - `XGROUP DESTROY` and `XGROUP DELCONSUMER`, and the newer deletes `XDELEX`, `XACKDEL`, `VREM`, `DELIFEQ` and `DELEX`;
   - `FLUSHDB`, `FLUSHALL`;
   - `RENAME` onto an existing key;
   - `FT.DROPINDEX`;

@@ -201,7 +201,16 @@ async fn scripts_are_never_a_write(server: &common::TestServer) {
 /// before its flags are read, writes on included.
 async fn transactions_are_refused(server: &common::TestServer) {
     let mut c = server.admin().await;
-    for line in ["MULTI", "EXEC", "WATCH k", "UNWATCH", "CLIENT SETNAME x"] {
+    for line in [
+        "MULTI",
+        "EXEC",
+        "DISCARD",
+        "WATCH k",
+        "UNWATCH",
+        "SYNC",
+        "READONLY",
+        "CLIENT SETNAME x",
+    ] {
         match gated(&mut c, line).await {
             Err(Gate::Refuse(why)) => {
                 assert!(

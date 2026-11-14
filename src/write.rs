@@ -428,7 +428,7 @@ pub enum WriteOp {
 /// Commands that delete or overwrite data (spec "What counts as destructive or
 /// dangerous"), lower-case as `COMMAND INFO` names them. `RENAME` may overwrite a key,
 /// so it counts; `RENAMENX` never does.
-pub const DESTRUCTIVE: [&str; 39] = [
+pub const DESTRUCTIVE: [&str; 44] = [
     "del",
     "unlink",
     "hdel",
@@ -468,26 +468,45 @@ pub const DESTRUCTIVE: [&str; 39] = [
     "zinterstore",
     "zunionstore",
     "zdiffstore",
+    "xdelex",
+    "xackdel",
+    "vrem",
+    "delifeq",
+    "delex",
 ];
 
 /// Commands that write a destination they overwrite or delete keys and elements
 /// besides those on [`DESTRUCTIVE`]: `ZRANGESTORE`, `GEO*` with `STORE`, `SORT … STORE`,
-/// and a TTL that is not in the future (`EXPIRE k 0` deletes `k`).
+/// `XGROUP DESTROY|DELCONSUMER`, and a TTL that may not be in the future (`EXPIRE k 0`
+/// deletes `k`; an absolute time may be past).
 fn destructive_by_arguments(args: &[Vec<u8>], name: &str) -> bool {
     let has = |w: &str| {
         args.iter()
             .skip(1)
             .any(|a| a.eq_ignore_ascii_case(w.as_bytes()))
     };
+    let not_positive = |a: Option<&Vec<u8>>| {
+        a.and_then(|a| std::str::from_utf8(a).ok())
+            .and_then(|a| a.trim().parse::<i64>().ok())
+            .is_none_or(|n| n <= 0)
+    };
+    // `EX n` / `PX n` with n not positive, or any `EXAT` / `PXAT`.
+    let ttl_option = || {
+        args.iter().enumerate().skip(2).any(|(i, a)| {
+            let is = |w: &str| a.eq_ignore_ascii_case(w.as_bytes());
+            is("exat") || is("pxat") || ((is("ex") || is("px")) && not_positive(args.get(i + 1)))
+        })
+    };
+    let sub = || args.get(1).map(|a| a.to_ascii_lowercase());
     match name {
+        "getex" | "set" => ttl_option(),
+        "hexpire" | "hpexpire" => not_positive(args.get(2)),
+        "hexpireat" | "hpexpireat" => true,
+        "xgroup" => matches!(sub().as_deref(), Some(b"destroy" | b"delconsumer")),
         "zrangestore" => true,
         "sort" | "georadius" | "georadiusbymember" => has("store") || has("storedist"),
         "geosearchstore" => true,
-        "expire" | "pexpire" => args
-            .get(2)
-            .and_then(|a| std::str::from_utf8(a).ok())
-            .and_then(|a| a.trim().parse::<i64>().ok())
-            .is_none_or(|n| n <= 0),
+        "expire" | "pexpire" => not_positive(args.get(2)),
         "expireat" | "pexpireat" => true,
         _ => false,
     }
@@ -1335,6 +1354,14 @@ mod tests {
             "EXPIRE k -5",
             "PEXPIRE k soon",
             "EXPIREAT k 1",
+            "GETEX k PXAT 1",
+            "GETEX k EX 0",
+            "SET k v EXAT 1",
+            "HEXPIRE h 0 FIELDS 1 f",
+            "HPEXPIREAT h 1 FIELDS 1 f",
+            "XGROUP DESTROY s g",
+            "xgroup delconsumer s g c",
+            "VREM v e",
         ] {
             let name = line.split(' ').next().unwrap().to_ascii_lowercase();
             assert_eq!(
@@ -1343,7 +1370,15 @@ mod tests {
                 "{line}"
             );
         }
-        for line in ["EXPIRE k 60", "SORT l", "LPUSH l a"] {
+        for line in [
+            "EXPIRE k 60",
+            "SORT l",
+            "LPUSH l a",
+            "GETEX k EX 60",
+            "SET k v EX 60",
+            "HEXPIRE h 60 FIELDS 1 f",
+            "XGROUP CREATE s g $",
+        ] {
             let name = line.split(' ').next().unwrap().to_ascii_lowercase();
             assert_eq!(
                 command_kind(&args(line), &info(&name, &["@write"])),
