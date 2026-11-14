@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** Redis Insight parity phase 4 (topology and connections), in one PR from branch `claude/insight-phase4-289a4c`. Phases 1 to 3 are on main (#15, #16, #17, #18).
-**Last updated:** 2026-11-14 (phase 4: spec written, Sentinel built; building the rest)
+**Last updated:** 2026-11-14 (phase 4: parts 1a, 2, 3, 4 and 5 built; part 1b, the rest of the cluster views, in progress)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -512,11 +512,14 @@ Built unattended on `claude/insight-phase4-289a4c`, one PR for the phase. Not me
 | Part | Content | Commits | State |
 |---|---|---|---|
 | 0 | Spec: the P4 section, milestones, the parity roadmap | | **done** |
-| 1 | Live views on a cluster: node connections kept with their budgets, routing by slot (local CRC16), `MOVED`/`ASK` once, the picked node (`[` `]`), per-shard summary, Streams per slot owner, classic and sharded Pub/Sub, Search and Monitor per node, bulk and `redis-lens expire` per primary, the command line by key specs with CROSSSLOT refused | | not started |
-| 2 | Sentinel: `[profile.sentinel]`, `sentinel:profile:<name>` keychain entry, `GET-MASTER-ADDR-BY-NAME` with the primary checked, `SENTINEL REPLICAS` for `prefer_replica`, `conn add`/`test`/`list`, Connections detail | `a2d467b` | **done**; `tests/sentinel_it.rs` 14 tests on Redis 7.4, Valkey 8.1 and Redis 6.2; verifier pending |
-| 3 | Database switch (`b`) | | not started |
-| 4 | Slots panel (`CLUSTER SLOT-STATS`) | | not started |
-| 5 | Type filter (`t`), `conn export`/`import`, tags, light theme and `NO_COLOR` | | not started |
+| 1a | Cluster live core: node connections kept with their budgets, routing by slot (local CRC16), `MOVED`/`ASK` once, the picked node (`[` `]`), per-shard summary on Overview, Search and Monitor per node | `cbf01f7` | **done**; `tests/cluster_live_it.rs` |
+| 1b | The other views on a cluster: key list and detail, edits, Big keys lengths, Streams per slot owner, classic and sharded Pub/Sub, bulk and `redis-lens expire` per primary, the command line by key specs with CROSSSLOT refused | | in progress |
+| 2 | Sentinel: `[profile.sentinel]`, `sentinel:profile:<name>` keychain entry, `GET-MASTER-ADDR-BY-NAME` with the primary checked, `SENTINEL REPLICAS` for `prefer_replica`, `conn add`/`test`/`list`, Connections detail | `a2d467b`, `c53f2dd` | **done**; `tests/sentinel_it.rs` 14 tests on Redis 7.4, Valkey 8.1 and Redis 6.2. The verifier approved it; what it noted is fixed in `c53f2dd`, each with a test |
+| 3 | Database switch (`b`): the list from `INFO keyspace`, a session rescan on the other index, `s` saves after asking | `103f09b` | **done**; `tests/dbs_it.rs` 5 tests |
+| 4 | Slots panel (`CLUSTER SLOT-STATS`), read on show and `r` | `29b53f2` | **done**; `tests/slots_it.rs` 3 tests (Valkey 8.1 counts against `CLUSTER COUNTKEYSINSLOT`; Redis 7.4 and 6.2 are off as too old; a Redis 8.2 run behind `REDIS_LENS_IT_REDIS82=1`) |
+| 5 | Type filter (`t`), `conn export`/`import`, tags, light theme and `NO_COLOR` | `57f1be8`, merge `5a52009` | **done**; unit tests only (nothing here talks to a server) |
+
+Parts landed out of order (2, 1a, 5, 4, 3, then 1b) because they were built in parallel by separate agents, each in its own worktree, and merged as each one passed its checks.
 
 ### Decisions taken alone (phase 4)
 
@@ -532,6 +535,11 @@ Built unattended on `claude/insight-phase4-289a4c`, one PR for the phase. Not me
 - **Database switch** is a rescan on the other index for the session only; `s` in the list saves it after asking. A running Pub/Sub tail resubscribes (Pub/Sub ignores the database), a running Monitor stops (it asks before starting again).
 - **Slots panel:** read on show and `r`, never polled; the whole panel is off when any primary is older than Redis 8.2 / Valkey 8.0.
 - **Import never turns writes on:** `read_only = false` is dropped on import; token commands are shown and asked for, like `conn add`.
+- **Import never lets a name pick up credentials stored for another place:** the keychain entries under an imported name are deleted unless the profile replaces one with the same address and TLS, auth, token command, bastion and Sentinels. The first build left them alone, so a file could have pointed `prod` at another host and been sent prod's password.
+- **Tags on a Sentinel profile** show after the TLS setting on the Connections detail (`on · tags a, b`), because the Sentinel row already has the row the tags would take.
+- **A replica refused before it reached the server keeps its own reason** (an unknown issuer, a certificate for another name, a refused connection): that text comes from the operating system or the certificate check. Only a server's reply is replaced with a fixed text, since it can name the ACL user.
+- **Database switch:** a failed save still switches the session and says so; `s` on a Docker container only says it can't save; `s` on the current database saves without a rescan.
+- **Slots panel has no permission probe:** each node gets one `INFO server` for the version gate, and a refusal is read from the first real request, which is read-only and sent only when the panel is shown. `↑↓` move through the hottest slots; the range table is not selectable.
 - **`NO_COLOR`** draws no colour at all; selection and badges use reverse video and bold.
 
 ### Open questions (phase 4)
