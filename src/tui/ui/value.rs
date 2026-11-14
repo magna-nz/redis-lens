@@ -1,7 +1,9 @@
 //! Draws [`ValueState`]: the key detail (spec "Key detail"). The key's metadata on the
 //! left; on the right its items (fields, elements, members or entries) above a divider
 //! and the selected item's value below it, or for a string or JSON document just the
-//! value.
+//! value. A module type (time series, Bloom, Cuckoo, Count-Min Sketch, Top-K,
+//! t-digest) shows its summary instead, which scrolls; an array lists its elements by
+//! index.
 //!
 //! Every text that came from the server goes through [`value::escape`] or the value
 //! renderer before it is drawn: values, field names, members, entry IDs, the type name

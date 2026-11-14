@@ -1307,3 +1307,16 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn a_preview_of_a_long_first_part_is_not_empty() {
+    let s = "y".repeat(500);
+    let mut p = b"\x80\x04X".to_vec();
+    p.extend((s.len() as u32).to_le_bytes());
+    p.extend(s.as_bytes());
+    p.push(b'.');
+    assert_eq!(decode(&p).detected, Format::Pickle);
+    let pv = preview(&p, 20);
+    assert!(pv.starts_with("'yyy"), "{pv}");
+    assert_eq!(pv.chars().count(), 20);
+}

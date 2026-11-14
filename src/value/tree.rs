@@ -52,13 +52,25 @@ impl Tree {
     }
 
     /// Adds a line at `depth`. Past a cap it is left out and the tree is marked cut.
-    pub fn push(&mut self, depth: usize, text: String) {
+    pub fn push(&mut self, depth: usize, mut text: String) {
         if self.cut {
             return;
         }
-        if self.lines.len() >= MAX_NODES || self.bytes + text.len() > self.max_bytes {
+        if self.lines.len() >= MAX_NODES {
             self.cut = true;
             return;
+        }
+        if self.bytes + text.len() > self.max_bytes {
+            // What fits of the line is kept, so a short preview still shows its start.
+            self.cut = true;
+            let mut room = self.max_bytes - self.bytes;
+            if room == 0 {
+                return;
+            }
+            while !text.is_char_boundary(room) {
+                room -= 1;
+            }
+            text.truncate(room);
         }
         self.bytes += text.len();
         self.lines.push((depth, text));
@@ -222,10 +234,15 @@ mod tests {
     fn caps_hold() {
         let mut t = Tree::with_limit(10);
         t.push(0, "12345".into());
-        t.push(0, "123456".into());
+        t.push(0, "1234é6".into());
         assert!(t.full());
         t.push(0, "1".into());
-        assert_eq!(t.lines().len(), 1);
+        // The line that did not fit is kept up to the cap, on a character.
+        assert_eq!(t.lines().len(), 2);
+        assert_eq!(t.lines()[1].1, "1234");
+        let mut t = Tree::with_limit(0);
+        t.push(0, "x".into());
+        assert!(t.lines().is_empty() && t.full());
         let mut t = Tree::new();
         for _ in 0..MAX_NODES + 5 {
             t.push(0, "x".into());
