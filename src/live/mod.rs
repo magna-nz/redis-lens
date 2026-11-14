@@ -57,6 +57,7 @@ pub mod nodes;
 pub mod pubsub;
 pub mod search;
 pub mod server;
+pub mod slots;
 pub mod streams;
 pub mod values;
 pub mod write;
@@ -356,6 +357,8 @@ pub enum LiveRequest {
     /// A step of a bulk action (spec "Bulk actions"): the dry run, or a batch of a
     /// bulk op the gate let through.
     Bulk(bulk::Request),
+    /// The Slots panel: `CLUSTER SLOT-STATS` of a node's slot ranges.
+    Slots(slots::Request),
 }
 
 /// The answer to a [`LiveRequest`], from the same group.
@@ -370,6 +373,7 @@ pub enum LiveReply {
     Command(cmdline::Reply),
     Write(write::Reply),
     Bulk(bulk::Reply),
+    Slots(slots::Reply),
 }
 
 /// Why a request failed. The text is always redis-lens's own fixed wording, never the
@@ -411,6 +415,7 @@ pub async fn run(
         LiveRequest::Command(r) => cmdline::run(conn, budget, r).await.map(LiveReply::Command),
         LiveRequest::Write(p) => write::run(conn, budget, p).await.map(LiveReply::Write),
         LiveRequest::Bulk(r) => bulk::run(conn, budget, r).await.map(LiveReply::Bulk),
+        LiveRequest::Slots(r) => slots::run(conn, budget, r).await.map(LiveReply::Slots),
     }
 }
 

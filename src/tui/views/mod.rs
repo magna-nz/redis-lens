@@ -102,6 +102,7 @@ pub mod keys;
 pub mod pubsub;
 pub mod search;
 pub mod server;
+pub mod slots;
 pub mod streams;
 pub mod value;
 
@@ -251,6 +252,7 @@ pub enum Owner {
     Streams,
     PubSub,
     Search,
+    Slots,
     /// The command line panel, which is not a screen (`cmdline.rs`).
     Cmdline,
 }
@@ -321,6 +323,7 @@ pub struct Views {
     pub streams: streams::StreamsState,
     pub pubsub: pubsub::PubSubState,
     pub search: search::SearchState,
+    pub slots: slots::SlotsState,
     pub cmdline: cmdline::CmdlineState,
 }
 
@@ -334,6 +337,7 @@ impl Views {
             Owner::Streams => &self.streams,
             Owner::PubSub => &self.pubsub,
             Owner::Search => &self.search,
+            Owner::Slots => &self.slots,
             Owner::Cmdline => &self.cmdline,
         }
     }
@@ -347,6 +351,7 @@ impl Views {
             Owner::Streams => &mut self.streams,
             Owner::PubSub => &mut self.pubsub,
             Owner::Search => &mut self.search,
+            Owner::Slots => &mut self.slots,
             Owner::Cmdline => &mut self.cmdline,
         }
     }

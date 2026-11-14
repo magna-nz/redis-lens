@@ -558,6 +558,33 @@ static NODES: [KeyHelp; 7] = [
     SNAPSHOT,
 ];
 
+static SLOTS: [KeyHelp; 6] = [
+    k(
+        "↑↓ j k",
+        "↑↓",
+        "Move",
+        "Move through the hottest slots",
+        true,
+    ),
+    PAGE,
+    ENDS,
+    PANEL,
+    k(
+        "o",
+        "o",
+        "Order",
+        "Order the hottest slots by keys, CPU, network in or network out",
+        true,
+    ),
+    k(
+        "r",
+        "r",
+        "Refresh",
+        "Read CLUSTER SLOT-STATS again on every node",
+        true,
+    ),
+];
+
 /// Keys that work in every view.
 pub fn global() -> &'static [KeyHelp] {
     &GLOBAL
@@ -587,6 +614,7 @@ pub fn for_screen(screen: Screen) -> &'static [KeyHelp] {
         Screen::PubSub => &PUBSUB,
         Screen::Search => &SEARCH,
         Screen::Nodes => &NODES,
+        Screen::Slots => &SLOTS,
     }
 }
 
@@ -626,6 +654,7 @@ pub fn footer(screen: Screen, ready: bool) -> Vec<(&'static str, &'static str)> 
         Screen::PubSub if ready => &[MOVE, "enter", "space", "/", "0-6", "?", "q ctrl-c"],
         Screen::Search if ready => &[MOVE, TAB, "/", "enter", "0-6", "?", "q ctrl-c"],
         Screen::Nodes if ready => &[MOVE, TAB, "enter", "r", "0-6", "?", "q ctrl-c"],
+        Screen::Slots if ready => &[MOVE, TAB, "o", "r", "0-6", "?", "q ctrl-c"],
         s if s.view().panels().is_empty() => &["0-6", "a", "?", "q ctrl-c"],
         _ => &[TAB, "0-6", "a", "?", "q ctrl-c"],
     };
@@ -809,6 +838,10 @@ mod tests {
         assert_eq!(
             names(Screen::Monitor, false),
             ["Panel", "View", "Add", "Help", "Quit"]
+        );
+        assert_eq!(
+            names(Screen::Slots, true),
+            ["Move", "Panel", "Order", "Refresh", "View", "Help", "Quit"]
         );
         assert_eq!(
             names(Screen::Nodes, true),

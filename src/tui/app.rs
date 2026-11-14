@@ -108,6 +108,7 @@ impl View {
                 Screen::BigKeys,
                 Screen::Expiry,
                 Screen::Nodes,
+                Screen::Slots,
             ],
             Self::Server => &[
                 Screen::Overview,
@@ -138,6 +139,8 @@ pub enum Screen {
     Expiry,
     /// The shards of a cluster scan (empty on a standalone one).
     Nodes,
+    /// What each slot range holds, from `CLUSTER SLOT-STATS` ([`views::slots`]).
+    Slots,
     Overview,
     Clients,
     SlowLog,
@@ -149,7 +152,7 @@ pub enum Screen {
 }
 
 impl Screen {
-    pub const ALL: [Screen; 17] = [
+    pub const ALL: [Screen; 18] = [
         Screen::Connections,
         Screen::Patterns,
         Screen::KeyList,
@@ -160,6 +163,7 @@ impl Screen {
         Screen::BigKeys,
         Screen::Expiry,
         Screen::Nodes,
+        Screen::Slots,
         Screen::Overview,
         Screen::Clients,
         Screen::SlowLog,
@@ -174,9 +178,13 @@ impl Screen {
         match self {
             Self::Connections => View::Connections,
             Self::Patterns | Self::KeyList | Self::KeyDetail => View::Patterns,
-            Self::Ttl | Self::Diff | Self::HotKeys | Self::BigKeys | Self::Expiry | Self::Nodes => {
-                View::Analysis
-            }
+            Self::Ttl
+            | Self::Diff
+            | Self::HotKeys
+            | Self::BigKeys
+            | Self::Expiry
+            | Self::Nodes
+            | Self::Slots => View::Analysis,
             Self::Overview | Self::Clients | Self::SlowLog | Self::Monitor => View::Server,
             Self::Streams => View::Streams,
             Self::PubSub => View::PubSub,
@@ -195,6 +203,7 @@ impl Screen {
             Self::BigKeys => "Big keys",
             Self::Expiry => "Expiry",
             Self::Nodes => "Nodes",
+            Self::Slots => "Slots",
             Self::Overview => "Overview",
             Self::Clients => "Clients",
             Self::SlowLog => "Slow log",
@@ -215,6 +224,7 @@ impl Screen {
             Self::BigKeys => "Analysis · Big keys",
             Self::Expiry => "Analysis · Expiry",
             Self::Nodes => "Analysis · Nodes",
+            Self::Slots => "Analysis · Slots",
             Self::Overview => "Server · Overview",
             Self::Clients => "Server · Clients",
             Self::SlowLog => "Server · Slow log",
@@ -238,6 +248,7 @@ impl Screen {
             Self::KeyList => Owner::Keys,
             Self::KeyDetail => Owner::Value,
             Self::BigKeys | Self::Expiry => Owner::Analysis,
+            Self::Slots => Owner::Slots,
             Self::Overview | Self::Clients | Self::SlowLog | Self::Monitor => Owner::Server,
             Self::Streams => Owner::Streams,
             Self::PubSub => Owner::PubSub,
@@ -249,15 +260,16 @@ impl Screen {
     /// Patterns and every Analysis panel.
     pub fn is_scan_view(self) -> bool {
         matches!(self.view(), View::Patterns | View::Analysis)
-            && !matches!(self, Self::KeyList | Self::KeyDetail)
+            && !matches!(self, Self::KeyList | Self::KeyDetail | Self::Slots)
     }
 
     /// Screens that work on the live connection (`r` refreshes the panel).
     pub fn is_live_view(self) -> bool {
-        matches!(
-            self.view(),
-            View::Server | View::Streams | View::PubSub | View::Search
-        )
+        self == Self::Slots
+            || matches!(
+                self.view(),
+                View::Server | View::Streams | View::PubSub | View::Search
+            )
     }
 }
 
@@ -3651,7 +3663,7 @@ mod tests {
         // Analysis starts on TTL; tab and shift-tab cycle its panels, both ways round.
         app.handle_key(ch('2'));
         let mut seen = vec![app.screen()];
-        for _ in 0..6 {
+        for _ in 0..7 {
             app.handle_key(key(KeyCode::Tab));
             seen.push(app.screen());
         }
@@ -3664,11 +3676,12 @@ mod tests {
                 Screen::BigKeys,
                 Screen::Expiry,
                 Screen::Nodes,
+                Screen::Slots,
                 Screen::Ttl
             ]
         );
         app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(app.screen(), Screen::Nodes);
+        assert_eq!(app.screen(), Screen::Slots);
         // Each view keeps its panel while you are elsewhere.
         app.handle_key(ch('3'));
         assert_eq!(app.screen(), Screen::Overview);
@@ -3677,7 +3690,7 @@ mod tests {
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.screen(), Screen::SlowLog);
         app.handle_key(ch('2'));
-        assert_eq!(app.screen(), Screen::Nodes);
+        assert_eq!(app.screen(), Screen::Slots);
         app.handle_key(ch('3'));
         assert_eq!(app.screen(), Screen::SlowLog);
         // Monitor is Server's fourth panel, and tab wraps around after it.
@@ -6090,9 +6103,11 @@ mod tests {
         let n = app.calls.len();
         app.handle_key(ch('3'));
         app.handle_key(key(KeyCode::Tab));
-        // TTL and Nodes are App's own: nothing to tell.
+        // TTL and Nodes are App's own: nothing to tell. Slots has a state of its own.
         app.handle_key(ch('2'));
         assert_eq!(app.screen(), Screen::Ttl);
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.screen(), Screen::Slots);
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.screen(), Screen::Nodes);
         app.handle_key(key(KeyCode::BackTab));
@@ -6108,6 +6123,8 @@ mod tests {
                 (Owner::Server, "hide"),
                 (Owner::Server, "show"),
                 (Owner::Server, "hide"),
+                (Owner::Slots, "show"),
+                (Owner::Slots, "hide"),
                 (Owner::Analysis, "show"),
                 (Owner::Analysis, "hide"),
                 (Owner::Analysis, "show"),
