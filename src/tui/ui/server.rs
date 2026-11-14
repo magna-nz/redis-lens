@@ -83,7 +83,7 @@ fn gate(frame: &mut Frame, area: Rect, title: &str, poll: &Poll, ctx: &Ctx<'_>) 
 
 /// A line under the panel title when something is wrong: the last poll failed, or the
 /// live connection closed (what is shown is then the last data).
-fn trouble(poll: &Poll, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+pub(super) fn trouble(poll: &Poll, ctx: &Ctx<'_>) -> Option<Line<'static>> {
     let text = if let LiveState::Closed(why) = ctx.live() {
         why.clone()
             .unwrap_or_else(|| "The live connection is closed.".to_string())
@@ -98,7 +98,7 @@ fn trouble(poll: &Poll, ctx: &Ctx<'_>) -> Option<Line<'static>> {
 
 /// The right of a polling panel's title: on a cluster the picked node first (spec
 /// "Cluster live views (P4)"), then `extra` and how often it polls.
-fn right_title(state: &ServerState, ctx: &Ctx<'_>, every: &str, extra: &str) -> String {
+pub(super) fn right_title(state: &ServerState, ctx: &Ctx<'_>, every: &str, extra: &str) -> String {
     let when = if state.paused {
         "paused · r fetches".to_string()
     } else {
@@ -121,7 +121,7 @@ fn with_node(node: Option<String>, text: String) -> String {
     }
 }
 
-fn secs(d: std::time::Duration) -> String {
+pub(super) fn secs(d: std::time::Duration) -> String {
     format!("{} s", d.as_secs())
 }
 
@@ -229,7 +229,7 @@ fn shard_summary(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'
     rows(frame, inner, lines, None);
 }
 
-fn shard_cells(s: &InfoSample) -> Vec<Span<'static>> {
+pub(super) fn shard_cells(s: &InfoSample) -> Vec<Span<'static>> {
     let ops = s
         .ops_now
         .map_or_else(|| "—".to_string(), |o| format!("{}/s", format::count(o)));
@@ -280,7 +280,7 @@ fn per_sec(v: f64) -> String {
 }
 
 /// The current value of `m` as text, and its style.
-fn metric_text(m: Metric, o: &Overview) -> (String, Style) {
+pub(super) fn metric_text(m: Metric, o: &Overview) -> (String, Style) {
     let dash = || ("—".to_string(), style::dim());
     let (Some(p), Some(last)) = (o.now(), o.last.as_ref()) else {
         return dash();
@@ -341,7 +341,7 @@ fn metric_text(m: Metric, o: &Overview) -> (String, Style) {
     }
 }
 
-fn server_lines(last: Option<&InfoSample>, w: usize) -> Vec<Line<'static>> {
+pub(super) fn server_lines(last: Option<&InfoSample>, w: usize) -> Vec<Line<'static>> {
     let Some(s) = last else {
         return Vec::new();
     };

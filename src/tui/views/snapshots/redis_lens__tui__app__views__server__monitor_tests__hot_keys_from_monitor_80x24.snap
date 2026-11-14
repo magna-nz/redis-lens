@@ -1,18 +1,18 @@
 ---
 source: src/tui/views/server.rs
-assertion_line: 2837
+assertion_line: 3442
 expression: "testing::render(&app, 80, 24).backend()"
 ---
-" redis-lens 0.1.0    STAGE   prod-cache-01  prod-cache-01.int…  writes on       "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
-"  0   1   2 Analysis   3   4   5   6                                            "
-"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  ·  Slots       "
+" prod-cache-01   STAGE   writes on   15G / 24G             ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys                                "
 "┌─ Hot keys ────────────────────── from MONITOR, 12 s, 10 lines, at 13:04 UTC ─┐"
 "│ KEY                                 PATTERN                    COUNT  LINES  │"
 "│ user:10293:cart                     user:{id}:cart                 2    20%  │"
 "│ feature:\x1b[31mflags\u{202e}       feature:\x1b[31mflags\…        1    10%  │"
 "│ rate:1.2.3.4                        rate:{ip}                      1    10%  │"
 "│ session:9f3                         session:9f3                    1    10%  │"
+"│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"

@@ -192,7 +192,10 @@ async fn event_loop(
                 Some(Incoming::Msg(m)) => pending = app.apply(*m),
                 None => return Ok(()),
             },
-            _ = tick.tick() => pending = app.apply(Msg::TickAt(std::time::Instant::now())),
+            _ = tick.tick() => {
+                app.set_wall_clock(unix_ms_now() / 1000);
+                pending = app.apply(Msg::TickAt(std::time::Instant::now()));
+            }
         }
     }
 }
@@ -704,6 +707,7 @@ impl Runner {
                 scan,
                 profile,
                 secrets,
+                sample,
             } => {
                 if let Some(t) = self.scan_task.take() {
                     t.abort();
@@ -715,9 +719,22 @@ impl Runner {
                     scan,
                     profile,
                     secrets,
+                    sample,
                     tx,
                     Arc::clone(&self.live),
                 )));
+            }
+            Effect::CancelAnalysis { id, scan } => {
+                // Only the current run's: its scan task stops; the live task, kept in
+                // the live slot, stays.
+                if self.scans.get(&id) == Some(&scan)
+                    && lock(&self.live)
+                        .as_ref()
+                        .is_some_and(|s| s.id == id && s.scan == scan)
+                    && let Some(t) = self.scan_task.take()
+                {
+                    t.abort();
+                }
             }
             Effect::SetWrites { name, on } => {
                 let path = self.path.clone();
@@ -1235,11 +1252,15 @@ async fn forward_tail(
     }
 }
 
+/// Connects run `scan_id` of entry `id`: the permission check and the server's own
+/// figures, then its live connection. With `sample` it then analyzes: a scan with
+/// `ScanOptions::sample_limit` set to it. Without, it ends there, having read no key.
 async fn connect_and_scan(
     id: ConnId,
     scan_id: ScanId,
     profile: Profile,
     secrets: SecretSource,
+    sample: Option<u64>,
     tx: Tx,
     live: LiveSlot,
 ) {
@@ -1282,7 +1303,7 @@ async fn connect_and_scan(
     // The permission probes run once on connect and don't. On a cluster each node has a
     // budget of its own instead, shared by its scan and its live requests, and the
     // probes run on every node through its budget.
-    let opts = ScanOptions::for_profile(&profile);
+    let mut opts = ScanOptions::for_profile(&profile);
     let budget = Budget::new(opts.max_commands_per_sec);
     let (perms, server) = match &mut targets {
         ScanTargets::Single { conn, .. } => {
@@ -1336,6 +1357,11 @@ async fn connect_and_scan(
     if !started {
         return;
     }
+    // A connect reads no key: only `r` analyzes.
+    let Some(limit) = sample else {
+        return;
+    };
+    opts.sample_limit = limit;
 
     scan_and_report(id, scan_id, tx, |ptx, partial_tx| async move {
         match &mut targets {

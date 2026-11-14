@@ -387,7 +387,7 @@ mod tests {
             screen.contains("No sizes: MEMORY USAGE is not allowed"),
             "{screen}"
         );
-        app.handle_key(key(KeyCode::Tab));
+        testing::show(&mut app, Screen::Expiry);
         let screen = format!("{:?}", testing::render(&app, 80, 24).backend());
         assert!(
             screen.contains("No sizes: MEMORY USAGE is not allowed"),

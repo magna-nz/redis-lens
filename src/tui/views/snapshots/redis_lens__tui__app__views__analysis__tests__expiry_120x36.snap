@@ -1,12 +1,11 @@
 ---
 source: src/tui/views/analysis.rs
-assertion_line: 375
+assertion_line: 428
 expression: "testing::render(&app, 120, 36).backend()"
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                           "
-"  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
-"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  ·  Slots                                tab next panel "
+" prod-cache-01   PROD   read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys           ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
+"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys                                                                        "
 "┌─ Expiry ─────────────────────────────────────────────────────────── memory freed by TTL · scaled like the estimates ─┐"
 "│                                                                                                                      │"
 "│ From PTTL and MEMORY USAGE of 100,000 sampled keys.                                                                  │"
@@ -16,6 +15,7 @@ expression: "testing::render(&app, 120, 36).backend()"
 "│ within 7 d    ███████▎░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░     2.4G   18%                                                │"
 "│ within 30 d   ███████▎░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░     2.4G   18%                                                │"
 "│ never         ████████████████████████████████▊░░░░░░░      11G   82%                                                │"
+"│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
@@ -38,4 +38,4 @@ expression: "testing::render(&app, 120, 36).backend()"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" tab Panel   r Rescan   s Snapshot   0-6 View   ? Help   q Quit                                                         "
+" tab Next panel   ← Back   r Analyze   s Snapshot                                                      : Command  ? Help"

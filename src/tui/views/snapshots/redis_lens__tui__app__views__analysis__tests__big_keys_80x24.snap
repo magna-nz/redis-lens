@@ -1,12 +1,11 @@
 ---
 source: src/tui/views/analysis.rs
-assertion_line: 273
+assertion_line: 326
 expression: "testing::render(&app, 80, 24).backend()"
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
-"  0   1   2 Analysis   3   4   5   6                                            "
-"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  ·  Slots       "
+" prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys                                "
 "┌─ Big keys ──────────────────────────────── top 50 of 100K sampled · by size ─┐"
 "│ KEY                    PATTERN        TYPE      SIZE▼        LENGTH      TTL │"
 "│ queue:emails           queue:emails   list      612M    2.10M items     none │"
@@ -15,6 +14,7 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│ cache:search:a17e4d9b… cache:search:… string     96K     1.8K bytes     none │"
 "│ tmp:import:01JCE2M7N9… tmp:import:{u… string     88K     1.8K bytes     none │"
 "│ user:204551:feed       user:{id}:feed zset       64K   1.3K members   6d 19h │"
+"│ session:c41f0e9a-2d6b… session:{uuid} string     41K     1.8K bytes  23h 12m │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "┌─ Recommendations ─────────────────────────────────────────────────────── 10 ─┐"
 "│ ▲ queue:emails is a single 612M list of 2,104,332 items. Trim it with LTRIM,…│"
@@ -26,4 +26,4 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│ ● tmp:import:{ulid} never expires. Probably intentional, as it is not growin…│"
 "│ … and 3 more                                                                 │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   tab Panel   r Rescan   s Snapshot   0-6 View   ? Help   q Quit       "
+" ↑↓ Move   tab Next panel   y Copy   r Analyze   s Snapshot    : Command  ? Help"

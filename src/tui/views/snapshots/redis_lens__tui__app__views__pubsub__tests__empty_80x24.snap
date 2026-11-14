@@ -1,13 +1,14 @@
 ---
 source: src/tui/views/pubsub.rs
+assertion_line: 1109
 expression: "testing::render(&app, 80, 24).backend()"
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
-"  0   1   2   3   4   5 Pub/Sub   6                                             "
+" prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
 "┌─ Pub/Sub ────────────────────────── active channels, most subscribers first ─┐"
 "│ No active channels.                                                          │"
 "│ A channel exists only while a client subscribes to it.                       │"
+"│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
@@ -25,4 +26,4 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   enter Subscribe   space Pause   / Filter   0-6 View   ? Help   q Quit"
+" ↑↓ Move   enter Subscribe   space Pause   / Filter            : Command  ? Help"

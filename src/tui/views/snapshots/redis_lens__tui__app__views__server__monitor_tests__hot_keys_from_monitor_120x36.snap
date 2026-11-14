@@ -1,18 +1,18 @@
 ---
 source: src/tui/views/server.rs
-assertion_line: 2845
+assertion_line: 3450
 expression: "testing::render(&app, 120, 36).backend()"
 ---
-" redis-lens 0.1.0    STAGE   prod-cache-01  prod-cache-01.internal:6380  writes on         ● scan complete 14:02:11 UTC "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                           "
-"  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
-"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  ·  Slots                                tab next panel "
+" prod-cache-01   STAGE   writes on   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys          ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
+"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys                                                                        "
 "┌─ Hot keys ────────────────────────────────────────────────────────────── from MONITOR, 12 s, 10 lines, at 13:04 UTC ─┐"
 "│ KEY                                                                         PATTERN                    COUNT  LINES  │"
 "│ user:10293:cart                                                             user:{id}:cart                 2    20%  │"
 "│ feature:\x1b[31mflags\u{202e}                                               feature:\x1b[31mflags\…        1    10%  │"
 "│ rate:1.2.3.4                                                                rate:{ip}                      1    10%  │"
 "│ session:9f3                                                                 session:9f3                    1    10%  │"
+"│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"

@@ -1,9 +1,8 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 1442
+assertion_line: 1627
 expression: header
 ---
- redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC 
- Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                           
-  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 
-    Overview  ·  Clients  ·  Slow log  ·  Monitor                                                        tab next panel
+ prod-cache-01   PROD   read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys           ● analyzed 14:02 UTC 
+  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            
+    Clients  ·  Slow log  ·  Monitor

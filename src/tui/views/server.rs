@@ -1875,7 +1875,7 @@ mod tests {
         assert_eq!(only_request(&out).1, Request::Info);
 
         // On another view it asks for nothing.
-        app.handle_key(ch('1'));
+        app.handle_key(ch('0'));
         assert!(testing::requests(&app.apply(Msg::TickAt(t0 + secs(30)))).is_empty());
     }
 
@@ -1933,7 +1933,7 @@ mod tests {
     }
 
     #[test]
-    fn p_pauses_polling_and_r_fetches_once() {
+    fn p_pauses_polling_and_resuming_fetches_at_once() {
         let t0 = Instant::now();
         let (mut app, out) = app_at(t0, Screen::Overview);
         let (id, _) = only_request(&out);
@@ -1948,23 +1948,11 @@ mod tests {
         assert!(app.handle_key(ch('p')).is_empty());
         assert!(state(&app).paused);
         assert!(testing::requests(&app.apply(Msg::TickAt(t0 + secs(20)))).is_empty());
-        // `r` still fetches, once.
-        let out = app.handle_key(ch('r'));
-        assert_eq!(only_request(&out).1, Request::Info);
-        assert!(
-            testing::requests(&app.handle_key(ch('r'))).is_empty(),
-            "one is already out"
-        );
+        // `r` on Overview analyzes the keys: it asks first, and fetches nothing.
+        assert!(testing::requests(&app.handle_key(ch('r'))).is_empty());
+        assert!(app.analyze.is_some());
+        app.handle_key(key(KeyCode::Esc));
         // Resuming asks at once when nothing is out.
-        let (id, _) = testing::requests(&out)[0].clone();
-        answer(
-            &mut app,
-            id,
-            Reply::Info {
-                at: t0 + secs(20),
-                sample: Box::new(sample(20)),
-            },
-        );
         let out = app.handle_key(ch('p'));
         assert!(!state(&app).paused);
         assert_eq!(only_request(&out).1, Request::Info);
@@ -2040,11 +2028,10 @@ mod tests {
         assert!(testing::requests(&app.apply(Msg::TickAt(t0 + secs(60)))).is_empty());
         let out = testing::show(&mut app, Screen::Clients);
         assert_eq!(only_request(&out).1, Request::Clients);
-        // `r` tries again.
-        testing::show(&mut app, Screen::Overview);
-        let out = app.handle_key(ch('r'));
-        assert_eq!(only_request(&out).1, Request::Info);
-        assert!(state(&app).overview.poll.off.is_none());
+        // Shown again it stays off and sends nothing (`r` there analyzes the keys).
+        let out = testing::show(&mut app, Screen::Overview);
+        assert!(server_requests(&out).is_empty());
+        assert!(state(&app).overview.poll.off.is_some());
     }
 
     #[test]
@@ -2587,8 +2574,9 @@ mod tests {
         let t0 = Instant::now();
         let (mut app, _) = app_at(t0, Screen::Overview);
         feed_overview(&mut app, t0, 4);
+        // The next poll goes out, then `p` pauses before it is answered.
+        app.apply(Msg::TickAt(t0 + secs(8)));
         app.handle_key(ch('p'));
-        app.handle_key(ch('r'));
         let id = app_pending_info(&app);
         testing::reply(&mut app, id, Err(LiveError::Failed("INFO failed".into())));
         insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
@@ -3270,6 +3258,7 @@ mod monitor_tests {
         let (mut app, _) = running(Instant::now());
         app.handle_key(ch('2'));
         app.handle_key(ch('r'));
+        app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.views.server.monitor.stopped, Some(Stop::Rescan));
     }
 
@@ -3357,7 +3346,7 @@ mod monitor_tests {
         let debug = format!("{out:?} {:?} {:?}", app.views, app.notice);
         assert!(!value::leaks(&debug, MARK), "{debug}");
         // `s` from Patterns saves the scan only.
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         let effects = app.handle_key(ch('s'));
         let [Effect::SaveSnapshot(report)] = &effects[..] else {
             panic!("{effects:?}");
@@ -3575,7 +3564,7 @@ mod monitor_tests {
         app.handle_key(ch('k'));
         app.handle_key(ch('k'));
         assert!(text(&app, 120, 36).contains("CONFIG SET requirepass ***"));
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         let effects = app.handle_key(ch('s'));
         let [Effect::SaveSnapshot(report)] = &effects[..] else {
             panic!("{effects:?}");

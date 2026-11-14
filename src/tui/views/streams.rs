@@ -1307,10 +1307,10 @@ mod tests {
     #[test]
     fn does_not_poll_while_hidden() {
         let (mut app, t0) = loaded();
-        app.handle_key(key(KeyCode::Char('1')));
+        app.handle_key(key(KeyCode::Char('0')));
         assert_eq!(tick(&mut app, t0, 60_000), None);
         // Back on screen it reads at once.
-        let effects = app.handle_key(key(KeyCode::Char('4')));
+        let effects = app.handle_key(key(KeyCode::Char('2')));
         assert_eq!(testing::requests(&effects).len(), 1);
     }
 
@@ -1335,7 +1335,7 @@ mod tests {
         assert_eq!(app.views.streams.sel, 2);
         app.handle_key(key(KeyCode::Char('g')));
         assert_eq!(app.views.streams.sel, 0);
-        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Right));
         assert_eq!(app.views.streams.focus, Focus::Detail);
         // billing, b-1, b-2, audit, a-1.
         assert_eq!(app.views.streams.details().len(), 5);
@@ -1343,7 +1343,7 @@ mod tests {
         assert_eq!(app.views.streams.detail_sel, 4);
         app.handle_key(key(KeyCode::Down));
         assert_eq!(app.views.streams.detail_sel, 4, "clamped");
-        app.handle_key(key(KeyCode::BackTab));
+        app.handle_key(key(KeyCode::Left));
         assert_eq!(app.views.streams.focus, Focus::List);
     }
 
@@ -1437,7 +1437,7 @@ mod tests {
         insta::assert_snapshot!("list_80x24", testing::render(&app, 80, 24).backend());
         insta::assert_snapshot!("list_120x36", testing::render(&app, 120, 36).backend());
         // Details focused, on the second group's consumer.
-        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Right));
         app.handle_key(key(KeyCode::End));
         insta::assert_snapshot!("details_80x24", testing::render(&app, 80, 24).backend());
         app.handle_key(key(KeyCode::Char('p')));
@@ -1607,8 +1607,8 @@ mod tests {
     #[test]
     fn entries_stay_open_across_views_and_r_reads_them_again() {
         let (mut app, _) = entries_open();
-        app.handle_key(ch('1'));
-        let effects = app.handle_key(ch('4'));
+        app.handle_key(ch('0'));
+        let effects = app.handle_key(ch('2'));
         // Shown again: nothing asked, no XINFO either.
         assert!(testing::requests(&effects).is_empty(), "{effects:?}");
         assert!(app.views.streams.entries_open);
@@ -1658,15 +1658,20 @@ mod tests {
             notice(&app),
             "A stream entry has several fields, so y does not copy it."
         );
-        // tab moves to the value, which scrolls.
-        app.handle_key(key(KeyCode::Tab));
+        // → moves to the value, which scrolls.
+        app.handle_key(key(KeyCode::Right));
         assert_eq!(
             app.views.streams.shown_entries().unwrap().focus,
             crate::tui::app::views::value::Focus::Value
         );
-        // p still pauses, and esc goes back.
+        // p still pauses, and esc goes back: to the items, then out of the entries.
         app.handle_key(ch('p'));
         assert!(app.views.streams.paused);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(
+            app.views.streams.shown_entries().unwrap().focus,
+            crate::tui::app::views::value::Focus::Items
+        );
         app.handle_key(key(KeyCode::Esc));
         assert!(!app.views.streams.entries_open);
     }
@@ -1748,7 +1753,7 @@ mod tests {
         let debug = format!("{effects:?} {:?} {:?}", app.views, app.session);
         assert!(!crate::value::leaks(&debug, MARK), "{debug}");
         // A snapshot file, saved from Patterns.
-        app.handle_key(ch('1'));
+        app.handle_key(ch('3'));
         let effects = app.handle_key(ch('s'));
         let [Effect::SaveSnapshot(report)] = &effects[..] else {
             panic!("{effects:?}");
@@ -1800,7 +1805,7 @@ mod tests {
     fn on_consumer(env: Env, read_only: Option<bool>) -> App {
         let (mut app, _) = loaded();
         set_profile(&mut app, env, read_only);
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
         app.handle_key(ch('j'));
         assert!(matches!(
             app.views.streams.details()[app.views.streams.detail_sel],
@@ -1915,7 +1920,7 @@ mod tests {
         assert!(matches!(streams_requests(&e)[..], [Request::Info { .. }]));
 
         // On the list, c says where to go.
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Left);
         app.handle_key(ch('c'));
         assert!(app.views.streams.form.is_none());
         assert!(notice(&app).contains("Press tab"), "{}", notice(&app));

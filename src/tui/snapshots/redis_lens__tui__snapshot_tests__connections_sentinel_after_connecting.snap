@@ -1,16 +1,17 @@
 ---
 source: src/tui/snapshot_tests.rs
+assertion_line: 398
 expression: t.backend()
 ---
-" redis-lens 0.1.0    PROD   orders-sentinel  10.0.2.31:6379  read-only                                       ⠋ scanning "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   ⠋ Sampled 0 / 0                                             "
-"  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
+" orders-sentinel   PROD   read-only   10.0.2.31:6379 · Redis 7.4.2 · 15G / 24G · 7.92M keys                 ● connected "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
 "┌─ Connections ────────────────────────────────────────────────────────────────────────── 1 saved · 0 found in Docker ─┐"
 "│   NAME               ENV      ENDPOINT                                AUTH          WRITES     STATUS            MEM │"
 "│ SAVED                                                                                                                │"
 "│ › orders-sentinel     PROD    10.0.2.31:6379                          keychain      read-only  ● connected       15G │"
 "│ DOCKER · searching…                                                                                                  │"
 "│ + Add connection    paste a redis:// URI or a StackExchange.Redis string                                             │"
+"│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
@@ -37,4 +38,4 @@ expression: t.backend()
 "│ Sentinel    orders · named by 10.0.2.12:26379                          – MEMORY STATS                                │"
 "│ ✓ Every permission check passed.                                                                                     │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   enter Connect   a Add   r Rescan Docker   0-6 View   ? Help   q Quit                                         "
+" ↑↓ Move   enter Connect   a Add   w Writes   / Filter                                                 : Command  ? Help"

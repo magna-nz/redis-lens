@@ -1,11 +1,10 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 1550
+assertion_line: 1729
 expression: "render(&app, 120, 36).backend()"
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                           "
-"  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
+" prod-cache-01   PROD   read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys           ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
 "┌─ Connections ────────────────────────────────────────────────────────────────────────── 3 saved · 1 found in Docker ─┐"
 "│   NAME               ENV      ENDPOINT                                AUTH          WRITES     STATUS            MEM │"
 "│ SAVED                                                                                                                │"
@@ -15,6 +14,7 @@ expression: "render(&app, 120, 36).backend()"
 "│ DOCKER · 1 Redis-compatible container                                                                                │"
 "│   myapp-redis-1       LOCAL   127.0.0.1:6390                          none          on         ○ not open          — │"
 "│ + Add connection    paste a redis:// URI or a StackExchange.Redis string                                             │"
+"│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
@@ -38,4 +38,4 @@ expression: "render(&app, 120, 36).backend()"
 "│ Values      shown on screen, never saved                                                                             │"
 "│ ✓ Every permission check passed.                                                                                     │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   enter Connect   a Add   r Rescan Docker   0-6 View   ? Help   q Quit                                         "
+" ↑↓ Move   enter Connect   a Add   w Writes   / Filter                                                 : Command  ? Help"

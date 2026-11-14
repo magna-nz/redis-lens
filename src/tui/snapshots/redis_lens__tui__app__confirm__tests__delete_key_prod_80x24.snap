@@ -1,10 +1,11 @@
 ---
 source: src/tui/confirm.rs
+assertion_line: 890
 expression: t.backend()
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…   WRITES ON       "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
-"  0   1 Patterns   2   3   4   5   6                                            "
+" prod-cache-01   PROD    WRITES ON    15G / 24G            ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"    Keys  ·  Streams  ·  Search                                                 "
 "┌─ user:10293:cart ──────────┐┌─ Fields ─────────────────── ⠋ loading · HSCAN ─┐"
 "│ Type        hash           ││ ⠋ Reading the value…                           │"
 "│ Encoding    listpack       ││                                                │"

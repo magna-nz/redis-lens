@@ -1,14 +1,17 @@
 ---
 source: src/tui/snapshot_tests_server.rs
+assertion_line: 249
 expression: t.backend()
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01-x1y2z3.serverle…  read-only                         ⠋ scanning "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   ⠋ Sampled 12,400 / 100,000  ▲ sizes unavailable: MEMORY USAG"
-"  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
-"┌─ Patterns ─────────────────────────────────────────────────────────────────────────────────────────── prod-cache-01 ─┐"
+" prod-cache-01   PROD   read-only   Redis 7.4.2 · 15G / 24G · 7.92M keys · ▲ no sizes                   ⠋ analyzing 12% "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
+"┌─ Now ────────────────────────────────────────────────────────────────────────────────── INFO · every 2 s · p pauses ─┐"
+"│ Waiting for the live connection…                                                                                     │"
+"├─ Keys ─────────────────────────────────────────────────────────────────────────────────── about 40K commands in all ─┤"
+"│ 7.92M keys · 15G used                                                                                                │"
 "│                                                                                                                      │"
-"│ ⠋ Sampled 12,400 / 100,000 keys                                                                                      │"
-"│   █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░                                                                           │"
+"│ ANALYZING  sampling 1,240 of 10,000 keys   █▊░░░░░░░░░░░░                                                            │"
+"│ Browse and Analyze fill in as it goes.  esc stops it.                                                                │"
 "│                                                                                                                      │"
 "│ ▲ ElastiCache Serverless restricts MEMORY and OBJECT, so sizes and hot keys are missing; counts and TTLs still work. │"
 "│                                                                                                                      │"
@@ -26,8 +29,6 @@ expression: t.backend()
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
-"└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-"┌─ Details ────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
@@ -37,4 +38,4 @@ expression: t.backend()
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   →← Fold   enter Open   / Filter   o Sort   0-6 View   ? Help   q Quit                                        "
+" esc Stop   p Pause   +- Interval                                                                      : Command  ? Help"

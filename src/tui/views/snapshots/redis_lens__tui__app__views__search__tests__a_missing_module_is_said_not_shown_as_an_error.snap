@@ -1,10 +1,11 @@
 ---
 source: src/tui/views/search.rs
+assertion_line: 985
 expression: "testing::render(&app, 80, 24).backend()"
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
-"  0   1   2   3   4   5   6 Search                                              "
+" prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"    Keys  ·  Streams  ·  Search                                                 "
 "┌─ Search ──────────────────────────────────────────────────── module missing ─┐"
 "│                                                                              │"
 "│ The Search module is not loaded on this server.                              │"
@@ -25,4 +26,4 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   tab Details   / Query   enter Open   0-6 View   ? Help   q Quit      "
+" ↑↓ Move   → Details   / Query   enter Open   esc Back         : Command  ? Help"

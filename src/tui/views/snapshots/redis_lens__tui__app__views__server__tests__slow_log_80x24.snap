@@ -1,12 +1,11 @@
 ---
 source: src/tui/views/server.rs
-assertion_line: 2395
+assertion_line: 2705
 expression: "testing::render(&app, 80, 24).backend()"
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
-"  0   1   2   3 Server   4   5   6                                              "
-"    Overview  ·  Clients  ·  Slow log  ·  Monitor                tab next panel "
+" prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"    Clients  ·  Slow log  ·  Monitor                                            "
 "┌─ Slow log ──────────────────────────────────── 9 entries · UTC · every 10 s ─┐"
 "│ threshold 10.0ms · keeps 128 entries                                         │"
 "│  TIME      DURATION  COMMAND      KEYS                  CLIENT               │"
@@ -18,6 +17,7 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│ ▲22:13:24   310.0ms  FLUSHDB                            10.0.1.5:50386       │"
 "│  22:13:23     812µs  ZADD         leaderboard:2026-11   10.0.1.5:50386       │"
 "│  22:13:22    30.1ms  DEL          a-key-with-a-really-… 10.0.1.5:50386       │"
+"│  22:13:21    18.0ms  EVALSHA      lock:jobs lock:jobs:… 10.0.1.5:50386       │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "┌─ Entry ──────────────────────────────────────────────────────────────────────┐"
 "│ when   2023-11-14 22:13:28 UTC · 1.25s · KEYS                                │"
@@ -26,4 +26,4 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│ client 10.0.1.5:50386 (worker)                                               │"
 "│ ▲ KEYS walks every key and blocks the server. Use SCAN instead.              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" tab Panel   ↑↓ Move   p Pause   r Refresh   0-6 View   ? Help   q Quit         "
+" ↑↓ Move   tab Next panel   p Pause   r Refresh                : Command  ? Help"

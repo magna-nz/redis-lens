@@ -1,12 +1,11 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 738
+assertion_line: 917
 expression: t.backend()
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                           "
-"  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
-"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  ·  Slots                                tab next panel "
+" prod-cache-01   PROD   read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys           ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
+"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys                                                                        "
 "┌─ Hot keys ────────────────────────────────────────────────────────────────────────────────────── policy allkeys-lru ─┐"
 "│                                                                                                                      │"
 "│ No hot keys to show.                                                                                                 │"
@@ -14,6 +13,7 @@ expression: t.backend()
 "│ Set maxmemory-policy to allkeys-lfu or volatile-lfu to see hot keys.                                                 │"
 "│                                                                                                                      │"
 "│ Or rank keys by how often MONITOR sees them: Server (3) › Monitor.                                                   │"
+"│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
@@ -38,4 +38,4 @@ expression: t.backend()
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   tab Panel   r Rescan   s Snapshot   0-6 View   ? Help   q Quit                                               "
+" ↑↓ Move   tab Next panel   y Copy   r Analyze   s Snapshot                                            : Command  ? Help"

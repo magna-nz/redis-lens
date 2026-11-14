@@ -1,12 +1,11 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 606
+assertion_line: 786
 expression: t.backend()
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                           "
-"  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
-"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  ·  Slots                                tab next panel "
+" prod-cache-01   PROD   read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys           ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
+"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys                                                                        "
 "┌─ TTL ───────────────────────────────────────────────────────────────────────────────── 11 patterns · riskiest first ─┐"
 "│ PATTERN                                       KEYS  NO TTL   none <1m  <1h  <1d  <7d  <30d >30d VERDICT              │"
 "│ tmp:import:{ulid}                              48K  ▲ 100%   ███  ·    ·    ·    ·    ·    ·    persistent · growing │"
@@ -27,6 +26,7 @@ expression: t.backend()
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
+"│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 "┌─ user:{id}:profile ─────────────────────────────────────────────────────────────────── 412K keys · 100% without TTL ─┐"
 "│ WHY                                                                                                                  │"
@@ -38,4 +38,4 @@ expression: t.backend()
 "│                                                                                                                      │"
 "│ $ redis-cli --scan --pattern "user:*:profile"                                                                        │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   tab Panel   r Rescan   s Snapshot   0-6 View   ? Help   q Quit                                               "
+" ↑↓ Move   tab Next panel   → Forecast   s Snapshot                                                    : Command  ? Help"

@@ -1,10 +1,10 @@
 ---
 source: src/tui/snapshot_tests_cluster.rs
+assertion_line: 1432
 expression: t.backend()
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  cluster · 3 shards  read-only        "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
-"  0   1   2   3   4   5 Pub/Sub   6                                             "
+" prod-cache-01   PROD   read-only   cluster · 3 shards     ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
 "┌─ Pub/Sub ───── node 10.0.1.11:6379 · 1 of 3 · subscribers on 10.0.1.11:6379 ─┐"
 "│ CHANNEL                                                SUBS                  │"
 "│ news                                                      3 ████████████████ │"
@@ -13,6 +13,7 @@ expression: t.backend()
 "│ foo                                  10.0.1.13:6379       5                  │"
 "│ bar                                  10.0.1.11:6379       2                  │"
 "│ a                                    10.0.1.13:6379       1                  │"
+"│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "┌─ Totals ─────────────────────────────────────────────────────────────────────┐"
@@ -25,4 +26,4 @@ expression: t.backend()
 "│ Counts read no payloads. enter or s starts a live tail, S a shard one.       │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   enter Subscribe   space Pause   / Filter   0-6 View   ? Help   q Quit"
+" ↑↓ Move   enter Subscribe   space Pause   / Filter            : Command  ? Help"

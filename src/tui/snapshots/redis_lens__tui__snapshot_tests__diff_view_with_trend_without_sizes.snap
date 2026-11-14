@@ -1,12 +1,11 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 688
+assertion_line: 868
 expression: t.backend()
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)  ▲ sizes unavailable: MEMORY USAGE denied "
-"  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
-"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  ·  Slots                                tab next panel "
+" prod-cache-01   PROD   read-only   Redis 7.4.2 · 15G / 24G · 7.92M keys · ▲ no sizes              ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
+"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys                                                                        "
 "┌─ Diff ───────────────────────────────────────────── snapshot 2026-11-09 14:02:11 UTC → now · used 13G → 15G (+1.9G) ─┐"
 "│ PATTERN                        BEFORE      NOW        Δ      Δ%  TREND           shrank grew           WHY           │"
 "│ rl:{ip}:{id}                    2.60M    2.31M    -290K    -11%  █▇▇▆▅▄▄▁  ████████████│               fewer keys    │"
@@ -27,6 +26,7 @@ expression: t.backend()
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
+"│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 "┌─ queue:emails ──────────────────────────────────────────────────────────────────────────────── · since the snapshot ─┐"
 "│ WHERE THE CHANGE CAME FROM                                                                                           │"
@@ -38,4 +38,4 @@ expression: t.backend()
 "│ No meaningful change.                                                                                                │"
 "│ Sizes unavailable: one of the scans could not run MEMORY USAGE.                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   tab Panel   r Rescan   s Snapshot   0-6 View   ? Help   q Quit                                               "
+" ↑↓ Move   tab Next panel   y Copy   r Analyze   s Snapshot                                            : Command  ? Help"

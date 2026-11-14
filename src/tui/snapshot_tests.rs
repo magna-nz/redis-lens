@@ -66,6 +66,8 @@ fn scanned_with(report: ScanReport, perms: PermissionReport) -> (App, ConnId) {
         scan: scan_of(&app),
         report: Box::new(report),
     });
+    // A connect lands on Overview; these snapshots start on Browse › Keys.
+    super::app::views::testing::show(&mut app, Screen::Patterns);
     (app, id)
 }
 
@@ -133,9 +135,12 @@ fn go(app: &mut App, c: char) {
 }
 
 /// Goes to `screen`, unless it is the key list (or the key detail over it) and there is
-/// no pattern to open.
+/// no pattern to open, or Nodes or Slots off a cluster (not screens there).
 fn show(app: &mut App, screen: Screen) -> bool {
     if matches!(screen, Screen::KeyList | Screen::KeyDetail) && app.pattern_rows().is_empty() {
+        return false;
+    }
+    if matches!(screen, Screen::Nodes | Screen::Slots) && !app.is_cluster() {
         return false;
     }
     super::app::views::testing::show(app, screen);
@@ -161,6 +166,7 @@ fn select_pattern(app: &mut App, label: &str) {
             Row::Pattern { idx, .. } => report.patterns[idx].pattern == label,
         })
         .unwrap_or_else(|| panic!("no row {label}"));
+    assert_eq!(app.screen(), Screen::Patterns);
     while app.patterns.sel < at {
         app.handle_key(ch('j'));
     }
@@ -477,25 +483,34 @@ fn connections_filtered_by_tag_80x24() {
 fn scanning_progress_header() {
     let mut app = App::new(fixtures::profiles());
     let id = connect_selected(&mut app);
-    app.apply(Msg::Connected {
-        id,
-        scan: scan_of(&app),
-        server: Some(fixtures::server()),
-        perms: fixtures::perms_ok(),
-        target: ScanTarget::Primary,
-    });
+    let connected = |app: &mut App| {
+        app.apply(Msg::Connected {
+            id,
+            scan: scan_of(app),
+            server: Some(fixtures::server()),
+            perms: fixtures::perms_ok(),
+            target: ScanTarget::Primary,
+        })
+    };
+    connected(&mut app);
+    // `r`, `enter`: a Quick analysis.
+    app.handle_key(ch('r'));
+    app.handle_key(key(KeyCode::Enter));
+    connected(&mut app);
     app.apply(Msg::ScanProgress {
         id,
         scan: scan_of(&app),
         progress: ScanProgress {
-            sampled: 12_400,
-            target: 85_964,
+            sampled: 1_240,
+            target: 10_000,
             done: false,
         },
     });
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[1].contains("Sampled 12,400 / 85,964"), "{}", lines[1]);
+    assert!(lines[0].contains("analyzing 12%"), "{}", lines[0]);
+    let all = lines.join("\n");
+    assert!(all.contains("sampling 1,240 of 10,000 keys"), "{all}");
 }
 
 #[test]
@@ -574,6 +589,8 @@ fn partial_after_previous_profile() -> App {
         scan: scan_of(&app),
         partial,
     });
+    // A connect lands on Overview; these look at Browse › Keys.
+    go(&mut app, '1');
     app
 }
 
@@ -665,6 +682,7 @@ fn empty_partial_says_nothing_sampled_yet() {
         scan: scan_of(&app),
         partial: std::sync::Arc::new(partial),
     });
+    go(&mut app, '1');
     let lines = buffer_lines(&render(&app, 120, 36));
     assert!(
         lines[3].contains("partial · 0 / 100,000 sampled"),
@@ -1302,7 +1320,8 @@ fn rescanning(view: char) -> (App, ConnId, ScanId) {
     go(&mut app, view);
     press(&mut app, "j");
     let id = app.session.as_ref().unwrap().id;
-    let effects = app.handle_key(ch('r'));
+    app.handle_key(ch('r'));
+    let effects = app.handle_key(key(KeyCode::Enter));
     let [Effect::Connect { scan, .. }] = effects[..] else {
         panic!("unexpected effects {effects:?}");
     };
@@ -1325,8 +1344,8 @@ fn rescanning(view: char) -> (App, ConnId, ScanId) {
     (app, id, scan)
 }
 
-const RESCANNING: &str = "rescanning · previous results";
-const RESCAN_FAILED: &str = "rescan failed · previous results";
+const RESCANNING: &str = "analyzing · previous results";
+const RESCAN_FAILED: &str = "analysis failed · previous results";
 
 #[test]
 fn patterns_rescanning_shows_previous_results() {
@@ -1334,8 +1353,8 @@ fn patterns_rescanning_shows_previous_results() {
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
     assert!(lines[3].contains(RESCANNING), "{}", lines[3]);
-    // The header says a scan runs; the Δ column of the old report stays.
-    assert!(lines[0].contains("scanning"), "{}", lines[0]);
+    // The header says an analysis runs; the Δ column of the old report stays.
+    assert!(lines[0].contains("analyzing"), "{}", lines[0]);
     assert!(lines[4].contains('Δ'), "{}", lines[4]);
     insta::assert_snapshot!(t.backend());
 }
@@ -1371,6 +1390,7 @@ fn every_view_marks_previous_results_until_the_rescans_first_partial() {
     set_history(&mut app2, id2, None);
     go(&mut app2, '3');
     app2.handle_key(ch('r'));
+    app2.handle_key(key(KeyCode::Enter));
     for view in ['3', '4'] {
         go(&mut app2, view);
         assert!(top(&app2, 120).contains(RESCANNING), "view {view}");
@@ -1381,7 +1401,7 @@ fn every_view_marks_previous_results_until_the_rescans_first_partial() {
         scan,
         partial: fixtures::partial(true),
     });
-    app.handle_key(ch('1'));
+    app.handle_key(ch('2'));
     let line = top(&app, 120);
     assert!(line.contains("partial · 3,200 / 100,000 sampled"), "{line}");
     assert!(!line.contains("previous"), "{line}");
@@ -1419,11 +1439,11 @@ fn patterns_rescan_failed_keeps_previous_results_marked() {
 #[test]
 fn help_over_patterns_80x24() {
     let mut app = scanned_with_history(true);
-    press(&mut app, "1j?");
+    press(&mut app, "2j?");
     let t = render(&app, 80, 24);
     let text = buffer_lines(&t).join("\n");
-    assert!(text.contains("Keys · Patterns"));
-    assert!(text.contains("? or esc closes"));
+    assert!(text.contains("Help · Browse › Keys"));
+    assert!(text.contains("esc closes"));
     insta::assert_snapshot!(t.backend());
 }
 
@@ -1433,7 +1453,7 @@ fn help_over_connections_120x36() {
     press(&mut app, "0?");
     let t = render(&app, 120, 36);
     let text = buffer_lines(&t).join("\n");
-    assert!(text.contains("Keys · Connections"));
+    assert!(text.contains("Help · Connections"));
     assert!(text.contains("Look for Docker containers again"));
     insta::assert_snapshot!(t.backend());
 }
@@ -1442,12 +1462,14 @@ fn help_over_connections_120x36() {
 fn help_overlay_on_every_view_and_size_does_not_panic() {
     let mut app = scanned_with_history(true);
     for screen in Screen::ALL {
-        show(&mut app, screen);
+        if !show(&mut app, screen) {
+            continue;
+        }
         press(&mut app, "?");
         for (w, h) in [(80, 24), (40, 12), (20, 5), (1, 1), (200, 60)] {
             render(&app, w, h);
         }
-        let title = format!("Keys · {}", screen.title());
+        let title = format!("Help · {}", screen.title());
         assert!(
             buffer_lines(&render(&app, 80, 24))
                 .join("\n")
@@ -1505,7 +1527,7 @@ fn list_rows_is_what_every_list_view_draws() {
             go(&mut app, view);
             let lines = buffer_lines(&render(&app, w, h));
             // The tab bar's panel row takes one on Analysis (`App::page` knows).
-            let panel_row = usize::from(!app.view.panels().is_empty());
+            let panel_row = usize::from(app.area.has_panels());
             assert_eq!(
                 drawn_list_rows(&lines),
                 rows.saturating_sub(panel_row),
@@ -1513,8 +1535,8 @@ fn list_rows_is_what_every_list_view_draws() {
             );
         }
     }
-    // 80x24 shows 7 rows. Too small for any row: 0, and PgDn still moves one.
-    assert_eq!(ui::list_rows(ratatui::layout::Rect::new(0, 0, 80, 24)), 7);
+    // 80x24 shows 8 rows. Too small for any row: 0, and PgDn still moves one.
+    assert_eq!(ui::list_rows(ratatui::layout::Rect::new(0, 0, 80, 24)), 8);
     for h in [0, 1, 10, 16] {
         assert_eq!(
             ui::list_rows(ratatui::layout::Rect::new(0, 0, 80, h)),
@@ -1526,20 +1548,20 @@ fn list_rows_is_what_every_list_view_draws() {
 
 #[test]
 fn page_down_from_the_top_selects_the_row_below_the_screen() {
-    // With the page from the runtime's maths, PgDn from the top of the TTL list at
-    // 80x24 (6 rows below the tab bar's panel row) selects row 6: the list scrolls one
-    // row and the selection is the bottom row on screen.
+    // With the page from the runtime's maths, PgDn from the top of the Expiry list at
+    // 80x24 (7 rows below the sub-tab row) selects row 7: the list scrolls one row and
+    // the selection is the bottom row on screen.
     let mut app = scanned_with_history(true);
     go(&mut app, '2');
     app.set_list_rows(ui::list_rows(ratatui::layout::Rect::new(0, 0, 80, 24)));
     app.handle_key(key(KeyCode::PageDown));
-    assert_eq!(app.sel.ttl, 6);
+    assert_eq!(app.sel.ttl, 7);
     let t = render(&app, 80, 24);
     let buf = t.backend().buffer();
     let selected: Vec<u16> = (0..24u16)
         .filter(|&y| buf[(2, y)].bg == super::ui::style::sel().bg.unwrap())
         .collect();
-    // Rows 6-11 are the list (border at 4, header at 5); the last one is selected.
+    // Rows 5-11 are the list (border at 3, header at 4); the last one is selected.
     assert_eq!(selected, [11]);
 }
 
@@ -1549,16 +1571,17 @@ fn a_slow_keychain_during_a_rescan_shows_the_hint_in_the_header() {
     let t0 = Instant::now();
     let mut app = scanned_with_history(true);
     app.apply(Msg::TickAt(t0));
-    app.handle_key(ch('1'));
+    app.handle_key(ch('2'));
     app.handle_key(ch('r'));
+    app.handle_key(key(KeyCode::Enter));
     let text = |app: &App| buffer_lines(&render(app, 140, 40)).join("\n");
     assert!(!text(&app).contains("Waiting for the OS keychain"));
     app.apply(Msg::TickAt(t0 + Duration::from_secs(3)));
     let lines = buffer_lines(&render(&app, 140, 40));
-    assert!(lines[1].contains(super::app::KEYCHAIN_HINT), "{}", lines[1]);
+    assert!(lines[0].contains(super::app::KEYCHAIN_HINT), "{}", lines[0]);
     // The previous results stay in the body.
     assert!(
-        lines[3].contains("rescanning · previous results"),
+        lines[3].contains("analyzing · previous results"),
         "{}",
         lines[3]
     );
@@ -1579,8 +1602,9 @@ fn tab_bar_with_panels_at_80_columns() {
     let mut app = scanned(true);
     show(&mut app, Screen::BigKeys);
     let header = header_text(&app, 80);
-    // Below 100 columns the views not on screen show only their digit.
-    assert!(!header.contains("Server"), "{header}");
+    // The areas, and Analyze's panels under them.
+    assert!(header.contains("3 Analyze"), "{header}");
+    assert!(header.contains("Big keys"), "{header}");
     insta::assert_snapshot!(header);
 }
 
@@ -1591,12 +1615,12 @@ fn tab_bar_with_panels_at_120_columns() {
     let header = header_text(&app, 120);
     for name in [
         "Connections",
-        "Patterns",
-        "Analysis",
+        "Overview",
+        "Browse",
+        "Analyze",
         "Server",
-        "Streams",
         "Pub/Sub",
-        "Search",
+        "Slow log",
     ] {
         assert!(header.contains(name), "{name}: {header}");
     }
@@ -1608,27 +1632,26 @@ fn tab_bar_with_panels_at_120_columns() {
         colour_at(&t, "Slow log", "C", 0),
         style::title().fg.unwrap()
     );
-    assert_eq!(colour_at(&t, "Slow log", "O", 0), style::DIM);
+    assert_eq!(colour_at(&t, "Slow log", "M", 0), style::DIM);
 }
 
 #[test]
 fn views_without_panels_have_no_panel_row() {
     let mut app = scanned(true);
+    for screen in [Screen::Connections, Screen::Overview, Screen::PubSub] {
+        show(&mut app, screen);
+        let lines = buffer_lines(&render(&app, 120, 24));
+        assert_eq!(body_top(&lines), 2, "{screen:?}");
+    }
     for screen in [
-        Screen::Connections,
         Screen::Patterns,
         Screen::Streams,
-        Screen::PubSub,
-        Screen::Search,
+        Screen::Ttl,
+        Screen::Clients,
     ] {
         show(&mut app, screen);
         let lines = buffer_lines(&render(&app, 120, 24));
         assert_eq!(body_top(&lines), 3, "{screen:?}");
-    }
-    for screen in [Screen::Ttl, Screen::Overview] {
-        show(&mut app, screen);
-        let lines = buffer_lines(&render(&app, 120, 24));
-        assert_eq!(body_top(&lines), 4, "{screen:?}");
     }
 }
 
@@ -1663,7 +1686,7 @@ fn header_says_read_only_on_prod_by_default() {
     insta::assert_snapshot!(header);
     let t = render(&app, 120, 24);
     assert_eq!(
-        colour_at(&t, "read-only", "r", 70),
+        colour_at(&t, "read-only", "r", 20),
         crate::tui::ui::style::AMBER
     );
 }
@@ -1676,7 +1699,7 @@ fn header_says_writes_on_outside_prod() {
     insta::assert_snapshot!(header);
     let t = render(&app, 120, 24);
     assert_eq!(
-        colour_at(&t, "writes on", "w", 70),
+        colour_at(&t, "writes on", "w", 20),
         crate::tui::ui::style::RED
     );
 }

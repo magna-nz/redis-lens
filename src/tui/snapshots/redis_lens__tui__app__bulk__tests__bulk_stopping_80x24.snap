@@ -1,10 +1,11 @@
 ---
 source: src/tui/bulk.rs
+assertion_line: 1669
 expression: t.backend()
 ---
-" redis-lens 0.1.0    LOCAL   prod-cache-01  prod-cache-01.int…  writes on       "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
-"  0   1 Patterns   2   3   4   5   6                                            "
+" prod-cache-01   LOCAL   writes on   15G / 24G             ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"    Keys  ·  Streams  ·  Search                                                 "
 "┌─ Patterns ────────────────────────────────── 11 patterns · sorted by memory ─┐"
 "│ PATTERN         TYPE       KEYS   MEMORY▼     %      AVG  NO TTL  VERDICT    │"
 "│   session:{uui… string    1.84M     6.1G    46%     3.5K      0%  ok         │"

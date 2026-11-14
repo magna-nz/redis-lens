@@ -1433,7 +1433,10 @@ mod tests {
         app.handle_key(ch('?'));
         app.handle_key(ch(':'));
         assert!(!app.views.cmdline.open && app.help);
+        // esc clears what is typed into the help, then closes it; `a` is on Connections.
         app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(ch('0'));
         app.handle_key(ch('a'));
         app.handle_key(ch(':'));
         assert!(!app.views.cmdline.open);

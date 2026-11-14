@@ -1,10 +1,10 @@
 ---
 source: src/tui/snapshot_tests.rs
+assertion_line: 441
 expression: t.backend()
 ---
-" redis-lens 0.1.0   not connected                                               "
-" Pick a connection and press enter to scan it.                                  "
-"  0 Connections   1   2   3   4   5   6                                         "
+" redis-lens 0.1.0   not connected                 pick a connection, then enter "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
 "┌─ Connections ────────────────────────────────── 3 saved · 0 found in Docker ─┐"
 "│   NAME           ENV     ENDPOINT    AUTH     WRITES    STATUS           MEM │"
 "│ SAVED                                                                        │"
@@ -13,6 +13,7 @@ expression: t.backend()
 "│   local-6379      LOCAL  localhost:6…none     on        ○ not open         — │"
 "│ DOCKER · searching…                                                          │"
 "│ + Add connection    paste a redis:// URI or a StackExchange.Redis string     │"
+"│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "┌─ prod-cache-01 ─────────────────────────────────────── PROD · saved profile ─┐"
@@ -25,4 +26,4 @@ expression: t.backend()
 "│ Tags        team-a, eu                   – MEMORY STATS                      │"
 "│ Press enter to connect. redis-lens checks permissions before it scans.       │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   enter Connect   a Add   r Rescan Docker   0-6 View   ? Help   q Quit "
+" ↑↓ Move   enter Connect   a Add   w Writes   / Filter                    ? Help"

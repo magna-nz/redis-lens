@@ -1768,7 +1768,7 @@ mod tests {
             s.version = v.to_string();
         }
         testing::live_ready(&mut app);
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         let at = {
             let data = app.pattern_data().expect("patterns");
             let name = |i: usize| data.patterns[i].pattern.as_str();
@@ -2252,7 +2252,7 @@ mod tests {
         let items = Items::Hash(vec![field("a", &long, None), field("b", "x", None)]);
         testing::reply(&mut app, id, page(Some("hash"), items, None));
         testing::render(&app, 80, 24);
-        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Right));
         assert_eq!(app.views.value.focus, Focus::Value);
         app.handle_key(key(KeyCode::End));
         let bottom = app.views.value.scroll;
@@ -2261,7 +2261,7 @@ mod tests {
         assert_eq!(app.views.value.scroll, bottom - 1);
         // The selection stays while the value scrolls.
         assert_eq!(app.views.value.selected(), 0);
-        app.handle_key(key(KeyCode::BackTab));
+        app.handle_key(key(KeyCode::Left));
         app.handle_key(ch('j'));
         assert_eq!((app.views.value.selected(), app.views.value.scroll), (1, 0));
     }
@@ -2270,8 +2270,8 @@ mod tests {
     fn esc_goes_back_and_the_detail_stays_open_across_views() {
         let (mut app, id, _) = open(cart());
         testing::reply(&mut app, id, page(Some("hash"), fields(), None));
-        app.handle_key(ch('2'));
-        let effects = app.handle_key(ch('1'));
+        app.handle_key(ch('0'));
+        let effects = app.handle_key(ch('2'));
         assert_eq!(app.screen(), Screen::KeyDetail);
         assert!(value_requests(&effects).is_empty());
         app.handle_key(key(KeyCode::Esc));
@@ -2298,7 +2298,7 @@ mod tests {
         let all = text(&testing::render(&app, 80, 24));
         let last = all.lines().last().unwrap();
         assert!(
-            last.contains("tab Value") && last.contains("f Format") && last.contains("esc Back"),
+            last.contains("→ Value") && last.contains("f Format") && last.contains("esc Back"),
             "{last}"
         );
     }

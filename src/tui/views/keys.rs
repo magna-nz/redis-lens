@@ -804,7 +804,7 @@ mod tests {
     fn open(pattern: &str) -> (App, Vec<Effect>) {
         let mut app = testing::scanned();
         let mut out = testing::live_ready(&mut app);
-        out.extend(app.handle_key(ch('1')));
+        out.extend(app.handle_key(ch('2')));
         let at = {
             let data = app.pattern_data().expect("patterns");
             let name = |i: usize| data.patterns[i].pattern.as_str();

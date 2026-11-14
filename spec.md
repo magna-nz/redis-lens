@@ -111,9 +111,10 @@ A panel of 2 Analysis, after Expiry.
 
 | Keys | Action |
 |---|---|
-| `0-6` | Switch view, 0 Connections to 6 Search |
-| `?` | Show or hide this key list |
-| `a` | Add a connection |
+| `0` | Connections, the home screen |
+| `1` `2` `3` `4` `5` | Overview, Browse, Analyze, Server, Pub/Sub |
+| `v` | Show more columns and details, or fewer again |
+| `?` | Help here; type to find any action |
 | `:` | Open the command line |
 | `b` | Switch the database (once connected) |
 | `q` `ctrl-c` | Quit |
@@ -125,217 +126,251 @@ A panel of 2 Analysis, after Expiry.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `enter` | Connect and scan |
+| `enter` | Connect: reads the server's own figures, no keys |
+| `a` | Add a connection |
+| `w` | Turn writes on or off for the selected profile |
 | `/` | Filter the profiles by name or tag |
 | `esc` | Clear the filter |
 | `r` | Look for Docker containers again |
-| `w` | Turn writes on or off for the selected profile |
 
-#### Patterns
+#### Overview
+
+| Keys | Action |
+|---|---|
+| `r` | Analyze the keys: Quick (10,000) or Deep (100,000) |
+| `↑↓` `j` `k` | Move the selection |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `enter` | Go to the selected finding's panel |
+| `esc` | Stop a running analysis; drops what it sampled |
+| `p` | Pause or resume the live figures |
+| `+` `-` | Poll the live figures more or less often, 1 to 60 s |
+| `[` `]` | Pick the previous or next node (cluster only) |
+
+#### Browse › Keys
 
 | Keys | Action |
 |---|---|
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `→` `←` `l` `h` | Expand or collapse the selected group |
-| `enter` | Fold a group, or list a pattern's keys |
+| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `→` `l` `enter` | Open a pattern's keys, or expand a group and go in |
+| `←` `h` | Collapse a group, or go up to it |
 | `/` | Filter patterns by name |
 | `esc` | Clear the filter, or show all nodes again |
 | `o` | Sort by memory, keys, avg size, no-TTL % or name |
 | `y` | Copy the selected pattern to the clipboard |
 | `Y` | Copy a redis-cli --scan command for the pattern |
-| `r` | Scan again, keeping old results meanwhile |
-| `s` | Save a scan snapshot file |
-| `x` | Set a TTL on every key of the pattern |
-| `D` | Delete every key of the pattern |
+| `r` | Analyze again (Quick or Deep); old results stay |
+| `s` | Save a snapshot of the analysis |
+| `x` | Set a TTL on every key of the pattern (writes) |
+| `D` | Delete every key of the pattern (writes) |
 
-#### Patterns · key list
+#### Browse › Keys › a pattern's keys
 
 | Keys | Action |
 |---|---|
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `→` `l` `enter` | Show the selected key's value |
+| `←` `h` `esc` | Clear the filters first, then back to the patterns |
 | `/` | Filter the loaded keys by name |
 | `o` | Sort the loaded keys |
 | `t` | Show one type of the loaded keys |
 | `n` | Load 1,000 more keys |
-| `enter` | Show the selected key and its value |
 | `y` | Copy the selected key name to the clipboard |
-| `esc` | Clear the filters, or go back to Patterns |
-| `N` | Add a key |
+| `N` | Add a key (writes) |
 
-#### Patterns · key detail
+#### Browse › Keys › a key's value
 
 | Keys | Action |
 |---|---|
 | `↑↓` `j` `k` | Move the selection, or scroll the value |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Move between the items and the value |
+| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `→` `l` | Move into the value pane |
+| `←` `h` `esc` | Back to the items, then to the key list |
 | `f` | Show the value as text, hex, JSON or MessagePack |
 | `n` | Load the next 100 items |
 | `y` | Copy the selected value as shown to the clipboard |
-| `esc` | Go back to the key list |
-| `e` | Edit the selected field, element or value |
-| `+` | Add a field, element or member |
-| `t` | Set or remove the TTL |
-| `R` | Rename the key (never overwrites one) |
-| `d` | Delete the selected field, element or member |
-| `D` | Delete the key |
+| `e` | Edit the selected field, element or value (writes) |
+| `+` | Add a field, element or member (writes) |
+| `t` | Set or remove the TTL (writes) |
+| `R` | Rename the key, never over another (writes) |
+| `d` | Delete the selected field, element or member (writes) |
+| `D` | Delete the key (writes) |
 
-#### Analysis · TTL
+#### Browse › Streams
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection, or scroll the value |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `→` `l` | Into the right pane: the details or an entry's value |
+| `←` `h` | Back to the left pane, or close the entries or result |
+| `enter` | List the selected stream's entries |
+| `n` | Load 100 more entries |
+| `f` | Show the value as text, hex, JSON or MessagePack |
+| `y` | Copy the selected value as shown to the clipboard |
+| `esc` | Close the entries, or back to the list |
+| `p` | Pause or resume polling |
+| `r` | Refresh this panel now, or read the entries again |
+| `c` | Claim pending entries for another consumer (writes) |
+| `A` | Acknowledge the selected pending entry (writes) |
+| `X` | Trim the stream (writes) |
+
+#### Browse › Search
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection, or scroll the text |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `→` `l` | Into the right pane: the details or a result's value |
+| `←` `h` | Back to the left pane, or close the entries or result |
+| `/` | Run a query on the selected index |
+| `enter` | Open the selected result |
+| `e` | Explain the query |
+| `P` | Profile the query |
+| `f` | Show the value as text, hex, JSON or MessagePack |
+| `y` | Copy the selected value as shown to the clipboard |
+| `esc` | Back to the indexes and results |
+| `r` | Refresh this panel now |
+| `C` | Create an index (writes) |
+| `D` | Drop the selected index, its documents stay (writes) |
+| `[` `]` | Pick the previous or next node (cluster only) |
+
+#### Analyze › Big keys
 
 | Keys | Action |
 |---|---|
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel |
+| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `y` | Copy the selected key name to the clipboard |
+| `r` | Analyze again (Quick or Deep); old results stay |
+| `s` | Save a snapshot of the analysis |
+
+#### Analyze › Expiry
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move the selection |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `→` `l` `enter` | Expiry forecast: the memory TTLs free over time |
 | `y` | Copy the selected pattern to the clipboard |
 | `Y` | Copy a redis-cli --scan command for the pattern |
-| `r` | Scan again, keeping old results meanwhile |
-| `s` | Save a scan snapshot file |
+| `r` | Analyze again (Quick or Deep); old results stay |
+| `s` | Save a snapshot of the analysis |
 
-#### Analysis · Diff
+#### Analyze › Expiry › forecast
+
+| Keys | Action |
+|---|---|
+| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `←` `h` `esc` | Back to the patterns ranked by TTL risk |
+| `r` | Analyze again (Quick or Deep); old results stay |
+| `s` | Save a snapshot of the analysis |
+
+#### Analyze › Changes
 
 | Keys | Action |
 |---|---|
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel |
+| `tab` `shift-tab` | Next or previous panel, nothing else |
 | `y` | Copy the selected pattern to the clipboard |
 | `Y` | Copy a redis-cli --scan command for the pattern |
-| `r` | Scan again, keeping old results meanwhile |
-| `s` | Save a scan snapshot file |
+| `r` | Analyze again (Quick or Deep); old results stay |
+| `s` | Save a snapshot of the analysis |
 
-#### Analysis · Hot keys
+#### Analyze › Hot keys
 
 | Keys | Action |
 |---|---|
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel |
+| `tab` `shift-tab` | Next or previous panel, nothing else |
 | `y` | Copy the selected key name to the clipboard |
 | `Y` | Copy a redis-cli --scan command for the pattern |
-| `r` | Scan again, keeping old results meanwhile |
-| `s` | Save a scan snapshot file |
+| `r` | Analyze again (Quick or Deep); old results stay |
+| `s` | Save a snapshot of the analysis |
 
-#### Analysis · Big keys
-
-| Keys | Action |
-|---|---|
-| `↑↓` `j` `k` | Move the selection |
-| `PgUp` `PgDn` | Move one page |
-| `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel |
-| `y` | Copy the selected key name to the clipboard |
-| `r` | Scan again, keeping old results meanwhile |
-| `s` | Save a scan snapshot file |
-
-#### Analysis · Expiry
-
-| Keys | Action |
-|---|---|
-| `tab` `shift-tab` | Next or previous panel |
-| `r` | Scan again, keeping old results meanwhile |
-| `s` | Save a scan snapshot file |
-
-#### Analysis · Nodes
+#### Analyze › Nodes
 
 | Keys | Action |
 |---|---|
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel |
-| `enter` | Show the selected node's patterns on 1 Patterns |
-| `r` | Scan again, keeping old results meanwhile |
-| `s` | Save a scan snapshot file |
+| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `enter` | Only this node's patterns in Browse › Keys |
+| `r` | Analyze again (Quick or Deep); old results stay |
+| `s` | Save a snapshot of the analysis |
 
-#### Analysis · Slots
+#### Analyze › Slots
 
 | Keys | Action |
 |---|---|
 | `↑↓` `j` `k` | Move through the hottest slots |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel |
-| `o` | Order the hottest slots by keys, CPU, network in or network out |
-| `r` | Read CLUSTER SLOT-STATS again on every node |
+| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `o` | Sort the hottest slots by keys, CPU, net in or out |
+| `r` | Read the slot stats again on every node |
 
-#### Server · Overview
-
-| Keys | Action |
-|---|---|
-| `tab` `shift-tab` | Next or previous panel |
-| `p` | Pause or resume polling |
-| `+` `-` | Poll more or less often, 1 to 60 s |
-| `r` | Refresh this panel now |
-| `[` `]` | Pick the previous or next node (cluster only) |
-
-#### Server · Clients
+#### Server › Clients
 
 | Keys | Action |
 |---|---|
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel |
+| `tab` `shift-tab` | Next or previous panel, nothing else |
 | `enter` | List the selected group's connections |
 | `esc` | Back to the groups |
 | `p` | Pause or resume polling |
 | `r` | Refresh this panel now |
-| `K` | Kill the selected connection |
+| `K` | Kill the selected connection (writes) |
 | `[` `]` | Pick the previous or next node (cluster only) |
 
-#### Server · Slow log
+#### Server › Slow log
 
 | Keys | Action |
 |---|---|
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel |
+| `tab` `shift-tab` | Next or previous panel, nothing else |
 | `p` | Pause or resume polling |
 | `r` | Refresh this panel now |
-| `c` | Change the slow log threshold or length |
-| `R` | Reset the slow log |
+| `c` | Change the slow log threshold or length (writes) |
+| `R` | Reset the slow log (writes) |
 | `[` `]` | Pick the previous or next node (cluster only) |
 
-#### Server · Monitor
+#### Server › Monitor
 
 | Keys | Action |
 |---|---|
 | `↑↓` `j` `k` | Scroll the lines |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel |
-| `enter` | Start MONITOR after asking; it stops after 30 s or 10,000 lines |
+| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `enter` | Start MONITOR (asks; stops at 30 s or 10,000 lines) |
 | `esc` | Stop MONITOR now |
 | `[` `]` | Pick the previous or next node (cluster only) |
-
-#### Streams
-
-| Keys | Action |
-|---|---|
-| `↑↓` `j` `k` | Move the selection, or scroll the value |
-| `PgUp` `PgDn` | Move one page |
-| `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Move between the list and the details, or the entries and the value |
-| `enter` | List the selected stream's entries |
-| `n` | Load 100 more entries |
-| `f` | Show the value as text, hex, JSON or MessagePack |
-| `y` | Copy the selected value as shown to the clipboard |
-| `esc` | Go back to the stream list |
-| `p` | Pause or resume polling |
-| `r` | Refresh this panel now, or read the entries again |
-| `c` | Claim a consumer's pending entries for another consumer |
-| `A` | Acknowledge the selected pending entry |
-| `X` | Trim the stream |
 
 #### Pub/Sub
 
@@ -353,27 +388,7 @@ A panel of 2 Analysis, after Expiry.
 | `esc` | Clear the filter, or stop the tail |
 | `p` | Pause or resume polling |
 | `r` | Refresh this panel now |
-| `P` | Publish a message (SPUBLISH on a shard channel) |
-| `[` `]` | Pick the previous or next node (cluster only) |
-
-#### Search
-
-| Keys | Action |
-|---|---|
-| `↑↓` `j` `k` | Move the selection, or scroll the text |
-| `PgUp` `PgDn` | Move one page |
-| `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Move between the list and the details, or the fields and the value |
-| `/` | Run a query on the selected index |
-| `enter` | Open the selected result |
-| `e` | Explain the query |
-| `P` | Profile the query |
-| `f` | Show the value as text, hex, JSON or MessagePack |
-| `y` | Copy the selected value as shown to the clipboard |
-| `esc` | Go back to the indexes and results |
-| `r` | Refresh this panel now |
-| `C` | Create an index |
-| `D` | Drop the selected index (its documents stay) |
+| `P` | Publish; SPUBLISH on shard channels (writes) |
 | `[` `]` | Pick the previous or next node (cluster only) |
 
 #### Command line panel · keys

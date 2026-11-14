@@ -180,6 +180,8 @@ fn scanned(report: ScanReport, perms: PermissionReport) -> App {
         scan: scan_of(&app),
         report: Box::new(report),
     });
+    // A connect lands on Overview; these look at Browse › Keys.
+    super::app::views::testing::show(&mut app, super::app::Screen::Patterns);
     app
 }
 
@@ -220,19 +222,26 @@ fn connecting_and_scanning_panels_show_the_provider_notice() {
             c.status = PermStatus::Denied("ERR unknown command 'MEMORY'".into());
         }
     }
-    app.apply(Msg::Connected {
-        id,
-        scan: scan_of(&app),
-        server: Some(fixtures::server()),
-        perms,
-        target: ScanTarget::Primary,
-    });
+    let connected = |app: &mut App, perms: PermissionReport| {
+        app.apply(Msg::Connected {
+            id,
+            scan: scan_of(app),
+            server: Some(fixtures::server()),
+            perms,
+            target: ScanTarget::Primary,
+        })
+    };
+    connected(&mut app, perms.clone());
+    // `r`, `enter`: a Quick analysis, so the Keys section shows its progress.
+    app.handle_key(ch('r'));
+    app.handle_key(key(KeyCode::Enter));
+    connected(&mut app, perms);
     app.apply(Msg::ScanProgress {
         id,
         scan: scan_of(&app),
         progress: ScanProgress {
-            sampled: 12_400,
-            target: 100_000,
+            sampled: 1_240,
+            target: 10_000,
             done: false,
         },
     });

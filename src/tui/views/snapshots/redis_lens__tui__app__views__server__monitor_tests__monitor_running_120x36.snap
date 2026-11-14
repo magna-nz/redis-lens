@@ -1,12 +1,11 @@
 ---
 source: src/tui/views/server.rs
-assertion_line: 2887
+assertion_line: 3492
 expression: "testing::render(&app, 120, 36).backend()"
 ---
-" redis-lens 0.1.0    STAGE   prod-cache-01  prod-cache-01.internal:6380  writes on         ● scan complete 14:02:11 UTC "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                           "
-"  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
-"    Overview  ·  Clients  ·  Slow log  ·  Monitor                                                        tab next panel "
+" prod-cache-01   STAGE   writes on   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys          ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
+"    Clients  ·  Slow log  ·  Monitor                                                                                    "
 "┌─ Monitor ───────────────────────────────────────────────────────────────────── running · 10 lines · 23 s left · UTC ─┐"
 "│ esc stops it.                                                                                                        │"
 "│ TIME         DB  CLIENT                COMMAND                                                                       │"
@@ -20,6 +19,7 @@ expression: "testing::render(&app, 120, 36).backend()"
 "│ 13:04:05.008 0   10.0.1.5:50001        PING                                                                          │"
 "│ 13:04:05.009 0   10.0.1.5:50002        CONFIG SET requirepass ***                                                    │"
 "│ 13:04:06.500 0   lua                   MSET a                                                                        │"
+"│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"

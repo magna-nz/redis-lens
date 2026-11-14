@@ -327,7 +327,8 @@ mod tests {
     #[test]
     fn b_works_on_every_screen_but_not_in_a_text_input() {
         for screen in Screen::ALL {
-            if screen == Screen::Connections {
+            // Nodes and Slots are not screens of the standalone fixture server.
+            if matches!(screen, Screen::Connections | Screen::Nodes | Screen::Slots) {
                 continue;
             }
             let (mut app, _) = testing::app_on(screen);
@@ -413,16 +414,22 @@ mod tests {
         assert_eq!(notice(&app), OFF_NOT_READY);
         assert!(app.dbs.is_none());
 
-        // Connected, scanning.
-        let (id, scan) = ids(&app);
-        app.apply(Msg::Connected {
-            id,
-            scan,
-            server: None,
-            perms: fixtures::perms_with_probes(),
-            target: crate::conn::ScanTarget::Primary,
-        });
-        testing::live_ready(&mut app);
+        // Connected, analyzing (`r`, `enter`).
+        let connected = |app: &mut App| {
+            let (id, scan) = ids(app);
+            app.apply(Msg::Connected {
+                id,
+                scan,
+                server: None,
+                perms: fixtures::perms_with_probes(),
+                target: crate::conn::ScanTarget::Primary,
+            });
+            testing::live_ready(app);
+        };
+        connected(&mut app);
+        app.handle_key(ch('r'));
+        app.handle_key(key(KeyCode::Enter));
+        connected(&mut app);
         assert!(app.handle_key(ch('b')).is_empty());
         assert_eq!(notice(&app), OFF_SCANNING);
         assert!(app.dbs.is_none());
@@ -496,7 +503,8 @@ mod tests {
         let (scan, _) = connect_of(&effects);
         finish(&mut app, scan);
         app.handle_key(ch('1'));
-        let effects = app.handle_key(ch('r'));
+        app.handle_key(ch('r'));
+        let effects = app.handle_key(key(KeyCode::Enter));
         assert_eq!(connect_of(&effects).1.db, 3);
     }
 

@@ -1,10 +1,11 @@
 ---
 source: src/tui/snapshot_tests_cluster.rs
+assertion_line: 996
 expression: t.backend()
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  cluster · 3 shards  read-only        "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
-"  0   1 Patterns   2   3   4   5   6                                            "
+" prod-cache-01   PROD   read-only   cluster · 3 shards     ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"    Keys  ·  Streams  ·  Search                                                 "
 "┌─ Patterns › session:{uuid} ─── SCAN MATCH session:* · 3 of 3 nodes · 5 loa… ─┐"
 "│ KEY                   NODE            TYPE         TTL    SIZE▼  LENGTH  LFU │"
 "│ user:1:cart           10.0.1.11:6379  hash        none    512B        4    — │"

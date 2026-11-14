@@ -1,11 +1,11 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 431
+assertion_line: 610
 expression: t.backend()
 ---
-" redis-lens 0.1.0    STAGE   staging-cache  staging-cache.internal:6379  writes on                           ⠋ scanning "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   ⠋ Sampled 3,200 / 100,000                                   "
-"  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
+" staging-cache   STAGE   writes on   staging-cache.internal:6379 · Redis 7.4.2 · 15G / 24G · 7.92M keys  ⠋ analyzing 3% "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
+"    Keys  ·  Streams  ·  Search                                                                                         "
 "┌─ Patterns ─────────────────────────────────────── partial · 3,200 / 100,000 sampled · 8 patterns · sorted by memory ─┐"
 "│ PATTERN                                   TYPE       KEYS   MEMORY▼ SHARE             %      AVG  NO TTL  VERDICT    │"
 "│   session:{uuid}                          string    1.84M     6.1G  ██████▌░░░░░░░  46%     3.5K      0%  ok         │"
@@ -38,4 +38,4 @@ expression: t.backend()
 "│ ✓ No TTL or size problems in the sample.                                                                             │"
 "│ $ redis-cli --scan --pattern "session:*"                                                                             │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   →← Fold   enter Open   / Filter   o Sort   0-6 View   ? Help   q Quit                                        "
+" ↑↓ Move   → Open   / Filter   r Analyze   tab Next panel                                              : Command  ? Help"

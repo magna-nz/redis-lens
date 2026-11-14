@@ -61,184 +61,294 @@ mod key_edits;
 
 use views::{Act, Ctx, LiveState, Owner, TailCmd, ViewState, Views};
 
-/// The seven views, switched with `0` to `6`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum View {
+/// The five areas and the home screen, switched with `0` to `5` (spec "Navigation").
+/// `6` does nothing any more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Area {
+    /// The home screen: the connection list.
     Connections,
-    Patterns,
-    Analysis,
+    /// The live figures and what the server knows about its keys ([`views::overview`]).
+    Overview,
+    /// Keys · Streams · Search.
+    Browse,
+    /// Big keys · Expiry · Changes · Hot keys, and Nodes · Slots on a cluster.
+    Analyze,
+    /// Clients · Slow log · Monitor.
     Server,
-    Streams,
     PubSub,
-    Search,
 }
 
-impl View {
-    pub const ALL: [View; 7] = [
-        View::Connections,
-        View::Patterns,
-        View::Analysis,
-        View::Server,
-        View::Streams,
-        View::PubSub,
-        View::Search,
+impl Area {
+    pub const ALL: [Area; 6] = [
+        Area::Connections,
+        Area::Overview,
+        Area::Browse,
+        Area::Analyze,
+        Area::Server,
+        Area::PubSub,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Connections => "Connections",
-            Self::Patterns => "Patterns",
-            Self::Analysis => "Analysis",
+            Self::Overview => "Overview",
+            Self::Browse => "Browse",
+            Self::Analyze => "Analyze",
             Self::Server => "Server",
-            Self::Streams => "Streams",
             Self::PubSub => "Pub/Sub",
-            Self::Search => "Search",
         }
     }
 
-    /// The key that switches to this view.
+    /// The key that switches to this area.
     pub fn digit(self) -> char {
         char::from(b'0' + self as u8)
     }
 
-    /// The panels `tab` and `shift-tab` cycle through, in tab-bar order. Empty for a
-    /// view without panels (Streams, Pub/Sub and Search pass `tab` to their view state).
-    pub fn panels(self) -> &'static [Screen] {
+    /// The area digit `c` switches to; `None` for any other key (`6` included).
+    pub fn of_digit(c: char) -> Option<Area> {
+        Self::ALL.into_iter().find(|a| a.digit() == c)
+    }
+
+    /// The panels (sub-tabs) `tab` and `shift-tab` cycle through, in the sub-tab row's
+    /// order. Empty for an area without panels. Nodes and Slots are panels of Analyze
+    /// only on a cluster (`cluster`).
+    pub fn panels(self, cluster: bool) -> &'static [Panel] {
         match self {
-            Self::Analysis => &[
-                Screen::Ttl,
-                Screen::Diff,
-                Screen::HotKeys,
-                Screen::BigKeys,
-                Screen::Expiry,
-                Screen::Nodes,
-                Screen::Slots,
+            Self::Browse => &[Panel::Keys, Panel::Streams, Panel::Search],
+            Self::Analyze if cluster => &[
+                Panel::BigKeys,
+                Panel::Expiry,
+                Panel::Changes,
+                Panel::HotKeys,
+                Panel::Nodes,
+                Panel::Slots,
             ],
-            Self::Server => &[
-                Screen::Overview,
-                Screen::Clients,
-                Screen::SlowLog,
-                Screen::Monitor,
+            Self::Analyze => &[
+                Panel::BigKeys,
+                Panel::Expiry,
+                Panel::Changes,
+                Panel::HotKeys,
             ],
+            Self::Server => &[Panel::Clients, Panel::SlowLog, Panel::Monitor],
             _ => &[],
+        }
+    }
+
+    /// True for the areas that have a sub-tab row.
+    pub fn has_panels(self) -> bool {
+        !self.panels(false).is_empty()
+    }
+}
+
+/// A panel of an area: one sub-tab. A panel shows one [`Screen`] at a time; Browse ›
+/// Keys goes deeper (patterns, a pattern's keys, a key's value) and Analyze › Expiry
+/// has the forecast one level down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Panel {
+    Keys,
+    Streams,
+    Search,
+    BigKeys,
+    Expiry,
+    Changes,
+    HotKeys,
+    Nodes,
+    Slots,
+    Clients,
+    SlowLog,
+    Monitor,
+}
+
+impl Panel {
+    /// The area this panel belongs to.
+    pub fn area(self) -> Area {
+        match self {
+            Self::Keys | Self::Streams | Self::Search => Area::Browse,
+            Self::BigKeys
+            | Self::Expiry
+            | Self::Changes
+            | Self::HotKeys
+            | Self::Nodes
+            | Self::Slots => Area::Analyze,
+            Self::Clients | Self::SlowLog | Self::Monitor => Area::Server,
+        }
+    }
+
+    /// The name in the sub-tab row.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Keys => "Keys",
+            Self::Streams => "Streams",
+            Self::Search => "Search",
+            Self::BigKeys => "Big keys",
+            Self::Expiry => "Expiry",
+            Self::Changes => "Changes",
+            Self::HotKeys => "Hot keys",
+            Self::Nodes => "Nodes",
+            Self::Slots => "Slots",
+            Self::Clients => "Clients",
+            Self::SlowLog => "Slow log",
+            Self::Monitor => "Monitor",
+        }
+    }
+
+    /// The screen the panel shows at its top level.
+    pub fn top(self) -> Screen {
+        match self {
+            Self::Keys => Screen::Patterns,
+            Self::Streams => Screen::Streams,
+            Self::Search => Screen::Search,
+            Self::BigKeys => Screen::BigKeys,
+            Self::Expiry => Screen::Ttl,
+            Self::Changes => Screen::Diff,
+            Self::HotKeys => Screen::HotKeys,
+            Self::Nodes => Screen::Nodes,
+            Self::Slots => Screen::Slots,
+            Self::Clients => Screen::Clients,
+            Self::SlowLog => Screen::SlowLog,
+            Self::Monitor => Screen::Monitor,
         }
     }
 }
 
-/// What is on screen: a view, one of its panels, or a drill-down level. Each has its
-/// own key table ([`super::keymap::for_screen`]).
+/// `v` on any screen: more columns and details, per area (spec "Navigation"). Off by
+/// default; kept while the app runs, also across connects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct More([bool; 6]);
+
+impl More {
+    /// Whether `area` shows more.
+    pub fn get(self, area: Area) -> bool {
+        self.0[area as usize]
+    }
+
+    pub fn toggle(&mut self, area: Area) {
+        self.0[area as usize] = !self.0[area as usize];
+    }
+}
+
+/// What is on screen: an area, one level of one of its panels. Each has its own key
+/// table ([`super::keymap::for_screen`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Connections,
+    /// 1 Overview. Its live figures are the Server view state's Overview poll.
+    Overview,
+    /// Browse › Keys: the pattern tree.
     Patterns,
-    /// The keys of one pattern, opened with `enter` on Patterns ([`views::keys`]).
+    /// Browse › Keys, `→` on a pattern: its keys ([`views::keys`]).
     KeyList,
-    /// One key's metadata and value, opened with `enter` on the key list
-    /// ([`views::value`]).
+    /// Browse › Keys, `→` on a key: its value ([`views::value`]).
     KeyDetail,
+    Streams,
+    Search,
+    BigKeys,
+    /// Analyze › Expiry: patterns ranked by TTL risk (the former TTL panel).
     Ttl,
+    /// Analyze › Expiry, `→`: the expiry forecast ([`views::analysis`]).
+    Expiry,
+    /// Analyze › Changes: the diff against the last snapshot.
     Diff,
     HotKeys,
-    BigKeys,
-    Expiry,
-    /// The shards of a cluster scan (empty on a standalone one).
+    /// The shards of a cluster scan (only on a cluster).
     Nodes,
     /// What each slot range holds, from `CLUSTER SLOT-STATS` ([`views::slots`]).
     Slots,
-    Overview,
     Clients,
     SlowLog,
     /// A time-limited `MONITOR` run ([`views::server`]).
     Monitor,
-    Streams,
     PubSub,
-    Search,
 }
 
 impl Screen {
     pub const ALL: [Screen; 18] = [
         Screen::Connections,
+        Screen::Overview,
         Screen::Patterns,
         Screen::KeyList,
         Screen::KeyDetail,
+        Screen::Streams,
+        Screen::Search,
+        Screen::BigKeys,
         Screen::Ttl,
+        Screen::Expiry,
         Screen::Diff,
         Screen::HotKeys,
-        Screen::BigKeys,
-        Screen::Expiry,
         Screen::Nodes,
         Screen::Slots,
-        Screen::Overview,
         Screen::Clients,
         Screen::SlowLog,
         Screen::Monitor,
-        Screen::Streams,
         Screen::PubSub,
-        Screen::Search,
     ];
 
-    /// The view this screen belongs to.
-    pub fn view(self) -> View {
+    /// The area this screen belongs to.
+    pub fn area(self) -> Area {
         match self {
-            Self::Connections => View::Connections,
-            Self::Patterns | Self::KeyList | Self::KeyDetail => View::Patterns,
-            Self::Ttl
-            | Self::Diff
-            | Self::HotKeys
-            | Self::BigKeys
-            | Self::Expiry
-            | Self::Nodes
-            | Self::Slots => View::Analysis,
-            Self::Overview | Self::Clients | Self::SlowLog | Self::Monitor => View::Server,
-            Self::Streams => View::Streams,
-            Self::PubSub => View::PubSub,
-            Self::Search => View::Search,
+            Self::Connections => Area::Connections,
+            Self::Overview => Area::Overview,
+            Self::PubSub => Area::PubSub,
+            other => other.panel().map_or(Area::Connections, Panel::area),
         }
     }
 
-    /// The panel's name in the tab bar's second row.
+    /// The panel this screen is a level of; `None` on an area without panels.
+    pub fn panel(self) -> Option<Panel> {
+        Some(match self {
+            Self::Patterns | Self::KeyList | Self::KeyDetail => Panel::Keys,
+            Self::Streams => Panel::Streams,
+            Self::Search => Panel::Search,
+            Self::BigKeys => Panel::BigKeys,
+            Self::Ttl | Self::Expiry => Panel::Expiry,
+            Self::Diff => Panel::Changes,
+            Self::HotKeys => Panel::HotKeys,
+            Self::Nodes => Panel::Nodes,
+            Self::Slots => Panel::Slots,
+            Self::Clients => Panel::Clients,
+            Self::SlowLog => Panel::SlowLog,
+            Self::Monitor => Panel::Monitor,
+            Self::Connections | Self::Overview | Self::PubSub => return None,
+        })
+    }
+
+    /// The panel's name, or the area's title on an area without panels.
     pub fn name(self) -> &'static str {
-        match self {
-            Self::KeyList => "Keys",
-            Self::KeyDetail => "Key",
-            Self::Ttl => "TTL",
-            Self::Diff => "Diff",
-            Self::HotKeys => "Hot keys",
-            Self::BigKeys => "Big keys",
-            Self::Expiry => "Expiry",
-            Self::Nodes => "Nodes",
-            Self::Slots => "Slots",
-            Self::Overview => "Overview",
-            Self::Clients => "Clients",
-            Self::SlowLog => "Slow log",
-            Self::Monitor => "Monitor",
-            other => other.view().title(),
+        match self.panel() {
+            Some(p) => p.name(),
+            None => self.area().title(),
         }
     }
 
-    /// The title of the help overlay and of this screen's section of the spec's key
-    /// table, e.g. `Analysis · TTL`.
+    /// The title of the `?` help and of this screen's section of the spec's key table,
+    /// e.g. `Analyze › Expiry`.
     pub fn title(self) -> &'static str {
         match self {
-            Self::KeyList => "Patterns · key list",
-            Self::KeyDetail => "Patterns · key detail",
-            Self::Ttl => "Analysis · TTL",
-            Self::Diff => "Analysis · Diff",
-            Self::HotKeys => "Analysis · Hot keys",
-            Self::BigKeys => "Analysis · Big keys",
-            Self::Expiry => "Analysis · Expiry",
-            Self::Nodes => "Analysis · Nodes",
-            Self::Slots => "Analysis · Slots",
-            Self::Overview => "Server · Overview",
-            Self::Clients => "Server · Clients",
-            Self::SlowLog => "Server · Slow log",
-            Self::Monitor => "Server · Monitor",
-            other => other.view().title(),
+            Self::Connections => "Connections",
+            Self::Overview => "Overview",
+            Self::Patterns => "Browse › Keys",
+            Self::KeyList => "Browse › Keys › a pattern's keys",
+            Self::KeyDetail => "Browse › Keys › a key's value",
+            Self::Streams => "Browse › Streams",
+            Self::Search => "Browse › Search",
+            Self::BigKeys => "Analyze › Big keys",
+            Self::Ttl => "Analyze › Expiry",
+            Self::Expiry => "Analyze › Expiry › forecast",
+            Self::Diff => "Analyze › Changes",
+            Self::HotKeys => "Analyze › Hot keys",
+            Self::Nodes => "Analyze › Nodes",
+            Self::Slots => "Analyze › Slots",
+            Self::Clients => "Server › Clients",
+            Self::SlowLog => "Server › Slow log",
+            Self::Monitor => "Server › Monitor",
+            Self::PubSub => "Pub/Sub",
         }
     }
 
     /// The view state that owns this screen, `None` for the screens `App` draws and
-    /// handles itself (Connections, Patterns, TTL, Diff, Hot keys and Nodes).
+    /// handles itself (Connections, Patterns, Expiry's ranking, Changes, Hot keys and
+    /// Nodes). Overview's live figures are the Server view state's: its poll runs while
+    /// Overview is on screen.
     pub fn owner(self) -> Option<Owner> {
         Some(match self {
             Self::Connections
@@ -260,23 +370,40 @@ impl Screen {
         })
     }
 
-    /// Screens that show the finished scan (and `r` rescans, `s` saves a snapshot):
-    /// Patterns and every Analysis panel.
+    /// Screens that show an analysis (and `s` saves a snapshot): Browse › Keys and every
+    /// Analyze panel but Slots.
     pub fn is_scan_view(self) -> bool {
-        matches!(self.view(), View::Patterns | View::Analysis)
-            && !matches!(self, Self::KeyList | Self::KeyDetail | Self::Slots)
+        matches!(
+            self,
+            Self::Patterns
+                | Self::BigKeys
+                | Self::Ttl
+                | Self::Expiry
+                | Self::Diff
+                | Self::HotKeys
+                | Self::Nodes
+        )
+    }
+
+    /// Screens where `r` opens "Analyze the keys?": Overview and the scan views.
+    pub fn analyzes(self) -> bool {
+        self == Self::Overview || self.is_scan_view()
     }
 
     /// Screens that work on the live connection (`r` refreshes the panel).
     pub fn is_live_view(self) -> bool {
-        self == Self::Slots
-            || matches!(
-                self.view(),
-                View::Server | View::Streams | View::PubSub | View::Search
-            )
+        matches!(
+            self,
+            Self::Slots
+                | Self::Clients
+                | Self::SlowLog
+                | Self::Monitor
+                | Self::Streams
+                | Self::PubSub
+                | Self::Search
+        )
     }
 }
-
 /// Stable id of a row in the Connections list.
 pub type ConnId = u64;
 
@@ -368,12 +495,21 @@ pub enum SecretSource {
 /// Work for the runtime. Effects are the only way the app reaches the outside world.
 #[derive(Debug)]
 pub enum Effect {
-    /// Connect, check permissions, then scan with the profile's default options.
+    /// Connect, check permissions and read the server's own figures (no key is read).
+    /// With `sample`, then analyze: scan with the profile's default options and
+    /// `ScanOptions::sample_limit` set to it (`r`, [`views::overview::Depth`]).
     Connect {
         id: ConnId,
         scan: ScanId,
         profile: Profile,
         secrets: SecretSource,
+        sample: Option<u64>,
+    },
+    /// Stop session `id`'s analysis run `scan` (`esc` while it runs): its scan task is
+    /// aborted and its live connection stays open. Nothing comes back.
+    CancelAnalysis {
+        id: ConnId,
+        scan: ScanId,
     },
     DiscoverDocker,
     /// Credentials to the keychain first, then the profile to the config file.
@@ -641,6 +777,9 @@ pub enum Msg {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Phase {
     Connecting,
+    /// Connected, and no analysis runs: the run read only the server's own figures.
+    Connected,
+    /// An analysis (a scan) runs.
     Scanning,
     Done,
     Failed(String),
@@ -701,6 +840,15 @@ pub struct Session {
     /// The picked node: an index into `nodes` (spec "Cluster live views (P4)"). 0 on a
     /// standalone server.
     pub picked: usize,
+    /// `Some` when this run analyzes the keys (`r`, then enter), with how many; `None`
+    /// for a connect, which reads no key.
+    pub analysis: Option<views::overview::Depth>,
+    /// When this run connected, in Unix seconds from [`App::set_wall_clock`]: the
+    /// header's `● connected 14:02`. `None` before, or without a clock (tests).
+    pub connected_at_unix: Option<i64>,
+    /// This run's analysis was stopped (`esc`): what it still sends about its scan is
+    /// ignored. Its live connection stays.
+    pub stopped: bool,
 }
 
 impl Session {
@@ -874,6 +1022,14 @@ pub struct ViewSel {
     pub nodes: usize,
 }
 
+/// What is typed into the `?` help, and the picked match ([`super::keymap::find`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HelpFind {
+    pub query: String,
+    /// Index into the matches of `query`.
+    pub sel: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub text: String,
@@ -926,11 +1082,22 @@ fn copy_checked(text: CopyText, tick: u64) -> (Notice, Option<Effect>) {
 }
 
 pub struct App {
-    pub view: View,
-    /// The shown panel of Analysis and of Server, as an index into [`View::panels`].
-    /// Each view keeps its own while you are elsewhere.
-    pub analysis_panel: usize,
-    pub server_panel: usize,
+    /// The area on screen.
+    pub area: Area,
+    /// The shown panel of Browse, Analyze and Server. Each area keeps its own while
+    /// you are elsewhere. Analyze's Nodes and Slots give way to Big keys when the
+    /// session is not a cluster.
+    pub browse_panel: Panel,
+    pub analyze_panel: Panel,
+    pub server_panel: Panel,
+    /// Analyze › Expiry shows the forecast (`→` on the ranking, `←` back).
+    pub expiry_forecast: bool,
+    /// `v`: more columns and details, per area. Views read it as [`Ctx::more`].
+    pub more: More,
+    /// Overview's own state: the selected finding.
+    pub overview: views::overview::OverviewState,
+    /// "Analyze the keys?" (`r`), while it is open. Every key goes to it.
+    pub analyze: Option<views::overview::AnalyzeDialog>,
     /// Saved profiles first, then Docker containers.
     pub entries: Vec<ConnEntry>,
     pub docker: DockerState,
@@ -946,8 +1113,13 @@ pub struct App {
     /// The view states of the screens `App` does not draw itself.
     pub views: Views,
     pub notice: Option<Notice>,
-    /// The `?` key overlay is open.
+    /// The `?` help is open.
     pub help: bool,
+    /// What is typed into the `?` help, and the picked match.
+    pub help_find: HelpFind,
+    /// The wall clock, Unix seconds, from [`App::set_wall_clock`]: only for the times
+    /// the header shows. The app never reads a clock itself.
+    wall: Option<i64>,
     pub tick: u64,
     /// List rows visible on screen, set by the runtime from the terminal size (see
     /// [`App::set_list_rows`]). PgUp and PgDn move this far.
@@ -1095,6 +1267,46 @@ fn list_move(key: &KeyEvent, cur: usize, len: usize, page: usize) -> Option<usiz
     })
 }
 
+/// The key event a key-table token stands for, for `?` to press: `None` for one it
+/// can't (none in the tables).
+pub fn key_of(token: &str) -> Option<KeyEvent> {
+    let plain = |c| KeyEvent::new(c, KeyModifiers::NONE);
+    Some(match token {
+        "↑↓" => plain(KeyCode::Down),
+        "→" => plain(KeyCode::Right),
+        "←" => plain(KeyCode::Left),
+        "PgUp" => plain(KeyCode::PageUp),
+        "PgDn" => plain(KeyCode::PageDown),
+        "Home" => plain(KeyCode::Home),
+        "End" => plain(KeyCode::End),
+        "enter" => plain(KeyCode::Enter),
+        "esc" => plain(KeyCode::Esc),
+        "tab" => plain(KeyCode::Tab),
+        "shift-tab" => KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        "space" => plain(KeyCode::Char(' ')),
+        "ctrl-c" => KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        "ctrl-l" => KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        "ctrl-u" => KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        t => {
+            let mut cs = t.chars();
+            match (cs.next(), cs.next()) {
+                (Some(c), None) => plain(KeyCode::Char(c)),
+                _ => return None,
+            }
+        }
+    })
+}
+
+/// `→` `l` `enter`: open, go one level deeper, or into the right pane.
+fn is_open(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Right | KeyCode::Enter) || plain_char(key) == Some('l')
+}
+
+/// `←` `h` `esc`: back one level, or to the left pane.
+fn is_back(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Left | KeyCode::Esc) || plain_char(key) == Some('h')
+}
+
 fn clean_paste(s: &str) -> String {
     s.chars().filter(|c| !matches!(c, '\r' | '\n')).collect()
 }
@@ -1102,9 +1314,14 @@ fn clean_paste(s: &str) -> String {
 impl App {
     pub fn new(profiles: Vec<Profile>) -> Self {
         let mut app = Self {
-            view: View::Connections,
-            analysis_panel: 0,
-            server_panel: 0,
+            area: Area::Connections,
+            browse_panel: Panel::Keys,
+            analyze_panel: Panel::BigKeys,
+            server_panel: Panel::Clients,
+            expiry_forecast: false,
+            more: More::default(),
+            overview: Default::default(),
+            analyze: None,
             entries: Vec::new(),
             docker: DockerState::Searching,
             conn_sel: ConnSel::Add,
@@ -1117,6 +1334,8 @@ impl App {
             views: Views::default(),
             notice: None,
             help: false,
+            help_find: HelpFind::default(),
+            wall: None,
             tick: 0,
             list_rows: 0,
             sel_since: 0,
@@ -1439,11 +1658,39 @@ impl App {
         self.list_rows = rows;
     }
 
-    /// How far PgUp and PgDn move: the visible list rows, at least one. On a view with
-    /// panels the tab bar's second row takes one of the rows `ui::list_rows` counts.
+    /// How far PgUp and PgDn move: the visible list rows, at least one. On an area
+    /// with panels the sub-tab row takes one of the rows `ui::list_rows` counts.
     fn page(&self) -> usize {
-        let panel_row = usize::from(!self.view.panels().is_empty());
+        let panel_row = usize::from(self.area.has_panels());
         self.list_rows.saturating_sub(panel_row).max(1)
+    }
+
+    /// Sets the wall clock, in Unix seconds. The runtime calls it with every tick; the
+    /// header shows the time a run connected from it.
+    pub fn set_wall_clock(&mut self, unix: i64) {
+        self.wall = Some(unix);
+    }
+
+    /// True on a cluster: its nodes are known, the server says so, or the report has
+    /// nodes. Analyze shows Nodes and Slots only then.
+    pub fn is_cluster(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| {
+            s.is_cluster()
+                || s.server
+                    .as_ref()
+                    .is_some_and(|i| i.mode == crate::model::ServerMode::Cluster)
+                || s.report.as_ref().is_some_and(|r| r.nodes.is_some())
+        })
+    }
+
+    /// The panels of `area` for this session (Nodes and Slots only on a cluster).
+    pub fn panels_of(&self, area: Area) -> &'static [Panel] {
+        area.panels(self.is_cluster())
+    }
+
+    /// Whether `v` shows more on the area on screen.
+    pub fn more_here(&self) -> bool {
+        self.more.get(self.area)
     }
 
     /// What the selected Patterns row shows: a group's label (`user:{id}:*`) or a
@@ -1517,59 +1764,75 @@ impl App {
     // Screens and view states
     // -----------------------------------------------------------------------
 
-    /// What is on screen: the view, its current panel, or the key list over Patterns.
+    /// What is on screen: the area, its current panel, and how deep that panel is.
     pub fn screen(&self) -> Screen {
-        let panel = |i: usize| {
-            let p = self.view.panels();
-            p[i.min(p.len() - 1)]
-        };
-        match self.view {
-            View::Connections => Screen::Connections,
-            View::Patterns if self.patterns.keys_open && self.patterns.detail_open => {
-                Screen::KeyDetail
-            }
-            View::Patterns if self.patterns.keys_open => Screen::KeyList,
-            View::Patterns => Screen::Patterns,
-            View::Analysis => panel(self.analysis_panel),
-            View::Server => panel(self.server_panel),
-            View::Streams => Screen::Streams,
-            View::PubSub => Screen::PubSub,
-            View::Search => Screen::Search,
+        match self.area {
+            Area::Connections => Screen::Connections,
+            Area::Overview => Screen::Overview,
+            Area::PubSub => Screen::PubSub,
+            Area::Browse => self.screen_of(self.browse_panel),
+            Area::Analyze => self.screen_of(self.shown_panel(Area::Analyze)),
+            Area::Server => self.screen_of(self.server_panel),
         }
     }
 
-    /// The screen `view` shows when switched to: its last panel, or the key list (or
-    /// the key detail over it) when it was left open.
-    fn screen_of(&self, view: View) -> Screen {
-        let panel = |i: usize| {
-            let p = view.panels();
-            p[i.min(p.len() - 1)]
+    /// The panel `area` shows: its last one, or its first when that one is not a panel
+    /// of this session (Nodes and Slots off a cluster). On an area without panels,
+    /// Server's (unused).
+    pub fn shown_panel(&self, area: Area) -> Panel {
+        let last = match area {
+            Area::Browse => self.browse_panel,
+            Area::Analyze => self.analyze_panel,
+            _ => self.server_panel,
         };
-        match view {
-            View::Analysis => panel(self.analysis_panel),
-            View::Server => panel(self.server_panel),
-            View::Patterns if self.patterns.keys_open && self.patterns.detail_open => {
+        let panels = self.panels_of(area);
+        if panels.contains(&last) || panels.is_empty() {
+            last
+        } else {
+            panels[0]
+        }
+    }
+
+    /// The screen `panel` shows when switched to: the key list (or the value over it)
+    /// when it was left open on Browse › Keys, the forecast on Analyze › Expiry, else
+    /// its top screen.
+    fn screen_of(&self, panel: Panel) -> Screen {
+        match panel {
+            Panel::Keys if self.patterns.keys_open && self.patterns.detail_open => {
                 Screen::KeyDetail
             }
-            View::Patterns if self.patterns.keys_open => Screen::KeyList,
-            v => Screen::ALL
-                .into_iter()
-                .find(|s| s.view() == v)
-                .unwrap_or(Screen::Connections),
+            Panel::Keys if self.patterns.keys_open => Screen::KeyList,
+            Panel::Expiry if self.expiry_forecast => Screen::Expiry,
+            p => p.top(),
+        }
+    }
+
+    /// The screen `area` shows when switched to.
+    fn screen_of_area(&self, area: Area) -> Screen {
+        match area {
+            Area::Connections => Screen::Connections,
+            Area::Overview => Screen::Overview,
+            Area::PubSub => Screen::PubSub,
+            a => self.screen_of(self.shown_panel(a)),
         }
     }
 
     fn set_screen(&mut self, screen: Screen) {
-        let view = screen.view();
-        self.view = view;
-        let at = view.panels().iter().position(|p| *p == screen);
-        match (view, at) {
-            (View::Analysis, Some(i)) => self.analysis_panel = i,
-            (View::Server, Some(i)) => self.server_panel = i,
-            (View::Patterns, _) => {
+        self.area = screen.area();
+        let Some(panel) = screen.panel() else {
+            return;
+        };
+        match panel.area() {
+            Area::Browse => self.browse_panel = panel,
+            Area::Analyze => self.analyze_panel = panel,
+            _ => self.server_panel = panel,
+        }
+        match panel {
+            Panel::Keys => {
                 self.patterns.keys_open = matches!(screen, Screen::KeyList | Screen::KeyDetail);
                 self.patterns.detail_open = screen == Screen::KeyDetail;
             }
+            Panel::Expiry => self.expiry_forecast = screen == Screen::Expiry,
             _ => {}
         }
     }
@@ -1588,6 +1851,7 @@ impl App {
             self.page(),
             self.sel_ticks(),
             &self.settings,
+            self.more_here(),
         ))
     }
 
@@ -1614,6 +1878,7 @@ impl App {
         let screen = self.screen();
         let page = self.page();
         let sel_ticks = self.sel_ticks();
+        let more = self.more_here();
         let App {
             session,
             entries,
@@ -1633,7 +1898,9 @@ impl App {
             .iter()
             .find(|e| e.id == s.id)
             .and_then(|e| e.perms.as_ref());
-        let ctx = Ctx::new(screen, s, perms, *tick, *now, page, sel_ticks, settings);
+        let ctx = Ctx::new(
+            screen, s, perms, *tick, *now, page, sel_ticks, settings, more,
+        );
         let mut act = Act::new(
             ctx,
             owner,
@@ -1762,15 +2029,20 @@ impl App {
         out
     }
 
-    /// `tab` (`back` false) and `shift-tab` on a view with panels.
+    /// `tab` (`back` false) and `shift-tab` on an area with panels: the next or
+    /// previous panel, at the level it was left at.
     fn cycle_panel(&mut self, back: bool) -> Vec<Effect> {
-        let panels = self.view.panels();
-        let Some(i) = panels.iter().position(|p| *p == self.screen()) else {
+        let panels = self.panels_of(self.area);
+        let Some(i) = self
+            .screen()
+            .panel()
+            .and_then(|cur| panels.iter().position(|p| *p == cur))
+        else {
             return Vec::new();
         };
         let n = panels.len();
         let to = panels[if back { (i + n - 1) % n } else { (i + 1) % n }];
-        self.switch(to)
+        self.switch(self.screen_of(to))
     }
 
     /// Passes `key` to the view state on screen. True when it did something.
@@ -1830,13 +2102,7 @@ impl App {
             return vec![Effect::Quit];
         }
         if self.help {
-            // The overlay takes every key: ? and esc close it, q still quits.
-            match (key.code, plain_char(&key)) {
-                (KeyCode::Esc, _) | (_, Some('?')) => self.help = false,
-                (_, Some('q')) => return vec![Effect::Quit],
-                _ => {}
-            }
-            return Vec::new();
+            return self.help_key(key);
         }
         if self.notice.as_ref().is_some_and(|n| n.error) {
             self.notice = None;
@@ -1852,6 +2118,10 @@ impl App {
         // So does the database list (dbs.rs).
         if self.dbs.is_some() {
             return self.dbs_key(key);
+        }
+        // And "Analyze the keys?".
+        if self.analyze.is_some() {
+            return self.analyze_key(key);
         }
         // The command line panel takes every key while it is open (views/cmdline.rs).
         if self.views.cmdline.open {
@@ -1877,18 +2147,25 @@ impl App {
             Some('q') => return vec![Effect::Quit],
             Some(':') => return self.open_cmdline(),
             Some(c @ '0'..='6') => {
-                let view = View::ALL[c as usize - '0' as usize];
-                return self.switch(self.screen_of(view));
+                // `6` was a view of its own; it does nothing any more.
+                return match Area::of_digit(c) {
+                    Some(area) => self.switch(self.screen_of_area(area)),
+                    None => Vec::new(),
+                };
             }
-            Some('a') => return self.start_add(),
             Some('b') => return self.open_dbs(),
             Some('?') => {
                 self.help = true;
+                self.help_find = HelpFind::default();
+                return Vec::new();
+            }
+            Some('v') => {
+                self.more.toggle(self.area);
                 return Vec::new();
             }
             Some(c @ ('[' | ']')) if views::picks_node(screen) => return self.pick_node(c == ']'),
             Some('s') if screen.is_scan_view() => return self.save_snapshot(),
-            Some('r') if screen.is_scan_view() => return self.rescan(),
+            Some('r') if screen.analyzes() => return self.open_analyze(),
             Some('r') if screen.is_live_view() => return self.refresh(),
             Some('y') if copies(screen) => {
                 return self.copy(false);
@@ -1898,37 +2175,219 @@ impl App {
             }
             _ => {}
         }
-        if !self.view.panels().is_empty() && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        // `tab` only switches panels.
+        if self.area.has_panels() && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             return self.cycle_panel(key.code == KeyCode::BackTab);
         }
         match screen {
             Screen::Connections => self.conn_key(key),
+            Screen::Overview => self.overview_key(key),
             Screen::Patterns => self.patterns_key(key),
-            Screen::Ttl | Screen::Diff | Screen::HotKeys => {
+            Screen::Ttl => {
+                if !self.list_key(key) && is_open(&key) {
+                    return self.switch(Screen::Expiry);
+                }
+                Vec::new()
+            }
+            Screen::Diff | Screen::HotKeys => {
                 self.list_key(key);
                 Vec::new()
             }
             Screen::Nodes => self.nodes_key(key),
-            _ => {
-                let (handled, effects) = self.key_to_view(key);
-                if !handled && screen == Screen::KeyList && key.code == KeyCode::Esc {
-                    let mut out = effects;
+            Screen::Expiry if is_back(&key) => self.switch(Screen::Ttl),
+            Screen::KeyList => {
+                let (handled, mut out) = self.key_to_view(key);
+                if !handled && is_back(&key) {
                     out.extend(self.switch(Screen::Patterns));
-                    return out;
-                }
-                if !handled && screen == Screen::KeyList && key.code == KeyCode::Enter {
-                    let mut out = effects;
+                } else if !handled && is_open(&key) {
                     out.extend(self.open_detail());
-                    return out;
                 }
-                if !handled && screen == Screen::KeyDetail && key.code == KeyCode::Esc {
-                    let mut out = effects;
+                out
+            }
+            Screen::KeyDetail | Screen::Streams | Screen::Search => {
+                let Some(key) = self.pane_key(screen, key) else {
+                    // `←` on the left pane of a key's value: back to the key list.
+                    return self.switch(Screen::KeyList);
+                };
+                let (handled, mut out) = self.key_to_view(key);
+                if !handled && screen == Screen::KeyDetail && is_back(&key) {
                     out.extend(self.switch(Screen::KeyList));
-                    return out;
                 }
-                effects
+                out
+            }
+            _ => self.key_to_view(key).1,
+        }
+    }
+
+    /// `→` `l` and `←` `h` (and `esc` on a right pane) on the two-pane screens, as the
+    /// view states take them: moving between the panes is their `tab`, so `→` on the
+    /// left pane becomes `tab` and `←` (or `esc`) on the right pane `shift-tab`. On a
+    /// stream's entries or a Search result, `←` on the left pane closes it (`esc`).
+    /// `None`: `←` on the items of a key's value, which goes back to the key list. Any
+    /// other key is passed on as it is.
+    fn pane_key(&self, screen: Screen, key: KeyEvent) -> Option<KeyEvent> {
+        use views::value::Focus as V;
+        let right = matches!(key.code, KeyCode::Right) || plain_char(&key) == Some('l');
+        let left = matches!(key.code, KeyCode::Left) || plain_char(&key) == Some('h');
+        let esc = key.code == KeyCode::Esc;
+        if !(right || left || esc) {
+            return Some(key);
+        }
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let back = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        let esc_key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        // A value's items and value: `Some(true)` on the value pane.
+        let value_pane = |v: &views::value::ValueState| {
+            if v.form.is_some() {
+                None
+            } else {
+                Some(v.has_list() && v.focus == V::Value)
+            }
+        };
+        let on_value = |v: &views::value::ValueState, outer: Option<KeyEvent>| match value_pane(v) {
+            None => Some(key),
+            Some(true) if left || esc => Some(back),
+            Some(false) if right && v.has_list() => Some(tab),
+            Some(false) if left => outer,
+            _ => Some(key),
+        };
+        match screen {
+            Screen::KeyDetail => on_value(&self.views.value, None),
+            Screen::Streams => {
+                let st = &self.views.streams;
+                if st.form.is_some() {
+                    return Some(key);
+                }
+                if st.entries_open {
+                    return match st.entries.as_deref() {
+                        Some(v) => on_value(v, Some(esc_key)),
+                        None if left => Some(esc_key),
+                        None => Some(key),
+                    };
+                }
+                use views::streams::Focus as F;
+                Some(match st.focus {
+                    F::List if right => tab,
+                    F::Detail if left || esc => back,
+                    _ => key,
+                })
+            }
+            Screen::Search => {
+                let se = &self.views.search;
+                match &se.deeper {
+                    Some(views::search::Deeper::Document(doc)) => on_value(doc, Some(esc_key)),
+                    Some(_) if left => Some(esc_key),
+                    Some(_) => Some(key),
+                    None => {
+                        use views::search::Focus as F;
+                        Some(match se.focus {
+                            F::Indexes if right => tab,
+                            F::Schema if left => back,
+                            _ => key,
+                        })
+                    }
+                }
+            }
+            _ => Some(key),
+        }
+    }
+
+    /// Overview: `↑↓` pick a finding, `enter` goes to it, `esc` stops an analysis that
+    /// runs; the rest (`p`, `+`, `-`) goes to the live figures' view state.
+    fn overview_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let len = self.overview_findings();
+        if let Some(to) = list_move(&key, self.overview.sel, len, self.page()) {
+            self.overview.sel = to;
+            return Vec::new();
+        }
+        match key.code {
+            KeyCode::Enter if len > 0 => return self.switch(Screen::BigKeys),
+            KeyCode::Esc if self.analyzing() => return self.cancel_analysis(),
+            _ => {}
+        }
+        self.key_to_view(key).1
+    }
+
+    /// How many findings Overview lists: today's recommendations, once analyzed.
+    pub fn overview_findings(&self) -> usize {
+        let (Some(s), Some(r)) = (self.session.as_ref(), self.report()) else {
+            return 0;
+        };
+        crate::analysis::recommendations(r, s.diff(), &self.views.analysis.facts).len()
+    }
+
+    /// True while an analysis runs (connected, sampling).
+    pub fn analyzing(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.analysis.is_some() && s.phase == Phase::Scanning)
+    }
+
+    /// The `?` help takes every key: typing searches every action of every screen,
+    /// `↑↓` picks, `enter` runs the pick as if its key were pressed on its screen
+    /// (going there first), `esc` clears the search, then closes. `?` on an empty
+    /// search closes too.
+    fn help_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let hits = super::keymap::find(&self.help_find.query, self.is_cluster());
+        let f = &mut self.help_find;
+        match key.code {
+            KeyCode::Esc if !f.query.is_empty() => *f = HelpFind::default(),
+            KeyCode::Esc => self.help = false,
+            KeyCode::Up => f.sel = f.sel.saturating_sub(1),
+            KeyCode::Down => f.sel = (f.sel + 1).min(hits.len().saturating_sub(1)),
+            KeyCode::Backspace => {
+                f.query.pop();
+                f.sel = 0;
+            }
+            KeyCode::Enter => {
+                let Some(hit) = hits.get(f.sel.min(hits.len().saturating_sub(1))).copied() else {
+                    return Vec::new();
+                };
+                self.help = false;
+                self.help_find = HelpFind::default();
+                return self.run_hit(hit);
+            }
+            _ => match plain_char(&key) {
+                Some('?') if f.query.is_empty() => self.help = false,
+                Some(c) if f.query.chars().count() < MAX_FILTER => {
+                    f.query.push(c);
+                    f.sel = 0;
+                }
+                _ => {}
+            },
+        }
+        Vec::new()
+    }
+
+    /// Runs a `?` pick: goes to its screen (the nearest one open: the key list and a
+    /// key's value only when one is open), then presses its key there, through every
+    /// check that key meets, the write gate's included.
+    fn run_hit(&mut self, hit: super::keymap::Hit) -> Vec<Effect> {
+        let mut out = Vec::new();
+        if let Some(want) = hit.screen {
+            // A key list or a key's value that is not open: as far down as is open.
+            let to = match want {
+                Screen::KeyDetail if !self.patterns.detail_open => Screen::KeyList,
+                other => other,
+            };
+            let to = match to {
+                Screen::KeyList if !self.patterns.keys_open => Screen::Patterns,
+                other => other,
+            };
+            out.extend(self.switch(to));
+            if self.screen() != want {
+                // Not reached (no key open, or Nodes off a cluster): nothing is pressed,
+                // so a key never does what it does on another screen.
+                return out;
             }
         }
+        let Some(h) = hit.key else {
+            return out;
+        };
+        if let Some(k) = key_of(super::keymap::first_key(h)) {
+            out.extend(self.key_inner(k));
+        }
+        out
     }
 
     /// `[` and `]` on the views that read the picked node: the previous or next node of
@@ -2006,39 +2465,94 @@ impl App {
                 && matches!(s.phase, Phase::Connecting | Phase::Scanning)
         });
         if rescan_running {
-            self.set_info("A scan is running. Press s again when it finishes to save it.");
+            self.set_info("An analysis is running. Press s again when it finishes to save it.");
             return Vec::new();
         }
         match self.report() {
             Some(r) => vec![Effect::SaveSnapshot(Box::new(r.clone()))],
             None if self.session.as_ref().is_some_and(|s| s.partial.is_some()) => {
                 self.set_info(
-                    "These are partial results. Press s again when the scan finishes to save it.",
+                    "These are partial results. Press s again when the analysis finishes to save it.",
                 );
                 Vec::new()
             }
             None => {
-                self.set_info("Nothing to save yet: connect and wait for the scan to finish.");
+                self.set_info("Nothing to save yet: press r to analyze the keys first.");
                 Vec::new()
             }
         }
     }
 
-    /// `r` on Patterns and Analysis: scan the session's entry again as a new run,
-    /// keeping the Patterns state, the list selections, the view, the view states and,
-    /// until the new run's first results, the old report. The live connection of the
-    /// replaced run goes with it: its unanswered requests are forgotten.
-    fn rescan(&mut self) -> Vec<Effect> {
+    /// `r` on Overview, Browse › Keys and Analyze: "Analyze the keys?". While a connect
+    /// or an analysis runs it only says so; with no connection it says to connect first.
+    fn open_analyze(&mut self) -> Vec<Effect> {
         let Some(s) = self.session.as_ref() else {
-            self.set_info("Nothing to scan again: connect first (0 Connections, then enter).");
+            self.set_info("Nothing to analyze: connect first (0 Connections, then enter).");
+            return Vec::new();
+        };
+        match s.phase {
+            Phase::Scanning => {
+                self.set_info("An analysis is already running. esc on 1 Overview stops it.")
+            }
+            Phase::Connecting => self.set_info("Still connecting. Press r again once connected."),
+            _ => self.analyze = Some(views::overview::AnalyzeDialog::default()),
+        }
+        Vec::new()
+    }
+
+    /// The keys of "Analyze the keys?": `↑↓` `j` `k` pick, `enter` starts, `esc`
+    /// cancels; every other key is ignored while it is open.
+    fn analyze_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        use views::overview::Depth;
+        let Some(d) = self.analyze.as_mut() else {
+            return Vec::new();
+        };
+        match (key.code, plain_char(&key)) {
+            (KeyCode::Up, _) | (_, Some('k')) => d.pick = Depth::Quick,
+            (KeyCode::Down, _) | (_, Some('j')) => d.pick = Depth::Deep,
+            (KeyCode::Enter, _) => {
+                let depth = d.pick;
+                self.analyze = None;
+                return self.start_analysis(depth);
+            }
+            (KeyCode::Esc, _) => self.analyze = None,
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// Starts a `depth` analysis of the session's entry as a new run of the scan
+    /// machinery (as a rescan did), keeping the area panels, the list selections, the
+    /// view states and, until the new run's first results, the old report. The live
+    /// connection of the replaced run goes with it: its unanswered requests are
+    /// forgotten.
+    fn start_analysis(&mut self, depth: views::overview::Depth) -> Vec<Effect> {
+        self.new_run(Some(depth))
+    }
+
+    /// A new run of the session on its current profile (a database switch): an
+    /// analysis at the depth of the last one when there was one, else a connect that
+    /// reads no key (and shows no earlier results: they were of another run).
+    pub(super) fn rescan(&mut self) -> Vec<Effect> {
+        let Some(s) = self.session.as_ref() else {
+            self.set_info("Nothing to connect again: connect first (0 Connections, then enter).");
+            return Vec::new();
+        };
+        let again = s.analysis.or(s.report.as_ref().map(|_| Default::default()));
+        self.new_run(again)
+    }
+
+    /// See [`Self::start_analysis`] and [`Self::rescan`].
+    fn new_run(&mut self, analysis: Option<views::overview::Depth>) -> Vec<Effect> {
+        let Some(s) = self.session.as_ref() else {
             return Vec::new();
         };
         if matches!(s.phase, Phase::Connecting | Phase::Scanning) {
-            self.set_info("A scan is already running.");
+            self.set_info("An analysis is already running.");
             return Vec::new();
         }
         let id = s.id;
-        // A database switch lasts for the session: a rescan stays on it.
+        // A database switch lasts for the session: an analysis stays on it.
         let db = s.profile.db;
         let Some((scan, mut profile, secrets)) = self.start_run(id) else {
             self.set_info("This connection is no longer listed. Pick one on 0 Connections.");
@@ -2046,7 +2560,7 @@ impl App {
         };
         profile.db = db;
         if let Some(s) = self.session.as_mut() {
-            // The report on screen: an earlier rescan's kept one, or this run's own.
+            // The report on screen: an earlier run's kept one, or this run's own.
             s.previous = s.report.as_ref().and(s.previous.or(Some(s.scan)));
             s.scan = scan;
             s.profile = profile.clone();
@@ -2056,6 +2570,18 @@ impl App {
             s.partial = None;
             s.rescan = true;
             s.live = LiveState::Waiting;
+            s.analysis = analysis;
+            s.stopped = false;
+            if analysis.is_none() {
+                // Nothing replaces the earlier results: they go now.
+                s.previous = None;
+                s.report = None;
+                s.history = History::Pending;
+                s.trend = None;
+            }
+        }
+        if analysis.is_none() {
+            self.rebuild_patterns(None);
         }
         self.live_pending.clear();
         self.live_writes.clear();
@@ -2072,7 +2598,37 @@ impl App {
             scan,
             profile,
             secrets,
+            sample: analysis.map(views::overview::Depth::sample_limit),
         }]
+    }
+
+    /// `esc` on Overview while an analysis runs: stops it and drops what it sampled.
+    /// Results kept from an earlier run stay. The live connection stays open, so this
+    /// waits until it is.
+    fn cancel_analysis(&mut self) -> Vec<Effect> {
+        let Some(s) = self.session.as_mut() else {
+            return Vec::new();
+        };
+        if s.live != LiveState::Ready {
+            self.set_info("Still connecting: press esc again in a moment to stop the analysis.");
+            return Vec::new();
+        }
+        let (id, scan) = (s.id, s.scan);
+        s.analysis = None;
+        s.progress = None;
+        s.stopped = true;
+        let kept = s.previous.take().is_some() && s.report.is_some();
+        s.phase = if kept { Phase::Done } else { Phase::Connected };
+        if s.partial.take().is_some() {
+            self.patterns.tree = PatternTree::default();
+            self.patterns.sel = 0;
+        }
+        self.set_info(if kept {
+            "Analysis stopped. The earlier results stay."
+        } else {
+            "Analysis stopped. Nothing it sampled was kept."
+        });
+        vec![Effect::CancelAnalysis { id, scan }]
     }
 
     /// `y` (`command` false) and `Y` on Patterns, TTL, Diff and Hot keys: the selected
@@ -2217,7 +2773,7 @@ impl App {
             self.conn_reselect();
         } else if self.view_input().is_some() {
             return self.on_active("paste", |v, act| v.on_paste(&text, act));
-        } else if self.view == View::Connections {
+        } else if self.area == Area::Connections {
             let out = self.start_add();
             if let Some(add) = &mut self.add {
                 add.input = text.chars().take(MAX_INPUT).collect();
@@ -2380,6 +2936,7 @@ impl App {
                 self.conn_filter.clear();
             }
             _ => match plain_char(&key) {
+                Some('a') => return self.start_add(),
                 Some('/') => self.conn_filtering = true,
                 Some('r') => return self.rescan_docker(),
                 Some('w') => return self.toggle_writes(),
@@ -2449,9 +3006,15 @@ impl App {
             sentinel: None,
             nodes: Vec::new(),
             picked: 0,
+            analysis: None,
+            connected_at_unix: None,
+            stopped: false,
         });
         self.patterns = PatternsState::default();
         self.sel = ViewSel::default();
+        self.overview = Default::default();
+        self.expiry_forecast = false;
+        self.analyze = None;
         // The previous session's view states and live requests go with it; nothing is
         // shown from them, so none is told it is hidden.
         self.views = Views::default();
@@ -2461,12 +3024,14 @@ impl App {
         self.bulk = None;
         self.dbs = None;
         self.db_resub = None;
-        self.view = View::Patterns;
+        // A connect reads no key: it lands on the live Overview.
+        self.area = Area::Overview;
         vec![Effect::Connect {
             id,
             scan,
             profile,
             secrets,
+            sample: None,
         }]
     }
 
@@ -2503,12 +3068,14 @@ impl App {
             return Vec::new();
         }
         match (key.code, plain_char(&key)) {
-            (KeyCode::Right, _) | (_, Some('l')) => self.expand(&rows, sel),
+            // A pattern lists its keys; a group expands, or, expanded, moves into it.
+            (KeyCode::Right | KeyCode::Enter, _) | (_, Some('l')) => {
+                match self.selected_single_pattern() {
+                    Some(pattern) => return self.open_keys(pattern),
+                    None => self.expand(&rows, sel),
+                }
+            }
             (KeyCode::Left, _) | (_, Some('h')) => self.collapse(&rows, sel),
-            (KeyCode::Enter, _) => match self.selected_single_pattern() {
-                Some(pattern) => return self.open_keys(pattern),
-                None => self.toggle(&rows, sel),
-            },
             (_, Some('/')) => {
                 self.patterns.filtering = true;
             }
@@ -2634,15 +3201,6 @@ impl App {
         }
     }
 
-    fn toggle(&mut self, rows: &[Row], sel: usize) {
-        if let Some(Row::Group { root }) = rows.get(sel).copied()
-            && let Some(g) = self.group(root)
-            && !self.patterns.collapsed.expand(&g.key)
-        {
-            self.collapse_group(&g);
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Messages
     // -----------------------------------------------------------------------
@@ -2752,11 +3310,18 @@ impl App {
                     .and_then(|e| e.perms.as_ref())
                     .map(confirm::refusals_of)
                     .unwrap_or_default();
+                let wall = self.wall;
                 if let Some(s) = self.session.as_mut() {
                     s.server = server;
                     s.target = Some(target);
-                    s.phase = Phase::Scanning;
+                    // A connect reads no key; an analysis starts sampling now.
+                    s.phase = if s.analysis.is_some() {
+                        Phase::Scanning
+                    } else {
+                        Phase::Connected
+                    };
                     s.refusals = refusals;
+                    s.connected_at_unix = wall;
                 }
                 let after = self.active_owner();
                 if before != after {
@@ -2795,25 +3360,31 @@ impl App {
                     && s.id == id
                     && s.scan == scan
                     && s.phase != Phase::Done
+                    && !s.stopped
                 {
                     s.progress = Some(progress);
                 }
             }
             Msg::ScanPartial { id, scan, partial } => {
                 // Only while this session's own scan runs: not from a replaced run of
-                // the same entry, not before it is connected, not after it finished or
-                // failed. A report on screen blocks it unless it is the previous run's,
-                // kept during a rescan.
+                // the same entry, not before it is connected, not after it finished,
+                // failed or was stopped. A report on screen blocks it unless it is the
+                // previous run's, kept during an analysis. (A connect's run sends none;
+                // one that does is sampling, so it counts as analyzing.)
                 let Some(s) = self.session.as_mut() else {
                     return Vec::new();
                 };
+                let sampling = s.phase == Phase::Scanning
+                    || (s.phase == Phase::Connected && s.previous.is_none());
                 if s.id != id
                     || s.scan != scan
-                    || s.phase != Phase::Scanning
+                    || !sampling
+                    || s.stopped
                     || (s.report.is_some() && s.previous.is_none())
                 {
                     return Vec::new();
                 }
+                s.phase = Phase::Scanning;
                 // Taken from the rows on screen, the previous report's included.
                 let anchor = self.selection_anchor();
                 if let Some(s) = self.session.as_mut() {
@@ -2830,7 +3401,7 @@ impl App {
                 self.rebuild_patterns(anchor);
             }
             Msg::ScanDone { id, scan, report } => {
-                if !self.is_session(id, scan) {
+                if !self.is_session(id, scan) || self.session.as_ref().is_some_and(|s| s.stopped) {
                     return Vec::new();
                 }
                 let report = *report;
@@ -3069,7 +3640,7 @@ impl App {
                 }
             }
             Msg::ScanFailed { id, scan, error } => {
-                if !self.is_session(id, scan) {
+                if !self.is_session(id, scan) || self.session.as_ref().is_some_and(|s| s.stopped) {
                     return Vec::new();
                 }
                 if let Some(s) = self.session.as_mut() {
@@ -3241,6 +3812,7 @@ mod tests {
             perms: fixtures::perms_ok(),
             target: ScanTarget::Primary,
         });
+        show(&mut app, Screen::Patterns);
         (app, id)
     }
 
@@ -3252,7 +3824,7 @@ mod tests {
             scan: scan_of(&app),
             partial: fixtures::partial(true),
         });
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         assert_eq!(app.sel_ticks(), 0);
         for _ in 0..7 {
             app.apply(Msg::Tick);
@@ -3362,7 +3934,7 @@ mod tests {
             assert!(!notice.error);
             assert_eq!(
                 notice.text,
-                "These are partial results. Press s again when the scan finishes to save it."
+                "These are partial results. Press s again when the analysis finishes to save it."
             );
         }
     }
@@ -3554,7 +4126,7 @@ mod tests {
             perms: fixtures::perms_ok(),
             target: ScanTarget::Primary,
         });
-        assert_eq!(app.session.as_ref().unwrap().phase, Phase::Scanning);
+        assert_eq!(app.session.as_ref().unwrap().phase, Phase::Connected);
         app.handle_key(ch('0'));
         let effects = app.handle_key(key(KeyCode::Enter));
         let [
@@ -3622,7 +4194,7 @@ mod tests {
         ]
     }
 
-    /// Asserts the session is `s2`, connected and scanning, untouched by `s1`.
+    /// Asserts the session is `s2`, in `phase`, untouched by `s1`.
     fn assert_untouched(app: &App, id: ConnId, s2: ScanId, phase: Phase) {
         let s = app.session.as_ref().unwrap();
         assert_eq!((s.id, s.scan), (id, s2));
@@ -3636,7 +4208,7 @@ mod tests {
         assert!(app.notice.is_none(), "{:?}", app.notice);
         let e = app.entry(id).unwrap();
         assert!(e.error.is_none());
-        if phase == Phase::Scanning {
+        if phase == Phase::Connected {
             assert_eq!(s.target, Some(ScanTarget::Primary));
             assert_eq!(e.status, ConnStatus::Connected);
             assert_eq!(e.target, Some(ScanTarget::Primary));
@@ -3661,12 +4233,12 @@ mod tests {
             perms: fixtures::perms_ok(),
             target: ScanTarget::Primary,
         });
-        assert_untouched(&app, id, s2, Phase::Scanning);
+        assert_untouched(&app, id, s2, Phase::Connected);
         // After s2's Connected: same entry id, but s1's messages are all ignored.
         for msg in stale_messages(id, s1) {
             let what = format!("{msg:?}");
             assert!(app.apply(msg).is_empty(), "{what}");
-            assert_untouched(&app, id, s2, Phase::Scanning);
+            assert_untouched(&app, id, s2, Phase::Connected);
         }
 
         // s2's own messages are accepted.
@@ -3758,58 +4330,95 @@ mod tests {
     }
 
     #[test]
-    fn digits_switch_views_and_tab_switches_panels() {
+    fn digits_switch_areas_and_tab_switches_panels() {
         let mut app = App::new(fixtures::profiles());
         assert_eq!(app.screen(), Screen::Connections);
-        for v in View::ALL.into_iter().rev() {
-            app.handle_key(ch(v.digit()));
-            assert_eq!(app.view, v);
+        // Before connecting the digits still switch; the body says "Connect first".
+        for a in Area::ALL.into_iter().rev() {
+            app.handle_key(ch(a.digit()));
+            assert_eq!(app.area, a);
         }
-        // Analysis starts on TTL; tab and shift-tab cycle its panels, both ways round.
-        app.handle_key(ch('2'));
+        assert_eq!(app.screen(), Screen::Connections);
+        // `6` was a view of its own; it does nothing now.
+        app.handle_key(ch('1'));
+        assert!(app.handle_key(ch('6')).is_empty());
+        assert_eq!(app.screen(), Screen::Overview);
+        // Analyze starts on Big keys; tab and shift-tab cycle its panels, both ways
+        // round. Nodes and Slots are not panels off a cluster.
+        app.handle_key(ch('3'));
         let mut seen = vec![app.screen()];
-        for _ in 0..7 {
+        for _ in 0..4 {
             app.handle_key(key(KeyCode::Tab));
             seen.push(app.screen());
         }
         assert_eq!(
             seen,
             [
+                Screen::BigKeys,
                 Screen::Ttl,
                 Screen::Diff,
                 Screen::HotKeys,
-                Screen::BigKeys,
-                Screen::Expiry,
-                Screen::Nodes,
-                Screen::Slots,
-                Screen::Ttl
+                Screen::BigKeys
             ]
         );
         app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(app.screen(), Screen::Slots);
-        // Each view keeps its panel while you are elsewhere.
-        app.handle_key(ch('3'));
-        assert_eq!(app.screen(), Screen::Overview);
+        assert_eq!(app.screen(), Screen::HotKeys);
+        // Each area keeps its panel while you are elsewhere.
+        app.handle_key(ch('4'));
+        assert_eq!(app.screen(), Screen::Clients);
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.screen(), Screen::Monitor);
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.screen(), Screen::SlowLog);
+        app.handle_key(ch('3'));
+        assert_eq!(app.screen(), Screen::HotKeys);
+        app.handle_key(ch('4'));
+        assert_eq!(app.screen(), Screen::SlowLog);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.screen(), Screen::Monitor);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.screen(), Screen::Clients);
+        // Browse: Keys, Streams, Search.
         app.handle_key(ch('2'));
-        assert_eq!(app.screen(), Screen::Slots);
-        app.handle_key(ch('3'));
-        assert_eq!(app.screen(), Screen::SlowLog);
-        // Monitor is Server's fourth panel, and tab wraps around after it.
+        assert_eq!(app.screen(), Screen::Patterns);
         app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.screen(), Screen::Monitor);
+        assert_eq!(app.screen(), Screen::Streams);
         app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.screen(), Screen::Overview);
-        // Views without panels pass tab on to their state; on the rest it does nothing.
-        for v in [View::Connections, View::Patterns, View::Streams] {
-            app.handle_key(ch(v.digit()));
+        assert_eq!(app.screen(), Screen::Search);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.screen(), Screen::Patterns);
+        // Areas without panels: tab does not switch screens.
+        for a in [Area::Connections, Area::Overview, Area::PubSub] {
+            app.handle_key(ch(a.digit()));
             let before = app.screen();
             app.handle_key(key(KeyCode::Tab));
             assert_eq!(app.screen(), before);
         }
+    }
+
+    #[test]
+    fn nodes_and_slots_are_analyze_panels_only_on_a_cluster() {
+        let (mut app, _) = cluster_scanned(fixtures::cluster_report());
+        app.handle_key(ch('3'));
+        let mut seen = vec![app.screen()];
+        for _ in 0..6 {
+            app.handle_key(key(KeyCode::Tab));
+            seen.push(app.screen());
+        }
+        assert_eq!(
+            seen,
+            [
+                Screen::BigKeys,
+                Screen::Ttl,
+                Screen::Diff,
+                Screen::HotKeys,
+                Screen::Nodes,
+                Screen::Slots,
+                Screen::BigKeys
+            ]
+        );
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.screen(), Screen::Slots);
     }
 
     #[test]
@@ -4058,6 +4667,7 @@ mod tests {
                 scan,
                 profile,
                 secrets: SecretSource::Keychain,
+                sample: None,
             },
         ] = &effects[..]
         else {
@@ -4065,7 +4675,8 @@ mod tests {
         };
         assert_eq!(*scan, scan_of(&app));
         assert_eq!(profile.name, "staging-cache");
-        assert_eq!(app.view, View::Patterns);
+        // A connect samples no key and lands on Overview.
+        assert_eq!(app.screen(), Screen::Overview);
         assert_eq!(app.entry(*id).unwrap().status, ConnStatus::Connecting);
         assert_eq!(app.session.as_ref().unwrap().phase, Phase::Connecting);
 
@@ -4085,7 +4696,8 @@ mod tests {
                 .unwrap()
                 .allowed(PERM_MEMORY)
         );
-        assert_eq!(app.session.as_ref().unwrap().phase, Phase::Scanning);
+        // Connected, and no analysis runs until `r`.
+        assert_eq!(app.session.as_ref().unwrap().phase, Phase::Connected);
 
         app.apply(Msg::ScanDone {
             id: *id,
@@ -4165,6 +4777,7 @@ mod tests {
             scan: scan_of(&app),
             report: Box::new(fixtures::report(sizes)),
         });
+        show(&mut app, Screen::Patterns);
         app
     }
 
@@ -4198,11 +4811,15 @@ mod tests {
         // ← on a child goes back to the parent.
         app.handle_key(ch('h'));
         assert_eq!(selected_label(&app), "cache:*");
-        // Enter toggles.
-        app.handle_key(key(KeyCode::Enter));
+        // ← folds; enter unfolds like →, and on an unfolded group goes into it.
+        app.handle_key(key(KeyCode::Left));
         assert_eq!(app.pattern_rows().len(), all - 2);
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.pattern_rows().len(), all);
+        assert_eq!(selected_label(&app), "cache:*");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(selected_label(&app), "cache:search:{hash}");
+        app.handle_key(ch('h'));
         // Movement stops at the ends.
         for _ in 0..50 {
             app.handle_key(key(KeyCode::Down));
@@ -4276,7 +4893,7 @@ mod tests {
 
     /// Moves the Patterns selection down to `id`.
     fn select(app: &mut App, id: &RowId) {
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         for _ in 0..app.pattern_rows().len() {
             if app.selected_row_id().as_ref() == Some(id) {
                 return;
@@ -4540,7 +5157,7 @@ mod tests {
     #[test]
     fn o_without_sizes_skips_memory_and_avg_size() {
         let mut app = scanned_app(false);
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         let mut seen = Vec::new();
         for _ in 0..4 {
             app.handle_key(ch('o'));
@@ -4591,7 +5208,7 @@ mod tests {
     #[test]
     fn o_before_any_results_only_changes_the_sort() {
         let (mut app, _) = scanning();
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         app.handle_key(ch('o'));
         assert_eq!(app.patterns.sort, SortBy::Keys);
         assert!(app.patterns.tree.roots.is_empty());
@@ -4617,6 +5234,8 @@ mod tests {
             scan: scan_of(&app),
             report: Box::new(report),
         });
+        // A connect lands on Overview; these tests start on Browse › Keys.
+        show(&mut app, Screen::Patterns);
         (app, id)
     }
 
@@ -4675,7 +5294,7 @@ mod tests {
     #[test]
     fn snapshot_key_without_report_explains() {
         let mut app = App::new(fixtures::profiles());
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         assert!(app.handle_key(ch('s')).is_empty());
         assert!(!app.notice.as_ref().unwrap().error);
     }
@@ -4793,7 +5412,7 @@ mod tests {
         assert_eq!(app.sel.hot, 1);
 
         // Patterns has its own selection too.
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         assert_eq!(app.patterns.sel, 0);
 
         go(&mut app, '2');
@@ -5050,17 +5669,21 @@ mod tests {
         (app, id, report)
     }
 
-    /// Presses `r` and returns the new run, checking it is a Connect of the same entry
-    /// with the entry's profile and secret source.
+    /// Presses `r` and `enter` (a Quick analysis) and returns the new run, checking it
+    /// is a Connect of the same entry with the entry's profile and secret source.
     fn press_rescan(app: &mut App, id: ConnId) -> ScanId {
         let old = scan_of(app);
-        let effects = app.handle_key(ch('r'));
+        assert!(app.handle_key(ch('r')).is_empty());
+        assert_eq!(app.analyze, Some(views::overview::AnalyzeDialog::default()));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.analyze, None);
         let [
             Effect::Connect {
                 id: got,
                 scan,
                 profile,
                 secrets,
+                sample: Some(10_000),
             },
         ] = &effects[..]
         else {
@@ -5088,7 +5711,7 @@ mod tests {
         let (mut app, id, report) = finished_with_history();
         let s1 = scan_of(&app);
         // Sort by keys, collapse the cache group, select the cart pattern.
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         app.handle_key(ch('o'));
         select(&mut app, &grp("cache"));
         app.handle_key(key(KeyCode::Left));
@@ -5107,12 +5730,12 @@ mod tests {
             nodes: 0,
         };
         assert_eq!(app.sel, sel);
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         let patterns = format!("{:?}", app.patterns);
 
         let s2 = press_rescan(&mut app, id);
         // Same view, same Patterns state and selections, the old results still up.
-        assert_eq!(app.view, View::Patterns);
+        assert_eq!(app.screen().area(), Area::Browse);
         assert_eq!(format!("{:?}", app.patterns), patterns);
         assert_eq!(app.sel, sel);
         let s = app.session.as_ref().unwrap();
@@ -5162,7 +5785,7 @@ mod tests {
             result: Ok(Some(fixtures::history(true))),
         });
         assert_eq!(app.sel, sel);
-        assert_eq!(app.view, View::Patterns);
+        assert_eq!(app.screen().area(), Area::Browse);
         assert_eq!(app.session.as_ref().unwrap().phase, Phase::Done);
     }
 
@@ -5178,7 +5801,7 @@ mod tests {
         for _ in 0..6 {
             app.handle_key(ch('j'));
         }
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         let s2 = press_rescan(&mut app, id);
         connected(&mut app, id, s2);
         // A smaller result: fewer hot keys, the cart pattern moved.
@@ -5510,29 +6133,32 @@ mod tests {
             assert!(!n.error);
             assert!(n.text.contains("connect first"), "{}", n.text);
         }
-        // Connecting, then scanning: already running.
+        // Connecting: wait for it.
         let mut app = App::new(fixtures::profiles());
         app.handle_key(key(KeyCode::Enter));
         let scan = scan_of(&app);
         for view in ['1', '2', '3', '4'] {
             go(&mut app, view);
             assert!(app.handle_key(ch('r')).is_empty());
+            assert!(app.analyze.is_none());
             assert_eq!(
                 app.notice.clone().unwrap().text,
-                "A scan is already running."
+                "Still connecting. Press r again once connected."
             );
             assert_eq!(scan_of(&app), scan);
         }
-        let (mut app, _) = scanning();
-        assert!(app.handle_key(ch('r')).is_empty());
-        assert_eq!(
-            app.notice.clone().unwrap().text,
-            "A scan is already running."
-        );
-        // A rescan that is running counts too.
+        // An analysis that is running: already running.
         let (mut app, id, _) = finished_with_history();
         let s2 = press_rescan(&mut app, id);
         assert!(app.handle_key(ch('r')).is_empty());
+        assert_eq!(scan_of(&app), s2);
+        connected(&mut app, id, s2);
+        assert!(app.handle_key(ch('r')).is_empty());
+        assert!(app.analyze.is_none());
+        assert_eq!(
+            app.notice.clone().unwrap().text,
+            "An analysis is already running. esc on 1 Overview stops it."
+        );
         assert_eq!(scan_of(&app), s2);
         // Finished: works on every report view.
         let (mut app, id, _) = finished_with_history();
@@ -5554,7 +6180,7 @@ mod tests {
             [Effect::DiscoverDocker]
         ));
         // In the filter input it is text.
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         app.handle_key(ch('/'));
         assert!(app.handle_key(ch('r')).is_empty());
         assert_eq!(app.patterns.filter, "r");
@@ -5578,7 +6204,8 @@ mod tests {
             scan,
             error: "refused".into(),
         });
-        let effects = app.handle_key(ch('r'));
+        app.handle_key(ch('r'));
+        let effects = app.handle_key(key(KeyCode::Enter));
         let [
             Effect::Connect {
                 secrets: SecretSource::Container(Some(c)),
@@ -5609,7 +6236,8 @@ mod tests {
             report: Box::new(fixtures::report(true)),
         });
         app.apply(Msg::DockerFound(Vec::new()));
-        assert!(app.handle_key(ch('r')).is_empty());
+        app.handle_key(ch('r'));
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
         assert!(
             app.notice
                 .clone()
@@ -5624,7 +6252,7 @@ mod tests {
     fn s_during_a_rescan_waits_for_it() {
         let (mut app, id, report) = finished_with_history();
         let s2 = press_rescan(&mut app, id);
-        let wait = "A scan is running. Press s again when it finishes to save it.";
+        let wait = "An analysis is running. Press s again when it finishes to save it.";
         for view in ['1', '2', '3', '4'] {
             go(&mut app, view);
             assert!(app.handle_key(ch('s')).is_empty(), "view {view}");
@@ -5678,46 +6306,48 @@ mod tests {
     #[test]
     fn help_opens_on_every_view_and_takes_every_key() {
         let (mut app, _, _) = finished_with_history();
-        for screen in Screen::ALL {
+        // Nodes and Slots are not screens of a standalone server.
+        for screen in Screen::ALL
+            .into_iter()
+            .filter(|s| !matches!(s, Screen::Nodes | Screen::Slots))
+        {
             show(&mut app, screen);
             let shown = app.screen();
             assert!(app.handle_key(ch('?')).is_empty());
             assert!(app.help);
+            assert_eq!(app.help_find, HelpFind::default());
             let before = fingerprint(&app);
+            // Moving keys move nothing yet: nothing is typed.
             for k in [
-                ch('j'),
-                ch('k'),
                 key(KeyCode::Down),
+                key(KeyCode::Up),
                 key(KeyCode::PageDown),
                 key(KeyCode::End),
                 key(KeyCode::Enter),
                 key(KeyCode::Left),
-                ch('1'),
-                ch('a'),
-                ch('s'),
-                ch('r'),
-                ch('y'),
-                ch('Y'),
-                ch('o'),
-                ch('/'),
-                ch('G'),
                 key(KeyCode::Tab),
                 key(KeyCode::BackTab),
-                ch('p'),
-                ch('n'),
             ] {
                 assert!(app.handle_key(k).is_empty(), "{k:?}");
                 assert_eq!(fingerprint(&app), before, "{k:?}");
             }
             app.handle_paste("redis://localhost:6379".into());
             assert_eq!(fingerprint(&app), before);
-            assert!(matches!(app.handle_key(ch('q'))[..], [Effect::Quit]));
+            // Every printable key is typed into the search, q and digits included.
+            for c in ['j', '2', 'a', 's', 'r', 'q', '/', '?'] {
+                assert!(app.handle_key(ch(c)).is_empty(), "{c:?}");
+                assert_eq!(app.screen(), shown);
+                assert!(app.help);
+            }
+            assert_eq!(app.help_find.query, "j2asrq/?");
             assert!(matches!(
                 app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))[..],
                 [Effect::Quit]
             ));
+            // Esc clears what is typed, then closes; ? closes when nothing is typed.
+            app.handle_key(key(KeyCode::Esc));
             assert!(app.help);
-            // Esc closes; so does ? again.
+            assert_eq!(app.help_find.query, "");
             app.handle_key(key(KeyCode::Esc));
             assert!(!app.help);
             app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
@@ -5736,6 +6366,8 @@ mod tests {
         assert!(!app.help);
         assert_eq!(app.patterns.filter, "?");
         app.handle_key(key(KeyCode::Esc));
+        // `a` adds a connection on Connections.
+        app.handle_key(ch('0'));
         app.handle_key(ch('a'));
         app.handle_key(ch('?'));
         assert!(!app.help);
@@ -5774,7 +6406,7 @@ mod tests {
             report.patterns[1].pattern.clone(),
         ];
         let (mut app, _) = scanned_with(report, fixtures::perms_ok());
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         let mut saw = [false, false];
         for _ in 0..app.pattern_rows().len() {
             let label = selected_label(&app);
@@ -5807,7 +6439,7 @@ mod tests {
         let note =
             |what: &str| format!("Copied {what} to the clipboard (needs a terminal with OSC 52)");
         // Patterns: a single pattern, a group row (its label), a child.
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         assert_eq!(
             copies(&mut app, 'y'),
             (vec![CopyText::pattern("session:{uuid}")], note("pattern"))
@@ -5885,7 +6517,7 @@ mod tests {
             go(&mut app, view);
             assert_eq!(copies(&mut app, 'y'), (vec![], nothing.to_string()));
         }
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         app.handle_key(ch('/'));
         type_str(&mut app, "zzz");
         app.handle_key(key(KeyCode::Enter));
@@ -5915,7 +6547,7 @@ mod tests {
             assert!(app.handle_key(ch(k)).is_empty());
         }
         assert_eq!(fingerprint(&app), before);
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         app.handle_key(ch('/'));
         assert!(app.handle_key(ch('y')).is_empty());
         assert!(app.handle_key(ch('Y')).is_empty());
@@ -6018,6 +6650,7 @@ mod tests {
             }
             // The add flow: a pasted connection string with a password, then the
             // password step. `y` and `Y` are text there, never a copy.
+            app.handle_key(ch('0'));
             app.handle_key(ch('a'));
             app.handle_paste(fixtures::PROD_URL.into());
             for k in ['y', 'Y'] {
@@ -6072,7 +6705,8 @@ mod tests {
     /// prod-cache-01 scanned with hot keys and history, a Docker container listed. For
     /// the Nodes view, a scan of a 6-shard cluster instead (a standalone one has no rows).
     fn paging_app_for(screen: Screen) -> App {
-        if screen == Screen::Nodes {
+        // Nodes and Slots are panels only on a cluster.
+        if matches!(screen, Screen::Nodes | Screen::Slots) {
             let (mut app, _) = cluster_scanned(fixtures::cluster_report_with(&[1.0 / 6.0; 6]));
             app.apply(Msg::DockerFound(vec![fixtures::docker_instance()]));
             return app;
@@ -6099,7 +6733,7 @@ mod tests {
                 assert!(len >= 5, "{view:?} has {len} rows");
                 // A page of 0 rows (a tiny terminal) still moves one. The panel row of
                 // the tab bar takes one of the rows on Analysis.
-                let panel_row = usize::from(!view.view().panels().is_empty());
+                let panel_row = usize::from(view.area().has_panels());
                 let page = rows.saturating_sub(panel_row).max(1);
                 let at = |app: &App| list_index(app);
                 let ctx = format!("{view:?}, {rows} rows");
@@ -6158,13 +6792,14 @@ mod tests {
     #[test]
     fn paging_patterns_follows_the_row_and_restarts_the_marquee() {
         let mut app = paging_app();
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         app.set_list_rows(2);
         app.apply(Msg::Tick);
         app.apply(Msg::Tick);
         assert_eq!(app.sel_ticks(), 2);
+        // The sub-tab row of Browse takes one of the two rows.
         app.handle_key(key(KeyCode::PageDown));
-        assert_eq!(app.patterns.sel, 2);
+        assert_eq!(app.patterns.sel, 1);
         assert_eq!(app.sel_ticks(), 0);
         let id = app.selected_row_id();
         // The selected row stays selected when a partial reorders the rows (a rescan).
@@ -6206,21 +6841,22 @@ mod tests {
     fn view_states_are_told_when_they_show_and_hide() {
         let mut app = views::testing::scanned();
         let n = app.calls.len();
-        app.handle_key(ch('3'));
+        app.handle_key(ch('4'));
         app.handle_key(key(KeyCode::Tab));
-        // TTL and Nodes are App's own: nothing to tell. Slots has a state of its own.
-        app.handle_key(ch('2'));
-        assert_eq!(app.screen(), Screen::Ttl);
-        app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(app.screen(), Screen::Slots);
-        app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(app.screen(), Screen::Nodes);
-        app.handle_key(key(KeyCode::BackTab));
-        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.screen(), Screen::SlowLog);
+        // Big keys and the Expiry forecast are the Analysis state's; the Expiry ranking
+        // is App's own: nothing to tell.
+        app.handle_key(ch('3'));
         assert_eq!(app.screen(), Screen::BigKeys);
-        app.handle_key(ch('4'));
-        // Pressing the digit of the view on screen changes nothing.
-        app.handle_key(ch('4'));
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.screen(), Screen::Ttl);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.screen(), Screen::Expiry);
+        app.handle_key(ch('2'));
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.screen(), Screen::Streams);
+        // Pressing the digit of the area on screen changes nothing.
+        app.handle_key(ch('2'));
         assert_eq!(
             calls_since(&app, n),
             [
@@ -6228,8 +6864,6 @@ mod tests {
                 (Owner::Server, "hide"),
                 (Owner::Server, "show"),
                 (Owner::Server, "hide"),
-                (Owner::Slots, "show"),
-                (Owner::Slots, "hide"),
                 (Owner::Analysis, "show"),
                 (Owner::Analysis, "hide"),
                 (Owner::Analysis, "show"),
@@ -6237,8 +6871,8 @@ mod tests {
                 (Owner::Streams, "show"),
             ]
         );
-        // `a` leaves for Connections, so the view is hidden first.
-        app.handle_key(ch('a'));
+        // `0` leaves for Connections, so the view is hidden first.
+        app.handle_key(ch('0'));
         assert_eq!(app.calls.last(), Some(&(Owner::Streams, "hide")));
     }
 
@@ -6246,11 +6880,11 @@ mod tests {
     fn only_the_view_on_screen_ticks_and_only_with_the_time() {
         let t0 = Instant::now();
         let mut app = views::testing::scanned();
-        app.handle_key(ch('6'));
+        show(&mut app, Screen::Search);
         let n = app.calls.len();
         app.apply(Msg::Tick);
         app.apply(Msg::TickAt(t0));
-        app.handle_key(ch('1'));
+        app.handle_key(ch('0'));
         app.apply(Msg::TickAt(t0));
         assert_eq!(
             calls_since(&app, n),
@@ -6258,7 +6892,7 @@ mod tests {
         );
         // Without a session no view is called at all.
         let mut idle = App::new(fixtures::profiles());
-        for c in ['3', '4', '5', '6'] {
+        for c in ['1', '2', '3', '4', '5'] {
             idle.handle_key(ch(c));
             idle.apply(Msg::TickAt(t0));
             idle.handle_key(ch('j'));
@@ -6275,12 +6909,12 @@ mod tests {
     fn keys_go_to_the_view_on_screen_and_r_refreshes() {
         let mut app = views::testing::scanned();
         for (c, owner) in [
-            ('3', Owner::Server),
-            ('4', Owner::Streams),
-            ('5', Owner::PubSub),
-            ('6', Owner::Search),
+            (Screen::Clients, Owner::Server),
+            (Screen::Streams, Owner::Streams),
+            (Screen::PubSub, Owner::PubSub),
+            (Screen::Search, Owner::Search),
         ] {
-            app.handle_key(ch(c));
+            show(&mut app, c);
             let n = app.calls.len();
             for k in [
                 ch('j'),
@@ -6297,17 +6931,18 @@ mod tests {
             let mut expected = vec![(owner, "key"); 5];
             expected.push((owner, "refresh"));
             expected.push((owner, "key"));
-            assert_eq!(calls_since(&app, n), expected, "{c}");
+            assert_eq!(calls_since(&app, n), expected, "{c:?}");
             if owner == Owner::PubSub {
                 // `s` opened the subscribe input there: close it.
                 app.handle_key(key(KeyCode::Esc));
             }
         }
-        // tab is the view's own on Streams, Pub/Sub and Search, App's on Server.
+        // tab is App's: it switches panels, on Browse as on Server.
         let n = app.calls.len();
         app.handle_key(key(KeyCode::Tab));
-        assert_eq!(calls_since(&app, n), [(Owner::Search, "key")]);
-        app.handle_key(ch('3'));
+        assert_eq!(app.screen(), Screen::Patterns);
+        assert_eq!(calls_since(&app, n), [(Owner::Search, "hide")]);
+        app.handle_key(ch('4'));
         let n = app.calls.len();
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(
@@ -6323,8 +6958,10 @@ mod tests {
         let n = app.calls.len();
         assert!(app.handle_key(ch('y')).is_empty());
         assert_eq!(calls_since(&app, n), [(Owner::Analysis, "key")]);
+        // `r` asks first: Quick or Deep.
+        assert!(app.handle_key(ch('r')).is_empty());
         assert!(matches!(
-            app.handle_key(ch('r'))[..],
+            app.handle_key(key(KeyCode::Enter))[..],
             [Effect::Connect { .. }]
         ));
     }
@@ -6409,10 +7046,10 @@ mod tests {
     #[test]
     fn enter_on_a_pattern_opens_its_keys_and_esc_goes_back() {
         let mut app = scanned_app(true);
-        // A group still folds.
+        // A group still folds (←) and unfolds (enter).
         select(&mut app, &grp("cache"));
         let all = app.pattern_rows().len();
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Left));
         assert_eq!(app.pattern_rows().len(), all - 2);
         app.handle_key(key(KeyCode::Enter));
         // A child pattern opens its key list, one level down.
@@ -6421,7 +7058,7 @@ mod tests {
         let n = app.calls.len();
         assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
         assert_eq!(app.screen(), Screen::KeyList);
-        assert_eq!(app.view, View::Patterns);
+        assert_eq!(app.screen().area(), Area::Browse);
         assert_eq!(
             app.views.keys.pattern.as_deref(),
             Some("cache:search:{hash}")
@@ -6431,8 +7068,8 @@ mod tests {
             [(Owner::Keys, "open"), (Owner::Keys, "show")]
         );
         // Other views and back keep it open; esc closes it.
+        app.handle_key(ch('0'));
         app.handle_key(ch('2'));
-        app.handle_key(ch('1'));
         assert_eq!(app.screen(), Screen::KeyList);
         app.handle_key(ch('j'));
         assert_eq!(app.calls.last(), Some(&(Owner::Keys, "key")));
@@ -6452,11 +7089,11 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.patterns.filter, "");
         assert_eq!(app.screen(), Screen::Patterns);
-        // A new connect starts on Patterns with fresh view states.
+        // A new connect starts on Overview with fresh view states.
         app.handle_key(key(KeyCode::Enter));
         app.handle_key(ch('0'));
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen(), Screen::Patterns);
+        assert_eq!(app.screen(), Screen::Overview);
         assert_eq!(app.views.keys.pattern, None);
     }
 
@@ -6479,8 +7116,9 @@ mod tests {
         assert_eq!(app.session.as_ref().unwrap().live, LiveState::Ready);
         assert!(app.notice.is_none());
         // A rescan's run has a live connection of its own, not open yet.
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         app.handle_key(ch('r'));
+        app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.session.as_ref().unwrap().live, LiveState::Waiting);
         app.apply(Msg::LiveReady { id, scan });
         assert_eq!(app.session.as_ref().unwrap().live, LiveState::Waiting);
@@ -6494,7 +7132,7 @@ mod tests {
         // only ones pending (a view that sends on show would take ReqId(1) itself).
         app.live_pending.insert(ReqId(1), Owner::Server);
         app.live_pending.insert(ReqId(2), Owner::Keys);
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         let n = app.calls.len();
         live_err(&mut app, ReqId(2));
         live_err(&mut app, ReqId(1));
@@ -6563,8 +7201,9 @@ mod tests {
         let mut app = views::testing::scanned();
         views::testing::live_ready(&mut app);
         app.live_pending.insert(ReqId(1), Owner::Streams);
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         app.handle_key(ch('r'));
+        app.handle_key(key(KeyCode::Enter));
         assert!(app.live_pending.is_empty());
     }
 
@@ -6583,7 +7222,17 @@ mod tests {
                 app.add
                     .as_ref()
                     .map(|a| (a.input.clone(), a.password.is_some())),
-                app.help,
+                (
+                    app.help,
+                    &app.help_find,
+                    (
+                        app.area,
+                        app.browse_panel,
+                        app.analyze_panel,
+                        app.server_panel
+                    ),
+                    (app.more, app.expiry_forecast, &app.overview, app.analyze),
+                ),
                 &app.notice,
                 &app.patterns,
                 app.sel,
@@ -6612,7 +7261,6 @@ mod tests {
             "tab" => vec![key(KeyCode::Tab)],
             "shift-tab" => vec![key(KeyCode::BackTab)],
             "ctrl-c" => vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
-            "0-6" => ('0'..='6').map(ch).collect(),
             "space" => vec![ch(' ')],
             t if t.chars().count() == 1 => vec![ch(t.chars().next().unwrap())],
             t => panic!("no key events for token {t:?}"),
@@ -6634,7 +7282,6 @@ mod tests {
             KeyCode::Tab => "tab".into(),
             KeyCode::BackTab => "shift-tab".into(),
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-c".into(),
-            KeyCode::Char('0'..='6') => "0-6".into(),
             KeyCode::Char(' ') => "space".into(),
             KeyCode::Char(c) => c.to_string(),
             other => format!("{other:?}"),
@@ -6701,11 +7348,11 @@ mod tests {
                     let calls = app.calls.len();
                     let effects = app.handle_key(k);
                     let ctx = format!("{token:?} ({k:?}) on {screen:?}");
-                    if token == "0-6" {
+                    if matches!(token, "0" | "1" | "2" | "3" | "4" | "5") {
                         let KeyCode::Char(c) = k.code else {
                             unreachable!()
                         };
-                        assert_eq!(app.view, View::ALL[c as usize - '0' as usize], "{ctx}");
+                        assert_eq!(Some(app.area), Area::of_digit(c), "{ctx}");
                         continue;
                     }
                     assert!(
@@ -6833,8 +7480,8 @@ mod tests {
         }));
         // Moving and the other views keep the narrowing.
         app.handle_key(ch('j'));
+        app.handle_key(ch('0'));
         app.handle_key(ch('2'));
-        app.handle_key(ch('1'));
         assert!(app.narrowed_node().is_some());
         // The selected pattern stays selected when esc goes back to the merged rows.
         let picked = selected_label(&app);
@@ -6844,7 +7491,7 @@ mod tests {
         assert_eq!(app.patterns.node, None);
         assert_eq!(shown_patterns(&app), report.patterns);
         assert_eq!(app.sel.nodes, 1, "the Nodes selection is kept");
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         assert_eq!(selected_label(&app), picked);
         // esc on the merged rows, with no filter, does nothing.
         let before = fingerprint(&app);
@@ -6891,33 +7538,23 @@ mod tests {
     }
 
     #[test]
-    fn nodes_keys_on_a_standalone_report_change_nothing() {
+    fn nodes_and_slots_are_not_shown_for_a_standalone_report() {
         let (mut app, _, _) = finished_with_history();
-        show(&mut app, Screen::Nodes);
-        assert_eq!(app.screen(), Screen::Nodes);
         assert_eq!(app.nodes(), None);
-        let before = fingerprint(&app);
-        for k in [
-            key(KeyCode::Enter),
-            key(KeyCode::Down),
-            key(KeyCode::End),
-            key(KeyCode::Esc),
-            ch('j'),
-            ch('y'),
-            ch('Y'),
-        ] {
-            assert!(app.handle_key(k).is_empty(), "{k:?}");
-            assert_eq!(fingerprint(&app), before, "{k:?}");
+        show(&mut app, Screen::BigKeys);
+        for _ in 0..8 {
+            app.handle_key(key(KeyCode::Tab));
+            assert!(!matches!(app.screen(), Screen::Nodes | Screen::Slots));
         }
-        // Rescan and snapshot still work from view 5.
-        assert!(matches!(
-            app.handle_key(ch('s'))[..],
-            [Effect::SaveSnapshot(_)]
-        ));
-        assert!(matches!(
-            app.handle_key(ch('r'))[..],
-            [Effect::Connect { .. }]
-        ));
+        // `?` does not offer them either.
+        for q in ["nodes", "slots"] {
+            assert!(
+                crate::tui::keymap::find(q, false)
+                    .iter()
+                    .all(|h| !matches!(h.screen, Some(Screen::Nodes | Screen::Slots))),
+                "{q}"
+            );
+        }
     }
 
     #[test]
@@ -7057,5 +7694,300 @@ mod tests {
                 .iter()
                 .all(|r| !matches!(r, Row::Pattern { parent: Some(_), idx } if node[*idx].pattern.starts_with("cache:")))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Navigation: levels and panes, `v`, `?`, connect and analyze
+    // -----------------------------------------------------------------------
+
+    /// Connected to prod-cache-01 with the live connection open, and no analysis.
+    fn just_connected() -> (App, ConnId) {
+        let mut app = App::new(fixtures::profiles());
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { id, sample, .. }] = effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        assert_eq!(sample, None, "a connect samples no key");
+        app.apply(Msg::Connected {
+            id,
+            scan: scan_of(&app),
+            server: Some(fixtures::server()),
+            perms: fixtures::perms_ok(),
+            target: ScanTarget::Primary,
+        });
+        app.apply(Msg::LiveReady {
+            id,
+            scan: scan_of(&app),
+        });
+        (app, id)
+    }
+
+    #[test]
+    fn connect_lands_on_overview_without_starting_a_scan() {
+        let (app, _) = just_connected();
+        assert_eq!(app.screen(), Screen::Overview);
+        let s = app.session.as_ref().unwrap();
+        assert_eq!(s.phase, Phase::Connected);
+        assert_eq!(s.analysis, None);
+        assert!(s.report.is_none());
+        assert!(!app.analyzing());
+        // `s` has nothing to save before an analysis.
+        let mut app = app;
+        show(&mut app, Screen::Patterns);
+        assert!(app.handle_key(ch('s')).is_empty());
+        assert!(app.notice.as_ref().unwrap().text.contains("press r"));
+    }
+
+    #[test]
+    fn r_opens_the_analyze_dialog_and_enter_starts_the_pick() {
+        let (mut app, id) = just_connected();
+        let s1 = scan_of(&app);
+        assert!(app.handle_key(ch('r')).is_empty());
+        assert_eq!(
+            app.analyze.map(|d| d.pick),
+            Some(views::overview::Depth::Quick)
+        );
+        // ↑↓ pick; every other key stays in the dialog.
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            app.analyze.map(|d| d.pick),
+            Some(views::overview::Depth::Deep)
+        );
+        assert!(app.handle_key(ch('2')).is_empty());
+        assert_eq!(app.screen(), Screen::Overview);
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Down));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [
+            Effect::Connect {
+                id: got,
+                scan,
+                sample: Some(100_000),
+                ..
+            },
+        ] = effects[..]
+        else {
+            panic!("unexpected effects {effects:?}");
+        };
+        assert_eq!(got, id);
+        assert_ne!(scan, s1);
+        assert_eq!(app.analyze, None);
+        let s = app.session.as_ref().unwrap();
+        assert_eq!(s.analysis, Some(views::overview::Depth::Deep));
+        assert_eq!(s.phase, Phase::Connecting);
+        connected(&mut app, id, scan);
+        assert_eq!(app.session.as_ref().unwrap().phase, Phase::Scanning);
+        assert!(app.analyzing());
+    }
+
+    #[test]
+    fn esc_closes_the_analyze_dialog_without_starting() {
+        let (mut app, _) = just_connected();
+        let s1 = scan_of(&app);
+        app.handle_key(ch('r'));
+        assert!(app.handle_key(key(KeyCode::Esc)).is_empty());
+        assert_eq!(app.analyze, None);
+        assert_eq!(scan_of(&app), s1);
+        assert_eq!(app.session.as_ref().unwrap().phase, Phase::Connected);
+        // `r` is not an analysis on a live view: it fetches again there.
+        show(&mut app, Screen::Clients);
+        app.handle_key(ch('r'));
+        assert_eq!(app.analyze, None);
+    }
+
+    #[test]
+    fn esc_on_overview_cancels_a_running_analysis() {
+        let (mut app, id) = just_connected();
+        app.handle_key(ch('r'));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { scan, .. }] = effects[..] else {
+            panic!("unexpected effects {effects:?}");
+        };
+        connected(&mut app, id, scan);
+        app.apply(Msg::LiveReady { id, scan });
+        assert!(app.analyzing());
+        let effects = app.handle_key(key(KeyCode::Esc));
+        assert!(
+            matches!(effects[..], [Effect::CancelAnalysis { id: i, scan: s }] if i == id && s == scan),
+            "{effects:?}"
+        );
+        assert!(!app.analyzing());
+        let s = app.session.as_ref().unwrap();
+        assert_eq!(s.phase, Phase::Connected);
+        assert_eq!(s.analysis, None);
+        // A late result of the cancelled run is ignored.
+        app.apply(Msg::ScanDone {
+            id,
+            scan,
+            report: Box::new(fixtures::report(true)),
+        });
+        assert!(app.session.as_ref().unwrap().report.is_none());
+    }
+
+    #[test]
+    fn right_and_left_walk_the_browse_levels() {
+        let (mut app, _) = views::testing::app_on(Screen::Patterns);
+        // → on a single pattern opens its keys.
+        let rows = app.pattern_rows();
+        app.patterns.sel = rows
+            .iter()
+            .position(|r| match r {
+                Row::Pattern { .. } => true,
+                Row::Group { root } => matches!(
+                    app.patterns.tree.roots.get(*root),
+                    Some(crate::tui::tree::Root::Single(_))
+                ),
+            })
+            .unwrap();
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.screen(), Screen::KeyList);
+        app.views.keys.rows.push(views::testing::key_row());
+        // → (and l) opens the value; ← and esc go back up, one level each.
+        app.handle_key(ch('l'));
+        assert_eq!(app.screen(), Screen::KeyDetail);
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.screen(), Screen::KeyList);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen(), Screen::KeyDetail);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::KeyList);
+        app.handle_key(ch('h'));
+        assert_eq!(app.screen(), Screen::Patterns);
+        // Tab switches panels, never levels.
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.screen(), Screen::Streams);
+    }
+
+    #[test]
+    fn right_and_left_move_between_the_panes_of_two_pane_screens() {
+        let (mut app, _) = views::testing::app_on(Screen::Streams);
+        use views::streams::Focus as F;
+        assert_eq!(app.views.streams.focus, F::List);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.views.streams.focus, F::Detail);
+        assert_eq!(app.screen(), Screen::Streams);
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.views.streams.focus, F::List);
+        app.handle_key(ch('l'));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.views.streams.focus, F::List);
+        // ← on the left pane does not leave the screen.
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.screen(), Screen::Streams);
+
+        show(&mut app, Screen::Search);
+        use views::search::Focus as S;
+        assert_eq!(app.views.search.focus, S::Indexes);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.views.search.focus, S::Schema);
+        app.handle_key(ch('h'));
+        assert_eq!(app.views.search.focus, S::Indexes);
+    }
+
+    #[test]
+    fn right_opens_the_expiry_forecast_and_left_goes_back() {
+        let (mut app, _, _) = finished_with_history();
+        show(&mut app, Screen::Ttl);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.screen(), Screen::Expiry);
+        app.handle_key(ch('3'));
+        assert_eq!(app.screen(), Screen::Expiry, "Analyze keeps its level");
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::Ttl);
+    }
+
+    #[test]
+    fn v_toggles_more_per_area() {
+        let (mut app, _) = views::testing::app_on(Screen::Overview);
+        assert!(!app.more_here());
+        app.handle_key(ch('v'));
+        assert!(app.more_here());
+        assert!(app.ctx().unwrap().more);
+        show(&mut app, Screen::Clients);
+        assert!(!app.more_here(), "each area has its own");
+        show(&mut app, Screen::Overview);
+        assert!(app.more_here(), "kept while elsewhere");
+        app.handle_key(ch('v'));
+        assert!(!app.more_here());
+    }
+
+    #[test]
+    fn question_mark_types_a_search_and_enter_goes_there() {
+        let (mut app, _) = views::testing::app_on(Screen::Overview);
+        app.handle_key(ch('?'));
+        assert!(app.help);
+        for c in "slow log".chars() {
+            app.handle_key(ch(c));
+        }
+        assert_eq!(app.help_find.query, "slow log");
+        assert_eq!(app.screen(), Screen::Overview, "typing is not a key press");
+        // The first hit is the screen itself.
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.help);
+        assert_eq!(app.screen(), Screen::SlowLog);
+        // esc clears what is typed first, then closes.
+        app.handle_key(ch('?'));
+        app.handle_key(ch('x'));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.help);
+        assert_eq!(app.help_find.query, "");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.help);
+    }
+
+    #[test]
+    fn a_write_picked_in_help_asks_first_like_its_key() {
+        let (mut app, _) = views::testing::app_on(Screen::Overview);
+        let s = app.session.as_mut().unwrap();
+        s.profile.env = Env::Stage;
+        s.profile.read_only = Some(false);
+        app.handle_key(ch('?'));
+        for c in "reset the slow".chars() {
+            app.handle_key(ch(c));
+        }
+        let hits = crate::tui::keymap::find(&app.help_find.query, false);
+        let at = hits
+            .iter()
+            .position(|h| h.key.is_some_and(|k| k.keys == "R") && h.screen == Some(Screen::SlowLog))
+            .expect("the slow log reset");
+        for _ in 0..at {
+            app.handle_key(key(KeyCode::Down));
+        }
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen(), Screen::SlowLog);
+        // Nothing is written yet: the confirm dialog of the write gate is open.
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                Effect::Live {
+                    req: crate::live::LiveRequest::Write(_),
+                    ..
+                }
+            )),
+            "{effects:?}"
+        );
+        assert!(app.confirm.is_some());
+    }
+
+    #[test]
+    fn a_key_picked_in_help_is_not_pressed_where_its_screen_is_not_open() {
+        let (mut app, _) = views::testing::app_on(Screen::Overview);
+        app.handle_key(ch('?'));
+        for c in "delete the key".chars() {
+            app.handle_key(ch(c));
+        }
+        let hits = crate::tui::keymap::find(&app.help_find.query, false);
+        let at = hits
+            .iter()
+            .position(|h| h.screen == Some(Screen::KeyDetail))
+            .expect("D on a key's value");
+        for _ in 0..at {
+            app.handle_key(key(KeyCode::Down));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        // No key is open: it goes as far as Browse › Keys and presses nothing there.
+        assert_eq!(app.screen(), Screen::Patterns);
+        assert!(app.confirm.is_none());
+        assert!(app.bulk.is_none());
     }
 }

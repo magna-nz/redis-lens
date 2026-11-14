@@ -1,10 +1,11 @@
 ---
 source: src/tui/views/search.rs
+assertion_line: 1361
 expression: "testing::render(&app, 120, 36).backend()"
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                           "
-"  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
+" prod-cache-01   PROD   read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys           ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
+"    Keys  ·  Streams  ·  Search                                                                                         "
 "┌─ Explain · idx:products ────────────────────────────────────────────────────────────────────── ↑↓ scroll · esc back ─┐"
 "│ FT.EXPLAIN @price:[0 100]                                                                                            │"
 "│ INTERSECT {                                                                                                          │"
@@ -37,4 +38,4 @@ expression: "testing::render(&app, 120, 36).backend()"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   tab Details   / Query   enter Open   0-6 View   ? Help   q Quit                                              "
+" ↑↓ Move   → Details   / Query   enter Open   esc Back                                                 : Command  ? Help"

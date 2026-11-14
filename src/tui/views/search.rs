@@ -1042,13 +1042,13 @@ mod tests {
     #[test]
     fn keys_move_the_indexes_and_the_schema() {
         let mut app = loaded(true);
-        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Right));
         assert_eq!(app.views.search.focus, Focus::Schema);
         app.handle_key(key(KeyCode::Char('G')));
         assert_eq!(app.views.search.schema_sel, 5);
         app.handle_key(key(KeyCode::Down));
         assert_eq!(app.views.search.schema_sel, 5, "clamped");
-        app.handle_key(key(KeyCode::BackTab));
+        app.handle_key(key(KeyCode::Left));
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.views.search.sel, 1);
         assert_eq!(
@@ -1064,7 +1064,7 @@ mod tests {
         let mut app = loaded(true);
         insta::assert_snapshot!("redis_80x24", testing::render(&app, 80, 24).backend());
         insta::assert_snapshot!("redis_120x36", testing::render(&app, 120, 36).backend());
-        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Right));
         app.handle_key(key(KeyCode::End));
         insta::assert_snapshot!("schema_80x24", testing::render(&app, 80, 24).backend());
         // valkey-search reports no size: the column is left out, with the reason.
@@ -1273,7 +1273,7 @@ mod tests {
         // The move keys move the results; another index shows its schema.
         app.handle_key(key(KeyCode::End));
         assert_eq!(app.views.search.result_sel, 2);
-        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Left));
         app.handle_key(ch('j'));
         assert!(app.views.search.shown_results().is_none());
         assert!(text(&app, 80, 24).contains("FIELD"));
@@ -1654,7 +1654,7 @@ mod tests {
         assert!(text(&app, 120, 36).contains(MARK));
         let debug = format!("{effects:?} {:?} {:?}", app.views, app.session);
         assert!(!crate::value::leaks(&debug, MARK), "{debug}");
-        app.handle_key(ch('1'));
+        app.handle_key(ch('3'));
         let effects = app.handle_key(ch('s'));
         let [Effect::SaveSnapshot(report)] = &effects[..] else {
             panic!("{effects:?}");

@@ -1,15 +1,15 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 1575
+assertion_line: 1754
 expression: t.backend()
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
-"  0   1   2   3 Server   4   5   6                                              "
-"    Overview  ·  Clients  ·  Slow log  ·  Monitor                tab next panel "
+" prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"    Clients  ·  Slow log  ·  Monitor                                            "
 "┌─ Slow log ───────────────────────────────────────────────────────────── off ─┐"
 "│                                                                              │"
 "│ ▲ The server refused SLOWLOG for this user, so this view is off.             │"
+"│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
@@ -26,4 +26,4 @@ expression: t.backend()
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" tab Panel   ↑↓ Move   p Pause   r Refresh   0-6 View   ? Help   q Quit         "
+" ↑↓ Move   tab Next panel   p Pause   r Refresh                : Command  ? Help"

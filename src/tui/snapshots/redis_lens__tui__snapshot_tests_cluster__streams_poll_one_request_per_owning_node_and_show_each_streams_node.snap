@@ -1,10 +1,11 @@
 ---
 source: src/tui/snapshot_tests_cluster.rs
+assertion_line: 1368
 expression: t.backend()
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  cluster · 3 shards  read-only        "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
-"  0   1   2   3   4 Streams   5   6                                             "
+" prod-cache-01   PROD   read-only   cluster · 3 shards     ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"    Keys  ·  Streams  ·  Search                                                 "
 "┌─ Streams ────────────────────────── from the last scan, which may miss some ─┐"
 "│ KEY        NODE               LEN   SIZE OLDEST GRP    LAG   PEND VERDICT    │"
 "│ foo        10.0.1.13:6379     100    64K     1h   0      —      0 no readers │"
@@ -25,4 +26,4 @@ expression: t.backend()
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   tab Details   enter Entries   p Pause   0-6 View   ? Help   q Quit   "
+" ↑↓ Move   → Details   enter Entries   p Pause   esc Back      : Command  ? Help"

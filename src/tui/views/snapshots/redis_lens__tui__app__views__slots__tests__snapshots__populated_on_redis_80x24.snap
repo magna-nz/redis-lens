@@ -1,12 +1,11 @@
 ---
 source: src/tui/views/slots_tests.rs
-assertion_line: 448
+assertion_line: 465
 expression: render(&app)
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
-"  0   1   2 Analysis   3   4   5   6                                            "
-"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  ·  Slots       "
+" prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys  ·  Nodes  ·  Slots            "
 "┌─ Slot ranges ───────────────────────────────────────────────────── 3 ranges ─┐"
 "│ RANGE       NODE                  KEYS   CPU µs   NET IN  NET OUT   MEMORY   │"
 "│ 0-5460      10.0.1.11:6379          45     1.0K    1010B     2.0K     4.4K   │"
@@ -19,6 +18,7 @@ expression: render(&app)
 "│ 10     10.0.1.11:6379          40      900    1000B     2.0K                 │"
 "│ 12000  10.0.1.13:6379          10     5.0K      50B      88K                 │"
 "│ 11     10.0.1.11:6379           5      100      10B      20B                 │"
+"│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "┌─ Slot 6000 ───────────────────────────────────────────────── 10.0.1.12:6379 ─┐"
 "│ No example, big or hot key of the scan hashes to this slot.                  │"
@@ -26,4 +26,4 @@ expression: render(&app)
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   tab Panel   o Order   r Refresh   0-6 View   ? Help   q Quit         "
+" ↑↓ Move   tab Next panel   o Order   r Refresh                : Command  ? Help"

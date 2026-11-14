@@ -1,18 +1,18 @@
 ---
 source: src/tui/views/server.rs
-assertion_line: 2958
+assertion_line: 3563
 expression: "testing::render(&app, 80, 24).backend()"
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.int…  read-only        "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   "
-"  0   1   2   3 Server   4   5   6                                              "
-"    Overview  ·  Clients  ·  Slow log  ·  Monitor                tab next panel "
+" prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"    Clients  ·  Slow log  ·  Monitor                                            "
 "┌─ Slow log ──────────────────────────────────── 3 entries · UTC · every 10 s ─┐"
 "│ logs every command · keeps 128 entries                                       │"
 "│  TIME      DURATION  COMMAND      KEYS                  CLIENT               │"
 "│  13:04:02    15.0ms  CONFIG SET                         10.0.1.5:50386       │"
 "│  13:04:03    14.0ms  DEL                                10.0.1.5:50386       │"
 "│  13:04:04    13.0ms  SET                                10.0.1.5:50386       │"
+"│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
@@ -26,4 +26,4 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│ client 10.0.1.5:50386                                                        │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" tab Panel   ↑↓ Move   p Pause   r Refresh   0-6 View   ? Help   q Quit         "
+" ↑↓ Move   tab Next panel   p Pause   r Refresh                : Command  ? Help"

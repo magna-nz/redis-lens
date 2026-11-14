@@ -1,12 +1,11 @@
 ---
 source: src/tui/views/analysis.rs
-assertion_line: 280
+assertion_line: 333
 expression: "testing::render(&app, 120, 36).backend()"
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)                                           "
-"  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
-"    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  ·  Slots                                tab next panel "
+" prod-cache-01   PROD   read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys           ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
+"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys                                                                        "
 "┌─ Big keys ──────────────────────────────────────────────────────────────────────── top 50 of 100K sampled · by size ─┐"
 "│ KEY                                               PATTERN                     TYPE      SIZE▼        LENGTH      TTL │"
 "│ queue:emails                                      queue:emails                list      612M    2.10M items     none │"
@@ -27,6 +26,7 @@ expression: "testing::render(&app, 120, 36).backend()"
 "│ cache:product:4471                                cache:product:{id}          string    6.0K     1.8K bytes  52m 00s │"
 "│ cache:product:1024                                cache:product:{id}          string    5.8K     1.8K bytes  22h 03m │"
 "│ cache:product:120009                              cache:product:{id}          string    5.5K     1.8K bytes  19h 16m │"
+"│ user:331870:cart                                  user:{id}:cart              hash      4.4K      12 fields   6d 11h │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 "┌─ Recommendations ─────────────────────────────────────────────────────────────────────────────────────────────── 10 ─┐"
 "│ ▲ queue:emails is a single 612M list of 2,104,332 items. Trim it with LTRIM, or split it, by day for example.        │"
@@ -38,4 +38,4 @@ expression: "testing::render(&app, 120, 36).backend()"
 "│ ● tmp:import:{ulid} never expires. Probably intentional, as it is not growing.                                       │"
 "│ … and 3 more                                                                                                         │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   tab Panel   r Rescan   s Snapshot   0-6 View   ? Help   q Quit                                               "
+" ↑↓ Move   tab Next panel   y Copy   r Analyze   s Snapshot                                            : Command  ? Help"

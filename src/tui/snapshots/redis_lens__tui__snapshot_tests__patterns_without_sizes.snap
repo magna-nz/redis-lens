@@ -1,11 +1,11 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 523
+assertion_line: 703
 expression: t.backend()
 ---
-" redis-lens 0.1.0    PROD   prod-cache-01  prod-cache-01.internal:6380  read-only          ● scan complete 14:02:11 UTC "
-" Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)  ▲ sizes unavailable: MEMORY USAGE denied "
-"  0 Connections   1 Patterns   2 Analysis   3 Server   4 Streams   5 Pub/Sub   6 Search                                 "
+" prod-cache-01   PROD   read-only   Redis 7.4.2 · 15G / 24G · 7.92M keys · ▲ no sizes              ● analyzed 14:02 UTC "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
+"    Keys  ·  Streams  ·  Search                                                                                         "
 "┌─ Patterns ───────────────────────────────────────────────── sizes unavailable: MEMORY USAGE denied · sorted by keys ─┐"
 "│ PATTERN                                   TYPE       KEYS▼  MEMORY  SHARE             %      AVG  NO TTL  VERDICT    │"
 "│   rl:{ip}:{id}                            string    2.31M        —  █████░░░░░░░░░  36%        —      0%  ok         │"
@@ -38,4 +38,4 @@ expression: t.backend()
 "│ ▲ 12% never expire while the rest do. A write path probably skips EXPIRE.                                            │"
 "│ $ redis-cli --scan --pattern "cache:search:*"                                                                        │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   →← Fold   enter Open   / Filter   o Sort   0-6 View   ? Help   q Quit                                        "
+" ↑↓ Move   → Open   / Filter   o Sort   v More                                                         : Command  ? Help"
