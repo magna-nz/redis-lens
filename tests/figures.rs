@@ -206,13 +206,9 @@ async fn a_refused_memory_stats_is_a_gap_not_an_error() {
         let server = common::server_with(
             valkey,
             &[
-                "--user",
-                "lens",
-                "on",
-                ">lens-pw",
-                "~*",
-                "+@all",
-                "-memory|stats",
+                "--user", "lens", "on", ">lens-pw", "~*", "+@all",
+                // The whole command: Redis 6.2 has no ACL rules for one subcommand.
+                "-memory",
             ],
         )
         .await;
