@@ -50,6 +50,10 @@ pub mod confirm;
 #[path = "bulk.rs"]
 pub mod bulk;
 
+/// `b`: the database list and the database switch.
+#[path = "dbs.rs"]
+mod dbs;
+
 /// What the key detail's and key list's edits ask of `App`: going back after `D`, the
 /// new key after `N`, `$EDITOR`.
 #[path = "key_edits.rs"]
@@ -446,6 +450,13 @@ pub enum Effect {
         name: String,
         on: bool,
     },
+    /// Save database `db` as the `db` of the saved profile `name` in the config file,
+    /// and nothing else ([`crate::config::Config::set_db`]). Answered with
+    /// [`Msg::DbSaved`] or [`Msg::DbSaveFailed`].
+    SaveDb {
+        name: String,
+        db: u32,
+    },
     /// Edit a value in `$EDITOR` on a temporary file ([`crate::tui::editor`]), out of
     /// the TUI until it exits. Answered with [`Msg::Edited`].
     Editor(crate::tui::editor::EditorJob),
@@ -469,6 +480,17 @@ pub enum Msg {
     WritesFailed {
         name: String,
         on: bool,
+        error: String,
+    },
+    /// [`Effect::SaveDb`] saved the database.
+    DbSaved {
+        name: String,
+        db: u32,
+    },
+    /// [`Effect::SaveDb`] could not save it: why.
+    DbSaveFailed {
+        name: String,
+        db: u32,
         error: String,
     },
     Tick,
@@ -939,6 +961,12 @@ pub struct App {
     /// The bulk action's dialog (`x` or `D` on Patterns), if open. While it is open
     /// every key goes to it, after the confirm dialog.
     pub bulk: Option<bulk::Bulk>,
+    /// The database list (`b`), if open. While it is open every key goes to it, after
+    /// the bulk dialog.
+    pub dbs: Option<views::dbs::DbList>,
+    /// The Pub/Sub tail a database switch ended: it subscribes again once the new
+    /// run's live connection is ready.
+    db_resub: Option<crate::live::pubsub::Subscription>,
     /// Writes sent and not answered yet, with their command names: a `NOPERM` answer
     /// adds the name to the session's refusals.
     live_writes: HashMap<ReqId, String>,
@@ -1087,6 +1115,8 @@ impl App {
             settings: crate::write::Settings::default(),
             confirm: None,
             bulk: None,
+            dbs: None,
+            db_resub: None,
             live_writes: HashMap::new(),
             #[cfg(test)]
             calls: Vec::new(),
@@ -1778,6 +1808,10 @@ impl App {
         if self.bulk.is_some() {
             return self.bulk_key(key);
         }
+        // So does the database list (dbs.rs).
+        if self.dbs.is_some() {
+            return self.dbs_key(key);
+        }
         // The command line panel takes every key while it is open (views/cmdline.rs).
         if self.views.cmdline.open {
             return self.cmdline_key(key);
@@ -1806,6 +1840,7 @@ impl App {
                 return self.switch(self.screen_of(view));
             }
             Some('a') => return self.start_add(),
+            Some('b') => return self.open_dbs(),
             Some('?') => {
                 self.help = true;
                 return Vec::new();
@@ -1962,10 +1997,13 @@ impl App {
             return Vec::new();
         }
         let id = s.id;
-        let Some((scan, profile, secrets)) = self.start_run(id) else {
+        // A database switch lasts for the session: a rescan stays on it.
+        let db = s.profile.db;
+        let Some((scan, mut profile, secrets)) = self.start_run(id) else {
             self.set_info("This connection is no longer listed. Pick one on 0 Connections.");
             return Vec::new();
         };
+        profile.db = db;
         if let Some(s) = self.session.as_mut() {
             // The report on screen: an earlier rescan's kept one, or this run's own.
             s.previous = s.report.as_ref().and(s.previous.or(Some(s.scan)));
@@ -1982,6 +2020,8 @@ impl App {
         self.live_writes.clear();
         self.confirm = None;
         self.bulk = None;
+        self.dbs = None;
+        self.db_resub = None;
         // The live tail belongs to the replaced run: the runner drops it with it.
         self.views.pubsub.end_tail();
         // So does a Monitor run.
@@ -2378,6 +2418,8 @@ impl App {
         self.live_writes.clear();
         self.confirm = None;
         self.bulk = None;
+        self.dbs = None;
+        self.db_resub = None;
         self.view = View::Patterns;
         vec![Effect::Connect {
             id,
@@ -2605,6 +2647,8 @@ impl App {
             Msg::Edited { job, result } => return self.edited(job, result),
             Msg::WritesSaved { name, on } => self.writes_saved(&name, on),
             Msg::WritesFailed { name, on, error } => self.writes_failed(&name, on, &error),
+            Msg::DbSaved { name, db } => self.db_saved(&name, db),
+            Msg::DbSaveFailed { name, db, error } => self.db_save_failed(&name, db, &error),
             Msg::DockerFound(found) => self.set_docker(found),
             Msg::DockerFailed(_) => {
                 self.set_docker(Vec::new());
@@ -2844,6 +2888,8 @@ impl App {
                     && s.scan == scan
                 {
                     s.live = LiveState::Ready;
+                    // A tail a database switch ended subscribes again.
+                    return self.resubscribe_after_switch();
                 }
             }
             Msg::Live {
@@ -2858,6 +2904,11 @@ impl App {
                 // A bulk action's step goes to its dialog (bulk.rs).
                 if self.bulk_waits_for(req_id) {
                     return self.bulk_reply(req_id, result);
+                }
+                // So does the database list's `INFO keyspace` (dbs.rs).
+                if self.dbs_waits_for(req_id) {
+                    self.dbs_reply(req_id, result);
+                    return Vec::new();
                 }
                 // Back to the view that sent it; an id no view waits for any more (its
                 // connection closed in between) is dropped.
@@ -2884,6 +2935,7 @@ impl App {
                 self.live_writes.clear();
                 self.close_write_question();
                 self.bulk_closed();
+                self.dbs_closed();
                 if let Some(e) = &error {
                     self.set_error(format!(
                         "The live connection closed: {e}. The server views stop until the next scan."

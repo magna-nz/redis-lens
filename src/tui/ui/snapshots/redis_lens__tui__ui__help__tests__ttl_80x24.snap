@@ -1,6 +1,5 @@
 ---
 source: src/tui/ui/help.rs
-assertion_line: 81
 expression: "render(Screen::Ttl, 80, 24).backend()"
 ---
 "                                                                                "
@@ -12,6 +11,7 @@ expression: "render(Screen::Ttl, 80, 24).backend()"
 "       │?              Show or hide this key list                       │       "
 "       │a              Add a connection                                 │       "
 "       │:              Open the command line                            │       "
+"       │b              Switch the database (once connected)             │       "
 "       │q ctrl-c       Quit                                             │       "
 "       │Analysis · TTL                                                  │       "
 "       │↑↓ j k         Move the selection                               │       "
@@ -23,7 +23,6 @@ expression: "render(Screen::Ttl, 80, 24).backend()"
 "       │r              Scan again, keeping old results meanwhile        │       "
 "       │s              Save a scan snapshot file                        │       "
 "       └────────────────────────────────────────────────────────────────┘       "
-"                                                                                "
 "                                                                                "
 "                                                                                "
 "                                                                                "

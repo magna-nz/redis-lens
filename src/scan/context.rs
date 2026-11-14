@@ -124,6 +124,49 @@ pub fn parse_keyspace(text: &str, db: u32) -> KeyspaceInfo {
     info
 }
 
+/// Every `dbN:keys=…,expires=…` line of `INFO keyspace`, in database order (the
+/// database list, spec "Database switch (P4)"). Extra fields (`avg_ttl`, `subexpiry`)
+/// are ignored; a line whose name isn't `db` and a number is skipped; a field that
+/// isn't a number reads as 0; a database named twice keeps its first line.
+pub fn parse_keyspace_all(text: &str) -> Vec<KeyspaceInfo> {
+    let mut out: Vec<KeyspaceInfo> = Vec::new();
+    for line in text.lines() {
+        let Some((name, rest)) = line.trim().split_once(':') else {
+            continue;
+        };
+        let Some(db) = name
+            .strip_prefix("db")
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if out.iter().any(|k| k.db == db) {
+            continue;
+        }
+        let mut info = KeyspaceInfo {
+            db,
+            ..KeyspaceInfo::default()
+        };
+        for kv in rest.split(',') {
+            let Some((k, v)) = kv.split_once('=') else {
+                continue;
+            };
+            let n = v.trim().parse::<u64>().unwrap_or(0);
+            match k.trim() {
+                "keys" => info.keys = n,
+                "expires" => info.expires = n,
+                "avg_ttl" => info.avg_ttl_ms = n,
+                "subexpiry" => info.subexpiry = Some(n),
+                _ => {}
+            }
+        }
+        out.push(info);
+    }
+    out.sort_by_key(|k| k.db);
+    out
+}
+
 /// A bin label of `INFO keysizes`: `0`, `512`, `1K`, `2M`, … (powers of 1024).
 fn bin_bound(label: &str) -> Option<u64> {
     let label = label.trim();
@@ -1135,11 +1178,53 @@ mod tests {
         })
     }
 
+    #[test]
+    fn keyspace_all_reads_every_database_line() {
+        let text = "# Keyspace\r\ndb3:keys=7,expires=2,avg_ttl=500,subexpiry=1\r\ndb0:keys=4,expires=1,avg_ttl=99954\r\ndb12:keys=1,expires=0\r\n";
+        let all = parse_keyspace_all(text);
+        assert_eq!(
+            all.iter()
+                .map(|k| (k.db, k.keys, k.expires))
+                .collect::<Vec<_>>(),
+            [(0, 4, 1), (3, 7, 2), (12, 1, 0)]
+        );
+        assert_eq!(all[1].avg_ttl_ms, 500);
+        assert_eq!(all[1].subexpiry, Some(1));
+    }
+
+    #[test]
+    fn keyspace_all_tolerates_nothing_and_junk() {
+        assert!(parse_keyspace_all("").is_empty());
+        assert!(parse_keyspace_all("# Keyspace\r\n").is_empty());
+        let junk = "dbx:keys=1\r\ndb:keys=1\r\ndb1_distrib_strings_sizes:0=1\r\nnonsense\r\ndb2:keys=abc,expires=,other=9,=3,loose\r\ndb99999999999:keys=1\r\n";
+        let all = parse_keyspace_all(junk);
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].db, all[0].keys, all[0].expires), (2, 0, 0));
+    }
+
+    #[test]
+    fn keyspace_all_keeps_the_first_of_a_repeated_database() {
+        let all = parse_keyspace_all("db1:keys=5,expires=0\r\ndb1:keys=9,expires=0\r\n");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].keys, 5);
+    }
+
     proptest! {
         #[test]
         fn parsers_never_panic(text in "(?s).{0,300}", db in 0u32..20) {
             let _ = parse_keyspace(&text, db);
             let _ = parse_keysizes(&text, db);
+            let all = parse_keyspace_all(&text);
+            prop_assert!(all.windows(2).all(|w| w[0].db < w[1].db));
+        }
+
+        #[test]
+        fn keyspace_all_never_panics_on_db_like_lines(
+            lines in prop::collection::vec(("(db)?[0-9a-z_]{0,6}", "[a-z0-9=,_-]{0,30}"), 0..8)
+        ) {
+            let text: String = lines.iter().map(|(k, v)| format!("{k}:{v}\r\n")).collect();
+            let all = parse_keyspace_all(&text);
+            prop_assert!(all.windows(2).all(|w| w[0].db < w[1].db));
         }
 
         #[test]

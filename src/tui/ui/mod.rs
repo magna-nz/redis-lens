@@ -23,6 +23,7 @@ mod bulk;
 mod cmdline;
 mod confirm;
 mod connections;
+mod dbs;
 mod delta;
 mod diff;
 pub mod help;
@@ -98,6 +99,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     footer(frame, foot, app);
     if let Some(b) = &app.bulk {
         bulk::draw(frame, body, b, app.tick);
+    }
+    if let Some(l) = &app.dbs {
+        dbs::draw(frame, body, l);
     }
     if let Some(c) = &app.confirm {
         confirm::draw(frame, body, c);
@@ -437,6 +441,9 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
             if show_endpoint {
                 left.push(endpoint);
             }
+            if p.db != 0 {
+                left.push(Span::styled(format!("  db {}", p.db), style::amber()));
+            }
             match &s.target {
                 Some(ScanTarget::Replica(ep)) => left.push(Span::styled(
                     format!("  replica {}", trunc(&ep.to_string(), 24)),
@@ -697,6 +704,8 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
         confirm::footer(c)
     } else if let Some(b) = &app.bulk {
         bulk::footer(b)
+    } else if let Some(l) = &app.dbs {
+        dbs::footer(l)
     } else if let Some(add) = &app.add {
         match &add.password {
             Some(_) => input_line(

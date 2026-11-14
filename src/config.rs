@@ -143,6 +143,18 @@ impl Config {
         Ok(p.clone())
     }
 
+    /// Sets the database of profile `name` (spec "Database switch (P4)", `s` on the
+    /// database list): `db` is set, and nothing else changes.
+    pub fn set_db(&mut self, name: &str, db: u32) -> Result<(), ConfigError> {
+        let p = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.name == name)
+            .ok_or_else(|| ConfigError::NotFound(name.to_string()))?;
+        p.db = db;
+        Ok(())
+    }
+
     /// Replaces the tags of profile `name`; nothing else changes.
     pub fn set_tags(&mut self, name: &str, tags: Vec<String>) -> Result<(), ConfigError> {
         let p = self

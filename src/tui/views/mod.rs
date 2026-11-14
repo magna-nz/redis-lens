@@ -98,6 +98,7 @@ use super::{Effect, Notice, Screen, Session, copy_checked};
 
 pub mod analysis;
 pub mod cmdline;
+pub mod dbs;
 pub mod keys;
 pub mod pubsub;
 pub mod search;

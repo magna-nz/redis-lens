@@ -115,6 +115,7 @@ A panel of 2 Analysis, after Expiry.
 | `?` | Show or hide this key list |
 | `a` | Add a connection |
 | `:` | Open the command line |
+| `b` | Switch the database (once connected) |
 | `q` `ctrl-c` | Quit |
 
 #### Connections
@@ -852,7 +853,7 @@ The TTL, Diff, Hot keys and Nodes panels are the earlier views of the same names
 - **Refused commands:** commands that would change the panel's own connection are refused with a pointer to the right place, without reading their flags:
   - `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE` and the unsubscribes: use Pub/Sub;
   - `MONITOR`: use the Monitor panel;
-  - `SELECT`: it would switch the database under every view;
+  - `SELECT`: it would switch the database under every view; the reason points to `b`, the database list;
   - `AUTH`, `HELLO`, `RESET`, `QUIT`, `CLIENT REPLY`, `SETNAME`, `SETINFO`, `TRACKING`, `CACHING`, `NO-TOUCH` and `NO-EVICT`: refused;
   - `MULTI`, `EXEC`, `DISCARD`, `WATCH` and `UNWATCH`: a transaction or a watch left open would queue or abort every view's commands and redis-lens's own edits, so they are refused, writes on included;
   - `SYNC`, `PSYNC`, `READONLY` and `READWRITE`: they would turn the connection into a replica link or switch its cluster mode;
@@ -989,10 +990,12 @@ Built. A profile can point at Sentinels instead of a server. redis-lens asks a S
 
 #### Database switch (P4)
 
-- `b` (on every view where the connection is ready) opens a list of databases: the current one, and every `dbN` line of `INFO keyspace`, read fresh when the list opens (one command from the budget), with its keys and expires. `↑↓` move, `enter` switches, `s` switches and saves the database as the profile's `db` in the config file (saved profiles only; it asks `y`/`n` first, and a failed save says so), `esc` closes. Without a saved profile (a Docker container) `s` says so.
-- **Switching** is a rescan of the session on the other database ([Rescan](#rescan): same rules, previous results kept and marked until the first partials). Every live connection moves with it: the views' live connection is opened again on the new index, a running Pub/Sub tail subscribes again to the same channel or pattern (Pub/Sub is not per database, so no message is lost to the switch other than those that arrive while it reconnects), and a running Monitor stops, since starting it again asks first. The header shows `db N` whenever the database is not 0.
-- The switch lasts for the session: a new connect uses the profile's saved `db` again, and the profile is never changed unless `s` is used.
-- **Off:** on a cluster ("A cluster only has database 0."), before the connection is ready, and while a scan runs. `SELECT` stays refused on the command line, and its reason points to `b`.
+**Built.**
+
+- `b` (on every view where the connection is ready, and a text input takes it as text) opens a list of databases: the current one, and every `dbN` line of `INFO keyspace`, read fresh when the list opens (one command from the budget, nothing polls it), with its keys and expires; the current database is always listed, with zeros when it holds no key, and the selection starts on it. `↑↓` move, `enter` switches (on the current database it only closes the list), `s` switches and saves the database as the profile's `db` in the config file (saved profiles only; it asks `y`/`n` first, `n` or `esc` going back to the list with nothing done, and a failed save says so), `esc` closes. If `INFO` is refused (`NOPERM`) or fails, the list shows the current database only, with a fixed reason ("The server refused INFO for this user: only the current database is listed."), never the server's text. Without a saved profile (a Docker container) `s` says so ("A container has no saved profile, so nothing can be saved.") and does nothing else; `enter` still switches, for the session. `s` on the current database saves it without a rescan.
+- **Switching** is a rescan of the session on the other database ([Rescan](#rescan): same rules, previous results kept and marked until the first partials; a later `r` stays on that database). Every live connection moves with it: the views' live connection is opened again on the new index, a running Pub/Sub tail subscribes again to the same channel or pattern once the new run's live connection is open (Pub/Sub is not per database, so no message is lost to the switch other than those that arrive while it reconnects), and a running Monitor stops, since starting it again asks first. The header shows `db N` whenever the database is not 0. With `s`, the switch is not held back by the save: a failed save says so ("Could not save db N for <profile>: …. The switch still applies to this session.") and the switch stands.
+- The switch lasts for the session: the session keeps its own copy of the profile with the new `db`, a new connect uses the profile's saved `db` again, and the profile is never changed unless `s` is used and answered `y`; only `db` is written, and no credential.
+- **Off:** on a cluster ("A cluster only has database 0."), before the connection is ready ("The connection is not ready yet…", also when nothing is connected, or the live connection is closed), and while a scan runs ("A scan is running: wait for it to finish, then press b."). Each says so in the status line and sends nothing. `SELECT` stays refused on the command line, and its reason points to `b`.
 
 #### 2 Analysis · Slots (P4)
 

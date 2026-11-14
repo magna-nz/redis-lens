@@ -430,6 +430,25 @@ impl PubSubState {
         t.restart_rate(None);
     }
 
+    /// What the running tail is subscribed to, if one runs (a database switch asks
+    /// before it ends the tail, to subscribe again).
+    pub fn running_subscription(&self) -> Option<Subscription> {
+        self.tail.active().then(|| self.tail.to.clone()).flatten()
+    }
+
+    /// A database switch ended the tail with its run: subscribes again to `to`, as
+    /// [`PubSubState::start`] does, keeping the rows and the filter on screen.
+    pub fn resubscribe(&mut self, to: Subscription, act: &mut Act<'_>) {
+        let old = std::mem::take(&mut self.tail);
+        self.start(to, act);
+        if self.tail.id.is_some() {
+            self.tail.rows = old.rows;
+            self.tail.filter = old.filter;
+        } else {
+            self.tail = old;
+        }
+    }
+
     /// The run the tail belongs to was replaced (a rescan): it is stopped.
     pub fn end_tail(&mut self) {
         if self.tail.active() {

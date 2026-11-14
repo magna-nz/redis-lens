@@ -51,6 +51,7 @@ use crate::budget::Budget;
 pub mod bulk;
 pub mod cmdline;
 pub mod command;
+pub mod dbs;
 pub mod keys;
 pub mod monitor;
 pub mod nodes;
@@ -359,6 +360,8 @@ pub enum LiveRequest {
     Bulk(bulk::Request),
     /// The Slots panel: `CLUSTER SLOT-STATS` of a node's slot ranges.
     Slots(slots::Request),
+    /// `INFO keyspace`, for the database list.
+    Dbs(dbs::Request),
 }
 
 /// The answer to a [`LiveRequest`], from the same group.
@@ -374,6 +377,7 @@ pub enum LiveReply {
     Write(write::Reply),
     Bulk(bulk::Reply),
     Slots(slots::Reply),
+    Dbs(dbs::Reply),
 }
 
 /// Why a request failed. The text is always redis-lens's own fixed wording, never the
@@ -416,6 +420,7 @@ pub async fn run(
         LiveRequest::Write(p) => write::run(conn, budget, p).await.map(LiveReply::Write),
         LiveRequest::Bulk(r) => bulk::run(conn, budget, r).await.map(LiveReply::Bulk),
         LiveRequest::Slots(r) => slots::run(conn, budget, r).await.map(LiveReply::Slots),
+        LiveRequest::Dbs(r) => dbs::run(conn, budget, r).await.map(LiveReply::Dbs),
     }
 }
 

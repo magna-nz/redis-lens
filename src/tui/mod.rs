@@ -686,6 +686,20 @@ impl Runner {
                     send(&tx, msg);
                 });
             }
+            Effect::SaveDb { name, db } => {
+                let path = self.path.clone();
+                tokio::task::spawn_blocking(move || {
+                    let msg = match save_db(&path, &name, db) {
+                        Ok(()) => Msg::DbSaved { name, db },
+                        Err(e) => Msg::DbSaveFailed {
+                            name,
+                            db,
+                            error: e.to_string(),
+                        },
+                    };
+                    send(&tx, msg);
+                });
+            }
             Effect::SaveConnection {
                 profile,
                 credentials,
@@ -776,6 +790,15 @@ fn load_trend(dir: &Path, report: &ScanReport) -> Result<snapshot::Trend, snapsh
 fn save_writes(path: &Path, name: &str, on: bool) -> anyhow::Result<()> {
     let mut config = Config::load(path)?;
     config.set_writes(name, on)?;
+    config.save(path)?;
+    Ok(())
+}
+
+/// Saves `db` as the database of profile `name` (the database list's `s`): `db`, and
+/// nothing else in the file.
+fn save_db(path: &Path, name: &str, db: u32) -> anyhow::Result<()> {
+    let mut config = Config::load(path)?;
+    config.set_db(name, db)?;
     config.save(path)?;
     Ok(())
 }
@@ -1397,6 +1420,55 @@ mod tests {
             sentinel: None,
             tags: Vec::new(),
         }
+    }
+
+    #[test]
+    fn save_db_changes_only_the_db_of_the_named_profile() {
+        let path = temp_path("save-db");
+        let a = Profile {
+            tags: vec!["team-a".into()],
+            read_only: Some(false),
+            ..profile("prod-cache-02")
+        };
+        let b = profile("other");
+        let cfg = Config {
+            profiles: vec![a.clone(), b.clone()],
+            ..Config::default()
+        };
+        cfg.save(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        save_db(&path, "prod-cache-02", 3).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        // The whole file is the same apart from that one line.
+        let changed: Vec<(&str, &str)> = before
+            .lines()
+            .zip(after.lines())
+            .filter(|(x, y)| x != y)
+            .collect();
+        assert_eq!(changed, [("db = 0", "db = 3")], "{after}");
+        assert_eq!(before.lines().count(), after.lines().count());
+        let got = Config::load(&path).unwrap();
+        assert_eq!(got.profiles[0], Profile { db: 3, ..a });
+        assert_eq!(got.profiles[1], b);
+    }
+
+    #[test]
+    fn save_db_for_a_profile_that_is_not_saved_fails_and_writes_nothing() {
+        let path = temp_path("save-db-missing");
+        let cfg = Config {
+            profiles: vec![profile("one")],
+            ..Config::default()
+        };
+        cfg.save(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(save_db(&path, "docker:app", 2).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // No file at all: nothing is created for a name that isn't there.
+        let none = temp_path("save-db-nofile");
+        assert!(save_db(&none, "one", 2).is_err());
+        assert!(!none.exists());
     }
 
     #[test]
