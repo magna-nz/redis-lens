@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** the TUI redesign is built on branch `claude/tui-redesign-ab602a`, for one PR that is not merged yet ([TUI redesign](#tui-redesign-2026-11-15)). On main: Redis Insight parity phases 1 to 4 (#15, #16, #17, #18, #19), and the phase 4 follow-up PR #20, merged on 2026-11-14 (merge commit `9e031cb`) with what #19 was merged without: the fixes for what the cluster verifier noted beyond its blocking finding, tests for the mutations that survived, and this file's phase 4 section.
-**Last updated:** 2026-11-15 (TUI redesign landed on its branch; the PR is not merged yet)
+**Current milestone:** Redis Insight parity phase 5, built on branch `claude/insight-phase5` for one PR that is not merged yet ([Phase 5](#phase-5-2026-11-15-the-rest-of-redis-insight-parity)). On main: parity phases 1 to 4 (#15, #16, #17, #18, #19), the phase 4 follow-up PR #20 (merged 2026-11-14, merge commit `9e031cb`) and the TUI redesign (#21, merged 2026-11-15, merge commit `dec974e`).
+**Last updated:** 2026-11-15 (phase 5 built on its branch except force standalone, which is in progress; the PR is not merged yet)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -470,7 +470,7 @@ Built unattended on `phase2/values-on-screen`, one PR for the whole phase ([#16]
 
 ## Phase 3 (2026-11-14): writes
 
-Built unattended on `claude/insight-phase3-e6291e`, one PR for the phase ([#18](https://github.com/magna-nz/redis-lens/pull/18)). Not merged: the owner merges. #17 (command-line gate fixes) was merged into this branch before Part 5, since both edit the command-line files, and is now on main too.
+Built unattended on `claude/insight-phase3-e6291e`, one PR for the phase ([#18](https://github.com/magna-nz/redis-lens/pull/18)), merged by the owner. #17 (command-line gate fixes) was merged into this branch before Part 5, since both edit the command-line files, and is now on main too.
 
 | Part | Content | Commits | State |
 |---|---|---|---|
@@ -570,7 +570,7 @@ Parts landed out of order (2, 1a, 5, 4, 3, then 1b) because they were built in p
 
 ## TUI redesign (2026-11-15)
 
-Built on branch `claude/tui-redesign-ab602a`, for one PR that is not merged yet. The design is in the redesign brief and screen notes; the behaviour is in spec.md ("Views", "Navigation", "1 Overview", "2 Browse › Keys", "The Analyze panels", "Analysis", "Help"). What a connect and an analysis send is the main change: a connect reads no key, and the TUI samples keys only when asked.
+Built on branch `claude/tui-redesign-ab602a` and merged by the owner as [#21](https://github.com/magna-nz/redis-lens/pull/21) (2026-11-15, merge commit `dec974e`). The design is in the redesign brief and screen notes; the behaviour is in spec.md ("Views", "Navigation", "1 Overview", "2 Browse › Keys", "The Analyze panels", "Analysis", "Help"). What a connect and an analysis send is the main change: a connect reads no key, and the TUI samples keys only when asked.
 
 | Part | Content | Commits | State |
 |---|---|---|---|
@@ -607,3 +607,42 @@ Built on branch `claude/tui-redesign-ab602a`, for one PR that is not merged yet.
 - On Connections at 80 columns `v` adds only SIGN-IN; MEMORY needs a wider list.
 - `conn::ssh` tests failed once each in two parts' runs (`early_exit_is_classified_and_never_echoed`, `a_dead_forward_is_started_again`) and passed on re-runs: they look flaky. `src/conn` was not changed by the redesign.
 - spec.md "Purpose" still says "Until the write phase lands, redis-lens writes nothing to a server", which phase 3 made stale.
+
+## Phase 5 (2026-11-15): the rest of Redis Insight parity
+
+Built on `claude/insight-phase5`, cut from main at `dec974e`, for one PR that is not merged yet. The parts were built in separate worktrees and merged into the branch as each passed its checks. The behaviour is in spec.md ("Recommendations (P1)", "Copy", "Command line panel", "Values", "Browse › Keys › a key's value", "Permission check, additions", "Server versions" and "Milestones").
+
+| Part | Content | Commits | State |
+|---|---|---|---|
+| small | Eviction findings (`VolatileNoTtl`, `NoEvictionFull`, `LfuOff`, no command sent); `y` on Server › Slow log and Monitor copies the masked command line; an `INFO` with no `maxmemory-policy` leaves the policy unknown, not a guessed `noeviction` | `88f807d`, `8fbc3d6`, `9eff419`, `908abf8`, `74b7411` (key rows), `5488e27`; merge `67619ac` | **done**; integration tests on Redis and Valkey for the findings |
+| cmdline | Command line result views (`ctrl-t`: text, table, JSON, raw), `N cmd` repeats (at most 100, checked and budgeted one by one), pipeline mode (`ctrl-p`) | `e92d71f`, `01a364b`, `7920a43` (key rows); merge `2261f46` | **done**; integration tests on Redis and Valkey |
+| values | Snappy; PHP, Pickle, Protobuf and Java serialization as bounded trees; detection order; arrays (Redis 8.8) and the TimeSeries, Bloom, Cuckoo, Count-Min Sketch, Top-K and t-digest values in a key's value; `f` cycles eight formats | `88cb82e`, `76e47dd`, `ec93b0f`, `c213ae2`, `534141d` (`f` text); merge `76ba274` | **done** |
+| docs | A GitHub Pages site in `docs/` (`index.html`, `site.css`, `site.js`, `.nojekyll`) and a README cut from 412 to 93 lines; the site's text on `expire` dry runs was corrected to match spec.md (a read-only profile refuses, dry run included) | `e22599c`, `6176202`; merge `1270a0c` | **done**; Pages is not enabled yet (see the questions) |
+| spec and status | spec.md, this section and the parity doc brought up to date | this commit | **done** |
+| force standalone | Connecting to one node of a cluster as a standalone server | | **in progress**, in a separate worktree; whoever merges it adds its commits, its spec.md text and this row's state |
+
+Tests: the keymap test `tui::keymap::tests::spec_lists_every_key` checks the key tables in spec.md against `src/tui/keymap.rs`; the key rows for the small and cmdline parts were added with their parts. Module values need no new ACL rule: their commands are in `+@read` on Redis 8 (checked on 8.10.1).
+
+### Decisions taken alone (phase 5)
+
+- **`expire --dry-run` on read-only profiles: not built.** spec.md "Bulk actions › From the command line" says "A read-only profile refuses with exit code 2, dry run included." Left as is: changing a safety rule is the owner's call.
+- **A repeat of a write that asks is refused**, not asked once. The write gate's question covers one command, so `N cmd` says "Not sent: this write asks first, … Send it without the count."
+- **An unknown eviction policy gives no finding** and is labelled "unknown", not guessed as `noeviction` (`5488e27`).
+- **Module value commands are not named in the ACL user:** a server without the module refuses the whole rule, and Redis 8's `+@read` covers them.
+- **Not built this round, with reasons:**
+  - cloud discovery (Redis Cloud, AWS, Azure across subscriptions): needs cloud accounts and can't be tested in CI;
+  - SSH password login: L effort, on a security-sensitive path;
+  - environment-variable connection presets: conflicts with rule 1, so the owner decides;
+  - aliases on connections: low value;
+  - server-side `HOTKEYS`: not confirmed on any image;
+  - uploading a commands file: the parity doc rates it low value;
+  - Vector Set similarity search;
+  - creating JSON keys.
+
+### Open questions (phase 5)
+
+- Install: the README and the site still say `cargo install redis-lens` and GitHub Releases. Neither exists yet (not on crates.io, no releases). Publish first, or reword?
+- GitHub Pages has to be enabled by the owner, served from `main` `/docs`.
+- Carried over: an allow-list for `INFO` and `PING` on the command line, and a reply-size check before whole-key reads.
+- Carried over: Dependabot PRs #2 to #5.
+- Carried over: the port-collision flake in the integration tests. The owner said to ignore it.
