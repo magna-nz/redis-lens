@@ -252,6 +252,17 @@ A panel of 2 Analysis, after Expiry.
 | `r` | Scan again, keeping old results meanwhile |
 | `s` | Save a scan snapshot file |
 
+#### Analysis · Slots
+
+| Keys | Action |
+|---|---|
+| `↑↓` `j` `k` | Move through the hottest slots |
+| `PgUp` `PgDn` | Move one page |
+| `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous panel |
+| `o` | Order the hottest slots by keys, CPU, network in or network out |
+| `r` | Read CLUSTER SLOT-STATS again on every node |
+
 #### Server · Overview
 
 | Keys | Action |
@@ -372,7 +383,7 @@ A panel of 2 Analysis, after Expiry.
 | `ctrl-u` | Clear the input line |
 | `esc` | Close the command line, or cancel a question |
 
-The key bar shows the main keys of the current screen, from this table: Connections `↑↓ Move · enter Connect · a Add · r Rescan Docker · 0-6 View · ? Help · q Quit`; Patterns `↑↓ Move · →← Fold · enter Open · / Filter · o Sort · 0-6 View · ? Help · q Quit`; the key list `↑↓ Move · / Filter · o Sort · n More · esc Back · 0-6 View · ? Help · q Quit`; the key detail `↑↓ Move · tab Value · f Format · n More · esc Back · 0-6 View · ? Help · q Quit`; TTL, Diff, Hot keys and Big keys with a result `↑↓ Move · tab Panel · r Rescan · s Snapshot · 0-6 View · ? Help · q Quit`, Expiry with a result `tab Panel · r Rescan · s Snapshot · 0-6 View · ? Help · q Quit`, Nodes with a result `↑↓ Move · tab Panel · enter Patterns · r Rescan · 0-6 View · ? Help · q Quit`, and the Analysis panels without one `tab Panel · 0-6 View · a Add · ? Help · q Quit`; once connected, Overview `tab Panel · p Pause · +- Interval · r Refresh · 0-6 View · ? Help · q Quit`, Clients `tab Panel · ↑↓ Move · enter List · r Refresh · 0-6 View · ? Help · q Quit`, Slow log `tab Panel · ↑↓ Move · p Pause · r Refresh · 0-6 View · ? Help · q Quit`, Monitor `tab Panel · enter Start · esc Stop · ↑↓ Scroll · 0-6 View · ? Help · q Quit`, Streams `↑↓ Move · tab Details · enter Entries · p Pause · 0-6 View · ? Help · q Quit`, Pub/Sub `↑↓ Move · enter Subscribe · space Pause · / Filter · 0-6 View · ? Help · q Quit` and Search `↑↓ Move · tab Details · / Query · enter Open · 0-6 View · ? Help · q Quit`; before that, the Server panels `tab Panel · 0-6 View · a Add · ? Help · q Quit` and Streams, Pub/Sub and Search `0-6 View · a Add · ? Help · q Quit`. Snapshot and rescan on Patterns, snapshot on Nodes, `enter` on the key list, `r` on Streams and Search, `s`, `c`, `esc`, `p` and `r` on Pub/Sub, the keys of a stream's entries and of Search's results (`n`, `f`, `e`, `P`, `esc`), paging and copy, and `:` (the command line), are only in the `?` overlay, so the bar fits 80 columns; the bar on Streams and Search is the same with the entries, a result, or an explain or profile open. A notice or an input line replaces the bar while shown; while the command line is open, its input line does. A test checks that this table is exactly what `keymap::markdown()` renders.
+The key bar shows the main keys of the current screen, from this table: Connections `↑↓ Move · enter Connect · a Add · r Rescan Docker · 0-6 View · ? Help · q Quit`; Patterns `↑↓ Move · →← Fold · enter Open · / Filter · o Sort · 0-6 View · ? Help · q Quit`; the key list `↑↓ Move · / Filter · o Sort · n More · esc Back · 0-6 View · ? Help · q Quit`; the key detail `↑↓ Move · tab Value · f Format · n More · esc Back · 0-6 View · ? Help · q Quit`; TTL, Diff, Hot keys and Big keys with a result `↑↓ Move · tab Panel · r Rescan · s Snapshot · 0-6 View · ? Help · q Quit`, Expiry with a result `tab Panel · r Rescan · s Snapshot · 0-6 View · ? Help · q Quit`, Nodes with a result `↑↓ Move · tab Panel · enter Patterns · r Rescan · 0-6 View · ? Help · q Quit`, Slots (once connected) `↑↓ Move · tab Panel · o Order · r Refresh · 0-6 View · ? Help · q Quit`, and the Analysis panels without one `tab Panel · 0-6 View · a Add · ? Help · q Quit`; once connected, Overview `tab Panel · p Pause · +- Interval · r Refresh · 0-6 View · ? Help · q Quit`, Clients `tab Panel · ↑↓ Move · enter List · r Refresh · 0-6 View · ? Help · q Quit`, Slow log `tab Panel · ↑↓ Move · p Pause · r Refresh · 0-6 View · ? Help · q Quit`, Monitor `tab Panel · enter Start · esc Stop · ↑↓ Scroll · 0-6 View · ? Help · q Quit`, Streams `↑↓ Move · tab Details · enter Entries · p Pause · 0-6 View · ? Help · q Quit`, Pub/Sub `↑↓ Move · enter Subscribe · space Pause · / Filter · 0-6 View · ? Help · q Quit` and Search `↑↓ Move · tab Details · / Query · enter Open · 0-6 View · ? Help · q Quit`; before that, the Server panels `tab Panel · 0-6 View · a Add · ? Help · q Quit` and Streams, Pub/Sub and Search `0-6 View · a Add · ? Help · q Quit`. Snapshot and rescan on Patterns, snapshot on Nodes, `enter` on the key list, `r` on Streams and Search, `s`, `c`, `esc`, `p` and `r` on Pub/Sub, the keys of a stream's entries and of Search's results (`n`, `f`, `e`, `P`, `esc`), paging and copy, and `:` (the command line), are only in the `?` overlay, so the bar fits 80 columns; the bar on Streams and Search is the same with the entries, a result, or an explain or profile open. A notice or an input line replaces the bar while shown; while the command line is open, its input line does. A test checks that this table is exactly what `keymap::markdown()` renders.
 
 ### Help overlay
 
@@ -659,7 +670,7 @@ Phase 1 is built: [Navigation](#navigation), the [Shared command budget](#shared
 - **Views (P1):** seven views, switched with `0` to `6`:
   - 0 Connections
   - 1 Patterns
-  - 2 Analysis, with the panels TTL, Diff, Hot keys, Big keys, Expiry and Nodes (TTL, Diff, Hot keys and Nodes keep their screens from before the panels)
+  - 2 Analysis, with the panels TTL, Diff, Hot keys, Big keys, Expiry, Nodes and Slots (TTL, Diff, Hot keys and Nodes keep their screens from before the panels)
   - 3 Server, with the panels Overview, Clients, Slow log and Monitor
   - 4 Streams
   - 5 Pub/Sub
@@ -982,12 +993,12 @@ Built. A profile can point at Sentinels instead of a server. redis-lens asks a S
 
 #### 2 Analysis · Slots (P4)
 
-A panel of 2 Analysis, after Nodes: what each slot range holds, from `CLUSTER SLOT-STATS` (Redis 8.2 and later, Valkey 8.0 and later; each node's version from its `INFO`).
+Built. A panel of 2 Analysis, after Nodes: what each slot range holds, from `CLUSTER SLOT-STATS` (Redis 8.2 and later, Valkey 8.0 and later; each node's version from its `INFO`).
 
-- **Commands:** when the panel is first shown and on `r`, never polled: on every primary, one `CLUSTER SLOT-STATS SLOTSRANGE <start> <end>` per slot range it owns, each from that node's budget, at most 4 nodes at once. A primary scanned on a replica is asked on that replica. Nothing else is sent; the per-slot CPU and network figures need `cluster-slot-stats-enabled yes`, which redis-lens never sets.
+- **Commands:** when the panel is first shown and on `r`, never polled: on every primary, one `CLUSTER SLOT-STATS SLOTSRANGE <start> <end>` per slot range it owns, each from that node's budget, at most 4 nodes at once. Each node's request starts with one `INFO server` (the version; nothing in the session knows it before the scan ends, and the panel does not wait for the scan), and a node whose version has no `CLUSTER SLOT-STATS` is not sent it. A primary scanned on a replica is asked on that replica. A node discovery could not connect to is not asked and shows `✗ not connected`. A rescan drops what was read; the panel reads again when it is shown. Nothing else is sent; the per-slot CPU and network figures need `cluster-slot-stats-enabled yes`, which redis-lens never sets.
 - **Ranges:** one row per node's slot range, in slot order: range, node, keys, CPU (µs), network in and out, and memory (Redis only, `memory-bytes`). A metric the reply doesn't carry shows `—`; when every CPU and network figure is 0 the title says "CPU and network need cluster-slot-stats-enabled yes".
-- **Hottest slots:** below, the 20 slots with the most keys, or by CPU, network in or network out: `o` cycles the order (keys → CPU → net in → net out → keys). Each row: slot, node, keys, CPU, network in and out. The detail panel lists the scan's example, big and hot keys that hash to the selected slot, with their patterns (computed locally, no command).
-- **Off** with a reason: "Not a cluster: this scan read one standalone server."; "CLUSTER SLOT-STATS needs Redis 8.2 or Valkey 8.0; <node> runs <version>" (the whole panel is off when any primary is older); "the server refused CLUSTER SLOT-STATS for this user"; a node that fails shows `✗` on its ranges and the others still show. It waits for the connection, not for the scan.
+- **Hottest slots:** below, the 20 slots with the most keys, or by CPU, network in or network out (a slot whose figure is 0 or missing is left out): `o` cycles the order (keys → CPU → net in → net out → keys), and the move keys move through this list. Each row: slot, node, keys, CPU, network in and out. The detail panel lists the scan's example, big and hot keys that hash to the selected slot, with their patterns (computed locally, no command).
+- **Off** with a reason: "Not a cluster: this scan read one standalone server."; "CLUSTER SLOT-STATS needs Redis 8.2 or Valkey 8.0; <node> runs <Redis|Valkey> <version>" (the whole panel is off when any primary is older; nodes not yet asked are then not asked); "The server refused CLUSTER SLOT-STATS for this user." (any node's `NOPERM`); a node that fails shows `✗` on its ranges and the others still show. It waits for the connection, not for the scan.
 - Nothing is copied on this panel (`y` does nothing).
 
 #### Small items (P4)
@@ -1004,7 +1015,7 @@ A panel of 2 Analysis, after Nodes: what each slot range holds, from `CLUSTER SL
 - **P1 probes:** `SLOWLOG LEN`, `CLIENT LIST ID 9223372036854775807` (an ID no client has, so it lists nothing), `XINFO HELP`, `PUBSUB NUMPAT`, `FT._LIST`. A refused probe turns its view off, never the connection: only the checks in [Permission check](#permission-check) make it limited. A missing Search module (an unknown `FT._LIST`) reads as skipped, not refused.
 - **P2 probes:** `COMMAND DOCS GET`.
 - **P3 probes:** `ACL DRYRUN`, where it is allowed.
-- **P4 probes:** on a cluster, all of the above on every connected node, each through its node's budget; `PUBSUB SHARDNUMSUB` (no channel) on Redis 7.0 and later and Valkey for the shard channel list; `CLUSTER SLOT-STATS SLOTSRANGE 0 0` on a primary for the Slots panel, where the version has it.
+- **P4 probes:** on a cluster, all of the above on every connected node, each through its node's budget; `PUBSUB SHARDNUMSUB` (no channel) on Redis 7.0 and later and Valkey for the shard channel list; no probe for the Slots panel: its refusal (`NOPERM`) is read from the panel's first request, which is read-only and sent only when the panel is shown.
 - **Turning off:** each missing permission turns off its view or panel, with the reason (rule 3).
 - **ACL user:** the minimal read-only user gains `+slowlog|get +slowlog|len +client|list +xinfo +pubsub|channels +pubsub|numsub +pubsub|numpat +command|docs +command|info +time +object|encoding +strlen +hlen +llen +scard +zcard +xlen`. Stream entries need `+type +xrevrange`, both in the `+@read` below. Give `+ft._list +ft.info`, and for queries `+ft.search +ft.explain +ft.profile`, only on a server with the Search module: a server without it refuses the whole rule, and an ACL file with it does not load. `+config|get` shows the slow log's threshold, but it also lets the user read every setting, `requirepass` and `masterauth` included, so it is left out: without it the panel says the threshold is unknown. For P2 it also needs the read commands for values: `+@read`, and `-keys` to block `KEYS`. The Pub/Sub live tail needs `+subscribe +psubscribe` and channels it may subscribe to: `&*` or `allchannels` in place of `resetchannels`, or `&<pattern>` for some (a `PSUBSCRIBE` pattern is checked against them as it is written). The Monitor panel needs `+monitor`; it is left out of the minimal user, because every command the server runs, other users' values included, goes to whoever runs `MONITOR`.
 

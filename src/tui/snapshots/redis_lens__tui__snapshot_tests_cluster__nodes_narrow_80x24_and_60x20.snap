@@ -7,7 +7,7 @@ expression: snap
  redis-lens 0.1.0    PROD   prod-cache-01  cluster · 3 shards · 1 u…  read-only 
  Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   SAMPLED 100K (1%)   
   0   1   2 Analysis   3   4   5   6                                            
-    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  tab next panel 
+    TTL  ·  Diff  ·  Hot keys  ·  Big keys  ·  Expiry  ·  Nodes  ·  Slots       
 ┌─ Nodes ─── 3 shards · 1 failed · 1 partial · slot order · enter shows a no… ─┐
 │ SLOTS        ENDPOINT         ROLE     STATUS      KEYS  SAMPLED   MEMORY    │
 │ 0-5460       10.0.1.11:6379   primary  scanned    3.17M      40K     5.9G    │
@@ -33,7 +33,7 @@ expression: snap
  redis-lens 0.1.0    PROD   prod-cache-01  cluster…  read-on
  Redis 7.4.2   MEM ██████▏░░░ 15G / 24G  62%   KEYS 7.92M   
   0   1   2 Analysis   3   4   5   6                        
-  TTL · Diff · Hot keys · Big keys · Expiry · Nodes         
+  TTL · Diff · Hot keys · Big keys · Expiry · Nodes · Slots 
 ┌─ Nodes ─── 3 shards · 1 failed · 1 partial · slot orde… ─┐
 │ SLOTS        ENDPOINT         ROLE     STATUS      KEYS  │
 │ 0-5460       10.0.1.11:6379   primary  scanned    3.17M  │

@@ -33,6 +33,7 @@ mod patterns;
 mod pubsub;
 mod search;
 mod server;
+mod slots;
 mod streams;
 pub mod style;
 mod ttl;
@@ -145,6 +146,7 @@ fn view_state(frame: &mut Frame, area: Rect, app: &App, screen: Screen) {
         Owner::Streams => streams::draw(frame, area, &v.streams, &ctx),
         Owner::PubSub => pubsub::draw(frame, area, &v.pubsub, &ctx),
         Owner::Search => search::draw(frame, area, &v.search, &ctx),
+        Owner::Slots => slots::draw(frame, area, &v.slots, &ctx),
         // Not a screen: drawn over the body by `draw`.
         Owner::Cmdline => {}
     }
