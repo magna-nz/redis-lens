@@ -7,7 +7,7 @@
 //! |---|---|---|
 //! | [`keys::KeysState`] | `ui/keys.rs` | Patterns › key list ([`Screen::KeyList`]) |
 //! | [`value::ValueState`] | `ui/value.rs` | Patterns › key detail ([`Screen::KeyDetail`]) |
-//! | [`analysis::AnalysisState`] | `ui/analysis.rs` | Analysis › Big keys, Expiry |
+//! | [`analysis::AnalysisState`] | `ui/analysis.rs` | Analyze › Big keys |
 //! | [`server::ServerState`] | `ui/server.rs` | Server › Overview, Clients, Slow log, Monitor |
 //! | [`streams::StreamsState`] | `ui/streams.rs` | Streams |
 //! | [`pubsub::PubSubState`] | `ui/pubsub.rs` | Pub/Sub |
@@ -71,8 +71,8 @@
 //!
 //! `ui/<view>.rs` has `pub fn draw(frame: &mut Frame, area: Rect, state: &State,
 //! ctx: &Ctx<'_>)`. `area` is the body between the header (with the tab bar) and the
-//! key bar. `ctx.screen` says which panel to draw. Big keys and Expiry are drawn only
-//! once the scan has finished (`ctx.report()` is `Some`).
+//! key bar. `ctx.screen` says which panel to draw. Big keys is drawn only once an
+//! analysis has finished (`ctx.report()` is `Some`).
 //!
 //! # Tests
 //!
@@ -100,6 +100,8 @@ pub mod analysis;
 pub mod cmdline;
 pub mod dbs;
 pub mod keys;
+pub mod names;
+pub mod overview;
 pub mod pubsub;
 pub mod search;
 pub mod server;
@@ -436,6 +438,9 @@ pub struct Ctx<'a> {
     pub sel_ticks: u64,
     /// `[settings]` from the config file, for the write gate.
     pub settings: &'a Settings,
+    /// `v` on this screen's area: show more columns and details. Off by default, kept
+    /// per area ([`crate::tui::app::More`]).
+    pub more: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -449,6 +454,7 @@ impl<'a> Ctx<'a> {
         page: usize,
         sel_ticks: u64,
         settings: &'a Settings,
+        more: bool,
     ) -> Self {
         Self {
             screen,
@@ -459,6 +465,7 @@ impl<'a> Ctx<'a> {
             page,
             sel_ticks,
             settings,
+            more,
         }
     }
 
@@ -802,7 +809,8 @@ pub mod testing {
     }
 
     /// Connected to prod-cache-01 (read-only), every permission check allowed, the
-    /// fixture scan finished, with no history. The live connection is not open yet.
+    /// fixture scan finished, with no history, on Browse › Keys. The live connection is
+    /// not open yet.
     pub fn scanned() -> App {
         let mut app = App::new(fixtures::profiles());
         let effects = app.handle_key(key(KeyCode::Enter));
@@ -822,6 +830,8 @@ pub mod testing {
             scan,
             report: Box::new(report),
         });
+        // A connect lands on Overview; tests start from Browse › Keys.
+        show(&mut app, Screen::Patterns);
         app
     }
 
@@ -844,9 +854,9 @@ pub mod testing {
         }
     }
 
-    /// Goes to `screen` with keys, as a user would: its view's digit, then `tab` to the
-    /// panel; for the key list, `enter` on the first pattern row of Patterns. For the
-    /// key detail, `enter` on the key list's selected key; when no key is loaded,
+    /// Goes to `screen` with keys, as a user would: its area's digit, then `tab` to the
+    /// panel; for the key list, `enter` on the first pattern row of Browse › Keys. For
+    /// the key detail, `enter` on the key list's selected key; when no key is loaded,
     /// [`key_row`] is put into the list first.
     pub fn show(app: &mut App, screen: Screen) -> Vec<Effect> {
         if screen == Screen::KeyDetail {
@@ -862,7 +872,7 @@ pub mod testing {
             return out;
         }
         let mut out = app.handle_key(KeyEvent::new(
-            KeyCode::Char(screen.view().digit()),
+            KeyCode::Char(screen.area().digit()),
             KeyModifiers::NONE,
         ));
         if screen == Screen::KeyList && app.screen() == Screen::KeyDetail {
@@ -882,7 +892,7 @@ pub mod testing {
             app.patterns.sel = first;
             out.extend(app.handle_key(key(KeyCode::Enter)));
         }
-        for _ in 0..screen.view().panels().len() {
+        for _ in 0..app.panels_of(screen.area()).len() {
             if app.screen() == screen {
                 break;
             }

@@ -9,9 +9,10 @@ use crate::model::KeyspaceInfo;
 pub const OFF_CLUSTER: &str = "A cluster only has database 0.";
 pub const OFF_NOT_READY: &str =
     "The connection is not ready yet: wait for it, then press b for the databases.";
-pub const OFF_SCANNING: &str = "A scan is running: wait for it to finish, then press b.";
+pub const OFF_SCANNING: &str = "An analysis is running: wait for it to finish, then press b.";
 pub const OFF_NOT_CONNECTED: &str = "Not connected: connect first (0 Connections, then enter).";
-pub const OFF_CLOSED: &str = "The live connection is closed: rescan (r on Patterns) first.";
+pub const OFF_CLOSED: &str =
+    "The live connection is closed: analyze again first (r on Overview, Browse or Analyze).";
 
 /// Shown in the list when `INFO` was refused (`NOPERM`). Never the server's text.
 pub const DENIED: &str =

@@ -1,11 +1,11 @@
-//! State of the Analysis view's Big keys and Expiry panels (spec "2 Analysis").
+//! State of the Analysis view's Big keys panel (spec "2 Analysis").
 //! Owner: wave B2. Drawn by `ui/analysis.rs`; its live requests are in
 //! `src/live/keys.rs`.
 //!
 //! Big keys lists the report's 50 biggest sampled keys. When it comes on screen it reads
 //! their lengths, and the encodings that the Recommendations need
-//! ([`crate::analysis::keys_to_check`]), once per report. Expiry needs no command. See
-//! [`super`] for the interface `App` calls.
+//! ([`crate::analysis::keys_to_check`]), once per report. See [`super`] for the
+//! interface `App` calls.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -28,7 +28,7 @@ fn report_id(r: &ScanReport) -> ReportId {
     (r.taken_at_unix, r.sampled_keys, r.profile.clone())
 }
 
-/// The Big keys and Expiry panels. TTL, Diff and Hot keys stay in `App`.
+/// The Big keys panel. Expiry, Changes and Hot keys stay in `App`.
 #[derive(Debug, Default)]
 pub struct AnalysisState {
     /// The selected Big keys row.
@@ -367,8 +367,13 @@ mod tests {
         }));
         testing::reply(&mut app, id, reply);
         let screen = format!("{:?}", testing::render(&app, 120, 36).backend());
+        // The sentence wraps in the detail pane: its parts, not its line breaks.
         assert!(
-            screen.contains("the server refused OBJECT ENCODING for this user"),
+            screen.contains("Without it, some rules are skipped"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("server refused OBJECT ENCODING"),
             "{screen}"
         );
         assert!(!screen.contains("reading lengths"), "{screen}");
@@ -387,18 +392,17 @@ mod tests {
             screen.contains("No sizes: MEMORY USAGE is not allowed"),
             "{screen}"
         );
-        app.handle_key(key(KeyCode::Tab));
-        let screen = format!("{:?}", testing::render(&app, 80, 24).backend());
-        assert!(
-            screen.contains("No sizes: MEMORY USAGE is not allowed"),
-            "{screen}"
-        );
+        // Expiry, one panel: its memory bars say why there are none.
+        testing::show(&mut app, Screen::Ttl);
+        let screen = format!("{:?}", testing::render(&app, 120, 36).backend());
+        assert!(screen.contains("No memory figures:"), "{screen}");
+        assert!(screen.contains("MEMORY USAGE is not"), "{screen}");
     }
 
     #[test]
     fn expiry_sends_nothing() {
         // Getting there passes Big keys, which asks for its facts once.
-        let (mut app, effects) = app_on(Screen::Expiry);
+        let (mut app, effects) = app_on(Screen::Ttl);
         let (id, _) = facts_request(&effects);
         let mut out = Vec::new();
         for _ in 0..20 {
@@ -414,17 +418,5 @@ mod tests {
         testing::reply(&mut app, id, reply);
         let report = app.session.as_ref().unwrap().report.as_ref().unwrap();
         assert!(app.views.analysis.loaded(report));
-    }
-
-    #[test]
-    fn expiry_80x24() {
-        let (app, _) = app_on(Screen::Expiry);
-        insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
-    }
-
-    #[test]
-    fn expiry_120x36() {
-        let (app, _) = app_on(Screen::Expiry);
-        insta::assert_snapshot!(testing::render(&app, 120, 36).backend());
     }
 }

@@ -1209,13 +1209,12 @@ impl App {
         match &s.live {
             LiveState::Ready => None,
             LiveState::Waiting => Some(
-                "The command line opens once the live connection is ready, after the scan \
-                 connects."
+                "The command line opens once the live connection is ready, after the connect."
                     .into(),
             ),
             LiveState::Closed(_) => Some(
                 "The live connection is closed, so the command line is off until the next \
-                 scan."
+                 connect or analysis (r on Overview)."
                     .into(),
             ),
         }
@@ -1433,7 +1432,10 @@ mod tests {
         app.handle_key(ch('?'));
         app.handle_key(ch(':'));
         assert!(!app.views.cmdline.open && app.help);
+        // esc clears what is typed into the help, then closes it; `a` is on Connections.
         app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(ch('0'));
         app.handle_key(ch('a'));
         app.handle_key(ch(':'));
         assert!(!app.views.cmdline.open);
@@ -1485,7 +1487,7 @@ mod tests {
         reply(&mut app, *id, ran(Value::BulkString(b"hello".to_vec())));
         assert!(!app.views.cmdline.running());
         let all = text(&app, 80, 24);
-        assert!(all.contains("> GET user:1"), "{all}");
+        assert!(all.contains("› GET user:1"), "{all}");
         assert!(all.contains("\"hello\""), "{all}");
         assert!(all.contains("(0.42 ms)"), "{all}");
         // The flags are kept: the second GET goes out at once.
@@ -2055,7 +2057,7 @@ mod tests {
             app.handle_key(key(KeyCode::PageUp));
         }
         let all = text(&app, 80, 24);
-        assert!(all.contains("> GET user:1"), "{all}");
+        assert!(all.contains("› GET user:1"), "{all}");
     }
 
     #[test]

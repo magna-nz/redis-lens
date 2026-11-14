@@ -890,7 +890,7 @@ mod tests {
         insta::assert_snapshot!("delete_key_prod_80x24", t.backend());
         let text = format!("{:?}", t.backend());
         assert!(text.contains("prod-cache-01 · PROD"), "{text}");
-        assert!(text.contains("Sends: UNLINK user:10293:cart"), "{text}");
+        assert!(text.contains("Sends   UNLINK user:10293:cart"), "{text}");
     }
 
     #[test]

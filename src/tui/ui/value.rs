@@ -8,39 +8,214 @@
 //! and the key name in the title. Rows too wide are cut with `…`.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Clear;
 
 use crate::format;
 use crate::live::values::{Items, JSON_MAX_SIZE, JSON_SHOWN, Kind, MAX_ITEMS, STRING_BYTES};
 use crate::model::Ttl;
+use crate::tui::app::App;
 use crate::tui::app::views::value::{Focus, Form, ValueState};
 use crate::tui::app::views::{Ctx, LiveState};
 use crate::value::{self, Raw};
-use crate::verdict::{PatternVerdict, pattern_verdict};
 
-use super::widgets::{fit, pad_l, pad_r, panel, pattern_spans, rows, scroll_offset, trunc, width};
+use super::widgets::{
+    Pane, Title, fit, pad_l, pad_r, panel, rows, scroll_offset, split_frame, trunc, width,
+};
 use super::{spinner, style};
 
-/// The metadata labels' column.
-const LABEL_W: usize = 13;
 const TTL_W: usize = 8;
 const SCORE_W: usize = 12;
 
-pub fn draw(frame: &mut Frame, area: Rect, state: &ValueState, ctx: &Ctx<'_>) {
-    let w = usize::from(area.width);
-    let left_w = (w * 38 / 100).clamp(20, 42).min(w);
-    let [left, right] = Layout::horizontal([
-        Constraint::Length(u16::try_from(left_w).unwrap_or(u16::MAX)),
-        Constraint::Min(0),
-    ])
-    .areas(area);
-    meta(frame, left, state, ctx);
-    value_panel(frame, right, state, ctx);
+/// Browse › Keys, `→` on a key: the key list on the left (dimmed: the keys are on the
+/// right), the key's value on the right (mockup "A key's value"). `←` goes back to the
+/// list; `→` moves into the value below the divider to scroll it.
+pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(ctx) = app.ctx() else {
+        return;
+    };
+    let state = &app.views.value;
+    let keys = &app.views.keys;
+    let left_title = format!("‹ {}", value::escape(keys.pattern.as_deref().unwrap_or("")));
+    let (title, right) = match &state.row {
+        Some(r) => (value::escape(&r.key), title_right(state, &ctx)),
+        None => ("Key".to_string(), String::new()),
+    };
+    let (left, inner) = split_frame(
+        frame,
+        area,
+        list_width(area.width),
+        Title::new(&left_title, ""),
+        Title::new(&title, &right),
+        Pane::Right,
+    );
+    key_column(frame, left, app);
+    let w = usize::from(inner.width);
+    let mut head: Vec<Line<'static>> = Vec::new();
+    if state.row.is_some() {
+        head.push(Line::from(fit(facts(state, &ctx, w), w)));
+        let mut notes: Vec<String> = state.refused.iter().map(|e| format!(" ▲ {e}.")).collect();
+        if let (Some(Kind::Hash), Some(why)) = (&state.kind(), &state.httl_off) {
+            notes.push(format!(" ▲ {why}"));
+        }
+        for n in notes {
+            head.extend(
+                wrap(&n, w)
+                    .into_iter()
+                    .map(|l| Line::from(fit(vec![Span::styled(l, style::amber())], w))),
+            );
+        }
+        head.push(Line::default());
+    }
+    let used = u16::try_from(head.len())
+        .unwrap_or(inner.height)
+        .min(inner.height);
+    rows(frame, inner, head, None);
+    let body = Rect {
+        y: inner.y + used,
+        height: inner.height - used,
+        ..inner
+    };
+    draw_value_body(frame, body, state, &ctx);
     if let Some(form) = &state.form {
         draw_form(frame, area, form);
     }
+}
+
+/// The key list's width on a key's value: 28 of 80 columns and 40 of 120.
+pub(super) fn list_width(total: u16) -> u16 {
+    let ratio = if total >= 110 { 1.0 / 3.0 } else { 0.35 };
+    super::widgets::split_at(total, ratio)
+}
+
+/// The key list beside a value: its keys, the open one bright, the others dim; SIZE
+/// and EXPIRES when there is room.
+fn key_column(frame: &mut Frame, area: Rect, app: &App) {
+    let keys = &app.views.keys;
+    let open = app.views.value.row.as_ref().map(|r| r.key.as_str());
+    let w = usize::from(area.width);
+    let wide = w >= 34;
+    let kw = if wide { w.saturating_sub(15) } else { w };
+    let mut head = vec![Span::styled(pad_r(" KEY", kw), style::hd())];
+    if wide {
+        head.push(Span::styled(format!("{} ", pad_l("SIZE", 6)), style::hd()));
+        head.push(Span::styled(pad_l("EXPIRES", 7), style::hd()));
+    }
+    rows(frame, area, vec![Line::from(head)], None);
+    let body = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    let visible = keys.visible();
+    let sel = keys.sel.min(visible.len().saturating_sub(1));
+    let off = scroll_offset(sel, usize::from(body.height));
+    let lines: Vec<Line<'static>> = visible
+        .iter()
+        .skip(off)
+        .take(usize::from(body.height))
+        .map(|&i| {
+            let r = &keys.rows[i];
+            let st = if Some(r.key.as_str()) == open {
+                style::fgb()
+            } else {
+                style::dim()
+            };
+            let mut spans = vec![Span::styled(
+                pad_r(&format!(" {}", value::escape(&r.key)), kw),
+                st,
+            )];
+            if wide {
+                let size = r.bytes.map_or_else(|| "—".to_string(), format::bytes);
+                spans.push(Span::styled(format!("{} ", pad_l(&size, 6)), st));
+                spans.push(Span::styled(pad_l(&super::keys::ttl_text(r.ttl), 7), st));
+            }
+            Line::from(fit(spans, w))
+        })
+        .collect();
+    rows(frame, body, lines, None);
+}
+
+/// The one line of facts above a value: its length, size and expiry; at wider widths
+/// the encoding, the LFU counter, field TTLs and, on a cluster, the node too.
+fn facts(state: &ValueState, ctx: &Ctx<'_>, w: usize) -> Vec<Span<'static>> {
+    let Some(row) = &state.row else {
+        return Vec::new();
+    };
+    let kind = state.kind();
+    let strlen = match &state.items {
+        Some(Items::String { len, .. }) => *len,
+        _ => None,
+    };
+    let mut parts: Vec<String> = Vec::new();
+    match (row.length.or(strlen), &kind) {
+        (Some(n), Some(Kind::String)) => parts.push(format!("{} bytes", format::grouped(n))),
+        (Some(n), k) => parts.push(format!(
+            "{} {}",
+            format::grouped(n),
+            length_label(k.as_ref(), n)
+        )),
+        (None, _) => {}
+    }
+    if let Some(b) = row.bytes {
+        parts.push(format::bytes(b));
+    }
+    parts.push(match row.ttl {
+        Ttl::Persistent => "never expires".to_string(),
+        Ttl::Expires(d) => format!("expires in {}", format::duration(d)),
+    });
+    let first = format!(" {}", parts.join(" · "));
+    // What joins the line when there is room, the node first: on a cluster, where
+    // the key is.
+    let mut more: Vec<String> = Vec::new();
+    if let Some(n) = ctx
+        .session
+        .owner_of(row.key.as_bytes())
+        .and_then(|i| ctx.session.nodes.get(i))
+    {
+        more.push(format!("on node {}", n.endpoint));
+    }
+    // A hash's field TTLs (Redis 7.4 and later), of the fields loaded.
+    if let (Some(Kind::Hash), true, Some(Items::Hash(fields))) =
+        (&kind, state.field_ttls, &state.items)
+    {
+        let with = fields
+            .iter()
+            .filter(|f| matches!(f.ttl, Some(Ttl::Expires(_))))
+            .count();
+        more.push(format!(
+            "{} of {} fields expire",
+            format::grouped(with as u64),
+            format::grouped(fields.len() as u64)
+        ));
+    }
+    if let Some(e) = &row.encoding {
+        more.push(format!("stored as {}", value::escape(e)));
+    }
+    if ctx.server().is_some_and(|s| s.lfu_enabled()) {
+        more.push(format!(
+            "LFU {}",
+            row.freq.map_or_else(|| "—".to_string(), |f| f.to_string())
+        ));
+    }
+    let mut spans = vec![Span::styled(first.clone(), style::fgb())];
+    let mut rest = String::new();
+    for m in more {
+        let next = if rest.is_empty() {
+            m
+        } else {
+            format!("{rest} · {m}")
+        };
+        if width(&first) + 3 + width(&next) >= w {
+            break;
+        }
+        rest = next;
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(format!("   {rest}"), style::dim()));
+    }
+    spans
 }
 
 /// Widest an edit form gets.
@@ -151,149 +326,22 @@ pub fn name_text(raw: &[u8]) -> String {
     out
 }
 
-fn ttl_text(t: Ttl) -> String {
-    match t {
-        Ttl::Persistent => "none".to_string(),
-        Ttl::Expires(d) => format::duration(d),
-    }
-}
-
-fn length_label(kind: Option<&Kind>) -> &'static str {
+/// What the items of a value are called, `n` of them.
+fn length_label(kind: Option<&Kind>, n: u64) -> &'static str {
+    let one = n == 1;
     match kind {
-        Some(Kind::Hash) => "Fields",
-        Some(Kind::List) => "Items",
-        Some(Kind::Set | Kind::ZSet) => "Members",
-        Some(Kind::Stream) => "Entries",
-        Some(Kind::Vector) => "Elements",
-        _ => "Length",
+        Some(Kind::Hash) if one => "field",
+        Some(Kind::Hash) => "fields",
+        Some(Kind::List) if one => "item",
+        Some(Kind::List) => "items",
+        Some(Kind::Set | Kind::ZSet) if one => "member",
+        Some(Kind::Set | Kind::ZSet) => "members",
+        Some(Kind::Stream) if one => "entry",
+        Some(Kind::Stream) => "entries",
+        Some(Kind::Vector) if one => "element",
+        Some(Kind::Vector) => "elements",
+        _ => "long",
     }
-}
-
-fn verdict_style(v: PatternVerdict) -> ratatui::style::Style {
-    match v {
-        PatternVerdict::Leak | PatternVerdict::Growing | PatternVerdict::Mixed => style::warn(),
-        PatternVerdict::BigKey | PatternVerdict::Persistent => style::amber(),
-        PatternVerdict::Ok => style::ok(),
-    }
-}
-
-fn meta(frame: &mut Frame, area: Rect, state: &ValueState, ctx: &Ctx<'_>) {
-    let Some(row) = &state.row else {
-        panel(frame, area, "Key", "");
-        return;
-    };
-    let inner = panel(frame, area, &value::escape(&row.key), "");
-    let w = usize::from(inner.width);
-    let kind = state.kind();
-    let label = |s: &str| Span::styled(pad_r(&format!(" {s}"), LABEL_W), style::dim());
-    let dash = || "—".to_string();
-    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
-    let type_text = state
-        .type_name
-        .as_deref()
-        .map_or_else(|| row.key_type.as_str().to_string(), value::escape);
-    lines.push(vec![label("Type"), Span::styled(type_text, style::fgb())]);
-    lines.push(vec![
-        label("Encoding"),
-        Span::styled(
-            row.encoding.as_deref().map_or_else(dash, value::escape),
-            style::fg(),
-        ),
-    ]);
-    let strlen = match &state.items {
-        Some(Items::String { len, .. }) => *len,
-        _ => None,
-    };
-    let length = match (row.length.or(strlen), &kind) {
-        (Some(n), Some(Kind::String)) => format!("{} bytes", format::grouped(n)),
-        (Some(n), _) => format::grouped(n),
-        (None, _) => dash(),
-    };
-    lines.push(vec![
-        label(length_label(kind.as_ref())),
-        Span::styled(length, style::fg()),
-    ]);
-    lines.push(vec![
-        label("Size"),
-        Span::styled(row.bytes.map_or_else(dash, format::bytes), style::fg()),
-    ]);
-    lines.push(vec![
-        label("TTL"),
-        Span::styled(ttl_text(row.ttl), style::fg()),
-    ]);
-    if let (Some(Kind::Hash), true, Some(Items::Hash(fields))) =
-        (&kind, state.field_ttls, &state.items)
-    {
-        let with = fields
-            .iter()
-            .filter(|f| matches!(f.ttl, Some(Ttl::Expires(_))))
-            .count();
-        let of = format!(
-            "{} of {} loaded",
-            format::grouped(with as u64),
-            format::grouped(fields.len() as u64)
-        );
-        let text = if LABEL_W + width(&of) + 7 <= w {
-            format!("{of} fields")
-        } else {
-            of
-        };
-        lines.push(vec![label("Field TTL"), Span::styled(text, style::fg())]);
-    }
-    if let Some(n) = ctx
-        .session
-        .owner_of(row.key.as_bytes())
-        .and_then(|i| ctx.session.nodes.get(i))
-    {
-        // On a cluster, the node the key is read on (its slot's owner), in full.
-        lines.push(vec![
-            label("Node"),
-            Span::styled(n.endpoint.to_string(), style::fg()),
-        ]);
-    }
-    if ctx.server().is_some_and(|s| s.lfu_enabled()) {
-        lines.push(vec![
-            label("LFU"),
-            Span::styled(row.freq.map_or_else(dash, |f| f.to_string()), style::fg()),
-        ]);
-    }
-    let mut p = vec![label("Pattern")];
-    p.extend(pattern_spans(
-        &value::escape(&state.pattern),
-        style::fg(),
-        style::ph(),
-    ));
-    lines.push(p);
-    let verdict = ctx
-        .report()
-        .and_then(|r| r.patterns.iter().find(|p| p.pattern == state.pattern))
-        .map(|p| {
-            let diff = ctx.session.diff().and_then(|d| d.pattern(&p.pattern));
-            pattern_verdict(p, diff)
-        });
-    lines.push(vec![
-        label("Verdict"),
-        match verdict {
-            Some(v) => Span::styled(v.label(), verdict_style(v)),
-            None => Span::styled("—", style::dim()),
-        },
-    ]);
-    let mut notes: Vec<String> = state.refused.iter().map(|e| format!(" ▲ {e}.")).collect();
-    if let (Some(Kind::Hash), Some(why)) = (&kind, &state.httl_off) {
-        notes.push(format!(" ▲ {why}"));
-    }
-    if !notes.is_empty() {
-        lines.push(Vec::new());
-    }
-    let mut out: Vec<Line<'static>> = lines.into_iter().map(|l| Line::from(fit(l, w))).collect();
-    for n in notes {
-        out.extend(
-            wrap(&n, w)
-                .into_iter()
-                .map(|l| Line::from(fit(vec![Span::styled(l, style::amber())], w))),
-        );
-    }
-    rows(frame, inner, out, None);
 }
 
 /// `text` in lines at most `w` cells wide, broken at spaces. Its leading spaces start
@@ -324,24 +372,25 @@ fn wrap(text: &str, w: usize) -> Vec<String> {
     out
 }
 
-fn panel_title(kind: Option<&Kind>) -> &'static str {
-    match kind {
-        Some(Kind::Hash) => "Fields",
-        Some(Kind::List) => "Items",
-        Some(Kind::Set | Kind::ZSet) => "Members",
-        Some(Kind::Stream) => "Entries",
-        Some(Kind::Json) => "Document",
-        Some(Kind::Vector) => "Elements",
-        _ => "Value",
-    }
-}
-
-fn title_right(state: &ValueState, ctx: &Ctx<'_>) -> String {
+/// The right of a value's title: its type, then loading, the format shown, how many
+/// items are loaded.
+pub fn title_right(state: &ValueState, ctx: &Ctx<'_>) -> String {
     let mut parts: Vec<String> = Vec::new();
+    if let Some(t) = state
+        .type_name
+        .as_deref()
+        .map(value::escape)
+        .or_else(|| state.row.as_ref().map(|r| r.key_type.as_str().to_string()))
+    {
+        parts.push(t);
+    }
     if state.is_loading() {
         parts.push(format!("{} loading", spinner(ctx.tick)));
     }
-    if let Some(raw) = state.format_source() {
+    // The format is in the line above the value; the title repeats it only with `v`.
+    if ctx.more
+        && let Some(raw) = state.format_source()
+    {
         let d = state.memo.decode(raw);
         parts.push(state.shown_format(&d).label().to_string());
     }
@@ -352,40 +401,31 @@ fn title_right(state: &ValueState, ctx: &Ctx<'_>) -> String {
             }
         }
         Some(Items::Json { .. } | Items::JsonNotRead { .. } | Items::NotRead) | None => {}
+        // How much is loaded, while not all of it is.
         Some(items) => {
-            let n = format::grouped(items.len() as u64);
-            let of = state.row.as_ref().and_then(|r| r.length).map_or_else(
-                || format!("{n} loaded"),
-                |m| format!("{n} of {}", format::grouped(m)),
-            );
-            parts.push(of);
+            let n = items.len() as u64;
+            match state.row.as_ref().and_then(|r| r.length) {
+                Some(m) if n < m => {
+                    parts.push(format!("{} of {}", format::grouped(n), format::grouped(m)))
+                }
+                Some(_) => {}
+                None => parts.push(format!("{} loaded", format::grouped(n))),
+            }
         }
     }
-    if let Some(cmd) = state.kind().and_then(|k| k.command()) {
+    // The command only with `v` (brief: command names leave titles).
+    if ctx.more
+        && let Some(cmd) = state.kind().and_then(|k| k.command())
+    {
         parts.push(cmd.to_string());
     }
     parts.join(" · ")
 }
 
-fn value_panel(frame: &mut Frame, area: Rect, state: &ValueState, ctx: &Ctx<'_>) {
-    let kind = state.kind();
-    draw_value_panel(frame, area, state, ctx, panel_title(kind.as_ref()), None);
-}
-
-/// The key detail's right-hand panel on its own, for the views that embed a value:
-/// the entries of a stream on 4 Streams and a Search document's fields. `title` goes on
-/// the left of the border; `right` on the right, or with `None` what the key detail
-/// shows there (loading, format, items loaded, the command).
-pub fn draw_value_panel(
-    frame: &mut Frame,
-    area: Rect,
-    state: &ValueState,
-    ctx: &Ctx<'_>,
-    title: &str,
-    right: Option<&str>,
-) {
-    let right = right.map_or_else(|| title_right(state, ctx), str::to_string);
-    let inner = panel(frame, area, title, &right);
+/// What a value pane holds, without a frame: the items and the selected one's value,
+/// a string or document, or why there is nothing to show. For the right pane of a
+/// key's value and the views that embed one (stream entries, a Search result).
+pub fn draw_value_body(frame: &mut Frame, inner: Rect, state: &ValueState, ctx: &Ctx<'_>) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -458,7 +498,9 @@ fn msg_lines(state: &ValueState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>> 
     } else if let LiveState::Closed(why) = ctx.live() {
         let why = why.as_deref().unwrap_or("it was closed");
         (
-            format!(" ✗ The live connection is closed: {why}. Scan again to reopen it."),
+            format!(
+                " ✗ The live connection is closed: {why}. r on Overview analyzes again and reopens it."
+            ),
             style::warn(),
         )
     } else if !ctx.live_ready() {

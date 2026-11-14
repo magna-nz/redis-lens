@@ -7,7 +7,7 @@
 //! [`value::preview`].
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use crate::format;
@@ -16,9 +16,12 @@ use crate::tui::app::views::Ctx;
 use crate::tui::app::views::pubsub::{PubSubState, Selected, Tail, TailRow, TailStatus};
 use crate::value;
 
+use super::analysis::{left_width, notice, paragraph};
 use super::streams::live_wait;
-use super::widgets::{bar, fit, pad_l, pad_r, panel, rows, scroll_offset, width};
-use super::{notice_panels, split_body, style};
+use super::style;
+use super::widgets::{
+    Pane, Title, bar, fit, pad_l, pad_r, rows, scroll_offset, split_frame, width,
+};
 
 const SUBS_W: usize = 6;
 const BAR_W: usize = 16;
@@ -41,29 +44,36 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) 
             format!(" ▲ {off}"),
             style::amber(),
         ))];
-        notice_panels(frame, area, TITLE, "off", lines);
+        notice(frame, area, TITLE, "off", lines);
         return;
     }
     if state.tail.status != TailStatus::None {
-        // The channels on the left, the tail on the right.
-        let left = if area.width >= 120 {
-            36
+        // The channels on the left, the tail on the right, in one frame.
+        let left_w = if area.width >= 120 {
+            35
         } else {
-            (area.width * 2 / 7).clamp(20, 30)
+            (area.width * 2 / 7).clamp(21, 31)
         };
-        let [chans, tail] =
-            Layout::horizontal([Constraint::Length(left), Constraint::Min(0)]).areas(area);
+        let (title, tail_right) =
+            tail_title(&state.tail, usize::from(area.width.saturating_sub(left_w)));
+        let (chans, tail) = split_frame(
+            frame,
+            area,
+            left_w,
+            Title::new("Channels", &channels_right(state)),
+            Title::new(&title, &tail_right),
+            Pane::Right,
+        );
         channels_narrow(frame, chans, state, ctx);
         draw_tail(frame, tail, &state.tail);
         return;
     }
     if !state.loaded {
-        let text = live_wait(ctx).unwrap_or_else(|| "Reading the channels with PUBSUB…".into());
+        let text = live_wait(ctx).unwrap_or_else(|| "Reading the channels…".into());
         let lines = vec![Line::from(Span::styled(format!(" {text}"), style::dim()))];
-        notice_panels(frame, area, TITLE, "", lines);
+        notice(frame, area, TITLE, "", lines);
         return;
     }
-    let (main, detail) = split_body(area);
     let mut right = String::new();
     if !ctx.live_ready() {
         right.push_str("not live · ");
@@ -71,20 +81,30 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) 
     if state.paused {
         right.push_str("paused · ");
     }
-    match (ctx.node_title(), ctx.session.picked_node()) {
-        // The classic counts are the picked node's own subscribers.
-        (Some(t), Some(n)) => right.push_str(&format!("{t} · subscribers on {}", n.endpoint)),
-        _ => right.push_str("active channels, most subscribers first"),
+    match ctx.node_title() {
+        Some(t) => right.push_str(&t),
+        None => right.push_str("most subscribers first"),
     }
-    let inner = panel(frame, main, TITLE, &right);
-    let w = usize::from(inner.width);
-    let (head, lines, sel) = list_lines(state, ctx, w, true);
+    let selected = state.selected().map(|s| match s {
+        Selected::Channel(ch) => value::escape(&ch.name),
+        Selected::Shard(r) => value::escape(&r.name),
+    });
+    let (list, detail) = split_frame(
+        frame,
+        area,
+        left_width(area.width),
+        Title::new(TITLE, &right),
+        Title::new(selected.as_deref().unwrap_or("Totals"), ""),
+        Pane::Left,
+    );
+    let w = usize::from(list.width).saturating_sub(1);
+    let (head, lines, sel) = list_lines(state, ctx, w, ctx.more && w >= 50);
     let body = if head.spans.is_empty() {
-        inner
+        list
     } else {
-        below_header(inner)
+        below_header(list)
     };
-    rows(frame, inner, vec![head], None);
+    rows(frame, list, vec![head], None);
     let at = sel.unwrap_or(0);
     let off = scroll_offset(at, usize::from(body.height));
     let lines: Vec<Line<'static>> = lines
@@ -243,17 +263,19 @@ fn below_header(inner: Rect) -> Rect {
 }
 
 /// The channel list beside the tail: names and subscriber counts, no bars.
-fn channels_narrow(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
-    let c = &state.counts;
+fn channels_right(state: &PubSubState) -> String {
     let mut right = String::new();
     if state.paused {
         right.push_str("paused · ");
     }
     if state.loaded {
-        right.push_str(&format::grouped(c.total_channels as u64));
+        right.push_str(&format::grouped(state.counts.total_channels as u64));
     }
-    let inner = panel(frame, area, "Channels", &right);
-    let w = usize::from(inner.width);
+    right
+}
+
+fn channels_narrow(frame: &mut Frame, inner: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
+    let w = usize::from(inner.width).saturating_sub(1);
     if !state.loaded {
         let text = format!(
             " {}",
@@ -376,9 +398,7 @@ fn wrap(text: &str, w: usize) -> Vec<String> {
     out
 }
 
-fn draw_tail(frame: &mut Frame, area: Rect, t: &Tail) {
-    let (title, right) = tail_title(t, usize::from(area.width));
-    let inner = panel(frame, area, &title, &right);
+fn draw_tail(frame: &mut Frame, inner: Rect, t: &Tail) {
     let w = usize::from(inner.width);
     let h = usize::from(inner.height);
     if h == 0 {
@@ -476,12 +496,19 @@ fn dim_line(text: String, w: usize) -> Line<'static> {
     Line::from(fit(vec![Span::styled(text, style::dim())], w))
 }
 
-fn totals(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
+fn totals(frame: &mut Frame, inner: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
     let c = &state.counts;
-    let inner = panel(frame, area, "Totals", "");
     let w = usize::from(inner.width);
-    let label = |s: &str| Span::styled(pad_r(&format!(" {s}"), 33), style::dim());
+    let label = |s: &str| Span::styled(pad_r(&format!(" {s}"), 16), style::dim());
     let dash = || "—".to_string();
+    // The commands behind a figure are for `v`.
+    let hint = |what: &str| {
+        if ctx.more {
+            format!("  ({what})")
+        } else {
+            String::new()
+        }
+    };
     let listed: Option<u64> = c
         .channels
         .iter()
@@ -498,26 +525,40 @@ fn totals(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
     };
     let mut lines = vec![
         Line::from(vec![
-            label("Active channels"),
+            label("Channels"),
             Span::styled(format::grouped(c.total_channels as u64), style::fgb()),
             Span::styled(cut, style::dim()),
         ]),
         Line::from(vec![
-            label("Pattern subscriptions"),
+            label("Patterns"),
             Span::styled(c.patterns.map_or_else(dash, format::grouped), style::fgb()),
-            Span::styled("  (PSUBSCRIBE, PUBSUB NUMPAT)", style::dim()),
+            Span::styled(hint("PSUBSCRIBE, PUBSUB NUMPAT"), style::dim()),
         ]),
         Line::from(vec![
-            label("Subscribers on listed channels"),
+            label("Subscribers"),
             Span::styled(listed.map_or_else(dash, format::grouped), style::fgb()),
-            Span::styled("  (direct SUBSCRIBE only)", style::dim()),
+            Span::styled(hint("direct SUBSCRIBE only"), style::dim()),
         ]),
     ];
+    // The classic counts are the picked node's own subscribers.
+    if let Some(n) = ctx
+        .session
+        .picked_node()
+        .filter(|_| ctx.node_title().is_some())
+    {
+        lines.push(Line::from(fit(
+            vec![
+                label("Counted on"),
+                Span::styled(n.endpoint.to_string(), style::fg()),
+            ],
+            w,
+        )));
+    }
     if state.shards_loaded && state.shards_off.is_none() {
         lines.push(Line::from(vec![
-            label("Active shard channels"),
+            label("Shard channels"),
             Span::styled(format::grouped(state.shards_total as u64), style::fgb()),
-            Span::styled("  (SSUBSCRIBE)", style::dim()),
+            Span::styled(hint("SSUBSCRIBE"), style::dim()),
         ]));
     }
     let selected = match state.selected() {
@@ -527,27 +568,30 @@ fn totals(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
     };
     if let Some((name, subs, node)) = selected {
         lines.push(Line::default());
-        let mut spans = vec![
-            label(if node.is_some() {
-                "Selected shard channel"
-            } else {
-                "Selected"
-            }),
-            Span::styled(value::escape(name), style::fg()),
-            Span::styled(
-                subs.map_or_else(String::new, |n| {
-                    format!("  ·  {} subscribers", format::grouped(n))
-                }),
-                style::dim(),
-            ),
-        ];
+        let which = if node.is_some() {
+            "Shard channel"
+        } else {
+            "Selected"
+        };
+        lines.push(Line::from(fit(
+            vec![label(which), Span::styled(value::escape(name), style::fg())],
+            w,
+        )));
+        let mut detail = subs.map_or_else(String::new, |n| {
+            format!("{} subscribers", format::grouped(n))
+        });
         if let Some(n) = node.and_then(|i| ctx.session.nodes.get(i)) {
-            spans.push(Span::styled(
-                format!("  ·  on {}", n.endpoint),
-                style::dim(),
-            ));
+            if !detail.is_empty() {
+                detail.push_str(" · ");
+            }
+            detail.push_str(&format!("on {}", n.endpoint));
         }
-        lines.push(Line::from(fit(spans, w)));
+        if !detail.is_empty() {
+            lines.push(Line::from(fit(
+                vec![label(""), Span::styled(detail, style::dim())],
+                w,
+            )));
+        }
     }
     for note in c.notes.iter().chain(&state.shards_notes) {
         lines.push(Line::from(fit(
@@ -564,13 +608,14 @@ fn totals(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
             w,
         )));
     }
-    lines.push(Line::from(fit(
-        vec![Span::styled(
-            " Counts read no payloads. enter or s starts a live tail, S a shard one.",
-            style::dim(),
-        )],
+    lines.push(Line::default());
+    lines.extend(paragraph(
+        vec![Span::raw(" ")],
+        " ",
+        "Counts read no payloads. enter or s starts a live tail, S a shard one.",
+        style::dim(),
         w,
-    )));
+    ));
     rows(frame, inner, lines, None);
 }
 

@@ -1768,7 +1768,7 @@ mod tests {
             s.version = v.to_string();
         }
         testing::live_ready(&mut app);
-        app.handle_key(ch('1'));
+        app.handle_key(ch('2'));
         let at = {
             let data = app.pattern_data().expect("patterns");
             let name = |i: usize| data.patterns[i].pattern.as_str();
@@ -1911,10 +1911,10 @@ mod tests {
         testing::reply(&mut app, id, page(Some("hash"), fields(), None));
         snap(&app, "hash");
         let all = text(&testing::render(&app, 120, 36));
-        assert!(all.contains("Field TTL   1 of 3 loaded fields"), "{all}");
+        // On the facts line, and a TTL column in the fields.
+        assert!(all.contains("1 of 3 fields expire"), "{all}");
         assert!(all.contains("TTL"), "{all}");
         assert!(all.contains("2h 10m"), "{all}");
-        assert!(all.contains("Verdict"), "{all}");
     }
 
     #[test]
@@ -1930,7 +1930,7 @@ mod tests {
             let (_, next) = one_request(&app.handle_key(ch('n')));
             assert!(!next.field_ttls, "{v}");
             let all = text(&testing::render(&app, 120, 36));
-            assert!(!all.contains("Field TTL"), "{all}");
+            assert!(!all.contains("fields expire"), "{all}");
             assert!(!all.contains(" TTL\n") && !all.contains("TTL │"), "{all}");
         }
         let (mut app, id, _) = open_with(cart(), Some("7.2.4"));
@@ -2252,7 +2252,7 @@ mod tests {
         let items = Items::Hash(vec![field("a", &long, None), field("b", "x", None)]);
         testing::reply(&mut app, id, page(Some("hash"), items, None));
         testing::render(&app, 80, 24);
-        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Right));
         assert_eq!(app.views.value.focus, Focus::Value);
         app.handle_key(key(KeyCode::End));
         let bottom = app.views.value.scroll;
@@ -2261,7 +2261,7 @@ mod tests {
         assert_eq!(app.views.value.scroll, bottom - 1);
         // The selection stays while the value scrolls.
         assert_eq!(app.views.value.selected(), 0);
-        app.handle_key(key(KeyCode::BackTab));
+        app.handle_key(key(KeyCode::Left));
         app.handle_key(ch('j'));
         assert_eq!((app.views.value.selected(), app.views.value.scroll), (1, 0));
     }
@@ -2270,8 +2270,8 @@ mod tests {
     fn esc_goes_back_and_the_detail_stays_open_across_views() {
         let (mut app, id, _) = open(cart());
         testing::reply(&mut app, id, page(Some("hash"), fields(), None));
-        app.handle_key(ch('2'));
-        let effects = app.handle_key(ch('1'));
+        app.handle_key(ch('0'));
+        let effects = app.handle_key(ch('2'));
         assert_eq!(app.screen(), Screen::KeyDetail);
         assert!(value_requests(&effects).is_empty());
         app.handle_key(key(KeyCode::Esc));
@@ -2298,7 +2298,7 @@ mod tests {
         let all = text(&testing::render(&app, 80, 24));
         let last = all.lines().last().unwrap();
         assert!(
-            last.contains("tab Value") && last.contains("f Format") && last.contains("esc Back"),
+            last.contains("→ Value") && last.contains("f Format") && last.contains("esc Back"),
             "{last}"
         );
     }
@@ -3175,5 +3175,104 @@ mod tests {
         // The key bar still fits 80 columns with the form's keys.
         let last = all.lines().last().unwrap();
         assert!(last.contains("enter send"), "{last}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Browse levels: pattern → keys → value → value pane, and back
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn right_and_left_walk_the_browse_levels_and_tab_only_switches_panels() {
+        let mut app = key_list(vec![cart()], None);
+        assert_eq!(app.screen(), Screen::KeyList);
+        // ← from a pattern's keys: the patterns; → on the pattern: its keys again.
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.screen(), Screen::Patterns);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.screen(), Screen::KeyList);
+        if app.views.keys.selected().is_none() {
+            app.views.keys.rows = vec![cart()];
+        }
+        // → on a key: its value on the right, the key list on the left.
+        let (id, _) = one_request(&app.handle_key(key(KeyCode::Right)));
+        assert_eq!(app.screen(), Screen::KeyDetail);
+        testing::reply(&mut app, id, page(Some("hash"), fields(), None));
+        let all = text(&testing::render(&app, 80, 24));
+        let frame = all.lines().nth(3).unwrap();
+        assert!(frame.starts_with("┌─ ‹ user:{id}:cart"), "{frame}");
+        assert!(frame.contains("┬─ user:10293:cart"), "{frame}");
+        // → moves into the value pane, ← comes back to the items.
+        assert_eq!(app.views.value.focus, Focus::Items);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.views.value.focus, Focus::Value);
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.views.value.focus, Focus::Items);
+        // Tab is for panels only: Streams, and back to the value as it was.
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.screen(), Screen::Streams);
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.screen(), Screen::KeyDetail);
+        assert_eq!(app.views.value.focus, Focus::Items);
+        // ← from the items: the key list; esc from there: the patterns.
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.screen(), Screen::KeyList);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::Patterns);
+    }
+
+    #[test]
+    fn writes_from_the_value_pane_go_through_the_confirm_dialog() {
+        let mut app = hash_app();
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.views.value.focus, Focus::Value);
+        // `d` on the selected field asks first; only `y` sends the HDEL.
+        let e = app.handle_key(ch('d'));
+        assert!(writes(&e).is_empty());
+        assert_eq!(app.confirm.as_ref().unwrap().expect, Expect::YesNo);
+        assert_eq!(
+            writes(&app.handle_key(ch('y'))),
+            [WriteOp::HDel {
+                key: "user:10293:cart".into(),
+                field: Raw::from("sku:44812")
+            }]
+        );
+        // `D`, the whole key, asks too; `n` sends nothing.
+        let mut app = hash_app();
+        app.handle_key(key(KeyCode::Right));
+        assert!(writes(&app.handle_key(ch('D'))).is_empty());
+        assert!(app.confirm.is_some());
+        assert!(writes(&app.handle_key(ch('n'))).is_empty());
+        assert!(app.confirm.is_none());
+        // A read-only profile gets no question and no write from the value pane.
+        let mut app = hash_app();
+        set_profile(&mut app, Env::Prod, None);
+        app.handle_key(key(KeyCode::Right));
+        for k in ['d', 'D', 'e', '+', 't', 'R'] {
+            assert!(writes(&app.handle_key(ch(k))).is_empty(), "{k}");
+            assert!(app.confirm.is_none(), "{k}");
+            app.handle_key(key(KeyCode::Esc));
+            if app.screen() != Screen::KeyDetail {
+                app.handle_key(key(KeyCode::Enter));
+            }
+        }
+    }
+
+    #[test]
+    fn a_value_with_writes_on_80x24_and_120x36() {
+        let app = hash_app();
+        let last = text(&testing::render(&app, 80, 24));
+        let last = last.lines().last().unwrap();
+        assert!(
+            last.contains("e Edit") && last.contains("+ Add") && last.contains("d Delete"),
+            "{last}"
+        );
+        insta::assert_snapshot!(
+            "value_writes_on_80x24",
+            testing::render(&app, 80, 24).backend()
+        );
+        insta::assert_snapshot!(
+            "value_writes_on_120x36",
+            testing::render(&app, 120, 36).backend()
+        );
     }
 }

@@ -290,6 +290,295 @@ pub fn panel(frame: &mut Frame, area: Rect, title: &str, right: &str) -> Rect {
     inner
 }
 
+// ---------------------------------------------------------------------------
+// Frames: list and details in one box, and stacked sections
+// ---------------------------------------------------------------------------
+
+/// Which pane of a [`split_frame`] has the keys: its title is highlighted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Left,
+    Right,
+}
+
+/// One pane's title in a frame's top border: `─ Title ` on the left, ` right ─` on the
+/// right, the right part dropped first when the pane is narrow.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Title<'a> {
+    pub left: &'a str,
+    pub right: &'a str,
+}
+
+impl<'a> Title<'a> {
+    pub fn new(left: &'a str, right: &'a str) -> Self {
+        Self { left, right }
+    }
+}
+
+/// The spans of a border line `w` cells wide between `start` and `end` (corner or tee
+/// characters): `start─ Title ───── right ─end`. The title in `title_style`.
+fn border_line(
+    w: usize,
+    start: &str,
+    end: &str,
+    t: Title<'_>,
+    title_style: Style,
+) -> Vec<Span<'static>> {
+    if w < 2 {
+        return vec![Span::styled(start.to_string(), style::border())];
+    }
+    let inner = w - 2;
+    let mut spans = vec![Span::styled(start.to_string(), style::border())];
+    let mut used = 0;
+    if !t.left.is_empty() && inner >= 5 {
+        let title = trunc(t.left, inner.saturating_sub(4).max(1));
+        spans.push(Span::styled("─ ", style::border()));
+        used += 2 + width(&title) + 1;
+        spans.push(Span::styled(title, title_style));
+        spans.push(Span::styled(" ", style::border()));
+    }
+    let room = inner.saturating_sub(used + 1);
+    let right = if !t.right.is_empty() && room > 6 {
+        trunc(t.right, room - 4)
+    } else {
+        String::new()
+    };
+    let right_w = if right.is_empty() {
+        0
+    } else {
+        width(&right) + 3
+    };
+    let fill = inner.saturating_sub(used + right_w);
+    spans.push(Span::styled("─".repeat(fill), style::border()));
+    if !right.is_empty() {
+        spans.push(Span::styled(" ", style::border()));
+        spans.push(Span::styled(right, style::dim()));
+        spans.push(Span::styled(" ─", style::border()));
+    }
+    spans.push(Span::styled(end.to_string(), style::border()));
+    spans
+}
+
+fn put(frame: &mut Frame, x: u16, y: u16, w: u16, spans: Vec<Span<'static>>) {
+    frame.render_widget(Line::from(spans), Rect::new(x, y, w, 1));
+}
+
+fn put_char(frame: &mut Frame, x: u16, y: u16, c: &str) {
+    frame.render_widget(
+        Span::styled(c.to_string(), style::border()),
+        Rect::new(x, y, 1, 1),
+    );
+}
+
+/// The width of the left pane of a [`split_frame`] `total` cells wide: `ratio` of it
+/// (0.0 to 1.0), and at least 12 cells on each side when there is room.
+pub fn split_at(total: u16, ratio: f64) -> u16 {
+    let ratio = if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let at = (f64::from(total) * ratio).round() as u16;
+    if total < 26 {
+        return at.min(total);
+    }
+    at.clamp(12, total - 12)
+}
+
+/// One frame holding a list on the left and the selected row's details on the right,
+/// with one shared divider:
+///
+/// ```text
+/// ┌─ Patterns ──────── by memory ─┬─ user:{id}:cart ───── hash ─┐
+/// │ …                             │ …                           │
+/// └───────────────────────────────┴─────────────────────────────┘
+/// ```
+///
+/// `left_w` is the left pane's width counted from the frame's left edge to the divider
+/// (see [`split_at`]). `focus` says which pane has the keys: its title is drawn
+/// highlighted, the other dim. Returns the inner areas of the left and the right pane.
+/// A frame too small for two panes gets everything on the left.
+pub fn split_frame(
+    frame: &mut Frame,
+    area: Rect,
+    left_w: u16,
+    left: Title<'_>,
+    right: Title<'_>,
+    focus: Pane,
+) -> (Rect, Rect) {
+    if area.width < 4 || area.height < 2 {
+        return (Rect::default(), Rect::default());
+    }
+    let left_w = left_w.clamp(1, area.width.saturating_sub(2));
+    let (lt, rt) = match focus {
+        Pane::Left => (style::title(), style::dim()),
+        Pane::Right => (style::dim(), style::title()),
+    };
+    let x = area.x;
+    let y = area.y;
+    let bottom = y + area.height - 1;
+    let div = x + left_w;
+    let right_w = area.width - left_w;
+    // Top: `┌─ left ─┬─ right ─┐`.
+    put(
+        frame,
+        x,
+        y,
+        left_w,
+        border_line(usize::from(left_w) + 1, "┌", "┬", left, lt),
+    );
+    put(
+        frame,
+        div,
+        y,
+        right_w,
+        border_line(usize::from(right_w), "┬", "┐", right, rt),
+    );
+    for row in y + 1..bottom {
+        put_char(frame, x, row, "│");
+        put_char(frame, div, row, "│");
+        put_char(frame, x + area.width - 1, row, "│");
+    }
+    let mut bot = vec![Span::styled("└", style::border())];
+    bot.push(Span::styled(
+        "─".repeat(usize::from(left_w.saturating_sub(1))),
+        style::border(),
+    ));
+    bot.push(Span::styled("┴", style::border()));
+    bot.push(Span::styled(
+        "─".repeat(usize::from(right_w.saturating_sub(2))),
+        style::border(),
+    ));
+    bot.push(Span::styled("┘", style::border()));
+    put(frame, x, bottom, area.width, bot);
+    let h = area.height.saturating_sub(2);
+    let l = Rect::new(x + 1, y + 1, left_w.saturating_sub(1), h);
+    let r = Rect::new(div + 1, y + 1, right_w.saturating_sub(2), h);
+    (l, r)
+}
+
+/// One of the stacked sections of a [`sections`] frame.
+#[derive(Debug, Clone, Copy)]
+pub struct Section<'a> {
+    pub title: Title<'a>,
+    /// Rows inside the section; `None` takes what is left (shared evenly when more
+    /// than one section has `None`).
+    pub rows: Option<u16>,
+}
+
+/// One frame of sections stacked top to bottom, each under its own title, one border
+/// between two (`├ ┤`):
+///
+/// ```text
+/// ┌─ Now ───────────── INFO every 2 s ─┐
+/// │ …                                  │
+/// ├─ Keys ──────────────── no keys read ┤
+/// │ …                                  │
+/// └────────────────────────────────────┘
+/// ```
+///
+/// Also the layout of a full-width list with its details below (Connections, Clients,
+/// Slow log, Nodes). Returns the inner area of each section, in order; a section that
+/// gets no room has an empty one. The first section's title is drawn highlighted.
+pub fn sections(frame: &mut Frame, area: Rect, list: &[Section<'_>]) -> Vec<Rect> {
+    let mut out = vec![Rect::default(); list.len()];
+    if list.is_empty() || area.width < 4 || area.height < 2 {
+        return out;
+    }
+    // One title row per section and the bottom border.
+    let borders = u16::try_from(list.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(1);
+    let room = area.height.saturating_sub(borders);
+    let fixed: u16 = list.iter().filter_map(|s| s.rows).sum();
+    let fills = list.iter().filter(|s| s.rows.is_none()).count() as u16;
+    let mut spare = room.saturating_sub(fixed);
+    let mut y = area.y;
+    let bottom = area.y + area.height - 1;
+    let w = usize::from(area.width);
+    let mut fills_left = fills;
+    for (i, sec) in list.iter().enumerate() {
+        if y >= bottom {
+            break;
+        }
+        let (start, end) = if i == 0 {
+            ("┌", "┐")
+        } else {
+            ("├", "┤")
+        };
+        let st = if i == 0 { style::title() } else { style::hd() };
+        put(
+            frame,
+            area.x,
+            y,
+            area.width,
+            border_line(w, start, end, sec.title, st),
+        );
+        y += 1;
+        let want = match sec.rows {
+            Some(n) => n,
+            None => {
+                let share = spare.checked_div(fills_left).unwrap_or(0);
+                fills_left = fills_left.saturating_sub(1);
+                spare -= share;
+                share
+            }
+        };
+        let h = want.min(bottom.saturating_sub(y));
+        for row in y..y + h {
+            put_char(frame, area.x, row, "│");
+            put_char(frame, area.x + area.width - 1, row, "│");
+        }
+        out[i] = Rect::new(area.x + 1, y, area.width - 2, h);
+        y += h;
+    }
+    // Rows no section took stay inside the frame.
+    for row in y..bottom {
+        put_char(frame, area.x, row, "│");
+        put_char(frame, area.x + area.width - 1, row, "│");
+    }
+    let mut bot = vec![Span::styled("└", style::border())];
+    bot.push(Span::styled(
+        "─".repeat(w.saturating_sub(2)),
+        style::border(),
+    ));
+    bot.push(Span::styled("┘", style::border()));
+    put(frame, area.x, bottom, area.width, bot);
+    out
+}
+
+/// Dims what is drawn in `area`, behind a dialog: every cell in the dim colour (in
+/// `NO_COLOR`, dim and not bold), so the dialog's words stand out. The text stays, so it
+/// still reads.
+pub fn dim(frame: &mut Frame, area: Rect) {
+    let area = area.intersection(frame.area());
+    let backdrop = style::backdrop();
+    let buf = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_style(backdrop);
+            }
+        }
+    }
+}
+
+/// A dialog box `w` × `h` centred in `area` (shrunk to fit): cleared, framed, with
+/// `title` and `right` in the top border. Returns its inner area. Draw it after
+/// [`dim`] so the screen behind it is dimmed.
+pub fn dialog(frame: &mut Frame, area: Rect, w: u16, h: u16, title: &str, right: &str) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    panel(frame, rect, title, right)
+}
+
 /// Render lines one per row from the top of `area`. `selected` gets the selection
 /// background across the whole row.
 pub fn rows(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, selected: Option<usize>) {
@@ -435,6 +724,105 @@ mod tests {
         let spans = ttl_hist_spans(&[0, 10, 0, 0, 0, 0, 5], style::warn());
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "·    ███  ·    ·    ·    ·    ▄▄▄  ");
+    }
+
+    fn draw_with(w: u16, h: u16, f: impl FnOnce(&mut Frame)) -> String {
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        t.draw(f).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_split_frame_shares_one_divider() {
+        let mut inner = (Rect::default(), Rect::default());
+        let text = draw_with(30, 4, |f| {
+            inner = split_frame(
+                f,
+                f.area(),
+                14,
+                Title::new("List", ""),
+                Title::new("Detail", "r"),
+                Pane::Left,
+            );
+        });
+        assert_eq!(
+            text,
+            "┌─ List ──────┬─ Detail ─────┐\n\
+             │             │              │\n\
+             │             │              │\n\
+             └─────────────┴──────────────┘"
+        );
+        assert_eq!(inner.0, Rect::new(1, 1, 13, 2));
+        assert_eq!(inner.1, Rect::new(15, 1, 14, 2));
+    }
+
+    #[test]
+    fn stacked_sections_share_tees_and_fill_the_rest() {
+        let mut inner = Vec::new();
+        let text = draw_with(20, 7, |f| {
+            inner = sections(
+                f,
+                f.area(),
+                &[
+                    Section {
+                        title: Title::new("Now", "x"),
+                        rows: Some(1),
+                    },
+                    Section {
+                        title: Title::new("Keys", ""),
+                        rows: None,
+                    },
+                ],
+            );
+        });
+        assert_eq!(
+            text,
+            "┌─ Now ──────── x ─┐\n\
+             │                  │\n\
+             ├─ Keys ───────────┤\n\
+             │                  │\n\
+             │                  │\n\
+             │                  │\n\
+             └──────────────────┘"
+        );
+        assert_eq!(inner, [Rect::new(1, 1, 18, 1), Rect::new(1, 3, 18, 3)]);
+    }
+
+    #[test]
+    fn frames_never_panic_on_tiny_areas() {
+        for (w, h) in [(0, 0), (1, 1), (3, 2), (4, 2), (5, 3), (200, 2)] {
+            draw_with(w, h, |f| {
+                split_frame(
+                    f,
+                    f.area(),
+                    2,
+                    Title::new("a", "b"),
+                    Title::new("c", "d"),
+                    Pane::Right,
+                );
+                sections(
+                    f,
+                    f.area(),
+                    &[Section {
+                        title: Title::new("a", "b"),
+                        rows: Some(9),
+                    }],
+                );
+                dim(f, f.area());
+                dialog(f, f.area(), 50, 9, "t", "r");
+            });
+        }
+        assert_eq!(split_at(100, 0.5), 50);
+        assert_eq!(split_at(40, 0.05), 12);
+        assert_eq!(split_at(40, 0.99), 28);
     }
 
     #[test]
