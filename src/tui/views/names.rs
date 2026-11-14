@@ -10,8 +10,9 @@
 //!
 //! The patterns are inferred with [`NamePatterns`], exactly as an analysis infers
 //! them, and each pattern's keys are estimated as (its names / names read) × `DBSIZE`.
-//! A pattern without a placeholder names one key: its count is the names seen, never
-//! scaled. The rows carry no type, size or TTL (`no_ttl` 0 means unknown): the draw
+//! A pattern that names one key (its only name is the pattern itself: no part of it
+//! varies, braces of a hash tag such as `{user1}.following` included) counts the names
+//! seen, never scaled. The rows carry no type, size or TTL (`no_ttl` 0 means unknown): the draw
 //! code never shows those, nor a `▲`, for them.
 
 use crate::live::names::{Ask, Page, Reply, Walk};
@@ -26,6 +27,11 @@ pub const FIRST_PAGES: u64 = 8;
 /// Why the names can't be read when the server refused `SCAN`.
 pub const SCAN_REFUSED: &str =
     "The server refused SCAN for this user, so no key names can be read.";
+
+/// Why a cluster node's key names are left out after its page failed twice (the
+/// address goes before it).
+pub const NODE_SKIPPED: &str =
+    "did not answer SCAN twice, so its key names are left out and the other nodes go on.";
 
 /// The names read so far and where the walk is.
 #[derive(Debug, Clone, Default)]
@@ -46,17 +52,17 @@ pub struct NamesState {
     pub error: Option<String>,
     /// Nodes whose `SCAN` was refused, left out of the walk.
     pub refused: Vec<usize>,
+    /// Nodes of a cluster left out because a page failed again when `n` asked for it
+    /// again ([`NODE_SKIPPED`]): the other nodes' walk goes on without them.
+    pub skipped: Vec<usize>,
+    /// The cluster node whose last page failed, once: a second failure leaves it out.
+    failed_node: Option<usize>,
     /// The rows: one per pattern, largest estimate first. Rebuilt after every page.
     pub stats: Vec<PatternStats>,
     /// Distinct names seen per pattern, by the order of `stats`.
     seen: Vec<u64>,
     /// The `DBSIZE` the estimates scale to.
     dbsize: u64,
-}
-
-/// True for a pattern that names one key: it has no placeholder.
-pub fn is_literal(pattern: &str) -> bool {
-    !pattern.contains('{') && !pattern.contains('*')
 }
 
 impl NamesState {
@@ -125,7 +131,22 @@ impl NamesState {
                 self.error = Some(SCAN_REFUSED.to_string());
                 self.rebuild();
             }
+            // A cluster node that fails again after `n` asked once more is left out, so
+            // one shard that does not answer does not stall every other shard's walk.
+            Err(LiveError::Failed(_) | LiveError::Unsupported(_))
+                if self.failed_node == Some(ask.node)
+                    && self.walk.as_ref().is_some_and(Walk::is_cluster) =>
+            {
+                if let Some(w) = self.walk.as_mut() {
+                    w.skip(ask.node);
+                }
+                self.skipped.push(ask.node);
+                self.failed_node = None;
+                self.error = None;
+                self.rebuild();
+            }
             Err(e) => {
+                self.failed_node = Some(ask.node);
                 self.retry = Some(ask);
                 // Stops here: `n` tries again.
                 self.want = self.pages;
@@ -138,6 +159,9 @@ impl NamesState {
     }
 
     fn take(&mut self, node: usize, page: &Page) {
+        if self.failed_node == Some(node) {
+            self.failed_node = None;
+        }
         if let Some(w) = self.walk.as_mut() {
             w.take(node, page);
         }
@@ -211,6 +235,13 @@ impl NamesState {
         self.seen.get(idx).copied().unwrap_or(0)
     }
 
+    /// True for a pattern that names one key: its only name read is the pattern
+    /// itself. Decided from the names, not from the pattern's characters: a key name
+    /// with a hash tag (`{user1}.following`, `cfg{prod}`) keeps its braces as they are.
+    pub fn is_literal(&self, pattern: &str) -> bool {
+        self.seen_of(pattern) == 1 && self.tree.contains(pattern)
+    }
+
     /// Distinct names seen of `pattern`.
     pub fn seen_of(&self, pattern: &str) -> u64 {
         self.stats
@@ -229,7 +260,7 @@ impl NamesState {
             .iter()
             .map(|p| {
                 let mut s = p.as_pattern_stats();
-                if is_literal(&p.pattern) {
+                if p.names_seen == 1 && self.tree.contains(&p.pattern) {
                     s.est_keys = p.names_seen;
                 }
                 s
@@ -292,6 +323,8 @@ mod tests {
         assert_eq!(row(&s, "user:{id}").est_keys, 750, "3 of 4 names × 1,000");
         assert_eq!(s.seen_of("user:{id}"), 3);
         assert_eq!(row(&s, "queue:emails").est_keys, 1, "one key, never scaled");
+        assert!(s.is_literal("queue:emails"));
+        assert!(!s.is_literal("user:{id}"));
         assert!(!s.complete());
         // The walk ends: every name read, so the counts are exact.
         let ask = s.next_page().unwrap();
@@ -300,6 +333,106 @@ mod tests {
         assert!(s.done() && s.complete());
         assert_eq!(row(&s, "user:{id}").est_keys, 4);
         assert!(s.more().unwrap_err().contains("Every key name is read: 5"));
+    }
+
+    /// A key name with a hash tag keeps its braces: it is still one key, never scaled.
+    /// A pattern the names collapsed into is scaled even when one name was read.
+    #[test]
+    fn a_hash_tagged_name_is_one_key_not_a_pattern() {
+        let mut s = NamesState::default();
+        s.start(&[], 1_000);
+        let ask = s.next_page().unwrap();
+        s.sent(Some(ReqId(1)), ask);
+        s.reply(page(
+            &[
+                "{user1}.following",
+                "cfg{prod}",
+                "user:1",
+                "user:2",
+                "order:7",
+            ],
+            9,
+        ));
+        let row =
+            |s: &NamesState, p: &str| s.stats.iter().find(|r| r.pattern == p).unwrap().clone();
+        for literal in ["{user1}.following", "cfg{prod}"] {
+            assert!(s.is_literal(literal), "{literal}: {:?}", s.stats);
+            assert_eq!(row(&s, literal).est_keys, 1, "{literal}");
+        }
+        assert!(!s.is_literal("user:{id}"));
+        assert_eq!(row(&s, "user:{id}").est_keys, 400);
+        // One name read, but its pattern varies: estimated.
+        assert!(!s.is_literal("order:{id}"), "{:?}", s.stats);
+        assert_eq!(row(&s, "order:{id}").est_keys, 200);
+    }
+
+    fn nodes(n: usize) -> Vec<NodeInfo> {
+        (0..n)
+            .map(|i| NodeInfo {
+                id: format!("n{i}"),
+                endpoint: crate::model::Endpoint {
+                    host: format!("10.0.1.{}", 11 + i),
+                    port: 6379,
+                    tls: false,
+                },
+                role: crate::model::NodeRole::Primary,
+                slots: vec![(i as u16 * 100, i as u16 * 100 + 99)],
+                connected: true,
+            })
+            .collect()
+    }
+
+    /// A cluster node whose page fails, and fails again when `n` asks once more, is
+    /// left out with a reason; the other nodes' walk goes on. A standalone server's
+    /// failing page is asked again on every `n`, as before.
+    #[test]
+    fn a_cluster_node_that_fails_twice_is_left_out_and_the_walk_goes_on() {
+        let mut s = NamesState::default();
+        s.start(&nodes(2), 1_000);
+        let mut id = 0;
+        let mut ask = |s: &mut NamesState| {
+            let a = s.next_page()?;
+            id += 1;
+            s.sent(Some(ReqId(id)), a.clone());
+            Some(a)
+        };
+        let first = ask(&mut s).unwrap();
+        s.reply(Err(LiveError::Failed("timeout".into())));
+        assert!(s.next_page().is_none(), "stops until n");
+        assert!(s.error.is_some());
+        s.more().unwrap();
+        assert_eq!(ask(&mut s), Some(first.clone()), "n asks the same page");
+        s.reply(Err(LiveError::Failed("timeout".into())));
+        assert_eq!(s.skipped, [first.node]);
+        assert_eq!(s.error, None);
+        // The other node is read on.
+        let other = ask(&mut s).expect("the other node's page");
+        assert_ne!(other.node, first.node);
+        s.reply(page(&["user:1", "user:2"], 0));
+        assert!(s.done() && !s.complete(), "a node left out: never complete");
+        assert!(NODE_SKIPPED.contains("left out"));
+
+        // Standalone: never left out, `n` asks again.
+        let mut s = NamesState::default();
+        s.start(&[], 10);
+        for i in 0..3 {
+            let a = s.next_page().unwrap();
+            s.sent(Some(ReqId(i)), a);
+            s.reply(Err(LiveError::Failed("timeout".into())));
+            assert!(s.skipped.is_empty());
+            s.more().unwrap();
+        }
+        assert!(s.next_page().is_some());
+        // A closed connection never leaves a node out.
+        let mut s = NamesState::default();
+        s.start(&nodes(2), 10);
+        for i in 0..3 {
+            let a = s.next_page().unwrap();
+            s.sent(Some(ReqId(i)), a);
+            s.reply(Err(LiveError::Closed));
+            s.more().unwrap();
+        }
+        assert!(s.skipped.is_empty());
     }
 
     #[test]

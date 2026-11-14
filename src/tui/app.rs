@@ -2344,7 +2344,7 @@ impl App {
                         use views::search::Focus as F;
                         Some(match se.focus {
                             F::Indexes if right => tab,
-                            F::Schema if left => back,
+                            F::Schema if left || esc => back,
                             _ => key,
                         })
                     }
@@ -2494,7 +2494,12 @@ impl App {
         } else {
             (s.picked + n - 1) % n
         };
-        self.node_changed()
+        let mut out = self.on_active("hide", |v, act| v.on_hide(act));
+        // Overview reads the new node's slow log and client list once (its findings).
+        self.views.server.node_picked();
+        self.views.search = Default::default();
+        out.extend(self.on_active("show", |v, act| v.on_show(act)));
+        out
     }
 
     /// The picked node changed: the Server panels and Search drop what they read from
@@ -2634,16 +2639,16 @@ impl App {
         out
     }
 
-    /// A new run of the session on its current profile (a database switch): an
-    /// analysis at the depth of the last one when there was one, else a connect that
-    /// reads no key (and shows no earlier results: they were of another run).
+    /// A new run of the session on its current profile (a database switch): a connect
+    /// that reads the figures and no key, never an analysis (keys are sampled only on
+    /// `r`). It shows no earlier results: they were of another database. Overview then
+    /// offers `r`, and Browse › Keys reads the new database's key names.
     pub(super) fn rescan(&mut self) -> Vec<Effect> {
-        let Some(s) = self.session.as_ref() else {
+        if self.session.is_none() {
             self.set_info("Nothing to connect again: connect first (0 Connections, then enter).");
             return Vec::new();
-        };
-        let again = s.analysis.or(s.report.as_ref().map(|_| Default::default()));
-        self.new_run(again)
+        }
+        self.new_run(None)
     }
 
     /// See [`Self::start_analysis`] and [`Self::rescan`].
@@ -2693,6 +2698,7 @@ impl App {
         }
         self.live_pending.clear();
         self.live_writes.clear();
+        self.views.server.new_run();
         self.confirm = None;
         self.bulk = None;
         self.dbs = None;
@@ -3603,11 +3609,13 @@ impl App {
                     return Vec::new();
                 }
                 let server = &mut self.views.server;
+                let pending = &self.live_pending;
+                let in_flight = |id: ReqId| pending.contains_key(&id);
                 if let Some(r) = slow {
-                    server.connect_read(views::server::Panel::SlowLog, r);
+                    server.connect_read(views::server::Panel::SlowLog, r, in_flight);
                 }
                 if let Some(r) = clients {
-                    server.connect_read(views::server::Panel::Clients, r);
+                    server.connect_read(views::server::Panel::Clients, r, in_flight);
                 }
             }
             Msg::LastSnapshot { id, scan, last } => {
@@ -8334,6 +8342,35 @@ mod tests {
         assert!(!s.stopped && !views::overview::stopped_early(s));
     }
 
+    /// `esc` while the analysis is still connecting: the header says `stopping…`
+    /// at once, as it does once it samples.
+    #[test]
+    fn the_header_says_stopping_while_a_stopped_analysis_still_connects() {
+        let (mut app, _) = just_connected();
+        show(&mut app, Screen::Overview);
+        app.handle_key(ch('r'));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            app.session.as_ref().unwrap().phase,
+            Phase::Connecting
+        ));
+        let effects = app.handle_key(key(KeyCode::Esc));
+        assert!(
+            matches!(effects[..], [Effect::StopAnalysis { .. }]),
+            "{effects:?}"
+        );
+        let header = |app: &App| {
+            let t = views::testing::render(app, 120, 36);
+            let buf = t.backend().buffer();
+            (0..buf.area.width)
+                .map(|x| buf[(x, 0)].symbol().to_string())
+                .collect::<String>()
+        };
+        let h = header(&app);
+        assert!(h.contains("stopping…"), "{h}");
+        assert!(!h.contains("connecting…"), "{h}");
+    }
+
     #[test]
     fn a_stopped_analysis_that_fails_shows_the_failure() {
         let (mut app, id, scan) = analyzing();
@@ -8408,6 +8445,60 @@ mod tests {
             last: Some(last),
         });
         assert_eq!(app.session.as_ref().unwrap().last_snapshot, Some(last));
+    }
+
+    /// The connect's `SLOWLOG GET` and `CLIENT LIST` arrive after the panels already
+    /// have something newer (a poll answered, or one in flight): they are dropped.
+    #[test]
+    fn a_connect_read_never_replaces_a_newer_panel_answer() {
+        use views::overview::tests::{clients_reply, slow_reply};
+        use views::testing;
+        let (mut app, id) = just_connected();
+        let scan = scan_of(&app);
+        // The Slow log polls and is answered; the Clients poll is still in flight.
+        let effects = testing::show(&mut app, Screen::SlowLog);
+        let (slow_req, _) = testing::requests(&effects)[0];
+        testing::reply(&mut app, slow_req, Ok(slow_reply()));
+        assert_eq!(app.views.server.slow.entries.len(), 2);
+        let effects = testing::show(&mut app, Screen::Clients);
+        let (clients_req, _) = testing::requests(&effects)[0];
+        let older_slow = crate::live::LiveReply::Server(crate::live::server::Reply::SlowLog(
+            Box::new(crate::live::server::SlowLogReply {
+                entries: Vec::new(),
+                config: None,
+                keys_off: None,
+                learned: std::collections::HashMap::new(),
+            }),
+        ));
+        app.apply(Msg::ServerReads {
+            id,
+            scan,
+            node: 0,
+            slow: Some(Ok(older_slow)),
+            clients: Some(Err(crate::live::LiveError::Denied("CLIENT LIST".into()))),
+        });
+        assert_eq!(
+            app.views.server.slow.entries.len(),
+            2,
+            "the poll's answer stays"
+        );
+        assert!(
+            app.views.server.clients.poll.off.is_none(),
+            "the poll in flight decides"
+        );
+        testing::reply(&mut app, clients_req, Ok(clients_reply()));
+        assert_eq!(app.views.server.clients.conns.len(), 213);
+
+        // A new run: answers of the last one are older than its connect's read.
+        app.views.server.new_run();
+        app.apply(Msg::ServerReads {
+            id,
+            scan,
+            node: 0,
+            slow: None,
+            clients: Some(Err(crate::live::LiveError::Denied("CLIENT LIST".into()))),
+        });
+        assert!(app.views.server.clients.poll.off.is_some());
     }
 
     #[test]

@@ -839,9 +839,17 @@ pub(super) fn draw_form(
     }
     lines.push(Line::from(""));
     match sends {
+        // Led by the label `Sends`, as the confirm dialog shows it: `Sends   XADD …`.
         Ok(line) => {
-            for part in wrap(&format!("Sends: {line}"), inner) {
-                lines.push(Line::from(Span::styled(format!(" {part}"), style::fgb())));
+            const LEAD: &str = " Sends   ";
+            const UNDER: &str = "         ";
+            let room = inner.saturating_sub(LEAD.len() + 1);
+            for (i, part) in wrap(line, room).into_iter().enumerate() {
+                let lead = if i == 0 { LEAD } else { UNDER };
+                lines.push(Line::from(vec![
+                    Span::styled(lead, style::dim()),
+                    Span::styled(part, style::fgb()),
+                ]));
             }
         }
         Err(why) => {

@@ -1,6 +1,5 @@
 ---
 source: src/tui/views/server.rs
-assertion_line: 2621
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys          ● connected "
@@ -15,8 +14,8 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
-"└──────────────────────────────────────────────────────────────────────────────┘"
-"┌─ Details ────────────────────────────────────────────────────────────────────┐"
+"│                                                                              │"
+"│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"

@@ -1,6 +1,5 @@
 ---
 source: src/tui/views/server.rs
-assertion_line: 2944
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " prod-cache-01   LOCAL   writes on   15G / 24G · 7.92M keys    ● analyzed 14:02 "
@@ -18,8 +17,8 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│ │ › max length    256▏                                                     │ │"
 "│ │   slowlog-max-len: the most entries the log keeps                        │ │"
 "│ │                                                                          │ │"
-"├─│ Sends: CONFIG SET slowlog-log-slower-than 5000; CONFIG SET slowlog-max-l │─┤"
-"│ │ en 256                                                                   │ │"
+"├─│ Sends   CONFIG SET slowlog-log-slower-than 5000; CONFIG SET slowlog-ma   │─┤"
+"│ │         x-len 256                                                        │ │"
 "│ └──────────────────────────────────────────────────────────────────────────┘ │"
 "│ keys   k                                                                     │"
 "│ client 10.0.1.5:50386 (worker)                                               │"

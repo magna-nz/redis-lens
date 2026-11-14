@@ -2,9 +2,8 @@
 //! cluster one row per shard) above "Keys" (what the server says about its keys, then
 //! what an analysis found), and the "Analyze the keys?" dialog.
 //!
-//! [`draw`] is the one entry point `ui::draw` calls for the Overview screen,
-//! [`draw_analyze`] the dialog's, and [`analyze_prompt`] the lines a scan view shows
-//! before an analysis.
+//! [`draw`] is the one entry point `ui::draw` calls for the Overview screen, and
+//! [`draw_analyze`] the dialog's.
 //!
 //! "Keys" is built from blocks (a heading and its rows) that are fitted to the height:
 //! a block is shown only with at least one of its rows, so a heading never stands
@@ -20,7 +19,7 @@ use crate::format;
 use crate::live::server::{InfoSample, Role};
 use crate::model::{NodeRole, Profile, ScanReport};
 use crate::tui::app::views::overview::{
-    AnalyzeDialog, Depth, Estimate, Finding, about_time, at_utc, estimate, estimate_for, findings,
+    AnalyzeDialog, Depth, Estimate, Finding, about_time, at_utc, estimate_for, findings,
     off_reasons, shows_analysis, stopped_early, time_left,
 };
 use crate::tui::app::views::server::{HISTORY, Metric, SHARDS_EVERY, sparkline};
@@ -650,7 +649,16 @@ fn keys_lines(app: &App, s: &Session, w: usize, h: usize) -> (Vec<Line<'static>>
         }
     } else {
         right = if cluster {
-            format!("summed over {} shards · no keys read", s.nodes.len())
+            // The shards whose figures are in the sum: those that answered.
+            let answered = s
+                .figures
+                .as_ref()
+                .filter(|f| !f.nodes.is_empty())
+                .map_or(s.nodes.len(), |f| {
+                    f.nodes.iter().filter(|n| n.figures.is_some()).count()
+                });
+            let shards = if answered == 1 { "shard" } else { "shards" };
+            format!("summed over {answered} {shards} · no keys read")
         } else {
             "from INFO, MEMORY STATS, SLOWLOG · no keys read".to_string()
         };
@@ -895,25 +903,6 @@ fn freed_line(r: &ScanReport, w: usize) -> Line<'static> {
         )),
     }
     Line::from(fit(spans, w))
-}
-
-/// The lines a screen that needs an analysis shows before one: what `r` would cost.
-/// `title` names the screen (empty on Overview itself). The profile's estimate alone
-/// ([`estimate`]): Overview has the session's own ([`estimate_for`]).
-pub fn analyze_prompt(p: &Profile, title: &str) -> Vec<Line<'static>> {
-    let e = estimate(Depth::Quick, p);
-    let mut lines = Vec::new();
-    if !title.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(" No analysis yet: {title} needs a sample of the keys."),
-            style::dim(),
-        )));
-    }
-    lines.push(Line::from(vec![
-        Span::styled("   r", style::amber()),
-        Span::styled(analyze_text(&e), style::fg()),
-    ]));
-    lines
 }
 
 /// Draws "Analyze the keys?" centred in `area`, over the dimmed screen: Quick and Deep
@@ -1509,6 +1498,20 @@ mod tests {
         app.handle_key(key(KeyCode::Char('r')));
         let t = text_of(&app, 80, 24);
         assert!(t.contains("across 3 shards"), "{t}");
+    }
+
+    /// A shard whose figures did not come is not in the sum, and the title says so.
+    #[test]
+    fn the_sum_names_only_the_shards_that_answered() {
+        let mut app = cluster_connected();
+        let t = text_of(&app, 120, 36);
+        assert!(t.contains("summed over 3 shards"), "{t}");
+        let s = app.session.as_mut().unwrap();
+        let f = s.figures.as_mut().unwrap();
+        f.nodes[2].figures = None;
+        let t = text_of(&app, 120, 36);
+        assert!(t.contains("summed over 2 shards"), "{t}");
+        assert!(!t.contains("summed over 3 shards"), "{t}");
     }
 
     #[test]

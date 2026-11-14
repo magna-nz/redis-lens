@@ -96,12 +96,28 @@ pub fn estimate_cluster_analysis(
     freq: bool,
     max_commands_per_sec: Option<u32>,
 ) -> AnalysisEstimate {
-    let quotas = split_sample_limit(sample, dbsizes);
+    let nodes: Vec<Option<u64>> = dbsizes.iter().copied().map(Some).collect();
+    estimate_cluster_analysis_of(sample, &nodes, sizes, freq, max_commands_per_sec)
+}
+
+/// [`estimate_cluster_analysis`] where some nodes have no figures (`None`: not
+/// connected, or `INFO`/`DBSIZE` failed). The scan sends such a node nothing, so it
+/// costs nothing and gets no share of the sample.
+pub fn estimate_cluster_analysis_of(
+    sample: u64,
+    dbsizes: &[Option<u64>],
+    sizes: bool,
+    freq: bool,
+    max_commands_per_sec: Option<u32>,
+) -> AnalysisEstimate {
+    let known: Vec<u64> = dbsizes.iter().map(|d| d.unwrap_or(0)).collect();
+    let quotas = split_sample_limit(sample, &known);
     let mut keys = 0u64;
     let mut commands = 0u64;
     // When each of the places running a node frees up, in commands.
     let mut lanes = [0u64; MAX_CONCURRENT_NODES];
     for (quota, dbsize) in quotas.iter().zip(dbsizes) {
+        let Some(dbsize) = dbsize else { continue };
         let (k, c) = server_cost(*quota, *dbsize, sizes, freq);
         keys = keys.saturating_add(k);
         commands = commands.saturating_add(c);
@@ -115,6 +131,21 @@ pub fn estimate_cluster_analysis(
         commands,
         duration: at_rate(longest, max_commands_per_sec),
     }
+}
+
+/// How long sampling `keys` more keys takes at least at the budget, while an analysis
+/// runs: one `SCAN` per [`SCAN_COUNT`] keys and the per-key commands, without the
+/// figures (already read). `None` without a limit.
+pub fn sampling_duration(
+    keys: u64,
+    sizes: bool,
+    freq: bool,
+    max_commands_per_sec: Option<u32>,
+) -> Option<Duration> {
+    let commands = keys
+        .div_ceil(SCAN_COUNT)
+        .saturating_add(keys.saturating_mul(per_key(sizes, freq)));
+    at_rate(commands, max_commands_per_sec)
 }
 
 #[cfg(test)]
@@ -177,6 +208,36 @@ mod tests {
             assert_eq!(e.duration, None, "{rate:?}");
             assert!(e.commands > 400_000);
         }
+    }
+
+    #[test]
+    fn a_node_without_figures_costs_nothing() {
+        let all = estimate_cluster_analysis(QUICK_SAMPLE, &[1_000, 1_000], true, false, None);
+        let one = estimate_cluster_analysis_of(
+            QUICK_SAMPLE,
+            &[Some(1_000), None, Some(1_000)],
+            true,
+            false,
+            None,
+        );
+        assert_eq!(one, all);
+        // A node with figures and no keys still costs its figures.
+        let empty = estimate_cluster_analysis_of(QUICK_SAMPLE, &[Some(0)], true, false, None);
+        assert_eq!(empty.commands, FIGURE_COMMANDS);
+        let none = estimate_cluster_analysis_of(QUICK_SAMPLE, &[None], true, false, None);
+        assert_eq!((none.keys, none.commands), (0, 0));
+    }
+
+    #[test]
+    fn sampling_left_counts_no_figures() {
+        // 5,900 keys: 6 SCANs and 3 per key, 17,706 commands at 5,000/s.
+        let d = sampling_duration(5_900, true, false, Some(5_000)).unwrap();
+        assert_eq!(d, Duration::from_secs_f64(17_706.0 / 5_000.0));
+        assert_eq!(
+            sampling_duration(0, true, false, Some(5_000)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(sampling_duration(10, true, true, None), None);
     }
 
     #[test]

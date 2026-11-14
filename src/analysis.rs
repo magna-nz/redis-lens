@@ -227,12 +227,34 @@ pub enum Severity {
     Info,
 }
 
+/// Which rule a [`Recommendation`] comes from, so a screen can tell where it leads
+/// without reading its sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecKind {
+    /// A sampled key past the big-key thresholds.
+    BigKey,
+    /// Collections past their compact encoding.
+    Encoding,
+    /// A lock pattern whose keys carry no TTL.
+    LockLeak,
+    /// A large share of memory never expires.
+    MemoryNeverExpires,
+    /// A pattern that never expires and grows (from Changes).
+    PersistentGrowing,
+    /// A pattern where some keys never expire while the rest do.
+    MixedTtl,
+    /// A pattern that never expires and is not growing.
+    PersistentStable,
+}
+
 /// One line of the Recommendations list: what was found, and what to do about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recommendation {
     pub severity: Severity,
     pub text: String,
     pub hint: String,
+    /// The rule it comes from.
+    pub kind: RecKind,
 }
 
 /// What the live connection read for one key: its length and encoding. `None` where
@@ -316,6 +338,7 @@ fn big_key_recs(
             severity: Severity::Warn,
             text,
             hint: big_key_hint(k.key_type).to_string(),
+            kind: RecKind::BigKey,
         });
     }
 }
@@ -360,6 +383,7 @@ fn encoding_recs(
                     if over == 1 { "is" } else { "are" }
                 ),
                 hint: "Past the compact encoding they take several times the memory.".to_string(),
+                kind: RecKind::Encoding,
             });
         }
     }
@@ -385,6 +409,7 @@ pub fn recommendations(
                 format::percent(p.no_ttl_ratio())
             ),
             hint: "A lock should always carry a TTL.".to_string(),
+            kind: RecKind::LockLeak,
         });
     }
     if let Some(e) = expiry(report).filter(|e| e.never_share() > NEVER_EXPIRES_SHARE) {
@@ -397,6 +422,7 @@ pub fn recommendations(
                 format::bytes(e.total)
             ),
             hint: "Fine for data that must stay; caches should expire.".to_string(),
+            kind: RecKind::MemoryNeverExpires,
         });
     }
     for p in &report.patterns {
@@ -405,12 +431,13 @@ pub fn recommendations(
             continue;
         }
         let change = diff.and_then(|d| d.pattern(&p.pattern));
-        let (severity, text, hint) = match ttl_verdict(p, change) {
+        let (severity, text, hint, kind) = match ttl_verdict(p, change) {
             TtlVerdict::Ok | TtlVerdict::ShortLived => continue,
             TtlVerdict::PersistentGrowing => (
                 Severity::Warn,
                 format!("{} never expires and is growing.", p.pattern),
                 "Probably a leak: nothing removes these keys.",
+                RecKind::PersistentGrowing,
             ),
             TtlVerdict::MixedLikelyBug => (
                 Severity::Note,
@@ -420,17 +447,20 @@ pub fn recommendations(
                     p.pattern
                 ),
                 "A write path probably skips EXPIRE.",
+                RecKind::MixedTtl,
             ),
             TtlVerdict::PersistentStable => (
                 Severity::Info,
                 format!("{} never expires.", p.pattern),
                 "Probably intentional, as it is not growing.",
+                RecKind::PersistentStable,
             ),
         };
         out.push(Recommendation {
             severity,
             text,
             hint: hint.to_string(),
+            kind,
         });
     }
     // Stable: the spec's order stays within a severity.
@@ -675,6 +705,11 @@ mod tests {
         assert!(!rule(&r));
         r.key_sizes.get_or_insert_default().ttl_bytes = [251, 0, 0, 749, 0, 0, 0];
         assert!(rule(&r));
+        let recs = recommendations(&r, None, &HashMap::new());
+        let rec = recs
+            .iter()
+            .find(|x| x.text.contains("of memory never expires"));
+        assert_eq!(rec.map(|x| x.kind), Some(RecKind::MemoryNeverExpires));
     }
 
     #[test]
@@ -715,6 +750,11 @@ mod tests {
             ["q:1 is a single 64M list.", "q:3 holds 1,000,000 items."],
             "{recs:#?}"
         );
+        assert!(
+            recs.iter()
+                .filter(|x| x.severity == Severity::Warn)
+                .all(|x| x.kind == RecKind::BigKey)
+        );
     }
 
     #[test]
@@ -745,6 +785,11 @@ mod tests {
         };
         assert!(fired(&r, &enc(20, 1)));
         assert!(!fired(&r, &enc(20, 0)));
+        let recs = recommendations(&r, None, &enc(20, 1));
+        assert!(
+            recs.iter().any(|x| x.kind == RecKind::Encoding),
+            "{recs:#?}"
+        );
         // A big key of the pattern counts too: 21 checked, 1 over is under 5%.
         r.key_sizes.get_or_insert_default().big_keys = vec![key("cart:99", KeyType::Hash, 100)];
         let mut f = enc(20, 1);
@@ -803,6 +848,16 @@ mod tests {
                 "forever:{id} never expires.",
             ],
             "{recs:#?}"
+        );
+        let kinds: Vec<RecKind> = recs.iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                RecKind::PersistentGrowing,
+                RecKind::LockLeak,
+                RecKind::MixedTtl,
+                RecKind::PersistentStable,
+            ]
         );
     }
 

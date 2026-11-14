@@ -353,7 +353,7 @@ impl StreamsState {
             return;
         };
         let Some(info) = &row.info else {
-            act.info("The key is gone, or no longer a stream. Rescan to update the list.");
+            act.info("The key is gone, or no longer a stream. r on Overview analyzes again and updates the list.");
             return;
         };
         let key_row = stream_row(&row.key, info);
@@ -450,7 +450,7 @@ impl StreamsState {
             return;
         };
         let Some(info) = &row.info else {
-            act.info("The key is gone, or no longer a stream. Rescan to update the list.");
+            act.info("The key is gone, or no longer a stream. r on Overview analyzes again and updates the list.");
             return;
         };
         let key = row.key.clone();
@@ -1633,7 +1633,7 @@ mod tests {
         assert!(!app.views.streams.entries_open);
         assert_eq!(
             notice(&app),
-            "The key is gone, or no longer a stream. Rescan to update the list."
+            "The key is gone, or no longer a stream. r on Overview analyzes again and updates the list."
         );
         // n, f and y on the list say what to do first.
         app.handle_key(ch('n'));

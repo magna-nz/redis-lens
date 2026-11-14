@@ -21,7 +21,7 @@ use crate::diff::ReportDiff;
 use crate::format;
 use crate::model::{ContextGap, PatternStats, ScanReport, TTL_BUCKET_LABELS, Ttl};
 use crate::scan::context::{bias_warnings, big_keys_total, coverage};
-use crate::tui::app::views::names::{NamesState, is_literal};
+use crate::tui::app::views::names::NamesState;
 use crate::tui::app::{App, PatternData, Phase};
 use crate::tui::clipboard::suggested_command;
 use crate::tui::tree::{Root, Row, SortBy, Summary, Verdict, summarize, summarize_group};
@@ -313,10 +313,10 @@ fn intro(w: usize) -> Vec<Line<'static>> {
 
 /// A key count from names: `~390K` estimated, exact once every name is read, and `1
 /// seen` for a pattern that names one key while the walk goes on.
-fn names_count(s: &Summary, complete: bool) -> String {
+fn names_count(s: &Summary, names: &NamesState, complete: bool) -> String {
     if complete {
         format::count(s.est_keys)
-    } else if is_literal(&s.label) {
+    } else if names.is_literal(&s.label) {
         format!("{} seen", format::count(s.sampled_keys))
     } else {
         format!("~{}", format::count(s.est_keys))
@@ -388,7 +388,7 @@ fn names_table(
                 let scroll = (i == sel).then(|| app.sel_ticks());
                 let mut spans = name_cell(s, *depth, *open, name_w, scroll);
                 spans.push(Span::styled(
-                    pad_l(&names_count(s, complete), NAMES_KEYS_W),
+                    pad_l(&names_count(s, names, complete), NAMES_KEYS_W),
                     style::fg(),
                 ));
                 Line::from(spans)
@@ -468,7 +468,7 @@ fn names_detail(
             format::grouped(s.est_keys),
             if s.est_keys == 1 { "key" } else { "keys" }
         )
-    } else if is_literal(&s.label) && !group {
+    } else if names.is_literal(&s.label) && !group {
         " One key: its name has no part that varies".to_string()
     } else {
         format!(
@@ -514,6 +514,20 @@ fn names_detail(
                 &format!(
                     " ▲ {}: not connected, so its key names are not read.",
                     n.endpoint
+                ),
+                w,
+                style::amber(),
+            ));
+        }
+    }
+    for &i in &names.skipped {
+        if let Some(n) = app.session.as_ref().and_then(|s| s.nodes.get(i)) {
+            lines.push(Line::default());
+            lines.extend(para(
+                &format!(
+                    " ▲ {}: {}",
+                    n.endpoint,
+                    crate::tui::app::views::names::NODE_SKIPPED
                 ),
                 w,
                 style::amber(),

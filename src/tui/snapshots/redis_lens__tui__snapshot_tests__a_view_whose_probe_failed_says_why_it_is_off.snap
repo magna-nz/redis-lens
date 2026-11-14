@@ -1,6 +1,5 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 1892
 expression: t.backend()
 ---
 " prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
@@ -15,8 +14,8 @@ expression: t.backend()
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
-"└──────────────────────────────────────────────────────────────────────────────┘"
-"┌─ Details ────────────────────────────────────────────────────────────────────┐"
+"│                                                                              │"
+"│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"

@@ -1,6 +1,5 @@
 ---
 source: src/tui/views/pubsub.rs
-assertion_line: 1636
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " prod-cache-01   LOCAL   writes on   15G / 24G · 7.92M keys    ● analyzed 14:02 "
@@ -18,7 +17,7 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│ │ › message  made-up order 4711▏                                           │ │"
 "│ │   the message, as typed; it is shown here only                           │ │"
 "│ │                                                                          │ │"
-"│ │ Sends: PUBLISH orders:us "made-up order 4711"                            │ │"
+"│ │ Sends   PUBLISH orders:us "made-up order 4711"                           │ │"
 "│ └──────────────────────────────────────────────────────────────────────────┘ │"
 "│                                             │                                │"
 "│                                             │                                │"

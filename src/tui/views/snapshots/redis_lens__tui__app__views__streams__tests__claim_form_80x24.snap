@@ -1,6 +1,5 @@
 ---
 source: src/tui/views/streams.rs
-assertion_line: 1894
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " prod-cache-01   LOCAL   writes on   15G / 24G · 7.92M keys    ● analyzed 14:02 "
@@ -19,7 +18,7 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│ │   count        100                                                       │ │"
 "│ │   the consumer that takes the entries                                    │ │"
 "│ │                                                                          │ │"
-"│ │ Sends: XAUTOCLAIM orders billing b-2 2700000 0-0 COUNT 100               │ │"
+"│ │ Sends   XAUTOCLAIM orders billing b-2 2700000 0-0 COUNT 100              │ │"
 "│ └──────────────────────────────────────────────────────────────────────────┘ │"
 "│                                        │                                     │"
 "│                                        │                                     │"

@@ -498,7 +498,9 @@ fn msg_lines(state: &ValueState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>> 
     } else if let LiveState::Closed(why) = ctx.live() {
         let why = why.as_deref().unwrap_or("it was closed");
         (
-            format!(" ✗ The live connection is closed: {why}. Scan again to reopen it."),
+            format!(
+                " ✗ The live connection is closed: {why}. r on Overview analyzes again and reopens it."
+            ),
             style::warn(),
         )
     } else if !ctx.live_ready() {

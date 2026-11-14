@@ -156,8 +156,8 @@ impl App {
         out
     }
 
-    /// Switches the session to database `db`: a rescan on it ([`App::rescan`]: previous
-    /// results kept and marked). The views' live connection is opened again on the new
+    /// Switches the session to database `db`: a connect on it that reads no key
+    /// ([`App::rescan`]: the previous database's results go). The views' live connection is opened again on the new
     /// index by the connect; a running Pub/Sub tail subscribes again to the same
     /// channel or pattern once the new live connection is ready; a running Monitor
     /// stops.
@@ -474,24 +474,46 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_another_database_rescans_on_it_and_keeps_the_old_results_marked() {
+    fn enter_on_another_database_connects_on_it_without_sampling_keys() {
+        // The session had an analysis: the switch still samples nothing (keys are
+        // sampled only on `r`), and the old database's results go.
         let mut app = ready();
+        assert!(app.session.as_ref().unwrap().report.is_some());
         opened(&mut app);
         let (id, old) = ids(&app);
         app.handle_key(ch('j'));
         let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { sample, .. }] = &effects[..] else {
+            panic!("expected one connect, got {effects:?}");
+        };
+        assert_eq!(*sample, None, "a switch reads no key");
         let (scan, profile) = connect_of(&effects);
         assert_eq!(profile.db, 3);
         assert_ne!(scan, old);
         assert!(app.dbs.is_none());
         let s = app.session.as_ref().unwrap();
         assert_eq!(s.profile.db, 3);
-        assert_eq!(s.previous, Some(old));
-        assert!(s.report.is_some(), "the previous results stay");
-        assert!(s.rescan);
+        assert_eq!(s.previous, None);
+        assert!(s.report.is_none(), "db 0's results are not shown for db 3");
+        assert_eq!(s.analysis, None);
         assert_eq!(s.scan, scan);
         // The saved profile is not touched.
         assert_eq!(app.entry(id).unwrap().profile.db, 0);
+
+        // Once connected, Overview offers `r` and nothing analyzes.
+        app.apply(Msg::Connected {
+            id,
+            scan,
+            server: Some(fixtures::report(true).server),
+            perms: fixtures::perms_with_probes(),
+            target: crate::conn::ScanTarget::Primary,
+        });
+        testing::live_ready(&mut app);
+        app.handle_key(ch('1'));
+        let text = format!("{:?}", testing::render(&app, 120, 36).backend());
+        assert!(text.contains("r  Analyze: 10,000 keys"), "{text}");
+        assert!(!text.contains("analyzing"), "{text}");
+        assert!(text.contains("● connected"), "{text}");
     }
 
     #[test]

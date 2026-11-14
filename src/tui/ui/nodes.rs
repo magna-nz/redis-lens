@@ -364,7 +364,7 @@ fn detail_lines(frame: &mut Frame, inner: Rect, n: &NodeReport, analyzed: u64) {
         w,
     ));
     // The whole note, wrapped over the rows that are left.
-    if let Some(note) = &n.note {
+    if let Some(note) = n.note.as_deref().map(plain_note) {
         out.push(Line::default());
         let (mark, st) = if n.status == NodeStatus::Failed {
             ("✗", note_style(n))
@@ -374,7 +374,7 @@ fn detail_lines(frame: &mut Frame, inner: Rect, n: &NodeReport, analyzed: u64) {
         out.extend(paragraph(
             vec![Span::styled(format!(" {mark} "), st)],
             "   ",
-            note,
+            &note,
             st,
             w,
         ));
@@ -382,8 +382,37 @@ fn detail_lines(frame: &mut Frame, inner: Rect, n: &NodeReport, analyzed: u64) {
     rows(frame, inner, out, None);
 }
 
+/// A node's note in the TUI's words: the engine's notes say "scan" (the CLI's report
+/// prints them as they are); here an analysis is an analysis.
+pub fn plain_note(note: &str) -> String {
+    use crate::scan::cluster::{NOTE_INFO_FAILED, NOTE_STOPPED};
+    note.replace(
+        NOTE_STOPPED,
+        "the analysis of this node stopped early (a connection or server error); its results are partial",
+    )
+    .replace(
+        NOTE_INFO_FAILED,
+        "INFO or DBSIZE could not be read on this node, so it was not analyzed",
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn engine_notes_say_analysis_on_screen() {
+        use crate::scan::cluster::{NOTE_INFO_FAILED, NOTE_STOPPED};
+        let joined = format!("10.0.1.12:6379: slow to answer; {NOTE_STOPPED}");
+        let plain = super::plain_note(&joined);
+        assert_eq!(
+            plain,
+            "10.0.1.12:6379: slow to answer; the analysis of this node stopped early (a connection or server error); its results are partial"
+        );
+        assert!(!super::plain_note(NOTE_INFO_FAILED).contains("scan"));
+        assert!(super::plain_note(NOTE_INFO_FAILED).ends_with("not analyzed"));
+        // Any other note is shown as it is.
+        assert_eq!(super::plain_note("could not connect"), "could not connect");
+    }
+
     use super::*;
 
     #[test]

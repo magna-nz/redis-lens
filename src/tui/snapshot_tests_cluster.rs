@@ -190,11 +190,14 @@ fn nodes_partial_note_wraps_in_the_detail_panel() {
     press(&mut app, "j");
     let t = render(&app, 80, 24);
     let all = text(&t);
-    // Every word of the note is on screen, over two lines of the detail panel.
+    // Every word of the note is on screen, over two lines of the detail panel, in
+    // the TUI's words: an analysis, not a scan.
     let detail: String = buffer_lines(&t)[9..23].join(" ");
-    for word in fixtures::NOTE_STOPPED.split_whitespace() {
+    let note = "the analysis of this node stopped early (a connection or server error); its results are partial";
+    for word in note.split_whitespace() {
         assert!(detail.contains(word), "{word} missing:\n{all}");
     }
+    assert!(!detail.contains("scan"), "{all}");
 }
 
 #[test]
@@ -676,6 +679,130 @@ fn picking_a_node_restarts_the_overview_and_keeps_a_monitor_run_on_its_node() {
     assert!(app.views.server.monitor.run.is_some());
     let all = text(&render(&app, 120, 36));
     assert!(all.contains("node 10.0.1.12:6379"), "{all}");
+}
+
+/// A cluster connected without an analysis, with every view probe allowed, its live
+/// connection open, on Overview, and the connect's slow log and client list of the
+/// first primary in.
+fn cluster_on_overview(perms: crate::model::PermissionReport) -> App {
+    use super::app::views::overview::tests::{clients_reply, slow_reply};
+    let mut app = App::new(fixtures::profiles());
+    let effects = app.handle_key(key(KeyCode::Enter));
+    let [Effect::Connect { id, .. }] = effects[..] else {
+        panic!("unexpected effects {effects:?}");
+    };
+    let scan = scan_of(&app);
+    app.apply(Msg::Connected {
+        id,
+        scan,
+        server: Some(fixtures::cluster_report().server),
+        perms,
+        target: ScanTarget::Cluster(HEALTHY.into()),
+    });
+    app.apply(Msg::Nodes {
+        id,
+        scan,
+        nodes: fixtures::live_nodes(),
+    });
+    app.apply(Msg::LiveReady { id, scan });
+    app.apply(Msg::ServerReads {
+        id,
+        scan,
+        node: 0,
+        slow: Some(Ok(slow_reply())),
+        clients: Some(Ok(clients_reply())),
+    });
+    assert_eq!(app.screen(), Screen::Overview);
+    app
+}
+
+fn finding_texts(app: &App) -> Vec<String> {
+    super::app::views::overview::findings(app)
+        .into_iter()
+        .map(|f| f.text)
+        .collect()
+}
+
+fn slow_and_clients(effects: &[Effect]) -> Vec<(Dest, LiveRequest)> {
+    sent(effects)
+        .into_iter()
+        .filter(|(_, _, r)| {
+            matches!(
+                r,
+                LiveRequest::Server(ServerRequest::SlowLog { .. } | ServerRequest::Clients)
+            )
+        })
+        .map(|(_, d, r)| (d, r))
+        .collect()
+}
+
+/// `]` on a cluster's Overview: the findings that came from the last node's slow log
+/// and client list go, and the new node's are read once (each through that node's
+/// budget, on the live connection to it), so they come back for that node.
+#[test]
+fn picking_a_node_on_overview_reads_its_slow_log_and_clients_once() {
+    use super::app::views::overview::tests::{clients_reply, slow_reply};
+    let mut app = cluster_on_overview(fixtures::perms_with_probes());
+    let before = finding_texts(&app);
+    assert!(
+        before.iter().any(|t| t.starts_with("KEYS took")),
+        "{before:?}"
+    );
+    assert!(before.iter().any(|t| t.contains("10.0.9.17")), "{before:?}");
+
+    let effects = app.handle_key(ch(']'));
+    let reads = slow_and_clients(&effects);
+    assert_eq!(reads.len(), 2, "{effects:?}");
+    assert!(reads.iter().all(|(d, _)| d.to == To::Node(1)), "{reads:?}");
+    // Nothing of the last node is shown for this one meanwhile.
+    assert!(finding_texts(&app).is_empty(), "{:?}", finding_texts(&app));
+
+    for (id, _, req) in sent(&effects) {
+        let reply = match req {
+            LiveRequest::Server(ServerRequest::SlowLog { .. }) => slow_reply(),
+            LiveRequest::Server(ServerRequest::Clients) => clients_reply(),
+            _ => continue,
+        };
+        super::app::views::testing::reply(&mut app, id, Ok(reply));
+    }
+    let after = finding_texts(&app);
+    assert!(
+        after.iter().any(|t| t.starts_with("KEYS took")),
+        "{after:?}"
+    );
+    assert!(after.iter().any(|t| t.contains("10.0.9.17")), "{after:?}");
+
+    // Once: the ticks on Overview read them no more.
+    for i in 1..=20u64 {
+        let at = std::time::Instant::now() + std::time::Duration::from_secs(i * 30);
+        let effects = app.apply(Msg::TickAt(at));
+        assert!(slow_and_clients(&effects).is_empty(), "{effects:?}");
+    }
+}
+
+/// `[` on another screen than Overview (Search) reads nothing for Overview until
+/// Overview is shown; a refused `SLOWLOG` is never sent, and Overview says it is off.
+#[test]
+fn the_findings_read_waits_for_overview_and_skips_a_refused_command() {
+    let mut app = cluster_on_overview(fixtures::perms_probes_off());
+    show(&mut app, Screen::Search);
+    let effects = app.handle_key(ch('['));
+    assert_eq!(app.session.as_ref().unwrap().picked, 2);
+    assert!(slow_and_clients(&effects).is_empty(), "{effects:?}");
+    let effects = super::app::views::testing::show(&mut app, Screen::Overview);
+    let reads = slow_and_clients(&effects);
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert!(
+        matches!(&reads[0], (d, LiveRequest::Server(ServerRequest::Clients)) if d.to == To::Node(2)),
+        "{reads:?}"
+    );
+    let effects = app.apply(Msg::TickAt(std::time::Instant::now()));
+    assert!(slow_and_clients(&effects).is_empty(), "{effects:?}");
+    let off = super::app::views::overview::off_reasons(&app);
+    assert!(
+        off.iter().any(|r| r.starts_with("Slow log is off")),
+        "{off:?}"
+    );
 }
 
 /// A live cluster whose third node discovery has no connection to: it refused the

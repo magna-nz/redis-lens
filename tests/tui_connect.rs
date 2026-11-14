@@ -1,6 +1,8 @@
 //! The TUI's connect and analyze runtime against real Redis and Valkey servers: a
-//! connect reads no key, a Quick analysis samples at most 10,000 keys, and `esc`
-//! (the stop flag) keeps what an analysis has sampled.
+//! connect reads no key and reads the slow log and the client list once, an ACL user
+//! refused both still connects with reasons, a cluster connect reads no key on any
+//! node, a Quick analysis samples at most 10,000 keys and reads the figures once, and
+//! `esc` (the stop flag) keeps what an analysis has sampled.
 #![cfg(feature = "integration-tests")]
 
 mod common;
@@ -8,14 +10,15 @@ mod common;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use common::cluster::parse_commandstats;
+use common::cluster::{cluster, parse_commandstats};
 use redis::aio::MultiplexedConnection;
 use redis_lens::conn;
-use redis_lens::model::{Auth, Endpoint, Env, Profile};
+use redis_lens::model::{Auth, Credentials, Endpoint, Env, PermStatus, Profile};
 use redis_lens::scan::StopFlag;
 use redis_lens::secrets::MemoryStore;
-use redis_lens::tui::app::Msg;
+use redis_lens::tui::app::{App, Effect, Msg};
 use redis_lens::tui::run_connect_for_tests;
+use secrecy::SecretString;
 use tokio::sync::mpsc;
 
 /// More keys than a Quick analysis samples.
@@ -120,13 +123,28 @@ fn calls(stats: &HashMap<String, (u64, u64)>, name: &str) -> u64 {
     stats.get(name).map_or(0, |s| s.0)
 }
 
+/// Calls of a command's subcommand as Redis 7+ and Valkey count it (`slowlog|get`)
+/// plus the whole command as Redis 6.2 counts every subcommand (`slowlog`).
+fn calls_of(stats: &HashMap<String, (u64, u64)>, command: &str, sub: &str) -> u64 {
+    calls(stats, &format!("{command}|{sub}")) + calls(stats, command)
+}
+
 /// Runs one connect (an analysis of `sample` keys with `Some`) to its end and returns
 /// every message it sent.
 async fn connect(profile: Profile, sample: Option<u64>) -> Vec<Msg> {
+    connect_with(profile, None, sample).await
+}
+
+/// [`connect`] with credentials (an ACL user).
+async fn connect_with(
+    profile: Profile,
+    credentials: Option<Credentials>,
+    sample: Option<u64>,
+) -> Vec<Msg> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     tokio::time::timeout(
         Duration::from_secs(60),
-        run_connect_for_tests(profile, None, sample, StopFlag::new(), tx),
+        run_connect_for_tests(profile, credentials, sample, StopFlag::new(), tx),
     )
     .await
     .expect("the connect ends in time");
@@ -146,16 +164,18 @@ fn no_failure(msgs: &[Msg], what: &str) {
     }
 }
 
-/// What the permission check alone sends, on a connection of its own.
+/// What one connection's handshake and the permission check send, as a connect opens
+/// one connection and checks it. The handshake counts: Redis 6.2 lists its `CLIENT
+/// SETINFO` under `client`, with `CLIENT LIST`.
 async fn probes(
     server: &common::TestServer,
     admin: &mut MultiplexedConnection,
 ) -> HashMap<String, (u64, u64)> {
+    reset_stats(admin).await;
     let mut c = conn::connect(&profile(server.port, Env::Local), &MemoryStore::default())
         .await
         .expect("connect")
         .into_inner();
-    reset_stats(admin).await;
     let _ = conn::check_all_permissions(&mut c).await;
     commandstats(admin).await
 }
@@ -192,10 +212,20 @@ async fn a_connect_reads_no_key() {
                 "{what}: {name} was sent: {stats:?}"
             );
         }
-        // The figures: one DBSIZE. The slow log and the client list: read once.
+        // The figures: one DBSIZE. The slow log and the client list: read once each,
+        // beyond the permission check's own `SLOWLOG LEN` and `CLIENT LIST ID` (Redis
+        // 6.2 counts every subcommand under the command's name).
         assert_eq!(calls(&stats, "dbsize"), 1, "{what}: {stats:?}");
-        let slowlog = calls(&stats, "slowlog|get") + calls(&stats, "slowlog");
-        assert!(slowlog >= 1, "{what}: {stats:?}");
+        assert_eq!(
+            calls_of(&stats, "slowlog", "get"),
+            calls_of(&baseline, "slowlog", "get") + 1,
+            "{what}: SLOWLOG GET once: {stats:?}"
+        );
+        assert_eq!(
+            calls_of(&stats, "client", "list"),
+            calls_of(&baseline, "client", "list") + 1,
+            "{what}: CLIENT LIST once: {stats:?}"
+        );
 
         // The messages: the figures with the keyspace, the two reads, no scan.
         let figures = msgs
@@ -258,6 +288,12 @@ async fn a_quick_analysis_samples_at_most_10000_keys() {
         assert_eq!(report.server.total_keys, KEYS, "{what}");
         // The server agrees: one TYPE per sampled key, plus the permission check's.
         assert!(calls(&stats, "type") <= QUICK + 1, "{what}: {stats:?}");
+        // The figures are read once: the analysis starts from the connect's.
+        assert_eq!(calls(&stats, "dbsize"), 1, "{what}: {stats:?}");
+        assert!(
+            msgs.iter().any(|m| matches!(m, Msg::Figures { .. })),
+            "{what}: the analysis's connect shows its figures"
+        );
         let target = msgs
             .iter()
             .filter_map(|m| match m {
@@ -330,5 +366,208 @@ async fn a_stopped_analysis_returns_what_it_sampled() {
         // Scaled from what it sampled: about the whole keyspace.
         let est: u64 = report.patterns.iter().map(|p| p.est_keys).sum();
         assert!(est.abs_diff(KEYS) <= KEYS / 100, "{what}: est {est}");
+    }
+}
+
+/// An ACL user refused `SLOWLOG` and `CLIENT` (whole commands: Redis 6.2 has no ACL
+/// rules for one subcommand): the connect sends neither, still connects and reads the
+/// figures, and Overview says why the slow log and the idle clients are off.
+#[tokio::test]
+async fn a_user_refused_slowlog_and_client_list_still_connects_with_reasons() {
+    for valkey in [false, true] {
+        let what = if valkey { "valkey" } else { "redis" };
+        let server = common::server_with(
+            valkey,
+            &[
+                "--user", "lens", "on", ">lens-pw", "~*", "+@all", "-slowlog", "-client",
+            ],
+        )
+        .await;
+        let mut admin = server.admin().await;
+        seed(&mut admin, 300).await;
+        let mut p = profile(server.port, Env::Local);
+        p.auth = Auth::Keychain;
+        let lens = Credentials {
+            username: Some("lens".into()),
+            password: SecretString::from("lens-pw"),
+        };
+        reset_stats(&mut admin).await;
+        let msgs = connect_with(p.clone(), Some(lens), None).await;
+        let stats = commandstats(&mut admin).await;
+        no_failure(&msgs, what);
+
+        // Neither is sent beyond the probes the server refused (not counted as calls).
+        assert_eq!(calls_of(&stats, "slowlog", "get"), 0, "{what}: {stats:?}");
+        assert_eq!(calls_of(&stats, "client", "list"), 0, "{what}: {stats:?}");
+        let perms = msgs
+            .iter()
+            .find_map(|m| match m {
+                Msg::Connected { perms, .. } => Some(perms.clone()),
+                _ => None,
+            })
+            .expect("connected");
+        for label in [conn::PERM_SLOWLOG, conn::PERM_CLIENT_LIST] {
+            let status = perms
+                .checks
+                .iter()
+                .find(|c| c.label == label)
+                .map(|c| &c.status);
+            assert!(
+                matches!(status, Some(PermStatus::Denied(_))),
+                "{what}: {label}: {status:?}"
+            );
+        }
+        let reads = msgs
+            .iter()
+            .find_map(|m| match m {
+                Msg::ServerReads { slow, clients, .. } => Some((slow.is_none(), clients.is_none())),
+                _ => None,
+            })
+            .expect("the reads message");
+        assert_eq!(reads, (true, true), "{what}: neither was sent");
+        let figures = msgs
+            .iter()
+            .find_map(|m| match m {
+                Msg::Figures { figures, .. } => Some(figures),
+                _ => None,
+            })
+            .expect("figures");
+        assert_eq!(figures.failed, None, "{what}");
+        assert_eq!(figures.server.as_ref().unwrap().server.total_keys, 300);
+
+        // What Overview says, from these messages: each part off with its reason, in
+        // redis-lens's words, never naming the user.
+        let mut app = App::new(vec![p]);
+        let effects = app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(
+            matches!(effects[..], [Effect::Connect { id: 1, scan: 1, .. }]),
+            "{effects:?}"
+        );
+        for m in msgs {
+            app.apply(m);
+        }
+        let off = redis_lens::tui::app::views::overview::off_reasons(&app);
+        assert!(
+            off.iter().any(|r| r.starts_with("Slow log is off")),
+            "{what}: {off:?}"
+        );
+        assert!(
+            off.iter().any(|r| r.starts_with("Idle clients are off")),
+            "{what}: {off:?}"
+        );
+        for r in &off {
+            assert!(!r.contains("lens-pw"), "{r}");
+            assert!(!r.contains("lens ") || r.contains("redis-lens"), "{r}");
+        }
+    }
+}
+
+/// A TUI connect to a cluster: every node's figures, no key read on any node, the slow
+/// log and the client list read once on the first primary only; then a Quick analysis
+/// reads each node's figures once.
+#[tokio::test]
+async fn a_cluster_connect_reads_no_key_and_the_first_primarys_reads_once() {
+    for valkey in [false, true] {
+        let what = if valkey { "valkey" } else { "redis" };
+        let c = cluster(valkey, false).await;
+        let keys: Vec<(String, String)> = (0..900)
+            .map(|i| (format!("user:{i}"), "x".to_string()))
+            .collect();
+        c.seed(&keys).await;
+        c.reset_stats().await;
+        let msgs = connect(profile(c.seed_port(), Env::Local), None).await;
+        no_failure(&msgs, what);
+
+        let nodes = msgs
+            .iter()
+            .find_map(|m| match m {
+                Msg::Nodes { nodes, .. } => Some(nodes.clone()),
+                _ => None,
+            })
+            .expect("the node list");
+        assert_eq!(nodes.len(), 3, "{what}");
+        let figures = msgs
+            .iter()
+            .find_map(|m| match m {
+                Msg::Figures { figures, .. } => Some(figures.clone()),
+                _ => None,
+            })
+            .expect("figures");
+        assert_eq!(figures.nodes.len(), 3, "{what}");
+        assert!(figures.nodes.iter().all(|n| n.figures.is_some()), "{what}");
+        assert_eq!(figures.server.as_ref().unwrap().server.total_keys, 900);
+        let (node, slow_ok, clients_ok) = msgs
+            .iter()
+            .find_map(|m| match m {
+                Msg::ServerReads {
+                    node,
+                    slow,
+                    clients,
+                    ..
+                } => Some((
+                    *node,
+                    matches!(slow, Some(Ok(_))),
+                    matches!(clients, Some(Ok(_))),
+                )),
+                _ => None,
+            })
+            .expect("the reads");
+        assert!(slow_ok && clients_ok, "{what}");
+        let first_primary = nodes
+            .iter()
+            .position(|n| n.role == redis_lens::model::NodeRole::Primary)
+            .unwrap();
+        assert_eq!(node, first_primary, "{what}");
+        let read_port = nodes[node].endpoint.port;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, Msg::ScanProgress { .. } | Msg::ScanDone { .. })),
+            "{what}: a connect does not analyze"
+        );
+
+        let mut per_node = HashMap::new();
+        for p in &c.ports {
+            per_node.insert(*p, c.commandstats(*p).await);
+        }
+        let other = *c.ports.iter().find(|p| **p != read_port).unwrap();
+        for (port, stats) in &per_node {
+            // The permission check probes each key command once at most; no KEYS, no GET.
+            assert_eq!(calls(stats, "keys"), 0, "{what} {port}: {stats:?}");
+            assert_eq!(calls(stats, "get"), 0, "{what} {port}: {stats:?}");
+            for k in KEY_COMMANDS {
+                assert!(calls(stats, k) <= 1, "{what} {port}: {k}: {stats:?}");
+            }
+            assert_eq!(calls(stats, "dbsize"), 1, "{what} {port}: {stats:?}");
+            // Every node gets the same probes; only the first primary is read once more.
+            let more = u64::from(*port == read_port);
+            for (cmd, sub) in [("slowlog", "get"), ("client", "list")] {
+                assert_eq!(
+                    calls_of(stats, cmd, sub),
+                    calls_of(&per_node[&other], cmd, sub) + more,
+                    "{what} {port}: {cmd} {sub}: {stats:?}"
+                );
+            }
+        }
+
+        // A Quick analysis: each node's figures once (the analysis starts from them).
+        c.reset_stats().await;
+        let msgs = connect(profile(c.seed_port(), Env::Local), Some(QUICK)).await;
+        no_failure(&msgs, what);
+        let report = msgs
+            .iter()
+            .find_map(|m| match m {
+                Msg::ScanDone { report, .. } => Some(report),
+                _ => None,
+            })
+            .expect("a report");
+        assert_eq!(report.sampled_keys, 900, "{what}");
+        for p in &c.ports {
+            let stats = c.commandstats(*p).await;
+            assert_eq!(calls(&stats, "dbsize"), 1, "{what} {p}: {stats:?}");
+        }
     }
 }

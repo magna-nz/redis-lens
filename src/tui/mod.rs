@@ -1291,8 +1291,9 @@ struct Run {
 /// Connects run `run`: the permission check and the server's own figures (no key is
 /// read: `scan::figures`), then its live connection, then once `SLOWLOG GET` and
 /// `CLIENT LIST` where the check allowed them. With `sample` it then analyzes: a scan
-/// with `ScanOptions::sample_limit` set to it, which `stop` ends early with what it has
-/// sampled. Without, it ends there, having read no key.
+/// with `ScanOptions::sample_limit` set to it, starting from the figures just read (it
+/// does not send them again), which `stop` ends early with what it has sampled.
+/// Without, it ends there, having read no key.
 async fn connect_and_scan(
     run: Run,
     profile: Profile,
@@ -1344,45 +1345,58 @@ async fn connect_and_scan(
     // live requests, and the probes run on every node through its budget.
     let mut opts = ScanOptions::for_profile(&profile);
     let budget = Budget::new(opts.max_commands_per_sec);
-    let (perms, figures) = match &mut targets {
+    // What the figures read gave, kept for the analysis: it starts from these figures
+    // and does not read them again.
+    enum Read {
+        Single(Result<scan::figures::ServerFigures, scan::ScanError>),
+        Cluster(Vec<Option<scan::figures::ServerFigures>>),
+    }
+    let (perms, figures, read) = match &mut targets {
         ScanTargets::Single { conn, .. } => {
             let perms = conn::check_all_permissions(conn).await;
-            let figures =
-                match scan::figures::server_figures_with_budget(conn, profile.db, &perms, &budget)
-                    .await
-                {
-                    Ok(f) => app::views::overview::Figures {
-                        server: Some(f),
-                        nodes: Vec::new(),
-                        failed: None,
-                    },
-                    // Never the error's own text: it can name the ACL user.
-                    Err(e) => app::views::overview::Figures {
-                        server: None,
-                        nodes: Vec::new(),
-                        failed: Some(scan::figures::failure_text(&e)),
-                    },
-                };
-            (perms, figures)
+            let read =
+                scan::figures::server_figures_with_budget(conn, profile.db, &perms, &budget).await;
+            let figures = match &read {
+                Ok(f) => app::views::overview::Figures {
+                    server: Some(f.clone()),
+                    nodes: Vec::new(),
+                    failed: None,
+                },
+                // Never the error's own text: it can name the ACL user.
+                Err(e) => app::views::overview::Figures {
+                    server: None,
+                    nodes: Vec::new(),
+                    failed: Some(scan::figures::failure_text(e)),
+                },
+            };
+            (perms, figures, Read::Single(read))
         }
         ScanTargets::Cluster(c) => {
             for node in &mut c.nodes {
                 node.budget = Some(Budget::new(opts.max_commands_per_sec));
             }
             let perms = c.check_all_permissions().await;
-            let figures = match scan::figures::cluster_figures(c, opts.max_commands_per_sec).await {
-                Ok(f) => app::views::overview::Figures {
-                    server: Some(f.merged),
-                    nodes: f.nodes,
-                    failed: None,
-                },
-                Err(e) => app::views::overview::Figures {
-                    server: None,
-                    nodes: Vec::new(),
-                    failed: Some(scan::figures::failure_text(&e)),
-                },
+            let read = scan::figures::cluster_figures(c, opts.max_commands_per_sec).await;
+            let (figures, per_node) = match read {
+                Ok(f) => {
+                    let per_node = f.nodes.iter().map(|n| n.figures.clone()).collect();
+                    let figures = app::views::overview::Figures {
+                        server: Some(f.merged),
+                        nodes: f.nodes,
+                        failed: None,
+                    };
+                    (figures, per_node)
+                }
+                Err(e) => {
+                    let figures = app::views::overview::Figures {
+                        server: None,
+                        nodes: Vec::new(),
+                        failed: Some(scan::figures::failure_text(&e)),
+                    };
+                    (figures, Vec::new())
+                }
             };
-            (perms, figures)
+            (perms, figures, Read::Cluster(per_node))
         }
     };
     if !send(
@@ -1446,31 +1460,38 @@ async fn connect_and_scan(
     opts.sample_limit = limit;
     opts.stop = stop;
 
+    // The analysis starts from the figures just read: they are not sent again.
     scan_and_report(id, scan_id, tx, |ptx, partial_tx| async move {
-        match &mut targets {
-            ScanTargets::Single { conn, .. } => {
-                scan::scan_with_budget(
+        match (&mut targets, read) {
+            (ScanTargets::Single { conn, .. }, Read::Single(figures)) => match figures {
+                Ok(figures) => {
+                    scan::scan_with_figures(
+                        &name,
+                        conn,
+                        &opts,
+                        &perms,
+                        Some(&ptx),
+                        Some(&partial_tx),
+                        &budget,
+                        figures,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            },
+            (ScanTargets::Cluster(c), Read::Cluster(figures)) => {
+                scan::cluster::scan_cluster_with_figures(
                     &name,
-                    conn,
+                    c,
                     &opts,
-                    &perms,
+                    figures,
                     Some(&ptx),
                     Some(&partial_tx),
-                    &budget,
                 )
                 .await
             }
-            ScanTargets::Cluster(_) => {
-                scan::cluster::scan_targets(
-                    &name,
-                    &mut targets,
-                    &opts,
-                    &perms,
-                    Some(&ptx),
-                    Some(&partial_tx),
-                )
-                .await
-            }
+            // Each target kind is read its own way above.
+            _ => Err(scan::ScanError::Protocol("the targets changed kind".into())),
         }
         .map_err(|e| clean(e.to_string()))
     })
@@ -2357,6 +2378,31 @@ mod tests {
             &mut Recorder::default(),
         );
         assert_eq!(expect_closed(&mut rx), (1, 11, 8));
+    }
+
+    /// `esc` stops the analysis of the run it was pressed for, and no other: a stop
+    /// for another entry or an older run of the same entry leaves the flag alone.
+    #[test]
+    fn stop_analysis_stops_only_the_matching_run() {
+        let (mut runner, _rx) = runner();
+        // Nothing runs: nothing to stop, and nothing breaks.
+        assert!(!runner.run(
+            Effect::StopAnalysis { id: 1, scan: 2 },
+            &mut Recorder::default()
+        ));
+        let flag = StopFlag::new();
+        runner.stop = Some((1, 2, flag.clone()));
+        for (id, scan) in [(1, 1), (1, 3), (2, 2), (0, 0)] {
+            runner.run(Effect::StopAnalysis { id, scan }, &mut Recorder::default());
+            assert!(!flag.is_stopped(), "({id}, {scan}) stopped run (1, 2)");
+        }
+        runner.run(
+            Effect::StopAnalysis { id: 1, scan: 2 },
+            &mut Recorder::default(),
+        );
+        assert!(flag.is_stopped());
+        // The live slot is untouched: the live task of the run stays.
+        assert!(runner.stop.is_some());
     }
 
     #[test]

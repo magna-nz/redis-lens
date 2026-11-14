@@ -44,12 +44,9 @@ mod ttl;
 mod value;
 pub mod widgets;
 
-use widgets::{panel, rows, trunc, width};
+use widgets::{rows, trunc, width};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// Rows inside a detail panel.
-pub const DETAIL_ROWS: u16 = 8;
 
 pub fn spinner(tick: u64) -> &'static str {
     SPINNER[(tick % SPINNER.len() as u64) as usize]
@@ -309,13 +306,6 @@ pub fn mark_previous(app: &App, right: &str) -> String {
     }
 }
 
-/// The main table above, the 8-row detail panel below.
-pub fn split_body(area: Rect) -> (Rect, Rect) {
-    let [main, detail] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(DETAIL_ROWS + 2)]).areas(area);
-    (main, detail)
-}
-
 /// A blank line and the profile's provider notice (see [`provider::notice`]), if any.
 fn provider_notice(lines: &mut Vec<Line<'static>>, p: &crate::model::Profile) {
     if let Some(n) = provider::notice(p.provider) {
@@ -324,7 +314,8 @@ fn provider_notice(lines: &mut Vec<Line<'static>>, p: &crate::model::Profile) {
     }
 }
 
-/// A panel holding a few lines of explanation, with an empty detail panel below.
+/// One frame holding a few lines of explanation under `title` (the frame layout every
+/// screen uses: no empty details panel beside or below it).
 pub fn notice_panels(
     frame: &mut Frame,
     area: Rect,
@@ -332,12 +323,17 @@ pub fn notice_panels(
     right: &str,
     lines: Vec<Line<'static>>,
 ) {
-    let (main, detail) = split_body(area);
-    let inner = panel(frame, main, title, right);
+    let inner = widgets::sections(
+        frame,
+        area,
+        &[widgets::Section {
+            title: widgets::Title::new(title, right),
+            rows: None,
+        }],
+    )[0];
     let mut all = vec![Line::default()];
     all.extend(lines);
     rows(frame, inner, all, None);
-    panel(frame, detail, "Details", "");
 }
 
 fn flavor(f: ServerFlavor) -> &'static str {
@@ -411,6 +407,10 @@ fn status(app: &App, s: &Session, clock: Clock) -> Vec<Span<'static>> {
         _ => String::new(),
     };
     match &s.phase {
+        // `esc` asked an analysis that is still connecting to stop.
+        Phase::Connecting if s.analysis.is_some() && s.stopped => {
+            vec![Span::styled(format!("{spin} stopping…"), style::amber())]
+        }
         Phase::Connecting if s.analysis.is_some() && s.previous.is_some() => {
             vec![Span::styled(format!("{spin} analyzing"), style::amber())]
         }

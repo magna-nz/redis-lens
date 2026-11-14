@@ -1209,13 +1209,12 @@ impl App {
         match &s.live {
             LiveState::Ready => None,
             LiveState::Waiting => Some(
-                "The command line opens once the live connection is ready, after the scan \
-                 connects."
+                "The command line opens once the live connection is ready, after the connect."
                     .into(),
             ),
             LiveState::Closed(_) => Some(
                 "The live connection is closed, so the command line is off until the next \
-                 scan."
+                 connect or analysis (r on Overview)."
                     .into(),
             ),
         }

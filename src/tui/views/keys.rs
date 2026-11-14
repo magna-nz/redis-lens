@@ -676,7 +676,10 @@ impl ViewState for KeysState {
             return true;
         }
         match (key.code, plain(&key)) {
-            (KeyCode::Esc, _) if !self.filter.is_empty() || self.type_filter != TypeFilter::All => {
+            // `←` `h` `esc` clear the filters first, then go back to the patterns.
+            (KeyCode::Esc | KeyCode::Left, _) | (_, Some('h'))
+                if !self.filter.is_empty() || self.type_filter != TypeFilter::All =>
+            {
                 let keep = self.selected().map(|r| r.key.clone());
                 self.filter.clear();
                 self.type_filter = TypeFilter::All;
@@ -1026,6 +1029,27 @@ mod tests {
         assert_eq!(app.views.keys.visible().len(), 14);
         app.handle_key(key(KeyCode::Esc));
         assert_ne!(app.screen(), Screen::KeyList);
+    }
+
+    #[test]
+    fn left_and_h_clear_the_filters_first_like_esc() {
+        for back in [key(KeyCode::Left), ch('h')] {
+            let mut app = mixed();
+            app.handle_key(ch('t'));
+            app.handle_key(ch('/'));
+            app.handle_key(ch('1'));
+            app.handle_key(key(KeyCode::Enter));
+            assert!(app.views.keys.visible().len() < 14);
+            // The first `←` clears both filters and stays on the keys.
+            app.handle_key(back);
+            assert_eq!(app.screen(), Screen::KeyList, "{back:?}");
+            assert_eq!(app.views.keys.filter, "");
+            assert_eq!(app.views.keys.type_filter, TypeFilter::All);
+            assert_eq!(app.views.keys.visible().len(), 14);
+            // The next goes back to the patterns.
+            app.handle_key(back);
+            assert_eq!(app.screen(), Screen::Patterns, "{back:?}");
+        }
     }
 
     #[test]

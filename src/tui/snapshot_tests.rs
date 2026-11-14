@@ -828,7 +828,7 @@ fn diff_view_with_trend() {
         "{text}"
     );
     assert!(text.contains("+8.7% a day (+128M a day)"), "{text}");
-    assert!(text.contains("over 8 scans"), "{text}");
+    assert!(text.contains("over 8 snapshots"), "{text}");
     insta::assert_snapshot!(t.backend());
 }
 
@@ -855,7 +855,7 @@ fn diff_view_with_trend_without_sizes() {
     let spark = crate::format::sparkline(values);
     assert!(spark.contains('·'), "{spark}");
     assert!(text.contains(&format!(" TREND {spark}")), "{text}");
-    assert!(text.contains("flat over 8 scans"), "{text}");
+    assert!(text.contains("flat over 8 snapshots"), "{text}");
     insta::assert_snapshot!(t.backend());
 }
 

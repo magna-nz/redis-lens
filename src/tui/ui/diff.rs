@@ -223,7 +223,7 @@ fn sparkline_for(t: &Trend, pattern: &str) -> String {
 /// Formats a byte or key figure.
 type Fmt = fn(u64) -> String;
 
-/// Before and after as text: bytes when both scans had sizes, keys otherwise.
+/// Before and after as text: bytes when both analyses had sizes, keys otherwise.
 fn sides(p: &PatternDiff) -> (Option<u64>, Option<u64>, Fmt) {
     if p.delta_bytes.is_some() {
         (p.bytes_before, p.bytes_after, format::bytes)
@@ -385,7 +385,7 @@ fn cause_sentence(p: &PatternDiff) -> (&'static str, Style, bool) {
         }
         Cause::Unchanged => "No meaningful change.",
         Cause::Unknown => {
-            "Not in the other scan, which used a different MATCH, so it may not be new or gone."
+            "Not in the other analysis, which used a different MATCH, so it may not be new or gone."
         }
     };
     let st = match p.cause {
@@ -405,12 +405,13 @@ fn trend_lines(t: &Trend, pattern: &str, w: usize) -> Vec<Line<'static>> {
         TrendMetric::Bytes => format::bytes,
         TrendMetric::Keys => format::count,
     };
-    let scans = t.points.len();
+    // Each point is a saved snapshot of an analysis.
+    let snapshots = t.points.len();
     let partial = t.partial_points();
     let over = match partial {
-        0 => format!("over {scans} scans"),
-        n if n == scans => format!("over {scans} scans, all partial"),
-        n => format!("over {scans} scans, {n} partial"),
+        0 => format!("over {snapshots} snapshots"),
+        n if n == snapshots => format!("over {snapshots} snapshots, all partial"),
+        n => format!("over {snapshots} snapshots, {n} partial"),
     };
     let pt: Option<&PatternTrend> = t.pattern(pattern);
     let (text, st) = match pt.and_then(|p| p.growth) {
@@ -430,7 +431,7 @@ fn trend_lines(t: &Trend, pattern: &str, w: usize) -> Vec<Line<'static>> {
             (text, st)
         }
         None => (
-            format!("too few scans with this pattern for a growth rate ({over})"),
+            format!("too few snapshots with this pattern for a growth rate ({over})"),
             style::dim(),
         ),
     };
@@ -507,7 +508,7 @@ fn detail_lines(
         lines.extend(paragraph(
             vec![Span::raw(" ")],
             " ",
-            "Sizes unavailable: one of the scans could not run MEMORY USAGE.",
+            "Sizes unavailable: one of the analyses could not run MEMORY USAGE.",
             style::dim(),
             w,
         ));

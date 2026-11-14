@@ -106,6 +106,10 @@ pub struct ServerState {
     then: Option<WriteOp>,
     /// The per-shard summary of a cluster's Overview.
     pub shards: Shards,
+    /// Another node was picked with `[` `]` (a cluster): its slow log and client list,
+    /// which Overview's findings come from, are read once while Overview is on screen
+    /// ([`Self::read_findings`]).
+    findings_due: bool,
 }
 
 /// The per-shard summary polls at most this often, or at the Overview's interval when
@@ -192,6 +196,7 @@ impl Default for ServerState {
             write: None,
             then: None,
             shards: Shards::default(),
+            findings_due: false,
         }
     }
 }
@@ -255,12 +260,63 @@ impl ServerState {
         self.slow.specs = specs;
     }
 
+    /// `[` `]` picked another node: [`Self::node_changed`], and Overview reads the new
+    /// node's slow log and client list once while it is on screen, so its findings
+    /// are of that node too.
+    pub fn node_picked(&mut self) {
+        self.node_changed();
+        self.findings_due = true;
+    }
+
+    /// A new run of the session (an analysis, a database switch) replaced the live
+    /// connection: answers the panels got so far are older than what its connect
+    /// reads ([`Self::connect_read`]).
+    pub fn new_run(&mut self) {
+        self.clients.poll.fresh = false;
+        self.slow.poll.fresh = false;
+    }
+
+    /// Overview's findings after `[` `]` ([`Self::node_picked`]): one `SLOWLOG GET` and
+    /// one `CLIENT LIST` on the picked node, through its budget, each only where the
+    /// permission check allowed it and the panel has nothing of this node yet. Once:
+    /// the Slow log and Clients panels poll on their own when shown.
+    fn read_findings(&mut self, act: &mut Act<'_>) {
+        if !self.findings_due || !act.live_ready() {
+            return;
+        }
+        self.findings_due = false;
+        use super::{PROBE_CLIENT_LIST, PROBE_SLOWLOG};
+        use crate::model::PermStatus;
+        for (panel, label) in [
+            (Panel::SlowLog, PROBE_SLOWLOG),
+            (Panel::Clients, PROBE_CLIENT_LIST),
+        ] {
+            let p = self.poll(panel);
+            if p.got || p.busy(act) || p.off.is_some() {
+                continue;
+            }
+            if act.check(label) == Some(&PermStatus::Allowed) {
+                self.send(panel, act);
+            }
+        }
+    }
+
     /// What the connect read once for `panel` (Slow log or Clients: `SLOWLOG GET`,
-    /// `CLIENT LIST`), taken as that panel's answer, with no poll in flight or timed:
-    /// the panel reads again when it is first shown. A refusal turns the panel off with
-    /// its fixed text, as a poll's would.
-    pub fn connect_read(&mut self, panel: Panel, result: Result<LiveReply, LiveError>) {
+    /// `CLIENT LIST`), taken as that panel's answer, with no poll timed: the panel
+    /// reads again when it is first shown. A refusal turns the panel off with its
+    /// fixed text, as a poll's would. Dropped when the panel already has a newer
+    /// answer: one of this run's polls came in, or one is in flight (`in_flight`).
+    pub fn connect_read(
+        &mut self,
+        panel: Panel,
+        result: Result<LiveReply, LiveError>,
+        in_flight: impl Fn(ReqId) -> bool,
+    ) {
         if !matches!(panel, Panel::SlowLog | Panel::Clients) {
+            return;
+        }
+        let p = self.poll(panel);
+        if p.fresh || p.in_flight.is_some_and(in_flight) {
             return;
         }
         match result {
@@ -529,6 +585,9 @@ impl ViewState for ServerState {
         if !(self.paused && self.poll(panel).got) && self.due(panel, act) {
             self.send(panel, act);
         }
+        if panel == Panel::Overview {
+            self.read_findings(act);
+        }
         if panel == Panel::Overview && !self.paused {
             let every = self.interval().max(SHARDS_EVERY);
             self.shards.poll(every, act);
@@ -542,6 +601,9 @@ impl ViewState for ServerState {
         };
         if !self.paused && act.live_ready() && self.due(panel, act) {
             self.send(panel, act);
+        }
+        if panel == Panel::Overview {
+            self.read_findings(act);
         }
         if panel == Panel::Overview && !self.paused {
             let every = self.interval().max(SHARDS_EVERY);
@@ -671,6 +733,8 @@ impl ViewState for ServerState {
             self.monitor_learned(result, act);
             return;
         }
+        // An answer on this run's live connection: newer than the connect's read.
+        p.fresh = true;
         match result {
             Ok(LiveReply::Server(reply)) => {
                 p.failed = None;
@@ -694,6 +758,9 @@ pub struct Poll {
     pub failed: Option<String>,
     /// An answer has come in.
     pub got: bool,
+    /// An answer came in on the current run's live connection ([`ServerState::new_run`]
+    /// clears it).
+    fresh: bool,
 }
 
 impl Poll {

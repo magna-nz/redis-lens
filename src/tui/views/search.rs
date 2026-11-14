@@ -1282,6 +1282,19 @@ mod tests {
     }
 
     #[test]
+    fn esc_on_the_results_goes_back_to_the_indexes_like_left() {
+        for back in [key(KeyCode::Esc), key(KeyCode::Left), ch('h')] {
+            let mut app = with_results();
+            assert_eq!(app.views.search.focus, Focus::Schema);
+            app.handle_key(back);
+            assert_eq!(app.views.search.focus, Focus::Indexes, "{back:?}");
+            assert_eq!(app.screen(), Screen::Search);
+            // The results stay under their index.
+            assert!(app.views.search.shown_results().is_some(), "{back:?}");
+        }
+    }
+
+    #[test]
     fn enter_opens_a_result_and_f_y_esc_work_on_its_fields() {
         let mut app = with_results();
         app.handle_key(ch('j'));

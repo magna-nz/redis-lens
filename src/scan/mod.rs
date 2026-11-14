@@ -730,8 +730,37 @@ pub async fn scan_with_budget<C: ConnectionLike + Send>(
     partial: Option<&PartialSender>,
     budget: &Budget,
 ) -> Result<ScanReport, ScanError> {
-    let figures::ServerFigures { server, context } =
-        figures::server_figures_with_budget(conn, opts.db, perms, budget).await?;
+    let figures = figures::server_figures_with_budget(conn, opts.db, perms, budget).await?;
+    scan_with_figures(
+        profile_name,
+        conn,
+        opts,
+        perms,
+        progress,
+        partial,
+        budget,
+        figures,
+    )
+    .await
+}
+
+/// [`scan_with_budget`] for a caller that has just read the server's figures itself
+/// ([`figures::server_figures_with_budget`] of database `opts.db`, as a TUI connect
+/// does): the scan starts from `figures` and sends neither `INFO` nor `DBSIZE` nor the
+/// server context again, only the sampling (`SCAN` and the per-key commands), each
+/// taken from `budget`. The report's server figures are `figures`.
+#[allow(clippy::too_many_arguments)]
+pub async fn scan_with_figures<C: ConnectionLike + Send>(
+    profile_name: &str,
+    conn: &mut C,
+    opts: &ScanOptions,
+    perms: &PermissionReport,
+    progress: Option<&watch::Sender<ScanProgress>>,
+    partial: Option<&PartialSender>,
+    budget: &Budget,
+    figures: figures::ServerFigures,
+) -> Result<ScanReport, ScanError> {
+    let figures::ServerFigures { server, context } = figures;
     let with_sizes = perms.allowed(PERM_MEMORY);
     let target = opts.sample_limit.min(server.total_keys);
     let has_match = opts.match_glob.is_some();
@@ -1431,6 +1460,65 @@ mod tests {
             // And it does not wait far longer than needed.
             assert!(took <= min + Duration::from_millis(1), "{took:?}");
         }
+    }
+
+    /// A caller that has just read the figures (a TUI connect) hands them to
+    /// `scan_with_figures`: the figures go to the server once, not twice, and the report
+    /// is the same as `scan_with_budget`'s, which reads them itself.
+    #[test]
+    fn figures_read_on_connect_are_not_read_again_by_the_analysis() {
+        let o = opts(1_000, 20);
+        let b = crate::budget::Budget::new(None);
+        let mut server = fake::Server::new(keyspace(100, |_| Fate::Present), 40);
+        let figures = run_timed(figures::server_figures_with_budget(
+            &mut server,
+            0,
+            &perms_all(),
+            &b,
+        ))
+        .unwrap();
+        let read = server.log.len();
+        assert_eq!(read as u64, figures::FIGURE_COMMANDS, "{:?}", server.log);
+        let report = run_timed(scan_with_figures(
+            "t",
+            &mut server,
+            &o,
+            &perms_all(),
+            None,
+            None,
+            &b,
+            figures.clone(),
+        ))
+        .unwrap();
+        let after = &server.log[read..];
+        assert!(
+            !after.iter().any(|c| c == "INFO" || c == "DBSIZE"),
+            "{after:?}"
+        );
+        // MEMORY USAGE per key only: no MEMORY STATS.
+        assert_eq!(after.iter().filter(|c| *c == "MEMORY").count(), 100);
+        assert_eq!(after.first().map(String::as_str), Some("SCAN"), "{after:?}");
+        assert_eq!(b.taken(), server.log.len() as u64);
+        let infos = server.log.iter().filter(|c| *c == "INFO").count();
+        let dbsizes = server.log.iter().filter(|c| *c == "DBSIZE").count();
+        assert_eq!((infos, dbsizes), (4, 1), "{:?}", server.log);
+        assert_eq!(report.server, figures.server);
+        assert_eq!(report.sampled_keys, 100);
+
+        // The same scan reading its own figures sends them once too.
+        let mut fresh = fake::Server::new(keyspace(100, |_| Fate::Present), 40);
+        let own = run_timed(scan_with_budget(
+            "t",
+            &mut fresh,
+            &o,
+            &perms_all(),
+            None,
+            None,
+            &crate::budget::Budget::new(None),
+        ))
+        .unwrap();
+        assert_eq!(fresh.log, server.log);
+        assert_eq!(own.patterns, report.patterns);
     }
 
     /// The server-context commands (`INFO keyspace`, `INFO keysizes`, `MEMORY STATS`) each

@@ -1,6 +1,5 @@
 ---
 source: src/tui/views/search.rs
-assertion_line: 1760
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " prod-cache-01   LOCAL   writes on   15G / 24G · 7.92M keys    ● analyzed 14:02 "
@@ -19,8 +18,8 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│ │ › fields    $.total AS total NUMERIC, $.status AS status TAG▏            │ │"
 "│ │   name TYPE, … (TEXT, TAG, NUMERIC, GEO); on JSON: $.path AS alias TYPE  │ │"
 "│ │                                                                          │ │"
-"│ │ Sends: FT.CREATE idx:orders ON JSON PREFIX 1 order: SCHEMA $.total AS to │ │"
-"│ │ tal NUMERIC $.status AS status TAG                                       │ │"
+"│ │ Sends   FT.CREATE idx:orders ON JSON PREFIX 1 order: SCHEMA $.total AS   │ │"
+"│ │          total NUMERIC $.status AS status TAG                            │ │"
 "│ └──────────────────────────────────────────────────────────────────────────┘ │"
 "│                                        │                                     │"
 "│                                        │                                     │"

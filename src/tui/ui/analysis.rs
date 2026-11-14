@@ -13,11 +13,10 @@ use crate::analysis::{
     length_unit, pattern_of, recommendations,
 };
 use crate::format;
-use crate::model::{KeySample, PERM_FREQ, PERM_MEMORY, ScanReport, Ttl};
-use crate::scan::ScanOptions;
-use crate::scan::estimate::{AnalysisEstimate, DEEP_SAMPLE, QUICK_SAMPLE, estimate_analysis};
+use crate::model::{KeySample, ScanReport, Ttl};
 use crate::tui::app::views::Ctx;
 use crate::tui::app::views::analysis::AnalysisState;
+use crate::tui::app::views::overview::{Depth, about_time, estimate_for};
 use crate::tui::app::{App, Phase};
 use crate::verdict::{TtlVerdict, explain};
 
@@ -266,28 +265,6 @@ pub fn verdict_sentence(
     explain(p, change).join(" ")
 }
 
-/// The scan engine's estimate of an analysis of `sample` keys on the connected server,
-/// the same figures the dialog shows. `None` without a session.
-pub fn analysis_cost(app: &App, sample: u64) -> Option<AnalysisEstimate> {
-    let s = app.session.as_ref()?;
-    let perms = app.entry(s.id).and_then(|e| e.perms.as_ref());
-    let sizes = perms.is_none_or(|p| p.allowed(PERM_MEMORY));
-    let lfu = s.server.as_ref().is_some_and(|i| i.lfu_enabled());
-    let freq = lfu && perms.is_none_or(|p| p.allowed(PERM_FREQ));
-    let keys = s.server.as_ref().map_or(0, |i| i.total_keys);
-    let rate = ScanOptions::for_profile(&s.profile).max_commands_per_sec;
-    Some(estimate_analysis(sample, keys, sizes, freq, rate))
-}
-
-/// `about 7 s`, `about 2 min`, or how fast without a budget.
-fn about(e: &AnalysisEstimate) -> String {
-    match e.duration {
-        Some(d) if d.as_secs() < 120 => format!("about {} s", d.as_secs().max(1)),
-        Some(d) => format!("about {} min", d.as_secs().div_ceil(60)),
-        None => "as fast as the server answers".to_string(),
-    }
-}
-
 /// One frame holding a single section titled `title`; returns its inner area.
 fn one_section(frame: &mut Frame, area: Rect, title: &str, right: &str) -> Rect {
     sections(
@@ -335,30 +312,29 @@ pub fn need_report(frame: &mut Frame, area: Rect, app: &App, title: &str, needs:
             let intro = format!("{title} {needs} It needs a sample of the keys:");
             lines.extend(paragraph(vec![Span::raw(" ")], " ", &intro, style::fg(), w));
             lines.push(Line::default());
-            if let Some(q) = analysis_cost(app, QUICK_SAMPLE) {
-                lines.push(Line::from(vec![
-                    Span::styled("   r", style::amber()),
-                    Span::styled(
-                        format!(
-                            "  Analyze: {} keys, about {} read-only commands, {}",
-                            format::grouped(q.keys),
-                            format::count(q.commands),
-                            about(&q)
-                        ),
-                        style::fg(),
-                    ),
-                ]));
-            }
-            if let Some(d) = analysis_cost(app, DEEP_SAMPLE) {
-                lines.push(Line::from(Span::styled(
+            // The engine's estimate, the same one the dialog and Overview show.
+            let q = estimate_for(Depth::Quick, app);
+            lines.push(Line::from(vec![
+                Span::styled("   r", style::amber()),
+                Span::styled(
                     format!(
-                        "      (or {} keys, {}, for rare patterns and big keys)",
-                        format::grouped(d.keys),
-                        about(&d)
+                        "  Analyze: {} keys, about {} read-only commands, {}",
+                        format::grouped(q.keys),
+                        format::count(q.commands),
+                        about_time(&q)
                     ),
-                    style::dim(),
-                )));
-            }
+                    style::fg(),
+                ),
+            ]));
+            let d = estimate_for(Depth::Deep, app);
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "      (or {} keys, {}, for rare patterns and big keys)",
+                    format::grouped(d.keys),
+                    about_time(&d)
+                ),
+                style::dim(),
+            )));
             lines.push(Line::default());
             let pointer = "What the server reports without a sample is on Overview (1): the key count, the share of keys with a TTL, and what keeps memory busy.";
             lines.extend(paragraph(
@@ -991,13 +967,13 @@ mod tests {
                 "{text}"
             );
             // The engine's own estimate, as the Analyze dialog shows it.
-            let est = analysis_cost(&app, QUICK_SAMPLE).unwrap();
+            let est = estimate_for(Depth::Quick, &app);
             assert!(
                 text.contains(&format!(
                     "r  Analyze: {} keys, about {} read-only commands, {}",
                     format::grouped(est.keys),
                     format::count(est.commands),
-                    about(&est)
+                    about_time(&est)
                 )),
                 "{text}"
             );
@@ -1009,14 +985,14 @@ mod tests {
     #[test]
     fn the_estimate_follows_the_permissions_and_the_budget() {
         let app = support::no_analysis(Screen::Ttl);
-        let quick = analysis_cost(&app, QUICK_SAMPLE).unwrap();
-        let deep = analysis_cost(&app, DEEP_SAMPLE).unwrap();
+        let quick = estimate_for(Depth::Quick, &app);
+        let deep = estimate_for(Depth::Deep, &app);
         assert!(deep.commands > quick.commands);
         // A server with fewer keys than the sample costs less than the sample.
-        assert!(quick.keys <= QUICK_SAMPLE);
+        assert!(quick.keys <= crate::scan::estimate::QUICK_SAMPLE);
         assert_eq!(
             quick.keys,
-            QUICK_SAMPLE.min(
+            crate::scan::estimate::QUICK_SAMPLE.min(
                 app.session
                     .as_ref()
                     .unwrap()

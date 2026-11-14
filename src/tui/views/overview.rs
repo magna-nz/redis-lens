@@ -29,12 +29,12 @@
 
 use std::time::Duration;
 
-use crate::analysis::{Recommendation, Severity, recommendations};
+use crate::analysis::{RecKind, Recommendation, Severity, recommendations};
 use crate::format;
 use crate::live::server::{ClientConn, SlowEntry};
 use crate::model::{ContextGap, PERM_FREQ, PERM_MEMORY, PermStatus, Profile, ScanReport};
 use crate::scan::ScanOptions;
-use crate::scan::estimate::{estimate_analysis, estimate_cluster_analysis};
+use crate::scan::estimate::{estimate_analysis, estimate_cluster_analysis_of, sampling_duration};
 use crate::scan::figures::{NodeFigures, ServerFigures};
 use crate::tui::app::{App, Phase, Screen, Session};
 
@@ -157,12 +157,13 @@ pub fn estimate_for(depth: Depth, app: &App) -> Estimate {
         let dbsize = server.map_or(u64::MAX, |v| v.total_keys);
         (estimate_analysis(sample, dbsize, sizes, freq, per_sec), 0)
     } else {
-        let dbsizes: Vec<u64> = nodes
+        // A node without figures is sent nothing by the scan.
+        let dbsizes: Vec<Option<u64>> = nodes
             .iter()
-            .map(|n| n.figures.as_ref().map_or(0, |f| f.server.total_keys))
+            .map(|n| n.figures.as_ref().map(|f| f.server.total_keys))
             .collect();
         (
-            estimate_cluster_analysis(sample, &dbsizes, sizes, freq, per_sec),
+            estimate_cluster_analysis_of(sample, &dbsizes, sizes, freq, per_sec),
             nodes.iter().filter(|n| n.figures.is_some()).count(),
         )
     };
@@ -195,8 +196,8 @@ pub fn about_time(e: &Estimate) -> String {
 /// `None` without a budget or a target.
 pub fn time_left(e: &Estimate, sampled: u64, target: u64) -> Option<String> {
     let left = target.checked_sub(sampled)?;
-    let rest = estimate_analysis(left, left, e.sizes, e.freq, e.per_sec);
-    let secs = round_secs(rest.duration?);
+    // The figures are read by then: only the sampling is left.
+    let secs = round_secs(sampling_duration(left, e.sizes, e.freq, e.per_sec)?);
     Some(if secs < 120 {
         format!("about {secs} s left")
     } else {
@@ -219,8 +220,8 @@ pub struct OverviewState {
     pub sel: usize,
     /// When the running analysis was started (`App::now`), for the done notice's time.
     pub started: Option<std::time::Instant>,
-    /// The running analysis was started with `r` (not by a database switch, which
-    /// says so itself): its report announces itself in the notice line.
+    /// The running analysis was started with `r` (the only way one starts): its report
+    /// announces itself in the notice line.
     pub announce: bool,
 }
 
@@ -371,12 +372,14 @@ pub fn server_findings(app: &App) -> Vec<Finding> {
 /// expire), Changes for a pattern that never expires and grows when there is a
 /// comparison with a snapshot, Big keys for the rest (big keys, encodings).
 fn rec_target(rec: &Recommendation, has_diff: bool) -> Screen {
-    if rec.text.ends_with("never expires and is growing.") {
-        if has_diff { Screen::Diff } else { Screen::Ttl }
-    } else if rec.text.contains("never expire") {
-        Screen::Ttl
-    } else {
-        Screen::BigKeys
+    match rec.kind {
+        RecKind::PersistentGrowing if has_diff => Screen::Diff,
+        RecKind::PersistentGrowing
+        | RecKind::LockLeak
+        | RecKind::MemoryNeverExpires
+        | RecKind::MixedTtl
+        | RecKind::PersistentStable => Screen::Ttl,
+        RecKind::BigKey | RecKind::Encoding => Screen::BigKeys,
     }
 }
 
@@ -643,7 +646,7 @@ pub(crate) mod tests {
     #[test]
     fn time_left_counts_the_keys_still_to_sample_at_the_budget() {
         let e = estimate(Depth::Quick, &profile(Env::Prod));
-        // 5,900 keys × 3 + 6 SCANs + 6 figures at 5,000/s.
+        // 5,900 keys × 3 + 6 SCANs at 5,000/s: the figures are read by then.
         assert_eq!(
             time_left(&e, 4_100, 10_000).as_deref(),
             Some("about 4 s left")
@@ -683,51 +686,27 @@ pub(crate) mod tests {
 
     #[test]
     fn recommendations_go_to_the_panel_that_explains_them() {
-        let rec = |text: &str| Recommendation {
+        // By the rule each comes from, never by its sentence: a pattern whose name
+        // says "never expire" is still a big key.
+        let rec = |kind: RecKind| Recommendation {
             severity: Severity::Note,
-            text: text.into(),
+            text: "never-expire:{id} never expires and is growing.".into(),
             hint: String::new(),
+            kind,
         };
         let cases = [
-            (
-                "queue:emails is a single 612M list.",
-                false,
-                Screen::BigKeys,
-            ),
-            (
-                "3 of the 5 largest sampled h:{id} hashes are hashtable.",
-                false,
-                Screen::BigKeys,
-            ),
-            (
-                "lock:{id}: 40% of its keys never expire.",
-                false,
-                Screen::Ttl,
-            ),
-            (
-                "62% of memory never expires: 9G of 15G.",
-                false,
-                Screen::Ttl,
-            ),
-            (
-                "31% of user:{id}:cart keys never expire while the rest do.",
-                false,
-                Screen::Ttl,
-            ),
-            ("user:{id}:profile never expires.", true, Screen::Ttl),
-            (
-                "user:{id}:profile never expires and is growing.",
-                true,
-                Screen::Diff,
-            ),
-            (
-                "user:{id}:profile never expires and is growing.",
-                false,
-                Screen::Ttl,
-            ),
+            (RecKind::BigKey, false, Screen::BigKeys),
+            (RecKind::BigKey, true, Screen::BigKeys),
+            (RecKind::Encoding, false, Screen::BigKeys),
+            (RecKind::LockLeak, false, Screen::Ttl),
+            (RecKind::MemoryNeverExpires, false, Screen::Ttl),
+            (RecKind::MixedTtl, false, Screen::Ttl),
+            (RecKind::PersistentStable, true, Screen::Ttl),
+            (RecKind::PersistentGrowing, true, Screen::Diff),
+            (RecKind::PersistentGrowing, false, Screen::Ttl),
         ];
-        for (text, diff, want) in cases {
-            assert_eq!(rec_target(&rec(text), diff), want, "{text}");
+        for (kind, diff, want) in cases {
+            assert_eq!(rec_target(&rec(kind), diff), want, "{kind:?} {diff}");
         }
     }
 
