@@ -1,6 +1,5 @@
 ---
 source: src/tui/views/server.rs
-assertion_line: 2737
 expression: "testing::render(&app, 80, 24).backend()"
 ---
 " prod-cache-01   PROD   read-only   15G / 24G              ● analyzed 14:02 UTC "
@@ -8,7 +7,7 @@ expression: "testing::render(&app, 80, 24).backend()"
 "    Clients  ·  Slow log  ·  Monitor                                            "
 "┌─ Slow log ──────────────────────────────────── 0 entries · UTC · every 10 s ─┐"
 "│ threshold 10.0ms · keeps 128 entries                                         │"
-"│  TIME      DURATION  COMMAND      KEYS                  CLIENT               │"
+"│   TIME       DURATION COMMAND       KEYS                                     │"
 "│ The slow log is empty.                                                       │"
 "│                                                                              │"
 "│                                                                              │"
@@ -18,8 +17,8 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
-"└──────────────────────────────────────────────────────────────────────────────┘"
-"┌─ Entry ──────────────────────────────────────────────────────────────────────┐"
+"├─ Entry ──────────────────────────────────────────────────────────────────────┤"
+"│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"

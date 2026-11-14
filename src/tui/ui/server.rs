@@ -24,8 +24,11 @@ use crate::tui::app::views::server::{
 use crate::tui::app::views::{Ctx, LiveState};
 use crate::value::escape;
 
-use super::widgets::{fit, pad_l, pad_r, panel, rows, scroll_offset, trunc};
-use super::{notice_panels, style, utc_time};
+use super::analysis::{Col, MARK, Tier, head_row_at, notice, paragraph, pick_flex};
+use super::widgets::{
+    Section, Title, fit, pad_l, pad_r, panel, rows, scroll_offset, sections, trunc,
+};
+use super::{style, utc_time};
 
 const LABEL_W: usize = 11;
 const VALUE_W: usize = 19;
@@ -53,7 +56,7 @@ fn gate(frame: &mut Frame, area: Rect, title: &str, poll: &Poll, ctx: &Ctx<'_>) 
     if let Some(off) = &poll.off {
         let line = Line::from(Span::styled(format!(" ▲ {off}"), style::amber()));
         let right = with_node(ctx.node_title(), "off".to_string());
-        notice_panels(frame, area, title, &right, vec![line]);
+        notice(frame, area, title, &right, vec![line]);
         return true;
     }
     if poll.got {
@@ -77,7 +80,7 @@ fn gate(frame: &mut Frame, area: Rect, title: &str, poll: &Poll, ctx: &Ctx<'_>) 
         },
     };
     let right = with_node(ctx.node_title(), String::new());
-    notice_panels(frame, area, title, &right, vec![line]);
+    notice(frame, area, title, &right, vec![line]);
     true
 }
 
@@ -405,12 +408,10 @@ pub(super) fn server_lines(last: Option<&InfoSample>, w: usize) -> Vec<Line<'sta
 // Clients
 // ---------------------------------------------------------------------------
 
-const BY_W: usize = 5;
-const CONNS_W: usize = 6;
-const AGE_W: usize = 8;
-const CMD_W: usize = 14;
-const MEM_W: usize = 7;
-const FLAG_W: usize = 13;
+/// Rows of the details under a list.
+const DETAIL_ROWS: u16 = 5;
+/// Lists this wide show their Wide columns.
+const WIDE_AT: usize = 90;
 
 /// A duration in seconds as `45s`, `3m 05s`, `2h 10m`.
 fn age(secs: u64) -> String {
@@ -437,6 +438,36 @@ fn clients(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
     }
 }
 
+const G_GROUP: usize = 0;
+const G_MARK: usize = 1;
+const G_CONNS: usize = 2;
+const G_IDLE: usize = 3;
+const G_OLDEST: usize = 4;
+const G_CMD: usize = 5;
+const G_MEM: usize = 6;
+const G_BY: usize = 7;
+
+fn group_columns() -> [Col; 8] {
+    [
+        Col::new("GROUP", 14, Tier::Base),
+        Col::new("", 1, Tier::Base),
+        Col::new("CONNS", 6, Tier::Base),
+        Col::new("IDLE", 8, Tier::Base),
+        Col::new("OLDEST", 8, Tier::Wide),
+        Col::new("LAST COMMAND", 14, Tier::Wide),
+        Col::new("MEM", 7, Tier::Wide),
+        Col::new("BY", 7, Tier::More),
+    ]
+}
+
+/// The lines above the table's rows: the trouble line when something is wrong, then the
+/// head. The selected row is `lines.len()` rows further down.
+fn with_head(trouble_line: Option<Line<'static>>, head: Line<'static>) -> Vec<Line<'static>> {
+    let mut v: Vec<Line<'static>> = trouble_line.into_iter().collect();
+    v.push(head);
+    v
+}
+
 fn groups(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
     let c = &state.clients;
     let right = right_title(
@@ -445,81 +476,148 @@ fn groups(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
         &secs(CLIENTS_EVERY),
         &format!("{} connections · {} groups", c.conns.len(), c.groups.len()),
     );
-    let inner = panel(frame, area, "Clients", &right);
-    let w = usize::from(inner.width);
-    let gw = w
-        .saturating_sub(1 + BY_W + CONNS_W + 2 * AGE_W + CMD_W + MEM_W + FLAG_W)
-        .max(8);
-    let head = Line::from(fit(
-        vec![Span::styled(
-            format!(
-                " {}{}{}{}{}{}{}",
-                pad_r("BY", BY_W),
-                pad_r("GROUP", gw),
-                pad_l("CONNS", CONNS_W),
-                pad_l("OLDEST", AGE_W),
-                pad_l("IDLE", AGE_W),
-                pad_r("  LAST CMD", CMD_W),
-                pad_l("MEM", MEM_W),
-            ),
-            style::hd(),
-        )],
-        w,
-    ));
-    let mut top = vec![trouble(&c.poll, ctx).unwrap_or_default(), head];
-    let body_h = usize::from(inner.height).saturating_sub(top.len());
-    let off = scroll_offset(c.sel, body_h);
+    let sel = c.sel.min(c.groups.len().saturating_sub(1));
+    let g = c.groups.get(sel);
+    let (dt, dr) = match g {
+        Some(g) => (
+            g.key.label().to_string(),
+            format!("{} · {} connections", g.key.kind(), g.connections()),
+        ),
+        None => ("Details".to_string(), String::new()),
+    };
+    let inner = sections(
+        frame,
+        area,
+        &[
+            Section {
+                title: Title::new("Clients", &right),
+                rows: None,
+            },
+            Section {
+                title: Title::new(&dt, &dr),
+                rows: Some(DETAIL_ROWS),
+            },
+        ],
+    );
+    let w = usize::from(inner[0].width);
+    let cols = group_columns();
+    let (keep, gw) = pick_flex(&cols, G_GROUP, w, WIDE_AT, ctx.more);
+    let head = head_row_at(
+        &cols,
+        &keep,
+        G_GROUP,
+        gw,
+        &[G_CONNS, G_IDLE, G_OLDEST, G_MEM],
+    );
+    let mut top = with_head(trouble(&c.poll, ctx), head);
+    let pre = top.len();
+    let body_h = usize::from(inner[0].height).saturating_sub(pre);
+    let off = scroll_offset(sel, body_h);
     top.extend(
         c.groups
             .iter()
             .skip(off)
             .take(body_h)
-            .map(|g| group_line(g, gw, w)),
+            .map(|g| group_line(g, &cols, &keep, gw)),
     );
     if c.groups.is_empty() {
         top.push(Line::from(Span::styled(" No connections.", style::dim())));
     }
-    rows(frame, inner, top, Some(c.sel - off + 2));
+    let selected = (!c.groups.is_empty()).then(|| sel - off + pre);
+    rows(frame, inner[0], top, selected);
+
+    let dw = usize::from(inner[1].width);
+    let mut dl = Vec::new();
+    if let Some(g) = g {
+        dl.push(Line::from(fit(
+            vec![Span::styled(
+                format!(
+                    " {} connections · oldest {} · longest idle {} · {}",
+                    g.connections(),
+                    age(g.oldest_age),
+                    age(g.longest_idle),
+                    format::bytes(g.mem)
+                ),
+                style::fg(),
+            )],
+            dw,
+        )));
+        if g.flagged() {
+            dl.extend(paragraph(
+                vec![Span::styled(format!(" {MARK} "), style::amber())],
+                "   ",
+                &format!(
+                    "{} of them {} been idle for {} or more. Idle clients hold memory and a connection each.",
+                    g.idle_conns,
+                    if g.idle_conns == 1 { "has" } else { "have" },
+                    idle_hours()
+                ),
+                style::amber(),
+                dw,
+            ));
+        }
+        dl.push(Line::from(Span::styled(
+            " enter lists this group's connections.",
+            style::dim(),
+        )));
+    }
+    rows(frame, inner[1], dl, None);
 }
 
-fn group_line(g: &Group, gw: usize, w: usize) -> Line<'static> {
-    let flag = if g.flagged() {
-        Span::styled(
-            format!(" ▲ {} idle {}", g.idle_conns, idle_unit()),
-            style::amber(),
-        )
-    } else {
-        Span::raw("")
-    };
-    let spans = vec![
-        Span::styled(format!(" {}", pad_r(g.key.kind(), BY_W)), style::dim()),
-        Span::styled(pad_r(g.key.label(), gw), style::fg()),
-        Span::styled(
-            pad_l(&format::count(g.connections() as u64), CONNS_W),
-            style::fgb(),
-        ),
-        Span::styled(pad_l(&age(g.oldest_age), AGE_W), style::fg()),
-        Span::styled(
-            pad_l(&age(g.longest_idle), AGE_W),
-            if g.flagged() {
-                style::amber()
-            } else {
-                style::fg()
-            },
-        ),
-        Span::styled(
-            format!("  {}", pad_r(cmd_text(&g.top_cmd), CMD_W - 2)),
-            style::fg(),
-        ),
-        Span::styled(pad_l(&format::bytes(g.mem), MEM_W), style::fg()),
-        flag,
-    ];
-    Line::from(fit(spans, w))
+fn group_line(g: &Group, cols: &[Col], keep: &[usize], gw: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    for &i in keep {
+        spans.push(Span::raw(" "));
+        let w = if i == G_GROUP { gw - 1 } else { cols[i].w };
+        spans.push(match i {
+            G_GROUP => Span::styled(pad_r(&trunc(g.key.label(), w), w), style::fg()),
+            G_MARK => Span::styled(if g.flagged() { MARK } else { " " }, style::amber()),
+            G_CONNS => Span::styled(
+                pad_l(&format::count(g.connections() as u64), w),
+                style::fgb(),
+            ),
+            G_IDLE => Span::styled(
+                pad_l(&age(g.longest_idle), w),
+                if g.flagged() {
+                    style::amber()
+                } else {
+                    style::fg()
+                },
+            ),
+            G_OLDEST => Span::styled(pad_l(&age(g.oldest_age), w), style::fg()),
+            G_CMD => Span::styled(pad_r(cmd_text(&g.top_cmd), w), style::fg()),
+            G_MEM => Span::styled(pad_l(&format::bytes(g.mem), w), style::fg()),
+            G_BY => Span::styled(pad_r(g.key.kind(), w), style::dim()),
+            _ => Span::raw(""),
+        });
+    }
+    Line::from(spans)
 }
 
-/// The unit in the flag: `1h+` for the hour the flag is set at.
-fn idle_unit() -> String {
-    format!("{}h+", IDLE_FLAG_SECS / 3600)
+/// The hour the flag is set at, in words: `1 hour`.
+fn idle_hours() -> String {
+    let h = IDLE_FLAG_SECS / 3600;
+    format!("{h} hour{}", if h == 1 { "" } else { "s" })
+}
+
+const C_ADDR: usize = 0;
+const C_ID: usize = 1;
+const C_IDLE: usize = 2;
+const C_AGE: usize = 3;
+const C_LIB: usize = 4;
+const C_CMD: usize = 5;
+const C_MEM: usize = 6;
+
+fn conn_columns() -> [Col; 7] {
+    [
+        Col::new("ADDRESS", 16, Tier::Base),
+        Col::new("ID", 7, Tier::Base),
+        Col::new("IDLE", 8, Tier::Base),
+        Col::new("AGE", 8, Tier::Wide),
+        Col::new("LIBRARY / NAME", 16, Tier::Wide),
+        Col::new("LAST COMMAND", 12, Tier::More),
+        Col::new("MEM", 7, Tier::More),
+    ]
 }
 
 fn connections(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
@@ -534,60 +632,65 @@ fn connections(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>
         &secs(CLIENTS_EVERY),
         &format!("{kind} {name} · {} connections · esc back", conns.len()),
     );
-    let inner = panel(frame, area, "Clients", &right);
-    let w = usize::from(inner.width);
-    const ID_W: usize = 7;
-    const NAME_W: usize = 16;
-    const CMD: usize = 12;
-    let aw = w
-        .saturating_sub(1 + ID_W + NAME_W + 2 * AGE_W + CMD + MEM_W)
-        .max(10);
-    let head = Line::from(fit(
-        vec![Span::styled(
-            format!(
-                " {}{}{}{}{}{}{}",
-                pad_l("ID", ID_W - 1),
-                pad_r("  ADDRESS", aw),
-                pad_r("LIBRARY / NAME", NAME_W),
-                pad_l("AGE", AGE_W),
-                pad_l("IDLE", AGE_W),
-                pad_r("  LAST CMD", CMD),
-                pad_l("MEM", MEM_W),
-            ),
-            style::hd(),
-        )],
-        w,
-    ));
-    let mut lines = vec![trouble(&c.poll, ctx).unwrap_or_default(), head];
-    let body_h = usize::from(inner.height).saturating_sub(lines.len());
-    let off = scroll_offset(c.conn_sel, body_h);
+    let sel = c.conn_sel.min(conns.len().saturating_sub(1));
+    let cn = conns.get(sel).copied();
+    let (dt, dr) = match cn {
+        Some(cn) => (cn.addr.clone(), format!("id {}", cn.id)),
+        None => ("Details".to_string(), String::new()),
+    };
+    let inner = sections(
+        frame,
+        area,
+        &[
+            Section {
+                title: Title::new("Clients", &right),
+                rows: None,
+            },
+            Section {
+                title: Title::new(&dt, &dr),
+                rows: Some(DETAIL_ROWS),
+            },
+        ],
+    );
+    let w = usize::from(inner[0].width);
+    let cols = conn_columns();
+    let (keep, aw) = pick_flex(&cols, C_ADDR, w, WIDE_AT, ctx.more);
+    let head = head_row_at(&cols, &keep, C_ADDR, aw, &[C_ID, C_IDLE, C_AGE, C_MEM]);
+    let mut lines = with_head(trouble(&c.poll, ctx), head);
+    let pre = lines.len();
+    let body_h = usize::from(inner[0].height).saturating_sub(pre);
+    let off = scroll_offset(sel, body_h);
     lines.extend(conns.iter().skip(off).take(body_h).map(|cn| {
         let idle_long = cn.idle >= IDLE_FLAG_SECS;
-        Line::from(fit(
-            vec![
-                Span::styled(
-                    format!(" {}", pad_l(&cn.id.to_string(), ID_W - 1)),
-                    style::dim(),
-                ),
-                Span::styled(format!("  {}", pad_r(&cn.addr, aw - 2)), style::fg()),
-                Span::styled(pad_r(&lib_label(cn), NAME_W), style::fg()),
-                Span::styled(pad_l(&age(cn.age), AGE_W), style::fg()),
-                Span::styled(
-                    pad_l(&age(cn.idle), AGE_W),
+        let mut spans = Vec::new();
+        for &i in &keep {
+            spans.push(Span::raw(" "));
+            let cw = if i == C_ADDR { aw - 1 } else { cols[i].w };
+            spans.push(match i {
+                C_ADDR => Span::styled(pad_r(&trunc(&cn.addr, cw), cw), style::fg()),
+                C_ID => Span::styled(pad_l(&cn.id.to_string(), cw), style::dim()),
+                C_IDLE => Span::styled(
+                    pad_l(
+                        &if idle_long {
+                            format!("{MARK} {}", age(cn.idle))
+                        } else {
+                            age(cn.idle)
+                        },
+                        cw,
+                    ),
                     if idle_long {
                         style::amber()
                     } else {
                         style::fg()
                     },
                 ),
-                Span::styled(
-                    format!("  {}", pad_r(cmd_text(&cn.cmd), CMD - 2)),
-                    style::fg(),
-                ),
-                Span::styled(pad_l(&format::bytes(cn.mem), MEM_W), style::fg()),
-            ],
-            w,
-        ))
+                C_AGE => Span::styled(pad_l(&age(cn.age), cw), style::fg()),
+                C_LIB => Span::styled(pad_r(&trunc(&lib_label(cn), cw), cw), style::fg()),
+                C_CMD => Span::styled(pad_r(cmd_text(&cn.cmd), cw), style::fg()),
+                _ => Span::styled(pad_l(&format::bytes(cn.mem), cw), style::fg()),
+            });
+        }
+        Line::from(spans)
     }));
     if conns.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -595,22 +698,67 @@ fn connections(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>
             style::dim(),
         )));
     }
-    rows(
-        frame,
-        inner,
-        lines,
-        Some(c.conn_sel.saturating_sub(off) + 2),
-    );
+    let selected = (!conns.is_empty()).then(|| sel - off + pre);
+    rows(frame, inner[0], lines, selected);
+
+    let dw = usize::from(inner[1].width);
+    let mut dl = Vec::new();
+    if let Some(cn) = cn {
+        let label = |t: &str| Span::styled(format!(" {}", pad_r(t, 9)), style::dim());
+        dl.push(Line::from(fit(
+            vec![label("Client"), Span::styled(lib_label(cn), style::fg())],
+            dw,
+        )));
+        dl.push(Line::from(fit(
+            vec![
+                label("Age"),
+                Span::styled(age(cn.age), style::fg()),
+                Span::styled(" · idle ", style::dim()),
+                Span::styled(
+                    age(cn.idle),
+                    if cn.idle >= IDLE_FLAG_SECS {
+                        style::amber()
+                    } else {
+                        style::fg()
+                    },
+                ),
+            ],
+            dw,
+        )));
+        dl.push(Line::from(fit(
+            vec![
+                label("Last"),
+                Span::styled(cmd_text(&cn.cmd).to_string(), style::cmd()),
+                Span::styled(" · memory ", style::dim()),
+                Span::styled(format::bytes(cn.mem), style::fg()),
+            ],
+            dw,
+        )));
+    }
+    rows(frame, inner[1], dl, None);
 }
 
 // ---------------------------------------------------------------------------
 // Slow log
 // ---------------------------------------------------------------------------
 
-const TIME_W: usize = 9;
-const DUR_W: usize = 9;
-const COMMAND_W: usize = 15;
-const CLIENT_W: usize = 21;
+const L_MARK: usize = 0;
+const L_TIME: usize = 1;
+const L_DUR: usize = 2;
+const L_CMD: usize = 3;
+const L_KEYS: usize = 4;
+const L_CLIENT: usize = 5;
+
+fn slow_columns() -> [Col; 6] {
+    [
+        Col::new("", 1, Tier::Base),
+        Col::new("TIME", 9, Tier::Base),
+        Col::new("DURATION", 9, Tier::Base),
+        Col::new("COMMAND", 13, Tier::Base),
+        Col::new("KEYS", 8, Tier::Base),
+        Col::new("CLIENT", 21, Tier::Wide),
+    ]
+}
 
 /// Microseconds as `812µs`, `25.3ms`, `1.25s`.
 fn micros(m: u64) -> String {
@@ -646,18 +794,32 @@ fn slow_log(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
     if gate(frame, area, "Slow log", &s.poll, ctx) {
         return;
     }
-    let [main, detail] = Layout::vertical([Constraint::Min(0), Constraint::Length(7)]).areas(area);
     let right = right_title(
         state,
         ctx,
         &secs(SLOWLOG_EVERY),
         &format!("{} entries · UTC", s.entries.len()),
     );
-    let inner = panel(frame, main, "Slow log", &right);
-    let w = usize::from(inner.width);
-    let kw = w
-        .saturating_sub(2 + TIME_W + DUR_W + COMMAND_W + CLIENT_W)
-        .max(8);
+    let inner = sections(
+        frame,
+        area,
+        &[
+            Section {
+                title: Title::new("Slow log", &right),
+                rows: None,
+            },
+            Section {
+                title: Title::new(
+                    "Entry",
+                    &s.selected().map_or_else(String::new, |e| micros(e.micros)),
+                ),
+                rows: Some(6),
+            },
+        ],
+    );
+    let w = usize::from(inner[0].width);
+    let cols = slow_columns();
+    let (keep, kw) = pick_flex(&cols, L_KEYS, w, WIDE_AT, ctx.more);
 
     let mut status: Vec<Span<'static>> = vec![Span::raw(" ")];
     match (&s.config, &s.config_note) {
@@ -674,40 +836,29 @@ fn slow_log(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
     }
     let status = trouble(&s.poll, ctx).unwrap_or_else(|| Line::from(fit(status, w)));
 
-    let head = Line::from(fit(
-        vec![Span::styled(
-            format!(
-                "  {}{}{}{}{}",
-                pad_r("TIME", TIME_W),
-                pad_l("DURATION", DUR_W),
-                pad_r("  COMMAND", COMMAND_W),
-                pad_r("KEYS", kw),
-                pad_r("CLIENT", CLIENT_W),
-            ),
-            style::hd(),
-        )],
-        w,
-    ));
+    let head = head_row_at(&cols, &keep, L_KEYS, kw, &[L_DUR]);
     let mut lines = vec![status, head];
-    let body_h = usize::from(inner.height).saturating_sub(lines.len());
-    let off = scroll_offset(s.sel, body_h);
+    let pre = lines.len();
+    let body_h = usize::from(inner[0].height).saturating_sub(pre);
+    let sel = s.sel.min(s.entries.len().saturating_sub(1));
+    let off = scroll_offset(sel, body_h);
     lines.extend(s.entries.iter().skip(off).take(body_h).map(|e| {
         let note = note_of(e).is_some();
-        Line::from(fit(
-            vec![
-                Span::styled(if note { " ▲" } else { "  " }, style::amber()),
-                Span::styled(pad_r(&utc_time(e.unix), TIME_W), style::dim()),
-                Span::styled(pad_l(&micros(e.micros), DUR_W), style::fgb()),
-                Span::styled(
-                    format!("  {}", pad_r(&e.command, COMMAND_W - 2)),
-                    style::cmd(),
-                ),
-                Span::styled(pad_r(&keys_text(e), kw - 1), style::fg()),
-                Span::raw(" "),
-                Span::styled(pad_r(&e.client, CLIENT_W), style::dim()),
-            ],
-            w,
-        ))
+        let mut spans = Vec::new();
+        for &i in &keep {
+            spans.push(Span::raw(" "));
+            let cw = if i == L_KEYS { kw - 1 } else { cols[i].w };
+            spans.push(match i {
+                L_MARK => Span::styled(if note { MARK } else { " " }, style::amber()),
+                L_TIME => Span::styled(pad_r(&utc_time(e.unix), cw), style::dim()),
+                L_DUR => Span::styled(pad_l(&micros(e.micros), cw), style::fgb()),
+                L_CMD => Span::styled(pad_r(&trunc(&e.command, cw), cw), style::cmd()),
+                L_KEYS => Span::styled(pad_r(&trunc(&keys_text(e), cw), cw), style::fg()),
+                L_CLIENT => Span::styled(pad_r(&trunc(&e.client, cw), cw), style::dim()),
+                _ => Span::raw(""),
+            });
+        }
+        Line::from(spans)
     }));
     if s.entries.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -715,12 +866,12 @@ fn slow_log(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
             style::dim(),
         )));
     }
-    rows(frame, inner, lines, Some(s.sel.saturating_sub(off) + 2));
-    entry_panel(frame, detail, s);
+    let selected = (!s.entries.is_empty()).then(|| sel - off + pre);
+    rows(frame, inner[0], lines, selected);
+    entry_lines(frame, inner[1], s);
 }
 
-fn entry_panel(frame: &mut Frame, area: Rect, s: &SlowLog) {
-    let inner = panel(frame, area, "Entry", "");
+fn entry_lines(frame: &mut Frame, inner: Rect, s: &SlowLog) {
     let w = usize::from(inner.width);
     let Some(e) = s.selected() else {
         return;
@@ -758,10 +909,13 @@ fn entry_panel(frame: &mut Frame, area: Rect, s: &SlowLog) {
         )),
     ];
     if let Some(n) = note_of(e) {
-        lines.push(Line::from(fit(
-            vec![Span::styled(format!(" ▲ {}", n.text()), style::amber())],
+        lines.extend(paragraph(
+            vec![Span::styled(format!(" {MARK} "), style::amber())],
+            "   ",
+            n.text(),
+            style::amber(),
             w,
-        )));
+        ));
     }
     rows(frame, inner, lines, None);
 }
@@ -784,9 +938,19 @@ fn args_spans(label: Span<'static>, e: &SlowEntry) -> Vec<Span<'static>> {
 // Monitor
 // ---------------------------------------------------------------------------
 
-const M_TIME_W: usize = 13;
-const M_DB_W: usize = 4;
-const M_CLIENT_W: usize = 22;
+const M_TIME: usize = 0;
+const M_DB: usize = 1;
+const M_CLIENT: usize = 2;
+const M_COMMAND: usize = 3;
+
+fn monitor_columns() -> [Col; 4] {
+    [
+        Col::new("TIME", 13, Tier::Base),
+        Col::new("DB", 4, Tier::More),
+        Col::new("CLIENT", 22, Tier::Wide),
+        Col::new("COMMAND", 12, Tier::Base),
+    ]
+}
 
 /// `13:04:05.123` (UTC) for a line, `—` when its time is unreadable.
 fn line_time(e: &Entry) -> String {
@@ -823,9 +987,21 @@ fn monitor_state(m: &Monitor, ctx: &Ctx<'_>) -> String {
 }
 
 fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
-    let [main, detail] = Layout::vertical([Constraint::Min(0), Constraint::Length(5)]).areas(area);
-    let inner = panel(frame, main, "Monitor", &monitor_right(m, ctx));
-    let w = usize::from(inner.width);
+    let inner = sections(
+        frame,
+        area,
+        &[
+            Section {
+                title: Title::new("Monitor", &monitor_right(m, ctx)),
+                rows: None,
+            },
+            Section {
+                title: Title::new("Line", ""),
+                rows: Some(4),
+            },
+        ],
+    );
+    let w = usize::from(inner[0].width);
     let text = |t: String, st: Style| Line::from(fit(vec![Span::styled(t, st)], w));
     if let Some(p) = &m.prompt {
         let profile = &ctx.profile().name;
@@ -833,24 +1009,26 @@ fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
             Line::default(),
             text(format!(" Send MONITOR to {profile}?"), style::fgb()),
             Line::default(),
-            text(
-                " MONITOR runs on a connection of its own, and the server copies every".to_string(),
-                style::fg(),
-            ),
-            text(
-                " command it runs to it. That slows a busy server.".to_string(),
-                style::fg(),
-            ),
-            text(
-                format!(
-                    " It stops after {} s or {} lines, or with esc. The lines stay in memory.",
-                    MAX_TIME.as_secs(),
-                    format::grouped(MAX_LINES as u64)
-                ),
-                style::dim(),
-            ),
-            Line::default(),
         ];
+        lines.extend(paragraph(
+            vec![Span::raw(" ")],
+            " ",
+            "MONITOR runs on a connection of its own, and the server copies every command it runs to it. That slows a busy server.",
+            style::fg(),
+            w,
+        ));
+        lines.extend(paragraph(
+            vec![Span::raw(" ")],
+            " ",
+            &format!(
+                "It stops after {} s or {} lines, or with esc. The lines stay in memory.",
+                MAX_TIME.as_secs(),
+                format::grouped(MAX_LINES as u64)
+            ),
+            style::dim(),
+            w,
+        ));
+        lines.push(Line::default());
         lines.push(match p {
             Prompt::YesNo => text(" y starts it, n cancels.".to_string(), style::amber()),
             Prompt::TypeName(_) => text(
@@ -858,12 +1036,11 @@ fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
                 style::amber(),
             ),
         });
-        rows(frame, inner, lines, None);
-        panel(frame, detail, "Line", "");
+        rows(frame, inner[0], lines, None);
         return;
     }
     let status = if let Some(why) = crate::conn::monitor_unsupported(ctx.profile()) {
-        text(format!(" ▲ {why}"), style::amber())
+        text(format!(" {MARK} {why}"), style::amber())
     } else if let Some(stop) = &m.stopped {
         let st = if matches!(
             stop,
@@ -876,7 +1053,7 @@ fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
         };
         let mut t = format!(" {}", stop.text());
         if m.ranking().is_some() && ctx.report().is_some_and(|r| r.hot_keys.is_empty()) {
-            t.push_str(" Hot keys (2) ranks its keys.");
+            t.push_str(" Analyze › Hot keys ranks its keys.");
         }
         text(t, st)
     } else if m.running() {
@@ -888,38 +1065,31 @@ fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
             style::dim(),
         )
     };
-    let cw = w.saturating_sub(1 + M_TIME_W + M_DB_W + M_CLIENT_W).max(8);
-    let head = Line::from(fit(
-        vec![Span::styled(
-            format!(
-                " {}{}{}{}",
-                pad_r("TIME", M_TIME_W),
-                pad_r("DB", M_DB_W),
-                pad_r("CLIENT", M_CLIENT_W),
-                pad_r("COMMAND", cw),
-            ),
-            style::hd(),
-        )],
-        w,
-    ));
+    let cols = monitor_columns();
+    let (keep, cw) = pick_flex(&cols, M_COMMAND, w, WIDE_AT, ctx.more);
+    let head = head_row_at(&cols, &keep, M_COMMAND, cw, &[]);
     let mut lines = vec![status, head];
-    let body_h = usize::from(inner.height).saturating_sub(lines.len());
-    let off = scroll_offset(m.sel, body_h);
+    let pre = lines.len();
+    let body_h = usize::from(inner[0].height).saturating_sub(pre);
+    let sel = m.sel.min(m.lines.len().saturating_sub(1));
+    let off = scroll_offset(sel, body_h);
     lines.extend(m.lines.iter().skip(off).take(body_h).map(|e| {
-        Line::from(fit(
-            vec![
-                Span::styled(format!(" {}", pad_r(&line_time(e), M_TIME_W)), style::dim()),
-                Span::styled(pad_r(&escape(&e.line.db), M_DB_W), style::dim()),
-                Span::styled(
-                    pad_r(&trunc(&escape(&e.line.client), M_CLIENT_W - 1), M_CLIENT_W),
-                    style::dim(),
-                ),
-                Span::styled(escape(&e.command_line()), style::fg()),
-            ],
-            w,
-        ))
+        let mut spans = Vec::new();
+        for &i in &keep {
+            spans.push(Span::raw(" "));
+            let w = if i == M_COMMAND { cw - 1 } else { cols[i].w };
+            spans.push(match i {
+                M_TIME => Span::styled(pad_r(&line_time(e), w), style::dim()),
+                M_DB => Span::styled(pad_r(&escape(&e.line.db), w), style::dim()),
+                M_CLIENT => {
+                    Span::styled(pad_r(&trunc(&escape(&e.line.client), w), w), style::dim())
+                }
+                _ => Span::styled(escape(&e.command_line()), style::fg()),
+            });
+        }
+        Line::from(fit(spans, usize::from(inner[0].width)))
     }));
-    let selected = (!m.lines.is_empty()).then(|| m.sel.saturating_sub(off) + 2);
+    let selected = (!m.lines.is_empty()).then(|| sel - off + pre);
     if m.lines.is_empty() && (m.running() || m.stopped.is_some()) {
         let t = if m.running() {
             " No lines yet."
@@ -928,13 +1098,12 @@ fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
         };
         lines.push(text(t.to_string(), style::dim()));
     }
-    rows(frame, inner, lines, selected);
-    line_panel(frame, detail, m.selected());
+    rows(frame, inner[0], lines, selected);
+    line_lines(frame, inner[1], m.selected());
 }
 
 /// The selected line in full, as far as two rows take it.
-fn line_panel(frame: &mut Frame, area: Rect, e: Option<&Entry>) {
-    let inner = panel(frame, area, "Line", "");
+fn line_lines(frame: &mut Frame, inner: Rect, e: Option<&Entry>) {
     let w = usize::from(inner.width);
     let Some(e) = e else {
         return;

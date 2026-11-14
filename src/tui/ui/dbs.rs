@@ -7,10 +7,9 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Clear;
 
 use super::style;
-use super::widgets::{pad_l, pad_r, panel, rows, scroll_offset, trunc, width};
+use super::widgets::{dialog, pad_l, pad_r, rows, scroll_offset, trunc, width};
 use crate::format;
 use crate::tui::app::views::dbs::{DbList, Stage};
 
@@ -148,14 +147,7 @@ pub fn draw(frame: &mut Frame, area: Rect, l: &DbList) {
     lines.extend(below);
     lines.push(Line::from(keyline));
 
-    let h = (lines.len() as u16 + 2).min(area.height);
-    let rect = Rect {
-        x: area.x + (area.width - w) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    };
-    frame.render_widget(Clear, rect);
+    let h = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let right = match &l.saved_as {
         Some(name) => format!(
             "{}{}",
@@ -164,8 +156,8 @@ pub fn draw(frame: &mut Frame, area: Rect, l: &DbList) {
         ),
         None => "container".to_string(),
     };
-    let title = trunc("Databases", inner.saturating_sub(width(&right) + 2));
-    let body = panel(frame, rect, &title, &right);
+    let title = trunc("Switch database", inner.saturating_sub(width(&right) + 2));
+    let body = dialog(frame, area, w, h, &title, &right);
     let sel = sel_line.filter(|&i| i < rows_end);
     rows(frame, body, lines, sel);
 }

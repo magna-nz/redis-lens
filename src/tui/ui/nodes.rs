@@ -1,5 +1,5 @@
-//! View 5: the shards of a cluster scan, one row per node scanned, with a detail panel
-//! for the selected node. `enter` narrows 1 Patterns to that node.
+//! Analyze › Nodes: the shards of a cluster analysis, one row per node read, with the
+//! selected node's details below in the same frame. `enter` narrows Browse to that node.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -10,23 +10,42 @@ use crate::format;
 use crate::model::{NodeReport, NodeRole, NodeStatus};
 use crate::tui::app::App;
 
-use super::widgets::{fit, pad_l, pad_r, panel, rows, scroll_offset, trunc, width};
-use super::{mark_previous, notice_panels, report_or_wait, server_label, split_body, style};
+use super::analysis::{Col, MARK, Tier, head_row, need_report, notice, paragraph, pick_cols};
+use super::widgets::{Section, Title, fit, pad_l, pad_r, rows, scroll_offset, sections, trunc};
+use super::{mark_previous, server_label, style};
 
-const SLOTS_W: usize = 13;
-const ROLE_W: usize = 9;
-const STATUS_W: usize = 9;
+const SLOTS_W: usize = 12;
+const ENDPOINT_W: usize = 16;
+const ROLE_W: usize = 8;
+const STATE_W: usize = 11;
 const NUM_W: usize = 7;
+/// The slot ranges of a node never take more than this many cells.
+const SLOTS_CAP: usize = 18;
+/// Rows the details get at least, when the list is long.
+const DETAIL_ROWS: u16 = 8;
 
-/// The endpoint column: wide enough for `10.0.1.11:6379` and a gap, wider on wide
-/// terminals for host names and IPv6.
-fn endpoint_width(inner: usize) -> usize {
-    if inner >= 100 { 24 } else { 17 }
+const NODE: usize = 1;
+const ROLE: usize = 2;
+const STATE: usize = 3;
+const KEYS: usize = 4;
+const MEMORY: usize = 5;
+const SAMPLED: usize = 6;
+
+/// The columns. The node address gets more room on wide terminals, for host names.
+fn columns(endpoint_w: usize) -> [Col; 7] {
+    [
+        Col::new("SLOTS", SLOTS_W, Tier::Base),
+        Col::new("NODE", endpoint_w, Tier::Base),
+        Col::new("ROLE", ROLE_W, Tier::Base),
+        Col::new("STATE", STATE_W, Tier::Base),
+        Col::new("KEYS", NUM_W, Tier::Base),
+        Col::new("MEMORY", NUM_W, Tier::Base),
+        Col::new("SAMPLED", NUM_W, Tier::More),
+    ]
 }
 
-/// Every column but the note, which takes what is left.
-fn fixed(ep: usize) -> usize {
-    1 + SLOTS_W + ep + ROLE_W + STATUS_W + 3 * (NUM_W + 2)
+fn endpoint_width(inner: usize) -> usize {
+    if inner >= 100 { 24 } else { ENDPOINT_W }
 }
 
 /// Slot ranges as `0-5460` or `0-99,200-5460`; a single slot as `42`.
@@ -62,23 +81,32 @@ fn role(r: NodeRole) -> &'static str {
     }
 }
 
-/// The status label and its style: `failed` red, `partial` amber, `scanned` teal.
+/// The state in words with its glyph, and its style: `✓ analyzed` teal, `▲ partial`
+/// amber, `✗ failed` red.
 pub fn status(s: NodeStatus) -> (&'static str, Style) {
     match s {
-        NodeStatus::Scanned => ("scanned", style::ok()),
+        NodeStatus::Scanned => ("✓ analyzed", style::ok()),
         NodeStatus::Partial => ("▲ partial", style::amber()),
         NodeStatus::Failed => ("✗ failed", style::warn()),
     }
 }
 
-/// The panel's right title: shard count, then how many failed or are partial.
+/// The frame's right title: shard count, then how many were read on a replica, failed
+/// or are partial.
 fn summary(nodes: &[NodeReport]) -> String {
     let n = nodes.len();
     let count = |s: NodeStatus| nodes.iter().filter(|x| x.status == s).count();
     let mut out = format!("{n} shard{}", if n == 1 { "" } else { "s" });
     let replicas = nodes.iter().filter(|x| x.role == NodeRole::Replica).count();
     if replicas > 0 {
-        out.push_str(&format!(" · {replicas} on replicas"));
+        out.push_str(&format!(
+            " · {replicas} read on {}",
+            if replicas == 1 {
+                "a replica"
+            } else {
+                "replicas"
+            }
+        ));
     }
     for (s, label) in [
         (NodeStatus::Failed, "failed"),
@@ -89,27 +117,35 @@ fn summary(nodes: &[NodeReport]) -> String {
             out.push_str(&format!(" · {c} {label}"));
         }
     }
-    out.push_str(" · slot order · enter shows a node's patterns");
     out
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
-    let Some((_, report)) = report_or_wait(frame, area, app, "Nodes") else {
+    if need_report(
+        frame,
+        area,
+        app,
+        "Nodes",
+        "shows how the analysis went on each shard of the cluster.",
+    ) {
+        return;
+    }
+    let Some(report) = app.report() else {
         return;
     };
     let Some(nodes) = report.nodes.as_deref() else {
-        notice_panels(
+        notice(
             frame,
             area,
             "Nodes",
             &mark_previous(app, "standalone"),
             vec![
                 Line::from(Span::styled(
-                    " Not a cluster: this scan read one standalone server.",
+                    " Not a cluster: this analysis read one standalone server.",
                     style::fgb(),
                 )),
                 Line::from(Span::styled(
-                    " On a cluster this view lists each shard and the node scanned for it.",
+                    " On a cluster this panel lists each shard and the node read for it.",
                     style::dim(),
                 )),
             ],
@@ -117,90 +153,116 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
     if nodes.is_empty() {
-        notice_panels(
+        notice(
             frame,
             area,
             "Nodes",
             &mark_previous(app, "0 shards"),
             vec![Line::from(Span::styled(
-                " The cluster scan has no shards to show.",
+                " The cluster analysis has no shards to show.",
                 style::dim(),
             ))],
         );
         return;
     }
-    let (main, detail) = split_body(area);
     let sel = app.sel.nodes.min(nodes.len() - 1);
-    let inner = panel(frame, main, "Nodes", &mark_previous(app, &summary(nodes)));
-    let iw = usize::from(inner.width);
-    let ep = endpoint_width(iw);
-    let note_w = iw.saturating_sub(fixed(ep));
-    let mut head = vec![
-        Span::styled(pad_r(" SLOTS", SLOTS_W + 1), style::hd()),
-        Span::styled(pad_r("ENDPOINT", ep), style::hd()),
-        Span::styled(pad_r("ROLE", ROLE_W), style::hd()),
-        Span::styled(pad_r("STATUS", STATUS_W), style::hd()),
-        Span::styled(format!("{}  ", pad_l("KEYS", NUM_W)), style::hd()),
-        Span::styled(format!("{}  ", pad_l("SAMPLED", NUM_W)), style::hd()),
-        Span::styled(format!("{}  ", pad_l("MEMORY", NUM_W)), style::hd()),
-    ];
-    if note_w >= 4 {
-        head.push(Span::styled("NOTE", style::hd()));
-    }
-    rows(frame, inner, vec![Line::from(head)], None);
+    let n = &nodes[sel];
+    let (st, _) = status(n.status);
+    let node_title = n.endpoint.to_string();
+    let node_right = format!(
+        "{} · {}",
+        role(n.role),
+        st.trim_start_matches(['✓', '▲', '✗', ' '])
+    );
+    // The list takes what it needs, leaving the details their rows.
+    let usable = area.height.saturating_sub(3);
+    let list_rows = u16::try_from(nodes.len() + 1)
+        .unwrap_or(u16::MAX)
+        .min(usable.saturating_sub(DETAIL_ROWS).max(3));
+    let inner = sections(
+        frame,
+        area,
+        &[
+            Section {
+                title: Title::new("Nodes", &mark_previous(app, &summary(nodes))),
+                rows: Some(list_rows),
+            },
+            Section {
+                title: Title::new(&node_title, &node_right),
+                rows: None,
+            },
+        ],
+    );
+    let (list, detail) = (inner[0], inner[1]);
+    let iw = usize::from(list.width);
+    let cols = columns(endpoint_width(iw));
+    let (keep, slots_w) = pick_cols(&cols, iw, usize::MAX, app.more_here());
+    let slots_w = slots_w.min(SLOTS_CAP);
+    rows(
+        frame,
+        list,
+        vec![head_row(&cols, &keep, slots_w, &[KEYS, MEMORY, SAMPLED])],
+        None,
+    );
     let body = Rect {
-        y: inner.y + 1,
-        height: inner.height.saturating_sub(1),
-        ..inner
+        y: list.y + 1,
+        height: list.height.saturating_sub(1),
+        ..list
     };
     let off = scroll_offset(sel, usize::from(body.height));
     let lines: Vec<Line<'static>> = nodes
         .iter()
         .skip(off)
         .take(usize::from(body.height))
-        .map(|n| node_row(n, ep, note_w))
+        .map(|n| node_row(n, &cols, &keep, slots_w))
         .collect();
     rows(frame, body, lines, Some(sel - off));
-    detail_panel(frame, detail, &nodes[sel]);
+    detail_lines(frame, detail, n, report.sampled_keys);
 }
 
-fn node_row(n: &NodeReport, ep: usize, note_w: usize) -> Line<'static> {
+fn node_row(n: &NodeReport, cols: &[Col], keep: &[usize], slots_w: usize) -> Line<'static> {
     let dash = || "—".to_string();
     let (st, st_style) = status(n.status);
-    let keys = n
-        .server
-        .as_ref()
-        .map_or_else(dash, |s| format::count(s.total_keys));
-    let sampled = if n.status == NodeStatus::Failed {
-        dash()
-    } else {
-        format::count(n.sampled_keys)
-    };
-    let mem = n
-        .server
-        .as_ref()
-        .map_or_else(dash, |s| format::bytes(s.used_memory));
     // A cut cell keeps one free cell before the next column.
-    let cell = |s: &str, w: usize| pad_r(&trunc(s, w - 1), w);
-    let mut spans = vec![
-        Span::styled(
-            format!(" {}", cell(&slot_ranges(&n.slots), SLOTS_W)),
-            style::fg(),
+    let cell = |s: &str, w: usize| pad_r(&trunc(s, w.saturating_sub(1)), w);
+    let mut spans = vec![Span::styled(
+        format!(
+            " {}",
+            cell(&slot_ranges(&n.slots), slots_w.saturating_sub(1))
         ),
-        Span::styled(cell(&n.endpoint.to_string(), ep), style::fgb()),
-        Span::styled(pad_r(role(n.role), ROLE_W), style::dim()),
-        Span::styled(pad_r(st, STATUS_W), st_style),
-        Span::styled(format!("{}  ", pad_l(&keys, NUM_W)), style::fg()),
-        Span::styled(format!("{}  ", pad_l(&sampled, NUM_W)), style::fg()),
-        Span::styled(format!("{}  ", pad_l(&mem, NUM_W)), style::fg()),
-    ];
-    if let Some(note) = &n.note
-        && note_w >= 4
-    {
-        spans.push(Span::styled(
-            trunc(note, note_w.saturating_sub(1)),
-            note_style(n),
-        ));
+        style::fg(),
+    )];
+    for &i in &keep[1..] {
+        spans.push(Span::raw(" "));
+        let w = cols[i].w;
+        match i {
+            NODE => spans.push(Span::styled(cell(&n.endpoint.to_string(), w), style::fgb())),
+            ROLE => spans.push(Span::styled(pad_r(role(n.role), w), style::dim())),
+            STATE => spans.push(Span::styled(pad_r(st, w), st_style)),
+            KEYS => {
+                let keys = n
+                    .server
+                    .as_ref()
+                    .map_or_else(dash, |s| format::count(s.total_keys));
+                spans.push(Span::styled(pad_l(&keys, w), style::fg()));
+            }
+            MEMORY => {
+                let mem = n
+                    .server
+                    .as_ref()
+                    .map_or_else(dash, |s| format::bytes(s.used_memory));
+                spans.push(Span::styled(pad_l(&mem, w), style::fg()));
+            }
+            SAMPLED => {
+                let sampled = if n.status == NodeStatus::Failed {
+                    dash()
+                } else {
+                    format::count(n.sampled_keys)
+                };
+                spans.push(Span::styled(pad_l(&sampled, w), style::fg()));
+            }
+            _ => {}
+        }
     }
     Line::from(spans)
 }
@@ -213,55 +275,16 @@ fn note_style(n: &NodeReport) -> Style {
     }
 }
 
-/// `text` cut into lines of at most `w` cells at spaces (a word longer than `w` is
-/// cut with `…`).
-fn wrap(text: &str, w: usize) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for word in text.split_whitespace() {
-        let need = if cur.is_empty() {
-            width(word)
-        } else {
-            width(&cur) + 1 + width(word)
-        };
-        if need <= w || cur.is_empty() {
-            if !cur.is_empty() {
-                cur.push(' ');
-            }
-            cur.push_str(word);
-            if width(&cur) > w {
-                cur = trunc(&cur, w);
-            }
-        } else {
-            out.push(std::mem::take(&mut cur));
-            cur.push_str(&trunc(word, w));
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
 fn kv(label: &str, value: Vec<Span<'static>>) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(format!(" {}", pad_r(label, 10)), style::dim())];
+    let mut spans = vec![Span::styled(format!(" {}", pad_r(label, 8)), style::dim())];
     spans.extend(value);
     spans
 }
 
-fn detail_panel(frame: &mut Frame, area: Rect, n: &NodeReport) {
-    let (st, _) = status(n.status);
-    let right = format!(
-        "{} · {}",
-        role(n.role),
-        st.trim_start_matches(['▲', '✗', ' '])
-    );
-    let inner = panel(frame, area, &n.endpoint.to_string(), &right);
+fn detail_lines(frame: &mut Frame, inner: Rect, n: &NodeReport, analyzed: u64) {
     let w = usize::from(inner.width);
-    let mut lines: Vec<Vec<Span<'static>>> = vec![
-        vec![Span::styled(" NODE", style::hd())],
-        kv("ID", vec![Span::styled(n.id.clone(), style::fg())]),
-    ];
+    let mut lines: Vec<Vec<Span<'static>>> =
+        vec![kv("Node", vec![Span::styled(n.id.clone(), style::fg())])];
     if n.role == NodeRole::Replica {
         lines.push(kv(
             "Primary",
@@ -289,8 +312,8 @@ fn detail_panel(frame: &mut Frame, area: Rect, n: &NodeReport) {
                     Span::styled(server_label(s), style::fg()),
                     Span::styled(
                         format!(
-                            " · {} keys · {} used",
-                            format::grouped(s.total_keys),
+                            " · {} keys · {}",
+                            format::count(s.total_keys),
                             format::bytes(s.used_memory)
                         ),
                         style::dim(),
@@ -298,7 +321,7 @@ fn detail_panel(frame: &mut Frame, area: Rect, n: &NodeReport) {
                 ];
                 if s.maxmemory > 0 {
                     v.push(Span::styled(
-                        format!(" / {}", format::bytes(s.maxmemory)),
+                        format!(" of {}", format::bytes(s.maxmemory)),
                         style::dim(),
                     ));
                 }
@@ -312,7 +335,8 @@ fn detail_panel(frame: &mut Frame, area: Rect, n: &NodeReport) {
             Span::styled(format::grouped(n.sampled_keys), style::fg()),
             Span::styled(
                 format!(
-                    " keys · {} pattern{}",
+                    " of the {} analyzed keys, {} pattern{}",
+                    format::grouped(analyzed),
                     n.patterns.len(),
                     if n.patterns.len() == 1 { "" } else { "s" }
                 ),
@@ -324,44 +348,36 @@ fn detail_panel(frame: &mut Frame, area: Rect, n: &NodeReport) {
         }
         if !n.sizes_available {
             v.push(Span::styled(
-                " · sizes unavailable: MEMORY USAGE denied",
+                " · no sizes: MEMORY USAGE denied",
                 style::warn(),
             ));
         }
-        lines.push(kv("Sampled", v));
+        lines.push(kv("Sample", v));
     }
     let mut out: Vec<Line<'static>> = lines.into_iter().map(|l| Line::from(fit(l, w))).collect();
+    out.push(Line::default());
+    out.extend(paragraph(
+        vec![Span::raw(" ")],
+        " ",
+        "enter shows only this node's patterns in Browse; esc there shows all again.",
+        style::dim(),
+        w,
+    ));
     // The whole note, wrapped over the rows that are left.
-    let room = usize::from(inner.height).saturating_sub(out.len());
-    match &n.note {
-        Some(note) if room > 0 => {
-            let mark = if n.status == NodeStatus::Failed {
-                "✗"
-            } else {
-                "▲"
-            };
-            let text = format!("{mark} {note}");
-            let wrapped = wrap(&text, w.saturating_sub(1));
-            let cut = wrapped.len() > room;
-            for (i, l) in wrapped.into_iter().take(room).enumerate() {
-                let l = if cut && i + 1 == room {
-                    trunc(&format!("{l} …"), w.saturating_sub(1))
-                } else {
-                    l
-                };
-                out.push(Line::from(Span::styled(format!(" {l}"), note_style(n))));
-            }
-        }
-        None if room > 0 => {
-            out.push(Line::from(Span::styled(
-                trunc(
-                    " enter shows this node's own patterns on 1 Patterns; esc there goes back.",
-                    w,
-                ),
-                style::dim(),
-            )));
-        }
-        _ => {}
+    if let Some(note) = &n.note {
+        out.push(Line::default());
+        let (mark, st) = if n.status == NodeStatus::Failed {
+            ("✗", note_style(n))
+        } else {
+            (MARK, note_style(n))
+        };
+        out.extend(paragraph(
+            vec![Span::styled(format!(" {mark} "), st)],
+            "   ",
+            note,
+            st,
+            w,
+        ));
     }
     rows(frame, inner, out, None);
 }
@@ -392,25 +408,45 @@ mod tests {
             .remove(0);
         n.slots = vec![(0, 99), (200, 200), (300, 5460)];
         n.endpoint.host = "cache-node-0001.example.internal".into();
-        let line = node_row(&n, 17, 0);
+        let cols = columns(17);
+        let (keep, slots_w) = pick_cols(&cols, 78, usize::MAX, false);
+        let line = node_row(&n, &cols, &keep, slots_w.min(14));
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
-            text.starts_with(" 0-99,200,30… cache-node-0001… primary"),
+            text.starts_with(" 0-99,200,300-5460 ") || text.starts_with(" 0-99,200,30…"),
             "{text}"
+        );
+        assert!(text.contains("cache-node-0001…"), "{text}");
+    }
+
+    #[test]
+    fn every_state_has_a_word_and_a_glyph() {
+        for s in [NodeStatus::Scanned, NodeStatus::Partial, NodeStatus::Failed] {
+            let (text, _) = status(s);
+            let (glyph, word) = text.split_once(' ').unwrap();
+            assert!(["✓", "▲", "✗"].contains(&glyph), "{text}");
+            assert!(word.len() > 3, "{text}");
+        }
+    }
+
+    #[test]
+    fn the_summary_counts_replicas_failures_and_partials() {
+        let mut nodes = crate::tui::fixtures::cluster_report().nodes.unwrap();
+        assert_eq!(summary(&nodes), "3 shards");
+        nodes[1].role = NodeRole::Replica;
+        nodes[2].status = NodeStatus::Partial;
+        assert_eq!(
+            summary(&nodes),
+            "3 shards · 1 read on a replica · 1 partial"
         );
     }
 
     #[test]
-    fn wrap_keeps_words_and_width() {
-        assert_eq!(wrap("a bb ccc", 4), ["a bb", "ccc"]);
-        assert_eq!(wrap("", 4), Vec::<String>::new());
-        let long = wrap("abcdefghij k", 4);
-        assert_eq!(long, ["abc…", "k"]);
-        for l in wrap(
-            "the scan of this node stopped early (a connection or server error); its results are partial",
-            20,
-        ) {
-            assert!(width(&l) <= 20, "{l}");
-        }
+    fn the_more_column_needs_v() {
+        let cols = columns(16);
+        let (keep, _) = pick_cols(&cols, 78, usize::MAX, false);
+        assert!(!keep.contains(&SAMPLED));
+        let (keep, _) = pick_cols(&cols, 100, usize::MAX, true);
+        assert!(keep.contains(&SAMPLED));
     }
 }

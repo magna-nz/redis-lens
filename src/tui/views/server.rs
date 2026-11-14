@@ -3444,7 +3444,7 @@ mod monitor_tests {
         testing::show(&mut app, Screen::HotKeys);
         let all = text(&app, 120, 36);
         assert!(
-            all.contains("from MONITOR, 12 s, 10 lines, at 13:04 UTC"),
+            all.contains("from Monitor, 12 s, 10 lines, at 13:04 UTC"),
             "{all}"
         );
         let effects = app.handle_key(ch('s'));

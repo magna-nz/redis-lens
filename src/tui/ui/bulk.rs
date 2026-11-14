@@ -5,10 +5,10 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Clear;
 
+use super::analysis::wrap_hard;
 use super::style;
-use super::widgets::{bar, char_width, panel, rows, trunc, width};
+use super::widgets::{bar, dialog, rows, trunc, width};
 use crate::format::grouped;
 use crate::tui::app::bulk::{Bulk, Stage};
 use crate::write::BulkAction;
@@ -16,23 +16,11 @@ use crate::write::BulkAction;
 /// Widest the dialog gets.
 const MAX_W: u16 = 76;
 
-/// `text` cut into lines of at most `w` columns.
-fn wrap(text: &str, w: usize) -> Vec<String> {
-    let w = w.max(1);
-    let mut out = Vec::new();
-    let mut line = String::new();
-    for ch in text.chars() {
-        if width(&line) + char_width(ch) > w {
-            out.push(std::mem::take(&mut line));
-        }
-        line.push(ch);
-    }
-    out.push(line);
-    out
-}
+/// Least wide, so a short message is not a sliver.
+const MIN_W: u16 = 40;
 
 fn text(lines: &mut Vec<Line<'static>>, t: &str, s: ratatui::style::Style, w: usize) {
-    for part in wrap(t, w) {
+    for part in wrap_hard(t, w) {
         lines.push(Line::from(Span::styled(format!(" {part}"), s)));
     }
 }
@@ -60,8 +48,8 @@ pub fn draw(frame: &mut Frame, area: Rect, b: &Bulk, tick: u64) {
     if matches!(b.stage, Stage::Asking { .. }) {
         return;
     }
-    let w = area.width.min(MAX_W);
-    let inner = usize::from(w.saturating_sub(4));
+    let wide = area.width.min(MAX_W);
+    let inner = usize::from(wide.saturating_sub(4));
     let mut lines: Vec<Line<'static>> = Vec::new();
     let pattern = format!("Pattern {}", crate::value::escape(&b.pattern));
     text(&mut lines, &pattern, style::fgb(), inner);
@@ -90,7 +78,7 @@ pub fn draw(frame: &mut Frame, area: Rect, b: &Bulk, tick: u64) {
             text(
                 &mut lines,
                 &format!(
-                    "{} Dry run: SCAN MATCH {}",
+                    "{} Dry run: looking for {}",
                     super::spinner(tick),
                     crate::value::escape(&b.glob)
                 ),
@@ -176,21 +164,27 @@ pub fn draw(frame: &mut Frame, area: Rect, b: &Bulk, tick: u64) {
     lines.push(Line::from(""));
     lines.push(key_line(b));
 
-    let h = (lines.len() as u16 + 2).min(area.height);
-    let rect = Rect {
-        x: area.x + (area.width - w) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    };
-    frame.render_widget(Clear, rect);
     let right = format!(
         "{}{}",
         crate::value::escape(&b.profile),
         if b.prod { " · PROD" } else { "" }
     );
-    let title = trunc(b.title(), inner.saturating_sub(width(&right) + 2));
-    let body = panel(frame, rect, &title, &right);
+    // Sized to its text: the longest line, or the title and profile, with the border.
+    let longest = lines.iter().map(Line::width).max().unwrap_or(0);
+    let head = width(b.title()) + width(&right) + 7;
+    let w = u16::try_from(longest.max(head) + 3)
+        .unwrap_or(MAX_W)
+        .clamp(MIN_W, MAX_W)
+        .min(area.width);
+    let h = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    // The first dialog is a question: it asks for the TTL.
+    let named = if matches!(b.stage, Stage::Ttl { .. }) {
+        format!("{}?", b.title())
+    } else {
+        b.title().to_string()
+    };
+    let title = trunc(&named, usize::from(w).saturating_sub(width(&right) + 7));
+    let body = dialog(frame, area, w, h, &title, &right);
     rows(frame, body, lines, None);
 }
 

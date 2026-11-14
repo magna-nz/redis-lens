@@ -136,22 +136,22 @@ fn nodes_healthy_three_shards() {
     ] {
         let l = &lines[row];
         assert!(l.contains(slots) && l.contains(ep), "{l}");
-        assert!(l.contains("primary") && l.contains("scanned"), "{l}");
+        assert!(l.contains("primary") && l.contains("✓ analyzed"), "{l}");
     }
     // Columns line up with the header.
-    for col in ["ENDPOINT", "ROLE", "STATUS"] {
+    for col in ["NODE", "ROLE", "STATE"] {
         let at = column_of(&lines, 4, col);
         let first = match col {
-            "ENDPOINT" => "10.0.1.11",
+            "NODE" => "10.0.1.11",
             "ROLE" => "primary",
-            _ => "scanned",
+            _ => "✓ analyzed",
         };
         assert_eq!(column_of(&lines, 5, first), at, "{col}");
     }
-    assert_eq!(colour_of(&t, "scanned"), TEAL);
-    // The detail panel is the selected (first) node's.
+    assert_eq!(colour_of(&t, "✓ analyzed"), TEAL);
+    // The detail section is the selected (first) node's, under the list in the same frame.
     assert!(
-        lines.iter().any(|l| l.starts_with("┌─ 10.0.1.11:6379 ")),
+        lines.iter().any(|l| l.starts_with("├─ 10.0.1.11:6379 ")),
         "{lines:#?}"
     );
     insta::assert_snapshot!(t.backend());
@@ -171,9 +171,13 @@ fn nodes_with_a_failed_and_a_partial_node() {
     assert_eq!(colour_of(&t, fixtures::NOTE_UNREACHABLE), RED);
     // The failed node has no server figures and no sample.
     let failed = lines.iter().find(|l| l.contains("│ 10923-16383")).unwrap();
-    assert_eq!(failed.matches('—').count(), 3, "{failed}");
-    // The failed node is selected: its whole note is in the detail panel.
-    assert!(text(&t).contains(&format!("✗ {}", fixtures::NOTE_UNREACHABLE)));
+    assert_eq!(failed.matches('—').count(), 2, "{failed}");
+    // The failed node is selected: its whole note is in the details, which may wrap it.
+    let detail = lines[8..].join(" ");
+    for word in fixtures::NOTE_UNREACHABLE.split_whitespace() {
+        assert!(detail.contains(word), "{word}: {detail}");
+    }
+    assert!(detail.contains("✗ "), "{detail}");
     // The header's summary is amber.
     assert_eq!(colour_of(&t, DEGRADED), AMBER);
     insta::assert_snapshot!(t.backend());
@@ -187,7 +191,7 @@ fn nodes_partial_note_wraps_in_the_detail_panel() {
     let t = render(&app, 80, 24);
     let all = text(&t);
     // Every word of the note is on screen, over two lines of the detail panel.
-    let detail: String = buffer_lines(&t)[13..23].join(" ");
+    let detail: String = buffer_lines(&t)[9..23].join(" ");
     for word in fixtures::NOTE_STOPPED.split_whitespace() {
         assert!(detail.contains(word), "{word} missing:\n{all}");
     }
@@ -200,12 +204,11 @@ fn nodes_with_replicas_scanned() {
     press(&mut app, "G");
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[3].contains("2 on replicas"), "{}", lines[3]);
+    assert!(lines[3].contains("2 read on replicas"), "{}", lines[3]);
     assert!(lines[5].contains("10.0.1.21:6379") && lines[5].contains("replica"));
     assert!(lines[6].contains("10.0.1.22:6379") && lines[6].contains("replica"));
     // The shard whose replica could not be used: its primary, with the reason.
     assert!(lines[7].contains("10.0.1.13:6379") && lines[7].contains("primary"));
-    assert!(lines[7].contains("replica not used"), "{}", lines[7]);
     assert!(text(&t).contains("▲ replica not used: 10.0.1.23:6379: timed out"));
     // Not degraded: the summary in the header is dim.
     assert_eq!(colour_of(&t, REPLICAS), DIM);
@@ -227,7 +230,7 @@ fn nodes_narrow_80x24_and_60x20() {
         for l in &lines {
             assert_eq!(l.chars().count(), usize::from(w), "{l}");
         }
-        // Slots and endpoints always show; at 80 the note column has no room.
+        // Slots and endpoints always show; the note is in the details, not the list.
         assert!(lines[5].contains("0-5460") && lines[5].contains("10.0.1.11:6379"));
         assert!(!lines[4].contains("NOTE"), "{}", lines[4]);
         snap.push_str(&format!("{w}x{h}:\n{}\n\n", lines.join("\n")));
@@ -326,7 +329,7 @@ fn hot_keys_with_the_node_column() {
         assert_eq!(column_of(&lines, 5 + i, &ep), node_col, "{}", lines[5 + i]);
     }
     // The detail panel names the selected key's node too.
-    assert!(text(&t).contains(" NODE   10.0.1.12:6379"), "{}", text(&t));
+    assert!(text(&t).contains(" Node    10.0.1.12:6379"), "{}", text(&t));
     // A standalone report keeps today's columns.
     let mut standalone = fixtures::report(true);
     standalone.hot_keys = fixtures::hot_keys();
@@ -346,7 +349,7 @@ fn hot_keys_node_column_cuts_a_long_address() {
     let lines = buffer_lines(&render(&app, 120, 36));
     let row = &lines[5];
     // Cut to 15 cells, and a cell stays free before the pattern.
-    assert!(row.contains(" cache-node-000… cache:"), "{row}");
+    assert!(row.contains(" cache-node-000… "), "{row}");
 }
 
 /// The header (the header line, the tabs and the sub-tabs) of `app` drawn `w` wide.
@@ -405,15 +408,15 @@ fn connections_detail_shows_the_cluster_summary() {
         let lines = buffer_lines(&t);
         let server = lines
             .iter()
-            .find(|l| l.starts_with('│') && l.contains(" Server "))
+            .find(|l| l.starts_with('│') && l.contains(" Address "))
             .unwrap_or_else(|| panic!("{lines:#?}"));
         assert!(
             server.contains(&format!("Redis 7.4.2 · {summary}")),
             "{server}"
         );
-        // The Endpoint line stays the profile's.
-        let endpoint = lines.iter().find(|l| l.contains(" Endpoint ")).unwrap();
-        assert!(!endpoint.contains("scanning"), "{endpoint}");
+        // The address stays the profile's: no node is named as the one being read.
+        let endpoint = lines.iter().find(|l| l.contains(" Address ")).unwrap();
+        assert!(!endpoint.contains("reading"), "{endpoint}");
         let got = colour_of(&t, &format!("Redis 7.4.2 · {summary}"));
         match colour {
             Some(c) => assert_eq!(got, c, "{summary}"),
@@ -491,7 +494,7 @@ fn a_seed_only_scan_is_amber_everywhere_it_is_summed_up() {
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
     assert!(lines[5].starts_with("│ —  "), "{}", lines[5]);
-    let detail = lines[27..36].join(" ");
+    let detail = lines[8..36].join(" ");
     for word in crate::conn::cluster::SHARDS_UNREADABLE.split_whitespace() {
         assert!(detail.contains(word), "{word}: {detail}");
     }
@@ -1436,7 +1439,10 @@ fn pubsub_counts_classic_channels_on_the_picked_node_and_shard_channels_on_every
     let t = render(&app, 80, 24);
     let all = text(&t);
     assert!(all.contains("SHARD CHANNEL"), "{all}");
-    assert!(all.contains("subscribers on 10.0.1.11:6379"), "{all}");
+    assert!(
+        all.contains("Counted on") && all.contains("10.0.1.11:6379"),
+        "{all}"
+    );
     insta::assert_snapshot!(t.backend());
     // SPUBLISH goes to the channel's slot owner, through the gate: the profile is
     // read-only, so `P` on a shard channel sends nothing to any node.

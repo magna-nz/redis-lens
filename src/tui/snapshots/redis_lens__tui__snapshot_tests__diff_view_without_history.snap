@@ -1,15 +1,14 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 898
 expression: t.backend()
 ---
 " prod-cache-01   PROD   read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys           ● analyzed 14:02 UTC "
 "  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
 "    Big keys  ·  Expiry  ·  Changes  ·  Hot keys                                                                        "
-"┌─ Diff ────────────────────────────────────────────────────────────────────────────────────────────────── no history ─┐"
+"┌─ Changes ─────────────────────────────────────────────────────────────────────────────────────────────── no history ─┐"
 "│                                                                                                                      │"
 "│ No earlier snapshot for prod-cache-01.                                                                               │"
-"│ Press s to save one; the next scan compares against it.                                                              │"
+"│ Press s to save one; the next analysis compares against it.                                                          │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
@@ -27,8 +26,8 @@ expression: t.backend()
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
-"└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-"┌─ Details ────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
+"│                                                                                                                      │"
+"│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"

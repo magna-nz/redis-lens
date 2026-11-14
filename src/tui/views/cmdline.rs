@@ -1488,7 +1488,7 @@ mod tests {
         reply(&mut app, *id, ran(Value::BulkString(b"hello".to_vec())));
         assert!(!app.views.cmdline.running());
         let all = text(&app, 80, 24);
-        assert!(all.contains("> GET user:1"), "{all}");
+        assert!(all.contains("› GET user:1"), "{all}");
         assert!(all.contains("\"hello\""), "{all}");
         assert!(all.contains("(0.42 ms)"), "{all}");
         // The flags are kept: the second GET goes out at once.
@@ -2058,7 +2058,7 @@ mod tests {
             app.handle_key(key(KeyCode::PageUp));
         }
         let all = text(&app, 80, 24);
-        assert!(all.contains("> GET user:1"), "{all}");
+        assert!(all.contains("› GET user:1"), "{all}");
     }
 
     #[test]

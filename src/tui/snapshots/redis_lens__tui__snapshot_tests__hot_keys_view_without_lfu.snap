@@ -1,6 +1,5 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 917
 expression: t.backend()
 ---
 " prod-cache-01   PROD   read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys           ● analyzed 14:02 UTC "
@@ -9,12 +8,10 @@ expression: t.backend()
 "┌─ Hot keys ────────────────────────────────────────────────────────────────────────────────────── policy allkeys-lru ─┐"
 "│                                                                                                                      │"
 "│ No hot keys to show.                                                                                                 │"
-"│ The eviction policy is allkeys-lru, so Redis keeps no LFU counters.                                                  │"
-"│ Set maxmemory-policy to allkeys-lfu or volatile-lfu to see hot keys.                                                 │"
+"│ The eviction policy is allkeys-lru, so Redis keeps no LFU counters. Set maxmemory-policy to allkeys-lfu or           │"
+"│ volatile-lfu to see hot keys.                                                                                        │"
 "│                                                                                                                      │"
-"│ Or rank keys by how often MONITOR sees them: Server (3) › Monitor.                                                   │"
-"│                                                                                                                      │"
-"│                                                                                                                      │"
+"│ Or rank keys by how often Monitor sees them: 4 Server › Monitor.                                                     │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
@@ -27,8 +24,10 @@ expression: t.backend()
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
-"└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-"┌─ Details ────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
+"│                                                                                                                      │"
+"│                                                                                                                      │"
+"│                                                                                                                      │"
+"│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
