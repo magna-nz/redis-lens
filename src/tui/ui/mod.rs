@@ -101,7 +101,12 @@ const SLOTS_RANGES: usize = 5;
 ///   column header (and the status line above it where there is one).
 pub fn list_rows(area: Rect, app: &App) -> usize {
     let screen = app.screen();
-    let h = usize::from(body_of(area, screen.area().has_panels()).height);
+    let mut body = body_of(area, screen.area().has_panels());
+    if screen == Screen::Connections {
+        // Less the dashboard line, while there is one.
+        body = connections::split_dashboard(body, app).0;
+    }
+    let h = usize::from(body.height);
     // A frame of sections ([`widgets::sections`]): one border per section and the
     // bottom one; the first section never gets more than the body less two borders.
     let first = |rows: usize| rows.min(h.saturating_sub(2));

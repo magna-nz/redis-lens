@@ -10,7 +10,8 @@
 //! batch after each `take` and waits for the reply therefore takes the longer of the
 //! batch's slot and the round trip per batch, not the sum of the two.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -91,6 +92,44 @@ impl Budget {
         // update is a plain assignment.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// The budgets in use in this process, by profile name and node address: a TUI session
+/// and a dashboard session (`crate::web`) connected to the same node of the same profile
+/// take from one budget, so together they stay within the profile's rate. Holds weak
+/// references only: a budget goes once the last session using it lets go.
+type Registry = HashMap<(String, String), Weak<Budget>>;
+
+fn registry() -> MutexGuard<'static, Registry> {
+    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+    REGISTRY
+        .get_or_init(Mutex::default)
+        .lock()
+        // Every update is a plain insert or remove.
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The budget of node `node` (its address, `host:port`) of profile `profile` at `per_sec`
+/// (spec "Shared command budget"): the one already in use in this process when there is
+/// one with that limit, otherwise a new one, kept for the next taker while it is in
+/// use. A budget in use with another limit (the profile's rate changed) is replaced
+/// for later takers; whoever holds it keeps it. So while both are in use (a TUI session
+/// from before the change and a dashboard session from after it, say) the two do not
+/// share: each stays within its own limit, and together they can send up to the sum of
+/// the two until the older session ends or reconnects.
+pub fn shared(profile: &str, node: &str, per_sec: Option<u32>) -> Arc<Budget> {
+    let mut reg = registry();
+    reg.retain(|_, b| b.strong_count() > 0);
+    let key = (profile.to_string(), node.to_string());
+    let want = per_sec.filter(|n| *n > 0);
+    if let Some(b) = reg.get(&key).and_then(Weak::upgrade)
+        && b.per_sec == want
+    {
+        return b;
+    }
+    let b = Budget::new(per_sec);
+    reg.insert(key, Arc::downgrade(&b));
+    b
 }
 
 /// `n / rate` seconds, rounded up to the nanosecond so the rate is never exceeded.
@@ -239,6 +278,35 @@ mod tests {
             assert_eq!(b.taken(), 1_000_000);
         }
         assert_eq!(Budget::new(Some(42)).per_sec(), Some(42));
+    }
+
+    #[test]
+    fn two_takers_of_one_profile_and_node_share_one_budget() {
+        let a = shared("budget-test-a", "127.0.0.1:6379", Some(100));
+        let b = shared("budget-test-a", "127.0.0.1:6379", Some(100));
+        assert!(Arc::ptr_eq(&a, &b));
+        // Another node, another profile, another limit: budgets of their own.
+        let node = shared("budget-test-a", "127.0.0.1:6380", Some(100));
+        let other = shared("budget-test-b", "127.0.0.1:6379", Some(100));
+        assert!(!Arc::ptr_eq(&a, &node));
+        assert!(!Arc::ptr_eq(&a, &other));
+        let faster = shared("budget-test-a", "127.0.0.1:6379", Some(200));
+        assert!(!Arc::ptr_eq(&a, &faster));
+        assert_eq!(faster.per_sec(), Some(200));
+        // `None` and `Some(0)` are the same: no limit.
+        let n1 = shared("budget-test-c", "h:1", None);
+        let n2 = shared("budget-test-c", "h:1", Some(0));
+        assert!(Arc::ptr_eq(&n1, &n2));
+    }
+
+    #[test]
+    fn a_budget_no_one_holds_is_not_kept() {
+        let a = shared("budget-test-d", "h:1", Some(5));
+        let weak = Arc::downgrade(&a);
+        drop(a);
+        assert!(weak.upgrade().is_none());
+        let b = shared("budget-test-d", "h:1", Some(5));
+        assert_eq!(b.taken(), 0);
     }
 
     #[test]

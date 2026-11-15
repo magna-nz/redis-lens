@@ -93,7 +93,48 @@ fn access_sentence(p: &Profile, perms: Option<&PermissionReport>) -> String {
     }
 }
 
+/// From this many rows the Connections screen keeps its last row for the dashboard
+/// line.
+const DASHBOARD_LINE_FROM: u16 = 12;
+
+/// The Connections screen in `area`: the frame's area, and the row under it for the
+/// dashboard line while the dashboard runs beside the TUI. Without a dashboard the
+/// frame takes all of `area`, as it always did.
+pub fn split_dashboard(area: Rect, app: &App) -> (Rect, Option<Rect>) {
+    if app.dashboard_url().is_none() || area.height < DASHBOARD_LINE_FROM {
+        return (area, None);
+    }
+    let frame = Rect {
+        height: area.height - 1,
+        ..area
+    };
+    let line = Rect {
+        y: area.y + area.height - 1,
+        height: 1,
+        ..area
+    };
+    (frame, Some(line))
+}
+
+/// ` Dashboard  http://127.0.0.1:7379  ·  ctrl-o opens it`, dim: the URL without the
+/// token.
+fn dashboard_line(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(url) = app.dashboard_url() else {
+        return;
+    };
+    let text = format!(" Dashboard  {url}  ·  ctrl-o opens it");
+    let line = Line::from(Span::styled(
+        trunc(&text, usize::from(area.width)),
+        style::dim(),
+    ));
+    rows(frame, area, vec![line], None);
+}
+
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
+    let (area, dash) = split_dashboard(area, app);
+    if let Some(r) = dash {
+        dashboard_line(frame, r, app);
+    }
     let n_saved = app.saved_shown().count();
     let n_docker = app.docker_shown().count();
     let filtered = !app.conn_filter.is_empty();

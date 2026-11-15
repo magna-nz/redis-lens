@@ -1,0 +1,15 @@
+// `node --test src/web/assets/tests/` names this directory, and Node (22 and later) runs a
+// directory argument as one module: this file. So it pulls in every test file.
+// `node --test "src/web/assets/tests/*.test.js"` runs them one process each instead; both
+// run the same tests. csp.test.js checks that this list has every *.test.js file.
+import './api.test.js';
+import './confirm.test.js';
+import './csp.test.js';
+import './format.test.js';
+import './forms.test.js';
+import './history.test.js';
+import './mock.test.js';
+import './signin.test.js';
+import './tail.test.js';
+import './theme.test.js';
+import './views.test.js';

@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** Find key (`ctrl-f`) on `claude/find-key` ([Find key](#find-key-2026-11-15)). Redis Insight parity phase 5 is merged as #22 and its follow-ups as #23, and the shorter README as #24. On main: parity phases 1 to 4 (#15, #16, #17, #18, #19), the phase 4 follow-up PR #20 (merged 2026-11-14, merge commit `9e031cb`) and the TUI redesign (#21, merged 2026-11-15, merge commit `dec974e`).
-**Last updated:** 2026-11-15 (release pipeline and the switch to MIT on `claude/release-pipeline`, [Release pipeline](#release-pipeline-2026-11-15); Find key merged as #25)
+**Current milestone:** the web dashboard, phase 1 of 4, on `claude/dashboard-p1` ([Web dashboard](#web-dashboard-2026-11-15)). On main: Redis Insight parity phases 1 to 5 (#15 to #23), the TUI redesign (#21), the shorter README (#24), Find key (#25) and the release pipeline with the switch to MIT (#27).
+**Last updated:** 2026-11-15 (web dashboard phase 1 in progress on `claude/dashboard-p1`; release pipeline merged as #27)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -662,11 +662,41 @@ Searching the whole server for a key by name, from any screen, was the gap left 
 | results | Browse › Keys lists them as `Find: <glob>`; `→` opens a value; `esc`/`←` goes back to where `ctrl-f` was pressed | **done** |
 | footer | `ctrl-f Find key  : Command  ? Help` on the right; `keymap::footer_fit`: `: Command` gives way first, then the screen's last key (at most one at 80 columns, none from 100) | **done**; 173 snapshots changed in the footer line only, 5 help overlays gained the row |
 | tests | 33 unit tests (prompt, glob with a proptest against a port of Redis's matcher, routing, footer fit), 6 insta snapshots, `tests/find_key_it.rs` (8 tests on Redis and Valkey, a cluster case) | **done** |
-| verifier | Nothing blocking. Fixed: a find before the live connection is open (on a cluster it could read one node and call itself done) now waits; typed globs hold at most 8 `*`; a find drops a form open on a key's value; the help row for `esc` on the key list; spaces around the text; tests for each, and for a late page of a replaced find | **done** |
+| verifier | Merged as #25. Nothing blocking. Fixed: a find before the live connection is open (on a cluster it could read one node and call itself done) now waits; typed globs hold at most 8 `*`; a find drops a form open on a key's value; the help row for `esc` on the key list; spaces around the text; tests for each, and for a late page of a replaced find | **done** |
+
+## Web dashboard (2026-11-15)
+
+A web UI served by redis-lens on `127.0.0.1`, an alternative to the TUI with the same features and rules. The owner approved a mockup (https://claude.ai/artifact/98mKnuAQFNX1AvobN1x2qc) and asked for parity with the TUI, adding connections included. Spec: [Web dashboard](spec.md#web-dashboard). API: [docs/dashboard-api.md](docs/dashboard-api.md).
+
+| Phase | Content | State |
+|---|---|---|
+| 1 | The server (`src/web/`, axum), sign-in token and request checks, the dashboard's own session through the TUI's runner, the shared command budget, `--dashboard` / `--terminal` / `--port` / `--no-open`, `ctrl-o`, and the screens Connections (add, edit, remove, test, writes), Overview, Server, Pub/Sub and Command line | in progress on `claude/dashboard-p1` |
+| 2 | Browse (patterns, keys, values, Find key) and Analyze (Big keys, Expiry, Changes, Hot keys, Nodes, Slots), snapshots, database switch | next |
+| 3 | Writes: field edits, add key, expiry, rename, delete, bulk actions | next |
+| 4 | Streams and Search | next |
+
+### How phase 1 was built
+
+| Part | Content | Commits | State |
+|---|---|---|---|
+| server | `src/web/`: guard (token, cookie, Host, Origin, headers), session over `tui::Headless`, confirm store, DTOs, the phase 1 routes, `budget::shared` | `ccd738c` | **done**; unit tests and `tests/web_p1_it.rs` on Redis, Valkey and a cluster |
+| wiring | CLI flags, `[settings] dashboard` / `dashboard_port`, the Connections line, `ctrl-o` | `322f868` | **done**; `tests/dashboard_cli_it.rs` runs the real binary |
+| page | `src/web/assets/`: plain ES modules, no build step, dark and light, a stand-in server for `?mock`; JavaScript tests run with `node --test src/web/assets/tests/` | `7c751a0` | **done**; checked in headless Chrome against the demo servers |
+| fixes | Ten server issues the page found: server text reaching a reply (rule 3), Monitor not asking, TUI keys in messages, polling control, edit parity, findings from the server | `409c9e7` | **done** |
+| verifier | One blocking finding, eight should-fix and ten small ones, all fixed with tests. Blocking: an address like `valkey://user:password@host` was taken as a host, so its password was shown and written to the config file (on main too, for `conn add` and the TUI's add flow): `valkey://` is now a `redis://` URL and other schemes or userinfo in a host are refused. Also: server error codes the wording filter missed; a profile made read-only elsewhere still writing; no caps on the command line; `conn test` outside the shared budget; the sign-in URL as a program argument | `6459f35` | **done** |
+| sign-in | The cookie is gone: the token travels in the URL fragment and an `Authorization` header, so no other local port ever receives it; the browser is opened through a private redirect file | `6459f35`, page in a later commit | **done** |
+| docs | `docs/dashboard.gif` (`make dashboard-gif`, `demo/record-dashboard.mjs`) in the README beside the terminal GIF; the site has a Terminal / Dashboard switch (`?ui=`, remembered in the browser) and dashboard pages with a screenshot per screen; the generator moved to `docs/site-src/` (`make site`) | **done**. Next: a light theme for the site, and fonts and mermaid served locally |
+
+### Decisions taken alone (dashboard)
+
+- The dashboard has its own connection, separate from the TUI's, and both take from one command budget per connection and node.
+- The page uses system fonts and asks no other host for anything.
+- A saved connection's environment cannot be changed in the dashboard, as in the TUI and `conn set`.
+- The page tests need Node 22 or newer (`make test-page`); CI runs them in a new job, "dashboard page tests", which is not a required check until the owner adds it.
 
 ## Release pipeline (2026-11-15)
 
-Releases like forgetop's, and MIT only. Built on `claude/release-pipeline`, cut from main at `c3a9894`. No tag, release or publish has been made: the first tag (`v0.1.0`) is the owner's to push, after the two secrets are set. How to release: [docs/releasing.md](docs/releasing.md).
+Releases like forgetop's, and MIT only. Merged as #27. No tag, release or publish has been made: the first tag (`v0.1.0`) is the owner's to push, after the two secrets are set. How to release: [docs/releasing.md](docs/releasing.md).
 
 | Part | Content | State |
 |---|---|---|

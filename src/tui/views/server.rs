@@ -52,7 +52,14 @@ use super::{Act, Input, ViewState};
 pub const HISTORY: usize = 60;
 /// What `+` and `-` step through, in seconds (spec: 1 to 60 s).
 pub const INTERVALS: [u64; 8] = [1, 2, 3, 5, 10, 15, 30, 60];
-const DEFAULT_INTERVAL: usize = 1;
+/// Index into [`INTERVALS`] of the interval polling starts at (2 s).
+pub(crate) const DEFAULT_INTERVAL: usize = 1;
+
+/// Rates over a longer gap than this between two polls at `interval` are not shown.
+pub(crate) fn max_gap(interval: Duration) -> Duration {
+    interval * 3 + Duration::from_secs(1)
+}
+
 /// Clients poll every 5 s, the Slow log every 10 s.
 pub const CLIENTS_EVERY: Duration = Duration::from_secs(5);
 pub const SLOWLOG_EVERY: Duration = Duration::from_secs(10);
@@ -535,7 +542,7 @@ impl ServerState {
         match reply {
             Reply::Pong => {}
             Reply::Info { at, sample } => {
-                let max_gap = self.interval() * 3 + Duration::from_secs(1);
+                let max_gap = max_gap(self.interval());
                 self.overview.add(at, *sample, max_gap);
             }
             Reply::Clients(list) => self.clients.set(list),
@@ -1510,6 +1517,13 @@ impl Monitor {
     }
 }
 
+/// Whether starting Monitor on `profile` asks for the profile's name to be typed (a
+/// `prod` profile) rather than `y`/`n`. It always asks, read-only profiles included
+/// (spec "Monitor (P2)"); the dashboard asks by the same rule.
+pub(crate) fn monitor_asks_name(profile: &crate::model::Profile) -> bool {
+    profile.env == Env::Prod
+}
+
 impl ServerState {
     /// The input the prompt shows in the key bar.
     fn monitor_input(&self) -> Option<Input> {
@@ -1536,7 +1550,7 @@ impl ServerState {
         } else if !act.live_ready() {
             act.info("The live connection is not open, so MONITOR cannot start.");
         } else {
-            self.monitor.prompt = Some(if act.profile().env == Env::Prod {
+            self.monitor.prompt = Some(if monitor_asks_name(act.profile()) {
                 Prompt::TypeName(String::new())
             } else {
                 Prompt::YesNo

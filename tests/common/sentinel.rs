@@ -98,7 +98,8 @@ pub async fn sentinel(setup: SentinelSetup) -> TestSentinel {
             Err(e)
                 if attempt < 4
                     && (e.contains("address already in use")
-                        || e.contains("ports are not available")) => {}
+                        || e.contains("ports are not available")
+                        || e.contains("port is already allocated")) => {}
             Err(e) => panic!("start the Sentinel container (is Docker running?): {e}"),
         }
     }

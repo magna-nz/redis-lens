@@ -14,6 +14,7 @@
 //! - [`snapshot`], [`diff`], [`verdict`]: saved reports, comparing them, TTL risk.
 //! - [`cli`]: command-line entry points.
 //! - [`tui`]: the terminal UI.
+//! - [`web`]: the web dashboard, served on 127.0.0.1 by the same process.
 //! - [`value`]: values on screen: decompression, format detection, terminal-safe drawing.
 //! - [`write`]: the one write gate every write goes through.
 
@@ -35,4 +36,5 @@ pub mod snapshot;
 pub mod tui;
 pub mod value;
 pub mod verdict;
+pub mod web;
 pub mod write;

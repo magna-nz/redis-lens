@@ -1,7 +1,7 @@
 <div align="center">
   <img src="docs/mark.svg" alt="redis-lens mark" width="104">
   <h1>redis-lens</h1>
-  <p><strong>Redis Insight in your terminal, for Redis and Valkey.</strong></p>
+  <p><strong>A terminal UI and a web dashboard for Redis and Valkey.</strong></p>
   <p>
     <a href="https://github.com/magna-nz/redis-lens/actions/workflows/ci.yml"><img src="https://github.com/magna-nz/redis-lens/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
     <a href="https://crates.io/crates/redis-lens"><img src="https://img.shields.io/crates/v/redis-lens" alt="crates.io"></a>
@@ -15,10 +15,16 @@
 redis-lens lists your keys and shows their values, finds the keys and key patterns that use the most memory, and shows live server stats, connected clients, the slow log and Pub/Sub messages.
 You can also run commands and edit keys from it.
 
+It runs in the terminal, and the same program serves a web dashboard on 127.0.0.1 that only you can open.
+The dashboard covers connections, the server, Pub/Sub and the command line so far; the rest is in the terminal.
+
 Connections marked as production are read-only unless you turn writes on.
 
 <div align="center">
-  <img src="docs/demo.gif" alt="redis-lens browsing key patterns and a value, then the Server panel and the command line" width="900">
+  <img src="docs/demo.gif" alt="redis-lens in the terminal: browsing key patterns and a value, then the Server panel and the command line" width="900">
+  <p><em>In the terminal</em></p>
+  <img src="docs/dashboard.gif" alt="The redis-lens dashboard in a browser: connecting, the Overview, the Server clients, slow log and Monitor, a Pub/Sub tail, the command line, and the light theme" width="900">
+  <p><em>In the browser</em></p>
 </div>
 
 ## What you can do
@@ -32,6 +38,8 @@ Connections marked as production are read-only unless you turn writes on.
 - **Connect to anything:** ACL users, TLS, cluster, Sentinel, SSH tunnels, cloud IAM sign-in and Docker discovery.
   Passwords stay in the OS keychain.
 - **Check it in CI:** save snapshots, compare them over time, and fail a build on rules you set.
+- **Use it in a browser:** a web dashboard on your own computer, for connections, the server, Pub/Sub and the command line so far.
+  It follows the same rules as the terminal: read-only production, writes asked about, passwords only in the keychain.
 
 ## Install
 
@@ -52,7 +60,9 @@ Or download a binary for macOS, Linux or Windows from [GitHub Releases](https://
 
 ```sh
 redis-lens conn add local --url redis://localhost:6379
-redis-lens            # pick a connection; press ? for every key
+redis-lens              # the terminal UI; press ? for every key, ctrl-o to open the dashboard
+redis-lens --dashboard  # only the dashboard, opened in your browser
+redis-lens --terminal   # only the terminal UI, no dashboard
 ```
 
 From a clone, `make demo` starts a seeded Redis and Valkey in Docker to try it on.

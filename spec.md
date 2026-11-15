@@ -207,6 +207,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `:` | Open the command line |
 | `ctrl-f` | Find keys by name or pattern on the whole server |
 | `b` | Switch the database (once connected) |
+| `ctrl-o` | Open the web dashboard in your browser |
 | `q` `ctrl-c` | Quit |
 
 #### Connections
@@ -744,8 +745,9 @@ On a cluster, `+cluster|shards` (or `+cluster|slots` on Redis 6.2) is needed to 
 
 ### Connection strings
 
-- `redis://[user[:password]@]host[:port][/db]`, and `rediss://` for TLS.
+- `redis://[user[:password]@]host[:port][/db]`, and `rediss://` for TLS. `valkey://` and `valkeys://` are the same URLs under Valkey's name.
 - StackExchange.Redis format: `host:port,password=…,user=…,ssl=True,defaultDatabase=N`. Unknown options are ignored.
+- Any other URL scheme is refused ("only redis, rediss, valkey and valkeys URLs are supported"), and so is a host that holds a user name, a password or other URL parts (`@`, `/`, `?` and the like): such a string would otherwise be taken as a host and its password shown and saved with it. The refusal never repeats what was typed.
 - Azure hosts are recognised: `*.redis.cache.windows.net` is Azure Cache for Redis and `*.redis.azure.net` is Azure Managed Redis. The environment is guessed from the host name.
 
 ### Docker discovery
@@ -1217,6 +1219,51 @@ Features that need a newer server are turned off with a reason on older ones:
 - P4: Redis 7.0 and Valkey: sharded Pub/Sub (`SSUBSCRIBE`, `PUBSUB SHARDCHANNELS|SHARDNUMSUB`, `SPUBLISH`); Redis 8.2 and Valkey 8.0: `CLUSTER SLOT-STATS` (`memory-bytes` on Redis only)
 
 Redis 6.2 stays tested: it runs everything else.
+
+## Web dashboard
+
+An alternative to the TUI in a web browser, served by the same redis-lens process, with the same features and the same rules. It is being built in phases; phase 1 is Connections, Overview, Server, Pub/Sub and the command line. Browse and Analyze, the edits and bulk actions, and Streams and Search follow, and until then the dashboard does not show those screens. The routes and their replies are in [docs/dashboard-api.md](docs/dashboard-api.md).
+
+### Starting it
+
+- `redis-lens` (or `redis-lens tui`) starts the TUI and serves the dashboard beside it on `127.0.0.1:7379`. The Connections screen shows `Dashboard  http://127.0.0.1:7379  ·  ctrl-o opens it` under the frame, and `ctrl-o` opens it in the browser, signed in. Its notices: "Opened the dashboard in your browser.", "Could not open a browser for the dashboard.", "The dashboard is off (--terminal).", "The dashboard is off (dashboard = false in the config file)." or why it did not start. Quitting the TUI stops the dashboard.
+- `redis-lens --dashboard` serves only the dashboard: it prints `Dashboard: <sign-in URL>` and `Press ctrl-c to stop.`, opens the browser unless `--no-open` is given, runs until ctrl-c and exits 0.
+- `redis-lens --terminal` runs only the TUI; nothing is served.
+- `--port N` (1 to 65535) picks the port. `--terminal` conflicts with `--dashboard` and `--port`, and `--no-open` needs `--dashboard`. With any subcommand but `tui` these flags are a usage error.
+- `[settings]` in the config file: `dashboard = false` never starts it beside the TUI (`--dashboard` still does), and `dashboard_port = N` sets the port. Flags win. Each key is absent from the file while at its default. A config file that cannot be read does not start it beside the TUI either, since the file may say not to: "The dashboard is off: the config file could not be read, so it may say not to start it. Fix the file, then start redis-lens again."
+- A port in use: with `--dashboard` it is an error, "Port N on 127.0.0.1 is in use, so the dashboard did not start. Pick another with --port."; beside the TUI the TUI carries on and says once "The dashboard is off: port N is in use. --port picks another."
+- While the TUI runs the dashboard never writes to the terminal.
+
+### Who can open it
+
+- It listens on `127.0.0.1` only. There is no option to listen anywhere else.
+- Each run makes a session token: 32 random bytes, in hex. It is shown in one place, the `Dashboard:` line of `--dashboard`; never in the TUI, a notice, a log, an error or `Debug` output.
+- The sign-in URL is `http://127.0.0.1:<port>/#token=<token>`. The token is in the fragment, which a browser never sends to a server or in a `Referer`. The page takes it from there, removes it from the address bar, keeps it for that tab, and sends it as `Authorization: Bearer <token>` with every `/api/*` request. There is no cookie, so the browser never sends the token to another port or site by itself.
+- Opening the browser (`ctrl-o`, `--dashboard`) never passes the URL as a program argument, where other users of the computer could read it: redis-lens writes a small page that redirects to it into a directory only the user can read (0700, the file 0600, random names), opens that file, and deletes it after 30 seconds and when it stops.
+- `/` and the page's own files hold no data and need no token. Every `/api/*` route, the event stream included, answers 401 without the token, compared in constant time; the page then says to open the dashboard from redis-lens.
+- Every request's `Host` must be `127.0.0.1:<port>` or `localhost:<port>`, so a name that resolves to this computer is refused (403), and so is a request line that names another host. Every request that is not a `GET` or `HEAD` must also carry an `Origin` of the dashboard itself, the header `X-Redis-Lens: 1` and a JSON body, so a page on another site cannot send one.
+- Every response carries `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` and a Content-Security-Policy that allows scripts, styles and requests from the dashboard itself only.
+- The page is plain HTML, CSS and JavaScript inside the binary. It asks no other host for anything, fonts included, has no inline script or style, and draws everything it gets from a server as text, never as markup.
+- The server logs no request, body or reply. A request's headers must arrive within 10 seconds, a body holds at most 2 MiB, and the number of open connections is capped.
+
+### The same rules as the TUI
+
+- **Credentials (rule 1).** Passwords and usernames never reach the browser. Adding a connection sends the password once, in the request's body, straight to the OS keychain through `SecretStore`; it is never sent back, logged or written to the config file. Addresses are shown masked, and slow log, Monitor and command-line text is masked as the TUI masks it. A password waiting on a question (a token command, writes on `prod`) is held in memory for at most two minutes.
+- **Values** are shown, never saved or logged.
+- **Never hurting the server (rule 2).** The dashboard has its own connection, opened the way the TUI opens one, and sends what the TUI sends, through the same code: it builds no commands of its own. The TUI and the dashboard take from one [command budget](#shared-command-budget-p1) per connection and node, so together they stay within the rate. The live figures are polled only while a page is open, every 2 s to start with (1 to 60 s), and not at all while paused.
+- **Writes** go through the one write gate ([Write permissions](#write-permissions)). A read-only profile refuses, in the dashboard too, and the saved profile is read again for every write, so one made read-only in the TUI or with `conn set` stops writing in the dashboard at once. A write the gate asks about comes back to the page as a question, yes or no, or the name typed on `prod`; the server keeps the write under a random id that works once and for two minutes, and checks the gate again when it is answered.
+- **Degrading (rule 3).** A missing permission turns one panel off and says why. No reply carries a server's error text, only redis-lens's own fixed wording (any text that starts with a server's error code is replaced); the one exception is the reply to a command typed on the command line, as in the TUI. A connect that opens but cannot sign in is a failed connect with a fixed reason.
+- The dashboard words things in its own terms: no TUI keys, screen numbers or CLI flags.
+
+### Screens (phase 1)
+
+One connection at a time, shared by every tab. Dark by default, with a light theme; the choice is remembered in the browser.
+
+- **Connections:** the saved connections (name, environment, masked address, tags, read-only or writes on, how it signs in) and the Docker containers found. Connect, disconnect, test (each permission check and why a feature is off), edit (tags, the writes switch, the options `conn set` has), remove, and add with the options of `conn add`: address, name, environment, password, tags, writes, provider, SSH tunnel, Sentinel, token command (asked about first, since it runs at every connect), Entra ID where it is compiled in, prefer replica and force standalone. The environment of a saved connection cannot be changed, as in the TUI and `conn set`: add it again and replace it. The writes switch of the connected profile is the TUI's `w`, with its questions; for a container it lasts for the session.
+- **Overview:** what the TUI's Overview shows before an analysis: the live figures, the server and its topology, a row per shard and the node picker on a cluster, the provider notice, the permission checks, and "Things to look at" from the server's own figures, by the TUI's rules. The analysis arrives with Browse.
+- **Server:** the live charts, Clients (grouped as the TUI groups them, a group opens to its connections), Slow log (arguments masked) and Monitor. Monitor always asks first, with the profile name typed on `prod`, and its limits (30 s, 10,000 lines) are said before it starts.
+- **Pub/Sub:** channels with their subscribers, subscribing to a channel, a pattern or a shard channel, the live tail (pause, clear, filter, rate; "Messages are shown, never saved"), and Publish through the write gate.
+- **Command line:** the TUI's panel with its rules: what is sent and refused, writes through the gate, repeats of at most 100, pipeline mode, the reply as text, a table, JSON or raw, completion and the command's help. A line holds at most 8,192 characters, a reply at most 4 MiB (the rest is dropped and said so), and one line runs at a time.
 
 ## Quality bar
 

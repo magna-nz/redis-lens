@@ -82,13 +82,106 @@ enum Incoming {
 
 type Tx = mpsc::UnboundedSender<Incoming>;
 
-pub async fn run(config: Option<PathBuf>) -> anyhow::Result<()> {
+/// Whether the web dashboard runs beside the TUI: the command line's say. `[settings]`
+/// in the config file has the rest ([`crate::config::DashboardSettings`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Beside {
+    /// `--terminal`: no dashboard.
+    pub terminal: bool,
+    /// `--port`: wins over `dashboard_port`.
+    pub port: Option<u16>,
+}
+
+/// What the dashboard says when it could not start beside the TUI. Fixed words; never
+/// an OS error's text.
+pub fn dashboard_failed(e: &crate::web::StartError) -> String {
+    use crate::web::StartError;
+    match e {
+        StartError::PortInUse(port) => {
+            format!("The dashboard is off: port {port} is in use. --port picks another.")
+        }
+        StartError::Bind { port, .. } => {
+            format!(
+                "The dashboard is off: it could not listen on 127.0.0.1:{port}. --port picks another."
+            )
+        }
+        StartError::Random => {
+            "The dashboard is off: the OS gave no random bytes for its token.".to_string()
+        }
+    }
+}
+
+/// Why the dashboard did not start beside the TUI when the config file could not be
+/// read: its `[settings] dashboard = false` may be in it.
+pub const DASHBOARD_CONFIG_UNREADABLE: &str = "The dashboard is off: the config file could not be read, so it may say not to start it. Fix the file, then start redis-lens again.";
+
+/// Starts the dashboard beside the TUI unless `--terminal` or `[settings] dashboard =
+/// false` says not to. Silent: nothing goes to the terminal, whatever happens. A start
+/// that fails leaves the TUI as it is, with the reason in the link. `settings` is `None`
+/// when the config file could not be read: then it does not start, since the file may
+/// turn it off ([`DASHBOARD_CONFIG_UNREADABLE`]).
+fn start_beside(
+    beside: Beside,
+    settings: Option<crate::config::DashboardSettings>,
+    path: &Path,
+) -> (Option<crate::web::Dashboard>, app::DashboardLink) {
+    use app::DashboardLink;
+    if beside.terminal {
+        return (None, DashboardLink::Terminal);
+    }
+    let Some(settings) = settings else {
+        return (
+            None,
+            DashboardLink::Failed(DASHBOARD_CONFIG_UNREADABLE.to_string()),
+        );
+    };
+    if !settings.dashboard {
+        return (None, DashboardLink::Disabled);
+    }
+    let opts = crate::web::Options {
+        port: settings.port(beside.port),
+        config: path.to_path_buf(),
+    };
+    match crate::web::start(opts) {
+        Ok(d) => {
+            let url = d.url().trim_end_matches('/').to_string();
+            (Some(d), DashboardLink::On { url })
+        }
+        Err(e) => (None, DashboardLink::Failed(dashboard_failed(&e))),
+    }
+}
+
+pub async fn run(config: Option<PathBuf>, beside: Beside) -> anyhow::Result<()> {
     let path = match config {
         Some(p) => p,
         None => Config::default_path()?,
     };
     let loaded = Config::load(&path);
+    // Before the first frame. A file that can't be read starts no dashboard (it may say
+    // `dashboard = false`); the TUI says what is wrong with the file, and ctrl-o why the
+    // dashboard is off.
+    let settings = loaded.as_ref().ok().map(|c| c.dashboard);
+    let (dashboard, link) = start_beside(beside, settings, &path);
+    let open_url = dashboard
+        .as_ref()
+        .map(|d| secrecy::SecretString::from(d.open_url()));
 
+    let result = run_terminal(path, loaded, (link, open_url)).await;
+    // Quitting shuts the dashboard down: its event streams end, then the server.
+    if let Some(d) = dashboard {
+        d.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(2), d.wait()).await;
+    }
+    result
+}
+
+/// The TUI's own terminal session, `dashboard` the link to show and the URL that signs
+/// a browser in.
+async fn run_terminal(
+    path: PathBuf,
+    loaded: Result<Config, crate::config::ConfigError>,
+    dashboard: (app::DashboardLink, Option<secrecy::SecretString>),
+) -> anyhow::Result<()> {
     let mut terminal = ratatui::try_init()?;
     // ratatui's panic hook restores the terminal; also turn bracketed paste off.
     let prev = std::panic::take_hook();
@@ -97,7 +190,7 @@ pub async fn run(config: Option<PathBuf>) -> anyhow::Result<()> {
         prev(info);
     }));
     let result = match execute!(stdout(), EnableBracketedPaste) {
-        Ok(()) => event_loop(&mut terminal, path, loaded).await,
+        Ok(()) => event_loop(&mut terminal, path, loaded, dashboard).await,
         Err(e) => Err(e.into()),
     };
     let _ = execute!(stdout(), DisableBracketedPaste);
@@ -139,6 +232,7 @@ async fn event_loop(
     terminal: &mut DefaultTerminal,
     path: PathBuf,
     loaded: Result<Config, crate::config::ConfigError>,
+    (link, open_url): (app::DashboardLink, Option<secrecy::SecretString>),
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     // The colours are set once, before the first frame: the theme from the file, and
@@ -159,8 +253,10 @@ async fn event_loop(
             app
         }
     };
+    app.set_dashboard(link);
     spawn_input_thread(tx.clone());
     let mut runner = Runner::new(tx, path);
+    runner.dashboard = open_url;
     // The clock from the start, so a connect that answers before the first tick still
     // has its time in the header ("● connected 14:02 UTC").
     app.set_wall_clock(unix_ms_now() / 1000);
@@ -216,6 +312,15 @@ struct Runner {
     scans: HashMap<ConnId, ScanId>,
     /// The current run and its scan's stop flag ([`Effect::StopAnalysis`]).
     stop: Option<(ConnId, ScanId, StopFlag)>,
+    /// Where a saved profile's credentials are read from ([`SecretSource::Keychain`]):
+    /// the OS keychain in the TUI; the web dashboard's own store
+    /// ([`Headless::set_keychain`]).
+    keychain: Arc<dyn SecretStore>,
+    /// The URL that signs a browser in to the dashboard beside the TUI, while it runs
+    /// ([`Effect::OpenDashboard`]). It holds the token: only the browser gets it.
+    dashboard: Option<secrecy::SecretString>,
+    /// Starts the browser: [`crate::web::open_in_browser`], a recorder in tests.
+    open_browser: fn(&str) -> std::io::Result<()>,
 }
 
 impl Drop for Runner {
@@ -470,6 +575,9 @@ impl Runner {
             live: Arc::new(Mutex::new(None)),
             scans: HashMap::new(),
             stop: None,
+            keychain: Arc::new(KeyringStore),
+            dashboard: None,
+            open_browser: crate::web::open_in_browser,
         }
     }
 
@@ -573,7 +681,7 @@ impl Runner {
             _task: AbortOnDrop(tokio::spawn(run_tail(
                 TailRun { id, scan, tail },
                 profile,
-                secrets,
+                (secrets, Arc::clone(&self.keychain)),
                 to,
                 route,
                 tx,
@@ -635,7 +743,7 @@ impl Runner {
                     tail: run,
                 },
                 profile,
-                secrets,
+                (secrets, Arc::clone(&self.keychain)),
                 route,
                 tx,
             ))),
@@ -695,6 +803,14 @@ impl Runner {
                     send(&tx, msg);
                 }
             }
+            Effect::OpenDashboard => {
+                // Starting a program may take a moment: never on the UI thread.
+                let (url, open) = (self.dashboard.clone(), self.open_browser);
+                tokio::task::spawn_blocking(move || {
+                    let ok = url.is_some_and(|u| open(u.expose_secret()).is_ok());
+                    send(&tx, Msg::DashboardOpened { ok });
+                });
+            }
             Effect::Editor(job) => {
                 // Blocks the event loop while the editor runs: nothing is drawn then.
                 let result = editor::run(&job, out);
@@ -741,10 +857,10 @@ impl Runner {
                         send(&tx, Msg::LastSnapshot { id, scan, last });
                     });
                 }
-                self.scan_task = Some(tokio::spawn(connect_and_scan(
+                self.scan_task = Some(tokio::spawn(connect_and_scan_with(
                     Run { id, scan },
                     profile,
-                    secrets,
+                    (secrets, Arc::clone(&self.keychain)),
                     sample,
                     stop,
                     tx,
@@ -928,7 +1044,7 @@ fn save_connection(
 }
 
 /// Remove a known secret from error text, as a second line of defence.
-fn scrub(text: String, secret: Option<&str>) -> String {
+pub(crate) fn scrub(text: String, secret: Option<&str>) -> String {
     match secret {
         Some(s) if !s.is_empty() => text.replace(s, "******"),
         _ => text,
@@ -1050,12 +1166,16 @@ where
     );
 }
 
-/// The store to read `profile`'s credentials from: the keychain for a saved profile,
-/// memory for a Docker container's; with the container's password, to scrub from error
-/// text (see [`scrub`]).
-fn store_for(profile: &Profile, secrets: SecretSource) -> (Box<dyn SecretStore>, Option<String>) {
+/// The store to read `profile`'s credentials from: the keychain (`keychain`: the OS
+/// keychain in the TUI) for a saved profile, memory for a Docker container's; with the
+/// container's password, to scrub from error text (see [`scrub`]).
+fn store_for(
+    profile: &Profile,
+    secrets: SecretSource,
+    keychain: &Arc<dyn SecretStore>,
+) -> (Arc<dyn SecretStore>, Option<String>) {
     match secrets {
-        SecretSource::Keychain => (Box::new(KeyringStore), None),
+        SecretSource::Keychain => (Arc::clone(keychain), None),
         SecretSource::Container(creds) => {
             let store = MemoryStore::default();
             let secret = creds
@@ -1065,7 +1185,7 @@ fn store_for(profile: &Profile, secrets: SecretSource) -> (Box<dyn SecretStore>,
                 // MemoryStore::set cannot fail.
                 let _ = store.set(&profile.secret_ref(), c);
             }
-            (Box::new(store), secret)
+            (Arc::new(store), secret)
         }
     }
 }
@@ -1133,7 +1253,7 @@ fn tail_open_error(e: &conn::ConnError, clean: impl Fn(String) -> String) -> Str
 async fn run_tail(
     run: TailRun,
     profile: Profile,
-    secrets: SecretSource,
+    (secrets, keychain): (SecretSource, Arc<dyn SecretStore>),
     to: Subscription,
     route: NodeRoute,
     tx: Tx,
@@ -1151,7 +1271,7 @@ async fn run_tail(
             },
         );
     };
-    let (store, secret) = store_for(&profile, secrets);
+    let (store, secret) = store_for(&profile, secrets, &keychain);
     let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
     let opened = conn::open_subscriber(&profile, store.as_ref(), route.addr.as_ref()).await;
     let (mut conn, mut pushes) = match opened {
@@ -1194,7 +1314,7 @@ async fn run_tail(
 async fn run_monitor(
     run: TailRun,
     profile: Profile,
-    secrets: SecretSource,
+    (secrets, keychain): (SecretSource, Arc<dyn SecretStore>),
     route: NodeRoute,
     tx: Tx,
 ) {
@@ -1207,7 +1327,7 @@ async fn run_monitor(
     let closed = |end: Result<live::monitor::End, String>| {
         send(&tx, Msg::MonitorClosed { id, scan, run, end });
     };
-    let (store, secret) = store_for(&profile, secrets);
+    let (store, secret) = store_for(&profile, secrets, &keychain);
     let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
     let opened = conn::open_monitor(&profile, store.as_ref(), &budget, route.addr.as_ref()).await;
     drop(store);
@@ -1309,9 +1429,22 @@ async fn connect_and_scan(
     tx: Tx,
     live: LiveSlot,
 ) {
+    connect_and_scan_with(run, profile, (secrets, keyring()), sample, stop, tx, live).await;
+}
+
+/// [`connect_and_scan`] reading a saved profile's credentials from `keychain`.
+async fn connect_and_scan_with(
+    run: Run,
+    profile: Profile,
+    (secrets, keychain): (SecretSource, Arc<dyn SecretStore>),
+    sample: Option<u64>,
+    stop: StopFlag,
+    tx: Tx,
+    live: LiveSlot,
+) {
     let Run { id, scan: scan_id } = run;
     let name = report_name(&profile, &secrets);
-    let (store, secret) = store_for(&profile, secrets);
+    let (store, secret) = store_for(&profile, secrets, &keychain);
     let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
 
     // A standalone server, or every shard of a cluster.
@@ -1350,7 +1483,13 @@ async fn connect_and_scan(
     // each node has a budget of its own instead, shared by its figures, its scan and its
     // live requests, and the probes run on every node through its budget.
     let mut opts = ScanOptions::for_profile(&profile);
-    let budget = Budget::new(opts.max_commands_per_sec);
+    // From the process-wide registry: a dashboard session of the same profile and
+    // node takes from the same budget (spec "Shared command budget").
+    let budget = crate::budget::shared(
+        &name,
+        &profile.endpoint.to_string(),
+        opts.max_commands_per_sec,
+    );
     // What the figures read gave, kept for the analysis: it starts from these figures
     // and does not read them again.
     enum Read {
@@ -1379,7 +1518,11 @@ async fn connect_and_scan(
         }
         ScanTargets::Cluster(c) => {
             for node in &mut c.nodes {
-                node.budget = Some(Budget::new(opts.max_commands_per_sec));
+                node.budget = Some(crate::budget::shared(
+                    &name,
+                    &node.endpoint.to_string(),
+                    opts.max_commands_per_sec,
+                ));
             }
             let perms = c.check_all_permissions().await;
             let read = scan::figures::cluster_figures(c, opts.max_commands_per_sec).await;
@@ -1716,6 +1859,77 @@ pub async fn run_browse_for_tests(
     };
     drop(lock(&slot).take());
     out
+}
+
+/// The OS keychain: where the TUI reads a saved profile's credentials from.
+fn keyring() -> Arc<dyn SecretStore> {
+    Arc::new(KeyringStore)
+}
+
+/// The TUI's runtime without a terminal, for the web dashboard (`crate::web`): the same
+/// [`Runner`] carries out the same [`Effect`]s (connect, live requests, the Pub/Sub tail,
+/// Monitor) and sends the same [`Msg`]s, which arrive on the receiver [`Headless::new`]
+/// returns instead of going to an [`App`]. So the dashboard connects, tails and monitors
+/// through exactly the TUI's code: one copy of the safety logic.
+pub(crate) struct Headless {
+    runner: Runner,
+    _forward: AbortOnDrop,
+}
+
+impl std::fmt::Debug for Headless {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Headless").finish_non_exhaustive()
+    }
+}
+
+impl Headless {
+    /// A runner for the config file at `path`, reading saved profiles' credentials from
+    /// `keychain`. Must be called inside a tokio runtime.
+    pub(crate) fn new(
+        path: PathBuf,
+        keychain: Arc<dyn SecretStore>,
+    ) -> (Self, mpsc::UnboundedReceiver<Msg>) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (out, msgs) = mpsc::unbounded_channel();
+        let forward = tokio::spawn(async move {
+            while let Some(incoming) = rx.recv().await {
+                if let Incoming::Msg(m) = incoming
+                    && out.send(*m).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let mut runner = Runner::new(tx, path);
+        runner.keychain = keychain;
+        (
+            Self {
+                runner,
+                _forward: AbortOnDrop(forward),
+            },
+            msgs,
+        )
+    }
+
+    /// Where saved profiles' credentials are read from from the next effect on.
+    pub(crate) fn set_keychain(&mut self, keychain: Arc<dyn SecretStore>) {
+        self.runner.keychain = keychain;
+    }
+
+    /// Carries out `effect` as the TUI does. Effects that write to the terminal (copy,
+    /// the editor) are not for it: their output goes nowhere.
+    pub(crate) fn run(&mut self, effect: Effect) {
+        let _ = self.runner.run(effect, &mut std::io::sink());
+    }
+
+    /// Ends the current session: its connect task, its live task, tail and Monitor.
+    pub(crate) fn close(&mut self) {
+        if let Some(t) = self.runner.scan_task.take() {
+            t.abort();
+        }
+        self.runner.stop = None;
+        self.runner.close_live();
+    }
 }
 
 #[cfg(test)]
@@ -2756,6 +2970,142 @@ mod tests {
             panic!("no CopyFailed");
         };
         assert_eq!(e, "the key is too long to copy");
+    }
+
+    /// `ctrl-o`'s effect hands the URL that signs in to the browser opener, off the UI
+    /// thread, and says how it went; without a dashboard nothing is opened.
+    #[tokio::test]
+    async fn open_dashboard_hands_the_signed_url_to_the_browser() {
+        static OPENED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        fn record(url: &str) -> std::io::Result<()> {
+            OPENED.lock().unwrap().push(url.to_string());
+            Ok(())
+        }
+        fn fail(_: &str) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        }
+        let url = "http://127.0.0.1:7379/#token=00ff";
+        let (mut runner, mut rx) = runner();
+        runner.open_browser = record;
+        runner.dashboard = Some(secrecy::SecretString::from(url));
+        let mut out = Recorder::default();
+        assert!(!runner.run(Effect::OpenDashboard, &mut out));
+        assert!(out.bytes.is_empty(), "nothing goes to the terminal");
+        let msg = rx.recv().await.map(msg_of);
+        assert!(
+            matches!(msg, Some(Msg::DashboardOpened { ok: true })),
+            "{msg:?}"
+        );
+        assert_eq!(*OPENED.lock().unwrap(), [url]);
+        // The browser could not be started.
+        runner.open_browser = fail;
+        runner.run(Effect::OpenDashboard, &mut out);
+        let msg = rx.recv().await.map(msg_of);
+        assert!(
+            matches!(msg, Some(Msg::DashboardOpened { ok: false })),
+            "{msg:?}"
+        );
+        // No dashboard (the web dashboard's own runner): nothing is opened.
+        let (mut bare, mut rx) = self::runner();
+        bare.open_browser = record;
+        bare.run(Effect::OpenDashboard, &mut out);
+        let msg = rx.recv().await.map(msg_of);
+        assert!(
+            matches!(msg, Some(Msg::DashboardOpened { ok: false })),
+            "{msg:?}"
+        );
+        assert_eq!(OPENED.lock().unwrap().len(), 1);
+        assert!(out.bytes.is_empty());
+    }
+
+    /// `--terminal` and `[settings] dashboard = false` start nothing; otherwise the
+    /// dashboard starts on the port asked for, and a port in use is a reason, not an
+    /// error. The link holds the URL to show, never the token.
+    #[tokio::test]
+    async fn start_beside_starts_the_dashboard_unless_told_not_to() {
+        use crate::config::DashboardSettings;
+        use app::DashboardLink;
+        let path = temp_path("beside");
+        let on = DashboardSettings::default();
+        let off = DashboardSettings {
+            dashboard: false,
+            ..on
+        };
+        let terminal = Beside {
+            terminal: true,
+            port: Some(0),
+        };
+        let (d, link) = start_beside(terminal, Some(on), &path);
+        assert!(d.is_none());
+        assert_eq!(link, DashboardLink::Terminal);
+        // A config file that could not be read: not started, and the link says why.
+        let (d, link) = start_beside(
+            Beside {
+                terminal: false,
+                port: Some(0),
+            },
+            None,
+            &path,
+        );
+        assert!(d.is_none());
+        assert_eq!(
+            link,
+            DashboardLink::Failed(DASHBOARD_CONFIG_UNREADABLE.to_string())
+        );
+        let (d, link) = start_beside(terminal, None, &path);
+        assert!(d.is_none());
+        assert_eq!(link, DashboardLink::Terminal);
+        let (d, link) = start_beside(
+            Beside {
+                terminal: false,
+                port: Some(0),
+            },
+            Some(off),
+            &path,
+        );
+        assert!(d.is_none());
+        assert_eq!(link, DashboardLink::Disabled);
+
+        let (d, link) = start_beside(
+            Beside {
+                terminal: false,
+                port: Some(0),
+            },
+            Some(on),
+            &path,
+        );
+        let d = d.expect("started");
+        let port = d.port();
+        assert_ne!(port, 0);
+        assert_eq!(
+            link,
+            DashboardLink::On {
+                url: format!("http://127.0.0.1:{port}")
+            }
+        );
+        let token = d.open_url().rsplit('=').next().unwrap().to_string();
+        assert_eq!(token.len(), 64);
+        assert!(!format!("{link:?}").contains(&token));
+        // Its port is taken now: a second one says so and starts nothing.
+        let (second, link) = start_beside(
+            Beside {
+                terminal: false,
+                port: Some(port),
+            },
+            Some(on),
+            &path,
+        );
+        assert!(second.is_none());
+        assert_eq!(
+            link,
+            DashboardLink::Failed(format!(
+                "The dashboard is off: port {port} is in use. --port picks another."
+            ))
+        );
+        d.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), d.wait())
+            .await
+            .expect("it stops");
     }
 
     #[test]

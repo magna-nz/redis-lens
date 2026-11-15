@@ -10,7 +10,7 @@ use super::ConnError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnFormat {
-    /// `redis://` or `rediss://`.
+    /// `redis://` or `rediss://` (and their aliases `valkey://` and `valkeys://`).
     RedisUri,
     /// `host:port,password=...,ssl=True,...`
     StackExchange,
@@ -45,17 +45,46 @@ pub struct ParsedConnection {
 const DEFAULT_PORT: u16 = 6379;
 const MASK: &str = "******";
 
-/// Parse a `redis://` / `rediss://` URI or a StackExchange.Redis connection string.
+/// Why a URL with another scheme is refused. Fixed: never the input, which can hold a
+/// password.
+pub const UNSUPPORTED_SCHEME: &str = "only redis, rediss, valkey and valkeys URLs are supported";
+/// Why a host that holds a user name or password (or other URL parts) is refused.
+pub const HOST_WITH_USERINFO: &str = "the host holds a user name, a password or other URL parts; \
+     give the user name and password in a redis:// URL instead";
+
+/// Parse a `redis://` / `rediss://` URI (`valkey://` / `valkeys://` are the same URIs
+/// under Valkey's name) or a StackExchange.Redis connection string.
 ///
-/// Error messages never contain the input.
+/// Anything else with `://` is refused, and so is a host with `@`, `/` or other URL
+/// parts in it: such a string would otherwise become a host holding the password, and
+/// be shown and saved as one. Error messages never contain the input.
 pub fn parse_connection_string(s: &str) -> Result<ParsedConnection, ConnError> {
     let s = s.trim();
     let lower = s.to_ascii_lowercase();
-    if lower.starts_with("redis://") || lower.starts_with("rediss://") {
-        parse_uri(s)
+    let parsed = if lower.starts_with("redis://") || lower.starts_with("rediss://") {
+        parse_uri(s)?
+    } else if lower.starts_with("valkey://") {
+        parse_uri(&format!("redis://{}", &s["valkey://".len()..]))?
+    } else if lower.starts_with("valkeys://") {
+        parse_uri(&format!("rediss://{}", &s["valkeys://".len()..]))?
+    } else if lower.contains("://") {
+        return Err(err(UNSUPPORTED_SCHEME));
     } else {
-        parse_stackexchange(s)
+        parse_stackexchange(s)?
+    };
+    if !host_is_plain(&parsed.endpoint.host) {
+        return Err(err(HOST_WITH_USERINFO));
     }
+    Ok(parsed)
+}
+
+/// A host name or an address and nothing else: no userinfo (`@`), path, query,
+/// fragment, scheme separator, space or control character.
+pub(crate) fn host_is_plain(host: &str) -> bool {
+    !host.is_empty()
+        && !host
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || "@/\\?#,;=\"'<>`".contains(c))
 }
 
 fn err(msg: &str) -> ConnError {
@@ -613,7 +642,73 @@ mod tests {
         assert_eq!(pw(&p), Some("s3cretCCC"));
     }
 
+    #[test]
+    fn valkey_urls_are_redis_urls_with_the_credentials_split_out() {
+        let p = parse_connection_string("valkey://vk-user:Vk-PW-222@127.0.0.1:6391/2").unwrap();
+        assert_eq!(p.format, ConnFormat::RedisUri);
+        assert_eq!(p.endpoint.host, "127.0.0.1");
+        assert_eq!(p.endpoint.port, 6391);
+        assert!(!p.endpoint.tls);
+        assert_eq!(p.db, 2);
+        assert_eq!(pw(&p), Some("Vk-PW-222"));
+        assert_eq!(
+            p.credentials.as_ref().unwrap().username.as_deref(),
+            Some("vk-user")
+        );
+        let p = parse_connection_string("VALKEYS://:pw-x@cache.example").unwrap();
+        assert!(p.endpoint.tls);
+        assert_eq!(p.endpoint.host, "cache.example");
+        assert_eq!(pw(&p), Some("pw-x"));
+    }
+
+    #[test]
+    fn other_schemes_and_userinfo_in_a_host_are_refused_without_echoing_them() {
+        for (bad, want) in [
+            (
+                "http://erin-user:Bad-PW-000@127.0.0.1:6391",
+                UNSUPPORTED_SCHEME,
+            ),
+            ("https://h", UNSUPPORTED_SCHEME),
+            ("tcp://u:Bad-PW-000@h:1", UNSUPPORTED_SCHEME),
+            ("  unix:///tmp/redis.sock", UNSUPPORTED_SCHEME),
+            ("sl-user:Sl-PW-999@127.0.0.1:6391", HOST_WITH_USERINFO),
+            ("u@h:6379", HOST_WITH_USERINFO),
+            ("h/0:6379", HOST_WITH_USERINFO),
+            ("h?x:6379", HOST_WITH_USERINFO),
+            ("a b:6379", HOST_WITH_USERINFO),
+        ] {
+            let e = parse_connection_string(bad).err().unwrap().to_string();
+            assert!(e.ends_with(want), "{bad}: {e}");
+            for secret in ["Bad-PW-000", "Sl-PW-999", "erin-user", "sl-user"] {
+                assert!(!e.contains(secret), "{e}");
+            }
+        }
+        // Still accepted: the StackExchange forms, IPv6, Azure hosts.
+        for good in [
+            "127.0.0.1:7000",
+            "cache.redis.cache.windows.net:6380,password=p,ssl=True",
+            "[::1]:6380",
+            "::1",
+            "redis://[::1]:6380",
+        ] {
+            assert!(parse_connection_string(good).is_ok(), "{good}");
+        }
+    }
+
     proptest! {
+        /// No accepted string gives a host holding userinfo or a URL: whatever is pasted,
+        /// what is saved and shown as the host is a host.
+        #[test]
+        fn no_accepted_host_holds_userinfo_or_a_url(
+            s in "([a-z]{1,8}://)?([A-Za-z0-9._-]{0,8}(:[A-Za-z0-9@/._-]{0,8})?@)?[A-Za-z0-9.:@/_-]{1,20}(,[a-z]{1,8}=[A-Za-z0-9@:/]{0,8}){0,2}"
+        ) {
+            if let Ok(p) = parse_connection_string(&s) {
+                prop_assert!(!p.endpoint.host.contains('@'), "{:?}", p.endpoint.host);
+                prop_assert!(!p.endpoint.host.contains("://"), "{:?}", p.endpoint.host);
+                prop_assert!(!p.endpoint.host.contains('/'), "{:?}", p.endpoint.host);
+            }
+        }
+
         #[test]
         fn parse_never_panics(s in "\\PC{0,80}") {
             let _ = parse_connection_string(&s);

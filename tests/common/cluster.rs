@@ -73,7 +73,8 @@ pub async fn cluster_with(valkey: bool, replicas: bool, extra: &[&str]) -> TestC
             Err(e)
                 if attempt < 4
                     && (e.contains("address already in use")
-                        || e.contains("ports are not available")) => {}
+                        || e.contains("ports are not available")
+                        || e.contains("port is already allocated")) => {}
             Err(e) => panic!("start the cluster container (is Docker running?): {e}"),
         }
     }
