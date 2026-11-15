@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** the web dashboard, phase 4 of 4, on `claude/dashboard-p4`; phases 1 to 3 merged as #26, #28 and #29 ([Web dashboard](#web-dashboard-2026-11-15)). On main: Redis Insight parity phases 1 to 5 (#15 to #23), the TUI redesign (#21), the shorter README (#24), Find key (#25) and the release pipeline with the switch to MIT (#27).
-**Last updated:** 2026-11-16 (web dashboard phase 3 merged as #29; phase 4 on `claude/dashboard-p4`)
+**Current milestone:** the first release, v0.1.0 (`claude/release-0.1.0`). The web dashboard is done: phases 1 to 4 merged as #26, #28, #29 and #30 ([Web dashboard](#web-dashboard-2026-11-15)). On main: Redis Insight parity phases 1 to 5 (#15 to #23), the TUI redesign (#21), the shorter README (#24), Find key (#25) and the release pipeline with the switch to MIT (#27).
+**Last updated:** 2026-11-16 (dashboard phase 4 merged as #30; v0.1.0 release notes updated before the tag)
 
 ## Overnight run (2026-11-10): approvals and plan
 

@@ -38,7 +38,7 @@ Connections marked as production are read-only unless you turn writes on.
 - **Connect to anything:** ACL users, TLS, cluster, Sentinel, SSH tunnels, cloud IAM sign-in and Docker discovery.
   Passwords stay in the OS keychain.
 - **Check it in CI:** save snapshots, compare them over time, and fail a build on rules you set.
-- **Use it in a browser:** a web dashboard on your own computer, for connections, keys and values (with edits), the analysis, the server, Pub/Sub and the command line so far.
+- **Use it in a browser:** a web dashboard on your own computer with every screen the terminal has: connections, keys and values (with edits and bulk actions), Streams, Search, the analysis, the server, Pub/Sub and the command line.
   It follows the same rules as the terminal: read-only production, writes asked about, passwords only in the keychain.
 
 ## Install
