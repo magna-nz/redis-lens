@@ -64,6 +64,8 @@ pub fn page(url: &str) -> String {
 /// the file's path.
 pub fn write_in(base: &Path, url: &str) -> std::io::Result<PathBuf> {
     let dir = base.join(format!("redis-lens-{}", random_name()?));
+    // Only Unix sets a mode on it, so on Windows `mut` is unused.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut db = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
