@@ -3,7 +3,7 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** Redis Insight parity phase 5, merged as #22, with the verifier's fixes in the follow-up branch `claude/insight-phase5-followups` ([Phase 5](#phase-5-2026-11-15-the-rest-of-redis-insight-parity)). On main: parity phases 1 to 4 (#15, #16, #17, #18, #19), the phase 4 follow-up PR #20 (merged 2026-11-14, merge commit `9e031cb`) and the TUI redesign (#21, merged 2026-11-15, merge commit `dec974e`).
-**Last updated:** 2026-11-15 (phase 5 merged as #22; the verifier's fixes and the docs update that landed after that merge are in a follow-up PR)
+**Last updated:** 2026-11-15 (phase 5 and its follow-ups merged as #22 and #23; README cut to a short overview)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -617,7 +617,7 @@ Built on `claude/insight-phase5`, cut from main at `dec974e`. Merged as #22 at `
 | small | Eviction findings (`VolatileNoTtl`, `NoEvictionFull`, `LfuOff`, no command sent); `y` on Server › Slow log and Monitor copies the masked command line; an `INFO` with no `maxmemory-policy` leaves the policy unknown, not a guessed `noeviction` | `88f807d`, `8fbc3d6`, `9eff419`, `908abf8`, `74b7411` (key rows), `5488e27`; merge `67619ac` | **done**; integration tests on Redis and Valkey for the findings |
 | cmdline | Command line result views (`ctrl-t`: text, table, JSON, raw), `N cmd` repeats (at most 100, checked and budgeted one by one), pipeline mode (`ctrl-p`) | `e92d71f`, `01a364b`, `7920a43` (key rows); merge `2261f46` | **done**; integration tests on Redis and Valkey |
 | values | Snappy; PHP, Pickle, Protobuf and Java serialization as bounded trees; detection order; arrays (Redis 8.8) and the TimeSeries, Bloom, Cuckoo, Count-Min Sketch, Top-K and t-digest values in a key's value; `f` cycles eight formats | `88cb82e`, `76e47dd`, `ec93b0f`, `c213ae2`, `534141d` (`f` text); merge `76ba274` | **done** |
-| docs | A GitHub Pages site in `docs/` (`index.html`, `site.css`, `site.js`, `.nojekyll`) and a README cut from 412 to 93 lines; the site's text on `expire` dry runs was corrected to match spec.md (a read-only profile refuses, dry run included) | `e22599c`, `6176202`; merge `1270a0c` | **done**; Pages is not enabled yet (see the questions) |
+| docs | A GitHub Pages site in `docs/` (`index.html`, `site.css`, `site.js`, `.nojekyll`) and a README cut from 412 to 93 lines, then to 59 as a short overview of what the tool does; the site's text on `expire` dry runs was corrected to match spec.md (a read-only profile refuses, dry run included) | `e22599c`, `6176202`; merge `1270a0c` | **done**; Pages is not enabled yet (see the questions) |
 | spec and status | spec.md, this section and the parity doc brought up to date | this commit | **done** |
 | force standalone | `conn add --standalone`, `conn set --standalone/--no-standalone`: one node of a cluster read as a standalone server, redirects never followed, a `standalone` mark and a report note; plus the module summary footer (`↑↓ Move`, `D`, `esc Back`) | `f77ecaf`, merge `59f2a74` (with a Java-reader fix from the proptests: a handle cleared by `TC_RESET` is no longer indexed) | **done**; `tests/cluster_standalone_it.rs` on Redis and Valkey |
 | GIF | `docs/demo.gif` re-recorded for the redesigned UI (63 s): connect, Overview, a Quick analysis, Browse to a value and `f`, Analyze, Server, the command line's table view | `2abccc2` | **done** |
@@ -644,7 +644,7 @@ Tests: the keymap test `tui::keymap::tests::spec_lists_every_key` checks the key
 
 ### Open questions (phase 5)
 
-- Install: the README and the site still say `cargo install redis-lens` and GitHub Releases. Neither exists yet (not on crates.io, no releases). Publish first, or reword?
+- Install: the README and the site now say `cargo install --git https://github.com/magna-nz/redis-lens`, and the site says there are no releases yet. When the crate is published or the first `vX.Y.Z` tag is pushed, switch them back to `cargo install redis-lens` and the release binaries.
 - GitHub Pages has to be enabled by the owner, served from `main` `/docs`.
 - Carried over: an allow-list for `INFO` and `PING` on the command line, and a reply-size check before whole-key reads.
 - Carried over: Dependabot PRs #2 to #5.
