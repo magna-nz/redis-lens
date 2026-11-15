@@ -56,7 +56,7 @@ pub const REPEAT_ASKS: &str = "Not sent: this write asks first, and the write ga
 /// question. A destructive or `@dangerous` write would ask without
 /// `skip_non_prod_confirm`, so it is never repeated, whatever the setting; an edit on
 /// `prod` asks, so it is not repeated either.
-fn repeatable(op: &WriteOp, decision: &Decision) -> bool {
+pub(crate) fn repeatable(op: &WriteOp, decision: &Decision) -> bool {
     op.kind() == Kind::Edit && *decision == Decision::Run
 }
 
@@ -467,7 +467,7 @@ impl fmt::Debug for CmdlineState {
 
 /// The first word as `COMMAND INFO` is asked about it: lower-case. `None` when it is
 /// not something to ask about (empty, too long, control characters).
-fn name_of(word: &[u8]) -> Option<String> {
+pub(crate) fn name_of(word: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(word).ok()?;
     (!s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_graphic()))
         .then(|| s.to_ascii_lowercase())

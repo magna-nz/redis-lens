@@ -20,6 +20,8 @@ integration-tests = []
 
 [dependencies]
 anyhow = "1.0.104"
+# The web dashboard's HTTP server (src/web/), already in the tree through bollard.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base64 = "0.22.1"
 bollard = "0.21.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
@@ -28,6 +30,8 @@ directories = "6.0.0"
 # Values (src/value/): gzip and zlib through the pure-Rust miniz_oxide backend.
 flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }
 futures = "0.3.34"
+# The dashboard's session token and confirmation ids.
+getrandom = "0.3.4"
 keyring = "4.2.0"
 # Values: LZ4 frame decoding only, the safe and bounds-checked decoder.
 lz4_flex = { version = "0.14.0", default-features = false, features = ["frame", "safe-decode", "checked-decode"] }
@@ -86,6 +90,8 @@ testcontainers = "0.28.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "io-util", "test-util"] }
 # The in-process TLS server in tests/os_trust.rs. Same version redis-rs uses.
 tokio-rustls = { version = "0.26.6", default-features = false }
+# The dashboard's router is called without a socket in its unit tests (`oneshot`).
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

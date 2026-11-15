@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="104" height="104" viewBox="0 0 104 104" role="img" aria-label="redis-lens mark">
+  <rect width="104" height="104" rx="22" fill="#2B2B2E"/>
+  <rect x="20" y="30" width="46" height="9" rx="4.5" fill="#5A5A60"/>
+  <rect x="20" y="48" width="64" height="9" rx="4.5" fill="#DC382D"/>
+  <rect x="20" y="66" width="34" height="9" rx="4.5" fill="#5A5A60"/>
+  <circle cx="58" cy="50" r="23" fill="#2B2B2E" fill-opacity="0.35" stroke="#F2F2F2" stroke-width="6"/>
+  <path d="M75 67 L90 82" stroke="#F2F2F2" stroke-width="8" stroke-linecap="round"/>
+</svg>

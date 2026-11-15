@@ -216,6 +216,10 @@ struct Runner {
     scans: HashMap<ConnId, ScanId>,
     /// The current run and its scan's stop flag ([`Effect::StopAnalysis`]).
     stop: Option<(ConnId, ScanId, StopFlag)>,
+    /// Where a saved profile's credentials are read from ([`SecretSource::Keychain`]):
+    /// the OS keychain in the TUI; the web dashboard's own store
+    /// ([`Headless::set_keychain`]).
+    keychain: Arc<dyn SecretStore>,
 }
 
 impl Drop for Runner {
@@ -470,6 +474,7 @@ impl Runner {
             live: Arc::new(Mutex::new(None)),
             scans: HashMap::new(),
             stop: None,
+            keychain: Arc::new(KeyringStore),
         }
     }
 
@@ -573,7 +578,7 @@ impl Runner {
             _task: AbortOnDrop(tokio::spawn(run_tail(
                 TailRun { id, scan, tail },
                 profile,
-                secrets,
+                (secrets, Arc::clone(&self.keychain)),
                 to,
                 route,
                 tx,
@@ -635,7 +640,7 @@ impl Runner {
                     tail: run,
                 },
                 profile,
-                secrets,
+                (secrets, Arc::clone(&self.keychain)),
                 route,
                 tx,
             ))),
@@ -741,10 +746,10 @@ impl Runner {
                         send(&tx, Msg::LastSnapshot { id, scan, last });
                     });
                 }
-                self.scan_task = Some(tokio::spawn(connect_and_scan(
+                self.scan_task = Some(tokio::spawn(connect_and_scan_with(
                     Run { id, scan },
                     profile,
-                    secrets,
+                    (secrets, Arc::clone(&self.keychain)),
                     sample,
                     stop,
                     tx,
@@ -928,7 +933,7 @@ fn save_connection(
 }
 
 /// Remove a known secret from error text, as a second line of defence.
-fn scrub(text: String, secret: Option<&str>) -> String {
+pub(crate) fn scrub(text: String, secret: Option<&str>) -> String {
     match secret {
         Some(s) if !s.is_empty() => text.replace(s, "******"),
         _ => text,
@@ -1050,12 +1055,16 @@ where
     );
 }
 
-/// The store to read `profile`'s credentials from: the keychain for a saved profile,
-/// memory for a Docker container's; with the container's password, to scrub from error
-/// text (see [`scrub`]).
-fn store_for(profile: &Profile, secrets: SecretSource) -> (Box<dyn SecretStore>, Option<String>) {
+/// The store to read `profile`'s credentials from: the keychain (`keychain`: the OS
+/// keychain in the TUI) for a saved profile, memory for a Docker container's; with the
+/// container's password, to scrub from error text (see [`scrub`]).
+fn store_for(
+    profile: &Profile,
+    secrets: SecretSource,
+    keychain: &Arc<dyn SecretStore>,
+) -> (Arc<dyn SecretStore>, Option<String>) {
     match secrets {
-        SecretSource::Keychain => (Box::new(KeyringStore), None),
+        SecretSource::Keychain => (Arc::clone(keychain), None),
         SecretSource::Container(creds) => {
             let store = MemoryStore::default();
             let secret = creds
@@ -1065,7 +1074,7 @@ fn store_for(profile: &Profile, secrets: SecretSource) -> (Box<dyn SecretStore>,
                 // MemoryStore::set cannot fail.
                 let _ = store.set(&profile.secret_ref(), c);
             }
-            (Box::new(store), secret)
+            (Arc::new(store), secret)
         }
     }
 }
@@ -1133,7 +1142,7 @@ fn tail_open_error(e: &conn::ConnError, clean: impl Fn(String) -> String) -> Str
 async fn run_tail(
     run: TailRun,
     profile: Profile,
-    secrets: SecretSource,
+    (secrets, keychain): (SecretSource, Arc<dyn SecretStore>),
     to: Subscription,
     route: NodeRoute,
     tx: Tx,
@@ -1151,7 +1160,7 @@ async fn run_tail(
             },
         );
     };
-    let (store, secret) = store_for(&profile, secrets);
+    let (store, secret) = store_for(&profile, secrets, &keychain);
     let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
     let opened = conn::open_subscriber(&profile, store.as_ref(), route.addr.as_ref()).await;
     let (mut conn, mut pushes) = match opened {
@@ -1194,7 +1203,7 @@ async fn run_tail(
 async fn run_monitor(
     run: TailRun,
     profile: Profile,
-    secrets: SecretSource,
+    (secrets, keychain): (SecretSource, Arc<dyn SecretStore>),
     route: NodeRoute,
     tx: Tx,
 ) {
@@ -1207,7 +1216,7 @@ async fn run_monitor(
     let closed = |end: Result<live::monitor::End, String>| {
         send(&tx, Msg::MonitorClosed { id, scan, run, end });
     };
-    let (store, secret) = store_for(&profile, secrets);
+    let (store, secret) = store_for(&profile, secrets, &keychain);
     let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
     let opened = conn::open_monitor(&profile, store.as_ref(), &budget, route.addr.as_ref()).await;
     drop(store);
@@ -1309,9 +1318,22 @@ async fn connect_and_scan(
     tx: Tx,
     live: LiveSlot,
 ) {
+    connect_and_scan_with(run, profile, (secrets, keyring()), sample, stop, tx, live).await;
+}
+
+/// [`connect_and_scan`] reading a saved profile's credentials from `keychain`.
+async fn connect_and_scan_with(
+    run: Run,
+    profile: Profile,
+    (secrets, keychain): (SecretSource, Arc<dyn SecretStore>),
+    sample: Option<u64>,
+    stop: StopFlag,
+    tx: Tx,
+    live: LiveSlot,
+) {
     let Run { id, scan: scan_id } = run;
     let name = report_name(&profile, &secrets);
-    let (store, secret) = store_for(&profile, secrets);
+    let (store, secret) = store_for(&profile, secrets, &keychain);
     let clean = |e: String| conn::parse::mask(&scrub(e, secret.as_deref()));
 
     // A standalone server, or every shard of a cluster.
@@ -1350,7 +1372,13 @@ async fn connect_and_scan(
     // each node has a budget of its own instead, shared by its figures, its scan and its
     // live requests, and the probes run on every node through its budget.
     let mut opts = ScanOptions::for_profile(&profile);
-    let budget = Budget::new(opts.max_commands_per_sec);
+    // From the process-wide registry: a dashboard session of the same profile and
+    // node takes from the same budget (spec "Shared command budget").
+    let budget = crate::budget::shared(
+        &name,
+        &profile.endpoint.to_string(),
+        opts.max_commands_per_sec,
+    );
     // What the figures read gave, kept for the analysis: it starts from these figures
     // and does not read them again.
     enum Read {
@@ -1379,7 +1407,11 @@ async fn connect_and_scan(
         }
         ScanTargets::Cluster(c) => {
             for node in &mut c.nodes {
-                node.budget = Some(Budget::new(opts.max_commands_per_sec));
+                node.budget = Some(crate::budget::shared(
+                    &name,
+                    &node.endpoint.to_string(),
+                    opts.max_commands_per_sec,
+                ));
             }
             let perms = c.check_all_permissions().await;
             let read = scan::figures::cluster_figures(c, opts.max_commands_per_sec).await;
@@ -1716,6 +1748,77 @@ pub async fn run_browse_for_tests(
     };
     drop(lock(&slot).take());
     out
+}
+
+/// The OS keychain: where the TUI reads a saved profile's credentials from.
+fn keyring() -> Arc<dyn SecretStore> {
+    Arc::new(KeyringStore)
+}
+
+/// The TUI's runtime without a terminal, for the web dashboard (`crate::web`): the same
+/// [`Runner`] carries out the same [`Effect`]s (connect, live requests, the Pub/Sub tail,
+/// Monitor) and sends the same [`Msg`]s, which arrive on the receiver [`Headless::new`]
+/// returns instead of going to an [`App`]. So the dashboard connects, tails and monitors
+/// through exactly the TUI's code: one copy of the safety logic.
+pub(crate) struct Headless {
+    runner: Runner,
+    _forward: AbortOnDrop,
+}
+
+impl std::fmt::Debug for Headless {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Headless").finish_non_exhaustive()
+    }
+}
+
+impl Headless {
+    /// A runner for the config file at `path`, reading saved profiles' credentials from
+    /// `keychain`. Must be called inside a tokio runtime.
+    pub(crate) fn new(
+        path: PathBuf,
+        keychain: Arc<dyn SecretStore>,
+    ) -> (Self, mpsc::UnboundedReceiver<Msg>) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (out, msgs) = mpsc::unbounded_channel();
+        let forward = tokio::spawn(async move {
+            while let Some(incoming) = rx.recv().await {
+                if let Incoming::Msg(m) = incoming
+                    && out.send(*m).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let mut runner = Runner::new(tx, path);
+        runner.keychain = keychain;
+        (
+            Self {
+                runner,
+                _forward: AbortOnDrop(forward),
+            },
+            msgs,
+        )
+    }
+
+    /// Where saved profiles' credentials are read from from the next effect on.
+    pub(crate) fn set_keychain(&mut self, keychain: Arc<dyn SecretStore>) {
+        self.runner.keychain = keychain;
+    }
+
+    /// Carries out `effect` as the TUI does. Effects that write to the terminal (copy,
+    /// the editor) are not for it: their output goes nowhere.
+    pub(crate) fn run(&mut self, effect: Effect) {
+        let _ = self.runner.run(effect, &mut std::io::sink());
+    }
+
+    /// Ends the current session: its connect task, its live task, tail and Monitor.
+    pub(crate) fn close(&mut self) {
+        if let Some(t) = self.runner.scan_task.take() {
+            t.abort();
+        }
+        self.runner.stop = None;
+        self.runner.close_live();
+    }
 }
 
 #[cfg(test)]

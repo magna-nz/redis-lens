@@ -1,0 +1,1158 @@
+//! The dashboard's session (spec "Web dashboard", Session): one active connection,
+//! shared by every browser tab, separate from the TUI's.
+//!
+//! It runs on the TUI's own runtime without a terminal ([`Headless`]): a connect is the
+//! TUI's [`Effect::Connect`] (the keychain, the route with SSH, Sentinel and cluster
+//! discovery, the permission check and the connect figures, then the live task over
+//! every node), the Pub/Sub tail is [`Effect::Subscribe`] and Monitor is
+//! [`Effect::Monitor`]. What the runtime sends back ([`Msg`]) updates [`Current`] here,
+//! resolves the request that asked ([`Hub::request`]: one `oneshot` per request) and
+//! becomes server-sent events ([`Event`]).
+//!
+//! Routing state is the TUI's [`Session`] (nodes, picked node, refusals, the live
+//! state), so the dashboard routes writes and typed commands with the TUI's own
+//! `write_dest` and `command_to`.
+//!
+//! Credentials: a saved profile's entries are read once per connect from the
+//! dashboard's store on a blocking thread ([`prefetch`]: the keychain has its own
+//! timeout, `secrets::KEYCHAIN_TIMEOUT`), into a [`MemoryStore`] the runtime reads from
+//! for that session, so no keychain call runs on the async runtime.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+use crate::config::Config;
+use crate::live::cmdline::CommandInfo;
+use crate::live::pubsub::Subscription;
+use crate::live::server::{CommandKeys, InfoSample};
+use crate::live::{Dest, LiveError, LiveReply, LiveRequest, ReqId};
+use crate::model::{Auth, PermissionReport, Profile};
+use crate::secrets::{MemoryStore, SecretError, SecretStore};
+use crate::tui::Headless;
+use crate::tui::app::views::LiveState;
+use crate::tui::app::views::server::Point;
+use crate::tui::app::{ConnId, Effect, History, Msg, Phase, SecretSource, Session};
+use crate::web::dto;
+use crate::write::{Permit, Settings};
+
+/// What a live request gives back.
+pub type LiveResult = Result<LiveReply, LiveError>;
+
+/// How long a live request may wait for its answer (the budget's wait included).
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Why a request was not answered in time, in redis-lens's words.
+pub const TIMED_OUT: &str = "the server did not answer in time";
+
+/// Events kept for an SSE client that reads slowly; past that it is told it missed some.
+const EVENTS_KEPT: usize = 1024;
+
+/// One server-sent event: its name and its JSON data.
+#[derive(Debug, Clone)]
+pub struct Event {
+    pub name: &'static str,
+    pub data: serde_json::Value,
+}
+
+impl Event {
+    pub fn new(name: &'static str, data: impl Serialize) -> Self {
+        Self {
+            name,
+            data: serde_json::to_value(data).unwrap_or(serde_json::Value::Null),
+        }
+    }
+
+    /// A `notice` event: a sentence for the page to show.
+    pub fn notice(text: impl Into<String>) -> Self {
+        Self::new("notice", serde_json::json!({ "text": text.into() }))
+    }
+}
+
+/// What to connect to.
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// A saved profile, by name.
+    Profile(String),
+    /// A container Docker discovery found, by container name.
+    Docker(String),
+}
+
+/// The Pub/Sub tail of the session.
+#[derive(Debug, Clone)]
+pub struct Tail {
+    pub id: u64,
+    pub to: Subscription,
+    pub node: usize,
+    pub ready: bool,
+}
+
+/// The Monitor run of the session.
+#[derive(Debug, Clone)]
+pub struct Monitor {
+    pub run: u64,
+    pub node: usize,
+    pub started_at_unix_ms: Option<i64>,
+}
+
+/// The Overview's live figures: the picked node's last poll and its rates, and on a
+/// cluster each node's last poll.
+#[derive(Debug, Default)]
+pub struct LiveFigures {
+    pub node: usize,
+    pub last: Option<(Instant, InfoSample)>,
+    pub point: Option<Point>,
+    /// One per node: its last `INFO`, and whether its last poll failed.
+    pub shards: Vec<(Option<InfoSample>, bool)>,
+    pub shards_at: Option<Instant>,
+}
+
+/// The current connection.
+pub struct Current {
+    pub id: ConnId,
+    /// Where its credentials come from, for the tail and Monitor connections.
+    pub source: SecretSource,
+    pub docker: bool,
+    /// The TUI's session: profile, server, nodes, picked node, refusals, live state.
+    pub session: Session,
+    pub perms: Option<PermissionReport>,
+    pub settings: Settings,
+    pending: HashMap<ReqId, oneshot::Sender<LiveResult>>,
+    /// The write requests in flight, by their command name: a `NOPERM` turns it off.
+    writes: HashMap<ReqId, String>,
+    pub tail: Option<Tail>,
+    pub monitor: Option<Monitor>,
+    /// `COMMAND INFO` per lower-case name, for the command line: read once a session.
+    pub infos: HashMap<String, Option<CommandInfo>>,
+    /// `COMMAND LIST`, for completion.
+    pub names: Option<Vec<String>>,
+    /// The slow log's learned key specs, and whether its settings and keys are read.
+    pub slow_specs: HashMap<String, CommandKeys>,
+    pub slow_config: bool,
+    pub slow_keys: bool,
+    pub live: LiveFigures,
+}
+
+impl Current {
+    fn new(id: ConnId, profile: Profile, source: SecretSource, docker: bool) -> Self {
+        Self {
+            id,
+            source,
+            docker,
+            session: Session {
+                id,
+                scan: 1,
+                profile,
+                server: None,
+                target: None,
+                progress: None,
+                phase: Phase::Connecting,
+                partial: None,
+                report: None,
+                history: History::Pending,
+                trend: None,
+                previous: None,
+                rescan: false,
+                live: LiveState::Waiting,
+                refusals: crate::write::Refusals::default(),
+                sentinel: None,
+                nodes: Vec::new(),
+                picked: 0,
+                analysis: None,
+                connected_at_unix: None,
+                stopped: false,
+                figures: None,
+                last_snapshot: None,
+            },
+            perms: None,
+            settings: Settings::default(),
+            pending: HashMap::new(),
+            writes: HashMap::new(),
+            tail: None,
+            monitor: None,
+            infos: HashMap::new(),
+            names: None,
+            slow_specs: HashMap::new(),
+            slow_config: true,
+            slow_keys: true,
+            live: LiveFigures::default(),
+        }
+    }
+
+    pub fn profile(&self) -> &Profile {
+        &self.session.profile
+    }
+
+    pub fn live_ready(&self) -> bool {
+        self.session.live == LiveState::Ready
+    }
+
+    /// Answers every request still waiting: the live connection is gone.
+    fn drain(&mut self) {
+        for (_, tx) in self.pending.drain() {
+            let _ = tx.send(Err(LiveError::Closed));
+        }
+        self.writes.clear();
+    }
+}
+
+impl Drop for Current {
+    fn drop(&mut self) {
+        self.drain();
+    }
+}
+
+struct Inner {
+    runner: Headless,
+    next_conn: ConnId,
+    next_req: u64,
+    next_tail: u64,
+    cur: Option<Current>,
+}
+
+/// The dashboard's one session and its event stream, shared by every request.
+pub struct Hub {
+    pub config: PathBuf,
+    pub store: Arc<dyn SecretStore>,
+    inner: Mutex<Inner>,
+    events: broadcast::Sender<Event>,
+    clients: AtomicUsize,
+}
+
+impl std::fmt::Debug for Hub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hub")
+            .field("clients", &self.clients.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+/// An SSE client being connected: counted while it lives ([`Hub::events`]).
+pub struct Listener {
+    hub: Arc<Hub>,
+    pub rx: broadcast::Receiver<Event>,
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.hub.clients.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The entries `profile` reads from the keychain (its own, its SSH user's, its
+/// Sentinels'), read from `store` into memory. Blocking: run it on a blocking thread.
+pub fn prefetch(store: &dyn SecretStore, profile: &Profile) -> Result<MemoryStore, SecretError> {
+    let mem = MemoryStore::default();
+    let mut refs = Vec::new();
+    if matches!(profile.auth, Auth::Keychain | Auth::Command) {
+        refs.push(profile.secret_ref());
+    }
+    if profile.ssh.is_some() {
+        refs.push(profile.ssh_secret_ref());
+    }
+    if profile.sentinel.is_some() {
+        refs.push(profile.sentinel_secret_ref());
+    }
+    for r in refs {
+        if let Some(c) = store.get(&r)? {
+            mem.set(&r, &c)?;
+        }
+    }
+    Ok(mem)
+}
+
+/// [`prefetch`] on a blocking thread, the error in words safe to show.
+pub async fn prefetch_async(
+    store: Arc<dyn SecretStore>,
+    profile: Profile,
+) -> Result<MemoryStore, String> {
+    tokio::task::spawn_blocking(move || prefetch(store.as_ref(), &profile))
+        .await
+        .map_err(|_| "the keychain read failed".to_string())?
+        .map_err(|e| crate::conn::parse::mask(&e.to_string()))
+}
+
+/// The settings in the config file at `path`, or the defaults when it can't be read.
+pub fn settings_of(path: &std::path::Path) -> Settings {
+    Config::load(path).map(|c| c.settings).unwrap_or_default()
+}
+
+fn lock(m: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
+    // Every update is a plain assignment, so a panic elsewhere leaves it consistent.
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Hub {
+    /// A hub with no connection, for the config file at `config`, reading saved
+    /// profiles' credentials from `store`. Must be called inside a tokio runtime.
+    pub fn new(config: PathBuf, store: Arc<dyn SecretStore>) -> Arc<Self> {
+        let (runner, msgs) = Headless::new(config.clone(), Arc::new(MemoryStore::default()));
+        let (events, _) = broadcast::channel(EVENTS_KEPT);
+        let hub = Arc::new(Self {
+            config,
+            store,
+            inner: Mutex::new(Inner {
+                runner,
+                next_conn: 1,
+                next_req: 1,
+                next_tail: 1,
+                cur: None,
+            }),
+            events,
+            clients: AtomicUsize::new(0),
+        });
+        tokio::spawn(pump(Arc::downgrade(&hub), msgs));
+        hub
+    }
+
+    /// A new SSE client.
+    pub fn listen(self: &Arc<Self>) -> Listener {
+        self.clients.fetch_add(1, Ordering::SeqCst);
+        Listener {
+            hub: Arc::clone(self),
+            rx: self.events.subscribe(),
+        }
+    }
+
+    /// How many SSE clients are connected: the live figures are polled only while some
+    /// are.
+    pub fn listeners(&self) -> usize {
+        self.clients.load(Ordering::SeqCst)
+    }
+
+    pub fn emit(&self, e: Event) {
+        let _ = self.events.send(e);
+    }
+
+    fn emit_all(&self, events: Vec<Event>) {
+        for e in events {
+            self.emit(e);
+        }
+    }
+
+    /// Reads the current connection, if any.
+    pub fn with<R>(&self, f: impl FnOnce(&Current) -> R) -> Option<R> {
+        lock(&self.inner).cur.as_ref().map(f)
+    }
+
+    /// Changes the current connection, if any.
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut Current) -> R) -> Option<R> {
+        lock(&self.inner).cur.as_mut().map(f)
+    }
+
+    /// The session as `GET /api/state` and the `state` event show it.
+    pub fn state(&self) -> State {
+        let g = lock(&self.inner);
+        State::of(g.cur.as_ref())
+    }
+
+    fn emit_state(&self) {
+        let s = self.state();
+        self.emit(Event::new("state", s));
+    }
+
+    /// Connects `target`, replacing the current connection. Returns once the connect has
+    /// started; how it goes comes as `state` events.
+    pub async fn connect(self: &Arc<Self>, target: Target) -> Result<(), ConnectError> {
+        let config = self.config.clone();
+        let (profile, source, docker) = match target {
+            Target::Profile(name) => {
+                let loaded = tokio::task::spawn_blocking(move || Config::load(&config))
+                    .await
+                    .map_err(|_| ConnectError::Failed("the config file could not be read".into()))?
+                    .map_err(|e| ConnectError::Failed(crate::conn::parse::mask(&e.to_string())))?;
+                let Some(profile) = loaded.get(&name).cloned() else {
+                    return Err(ConnectError::NotFound);
+                };
+                let mem = prefetch_async(Arc::clone(&self.store), profile.clone())
+                    .await
+                    .map_err(ConnectError::Failed)?;
+                let mut g = lock(&self.inner);
+                g.runner.set_keychain(Arc::new(mem));
+                drop(g);
+                (profile, SecretSource::Keychain, false)
+            }
+            Target::Docker(container) => {
+                let found = crate::conn::docker::discover()
+                    .await
+                    .map_err(|e| ConnectError::Failed(crate::conn::parse::mask(&e.to_string())))?;
+                let Some(d) = found.into_iter().find(|d| d.container == container) else {
+                    return Err(ConnectError::NotFound);
+                };
+                (d.profile, SecretSource::Container(d.credentials), true)
+            }
+        };
+        let path = self.config.clone();
+        let settings = tokio::task::spawn_blocking(move || settings_of(&path))
+            .await
+            .unwrap_or_default();
+        {
+            let mut g = lock(&self.inner);
+            let id = g.next_conn;
+            g.next_conn += 1;
+            let mut cur = Current::new(id, profile.clone(), source.clone(), docker);
+            cur.settings = settings;
+            // The old session goes first: its requests are answered as closed.
+            g.cur = Some(cur);
+            g.runner.run(Effect::Connect {
+                id,
+                scan: 1,
+                profile,
+                secrets: source,
+                sample: None,
+            });
+        }
+        self.emit_state();
+        Ok(())
+    }
+
+    /// Ends the current connection, its tail and its Monitor run.
+    pub fn disconnect(&self) {
+        {
+            let mut g = lock(&self.inner);
+            g.runner.close();
+            g.cur = None;
+        }
+        self.emit_state();
+    }
+
+    /// Picks node `index` of a cluster for the views that read one node. False when there
+    /// is no such node.
+    pub fn pick(&self, index: usize) -> bool {
+        let ok = self
+            .with_mut(|c| {
+                if index >= c.session.nodes.len().max(1) {
+                    return false;
+                }
+                c.session.picked = index;
+                c.live.node = index;
+                c.live.last = None;
+                c.live.point = None;
+                true
+            })
+            .unwrap_or(false);
+        if ok {
+            self.emit_state();
+        }
+        ok
+    }
+
+    /// Sends `req` to `dest` on connection `conn` (the current one when `None`) and waits
+    /// for its answer.
+    pub async fn request(&self, conn: Option<ConnId>, dest: Dest, req: LiveRequest) -> LiveResult {
+        let rx = self.send(conn, dest, req, None)?;
+        wait(rx).await
+    }
+
+    /// Sends a write the gate let through, on connection `conn`: a `NOPERM` turns its
+    /// command off for the session (spec "Write permissions", check 1).
+    pub async fn write(&self, conn: ConnId, dest: Dest, permit: Permit) -> LiveResult {
+        let name = permit.op().command();
+        let rx = self.send(Some(conn), dest, LiveRequest::Write(permit), Some(name))?;
+        wait(rx).await
+    }
+
+    fn send(
+        &self,
+        conn: Option<ConnId>,
+        dest: Dest,
+        req: LiveRequest,
+        write: Option<String>,
+    ) -> Result<oneshot::Receiver<LiveResult>, LiveError> {
+        let mut g = lock(&self.inner);
+        let req_id = ReqId(g.next_req);
+        g.next_req += 1;
+        let Inner { runner, cur, .. } = &mut *g;
+        let Some(c) = cur.as_mut() else {
+            return Err(LiveError::Closed);
+        };
+        if conn.is_some_and(|id| id != c.id) || !c.live_ready() {
+            return Err(LiveError::Closed);
+        }
+        let (tx, rx) = oneshot::channel();
+        c.pending.insert(req_id, tx);
+        if let Some(name) = write {
+            c.writes.insert(req_id, name);
+        }
+        let id = c.id;
+        runner.run(Effect::Live {
+            id,
+            req_id,
+            to: dest,
+            req,
+        });
+        Ok(rx)
+    }
+
+    /// Starts the Pub/Sub tail on `to` on node `node`, replacing the session's other
+    /// tail. Its messages come as `tail` events.
+    pub fn subscribe(&self, to: Subscription, node: usize) -> Result<u64, String> {
+        let started = {
+            let mut g = lock(&self.inner);
+            let tail = g.next_tail;
+            g.next_tail += 1;
+            let Inner { runner, cur, .. } = &mut *g;
+            let Some(c) = cur.as_mut() else {
+                return Err(LiveError::Closed.to_string());
+            };
+            if !c.live_ready() {
+                return Err(LiveError::Closed.to_string());
+            }
+            if let Some(why) = c.session.own_connection_refused(node) {
+                return Err(why);
+            }
+            c.tail = Some(Tail {
+                id: tail,
+                to: to.clone(),
+                node,
+                ready: false,
+            });
+            runner.run(Effect::Subscribe {
+                id: c.id,
+                scan: c.session.scan,
+                tail,
+                profile: c.session.profile.clone(),
+                secrets: c.source.clone(),
+                to,
+                node,
+            });
+            tail
+        };
+        self.emit_state();
+        Ok(started)
+    }
+
+    /// Ends the session's tail, if one runs.
+    pub fn unsubscribe(&self) -> bool {
+        let stopped = {
+            let mut g = lock(&self.inner);
+            let Inner { runner, cur, .. } = &mut *g;
+            match cur.as_mut().and_then(|c| c.tail.take().map(|t| (c.id, t))) {
+                Some((id, t)) => {
+                    runner.run(Effect::Unsubscribe { id, tail: t.id });
+                    Some(t.id)
+                }
+                None => None,
+            }
+        };
+        if let Some(tail) = stopped {
+            self.emit(Event::new(
+                "tail",
+                serde_json::json!({ "tail": tail, "kind": "closed", "error": null }),
+            ));
+            self.emit_state();
+        }
+        stopped.is_some()
+    }
+
+    /// Starts Monitor on the picked node: time-boxed by `live::monitor::Limits` as in
+    /// the TUI. Its lines come as `monitor` events.
+    pub fn monitor(&self) -> Result<u64, String> {
+        let run = {
+            let mut g = lock(&self.inner);
+            let run = g.next_tail;
+            g.next_tail += 1;
+            let Inner { runner, cur, .. } = &mut *g;
+            let Some(c) = cur.as_mut() else {
+                return Err(LiveError::Closed.to_string());
+            };
+            if !c.live_ready() {
+                return Err(LiveError::Closed.to_string());
+            }
+            if let Some(why) = crate::conn::monitor_unsupported(&c.session.profile) {
+                return Err(why.to_string());
+            }
+            let node = c.session.picked;
+            if let Some(why) = c.session.own_connection_refused(node) {
+                return Err(why);
+            }
+            c.monitor = Some(Monitor {
+                run,
+                node,
+                started_at_unix_ms: None,
+            });
+            runner.run(Effect::Monitor {
+                id: c.id,
+                scan: c.session.scan,
+                run,
+                profile: c.session.profile.clone(),
+                secrets: c.source.clone(),
+                node,
+            });
+            run
+        };
+        self.emit_state();
+        Ok(run)
+    }
+
+    /// Stops the Monitor run, if one runs.
+    pub fn stop_monitor(&self) -> bool {
+        let stopped = {
+            let mut g = lock(&self.inner);
+            let Inner { runner, cur, .. } = &mut *g;
+            match cur
+                .as_mut()
+                .and_then(|c| c.monitor.take().map(|m| (c.id, m)))
+            {
+                Some((id, m)) => {
+                    runner.run(Effect::StopMonitor { id, run: m.run });
+                    Some(m.run)
+                }
+                None => None,
+            }
+        };
+        if let Some(run) = stopped {
+            self.emit(Event::new(
+                "monitor",
+                serde_json::json!({ "run": run, "kind": "closed", "end": "stopped", "error": null }),
+            ));
+            self.emit_state();
+        }
+        stopped.is_some()
+    }
+
+    /// Ends everything: the server is shutting down.
+    pub fn close(&self) {
+        let mut g = lock(&self.inner);
+        g.runner.close();
+        g.cur = None;
+    }
+
+    /// One message from the runtime.
+    fn apply(&self, msg: Msg) {
+        let mut events = Vec::new();
+        let mut state = false;
+        {
+            let mut g = lock(&self.inner);
+            let Inner { runner, cur, .. } = &mut *g;
+            let Some(c) = cur.as_mut() else {
+                return;
+            };
+            let live_closed =
+                matches!(&msg, Msg::LiveClosed { id, scan, .. } if this(c, *id, *scan));
+            apply_to(c, msg, &mut events, &mut state);
+            // A Monitor run stops with the live connection, as in the TUI (spec "Monitor
+            // (P2)").
+            if live_closed && let Some(m) = c.monitor.take() {
+                runner.run(Effect::StopMonitor {
+                    id: c.id,
+                    run: m.run,
+                });
+                events.push(Event::new(
+                    "monitor",
+                    serde_json::json!({
+                        "run": m.run,
+                        "kind": "closed",
+                        "end": "lost",
+                        "error": crate::live::CONNECTION_LOST,
+                    }),
+                ));
+            }
+        }
+        if state {
+            self.emit_state();
+        }
+        self.emit_all(events);
+    }
+}
+
+/// How a connect could not start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectError {
+    NotFound,
+    /// In words safe to show (masked).
+    Failed(String),
+}
+
+async fn wait(rx: oneshot::Receiver<LiveResult>) -> LiveResult {
+    match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => Err(LiveError::Closed),
+        Err(_) => Err(LiveError::Failed(TIMED_OUT.into())),
+    }
+}
+
+/// Passes the runtime's messages on to the hub until either is gone.
+async fn pump(hub: Weak<Hub>, mut msgs: mpsc::UnboundedReceiver<Msg>) {
+    while let Some(m) = msgs.recv().await {
+        let Some(h) = hub.upgrade() else {
+            break;
+        };
+        h.apply(m);
+    }
+}
+
+fn this(c: &Current, id: ConnId, scan: u64) -> bool {
+    c.id == id && c.session.scan == scan
+}
+
+/// What `msg` changes in `c`: the events it makes go to `events`, and `state` is set
+/// when the session's state changed.
+fn apply_to(c: &mut Current, msg: Msg, events: &mut Vec<Event>, state: &mut bool) {
+    match msg {
+        Msg::Connected {
+            id,
+            scan,
+            server,
+            perms,
+            target,
+        } if this(c, id, scan) => {
+            c.session.refusals = crate::tui::app::confirm::refusals_of(&perms);
+            c.session.server = server;
+            c.session.target = Some(target);
+            c.session.phase = Phase::Connected;
+            c.session.connected_at_unix = Some(unix_secs());
+            c.perms = Some(perms);
+            *state = true;
+        }
+        Msg::Figures { id, scan, figures } if this(c, id, scan) => {
+            c.session.figures = Some(figures);
+            *state = true;
+        }
+        Msg::SentinelResolved { id, scan, answer } if this(c, id, scan) => {
+            c.session.sentinel = Some(answer);
+            *state = true;
+        }
+        Msg::Nodes { id, scan, nodes } if this(c, id, scan) => {
+            // The first primary, as the TUI picks it.
+            c.session.picked = nodes
+                .iter()
+                .position(|n| n.role == crate::model::NodeRole::Primary)
+                .unwrap_or(0);
+            c.live.node = c.session.picked;
+            c.live.shards = vec![(None, false); nodes.len()];
+            c.session.nodes = nodes;
+            *state = true;
+        }
+        Msg::ConnectFailed { id, scan, error } if this(c, id, scan) => {
+            c.session.phase = Phase::Failed(error);
+            *state = true;
+        }
+        Msg::LastSnapshot { id, scan, last } if this(c, id, scan) => {
+            c.session.last_snapshot = last;
+        }
+        Msg::LiveReady { id, scan } if this(c, id, scan) => {
+            c.session.live = LiveState::Ready;
+            *state = true;
+        }
+        Msg::LiveClosed { id, scan, error } if this(c, id, scan) => {
+            c.drain();
+            if let Some(e) = &error {
+                events.push(Event::notice(format!(
+                    "The live connection closed: {e}. Connect again to go on."
+                )));
+            }
+            c.session.live = LiveState::Closed(error);
+            // A tail and a Monitor run end with the live connection (their messages
+            // say so); nothing new starts on it.
+            *state = true;
+        }
+        Msg::Live {
+            id, req_id, result, ..
+        } if c.id == id => {
+            if let Some(name) = c.writes.remove(&req_id)
+                && let Err(LiveError::Denied(_)) = &result
+            {
+                c.session.refusals.add(&name);
+            }
+            if let Some(tx) = c.pending.remove(&req_id) {
+                let _ = tx.send(result);
+            }
+        }
+        Msg::TailReady { id, scan, tail } if this(c, id, scan) => {
+            if let Some(t) = c.tail.as_mut().filter(|t| t.id == tail) {
+                t.ready = true;
+                events.push(Event::new(
+                    "tail",
+                    serde_json::json!({ "tail": tail, "kind": "ready" }),
+                ));
+                *state = true;
+            }
+        }
+        Msg::Tail {
+            id,
+            scan,
+            tail,
+            batch,
+            dropped,
+        } if this(c, id, scan) && c.tail.as_ref().is_some_and(|t| t.id == tail) => {
+            let messages: Vec<dto::TailMsg> = batch.iter().map(dto::TailMsg::of).collect();
+            events.push(Event::new(
+                "tail",
+                serde_json::json!({
+                    "tail": tail,
+                    "kind": "messages",
+                    "messages": messages,
+                    "dropped": dropped,
+                }),
+            ));
+        }
+        Msg::TailClosed {
+            id,
+            scan,
+            tail,
+            error,
+        } if this(c, id, scan) && c.tail.as_ref().is_some_and(|t| t.id == tail) => {
+            c.tail = None;
+            events.push(Event::new(
+                "tail",
+                serde_json::json!({ "tail": tail, "kind": "closed", "error": error }),
+            ));
+            *state = true;
+        }
+        Msg::MonitorReady {
+            id,
+            scan,
+            run,
+            at_unix_ms,
+        } if this(c, id, scan) => {
+            if let Some(m) = c.monitor.as_mut().filter(|m| m.run == run) {
+                m.started_at_unix_ms = Some(at_unix_ms);
+                events.push(Event::new(
+                    "monitor",
+                    serde_json::json!({
+                        "run": run,
+                        "kind": "ready",
+                        "at_unix_ms": at_unix_ms,
+                        "max_lines": crate::live::monitor::MAX_LINES,
+                        "max_secs": crate::live::monitor::MAX_TIME.as_secs(),
+                    }),
+                ));
+                *state = true;
+            }
+        }
+        Msg::MonitorLines {
+            id,
+            scan,
+            run,
+            lines,
+        } if this(c, id, scan) && c.monitor.as_ref().is_some_and(|m| m.run == run) => {
+            let lines: Vec<dto::MonitorLine> = lines.iter().map(dto::MonitorLine::of).collect();
+            events.push(Event::new(
+                "monitor",
+                serde_json::json!({ "run": run, "kind": "lines", "lines": lines }),
+            ));
+        }
+        Msg::MonitorClosed { id, scan, run, end }
+            if this(c, id, scan) && c.monitor.as_ref().is_some_and(|m| m.run == run) =>
+        {
+            c.monitor = None;
+            let (end, error) = match end {
+                Ok(crate::live::monitor::End::TimeUp) => ("time_up", None),
+                Ok(crate::live::monitor::End::LineCap) => ("line_cap", None),
+                Ok(crate::live::monitor::End::Lost) => {
+                    ("lost", Some(crate::live::CONNECTION_LOST.to_string()))
+                }
+                Ok(crate::live::monitor::End::Gone) => ("stopped", None),
+                Err(e) => ("failed", Some(e)),
+            };
+            events.push(Event::new(
+                "monitor",
+                serde_json::json!({ "run": run, "kind": "closed", "end": end, "error": error }),
+            ));
+            *state = true;
+        }
+        // The scan's progress, the one-off server reads and the rest are for the TUI's
+        // views: the dashboard's panels ask for what they show.
+        _ => {}
+    }
+}
+
+fn unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// The session, as `GET /api/state` and the `state` event show it.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct State {
+    /// `idle`, `connecting`, `connected` or `failed`.
+    pub status: &'static str,
+    /// Why the connect failed, in redis-lens's words.
+    pub error: Option<String>,
+    pub connection: Option<dto::Connection>,
+    /// Connected to a container Docker discovery found, not a saved profile.
+    pub docker: bool,
+    /// `waiting`, `ready` or `closed`.
+    pub live: &'static str,
+    pub live_error: Option<String>,
+    pub connected_at_unix: Option<i64>,
+    pub server: Option<dto::Server>,
+    /// Which server is read: `primary`, `replica <addr>`, or the cluster's summary.
+    pub target: Option<String>,
+    pub sentinel: Option<SentinelDto>,
+    /// A cluster's nodes; empty on a standalone server.
+    pub nodes: Vec<dto::Node>,
+    pub picked: usize,
+    pub writes: bool,
+    /// Why writes are off, when they are.
+    pub writes_off: Option<String>,
+    /// Write commands the server refused this session.
+    pub refused: Vec<String>,
+    pub tail: Option<TailDto>,
+    pub monitor: Option<MonitorDto>,
+    /// What this build can do.
+    pub features: Features,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SentinelDto {
+    pub sentinel: String,
+    pub master: String,
+    pub primary: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TailDto {
+    pub id: u64,
+    /// `channel`, `pattern` or `shard`.
+    pub kind: &'static str,
+    pub name: String,
+    pub node: usize,
+    pub ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MonitorDto {
+    pub run: u64,
+    pub node: usize,
+    pub started_at_unix_ms: Option<i64>,
+    pub max_lines: usize,
+    pub max_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Features {
+    pub entra_id: bool,
+    pub version: &'static str,
+}
+
+pub fn sub_kind(s: &Subscription) -> &'static str {
+    match s {
+        Subscription::Channel(_) => "channel",
+        Subscription::Pattern(_) => "pattern",
+        Subscription::Shard(_) => "shard",
+    }
+}
+
+impl State {
+    fn of(c: Option<&Current>) -> Self {
+        let features = Features {
+            entra_id: cfg!(feature = "entra-id"),
+            version: env!("CARGO_PKG_VERSION"),
+        };
+        let Some(c) = c else {
+            return Self {
+                status: "idle",
+                error: None,
+                connection: None,
+                docker: false,
+                live: "waiting",
+                live_error: None,
+                connected_at_unix: None,
+                server: None,
+                target: None,
+                sentinel: None,
+                nodes: Vec::new(),
+                picked: 0,
+                writes: false,
+                writes_off: None,
+                refused: Vec::new(),
+                tail: None,
+                monitor: None,
+                features,
+            };
+        };
+        let s = &c.session;
+        let (status, error) = match &s.phase {
+            Phase::Connecting => ("connecting", None),
+            Phase::Failed(e) => ("failed", Some(crate::value::escape(e))),
+            _ => ("connected", None),
+        };
+        let (live, live_error) = match &s.live {
+            LiveState::Waiting => ("waiting", None),
+            LiveState::Ready => ("ready", None),
+            LiveState::Closed(e) => ("closed", e.clone()),
+        };
+        Self {
+            status,
+            error,
+            connection: Some(dto::Connection::of(&s.profile)),
+            docker: c.docker,
+            live,
+            live_error,
+            connected_at_unix: s.connected_at_unix,
+            server: s.server.as_ref().map(dto::Server::of),
+            target: s
+                .target
+                .as_ref()
+                .map(|t| crate::value::escape(&t.to_string())),
+            sentinel: s.sentinel.as_ref().map(|a| SentinelDto {
+                sentinel: crate::value::escape(&a.sentinel.to_string()),
+                master: crate::value::escape(&a.master),
+                primary: crate::value::escape(&a.primary.to_string()),
+            }),
+            nodes: s
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| dto::Node::of(i, n))
+                .collect(),
+            picked: s.picked,
+            writes: !s.profile.is_read_only(),
+            writes_off: s
+                .profile
+                .is_read_only()
+                .then(|| crate::write::read_only_reason(&s.profile)),
+            refused: s.refusals.iter().map(str::to_string).collect(),
+            tail: c.tail.as_ref().map(|t| TailDto {
+                id: t.id,
+                kind: sub_kind(&t.to),
+                name: crate::value::escape(t.to.name()),
+                node: t.node,
+                ready: t.ready,
+            }),
+            monitor: c.monitor.as_ref().map(|m| MonitorDto {
+                run: m.run,
+                node: m.node,
+                started_at_unix_ms: m.started_at_unix_ms,
+                max_lines: crate::live::monitor::MAX_LINES,
+                max_secs: crate::live::monitor::MAX_TIME.as_secs(),
+            }),
+            features,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Credentials, Endpoint, Env, SshTunnel};
+    use secrecy::SecretString;
+
+    fn profile(auth: Auth) -> Profile {
+        Profile {
+            name: "cache".into(),
+            env: Env::Local,
+            endpoint: Endpoint {
+                host: "127.0.0.1".into(),
+                port: 6379,
+                tls: false,
+            },
+            db: 0,
+            auth,
+            read_only: None,
+            prefer_replica: false,
+            provider: None,
+            token_command: None,
+            ssh: None,
+            sentinel: None,
+            force_standalone: false,
+            tags: Vec::new(),
+        }
+    }
+
+    fn creds(user: &str) -> Credentials {
+        Credentials {
+            username: Some(user.into()),
+            password: SecretString::from("pw".to_string()),
+        }
+    }
+
+    #[test]
+    fn prefetch_reads_only_the_entries_the_profile_uses() {
+        let store = MemoryStore::default();
+        let mut p = profile(Auth::None);
+        store.set(&p.secret_ref(), &creds("main")).unwrap();
+        store.set(&p.ssh_secret_ref(), &creds("ssh")).unwrap();
+        store
+            .set(&p.sentinel_secret_ref(), &creds("sentinel"))
+            .unwrap();
+        let mem = prefetch(&store, &p).unwrap();
+        assert!(mem.get(&p.secret_ref()).unwrap().is_none());
+        p.auth = Auth::Keychain;
+        p.ssh = Some(SshTunnel {
+            host: "bastion".into(),
+            port: None,
+            identity_file: None,
+            known_hosts_file: None,
+        });
+        let mem = prefetch(&store, &p).unwrap();
+        let user = |r| mem.get(&r).unwrap().and_then(|c| c.username);
+        assert_eq!(user(p.secret_ref()).as_deref(), Some("main"));
+        assert_eq!(user(p.ssh_secret_ref()).as_deref(), Some("ssh"));
+        assert!(mem.get(&p.sentinel_secret_ref()).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_idle_state_has_no_connection() {
+        let s = State::of(None);
+        assert_eq!(s.status, "idle");
+        assert!(s.connection.is_none());
+        assert_eq!(s.features.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn a_reply_resolves_its_request_and_a_nopermission_write_turns_the_command_off() {
+        let mut c = Current::new(1, profile(Auth::None), SecretSource::Keychain, false);
+        let (tx, mut rx) = oneshot::channel();
+        c.pending.insert(ReqId(7), tx);
+        c.writes.insert(ReqId(7), "PUBLISH".into());
+        let (mut events, mut state) = (Vec::new(), false);
+        apply_to(
+            &mut c,
+            Msg::Live {
+                id: 1,
+                scan: 1,
+                req_id: ReqId(7),
+                result: Err(LiveError::Denied("PUBLISH".into())),
+            },
+            &mut events,
+            &mut state,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Err(LiveError::Denied("PUBLISH".into()))
+        );
+        assert!(c.session.refusals.refused("PUBLISH"));
+        // Another connection's reply is not this one's.
+        let (tx, mut rx) = oneshot::channel();
+        c.pending.insert(ReqId(8), tx);
+        apply_to(
+            &mut c,
+            Msg::Live {
+                id: 2,
+                scan: 1,
+                req_id: ReqId(8),
+                result: Ok(LiveReply::Server(crate::live::server::Reply::Pong)),
+            },
+            &mut events,
+            &mut state,
+        );
+        assert!(rx.try_recv().is_err());
+        // The live connection closing answers what still waits.
+        apply_to(
+            &mut c,
+            Msg::LiveClosed {
+                id: 1,
+                scan: 1,
+                error: Some(crate::live::CONNECTION_LOST.into()),
+            },
+            &mut events,
+            &mut state,
+        );
+        assert_eq!(rx.try_recv().unwrap(), Err(LiveError::Closed));
+        assert!(state);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "notice");
+        let st = State::of(Some(&c));
+        assert_eq!(st.live, "closed");
+        assert_eq!(st.live_error.as_deref(), Some(crate::live::CONNECTION_LOST));
+    }
+}
