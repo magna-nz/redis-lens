@@ -16,7 +16,7 @@ redis-lens lists your keys and shows their values, finds the keys and key patter
 You can also run commands and edit keys from it.
 
 It runs in the terminal, and the same program serves a web dashboard on 127.0.0.1 that only you can open.
-The dashboard covers connections, browsing and editing keys and values, bulk actions, the analysis, the server, Pub/Sub and the command line so far; Streams and Search are still in the terminal.
+The dashboard has every screen the terminal has: connections, browsing and editing keys and values, bulk actions, Streams, Search, the analysis, the server, Pub/Sub and the command line.
 
 Connections marked as production are read-only unless you turn writes on.
 
