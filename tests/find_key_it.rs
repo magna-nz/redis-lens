@@ -397,11 +397,17 @@ async fn each_row_has_its_metadata_and_no_value_is_read() {
             stats.get("scan").is_some_and(|s| s.0 >= 1),
             "valkey {valkey}: {stats:?}"
         );
+        // Before Redis 7.0, commandstats counts a container command under its own name
+        // (`object`, `memory`, `config`), not per subcommand: such a name passes when one
+        // of its allowed subcommands is listed.
         for name in stats.keys() {
-            assert!(
-                METADATA.contains(&name.as_str()) || name == "info",
-                "valkey {valkey}: a find sent {name}: {stats:?}"
-            );
+            let allowed = METADATA.contains(&name.as_str())
+                || name == "info"
+                || METADATA.iter().any(|m| {
+                    m.strip_prefix(name.as_str())
+                        .is_some_and(|r| r.starts_with('|'))
+                });
+            assert!(allowed, "valkey {valkey}: a find sent {name}: {stats:?}");
         }
     }
 }
