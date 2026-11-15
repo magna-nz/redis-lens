@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** Redis Insight parity phase 5, built on branch `claude/insight-phase5` for one PR that is not merged yet ([Phase 5](#phase-5-2026-11-15-the-rest-of-redis-insight-parity)). On main: parity phases 1 to 4 (#15, #16, #17, #18, #19), the phase 4 follow-up PR #20 (merged 2026-11-14, merge commit `9e031cb`) and the TUI redesign (#21, merged 2026-11-15, merge commit `dec974e`).
-**Last updated:** 2026-11-15 (phase 5 built on its branch, in draft PR #22; not merged yet)
+**Current milestone:** Redis Insight parity phase 5, merged as #22, with the verifier's fixes in the follow-up branch `claude/insight-phase5-followups` ([Phase 5](#phase-5-2026-11-15-the-rest-of-redis-insight-parity)). On main: parity phases 1 to 4 (#15, #16, #17, #18, #19), the phase 4 follow-up PR #20 (merged 2026-11-14, merge commit `9e031cb`) and the TUI redesign (#21, merged 2026-11-15, merge commit `dec974e`).
+**Last updated:** 2026-11-15 (phase 5 merged as #22; the verifier's fixes and the docs update that landed after that merge are in a follow-up PR)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -610,7 +610,7 @@ Built on branch `claude/tui-redesign-ab602a` and merged by the owner as [#21](ht
 
 ## Phase 5 (2026-11-15): the rest of Redis Insight parity
 
-Built on `claude/insight-phase5`, cut from main at `dec974e`, for one PR that is not merged yet. The parts were built in separate worktrees and merged into the branch as each passed its checks. The behaviour is in spec.md ("Recommendations (P1)", "Copy", "Command line panel", "Values", "Browse › Keys › a key's value", "Permission check, additions", "Server versions" and "Milestones").
+Built on `claude/insight-phase5`, cut from main at `dec974e`. Merged as #22 at `2dfbd53`; the commits after that (the verifier's fixes, the docs update, this section) are in a follow-up PR from `claude/insight-phase5-followups`. The parts were built in separate worktrees and merged into the branch as each passed its checks. The behaviour is in spec.md ("Recommendations (P1)", "Copy", "Command line panel", "Values", "Browse › Keys › a key's value", "Permission check, additions", "Server versions" and "Milestones").
 
 | Part | Content | Commits | State |
 |---|---|---|---|
