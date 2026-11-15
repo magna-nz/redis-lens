@@ -312,6 +312,7 @@ pub async fn run(State(app): State<App>, Body(l): Body<Line>) -> Response {
                             dest,
                             decision,
                             cmd: Some(meta),
+                            edit: None,
                         },
                         q,
                     )

@@ -512,6 +512,12 @@ struct Editing {
 static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
 static NEXT_MARKER: AtomicU64 = AtomicU64::new(1);
 
+/// A marker for `d` on a list element ([`WriteOp::LDel`]) that no other delete of this
+/// process uses: the key detail's and the web dashboard's draw from the same counter.
+pub(crate) fn next_list_marker() -> String {
+    list_marker(NEXT_MARKER.fetch_add(1, Ordering::Relaxed))
+}
+
 /// What `e` edits, and how the new value is written.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Target {
@@ -1061,8 +1067,9 @@ impl ValueState {
         true
     }
 
-    /// What `e` edits, and the value it holds now; or why it can't.
-    fn edit_target(&self) -> Result<(Target, Raw, String), String> {
+    /// What `e` edits, and the value it holds now; or why it can't. The web dashboard
+    /// asks it too, with `sel` set to the item the page names.
+    pub(crate) fn edit_target(&self) -> Result<(Target, Raw, String), String> {
         let i = self.selected();
         let Some(items) = &self.items else {
             return Err(if self.gone {
@@ -1317,8 +1324,9 @@ impl ValueState {
         self.form = Some(form);
     }
 
-    /// The selected hash field, and why field TTLs are off when they are.
-    fn ttl_field(&self) -> (Option<Raw>, Option<String>) {
+    /// The selected hash field, and why field TTLs are off when they are. The web
+    /// dashboard asks it too, with `sel` set to the field the page names.
+    pub(crate) fn ttl_field(&self) -> (Option<Raw>, Option<String>) {
         let Some(Items::Hash(fields)) = &self.items else {
             return (None, None);
         };
@@ -1410,7 +1418,7 @@ impl ValueState {
                 key: key.clone(),
                 index: i as u64,
                 old: e.clone(),
-                marker: list_marker(NEXT_MARKER.fetch_add(1, Ordering::Relaxed)),
+                marker: next_list_marker(),
             }),
             Some(Items::String { .. } | Items::Json { .. } | Items::JsonNotRead { .. }) => {
                 act.info("d deletes a field, element, member or entry: D deletes the key.");
@@ -1490,6 +1498,14 @@ impl ValueState {
 
     /// Reads the value again from its first page, keeping the selection where it was.
     fn reload(&mut self, act: &mut Act<'_>) {
+        self.clear_loaded();
+        self.load(act);
+    }
+
+    /// Forgets what was loaded, so the next read is the first page again: the key, its
+    /// type, the format, the selection and what was learned about refused commands stay.
+    /// The web dashboard does the same after a write, then reads the page itself.
+    pub(crate) fn clear_loaded(&mut self) {
         self.items = None;
         self.next = None;
         self.pages = 0;
@@ -1500,7 +1516,6 @@ impl ValueState {
         self.gone = false;
         self.loading = None;
         self.scroll = 0;
-        self.load(act);
     }
 
     /// Reads the key's TTL and length again.

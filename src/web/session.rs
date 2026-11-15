@@ -168,6 +168,9 @@ pub struct Current {
     /// The tail to subscribe again once a database switch's live connection is ready,
     /// as the TUI does.
     resub: Option<(Subscription, usize)>,
+    /// The bulk expire or delete of this connection (one at a time, as the TUI's
+    /// dialog): its dry run, its question, its run and how it ended.
+    pub bulk: Option<crate::web::api::bulk::Bulk>,
 }
 
 /// How this session's analyses went, beside what the TUI's [`Session`] keeps (the
@@ -244,6 +247,7 @@ impl Current {
             browse: Default::default(),
             own_snapshots: false,
             resub: None,
+            bulk: None,
         }
     }
 
@@ -343,6 +347,10 @@ pub struct Hub {
     /// Where snapshots are saved and read: `None` for the TUI's own directory
     /// ([`crate::snapshot::default_dir`]); the integration tests give their own.
     snapshots: Option<PathBuf>,
+    /// Where a bulk action's key files go: `None` for the TUI's own directory
+    /// ([`crate::live::bulk::default_dir`]); beside the tests' own snapshot directory
+    /// when they give one.
+    bulk_files: Option<PathBuf>,
     /// Tests: requests sent through [`Hub::send`], and whether they are held (kept
     /// waiting for [`Hub::answer_oldest`]) instead of going to the runtime.
     #[cfg(test)]
@@ -444,6 +452,10 @@ impl Hub {
             events,
             clients: AtomicUsize::new(0),
             line_running: std::sync::atomic::AtomicBool::new(false),
+            bulk_files: snapshots
+                .as_ref()
+                .and_then(|d| d.parent())
+                .map(|d| d.join("bulk")),
             snapshots,
             #[cfg(test)]
             test_sent: AtomicUsize::new(0),
@@ -962,6 +974,35 @@ impl Hub {
         let name = permit.op().command();
         let sent = self.send(Some(conn), dest, LiveRequest::Write(permit), Some(name))?;
         self.wait(sent).await
+    }
+
+    /// Sends a step of a bulk action on connection `conn`: a dry-run step (a read), or a
+    /// batch, which only holds a [`Permit`] the gate gave for the bulk op. A `NOPERM` on a
+    /// batch turns its command off for the session, as [`Self::write`] does.
+    pub async fn bulk_step(
+        &self,
+        conn: ConnId,
+        dest: Dest,
+        req: crate::live::bulk::Request,
+    ) -> LiveResult {
+        let name = match &req {
+            crate::live::bulk::Request::Batch { permit, .. } => Some(permit.op().command()),
+            crate::live::bulk::Request::Count { .. } => None,
+        };
+        let sent = self.send(Some(conn), dest, LiveRequest::Bulk(req), name)?;
+        self.wait(sent).await
+    }
+
+    /// Where a bulk run's key file goes for `profile`: the TUI's directory, or the
+    /// tests' own.
+    pub fn bulk_file(&self, profile: String) -> crate::live::bulk::FileAt {
+        match &self.bulk_files {
+            Some(dir) => crate::live::bulk::FileAt::NewIn {
+                dir: dir.clone(),
+                profile,
+            },
+            None => crate::live::bulk::FileAt::New { profile },
+        }
     }
 
     /// The answer to a request [`Self::send`] sent, or [`TIMED_OUT`] after

@@ -34,6 +34,19 @@ pub enum Action {
         decision: Decision,
         /// For the command line: how its reply is drawn.
         cmd: Option<super::cmdline::Meta>,
+        /// For a key edit: what is read again once it answered (the value, the key
+        /// list's row), as the TUI's key detail does.
+        edit: Option<super::edits::After>,
+    },
+    /// A bulk expire or delete after its dry run (`POST /api/bulk/run`): answered, the
+    /// run starts with the permit the gate gives for the answer.
+    Bulk {
+        conn: ConnId,
+        run: u64,
+        /// The bulk action's number ([`super::bulk::Bulk`]).
+        bulk: u64,
+        op: WriteOp,
+        decision: Decision,
     },
     /// A readonly `@dangerous` command (`KEYS`): sent once confirmed.
     Command(super::cmdline::Asked),
@@ -57,6 +70,7 @@ impl std::fmt::Debug for Action {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Action::Write { op, .. } => write!(f, "Write({})", op.command()),
+            Action::Bulk { op, .. } => write!(f, "Bulk({})", op.command()),
             Action::Command(_) => f.write_str("Command"),
             Action::Add(_) => f.write_str("Add"),
             Action::Set(_) => f.write_str("Set"),
@@ -101,13 +115,23 @@ impl WriteReply {
     }
 }
 
-/// The question to ask for `decision` about `op`, or `None` when none is asked.
+/// The question to ask for `decision` about `op`, or `None` when none is asked. It
+/// names the profile and shows the exact command, and says when the write can't be
+/// undone (spec "Write permissions": "Each prompt").
 pub fn question(op: &WriteOp, decision: &Decision, profile: &str) -> Option<Question> {
     let shown = op.shown();
+    let undone = if op.kind() == crate::write::Kind::Destructive {
+        " This can't be undone."
+    } else {
+        ""
+    };
     match decision {
-        Decision::Ask => Some(Question::ask(format!("Send {shown} to {profile}?"))),
+        Decision::Ask => Some(Question::ask(format!("Send {shown} to {profile}?{undone}"))),
         Decision::Type(want) => Some(Question::typed(
-            format!("Type {want} to send {shown} to {profile}."),
+            format!(
+                "Type {} to send {shown} to {profile}.{undone}",
+                crate::value::escape(want)
+            ),
             want.clone(),
         )),
         Decision::Run | Decision::Refuse(_) => None,
@@ -213,6 +237,17 @@ pub async fn send(app: &App, conn: ConnId, dest: Dest, permit: Permit) -> Respon
 
 /// One write, start to end: refused, sent, or asked about.
 pub async fn write_flow(app: &App, op: WriteOp) -> Response {
+    write_flow_then(app, op, None).await
+}
+
+/// [`write_flow`] for a key edit: once sent (now, or when its question is answered),
+/// what `edit` names is read again and the reply says how it went
+/// ([`super::edits::send`]).
+pub async fn write_flow_then(
+    app: &App,
+    op: WriteOp,
+    edit: Option<super::edits::After>,
+) -> Response {
     app.hub.follow_saved_profile().await;
     let Decided {
         conn,
@@ -227,7 +262,10 @@ pub async fn write_flow(app: &App, op: WriteOp) -> Response {
     match &decision {
         Decision::Refuse(why) => error(StatusCode::UNPROCESSABLE_ENTITY, why),
         Decision::Run => match grant(app, (conn, run), op, &Answer::None) {
-            Ok(p) => send(app, conn, dest, p).await,
+            Ok(p) => match edit {
+                Some(after) => super::edits::send(app, conn, dest, p, after).await,
+                None => send(app, conn, dest, p).await,
+            },
             Err(r) => r.into_response(),
         },
         Decision::Ask | Decision::Type(_) => {
@@ -242,6 +280,7 @@ pub async fn write_flow(app: &App, op: WriteOp) -> Response {
                     dest,
                     decision,
                     cmd: None,
+                    edit,
                 },
                 q,
             )
@@ -299,6 +338,7 @@ pub async fn answer(
             dest,
             decision,
             cmd,
+            edit,
         } => {
             let answer = match decision {
                 Decision::Type(_) => Answer::Typed(a.typed.unwrap_or_default()),
@@ -310,10 +350,24 @@ pub async fn answer(
                 Ok(p) => p,
                 Err(r) => return r.into_response(),
             };
-            match cmd {
-                Some(meta) => super::cmdline::send_write(&app, conn, dest, permit, meta).await,
-                None => send(&app, conn, dest, permit).await,
+            match (cmd, edit) {
+                (Some(meta), _) => super::cmdline::send_write(&app, conn, dest, permit, meta).await,
+                (None, Some(after)) => super::edits::send(&app, conn, dest, permit, after).await,
+                (None, None) => send(&app, conn, dest, permit).await,
             }
+        }
+        Action::Bulk {
+            conn,
+            run,
+            bulk,
+            op,
+            decision,
+        } => {
+            let answer = match decision {
+                Decision::Type(_) => Answer::Typed(a.typed.unwrap_or_default()),
+                _ => Answer::Yes,
+            };
+            super::bulk::answered(&app, (conn, run), bulk, op, &answer).await
         }
         Action::Command(asked) => super::cmdline::confirmed(&app, asked, a.typed).await,
         Action::Add(asked) => super::connections::add_answered(&app, *asked, a.typed).await,
@@ -330,8 +384,15 @@ pub async fn answer(
 
 /// `DELETE /api/confirm/<id>`: cancels the question; nothing is sent.
 pub async fn cancel(State(app): State<App>, Path(id): Path<String>) -> Response {
-    match app.confirms().take(&id, std::time::Instant::now()) {
-        Some(_) => ok(serde_json::json!({ "cancelled": true, "text": CANCELLED })),
+    let taken = app.confirms().take(&id, std::time::Instant::now());
+    match taken {
+        Some(a) => {
+            // A bulk action's question cancelled closes it, as the TUI's `n` does.
+            if let Action::Bulk { conn, bulk, .. } = a {
+                super::bulk::cancelled(&app, conn, bulk);
+            }
+            ok(serde_json::json!({ "cancelled": true, "text": CANCELLED }))
+        }
         None => error(StatusCode::GONE, GONE),
     }
 }

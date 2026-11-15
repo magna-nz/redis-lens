@@ -60,6 +60,34 @@ pub struct View {
     conn: ConnId,
     pub state: ValueState,
     loading: bool,
+    /// How many times the value was read again from its first page after a write
+    /// (`rev` in the reply). An edit names an item by its index in the items the page
+    /// was shown, so it names the `rev` they were read at too.
+    pub rev: u64,
+    /// A write of this value is on its way: one at a time per value, as in the TUI.
+    pub writing: bool,
+}
+
+impl View {
+    /// The connection the value was opened on.
+    pub fn conn(&self) -> ConnId {
+        self.conn
+    }
+
+    /// A page of it is being read.
+    pub fn loading(&self) -> bool {
+        self.loading
+    }
+
+    /// Starts reading the value again from its first page, as the TUI's key detail does
+    /// after a write ([`ValueState::clear_loaded`]): what was loaded goes; the key, its
+    /// type, the format picked, the selection and what was learned about refused
+    /// commands stay. `rev` goes up, so an edit naming an item of the old items is
+    /// refused.
+    pub fn restart(&mut self) {
+        self.state.clear_loaded();
+        self.rev += 1;
+    }
 }
 
 /// The values open in the session, newest last, and what the session learned about
@@ -72,7 +100,7 @@ pub struct Views {
 }
 
 impl Views {
-    fn add(&mut self, conn: ConnId, row: KeyRow, pattern: String) -> u64 {
+    pub(crate) fn add(&mut self, conn: ConnId, row: KeyRow, pattern: String) -> u64 {
         self.next += 1;
         let mut state = ValueState::default();
         state.row = Some(row);
@@ -86,16 +114,30 @@ impl Views {
             conn,
             state,
             loading: false,
+            rev: 0,
+            writing: false,
         });
         self.next
     }
 
-    fn get_mut(&mut self, id: u64) -> Option<&mut View> {
+    pub(crate) fn get_mut(&mut self, id: u64) -> Option<&mut View> {
         self.views.iter_mut().find(|v| v.id == id)
     }
 
-    fn get(&self, id: u64) -> Option<&View> {
+    pub(crate) fn get(&self, id: u64) -> Option<&View> {
         self.views.iter().find(|v| v.id == id)
+    }
+
+    /// Closes view `id` (its key was deleted).
+    pub(crate) fn close(&mut self, id: u64) {
+        self.views.retain(|v| v.id != id);
+    }
+
+    /// Every view of `key`: a write to it changes what they hold.
+    pub(crate) fn of_key<'a>(&'a mut self, key: &'a str) -> impl Iterator<Item = &'a mut View> {
+        self.views
+            .iter_mut()
+            .filter(move |v| v.state.row.as_ref().is_some_and(|r| r.key == key))
     }
 
     /// Tests: whether view `id` is loading a page; `None` when there is no such view.
@@ -188,6 +230,14 @@ pub async fn more(State(app): State<App>, Q(q): Q<ViewQuery>) -> Response {
 /// when the request goes (the browser closed it), the view still gets its page and
 /// never stays loading.
 async fn read(app: &App, id: u64) -> Response {
+    match read_body(app, id).await {
+        Ok(b) => ok(b),
+        Err(r) => r.into_response(),
+    }
+}
+
+/// [`read`], with the value's body as JSON, or why not.
+pub(crate) async fn read_body(app: &App, id: u64) -> Result<serde_json::Value, Refused> {
     let step = app.hub.with_mut(|c| {
         let conn = c.id;
         let server = c.session.server.clone();
@@ -205,8 +255,8 @@ async fn read(app: &App, id: u64) -> Response {
         Ok(next.map(|r| (conn, r)))
     });
     let next = match step {
-        None => return error(StatusCode::NOT_FOUND, NO_VIEW),
-        Some(Err(r)) => return r.into_response(),
+        None => return Err(Refused::new(StatusCode::NOT_FOUND, NO_VIEW)),
+        Some(Err(r)) => return Err(r),
         Some(Ok(next)) => next,
     };
     if let Some((conn, (dest, req))) = next {
@@ -232,19 +282,20 @@ async fn read(app: &App, id: u64) -> Response {
         })
         .await;
     }
-    match app
-        .hub
+    body_of(app, id).ok_or_else(|| Refused::new(StatusCode::NOT_FOUND, NO_VIEW))
+}
+
+/// The body of view `id` as it is now, when it is open.
+pub(crate) fn body_of(app: &App, id: u64) -> Option<serde_json::Value> {
+    app.hub
         .with(|c| {
             c.browse
                 .values
                 .get(id)
+                .filter(|v| v.conn == c.id)
                 .map(|v| body(v, c.session.nodes.len()))
         })
         .flatten()
-    {
-        Some(b) => ok(b),
-        None => error(StatusCode::NOT_FOUND, NO_VIEW),
-    }
 }
 
 /// Whether a page is to be read: the first, or a next one the TUI's `n` would read.
@@ -534,6 +585,8 @@ fn body(v: &View, nodes: usize) -> serde_json::Value {
     }
     serde_json::json!({
         "view": v.id,
+        "rev": v.rev,
+        "writing": v.writing,
         "key": row.map(|r| Name::of(&r.key)),
         "type": type_name,
         "kind": kind.as_ref().map(kind_name),
@@ -878,6 +931,8 @@ mod tests {
             conn: 1,
             state: s,
             loading: false,
+            rev: 0,
+            writing: false,
         };
         let b = body(&v, 0);
         assert_eq!(b["type"], "stream");

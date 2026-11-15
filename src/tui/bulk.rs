@@ -224,6 +224,57 @@ pub fn summary(count: &Count, action: &BulkAction) -> Vec<String> {
     out
 }
 
+/// Where a bulk action runs on session `s`: on a cluster, every primary in slot order
+/// (its index in `s.nodes` and its announced address), each one connected; on a
+/// standalone server, nowhere in particular (empty). `report_nodes`: the analysis on
+/// screen was of a cluster. Otherwise why it is off, in the words the TUI shows: a
+/// replica target, a cluster read on replicas, a primary without a connection, or a
+/// slot map not read in full. The web dashboard asks the same.
+pub(crate) fn bulk_nodes(
+    s: &super::Session,
+    report_nodes: bool,
+) -> Result<Vec<(usize, String)>, String> {
+    let cluster = matches!(s.target, Some(ScanTarget::Cluster(_)))
+        || (!s.profile.force_standalone
+            && s.server
+                .as_ref()
+                .is_some_and(|i| i.mode == crate::model::ServerMode::Cluster))
+        || report_nodes
+        || s.is_cluster();
+    if matches!(s.target, Some(ScanTarget::Replica(_))) {
+        return Err(bulk::REPLICA_OFF.to_string());
+    }
+    if !cluster {
+        return Ok(Vec::new());
+    }
+    // On a cluster: every primary, in slot order, each one connected.
+    if s.nodes.is_empty() {
+        return Err("Not available yet: the cluster's nodes are not known.".to_string());
+    }
+    if s.nodes
+        .iter()
+        .any(|n| n.role == crate::model::NodeRole::Replica)
+    {
+        return Err(bulk::CLUSTER_REPLICA_OFF.to_string());
+    }
+    if let Some(n) = s.nodes.iter().find(|n| !n.connected) {
+        let why = crate::live::nodes::not_connected(&n.endpoint);
+        return Err(format!(
+            "Not available: {why}, so the pattern can't be walked on every primary."
+        ));
+    }
+    // Without the full slot map (CLUSTER SHARDS/SLOTS unreadable: the seed alone, no
+    // slots) keys on other primaries would be skipped.
+    if let Some(why) = bulk::slot_map_gap(s.nodes.iter().map(|n| n.slots.as_slice())) {
+        return Err(why.to_string());
+    }
+    Ok(s.nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (i, n.endpoint.to_string()))
+        .collect())
+}
+
 impl App {
     /// `x` (expire) or `D` (`delete`) on Patterns. Checks that the action can run, then
     /// opens the TTL input (`x`) or starts the dry run (`D`). Nothing is sent when it
@@ -237,51 +288,14 @@ impl App {
             self.set_info("Select a pattern first: x and D work on one pattern, not a group.");
             return Vec::new();
         };
-        let cluster = matches!(s.target, Some(ScanTarget::Cluster(_)))
-            || (!s.profile.force_standalone
-                && s.server
-                    .as_ref()
-                    .is_some_and(|i| i.mode == crate::model::ServerMode::Cluster))
-            || self.report().is_some_and(|r| r.nodes.is_some())
-            || s.is_cluster();
-        if matches!(s.target, Some(ScanTarget::Replica(_))) {
-            self.set_error(bulk::REPLICA_OFF);
-            return Vec::new();
-        }
-        // On a cluster: every primary, in slot order, each one connected.
-        let mut nodes = Vec::new();
-        if cluster {
-            if s.nodes.is_empty() {
-                self.set_error("Not available yet: the cluster's nodes are not known.");
-                return Vec::new();
-            }
-            if s.nodes
-                .iter()
-                .any(|n| n.role == crate::model::NodeRole::Replica)
-            {
-                self.set_error(bulk::CLUSTER_REPLICA_OFF);
-                return Vec::new();
-            }
-            if let Some(n) = s.nodes.iter().find(|n| !n.connected) {
-                let why = crate::live::nodes::not_connected(&n.endpoint);
-                self.set_error(format!(
-                    "Not available: {why}, so the pattern can't be walked on every primary."
-                ));
-                return Vec::new();
-            }
-            // Without the full slot map (CLUSTER SHARDS/SLOTS unreadable: the seed
-            // alone, no slots) keys on other primaries would be skipped.
-            if let Some(why) = bulk::slot_map_gap(s.nodes.iter().map(|n| n.slots.as_slice())) {
+        let report_nodes = self.report().is_some_and(|r| r.nodes.is_some());
+        let nodes = match bulk_nodes(s, report_nodes) {
+            Ok(n) => n,
+            Err(why) => {
                 self.set_error(why);
                 return Vec::new();
             }
-            nodes = s
-                .nodes
-                .iter()
-                .enumerate()
-                .map(|(i, n)| (i, n.endpoint.to_string()))
-                .collect();
-        }
+        };
         let glob = crate::analysis::match_glob(&pattern);
         let action = if delete {
             BulkAction::Delete

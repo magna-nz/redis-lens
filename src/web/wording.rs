@@ -37,6 +37,27 @@ const SENTENCES: &[(&str, &str)] = &[
         "Writes are turned on with w on 0 Connections.",
         "Turn writes on in Connections.",
     ),
+    // The key detail's edits (`tui::app::views::value`): what an edit can't do.
+    (
+        "e is off: the string's length is unknown (STRLEN was refused), and an edit needs the whole value.",
+        "Editing is off: the string's length is unknown (STRLEN was refused), and an edit needs the whole value.",
+    ),
+    (
+        "e is off: only the first 64 KiB of this string is loaded, and an edit needs the whole value.",
+        "Editing is off: only the first 64 KiB of this string is loaded, and an edit needs the whole value.",
+    ),
+    (
+        "e is off: only the first 64 KiB of this document is loaded, and an edit needs the whole document.",
+        "Editing is off: only the first 64 KiB of this document is loaded, and an edit needs the whole document.",
+    ),
+    (
+        "A stream entry can't be edited: + adds an entry, d deletes this one.",
+        "A stream entry can't be edited: add an entry, or delete this one.",
+    ),
+    (
+        "A TTL of 0 would delete the key: D deletes it.",
+        "A TTL of 0 would delete the key: delete the key instead.",
+    ),
     // The command line's refusals (`live::command::refused`).
     (
         "use Pub/Sub (5) to subscribe.",
