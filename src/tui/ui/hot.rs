@@ -294,7 +294,7 @@ const COUNT_W: usize = 7;
 const SHARE_W: usize = 6;
 
 /// `once`, `twice`, `3 times`.
-fn times(n: u64) -> String {
+pub(crate) fn times(n: u64) -> String {
     match n {
         1 => "once".to_string(),
         2 => "twice".to_string(),
@@ -303,7 +303,7 @@ fn times(n: u64) -> String {
 }
 
 /// `from Monitor, 30 s, 8,412 lines, at 13:04 UTC`.
-fn monitor_source(hot: &MonitorHot) -> String {
+pub(crate) fn monitor_source(hot: &MonitorHot) -> String {
     let s = hot.at_unix.rem_euclid(86_400);
     format!(
         "from Monitor, {} s, {} lines, at {:02}:{:02} UTC",

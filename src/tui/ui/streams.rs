@@ -396,7 +396,7 @@ fn header(c: &Cols) -> Line<'static> {
 }
 
 /// The most lag any group has, if any group reports one.
-fn max_lag(info: &StreamInfo) -> Option<u64> {
+pub(crate) fn max_lag(info: &StreamInfo) -> Option<u64> {
     info.groups
         .iter()
         .flatten()
@@ -407,7 +407,7 @@ fn max_lag(info: &StreamInfo) -> Option<u64> {
         .max()
 }
 
-fn total_pending(info: &StreamInfo) -> Option<u64> {
+pub(crate) fn total_pending(info: &StreamInfo) -> Option<u64> {
     info.groups
         .as_ref()
         .map(|gs| gs.iter().map(|g| g.pending).sum())
@@ -489,7 +489,7 @@ fn list_row(r: &StreamRow, c: &Cols, node: Option<String>) -> Line<'static> {
 }
 
 /// What a verdict means, in a sentence, for the right pane.
-fn verdict_reason(v: Verdict) -> &'static str {
+pub(crate) fn verdict_reason(v: Verdict) -> &'static str {
     match v {
         Verdict::Stuck => {
             "Stuck: a consumer holds pending entries and has been idle 30 minutes or more."
@@ -720,7 +720,7 @@ fn group_spans(g: &GroupInfo, nw: usize, wide: bool) -> Vec<Span<'static>> {
 }
 
 /// Why a figure is left out, for the server this stream came from.
-fn left_out(info: &StreamInfo) -> Vec<String> {
+pub(crate) fn left_out(info: &StreamInfo) -> Vec<String> {
     let mut out = Vec::new();
     let groups = info.groups.iter().flatten();
     if groups.clone().any(|g| g.lag == Lag::Unsupported) {

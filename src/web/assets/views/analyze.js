@@ -3,7 +3,8 @@
 // Nodes and Slots; and the snapshots: save the analysis, list them, compare two.
 //
 // An analysis reads keys' metadata (SCAN, TYPE, TTL, sizes, LFU counters) through the
-// command budget, never a value. Everything from Redis is drawn as text.
+// command budget, never a value. Everything from Redis is drawn as text. Without LFU
+// counters, Hot keys ranks the keys the last Server › Monitor run named, as the TUI does.
 
 import {
   h, fill, refill, DASH, fmtBytes, fmtCount, fmtGrouped, fmtPercent, fmtDuration, fmtClock, plural, barPercent, meter, setVar,
@@ -25,6 +26,15 @@ export const PANELS = [
 ];
 
 /** The panels shown: Nodes and Slots only on a cluster. */
+/** The Monitor ranking's line: `Or rank keys by how often Monitor sees them: Server ›
+ *  Monitor.` split around its link. */
+export function monitorLinkParts(text) {
+  const t = String(text ?? '');
+  const at = t.lastIndexOf('Server › Monitor');
+  if (at < 0) return { before: t, link: null, after: '' };
+  return { before: t.slice(0, at), link: 'Server › Monitor', after: t.slice(at + 'Server › Monitor'.length) };
+}
+
 export function panelsFor(cluster) {
   return PANELS.filter((p) => !p.cluster || cluster);
 }
@@ -288,13 +298,14 @@ export function mount(root, ctx, route) {
     const d = p.data;
     const prev = a.previous || (d.report && d.report.previous) ? notice('Previous results: a new analysis is running, and these are the last one\'s.', 'info') : null;
     if (d.off) {
-      fill(body, h('div', { class: 'card stack' }, prev, notice(d.off),
-        tab === 'hot_keys' ? h('p', { class: 'muted' }, 'Server › ', h('a', { href: '#/server/monitor', text: 'Monitor' }), ' shows which keys are read right now.') : null));
+      fill(body, h('div', { class: 'card stack' }, prev, notice(d.off)), tab === 'hot_keys' ? monitorBox : null);
+      if (tab === 'hot_keys') loadMonitor();
       return;
     }
     const draw = { big_keys: drawBig, expiry: drawExpiry, changes: drawChanges, hot_keys: drawHot, nodes: drawNodes, slots: drawSlots }[tab];
     const focused = body.contains(document.activeElement) ? (document.activeElement.getAttribute('aria-label') || document.activeElement.textContent.trim()) : null;
-    fill(body, prev, draw(d));
+    fill(body, prev, draw(d), tab === 'hot_keys' && !d.rows.length ? monitorBox : null);
+    if (tab === 'hot_keys' && !d.rows.length) loadMonitor();
     if (focused) {
       const again = Array.from(body.querySelectorAll('button, a, select')).find((el) => (el.getAttribute('aria-label') || el.textContent.trim()) === focused);
       if (again) again.focus();
@@ -498,7 +509,63 @@ export function mount(root, ctx, route) {
         { label: 'Pattern', cls: 'keycell', cell: (r) => patternButton(r.pattern) },
         cluster ? { label: 'Node', cls: 'mono nowrap', cell: (r) => r.endpoint || nodeName(r.key.node) } : null,
       ].filter(Boolean), d.rows, { caption: 'The most-read sampled keys', cls: 'hot' }),
-      h('p', { class: 'muted small', text: `▲ hot and big: an LFU counter of ${fmtGrouped(d.hotFreq)} or more and ${fmtBytes(d.hotBigBytes)} or more.` }));
+      // The thresholds come only with rows; with none there is nothing to mark.
+      d.empty || !d.rows.length ? null
+        : h('p', { class: 'muted small', text: `▲ hot and big: an LFU counter of ${fmtGrouped(d.hotFreq)} or more and ${fmtBytes(d.hotBigBytes)} or more.` }));
+  }
+
+  // ---------- Hot keys from the last Monitor run ----------
+
+  const monitorBox = h('section', { class: 'card stack', 'aria-label': 'Hot keys from Monitor', 'aria-live': 'polite' });
+  let monitorSeq = 0;
+  let monitorTimer = null;
+  async function loadMonitor() {
+    const mine = (monitorSeq += 1);
+    clearTimeout(monitorTimer);
+    let m;
+    try {
+      m = await ctx.api.getHotKeysMonitor();
+    } catch (err) {
+      if (alive && mine === monitorSeq) fill(monitorBox, notice(errorText(err)));
+      return;
+    }
+    if (!alive || mine !== monitorSeq) return;
+    drawMonitor(m);
+    // Once the run ends its keys are placed with the Slow log's key specs, and the commands
+    // those lack are asked about with COMMAND INFO (COMMAND GETKEYS is never sent).
+    if (m.status === 'pending') monitorTimer = setTimeout(() => alive && loadMonitor(), 700);
+  }
+
+  function drawMonitor(m) {
+    monitorBox.hidden = m.status === 'lfu';
+    if (m.status === 'none' || m.status === 'lfu') {
+      const parts = monitorLinkParts(m.text);
+      fill(monitorBox, h('h2', { class: 'lbl', text: 'Hot keys from Monitor' }),
+        h('p', { class: 'muted' }, parts.before, parts.link ? h('a', { href: '#/server/monitor', text: parts.link }) : null, parts.after),
+        h('p', { class: 'muted small', text: 'A Monitor run names the keys of the commands it sees; Hot keys ranks them once it stops.' }));
+      return;
+    }
+    if (m.status === 'pending') {
+      fill(monitorBox, h('h2', { class: 'lbl', text: 'Hot keys from Monitor' }), h('p', { class: 'muted', role: 'status', text: m.text || 'Ranking the keys of the last Monitor run…' }));
+      return;
+    }
+    const r = m.ranking;
+    const max = Math.max(1, ...r.rows.map((x) => x.count));
+    fill(monitorBox,
+      h('div', { class: 'toolbar' },
+        h('h2', { class: 'lbl', text: `Most-named keys, ${r.title}` }),
+        h('a', { class: 'btn quiet', href: '#/server/monitor', text: 'Run Monitor again' })),
+      r.empty || !r.rows.length ? emptyState(r.empty || 'The last Monitor run named no keys.') : table([
+        { label: 'Key', cls: 'keycell', cell: (x) => keyButton(x.key) },
+        { label: 'Named', cls: 'mono right nowrap', cell: (x) => h('span', { title: x.named || null, text: `${fmtGrouped(x.count)}×` }) },
+        { label: 'Share', cls: 'mono right nowrap', cell: (x) => fmtPercent(x.share) },
+        { label: 'Heat', cls: 'barcell', cell: (x) => meter(barPercent(x.count, max)) },
+        { label: 'Pattern', cls: 'keycell', cell: (x) => patternButton(x.pattern) },
+      ], r.rows, { caption: 'The keys the last Monitor run named most', cls: 'hot' }),
+      h('p', { class: 'muted small', text: m.text }),
+      r.endpoint ? h('p', { class: 'muted small', text: `Monitor ran on ${r.endpoint}.` }) : null,
+      r.unknownText ? h('p', { class: 'muted small', text: r.unknownText }) : null,
+      r.keysNote ? h('p', { class: 'muted small', text: r.keysNote }) : null);
   }
 
   function drawNodes(d) {
@@ -631,7 +698,11 @@ export function mount(root, ctx, route) {
     if (p.kind === 'compared' && tab === 'changes') drawBody();
   };
   listeners.add(onProgress);
-  const offs = [ctx.api.on('state', onState), () => listeners.delete(onProgress)];
+  // A Monitor run that ends (here or in another tab) is ranked for Hot keys.
+  const onMonitor = (e) => {
+    if (alive && e.kind === 'closed' && tab === 'hot_keys' && monitorBox.isConnected) loadMonitor();
+  };
+  const offs = [ctx.api.on('state', onState), () => listeners.delete(onProgress), ctx.api.on('monitor', onMonitor), () => clearTimeout(monitorTimer)];
 
   drawHead();
   drawBody();

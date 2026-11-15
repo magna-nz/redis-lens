@@ -93,7 +93,7 @@ function savedProfiles() {
       version: '7.2.5', scale: 0.08,
       denied: {
         'MEMORY USAGE': noperm('MEMORY USAGE'), 'OBJECT FREQ': noperm('OBJECT FREQ'), 'MEMORY STATS': noperm('MEMORY STATS'), SLOWLOG: noperm('SLOWLOG LEN'),
-        'CLIENT LIST': noperm('CLIENT LIST'), XINFO: noperm('XINFO'), PUBSUB: noperm('PUBSUB NUMPAT'),
+        'CLIENT LIST': noperm('CLIENT LIST'), XINFO: noperm('XINFO'), PUBSUB: noperm('PUBSUB NUMPAT'), 'FT._LIST': noperm('FT._LIST'),
       },
       // Writes this user's ACL refuses: found when one is sent, then off for the session.
       writeDenied: ['HSET', 'UNLINK'],
@@ -103,7 +103,7 @@ function savedProfiles() {
 
 function containers() {
   return [
-    { container: 'demo-redis', image: 'redis:8', endpoint: '127.0.0.1:6390', auth: 'password', sim: { flavor: 'redis', version: '8.0.2', scale: 0.002, policy: 'noeviction', lfu: false } },
+    { container: 'demo-redis', image: 'redis:8', endpoint: '127.0.0.1:6390', auth: 'password', sim: { flavor: 'redis', version: '8.0.2', scale: 0.002, policy: 'noeviction', lfu: false, search: true } },
     { container: 'demo-valkey', image: 'valkey/valkey:8', endpoint: '127.0.0.1:6391', auth: 'none', sim: { flavor: 'valkey', version: '8.0.1', scale: 0.002, policy: 'noeviction', lfu: false } },
     { container: 'legacy-redis', image: 'redis:6.2', endpoint: '127.0.0.1:6392', auth: 'required', sim: { flavor: 'redis', version: '6.2.14', scale: 0.002, policy: 'noeviction', lfu: false } },
   ];
@@ -426,7 +426,10 @@ export function createMockServer({ entra = false } = {}) {
   function closeMonitor(end, error = null) {
     if (!session || !session.monitor) return false;
     const run = session.monitor.run;
+    const { startedAt, firstTick } = session.monitor;
     session.monitor = null;
+    // Hot keys ranks the keys the run named (phase 4), once it has placed them.
+    if (startedAt && firstTick !== undefined && tick >= firstTick) rankMonitor(run, startedAt, [firstTick, tick]);
     emit('monitor', { end, error, kind: 'closed', run });
     emitState();
     return true;
@@ -524,7 +527,7 @@ export function createMockServer({ entra = false } = {}) {
   function perms(p) {
     return PERMS.map((name) => {
       if (p.sim.denied[name]) return { label: name, reason: p.sim.denied[name], status: 'denied' };
-      if (name === 'FT._LIST') return { label: name, reason: 'the Search module is not loaded', status: 'skipped' };
+      if (name === 'FT._LIST' && !p.sim.search) return { label: name, reason: 'the Search module is not loaded', status: 'skipped' };
       if (name === 'ACL DRYRUN') return { label: name, reason: 'checked by the server on use', status: 'skipped' };
       if (name === 'OBJECT FREQ' && !p.sim.lfu) return { label: name, reason: 'the maxmemory policy is not LFU, so there are no hot keys', status: 'skipped' };
       return { label: name, reason: null, status: 'allowed' };
@@ -2410,6 +2413,8 @@ export function createMockServer({ entra = false } = {}) {
 
     const p2 = await phase2(method, path, query, body);
     if (p2) return p2;
+    const p4r = await phase4(method, path, query, body);
+    if (p4r) return p4r;
 
     // Everything below reads the live connection.
     if (!live()) return [409, { error: NOT_LIVE }];
@@ -2446,6 +2451,462 @@ export function createMockServer({ entra = false } = {}) {
     return [404, { error: 'not found' }];
   }
 
+  // ---------- Browse › Streams, Browse › Search and Hot keys from Monitor (phase 4) ----------
+
+  const P4 = ['/api/streams', '/api/streams/pending', '/api/streams/ack', '/api/streams/claim', '/api/streams/trim',
+    '/api/search', '/api/search/query', '/api/search/results', '/api/search/field', '/api/search/create', '/api/search/drop',
+    '/api/analysis/hot_keys/monitor'];
+  const viewOff = (label) => `The server refused ${label} for this user, so this view is off.`;
+  const STREAMS_NO_ANALYSIS = 'Streams are found by an analysis: it samples the keys and lists the streams among them.';
+  const STREAM_NOT_LISTED = 'That stream is not in the list: read the streams again, or analyze again to update it.';
+  const NO_GROUP = "That group is not one of the stream's: read the streams again.";
+  const NOT_PENDING_LISTED = 'That entry is not in the pending list shown: list the pending entries again.';
+  const BAD_ID = 'That is not a stream entry ID, such as 1700000000000-0.';
+  const STREAM_ID = /^\d+-\d+$/;
+  const SEARCH_NOT_LOADED = 'FT._LIST is not available: the Search module is not loaded.';
+  const SEARCH_NOT_LOADED_WHY = 'FT._LIST is unknown, so there is no Redis Search (built into Redis 8) or valkey-search to list indexes from.';
+  const SEARCH_NO_MODULE = "Not available: the server has no Search module, so indexes can't be created or dropped.";
+  const SEARCH_STALE = "Those results are not the last query's: run it again.";
+  const INDEX_NOT_LISTED = 'That index is not in the list: read the indexes again.';
+  const HOT_SOURCE = "Ranked by how often the last Monitor run named each key, because the analysis has no LFU counters: a short sample, not the server's own counters.";
+  const MIN = 60 * 1000;
+  const age = (ms) => {
+    const s = Math.floor(ms / 1000);
+    return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400 ? `${Math.floor(s / 3600)}h` : `${Math.floor(s / 86400)}d`;
+  };
+
+  function p4() {
+    if (!session.p4) session.p4 = { run: null, streams: [], pending: null, search: null, hot: { rank: null, pendingUntil: 0 } };
+    return session.p4;
+  }
+
+  /** The streams of the analysis: their groups, consumers and pending entries. */
+  function streamsNow() {
+    const s = p4();
+    if (s.run === session.an.run) return s.streams;
+    s.run = session.an.run;
+    s.pending = null;
+    const nodes = session.profile.sim.nodes.length;
+    s.streams = space().filter(({ spec }) => spec.type === 'stream').map(({ spec }) => {
+      const raw = spec.key(0);
+      const entry = (n) => `1794745${String(502183 - n * 61).padStart(6, '0')}-0`;
+      const pend = (consumer, n, idle, from) => Array.from({ length: n }, (_, k) => ({ id: entry(from + k * 3), consumer, idle: idle + k * 1000, deliveries: 1 + (k % 3) }));
+      return {
+        raw, spec, node: nodes ? spec.name.length % nodes : null, length: spec.len, bytes: spec.avg, firstId: '1794659102183-0', lastId: entry(0), oldestMs: 26 * 3600 * 1000, added: spec.len + 1240,
+        groups: [
+          { name: 'billing', lastId: entry(18), lag: 18, consumers: [{ name: 'worker-1', idle: 47 * MIN, inactive: 47 * MIN, entries: pend('worker-1', 6, 47 * MIN, 4000) }, { name: 'worker-2', idle: 2000, inactive: 2000, entries: pend('worker-2', 2, 1500, 40) }] },
+          { name: 'shipping', lastId: '1794743025183-0', lag: 24210, consumers: [{ name: 'ship-1', idle: 5000, inactive: 5000, entries: [] }] },
+        ],
+      };
+    });
+    return s.streams;
+  }
+
+  function streamRow(st) {
+    if (st.gone) return { endpoint: st.node === null ? null : session.profile.sim.nodes[st.node][0], gone: true, key: nameOf(st.raw), node: st.node, text: 'The key is gone, or no longer a stream.' };
+    const pendingOf = (g) => g.consumers.reduce((n, c) => n + c.entries.length, 0);
+    const stuck = st.groups.some((g) => g.consumers.some((c) => c.entries.length > 0 && c.idle >= 30 * MIN));
+    const lagging = st.groups.some((g) => g.lag >= 1000);
+    const verdicts = [];
+    if (stuck) verdicts.push({ label: 'stuck', text: 'Stuck: a consumer holds pending entries and has been idle 30 minutes or more.' });
+    if (lagging) verdicts.push({ label: 'lagging', text: 'Lagging: a group is 1,000 or more entries behind.' });
+    if (!st.groups.length) verdicts.push({ label: 'no readers', text: 'No readers: no consumer group reads this stream.' });
+    return {
+      bytes: sizesOn(session.profile) ? st.bytes : null, endpoint: st.node === null ? null : session.profile.sim.nodes[st.node][0], entries_added: st.added, first_id: st.firstId, gone: false,
+      group_count: st.groups.length,
+      groups: st.groups.map((g) => {
+        const recent = [...g.consumers].sort((a, b) => a.idle - b.idle)[0];
+        return {
+          claim: { count: 100, min_idle_ms: 60000, to: recent ? nameOf(recent.name) : null }, consumers: g.consumers.length, lag: g.lag, lagging: g.lag >= 1000,
+          last_delivered_id: g.lastId, name: nameOf(g.name), pending: pendingOf(g),
+          readers: g.consumers.map((c) => ({ idle: age(c.idle), idle_ms: c.idle, inactive: age(c.inactive), inactive_ms: c.inactive, name: nameOf(c.name), pending: c.entries.length, stuck: c.entries.length > 0 && c.idle >= 30 * MIN })),
+        };
+      }),
+      groups_text: st.groups.length ? null : 'No consumer groups: nothing reads this stream.',
+      key: nameOf(st.raw), lag: st.groups.reduce((m, g) => Math.max(m, g.lag), 0), last_id: st.lastId, left_out: sizesOn(session.profile) ? null : 'Left out: the server refused MEMORY USAGE for this user.', length: st.length, node: st.node,
+      oldest: age(st.oldestMs), oldest_age_ms: st.oldestMs, pending: st.groups.reduce((n, g) => n + pendingOf(g), 0), verdict: verdicts.length ? verdicts[0].label : 'ok', verdicts,
+    };
+  }
+
+  function streamsList() {
+    const p = session.profile;
+    if (p.sim.denied.XINFO) return [200, { off: viewOff('XINFO') }];
+    if (!session.an.report) return [200, { analysis_running: running(), rows: [], status: 'no_report', text: STREAMS_NO_ANALYSIS }];
+    const rows = streamsNow();
+    if (!rows.length) return [200, { hint: 'It samples keys, so it may miss some; a Deep analysis samples more.', rows: [], status: 'none', text: 'The analysis found no streams.' }];
+    return [200, { cluster: isCluster(p), error: null, found: rows.length, note: null, rows: rows.map(streamRow), shown: rows.length, status: 'ready', writes: p.read_only ? readOnly(p) : null }];
+  }
+
+  /** The stream and group a request names (hex ids), from the list. */
+  function listedStream(body, needGroup = true) {
+    const raw = fromHex(body.key);
+    if (raw === null) return [400, { error: 'that is not a name id: hex, two digits a byte' }];
+    const st = streamsNow().find((x) => x.raw === raw && !x.gone);
+    if (!st) return [404, { error: STREAM_NOT_LISTED }];
+    if (!needGroup) return { st };
+    const name = fromHex(body.group);
+    if (name === null) return [400, { error: 'that is not a name id: hex, two digits a byte' }];
+    const g = st.groups.find((x) => x.name === name);
+    if (!g) return [404, { error: NO_GROUP }];
+    return { st, g };
+  }
+
+  function pendingList(q) {
+    if (session.profile.sim.denied.XINFO) return [200, { off: viewOff('XINFO') }];
+    const got = listedStream({ key: q.get('key'), group: q.get('group') });
+    if (Array.isArray(got)) return got;
+    const { st, g } = got;
+    const who = q.get('consumer') ? fromHex(q.get('consumer')) : null;
+    const entries = g.consumers.filter((c) => !who || c.name === who).flatMap((c) => c.entries).slice(0, 100);
+    p4().pending = { raw: st.raw, group: g.name, ids: entries.map((e) => e.id) };
+    return [200, {
+      pending: {
+        consumer: who ? nameOf(who) : null, entries: entries.map((e) => ({ consumer: nameOf(e.consumer), deliveries: e.deliveries, id: e.id, idle: age(e.idle), idle_ms: e.idle })),
+        error: null, group: nameOf(g.name), key: nameOf(st.raw), max: 100,
+      },
+      row: streamRow(st),
+    }];
+  }
+
+  /** A stream write's checks before the gate, in the server's order. */
+  function streamWritable(body, fields) {
+    if (!known(body, fields) || fields.some((f) => typeof body[f] !== 'string')) return [400, { error: SHAPE }];
+    if (session.profile.read_only) return [422, { error: readOnly(session.profile) }];
+    if (bulkBusy()) return [409, { error: BULK_RUNS }];
+    if (session.profile.sim.denied.XINFO) return [422, { error: viewOff('XINFO') }];
+    return null;
+  }
+
+  function ackEntry(body) {
+    const refused = streamWritable(body, ['key', 'group', 'id']);
+    if (refused) return refused;
+    if (!STREAM_ID.test(body.id)) return [422, { error: BAD_ID }];
+    const got = listedStream(body);
+    if (Array.isArray(got)) return got;
+    const { st, g } = got;
+    const shown = p4().pending;
+    if (!shown || shown.raw !== st.raw || shown.group !== g.name || !shown.ids.includes(body.id)) return [422, { error: NOT_PENDING_LISTED }];
+    return gate({ cmds: ['XACK'], text: `XACK ${said(st.raw)} ${said(g.name)} ${body.id}` }, () => {
+      let n = 0;
+      for (const c of g.consumers) {
+        const before = c.entries.length;
+        c.entries = c.entries.filter((e) => e.id !== body.id);
+        n += before - c.entries.length;
+      }
+      return [200, { reply: { kind: 'int', value: n }, sent: true }];
+    });
+  }
+
+  function claimEntries(body) {
+    const refused = streamWritable(body, ['key', 'group', 'to', 'min_idle_ms', 'count']);
+    if (refused) return refused;
+    const got = listedStream(body);
+    if (Array.isArray(got)) return got;
+    const { st, g } = got;
+    const to = body.to.trim();
+    if (!to) return [422, { error: 'Type the consumer that takes the entries.' }];
+    if (!/^\d+$/.test(body.min_idle_ms.trim())) return [422, { error: 'The min idle time is a whole number of milliseconds.' }];
+    if (!/^[1-9]\d*$/.test(body.count.trim())) return [422, { error: 'The count is a whole number, 1 or more.' }];
+    const idle = Number(body.min_idle_ms.trim());
+    const n = Number(body.count.trim());
+    return gate({ cmds: ['XAUTOCLAIM'], text: `XAUTOCLAIM ${said(st.raw)} ${said(g.name)} ${said(to)} ${idle} 0-0 COUNT ${n}` }, () => {
+      let target = g.consumers.find((c) => c.name === to);
+      if (!target) {
+        target = { name: to, idle: 0, inactive: 0, entries: [] };
+        g.consumers.push(target);
+      }
+      const ids = [];
+      for (const c of g.consumers) {
+        if (c === target) continue;
+        const take = c.entries.filter((e) => e.idle >= idle).slice(0, n - ids.length);
+        c.entries = c.entries.filter((e) => !take.includes(e));
+        for (const e of take) {
+          ids.push(e.id);
+          target.entries.push({ ...e, consumer: to, idle: 0, deliveries: e.deliveries + 1 });
+        }
+      }
+      target.idle = 0;
+      return [200, { reply: { deleted: 0, ids, kind: 'claimed' }, sent: true }];
+    });
+  }
+
+  function trimStream(body) {
+    const refused = streamWritable(body, ['key', 'by', 'value']);
+    if (refused) return refused;
+    const got = listedStream(body, false);
+    if (Array.isArray(got)) return got;
+    const { st } = got;
+    if (body.by !== 'MAXLEN' && body.by !== 'MINID') return [400, { error: 'trim by MAXLEN or MINID' }];
+    const v = body.value.trim();
+    if (body.by === 'MINID' && !STREAM_ID.test(v)) return [422, { error: 'MINID takes an entry ID, such as 1700000000000-0.' }];
+    if (body.by === 'MAXLEN' && !/^\d+$/.test(v)) return [422, { error: 'MAXLEN takes how many entries to keep.' }];
+    return gate({ cmds: ['XTRIM'], text: `XTRIM ${said(st.raw)} ${body.by} ~ ${v}`, destructive: true, typed: st.raw }, () => {
+      let removed = 0;
+      if (body.by === 'MAXLEN') {
+        // With ~ the server removes whole blocks of 100 only.
+        const over = st.length - Number(v);
+        removed = over >= 100 ? Math.floor(over / 100) * 100 : 0;
+      }
+      st.length -= removed;
+      return [200, { reply: { kind: 'int', value: removed }, sent: true }];
+    });
+  }
+
+  // Search: the module on demo-redis (Redis 8); refused for limited-user; not loaded elsewhere.
+
+  function searchOff() {
+    const p = session.profile;
+    if (p.sim.denied['FT._LIST']) return { detail: null, no_module: false, off: viewOff('FT._LIST') };
+    if (!p.sim.search) return { detail: SEARCH_NOT_LOADED_WHY, no_module: true, off: SEARCH_NOT_LOADED };
+    return null;
+  }
+
+  function searchNow() {
+    const s = p4();
+    if (!s.search) {
+      const docs = Math.round(1210000 * session.profile.sim.scale);
+      s.search = {
+        indexes: [
+          { name: 'idx:products', on: 'HASH', prefixes: ['cache:product:'], docs, bytes: docs * 210, progress: 1, failures: 0, schema: [
+            { flags: ['SORTABLE'], name: 'name', path: null, type: 'TEXT' }, { flags: ['SORTABLE'], name: 'price', path: null, type: 'NUMERIC' }, { flags: [], name: 'currency', path: null, type: 'TAG' }] },
+          { name: 'idx:flags', on: 'JSON', prefixes: ['cfg:'], docs: 1, bytes: 1800, progress: 0.62, failures: 0, schema: [{ flags: [], name: 'banner', path: '$.banner.text', type: 'TEXT' }] },
+        ],
+        lastQuery: null, run: null, nextRun: 0, busy: null,
+      };
+    }
+    return s.search;
+  }
+
+  function indexJson(i) {
+    const building = i.progress < 1;
+    return {
+      building, bytes: i.bytes, docs: i.docs, failures: i.failures, fields_text: i.schema.length ? null : 'The module returned no fields.', indexing: building, info: true, info_text: null, left_out: null,
+      name: nameOf(i.name), on: i.on, prefixes: i.prefixes, progress: i.progress, progress_text: `${Math.round(i.progress * 100)}%`, schema: i.schema,
+    };
+  }
+
+  function searchResults(r, from) {
+    return {
+      cmd: r.cmd, count: `${n0(r.total)} match${r.total === 1 ? '' : 'es'}`, docs: r.docs.slice(from, from + 10).map((d, k) => ({ field_count: d.fields.length, fields: d.fields.map(([name, value]) => ({ name, value })), index: from + k, key: nameOf(d.key) })),
+      empty: r.docs.length ? null : 'No documents match the query.', from, index: nameOf(r.index), kept: r.docs.length, max: 50, page: 10, query: r.query, run: r.id, took: '2 ms', total: r.total,
+    };
+  }
+
+  function searchList() {
+    const off = searchOff();
+    if (off) return [200, off];
+    const s = searchNow();
+    const cluster = isCluster(session.profile);
+    return [200, {
+      busy: s.busy, cmd_off: { explain: null, profile: null, search: null }, empty: s.indexes.length ? null : { text: 'Redis Search is loaded; nothing was created with FT.CREATE yet.', title: 'The module has no indexes.' },
+      error: null, first_of: null, indexes: s.indexes.map(indexJson), last_query: s.lastQuery, last_query_copy: s.lastQuery, module: 'Redis Search',
+      node: cluster ? session.picked : null, node_title: null, notes: [], results: s.run ? searchResults(s.run, 0) : null, total: s.indexes.length, writes: session.profile.read_only ? readOnly(session.profile) : null,
+    }];
+  }
+
+  /** The documents a query finds among the sample products. */
+  function matches(index, query) {
+    if (index.name !== 'idx:products') return { total: 0, docs: [] };
+    const price = /@price:\[(\d+)\s+(\d+)\]/.exec(query);
+    const word = query === '*' ? null : (/^[\w ]+$/.test(query) ? query.toLowerCase() : null);
+    const docs = [];
+    let total = 0;
+    for (let i = 0; i < Math.min(index.docs, 2400); i += 1) {
+      const fields = valueOf({ value: 'product' }, i).item;
+      const row = Array.from({ length: 6 }, (_, n) => fields(n));
+      const p = Number(row[1][1]);
+      if (price && (p < Number(price[1]) || p > Number(price[2]))) continue;
+      if (word && !row[0][1].toLowerCase().includes(word)) continue;
+      total += 1;
+      if (docs.length < 50) docs.push({ key: `cache:product:${51007 + i}`, fields: row.slice(0, 4) });
+    }
+    if (!price && !word) total = index.docs;
+    return { total, docs };
+  }
+
+  async function runQuery(body) {
+    if (!known(body, ['index', 'cmd', 'query']) || typeof body.index !== 'string') return [400, { error: SHAPE }];
+    if (!['search', 'explain', 'profile'].includes(body.cmd)) return [400, { error: 'the command must be search, explain or profile' }];
+    const off = searchOff();
+    if (off) return [200, { off: off.off }];
+    const s = searchNow();
+    const CMD = { search: 'FT.SEARCH', explain: 'FT.EXPLAIN', profile: 'FT.PROFILE' }[body.cmd];
+    let query = null;
+    if (body.cmd === 'search') {
+      query = String(body.query ?? '*').replace(/[\r\n]/g, ' ').replace(/[\x00-\x1f\x7f]/g, '').trim() || '*';
+      if (query.length > 1000) return [422, { error: 'A query is at most 1,000 characters.' }];
+    } else if (body.query !== undefined) return [422, { error: 'FT.EXPLAIN and FT.PROFILE use the query last run: send no query.' }];
+    if (s.busy) return [409, { error: `${s.busy} is still running: wait for its answer.` }];
+    const name = fromHex(body.index);
+    const index = s.indexes.find((i) => i.name === name);
+    if (!index) return [404, { error: INDEX_NOT_LISTED }];
+    if (body.cmd !== 'search') {
+      if (!s.lastQuery) return [422, { error: `Run a query first: ${CMD} uses the query last run.` }];
+      query = s.lastQuery;
+    } else s.lastQuery = query;
+    s.busy = CMD;
+    try {
+      await later(body.cmd === 'profile' ? 400 : 250);
+    } finally {
+      s.busy = null;
+    }
+    if ((query.match(/\[/g) || []).length !== (query.match(/\]/g) || []).length) {
+      return [422, { error: `${CMD} failed: Syntax error at offset ${query.indexOf('[') + 1} near ${query.replace(/[^\w]/g, '').slice(0, 12)}.` }];
+    }
+    const keep = () => {
+      const m = matches(index, query);
+      s.nextRun += 1;
+      s.run = { id: s.nextRun, cmd: body.cmd, index: index.name, query, total: m.total, docs: m.docs };
+      return searchResults(s.run, 0);
+    };
+    if (body.cmd === 'search') return [200, { cmd: 'search', results: keep(), text: null }];
+    if (body.cmd === 'explain') {
+      const price = /@price:\[(\d+)\s+(\d+)\]/.exec(query);
+      const lines = query === '*' ? ['<WILDCARD>'] : price ? [`NUMERIC {${Number(price[1]).toFixed(6)} <= @price <= ${Number(price[2]).toFixed(6)}}`] : ['UNION {', `  ${query}`, `  +${query}(expanded)`, '}'];
+      return [200, { cmd: 'explain', index: nameOf(index.name), query, results: null, text: { empty: null, lines } }];
+    }
+    const results = keep();
+    return [200, { cmd: 'profile', index: nameOf(index.name), query, results, text: { empty: null, lines: [
+      'Shards', '  - Total profile time: 0.739417', '    Parsing time: 0.095084', '    Iterators profile', `      Type: ${query === '*' ? 'WILDCARD' : 'TEXT'}`, '      Time: 0.000792',
+      `      Estimated number of matches: ${results.total}`, '    Result processors profile', '      - Type: Index', '        Time: 0.001834', `        Results processed: ${results.kept}`, 'Coordinator: (empty)'] } }];
+  }
+
+  function resultsPage(q) {
+    const s = searchNow();
+    const run = Number(q.get('run'));
+    if (!s.run || s.run.id !== run) return [409, { error: SEARCH_STALE }];
+    return [200, searchResults(s.run, Math.min(Math.max(0, Number(q.get('from')) || 0), s.run.docs.length))];
+  }
+
+  function resultField(q) {
+    const s = searchNow();
+    if (!s.run || s.run.id !== Number(q.get('run'))) return [409, { error: SEARCH_STALE }];
+    const d = s.run.docs[Number(q.get('doc'))];
+    const f = d && d.fields[Number(q.get('field'))];
+    if (!f) return [404, { error: 'There is no such result, or no such field in it.' }];
+    const raw = f[1];
+    return [200, { doc: Number(q.get('doc')), field: Number(q.get('field')), key: nameOf(d.key), name: f[0], run: s.run.id, shown: {
+      bytes: raw.length, compression: null, copy: raw, copy_refused: null, detected: 'text', format: 'text', formats: FORMATS, header: `value · text · ${raw.length} bytes · auto-detected`,
+      lines: [raw], note: null, picked: null, truncated: false } }];
+  }
+
+  function searchWritable() {
+    if (session.profile.read_only) return [422, { error: readOnly(session.profile) }];
+    if (bulkBusy()) return [409, { error: BULK_RUNS }];
+    const off = searchOff();
+    if (off && off.no_module) return [422, { error: SEARCH_NO_MODULE }];
+    if (off) return [422, { error: off.off }];
+    return null;
+  }
+
+  function createIndex(body) {
+    if (!known(body, ['name', 'on', 'prefixes', 'fields']) || typeof body.name !== 'string' || typeof body.fields !== 'string') return [400, { error: SHAPE }];
+    if (body.on !== 'HASH' && body.on !== 'JSON') return [400, { error: 'an index is on HASH or JSON' }];
+    const refused = searchWritable();
+    if (refused) return refused;
+    const name = body.name.trim();
+    if (!name) return [422, { error: "Type the index's name." }];
+    if (/\s/.test(name)) return [422, { error: 'An index name has no spaces.' }];
+    const prefixes = String(body.prefixes || '').split(/[\s,]+/).filter(Boolean);
+    const schema = [];
+    for (const part of body.fields.split(',').map((x) => x.trim()).filter(Boolean)) {
+      const w = part.split(/\s+/);
+      const [field, path, type] = w.length === 4 && /^AS$/i.test(w[1]) ? [w[2], w[0], w[3]] : w.length === 2 ? [w[0], null, w[1]] : [null, null, null];
+      if (!field) return [422, { error: `Write each field as name TYPE, or $.path AS alias TYPE: ${part}.` }];
+      if (!['TEXT', 'TAG', 'NUMERIC', 'GEO'].includes(type.toUpperCase())) return [422, { error: `A field's type is TEXT, TAG, NUMERIC or GEO, not ${type}.` }];
+      if (body.on === 'JSON' && !(path || field).startsWith('$')) return [422, { error: `On JSON a field is a path such as $.title: ${part}.` }];
+      schema.push({ flags: [], name: field, path, type: type.toUpperCase() });
+    }
+    if (!schema.length) return [422, { error: 'Add at least one field, such as title TEXT.' }];
+    const s = searchNow();
+    const text = `FT.CREATE ${said(name)} ON ${body.on}${prefixes.length ? ` PREFIX ${prefixes.length} ${prefixes.map(said).join(' ')}` : ''} SCHEMA ${schema.map((f) => `${f.path ? `${f.path} AS ` : ''}${f.name} ${f.type}`).join(' ')}`;
+    return gate({ cmds: ['FT.CREATE'], text }, () => {
+      if (s.indexes.some((i) => i.name === name)) return [422, { error: 'FT.CREATE failed: Index already exists.' }];
+      s.indexes.push({ name, on: body.on, prefixes, docs: 0, bytes: 0, progress: 0, failures: 0, schema });
+      later(1500).then(() => {
+        const i = s.indexes.find((x) => x.name === name);
+        if (i) i.progress = 1;
+      });
+      return [200, { reply: { kind: 'ok' }, sent: true }];
+    });
+  }
+
+  function dropIndex(body) {
+    if (!known(body, ['index']) || typeof body.index !== 'string') return [400, { error: SHAPE }];
+    const name = fromHex(body.index);
+    if (name === null) return [400, { error: 'that is not a name id: hex, two digits a byte' }];
+    const refused = searchWritable();
+    if (refused) return refused;
+    const s = searchNow();
+    if (!s.indexes.some((i) => i.name === name)) return [404, { error: INDEX_NOT_LISTED }];
+    return gate({ cmds: ['FT.DROPINDEX'], text: `FT.DROPINDEX ${said(name)}`, destructive: true, typed: name }, () => {
+      s.indexes = s.indexes.filter((i) => i.name !== name);
+      if (s.run && s.run.index === name) s.run = null;
+      return [200, { reply: { kind: 'ok' }, sent: true }];
+    });
+  }
+
+  /** Hot keys from the last Monitor run: its lines' keys, ranked, a moment after it ends. */
+  function hotFromMonitor() {
+    if (!session.an.report) return [409, { error: NO_REPORT }];
+    const p = session.profile;
+    if (freqOn(p)) return [200, { ranking: null, status: 'lfu', text: 'The analysis has LFU counters: Hot keys ranks the keys by them.' }];
+    const h = p4().hot;
+    if (!h.rank) return [200, { ranking: null, status: 'none', text: 'Or rank keys by how often Monitor sees them: Server › Monitor.' }];
+    if (Date.now() < h.pendingUntil) return [200, { ranking: null, status: 'pending', text: 'Ranking the keys of the last Monitor run…' }];
+    return [200, { ranking: h.rank, status: 'ready', text: HOT_SOURCE }];
+  }
+
+  /** A Monitor run ended: rank the keys its lines named (the ticks it ran for). */
+  function rankMonitor(run, startedAt, ticks) {
+    if (!session || !startedAt) return;
+    const seen = new Map();
+    let lines = 0;
+    for (let t = ticks[0]; t <= ticks[1]; t += 1) {
+      for (let n = 0; n < 3; n += 1) {
+        lines += 1;
+        const key = MONITOR_COMMANDS[(t * 3 + n) % MONITOR_COMMANDS.length].split(' ')[1];
+        seen.set(key, (seen.get(key) || 0) + 1);
+      }
+    }
+    const secs = Math.round((Date.now() - startedAt) / 1000);
+    const at = new Date(startedAt);
+    const hhmm = `${String(at.getUTCHours()).padStart(2, '0')}:${String(at.getUTCMinutes()).padStart(2, '0')}`;
+    const rows = Array.from(seen).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).map(([key, n]) => {
+      const spec = SPACE.find((sp) => sp.glob && globRe(sp.glob).test(key));
+      return { count: n, key: nameOf(key), named: `${key} · named ${n === 1 ? 'once' : n === 2 ? 'twice' : `${n0(n)} times`} in ${n0(lines)} lines`, pattern: nameOf(spec ? spec.name : key), share: n / Math.max(1, lines) };
+    });
+    p4().hot = {
+      pendingUntil: Date.now() + 600,
+      rank: {
+        at_unix: Math.floor(startedAt / 1000), empty: rows.length ? null : 'The last Monitor run named no keys.', endpoint: isCluster(session.profile) ? session.profile.sim.nodes[session.picked][0] : null,
+        keys_note: null, lines, node: session.picked, rows, secs, title: `from Monitor, ${secs} s, ${n0(lines)} lines, at ${hhmm} UTC`, unknown: 0, unknown_text: null,
+      },
+    };
+  }
+
+  /** Phase 4's routes, or null for another route. */
+  async function phase4(method, path, query, body) {
+    if (!P4.includes(path)) return null;
+    if (path === '/api/analysis/hot_keys/monitor' && method === 'GET') return session ? hotFromMonitor() : [409, { error: NOT_CONNECTED }];
+    if (!live()) return [409, { error: NOT_LIVE }];
+    const q = new URLSearchParams(query);
+    switch (`${method} ${path}`) {
+      case 'GET /api/streams': return streamsList();
+      case 'GET /api/streams/pending': return pendingList(q);
+      case 'POST /api/streams/ack': return ackEntry(body);
+      case 'POST /api/streams/claim': return claimEntries(body);
+      case 'POST /api/streams/trim': return trimStream(body);
+      case 'GET /api/search': return searchList();
+      case 'POST /api/search/query': return runQuery(body);
+      case 'GET /api/search/results': return resultsPage(q);
+      case 'GET /api/search/field': return resultField(q);
+      case 'POST /api/search/create': return createIndex(body);
+      case 'POST /api/search/drop': return dropIndex(body);
+      default: return [405, { error: 'method not allowed' }];
+    }
+  }
+
   function startMonitor(p) {
     if (!live() || session.profile !== p) return [422, { error: NOT_LIVE }];
     idSeq += 1;
@@ -2459,6 +2920,7 @@ export function createMockServer({ entra = false } = {}) {
         return;
       }
       session.monitor.startedAt = Date.now();
+      session.monitor.firstTick = tick + 1;
       emitState();
       emit('monitor', { at_unix_ms: session.monitor.startedAt, kind: 'ready', max_lines: 10000, max_secs: 30, run });
     });

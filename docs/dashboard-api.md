@@ -167,8 +167,10 @@ and so does starting Monitor (it always asks) and turning writes on:
   gate checks again at that point, with the profile's `read_only` and `env` read again from
   the config file: a different connection (409 or 410), a new run of the same connection
   since the question (a database switch or an analysis started: 409
-  `{"error":"Not sent: the connection changed since the question was asked."}`), a profile
-  that is now read-only (422), or a wrong typed name means it is not sent. The same holds
+  `{"error":"Not sent: the connection changed since the question was asked."}`), another
+  node picked since, for a write sent to the picked node (`FT.CREATE`, `FT.DROPINDEX`: the
+  same 409), a bulk action that counts or runs (409, for every write but a typed command's),
+  a profile that is now read-only (422), or a wrong typed name means it is not sent. The same holds
   for a `@dangerous` command line's question, and for a repeated write that a new run
   interrupts.
 - `DELETE /api/confirm/<id>` cancels.
@@ -402,6 +404,18 @@ Example, `event: figures`. Event
 | POST | `/api/keys/add` | add a key with its first item |
 | GET, POST, DELETE | `/api/bulk` | the bulk action; count one (the dry run); stop or close it |
 | POST | `/api/bulk/run` | run the counted bulk action (asks first) |
+| GET | `/api/streams` | Browse › Streams: the analysis's streams, groups and consumers, each read on its owner |
+| GET | `/api/streams/pending?key=&group=` | a group's pending entries (`XPENDING`) |
+| POST | `/api/streams/ack` | `XACK` an entry of the pending list shown |
+| POST | `/api/streams/claim` | `XAUTOCLAIM` a group's pending entries for a consumer |
+| POST | `/api/streams/trim` | `XTRIM` by `MAXLEN` or `MINID` (asks first) |
+| GET | `/api/search` | Browse › Search: the indexes of the picked node and their `FT.INFO` |
+| POST | `/api/search/query` | `FT.SEARCH`, `FT.EXPLAIN` or `FT.PROFILE` |
+| GET | `/api/search/results?run=&from=` | a page of the last results |
+| GET | `/api/search/field?run=&doc=&field=` | one field of a result, whole, in a format |
+| POST | `/api/search/create` | `FT.CREATE` from the form |
+| POST | `/api/search/drop` | `FT.DROPINDEX` without `DD` (asks first) |
+| GET | `/api/analysis/hot_keys/monitor` | Hot keys ranked from the last Monitor run |
 | POST, DELETE | `/api/confirm/{id}` | answer or cancel a question |
 
 ### `GET /api/state`
@@ -1766,7 +1780,9 @@ Example, `DELETE /api/pubsub/subscribe`. Reply: HTTP 200
 The body is `{"channel": "...", "message": "...", "shard": false}`. This is a write: it goes
 through the one write gate. A publish is an edit: a read-only profile gets 422, a prod
 profile with writes on gets a 409 `ask` question, and a profile with writes on that is not
-prod sends at once. The reply is
+prod sends at once. While a bulk action counts or runs it is 409
+`{"error":"A bulk action is running: wait for it to end, or stop it first."}`, asked or
+answered, as every write but a typed command's is. The reply is
 `{sent: true, reply}`, where `reply` is the receiver count.
 
 Example, `POST /api/pubsub/publish {"channel":"orders","message":"{\"id\":42}"}`. Reply: HTTP 200
@@ -4825,7 +4841,9 @@ The rules every route here keeps:
   request was on its way gets the same 409, and nothing is sent.
 - **No edit while a bulk action counts or runs**, as the TUI's bulk dialog takes every key
   until it ends: 409 `{"error":"A bulk action is running: wait for it to end, or stop it first."}`. A key added or written behind the walk
-  would otherwise outlive "every key of the pattern".
+  would otherwise outlive "every key of the pattern". An edit asked before the bulk action
+  started and answered while it counts or runs gets the same 409, and nothing is sent: the
+  check is made where the write is decided and again where its answer is granted.
 - **A command the server refused for this user is off** for the rest of the session: the
   first refusal is `"Not written: the server refused HSET for this user."` (422); after
   that it is refused before anything is sent, `"Not sent: the server refused HSET for
@@ -6247,5 +6265,1161 @@ Event `bulk`:
     "ttl": null,
     "ttl_secs": null
   }
+}
+```
+
+## Browse › Streams, Browse › Search and Hot keys from Monitor
+
+Phase 4: the TUI's Streams and Search panels as Browse's other two panels (the page's
+`#/browse/streams` and `#/browse/search`), and Hot keys ranked from a Monitor run when
+the analysis has no LFU counters. Each route reads or writes only what the TUI's panel
+does: the commands, their limits and their words are the TUI's (`src/tui/views/streams.rs`,
+`src/tui/views/search.rs`, `src/tui/views/server.rs`), built by `src/live/`, never in
+`src/web/`. Every write goes through the one write gate: `writes::decide`, then the
+question (409 `{"confirm":…}`, answered with `POST /api/confirm/{id}`), then the grant and
+`Hub::write`. A read-only profile is refused before anything is asked or sent
+(422, the gate's words), and so is any of these writes while a bulk action counts or runs
+(409 `{"error":"A bulk action is running: wait for it to end, or stop it first."}`, at the
+answer too, whether it was asked before the bulk action started or not). A Search write is
+for the node it was made on: another node picked before it is decided, or before its
+question is answered, refuses it with 409
+`{"error":"Not sent: the connection changed since the question was asked."}`, and nothing
+is sent. A read whose reply comes back on another run (a database switch, an analysis) or,
+for Search, another node than it was asked on keeps nothing and answers the same 409.
+
+A feature that is off answers HTTP 200 `{"off": "<why>"}` in the TUI's words, as the
+other panels do. Names (streams, groups, consumers, indexes, keys) come as
+`{name, id, copy}` (see "Key and pattern names"), and a request names them by `id`.
+
+There is no new event. A Monitor run's ranking follows the `monitor` event of kind
+`closed` (see `POST /api/server/monitor`): the page reads
+`GET /api/analysis/hot_keys/monitor` again then.
+
+The examples are replies of the real server in `tests/web_p4_it.rs` (Redis 8.10 and
+valkey-bundle 9.1 for Search; Redis 7.4, Valkey 8.1 and a three-shard cluster for
+Streams and Hot keys; a profile named `dev`, and `ro` for a read-only one).
+
+
+### `GET /api/streams[?refresh=1|now=1]`
+
+The streams the analysis found (the stream keys among its sampled keys, at most 50), each
+read with `XINFO STREAM`, `XINFO GROUPS` and `XINFO CONSUMERS` (and `MEMORY USAGE`) on the
+node that owns it: on a cluster the keys are grouped by owner and each node is asked for
+its own, at once. A list read under 2 s ago is answered again without asking the server,
+so two tabs polling every 5 s (as the TUI polls) cost one read. `refresh=1` reads now and
+asks again for what was refused before (the TUI's `r`). `now=1` reads now too but still
+leaves out what was refused: the page's read after a write when no pending list of that
+stream is shown, as the TUI's poll after a write (with one shown, the page reads only
+`GET /api/streams/pending`, which reads the stream's row too). The page polls every 5 s
+while the panel is shown and the entries are not open.
+
+- 409 `{"error":"not connected: connect first, or the live connection is closed"}` without
+  a ready live connection.
+- 409 `{"error":"Not sent: the connection changed since the question was asked."}` when a
+  new run started (a database switch, an analysis) while it was read: nothing of that read
+  is kept.
+- `{"off": …}` when the connect's permission check refused `XINFO`, or when the server
+  refuses or does not know `XINFO STREAM`: `"The server refused XINFO for this user, so
+  this view is off."`, or `"XINFO is not available: <why>."`.
+- Before an analysis: `status: "no_report"`, the TUI's `text`, `analysis_running`, no rows.
+  The page offers to analyze.
+- None found: `status: "none"`, `"text": "The analysis found no streams."`, `"hint": "It
+  samples keys, so it may miss some; a Deep analysis samples more."`.
+- Else `status: "ready"`: `cluster`, `rows` in the analysis's order, `found` (how many the
+  analysis found), `shown`, `note` (`"first 50 of 61 streams"`, or why the last read failed
+  and the previous one is shown), `error`, and `writes`: why the writes are off for this
+  profile (the gate's words), or `null`. The page leaves the write buttons out then.
+
+A row: `key`, `node` and `endpoint` (on a cluster: the owner it was read on), `length`,
+`bytes` (`null` when `MEMORY USAGE` is refused), `first_id`, `last_id`, `oldest_age_ms` and
+`oldest` (the TUI's short age), `entries_added`, `group_count`, `lag` (the largest group
+lag; `null` when unknown), `pending` (all groups), `verdict` (the first of `stuck`,
+`lagging`, `no readers`, `unbounded`, else `ok`), `verdicts` (each with the TUI's reason),
+`left_out` (what this user may not read), `groups` (`null` when `XINFO GROUPS` is refused,
+with `groups_text`). A group: `name`, `consumers`, `pending`, `last_delivered_id`, `lag`,
+`lagging` (1,000 or more), `readers` (`null` when `XINFO CONSUMERS` is refused): each
+consumer's `name`, `pending`, `idle_ms`/`idle`, `inactive_ms`/`inactive` (Redis 7.2 and
+later) and `stuck` (pending entries and idle 30 minutes or more); and `claim`, what the
+TUI's claim form starts with from the group: the most recently active consumer, 60000 ms,
+100 entries. The page opens the same form from a consumer's row and a pending entry's row,
+as the TUI does: that consumer's idle time (in whole seconds), and the most recently active
+of the group's other consumers to take them.
+A stream gone since the analysis is `{key, node, endpoint, gone: true, text: "The key is
+gone, or no longer a stream."}`.
+
+Example, before an analysis, `GET /api/streams`. Reply: HTTP 200
+
+```json
+{
+  "analysis_running": false,
+  "rows": [],
+  "status": "no_report",
+  "text": "Streams are found by an analysis: it samples the keys and lists the streams among them."
+}
+```
+
+Example, a read-only profile (`ro`), `GET /api/streams`. Reply: HTTP 200 (`$.rows` cut to 2 of 3)
+
+```json
+{
+  "cluster": false,
+  "error": null,
+  "found": 3,
+  "note": null,
+  "rows": [
+    {
+      "bytes": 9704,
+      "endpoint": null,
+      "entries_added": 6,
+      "first_id": "1794764710058-0",
+      "gone": false,
+      "group_count": 1,
+      "groups": [
+        {
+          "claim": {
+            "count": 100,
+            "min_idle_ms": 60000,
+            "to": {
+              "copy": "w1",
+              "id": "7731",
+              "name": "w1"
+            }
+          },
+          "consumers": 2,
+          "lag": 2,
+          "lagging": false,
+          "last_delivered_id": "1794764710059-2",
+          "name": {
+            "copy": "billing",
+            "id": "62696c6c696e67",
+            "name": "billing"
+          },
+          "pending": 4,
+          "readers": [
+            {
+              "idle": "0s",
+              "idle_ms": 218,
+              "inactive": "0s",
+              "inactive_ms": 218,
+              "name": {
+                "copy": "w1",
+                "id": "7731",
+                "name": "w1"
+              },
+              "pending": 3,
+              "stuck": false
+            },
+            {
+              "idle": "0s",
+              "idle_ms": 218,
+              "inactive": "0s",
+              "inactive_ms": 218,
+              "name": {
+                "copy": "w2",
+                "id": "7732",
+                "name": "w2"
+              },
+              "pending": 1,
+              "stuck": false
+            }
+          ]
+        }
+      ],
+      "groups_text": null,
+      "key": {
+        "copy": "p4s:orders",
+        "id": "7034733a6f7264657273",
+        "name": "p4s:orders"
+      },
+      "lag": 2,
+      "last_id": "1794764710210-0",
+      "left_out": null,
+      "length": 6,
+      "node": null,
+      "oldest": "0s",
+      "oldest_age_ms": 219,
+      "pending": 4,
+      "verdict": "ok",
+      "verdicts": []
+    },
+    {
+      "bytes": 8536,
+      "endpoint": null,
+      "entries_added": 250,
+      "first_id": "1794764710061-0",
+      "gone": false,
+      "group_count": 0,
+      "groups": [],
+      "groups_text": "No consumer groups: nothing reads this stream.",
+      "key": {
+        "copy": "p4s:big",
+        "id": "7034733a626967",
+        "name": "p4s:big"
+      },
+      "lag": null,
+      "last_id": "1794764710127-3",
+      "left_out": null,
+      "length": 250,
+      "node": null,
+      "oldest": "0s",
+      "oldest_age_ms": 216,
+      "pending": 0,
+      "verdict": "no readers",
+      "verdicts": [
+        {
+          "label": "no readers",
+          "text": "No readers: no consumer group reads this stream."
+        }
+      ]
+    }
+  ],
+  "shown": 3,
+  "status": "ready",
+  "writes": "Not sent: ro is read-only. Turn writes on in Connections."
+}
+```
+
+Example, a cluster (Valkey), `GET /api/streams?refresh=1`. Reply: HTTP 200 (`$.rows` cut to 1 of 5)
+
+```json
+{
+  "cluster": true,
+  "error": null,
+  "found": 5,
+  "note": null,
+  "rows": [
+    {
+      "bytes": 4642,
+      "endpoint": "127.0.0.1:50806",
+      "entries_added": 3,
+      "first_id": "1794764705906-0",
+      "gone": false,
+      "group_count": 1,
+      "groups": [
+        {
+          "claim": {
+            "count": 100,
+            "min_idle_ms": 60000,
+            "to": {
+              "copy": "c1",
+              "id": "6331",
+              "name": "c1"
+            }
+          },
+          "consumers": 1,
+          "lag": 1,
+          "lagging": false,
+          "last_delivered_id": "1794764705906-1",
+          "name": {
+            "copy": "g",
+            "id": "67",
+            "name": "g"
+          },
+          "pending": 2,
+          "readers": [
+            {
+              "idle": "0s",
+              "idle_ms": 86,
+              "inactive": "0s",
+              "inactive_ms": 86,
+              "name": {
+                "copy": "c1",
+                "id": "6331",
+                "name": "c1"
+              },
+              "pending": 2,
+              "stuck": false
+            }
+          ]
+        }
+      ],
+      "groups_text": null,
+      "key": {
+        "copy": "p4c:0",
+        "id": "7034633a30",
+        "name": "p4c:0"
+      },
+      "lag": 1,
+      "last_id": "1794764705906-2",
+      "left_out": null,
+      "length": 3,
+      "node": 1,
+      "oldest": "0s",
+      "oldest_age_ms": 87,
+      "pending": 2,
+      "verdict": "ok",
+      "verdicts": []
+    }
+  ],
+  "shown": 5,
+  "status": "ready",
+  "writes": null
+}
+```
+
+Example, a user without `XINFO GROUPS`, `GET /api/streams`. Reply: HTTP 200 (`$.rows` cut to 1 of 3)
+
+```json
+{
+  "cluster": false,
+  "error": null,
+  "found": 3,
+  "note": null,
+  "rows": [
+    {
+      "bytes": 9948,
+      "endpoint": null,
+      "entries_added": 5,
+      "first_id": "1794764706306-0",
+      "gone": false,
+      "group_count": null,
+      "groups": null,
+      "groups_text": "XINFO GROUPS is not available for this user.",
+      "key": {
+        "copy": "p4s:orders",
+        "id": "7034733a6f7264657273",
+        "name": "p4s:orders"
+      },
+      "lag": null,
+      "last_id": "1794764706307-2",
+      "left_out": "Left out: the server refused XINFO GROUPS for this user.",
+      "length": 5,
+      "node": null,
+      "oldest": "0s",
+      "oldest_age_ms": 203,
+      "pending": null,
+      "verdict": "ok",
+      "verdicts": []
+    }
+  ],
+  "shown": 3,
+  "status": "ready",
+  "writes": null
+}
+```
+
+Example, a user without `XINFO`, `GET /api/streams`. Reply: HTTP 200
+
+```json
+{
+  "off": "The server refused XINFO for this user, so this view is off."
+}
+```
+
+
+### `GET /api/streams/pending?key=&group=[&consumer=]`
+
+A group's pending entries, `XPENDING <key> <group> - + 100 [<consumer>]` (the TUI's
+`p`, at most 100), on the stream's owner, with the stream's row read again. `key`,
+`group` and `consumer` are the ids of the list. The stream and the group must be in the
+list (404 `"That stream is not in the list: read the streams again, or analyze again to
+update it."`, `"That group is not one of the stream's: read the streams again."`).
+The entries listed are the ones `POST /api/streams/ack` takes. A stream gone meanwhile is
+`{"pending": null, "row": {…gone…}, "text": "The key is gone, or no longer a stream."}`;
+`{"off": …}` as for the list; 409 `"Not sent: the connection changed since the question was
+asked."` when a new run started while it was read (nothing is kept).
+
+Example, `GET /api/streams/pending?key=7034733a6f7264657273&group=62696c6c696e67&consumer=7731`. Reply: HTTP 200 (`$.row` left out)
+
+```json
+{
+  "pending": {
+    "consumer": {
+      "copy": "w1",
+      "id": "7731",
+      "name": "w1"
+    },
+    "entries": [
+      {
+        "consumer": {
+          "copy": "w1",
+          "id": "7731",
+          "name": "w1"
+        },
+        "deliveries": 1,
+        "id": "1794764710058-0",
+        "idle": "0s",
+        "idle_ms": 145
+      },
+      {
+        "consumer": {
+          "copy": "w1",
+          "id": "7731",
+          "name": "w1"
+        },
+        "deliveries": 1,
+        "id": "1794764710059-0",
+        "idle": "0s",
+        "idle_ms": 145
+      },
+      {
+        "consumer": {
+          "copy": "w1",
+          "id": "7731",
+          "name": "w1"
+        },
+        "deliveries": 1,
+        "id": "1794764710059-1",
+        "idle": "0s",
+        "idle_ms": 145
+      }
+    ],
+    "error": null,
+    "group": {
+      "copy": "billing",
+      "id": "62696c6c696e67",
+      "name": "billing"
+    },
+    "key": {
+      "copy": "p4s:orders",
+      "id": "7034733a6f7264657273",
+      "name": "p4s:orders"
+    },
+    "max": 100
+  },
+  "row": "…the row, as in the list…"
+}
+```
+
+
+### `POST /api/streams/ack`, `POST /api/streams/claim`, `POST /api/streams/trim`
+
+The TUI's three stream writes, and no other. Each is checked in the TUI's order: the
+gate's refusal for a read-only profile (422), a bulk action running (409), the live
+connection (409), the view off (422, its words), then the stream (and group) in the list
+(404), then the form as the TUI's form checks it (422, its words). Then the gate: off
+`prod` XACK and XAUTOCLAIM are sent at once and XTRIM (destructive) asks; on `prod` each
+asks, and XTRIM has the stream's name typed. Each is sent to the stream's owner. The
+reply is `{"sent": true, "reply": …}`: `{"kind":"int","value":n}` for XACK (1, or 0 when
+the entry was not pending any more) and XTRIM (entries removed),
+`{"kind":"claimed","ids":[…],"deleted":n}` for XAUTOCLAIM. The page says it in the TUI's
+words (`Acknowledged <id>.`, `<id> was not pending any more.`, `Claimed 3 entries for w2.`
+and `… 1 entry no longer in the stream left the pending list.`, `Trimmed 200 entries.`,
+`Trimmed 0 entries: with ~ the server removes whole blocks only.`) and reads the list again.
+
+- `ack` `{key, group, id}`: `XACK key group id`. `id` must be an entry ID (422 `"That is
+  not a stream entry ID, such as 1700000000000-0."`) of the pending list last listed for
+  that stream and group (422 `"That entry is not in the pending list shown: list the
+  pending entries again."`).
+- `claim` `{key, group, to, min_idle_ms, count}` as typed: `XAUTOCLAIM key group to
+  min-idle 0-0 COUNT count`. `"Type the consumer that takes the entries."`, `"The min
+  idle time is a whole number of milliseconds."`, `"The count is a whole number, 1 or
+  more."`.
+- `trim` `{key, by, value}`: `by` is `MAXLEN` or `MINID` (else 400 `"trim by MAXLEN or
+  MINID"`); `XTRIM key MAXLEN ~ n` or `XTRIM key MINID ~ id`, approximate as the TUI's
+  (`"Approximate (~): the server may keep a few more."`). `"MAXLEN takes how many entries to
+  keep."`, `"MINID takes an entry ID, such as 1700000000000-0."`.
+
+Example, `POST /api/streams/ack {"group":"62696c6c696e67","id":"1794764710058-0","key":"7034733a6f7264657273"}`. Reply: HTTP 200
+
+```json
+{
+  "reply": {
+    "kind": "int",
+    "value": 1
+  },
+  "sent": true
+}
+```
+
+Example, `POST /api/streams/ack {"group":"62696c6c696e67","id":"1-1","key":"7034733a6f7264657273"}`. Reply: HTTP 422
+
+```json
+{
+  "error": "That entry is not in the pending list shown: list the pending entries again."
+}
+```
+
+Example, `POST /api/streams/claim {"count":"100","group":"62696c6c696e67","key":"7034733a6f7264657273","min_idle_ms":"0","to":"w2"}`. Reply: HTTP 200
+
+```json
+{
+  "reply": {
+    "deleted": 0,
+    "ids": [
+      "1794764710059-0",
+      "1794764710059-1",
+      "1794764710059-2"
+    ],
+    "kind": "claimed"
+  },
+  "sent": true
+}
+```
+
+Example, `POST /api/streams/trim {"by":"MAXLEN","key":"7034733a626967","value":"10"}`. Reply: HTTP 409
+
+```json
+{
+  "confirm": {
+    "expect": null,
+    "id": "fc4f0277580b9e927e40ee756d876365",
+    "kind": "ask",
+    "text": "Send XTRIM p4s:big MAXLEN ~ 10 to dev? This can't be undone."
+  }
+}
+```
+
+Example, its answer, `POST /api/confirm/fc4f0277580b9e927e40ee756d876365`. Reply: HTTP 200
+
+```json
+{
+  "reply": {
+    "kind": "int",
+    "value": 200
+  },
+  "sent": true
+}
+```
+
+Example, a read-only profile, `POST /api/streams/trim {"by":"MAXLEN","key":"7034733a626967","value":"10"}`. Reply: HTTP 422
+
+```json
+{
+  "error": "Not sent: ro is read-only. Turn writes on in Connections."
+}
+```
+
+
+### `GET /api/search[?refresh=1]`
+
+The indexes of the picked node (on a cluster: `POST /api/node`), from `FT._LIST`, each
+with `FT.INFO` (the TUI's limit: at most 50 indexes). Read on each request, as the TUI reads
+the list when its view is shown: the page asks when the panel is shown and after each of
+its writes, and does not poll. A module found missing, or `FT._LIST` refused, is not asked
+again until `refresh=1`, which reads now and asks again for what was refused (the TUI's
+`r`). A reply that comes back on another run or another node than it was asked on keeps
+nothing and answers 409 `"Not sent: the connection changed since the question was asked."`.
+
+- `{"off": …, "no_module": true, "detail": …}` without the module: the permission check
+  skipped `FT._LIST`, or the server does not know it. `{"off": …, "no_module": false,
+  "detail": null}` when it is refused for this user (`"The server refused FT._LIST for this
+  user, so this view is off."`).
+- Else `module` (`Redis Search` or `valkey-search`), `node` and `node_title` on a cluster,
+  `indexes`, `total`, `first_of` (`"first 50 of 140 indexes"`), `notes`, `empty`
+  (`{title, text}` when there is none), `error` (the last read failed; the previous one is
+  shown), `cmd_off` (why FT.SEARCH, FT.EXPLAIN or FT.PROFILE is off: refused or unknown,
+  found on use), `busy` (the command running, named as in its messages: `"FT.SEARCH"`,
+  `"FT.EXPLAIN"` or `"FT.PROFILE"`), `last_query` (and `last_query_copy`, `null` when
+  escaping changed it; the page's query box starts from it), `results` (the last results' first page) and `writes` (why
+  writes are off, or `null`).
+
+An index: `name`, `info` (`false` when `FT.INFO` was refused: only the name is known, with
+`info_text`), `on` (`HASH` or `JSON`), `prefixes`, `docs`, `bytes` (`null` when the
+module does not report it), `indexing`, `progress` and `progress_text`, `building`,
+`failures`, `left_out`, `schema` (`name`, `path` when it is not the name, `type`, `flags`)
+and `fields_text`.
+
+Example, no module (Redis 7.4), `GET /api/search`. Reply: HTTP 200
+
+```json
+{
+  "detail": "FT._LIST is unknown, so there is no Redis Search (built into Redis 8) or valkey-search to list indexes from.",
+  "no_module": true,
+  "off": "FT._LIST is not available: the Search module is not loaded."
+}
+```
+
+Example, Redis 8, no index yet, `GET /api/search`. Reply: HTTP 200
+
+```json
+{
+  "busy": null,
+  "cmd_off": {
+    "explain": null,
+    "profile": null,
+    "search": null
+  },
+  "empty": {
+    "text": "Redis Search is loaded; nothing was created with FT.CREATE yet.",
+    "title": "The module has no indexes."
+  },
+  "error": null,
+  "first_of": null,
+  "indexes": [],
+  "last_query": null,
+  "last_query_copy": null,
+  "module": "Redis Search",
+  "node": null,
+  "node_title": null,
+  "notes": [],
+  "results": null,
+  "total": 0,
+  "writes": null
+}
+```
+
+Example, valkey-search, after FT.EXPLAIN and FT.PROFILE were found missing, `GET /api/search`. Reply: HTTP 200 (`$.results.docs` cut to 1)
+
+```json
+{
+  "busy": null,
+  "cmd_off": {
+    "explain": "The server does not support FT.EXPLAIN.",
+    "profile": "The server does not support FT.PROFILE.",
+    "search": null
+  },
+  "empty": null,
+  "error": null,
+  "first_of": null,
+  "indexes": [
+    {
+      "building": false,
+      "bytes": null,
+      "docs": 3,
+      "failures": 0,
+      "fields_text": null,
+      "indexing": false,
+      "info": true,
+      "info_text": null,
+      "left_out": "left out: size (valkey-search does not report it)",
+      "name": {
+        "copy": "p4idx",
+        "id": "7034696478",
+        "name": "p4idx"
+      },
+      "on": "HASH",
+      "prefixes": [
+        "p4p:"
+      ],
+      "progress": 1.0,
+      "progress_text": "100%",
+      "schema": [
+        {
+          "flags": [],
+          "name": "price",
+          "path": null,
+          "type": "NUMERIC"
+        },
+        {
+          "flags": [],
+          "name": "title",
+          "path": null,
+          "type": "TEXT"
+        }
+      ]
+    }
+  ],
+  "last_query": "@title:red",
+  "last_query_copy": "@title:red",
+  "module": "valkey-search",
+  "node": null,
+  "node_title": null,
+  "notes": [],
+  "results": {
+    "cmd": "search",
+    "count": "2 matches",
+    "docs": [
+      {
+        "field_count": 2,
+        "fields": [
+          {
+            "name": "price",
+            "value": "20"
+          },
+          {
+            "name": "title",
+            "value": "red shoe"
+          }
+        ],
+        "index": 0,
+        "key": {
+          "copy": "p4p:2",
+          "id": "7034703a32",
+          "name": "p4p:2"
+        }
+      }
+    ],
+    "empty": null,
+    "from": 0,
+    "index": {
+      "copy": "p4idx",
+      "id": "7034696478",
+      "name": "p4idx"
+    },
+    "kept": 2,
+    "max": 50,
+    "page": 10,
+    "query": "@title:red",
+    "run": 3,
+    "took": "<1 ms",
+    "total": 2
+  },
+  "total": 1,
+  "writes": null
+}
+```
+
+
+### `POST /api/search/query`
+
+Body `{index, cmd, query?}`: `index` is an index's id from the list (404 `"That index is
+not in the list: read the indexes again."`), `cmd` is `search`, `explain` or `profile`
+(else 400). As the TUI sends them, on the picked node:
+
+- `search`: `FT.SEARCH <index> <query> LIMIT 0 50`, the query as typed (a newline is a
+  space, other control characters are dropped, empty is `*`; more than 1,000 characters is
+  422 `"A query is at most 1,000 characters."`). It becomes the last query.
+- `explain`, `profile`: `FT.EXPLAIN <index> <last query>`, `FT.PROFILE <index> SEARCH
+  QUERY <last query> LIMIT 0 50`. They take no `query` (422 `"FT.EXPLAIN and FT.PROFILE
+  use the query last run: send no query."`) and need one run first (422 `"Run a query
+  first: FT.EXPLAIN uses the query last run."`).
+
+One at a time: 409 `"FT.SEARCH is still running: wait for its answer."`. No
+`FT.AGGREGATE` (the TUI has none). The reply is `{cmd, results, text}`: `results` the first
+page (as `GET /api/search/results`) for `search` and `profile`, `text` (`{lines, empty}`)
+for `explain` and `profile`. A command the server refuses or does not know answers
+`{"off": …}` and stays off (in `cmd_off`) until `refresh=1`. A reply that comes back after
+another node was picked or a new run started keeps nothing (no results, no command off)
+and answers 409 `"Not sent: the connection changed since the question was asked."`; the
+query slot is freed only by the query that took it. Any other failure is 422 with
+the module's message about the query (`"FT.SEARCH failed: Syntax error at offset 7 near
+price."`), or `"FT.SEARCH failed: the server could not run the query."` when that message
+would not be shown.
+
+Example, `POST /api/search/query {"cmd":"search","index":"7034696478","query":"@price:[0 100]"}`. Reply: HTTP 200 (`$.results.docs` cut to 2 of 3)
+
+```json
+{
+  "cmd": "search",
+  "results": {
+    "cmd": "search",
+    "count": "3 matches",
+    "docs": [
+      {
+        "field_count": 2,
+        "fields": [
+          {
+            "name": "title",
+            "value": "red shoe"
+          },
+          {
+            "name": "price",
+            "value": "10"
+          }
+        ],
+        "index": 0,
+        "key": {
+          "copy": "p4p:1",
+          "id": "7034703a31",
+          "name": "p4p:1"
+        }
+      },
+      {
+        "field_count": 2,
+        "fields": [
+          {
+            "name": "title",
+            "value": "red shoe"
+          },
+          {
+            "name": "price",
+            "value": "20"
+          }
+        ],
+        "index": 1,
+        "key": {
+          "copy": "p4p:2",
+          "id": "7034703a32",
+          "name": "p4p:2"
+        }
+      }
+    ],
+    "empty": null,
+    "from": 0,
+    "index": {
+      "copy": "p4idx",
+      "id": "7034696478",
+      "name": "p4idx"
+    },
+    "kept": 3,
+    "max": 50,
+    "page": 10,
+    "query": "@price:[0 100]",
+    "run": 1,
+    "took": "1 ms",
+    "total": 3
+  },
+  "text": null
+}
+```
+
+Example, `POST /api/search/query {"cmd":"explain","index":"7034696478"}`. Reply: HTTP 200
+
+```json
+{
+  "cmd": "explain",
+  "index": {
+    "copy": "p4idx",
+    "id": "7034696478",
+    "name": "p4idx"
+  },
+  "query": "@title:red",
+  "results": null,
+  "text": {
+    "empty": null,
+    "lines": [
+      "@title:UNION {",
+      "  @title:red",
+      "  @title:+red(expanded)",
+      "}"
+    ]
+  }
+}
+```
+
+Example, `POST /api/search/query {"cmd":"profile","index":"7034696478"}`. Reply: HTTP 200 (`$.results.docs` cut to 1, `$.text.lines` to 6)
+
+```json
+{
+  "cmd": "profile",
+  "index": {
+    "copy": "p4idx",
+    "id": "7034696478",
+    "name": "p4idx"
+  },
+  "query": "@title:red",
+  "results": {
+    "cmd": "profile",
+    "count": "2 matches",
+    "docs": [
+      {
+        "field_count": 2,
+        "fields": [
+          {
+            "name": "title",
+            "value": "red shoe"
+          },
+          {
+            "name": "price",
+            "value": "10"
+          }
+        ],
+        "index": 0,
+        "key": {
+          "copy": "p4p:1",
+          "id": "7034703a31",
+          "name": "p4p:1"
+        }
+      }
+    ],
+    "empty": null,
+    "from": 0,
+    "index": {
+      "copy": "p4idx",
+      "id": "7034696478",
+      "name": "p4idx"
+    },
+    "kept": 2,
+    "max": 50,
+    "page": 10,
+    "query": "@title:red",
+    "run": 4,
+    "took": "1 ms",
+    "total": 2
+  },
+  "text": {
+    "empty": null,
+    "lines": [
+      "Shards",
+      "  - Total profile time: 0.739417",
+      "    Parsing time: 0.095084",
+      "    Workers queue time: 0.573125",
+      "    Pipeline creation time: 0.037583",
+      "    Total GIL time: 0.031877"
+    ]
+  }
+}
+```
+
+Example, valkey-search, `POST /api/search/query {"cmd":"explain","index":"7034696478"}`. Reply: HTTP 200
+
+```json
+{
+  "off": "The server does not support FT.EXPLAIN."
+}
+```
+
+Example, `POST /api/search/query {"cmd":"search","index":"7034696478","query":"@price:["}`. Reply: HTTP 422
+
+```json
+{
+  "error": "FT.SEARCH failed: Syntax error at offset 7 near price."
+}
+```
+
+
+### `GET /api/search/results?run=&from=`, `GET /api/search/field?run=&doc=&field=[&format=&width=]`
+
+A page of 10 of the last results (`run` is `results.run`), from `from`; and one field of
+one result whole, drawn in a format as a value's item is (`GET /api/value/item`). Results
+of an earlier run are 409 `"Those results are not the last query's: run it again."`; a
+`doc` or `field` that is not there is 404 `"There is no such result, or no such field in
+it."`. A result: `index`, `key`, `field_count`, `fields` (`name`, and `value`, a preview).
+`total` is what the module counted, `kept` how many it returned (at most `max`, 50).
+
+Example, `GET /api/search/results?run=1&from=0`. Reply: HTTP 200 (`$.docs` cut to 1 of 3)
+
+```json
+{
+  "cmd": "search",
+  "count": "3 matches",
+  "docs": [
+    {
+      "field_count": 2,
+      "fields": [
+        {
+          "name": "title",
+          "value": "red shoe"
+        },
+        {
+          "name": "price",
+          "value": "10"
+        }
+      ],
+      "index": 0,
+      "key": {
+        "copy": "p4p:1",
+        "id": "7034703a31",
+        "name": "p4p:1"
+      }
+    }
+  ],
+  "empty": null,
+  "from": 0,
+  "index": {
+    "copy": "p4idx",
+    "id": "7034696478",
+    "name": "p4idx"
+  },
+  "kept": 3,
+  "max": 50,
+  "page": 10,
+  "query": "@price:[0 100]",
+  "run": 1,
+  "took": "1 ms",
+  "total": 3
+}
+```
+
+Example, `GET /api/search/field?run=1&doc=2&field=0`. Reply: HTTP 200
+
+```json
+{
+  "doc": 2,
+  "field": 0,
+  "key": {
+    "copy": "p4p:3",
+    "id": "7034703a33",
+    "name": "p4p:3"
+  },
+  "name": "title",
+  "run": 1,
+  "shown": {
+    "bytes": 8,
+    "compression": null,
+    "copy": "blue hat",
+    "copy_refused": null,
+    "detected": "text",
+    "format": "text",
+    "formats": [
+      "text",
+      "hex",
+      "JSON",
+      "MessagePack",
+      "PHP",
+      "Pickle",
+      "Protobuf",
+      "Java"
+    ],
+    "header": "value · text · 8 bytes · auto-detected",
+    "lines": [
+      "blue hat"
+    ],
+    "note": null,
+    "picked": null,
+    "truncated": false
+  }
+}
+```
+
+
+### `POST /api/search/create`, `POST /api/search/drop`
+
+The TUI's `C` and `D`, through the write gate, on the picked node: the node whose list
+the index was checked against. Another node picked before the write is decided, or before
+its question is answered, refuses it with 409 `"Not sent: the connection changed since the
+question was asked."`, and nothing is sent to either node.
+
+- `create` `{name, on, prefixes, fields}` as typed: `on` is `HASH` or `JSON` (else 400);
+  `prefixes` separated by spaces or commas (empty: every key); `fields` as `name TYPE, …`,
+  on JSON `$.path AS alias TYPE`. Checked as the TUI's form checks it (`"Type the index's
+  name."`, `"An index name has no spaces."`, `"A field's type is TEXT, TAG, NUMERIC or GEO,
+  not WORDS."`, `"Add at least one field, such as title TEXT."`, …), then `FT.CREATE`. An
+  edit: sent at once off `prod`.
+- `drop` `{index}`: an index of the list, `FT.DROPINDEX <index>` without `DD`: its
+  documents stay. Destructive: asked, and on `prod` the index's name is typed.
+
+Without the module both are 422 `"Not available: the server has no Search module, so
+indexes can't be created or dropped."`. The reply is `{"sent": true, "reply":
+{"kind":"ok"}}`; the page says `Created index <name>.` or `Dropped index <name>. Its
+documents stay.` and reads the list again.
+
+Example, `POST /api/search/create {"fields":"title TEXT, price NUMERIC","name":"p4idx","on":"HASH","prefixes":"p4p:"}`. Reply: HTTP 200
+
+```json
+{
+  "reply": {
+    "kind": "ok"
+  },
+  "sent": true
+}
+```
+
+Example, `POST /api/search/create {"fields":"title TEXT","name":"p4 idx","on":"HASH","prefixes":""}`. Reply: HTTP 422
+
+```json
+{
+  "error": "An index name has no spaces."
+}
+```
+
+Example, `POST /api/search/drop {"index":"7034696478"}`. Reply: HTTP 409
+
+```json
+{
+  "confirm": {
+    "expect": null,
+    "id": "bee3c691082b85bdea082b47c2d51ed0",
+    "kind": "ask",
+    "text": "Send FT.DROPINDEX p4idx to dev? This can't be undone."
+  }
+}
+```
+
+Example, its answer, `POST /api/confirm/bee3c691082b85bdea082b47c2d51ed0`. Reply: HTTP 200
+
+```json
+{
+  "reply": {
+    "kind": "ok"
+  },
+  "sent": true
+}
+```
+
+Example, no module, `POST /api/search/create {"fields":"title TEXT","name":"p4idx","on":"HASH","prefixes":"p4p:"}`. Reply: HTTP 422
+
+```json
+{
+  "error": "Not available: the server has no Search module, so indexes can't be created or dropped."
+}
+```
+
+
+### `GET /api/analysis/hot_keys/monitor`
+
+Hot keys ranked from the last Monitor run (`POST /api/server/monitor`), for when the
+analysis has no hot keys (no LFU policy, or `OBJECT FREQ` refused), as the TUI's Hot keys
+shows it. A run that ends keeps its lines, and their keys are found from each command's
+key specs: `COMMAND INFO` for the command names the session does not know yet (shared
+with Server › Slow log, at most 8 requests, on the node Monitor ran on, through the
+command budget; never `COMMAND GETKEYS`, so no logged argument goes back to the server).
+They are ranked once that is done. With `COMMAND INFO` refused, the lines of commands
+whose specs are unknown count in `unknown`, and `keys_note` says why (`"Key names are off:
+<why>."`). 409 `{"error":"No analysis yet: analyze the keys first."}` before an analysis.
+
+`status` is `lfu` (the analysis has hot keys; the panel ranks by them), `none` (no run has
+ended in this session; `text` says where to start one), `pending` (the keys are being
+placed) or `ready`, with `ranking`: `title` (the TUI's line: run length, lines, when),
+`secs`, `lines`, `at_unix`, `unknown` and `unknown_text` (lines whose keys could not be
+found), `keys_note` (why the keys were not looked up, when they were not), `node`,
+`endpoint`, `rows` (`key`, `count`, `share` of the lines, `named`, `pattern`) and `empty`.
+
+Example, `GET /api/analysis/hot_keys/monitor`. Reply: HTTP 200
+
+```json
+{
+  "ranking": null,
+  "status": "none",
+  "text": "Or rank keys by how often Monitor sees them: Server › Monitor."
+}
+```
+
+Example, just after the run stopped, `GET /api/analysis/hot_keys/monitor`. Reply: HTTP 200
+
+```json
+{
+  "ranking": null,
+  "status": "pending",
+  "text": "Ranking the keys of the last Monitor run…"
+}
+```
+
+Example, `GET /api/analysis/hot_keys/monitor`. Reply: HTTP 200
+
+```json
+{
+  "ranking": {
+    "at_unix": 1794764707,
+    "empty": null,
+    "endpoint": null,
+    "keys_note": null,
+    "lines": 10,
+    "node": 0,
+    "rows": [
+      {
+        "count": 6,
+        "key": {
+          "copy": "p4h:a",
+          "id": "7034683a61",
+          "name": "p4h:a"
+        },
+        "named": "p4h:a · named 6 times in 10 lines",
+        "pattern": {
+          "copy": "p4h:a",
+          "id": "7034683a61",
+          "name": "p4h:a"
+        },
+        "share": 0.6
+      },
+      {
+        "count": 4,
+        "key": {
+          "copy": "p4h:b",
+          "id": "7034683a62",
+          "name": "p4h:b"
+        },
+        "named": "p4h:b · named 4 times in 10 lines",
+        "pattern": {
+          "copy": "p4h:b",
+          "id": "7034683a62",
+          "name": "p4h:b"
+        },
+        "share": 0.4
+      },
+      {
+        "count": 1,
+        "key": {
+          "copy": "p4h:c",
+          "id": "7034683a63",
+          "name": "p4h:c"
+        },
+        "named": "p4h:c · named once in 10 lines",
+        "pattern": {
+          "copy": "p4h:c",
+          "id": "7034683a63",
+          "name": "p4h:c"
+        },
+        "share": 0.1
+      }
+    ],
+    "secs": 0,
+    "title": "from Monitor, 0 s, 10 lines, at 17:45 UTC",
+    "unknown": 0,
+    "unknown_text": null
+  },
+  "status": "ready",
+  "text": "Ranked by how often the last Monitor run named each key, because the analysis has no LFU counters: a short sample, not the server's own counters."
 }
 ```

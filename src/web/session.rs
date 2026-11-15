@@ -171,6 +171,12 @@ pub struct Current {
     /// The bulk expire or delete of this connection (one at a time, as the TUI's
     /// dialog): its dry run, its question, its run and how it ended.
     pub bulk: Option<crate::web::api::bulk::Bulk>,
+    /// Hot keys from Monitor: the lines of the run, and the ranking of the last one.
+    pub hot: crate::web::api::hot::Hot,
+    /// Browse › Streams: what the last read of the streams found.
+    pub streams: crate::web::api::streams::Streams,
+    /// Browse › Search: the commands found off, the last query and its results.
+    pub search: crate::web::api::search::Search,
 }
 
 /// How this session's analyses went, beside what the TUI's [`Session`] keeps (the
@@ -248,6 +254,9 @@ impl Current {
             own_snapshots: false,
             resub: None,
             bulk: None,
+            hot: Default::default(),
+            streams: Default::default(),
+            search: Default::default(),
         }
     }
 
@@ -789,11 +798,15 @@ impl Hub {
                     id: c.id,
                     run: m.run,
                 });
+                // As the TUI ranks a run its rescan ended: at once, with what is known.
+                crate::web::api::hot::end_run(c, m.run, false);
                 events.push(Event::new(
                     "monitor",
                     serde_json::json!({ "run": m.run, "kind": "closed", "end": "stopped", "error": null }),
                 ));
             }
+            c.streams = Default::default();
+            c.search = Default::default();
             c.resub = db.and(tail.map(|t| (t.to, t.node)));
             c.drain();
             let s = &mut c.session;
@@ -1017,6 +1030,8 @@ impl Hub {
                 if c.session.picked != index {
                     c.slow_entries.clear();
                     c.client_conns.clear();
+                    // Search reads the picked node: what it found was another node's.
+                    c.search = Default::default();
                 }
                 c.session.picked = index;
                 c.live.node = index;
@@ -1109,6 +1124,12 @@ impl Hub {
         self.test_hold.store(hold, Ordering::SeqCst);
     }
 
+    /// Tests: `msg` as if the runtime sent it.
+    #[cfg(test)]
+    pub(crate) fn apply_for_test(self: &Arc<Self>, msg: Msg) {
+        self.apply(msg);
+    }
+
     /// Tests: how many requests (reads and writes) were sent so far.
     #[cfg(test)]
     pub(crate) fn sent_count(&self) -> usize {
@@ -1121,6 +1142,22 @@ impl Hub {
     pub(crate) fn answer_oldest(&self, result: LiveResult) -> bool {
         self.with_mut(|c| {
             let Some(id) = c.pending.keys().min_by_key(|r| r.0).copied() else {
+                return false;
+            };
+            c.writes.remove(&id);
+            c.pending
+                .remove(&id)
+                .is_some_and(|tx| tx.send(result).is_ok())
+        })
+        .unwrap_or(false)
+    }
+
+    /// Tests: answers the newest request still waiting with `result`. False when none
+    /// waits.
+    #[cfg(test)]
+    pub(crate) fn answer_newest(&self, result: LiveResult) -> bool {
+        self.with_mut(|c| {
+            let Some(id) = c.pending.keys().max_by_key(|r| r.0).copied() else {
                 return false;
             };
             c.writes.remove(&id);
@@ -1265,6 +1302,7 @@ impl Hub {
                 node,
                 started_at_unix_ms: None,
             });
+            c.hot.begin(run, node);
             runner.run(Effect::Monitor {
                 id: c.id,
                 scan: c.session.scan,
@@ -1280,21 +1318,27 @@ impl Hub {
     }
 
     /// Stops the Monitor run, if one runs.
-    pub fn stop_monitor(&self) -> bool {
+    /// Its keys are then ranked for Hot keys, as the TUI ranks a run `esc` stopped.
+    pub fn stop_monitor(self: &Arc<Self>) -> bool {
+        let mut settle = None;
         let stopped = {
             let mut g = lock(&self.inner);
             let Inner { runner, cur, .. } = &mut *g;
-            match cur
-                .as_mut()
-                .and_then(|c| c.monitor.take().map(|m| (c.id, m)))
-            {
-                Some((id, m)) => {
-                    runner.run(Effect::StopMonitor { id, run: m.run });
+            match cur.as_mut().and_then(|c| c.monitor.take().map(|m| (c, m))) {
+                Some((c, m)) => {
+                    runner.run(Effect::StopMonitor {
+                        id: c.id,
+                        run: m.run,
+                    });
+                    settle = crate::web::api::hot::end_run(c, m.run, true);
                     Some(m.run)
                 }
                 None => None,
             }
         };
+        if let Some(conn) = settle {
+            self.settle_hot(conn);
+        }
         if let Some(run) = stopped {
             self.emit(Event::new(
                 "monitor",
@@ -1303,6 +1347,14 @@ impl Hub {
             self.emit_state();
         }
         stopped.is_some()
+    }
+
+    /// Places the keys of connection `conn`'s ended Monitor run and ranks them, in a
+    /// task of its own ([`crate::web::api::hot::settle`]).
+    fn settle_hot(self: &Arc<Self>, conn: ConnId) {
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(crate::web::api::hot::settle(Arc::clone(self), conn));
+        }
     }
 
     /// Ends everything: the server is shutting down.
@@ -1317,6 +1369,7 @@ impl Hub {
         let mut events = Vec::new();
         let mut state = false;
         let history;
+        let settle;
         {
             let mut g = lock(&self.inner);
             let Inner {
@@ -1346,6 +1399,7 @@ impl Hub {
                     id: c.id,
                     run: m.run,
                 });
+                crate::web::api::hot::end_run(c, m.run, false);
                 events.push(Event::new(
                     "monitor",
                     serde_json::json!({
@@ -1361,6 +1415,7 @@ impl Hub {
                 .history_due
                 .take()
                 .map(|r| (c.id, c.session.scan, r));
+            settle = c.hot.due.take();
             // After a database switch, the tail that ran subscribes again on the new
             // live connection, as in the TUI.
             let resub = if ready && c.live_ready() {
@@ -1393,6 +1448,9 @@ impl Hub {
         }
         if let Some((id, scan, report)) = history {
             self.load_history(id, scan, report);
+        }
+        if let Some(conn) = settle {
+            self.settle_hot(conn);
         }
         if state {
             self.emit_state();
@@ -1609,6 +1667,7 @@ fn apply_to(c: &mut Current, msg: Msg, events: &mut Vec<Event>, state: &mut bool
         } if this(c, id, scan) => {
             if let Some(m) = c.monitor.as_mut().filter(|m| m.run == run) {
                 m.started_at_unix_ms = Some(at_unix_ms);
+                c.hot.ready(run, at_unix_ms);
                 events.push(Event::new(
                     "monitor",
                     serde_json::json!({
@@ -1628,6 +1687,7 @@ fn apply_to(c: &mut Current, msg: Msg, events: &mut Vec<Event>, state: &mut bool
             run,
             lines,
         } if this(c, id, scan) && c.monitor.as_ref().is_some_and(|m| m.run == run) => {
+            c.hot.lines(run, &lines);
             let lines: Vec<dto::MonitorLine> = lines.iter().map(dto::MonitorLine::of).collect();
             events.push(Event::new(
                 "monitor",
@@ -1638,6 +1698,8 @@ fn apply_to(c: &mut Current, msg: Msg, events: &mut Vec<Event>, state: &mut bool
             if this(c, id, scan) && c.monitor.as_ref().is_some_and(|m| m.run == run) =>
         {
             c.monitor = None;
+            // Its keys are placed and ranked once this message is applied.
+            c.hot.due = crate::web::api::hot::end_run(c, run, true);
             let (end, error) = match end {
                 Ok(crate::live::monitor::End::TimeUp) => ("time_up", None),
                 Ok(crate::live::monitor::End::LineCap) => ("line_cap", None),

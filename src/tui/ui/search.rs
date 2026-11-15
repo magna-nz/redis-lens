@@ -40,7 +40,12 @@ const WIDE_LIST: usize = 60;
 
 /// Which search module the server runs, for the reasons.
 fn module(ctx: &Ctx<'_>) -> &'static str {
-    match ctx.server().map(|s| s.flavor) {
+    module_name(ctx.server().map(|s| s.flavor))
+}
+
+/// [`module`] for a server of `flavor`.
+pub(crate) fn module_name(flavor: Option<ServerFlavor>) -> &'static str {
+    match flavor {
         Some(ServerFlavor::Redis) => "Redis Search",
         Some(ServerFlavor::Valkey) => "valkey-search",
         _ => "the Search module",
@@ -578,7 +583,7 @@ fn draw_deeper(
     }
 }
 
-fn progress_cell(i: &IndexInfo) -> (String, bool) {
+pub(crate) fn progress_cell(i: &IndexInfo) -> (String, bool) {
     match (i.indexing, i.progress) {
         (Some(true), Some(p)) => (format::percent(p), true),
         (Some(true), None) => ("building".to_string(), true),
@@ -650,7 +655,7 @@ fn list_row(i: &IndexInfo, nw: usize, pw: usize, shown: [bool; 4]) -> Line<'stat
 }
 
 /// What the module did not return for `i`, with why.
-fn left_out(i: &IndexInfo, module: &str) -> Vec<String> {
+pub(crate) fn left_out(i: &IndexInfo, module: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut add = |missing: bool, what: &str| {
         if missing {
