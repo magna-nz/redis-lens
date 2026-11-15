@@ -685,6 +685,7 @@ A web UI served by redis-lens on `127.0.0.1`, an alternative to the TUI with the
 | fixes | Ten server issues the page found: server text reaching a reply (rule 3), Monitor not asking, TUI keys in messages, polling control, edit parity, findings from the server | `409c9e7` | **done** |
 | verifier | One blocking finding, eight should-fix and ten small ones, all fixed with tests. Blocking: an address like `valkey://user:password@host` was taken as a host, so its password was shown and written to the config file (on main too, for `conn add` and the TUI's add flow): `valkey://` is now a `redis://` URL and other schemes or userinfo in a host are refused. Also: server error codes the wording filter missed; a profile made read-only elsewhere still writing; no caps on the command line; `conn test` outside the shared budget; the sign-in URL as a program argument | `6459f35` | **done** |
 | sign-in | The cookie is gone: the token travels in the URL fragment and an `Authorization` header, so no other local port ever receives it; the browser is opened through a private redirect file | `6459f35`, page in a later commit | **done** |
+| docs | `docs/dashboard.gif` (`make dashboard-gif`, `demo/record-dashboard.mjs`) in the README beside the terminal GIF; the site has a Terminal / Dashboard switch (`?ui=`, remembered in the browser) and dashboard pages with a screenshot per screen; the generator moved to `docs/site-src/` (`make site`) | **done**. Next: a light theme for the site, and fonts and mermaid served locally |
 
 ### Decisions taken alone (dashboard)
 

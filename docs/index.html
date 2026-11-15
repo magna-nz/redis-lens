@@ -3,23 +3,24 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>redis-lens: a terminal UI for Redis and Valkey</title>
-<meta name="description" content="redis-lens lists your Redis and Valkey keys and shows their values, finds the keys that use the most memory, and shows the server live. Production connections are read-only unless you turn writes on.">
+<title>redis-lens: a terminal UI and web dashboard for Redis and Valkey</title>
+<meta name="description" content="redis-lens lists your Redis and Valkey keys and shows their values, finds the keys that use the most memory, and shows the server live. In the terminal or in the browser. Production connections are read-only unless you turn writes on.">
 <meta name="theme-color" content="#111215">
 <link rel="icon" href="mark.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650;700&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="site.css">
-<script>document.documentElement.classList.add('js');</script>
+<script>(function(){var d=document.documentElement,u=null;d.classList.add('js');try{u=new URLSearchParams(location.search).get('ui');}catch(e){}if(u!=='terminal'&&u!=='dashboard'){try{u=localStorage.getItem('redis-lens.docs.ui');}catch(e){u=null;}}d.setAttribute('data-ui',u==='dashboard'?'dashboard':'terminal');})();</script>
 </head>
 <body>
 <a class="skip" href="#introduction">Skip to content</a>
 <header class="topbar">
 <img src="mark.svg" alt="">
 <span class="title">redis-lens</span>
-<span class="sub">Redis and Valkey in the terminal</span>
+<span class="sub">Redis and Valkey, in the terminal and the browser</span>
 <span class="spacer"></span>
+<div class="ui-switch" role="group" aria-label="Show the instructions for"><button type="button" data-ui-choice="terminal" aria-pressed="true">Terminal</button><button type="button" data-ui-choice="dashboard" aria-pressed="false">Dashboard</button></div>
 <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="nav">Sections</button>
 <a class="toplink crate" href="https://crates.io/crates/redis-lens" target="_blank" rel="noopener">crates.io</a>
 <a class="toplink" href="https://github.com/magna-nz/redis-lens" target="_blank" rel="noopener">GitHub</a>
@@ -30,11 +31,12 @@
 <li><a href="#introduction">Introduction</a></li>
 <li><a href="#install">Install</a></li>
 <li><a href="#quickstart">Quickstart</a><ul class="sub-nav">
+<li data-only="dashboard"><a href="#quickstart-dashboard">Open the dashboard</a></li>
 <li><a href="#quickstart-demo">Try the demo</a></li>
 </ul></li>
 </ul></div>
 <div class="nav-group"><div class="nav-label">Use it</div><ul>
-<li><a href="#tui">The TUI</a><ul class="sub-nav">
+<li data-only="terminal"><a href="#tui">The TUI</a><ul class="sub-nav">
 <li><a href="#tui-layout">Screen layout</a></li>
 <li><a href="#tui-connections">0 Connections</a></li>
 <li><a href="#tui-overview">1 Overview</a></li>
@@ -47,7 +49,19 @@
 <li><a href="#tui-help">The ? help</a></li>
 <li><a href="#tui-more">Database, copy, theme</a></li>
 </ul></li>
-<li><a href="#keys">Key reference</a><ul class="sub-nav">
+<li data-only="dashboard"><a href="#dashboard">The dashboard</a><ul class="sub-nav">
+<li><a href="#dash-start">Starting and stopping</a></li>
+<li><a href="#dash-access">Who can open it</a></li>
+<li><a href="#dash-rules">The same rules</a></li>
+<li><a href="#dash-connections">Connections</a></li>
+<li><a href="#dash-overview">Overview</a></li>
+<li><a href="#dash-server">Server</a></li>
+<li><a href="#dash-pubsub">Pub/Sub</a></li>
+<li><a href="#dash-cmdline">Command line</a></li>
+<li><a href="#dash-theme">Light theme</a></li>
+<li><a href="#dash-not-yet">Not in the dashboard yet</a></li>
+</ul></li>
+<li data-only="terminal"><a href="#keys">Key reference</a><ul class="sub-nav">
 <li><a href="#keys-everywhere">Everywhere</a></li>
 <li><a href="#keys-browse-keys">Browse › Keys</a></li>
 <li><a href="#keys-browse-keys-a-key-s-value">A key's value</a></li>
@@ -121,8 +135,9 @@
 <h1>redis-lens</h1>
 <p class="lede">redis-lens lists your keys and shows their values, finds the keys and key patterns that use the most memory, and shows live server stats, connected clients, the slow log and Pub/Sub messages. You can also run commands and edit keys from it.</p>
 <div class="badges"><span>Redis 6.2 and later</span><span>Valkey 8</span><span>standalone, cluster, Sentinel</span><span>macOS · Linux · Windows</span><span>MIT</span></div>
-<p>To see what uses the memory, press <kbd>r</kbd>. redis-lens samples the keys with <code>SCAN</code>, groups them into patterns such as <code>user:{id}:cart</code>, and lists each pattern's key count, memory, average size and how many keys have no TTL. A pattern that looks wrong, such as keys that never expire or one very large list, is marked <code>▲</code> with the reason.</p>
-<p>To find a key, press <kbd>ctrl-f</kbd> on any screen and type part of its name or a pattern. Other screens show the server (stats, clients, the slow log, <code>MONITOR</code>), streams and consumer groups, Pub/Sub, Search indexes, and a <code>:</code> command line. Snapshots, diffs, trends and <code>--check</code> rules run the same analysis from cron or CI.</p>
+<p data-only="terminal">To see what uses the memory, press <kbd>r</kbd>. redis-lens samples the keys with <code>SCAN</code>, groups them into patterns such as <code>user:{id}:cart</code>, and lists each pattern's key count, memory, average size and how many keys have no TTL. A pattern that looks wrong, such as keys that never expire or one very large list, is marked <code>▲</code> with the reason.</p>
+<p data-only="dashboard">redis-lens runs in the terminal, and the same program serves a web dashboard on <code>127.0.0.1</code>. The dashboard has five screens so far: Connections, Overview, Server (clients, the slow log, <code>MONITOR</code>), Pub/Sub and a command line. It follows the same rules as the terminal. Browsing keys, the analysis, edits, streams and Search are still terminal-only; see <a href="#dash-not-yet">Not in the dashboard yet</a>.</p>
+<p data-only="terminal">To find a key, press <kbd>ctrl-f</kbd> on any screen and type part of its name or a pattern. Other screens show the server (stats, clients, the slow log, <code>MONITOR</code>), streams and consumer groups, Pub/Sub, Search indexes, and a <code>:</code> command line. Snapshots, diffs, trends and <code>--check</code> rules run the same analysis from cron or CI.</p>
 <h3>Why it is safe on production</h3>
 <ul>
 <li><strong>It reads nothing on connect.</strong> Connecting reads the server's own figures (<code>INFO</code>, <code>DBSIZE</code>, <code>MEMORY STATS</code>) and no key. Keys are sampled only when you press <kbd>r</kbd>.</li>
@@ -131,12 +146,18 @@
 <li><strong>Credentials live in the OS keychain</strong>, never in the config file, logs, error messages, snapshots or on screen.</li>
 <li><strong>A missing permission turns one feature off</strong> and says why. It never aborts a scan.</li>
 </ul>
-<figure><img class="gif" src="demo.gif" alt="redis-lens opening the demo Redis, analyzing the keys, browsing the key patterns and their verdicts, opening a pattern's keys and a value, then the Analyze and Server panels" loading="lazy"><figcaption>The demo keyspace from <code>make demo</code>. Every screen below is drawn from the app's own snapshot tests.</figcaption></figure>
+<figure data-only="terminal"><img class="gif" src="demo.gif" width="1175" height="784" decoding="async" alt="redis-lens opening the demo Redis, analyzing the keys, browsing the key patterns and their verdicts, opening a pattern's keys and a value, then the Analyze and Server panels" loading="lazy"><figcaption>The demo keyspace from <code>make demo</code>. Every screen below is drawn from the app's own snapshot tests.</figcaption></figure>
+<figure data-only="dashboard"><img class="gif" src="dashboard.gif" width="960" height="669" loading="lazy" decoding="async" alt="The redis-lens dashboard in a browser: connecting to a demo Redis, the Overview, the Server clients, slow log and Monitor, a Pub/Sub tail with messages arriving, the command line showing a table, and the light theme"><figcaption>The dashboard against the demo servers from <code>make demo</code>. The screenshots below are from the same run.</figcaption></figure>
 </div>
 <div class="rail">
 <div class="codeblock"><div class="cb-head"><span class="cb-title">install</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">brew install magna-nz/tap/redis-lens</code></pre></div>
 <p class="rail-note">Or <code>cargo install redis-lens</code>, an installer script, or a binary from <a href="https://github.com/magna-nz/redis-lens/releases" target="_blank" rel="noopener">GitHub Releases</a>. See <a href="#install">Install</a>.</p>
-<div class="codeblock"><div class="cb-head"><span class="cb-title">first run</span><span class="cb-lang">bash</span></div><pre><code class="language-bash"># save a connection; the password goes to the OS keychain
+<div class="codeblock" data-only="dashboard"><div class="cb-head"><span class="cb-title">first run</span><span class="cb-lang">bash</span></div><pre><code class="language-bash"># the dashboard only; opens your browser, signed in
+redis-lens --dashboard
+
+# or the terminal UI, then ctrl-o to open the dashboard
+redis-lens</code></pre></div>
+<div class="codeblock" data-only="terminal"><div class="cb-head"><span class="cb-title">first run</span><span class="cb-lang">bash</span></div><pre><code class="language-bash"># save a connection; the password goes to the OS keychain
 redis-lens conn add staging \
   --url redis://lens-ro@staging.internal:6379 \
   --env stage --ask-password
@@ -201,7 +222,8 @@ make build        # cargo build --release --locked
 <div class="prose">
 <div class="eyebrow">Get started</div>
 <h2>Quickstart <a class="anchor" href="#quickstart" aria-label="Link to this section">#</a></h2>
-<p class="lede">Save a connection, open the TUI, analyze.</p>
+<p class="lede" data-only="terminal">Save a connection, open the TUI, analyze.</p>
+<p class="lede" data-only="dashboard">Start the dashboard, add or pick a connection, connect.</p>
 <h3>1. Save a connection</h3>
 <p><code>conn add</code> saves a profile. The URL takes <code>redis://</code>, <code>rediss://</code> for TLS, or a StackExchange.Redis string. <code>--ask-password</code> prompts without echoing; <code>--password-stdin</code> reads it from a pipe. Either way the password goes to the OS keychain, and the config file only holds the name, address, TLS setting and environment.</p>
 <p><code>--env</code> is <code>prod</code>, <code>stage</code>, <code>local</code> or <code>other</code>, guessed from the host when you leave it out. A <code>prod</code> profile is read-only unless you turn writes on.</p>
@@ -219,7 +241,7 @@ redis-lens conn test prod-cache   # connect and run the permission check</code><
 </div>
 <div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">redis-lens discover</code></pre></div></div>
 </div>
-<div class="row">
+<div class="row" data-only="terminal">
 <div class="prose">
 <h3>3. Open the TUI and analyze</h3>
 <p>Run <code>redis-lens</code> with no arguments. Pick a connection and press <kbd>enter</kbd>: you land on <strong>1 Overview</strong> with the server's live figures and what the server says on its own, with no key read. Press <kbd>r</kbd> and choose <strong>Quick</strong> (10,000 keys) or <strong>Deep</strong> (100,000 keys). The dialog shows how many commands each sends and how long it takes at the profile's budget. <kbd>esc</kbd> stops an analysis and keeps what it has.</p>
@@ -231,12 +253,30 @@ redis-lens conn test prod-cache   # connect and run the permission check</code><
 # or without the TUI
 redis-lens scan prod-cache --sample 20000</code></pre></div></div>
 </div>
+<div class="sub" id="quickstart-dashboard" data-only="dashboard">
+<div class="row">
+<div class="prose">
+<h3>3. Open the dashboard</h3>
+<p><code>redis-lens --dashboard</code> serves the dashboard alone. It prints <code>Dashboard:</code> and a sign-in link, opens your browser on it (not with <code>--no-open</code>), and runs until <kbd>ctrl-c</kbd>.</p>
+<p>Plain <code>redis-lens</code> starts the TUI and serves the dashboard beside it on <code>127.0.0.1:7379</code>. The Connections screen shows the address; <kbd>ctrl-o</kbd> opens it in your browser, signed in. Quitting the TUI stops the dashboard.</p>
+<p>In the page, <strong>Connections</strong> lists the saved connections and the containers found in Docker. <strong>Add a connection</strong> saves a new one, with the password going to the OS keychain. <strong>Connect</strong> reads the server's own figures, no key, and opens the Overview. Server, Pub/Sub and Command line are in the side bar.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">redis-lens --dashboard             # the dashboard only
+redis-lens --dashboard --no-open   # print the link, open no browser
+redis-lens --dashboard --port 8080
+
+redis-lens                         # the TUI; ctrl-o opens the dashboard
+redis-lens --terminal              # the TUI, no dashboard</code></pre></div></div>
+</div>
+</div>
+
 <div class="sub" id="quickstart-demo">
 <div class="row">
 <div class="prose">
 <h3>Try the demo in 30 seconds</h3>
 <p>You need Docker and a Rust toolchain. From a clone of the repository, <code>make demo</code> starts a Redis 7.4 on port 6390 (ACL users <code>lens</code> and <code>lens-limited</code>, from <code>demo/users.acl</code>) and a Valkey 8.1 on port 6391 (no auth), both with an LFU eviction policy so hot keys show up.</p>
 <p>It seeds them with a keyspace that has planted problems: about 31% of <code>user:{id}:cart</code> never expire, the biggest <code>cache:search:{hash}</code> results never expire, a <code>tmp:import:{ulid}</code> job that never cleans up, one very large <code>queue:emails</code> list, and a hot <code>feature:checkout-v2</code> key. It saves three connections (<code>demo-redis</code>, <code>demo-redis-limited</code>, <code>demo-valkey</code>), puts the demo passwords in your keychain, and opens the TUI.</p>
+<p data-only="dashboard">The TUI that <code>make demo</code> opens also serves the dashboard: press <kbd>ctrl-o</kbd>.</p>
 <p><code>demo-redis-limited</code> can only run <code>SCAN</code>, <code>TYPE</code>, <code>TTL</code> and <code>PTTL</code>, so it shows how redis-lens degrades without <code>MEMORY USAGE</code>. <code>make demo-down</code> stops the servers and deletes the data.</p>
 </div>
 <div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">make demo        # start, seed, save the connections, open the TUI
@@ -247,7 +287,7 @@ make demo-down   # stop the demo and delete its data</code></pre></div></div>
 </section>
 
 <!-- ================================================================ -->
-<section class="section" id="tui">
+<section class="section" id="tui" data-only="terminal">
 <div class="row row-wide">
 <div class="prose">
 <div class="eyebrow">Use it</div>
@@ -1030,7 +1070,7 @@ na\x1b[2Jme · hex · 6 bytes · auto-detected</code></pre></div>
     <span class="b">│</span> :              Open the command line                                 <span class="b">│</span>    
     <span class="b">│</span> ctrl-f         Find keys by name or pattern on the whole server      <span class="b">│</span>    
     <span class="b">│</span> b              Switch the database (once connected)                  <span class="b">│</span>    
-    <span class="b">│</span> q ctrl-c       Quit                                                  <span class="b">│</span>    
+    <span class="b">│</span> ctrl-o         Open the web dashboard in your browser                <span class="b">│</span>    
     <span class="b">└──────────────────────────────────────────────────────────────────────┘</span>    </pre></div><figcaption>The keys of the screen it was opened on, then the ones that work everywhere.</figcaption></figure>
 <figure class="screen" data-label="Searching"><div class="term-window" data-cols="80"><div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="term-size">80×24</span></div><pre class="term" aria-label="Terminal screen drawn from redis_lens__tui__ui__help__tests__filtered_80x24.snap">                                                                                
                                                                                 
@@ -1106,7 +1146,7 @@ skip_non_prod_confirm = true   # no y/n on non-prod writes</code></pre></div>
 </section>
 
 <!-- ================================================================ -->
-<section class="section" id="keys">
+<section class="section" id="keys" data-only="terminal">
 <div class="row">
 <div class="prose">
 <div class="eyebrow">Reference</div>
@@ -1114,7 +1154,7 @@ skip_non_prod_confirm = true   # no y/n on non-prod writes</code></pre></div>
 <p class="lede">Every key, screen by screen, from the spec's key table.</p>
 <p>Every list also moves with <kbd>↑↓</kbd> (<kbd>j</kbd> <kbd>k</kbd>), <kbd>PgUp</kbd> <kbd>PgDn</kbd> and <kbd>Home</kbd> <kbd>End</kbd> (<kbd>g</kbd> <kbd>G</kbd>). Keys marked <em>(writes)</em> go through the <a href="#safety-gate">write gate</a>. In text inputs (the add flow, filters, the Search query, the command line) every key is text.</p>
 <div class="note"><p><span class="new">New</span> in phase 5: <kbd>y</kbd> on a Slow log or Monitor line copies it, credentials masked. <kbd>f</kbd> on a value also cycles through the new formats listed in <a href="#tui-values">Values and formats</a>.</p></div>
-<div class="sub" id="keys-everywhere"><h3>Everywhere <a class="anchor" href="#keys-everywhere" aria-label="Link to this table">#</a></h3><div class="table-wrap"><table class="keytable"><thead><tr><th>Keys</th><th>Action</th></tr></thead><tbody><tr><td class="keys"><kbd>0</kbd></td><td>Connections, the home screen</td></tr><tr><td class="keys"><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>4</kbd> <kbd>5</kbd></td><td>Overview, Browse, Analyze, Server, Pub/Sub</td></tr><tr><td class="keys"><kbd>v</kbd></td><td>Show more columns and details, or fewer again</td></tr><tr><td class="keys"><kbd>?</kbd></td><td>Help here; type to find any action</td></tr><tr><td class="keys"><kbd>:</kbd></td><td>Open the command line</td></tr><tr><td class="keys"><kbd>ctrl-f</kbd></td><td>Find keys by name or pattern on the whole server</td></tr><tr><td class="keys"><kbd>b</kbd></td><td>Switch the database (once connected)</td></tr><tr><td class="keys"><kbd>q</kbd> <kbd>ctrl-c</kbd></td><td>Quit</td></tr></tbody></table></div></div>
+<div class="sub" id="keys-everywhere"><h3>Everywhere <a class="anchor" href="#keys-everywhere" aria-label="Link to this table">#</a></h3><div class="table-wrap"><table class="keytable"><thead><tr><th>Keys</th><th>Action</th></tr></thead><tbody><tr><td class="keys"><kbd>0</kbd></td><td>Connections, the home screen</td></tr><tr><td class="keys"><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>4</kbd> <kbd>5</kbd></td><td>Overview, Browse, Analyze, Server, Pub/Sub</td></tr><tr><td class="keys"><kbd>v</kbd></td><td>Show more columns and details, or fewer again</td></tr><tr><td class="keys"><kbd>?</kbd></td><td>Help here; type to find any action</td></tr><tr><td class="keys"><kbd>:</kbd></td><td>Open the command line</td></tr><tr><td class="keys"><kbd>ctrl-f</kbd></td><td>Find keys by name or pattern on the whole server</td></tr><tr><td class="keys"><kbd>b</kbd></td><td>Switch the database (once connected)</td></tr><tr><td class="keys"><kbd>ctrl-o</kbd></td><td>Open the web dashboard in your browser</td></tr><tr><td class="keys"><kbd>q</kbd> <kbd>ctrl-c</kbd></td><td>Quit</td></tr></tbody></table></div></div>
 <div class="sub" id="keys-connections"><h3>Connections <a class="anchor" href="#keys-connections" aria-label="Link to this table">#</a></h3><div class="table-wrap"><table class="keytable"><thead><tr><th>Keys</th><th>Action</th></tr></thead><tbody><tr><td class="keys"><kbd>↑↓</kbd> <kbd>j</kbd> <kbd>k</kbd></td><td>Move the selection</td></tr><tr><td class="keys"><kbd>PgUp</kbd> <kbd>PgDn</kbd></td><td>Move one page</td></tr><tr><td class="keys"><kbd>Home</kbd> <kbd>End</kbd> <kbd>g</kbd> <kbd>G</kbd></td><td>Jump to the first or last row</td></tr><tr><td class="keys"><kbd>enter</kbd></td><td>Connect: reads the server's own figures, no keys</td></tr><tr><td class="keys"><kbd>a</kbd></td><td>Add a connection</td></tr><tr><td class="keys"><kbd>w</kbd></td><td>Turn writes on or off for the selected profile</td></tr><tr><td class="keys"><kbd>/</kbd></td><td>Filter the profiles by name or tag</td></tr><tr><td class="keys"><kbd>esc</kbd></td><td>Clear the filter</td></tr><tr><td class="keys"><kbd>r</kbd></td><td>Look for Docker containers again</td></tr></tbody></table></div></div>
 <div class="sub" id="keys-overview"><h3>Overview <a class="anchor" href="#keys-overview" aria-label="Link to this table">#</a></h3><div class="table-wrap"><table class="keytable"><thead><tr><th>Keys</th><th>Action</th></tr></thead><tbody><tr><td class="keys"><kbd>r</kbd></td><td>Analyze the keys: Quick (10,000) or Deep (100,000)</td></tr><tr><td class="keys"><kbd>↑↓</kbd> <kbd>j</kbd> <kbd>k</kbd></td><td>Move the selection</td></tr><tr><td class="keys"><kbd>PgUp</kbd> <kbd>PgDn</kbd></td><td>Move one page</td></tr><tr><td class="keys"><kbd>Home</kbd> <kbd>End</kbd> <kbd>g</kbd> <kbd>G</kbd></td><td>Jump to the first or last row</td></tr><tr><td class="keys"><kbd>enter</kbd></td><td>Go to the selected finding's panel</td></tr><tr><td class="keys"><kbd>esc</kbd></td><td>Stop the analysis and keep what it has sampled</td></tr><tr><td class="keys"><kbd>p</kbd></td><td>Pause or resume the live figures</td></tr><tr><td class="keys"><kbd>+</kbd> <kbd>-</kbd></td><td>Poll the live figures more or less often, 1 to 60 s</td></tr><tr><td class="keys"><kbd>[</kbd> <kbd>]</kbd></td><td>Pick the previous or next node (cluster only)</td></tr></tbody></table></div></div>
 <div class="sub" id="keys-browse-keys"><h3>Browse › Keys <a class="anchor" href="#keys-browse-keys" aria-label="Link to this table">#</a></h3><div class="table-wrap"><table class="keytable"><thead><tr><th>Keys</th><th>Action</th></tr></thead><tbody><tr><td class="keys"><kbd>↑↓</kbd> <kbd>j</kbd> <kbd>k</kbd></td><td>Move the selection</td></tr><tr><td class="keys"><kbd>PgUp</kbd> <kbd>PgDn</kbd></td><td>Move one page</td></tr><tr><td class="keys"><kbd>Home</kbd> <kbd>End</kbd> <kbd>g</kbd> <kbd>G</kbd></td><td>Jump to the first or last row</td></tr><tr><td class="keys"><kbd>tab</kbd> <kbd>shift-tab</kbd></td><td>Next or previous panel, nothing else</td></tr><tr><td class="keys"><kbd>→</kbd> <kbd>l</kbd> <kbd>enter</kbd></td><td>Open a pattern's keys, or expand a group and go in</td></tr><tr><td class="keys"><kbd>←</kbd> <kbd>h</kbd></td><td>Collapse a group, or go up to it</td></tr><tr><td class="keys"><kbd>/</kbd></td><td>Filter patterns by name</td></tr><tr><td class="keys"><kbd>n</kbd></td><td>Before an analysis: read 1,000 more key names</td></tr><tr><td class="keys"><kbd>esc</kbd></td><td>Clear the filter, or show all nodes again</td></tr><tr><td class="keys"><kbd>o</kbd></td><td>Sort by memory, keys, avg size, no-TTL % or name</td></tr><tr><td class="keys"><kbd>y</kbd></td><td>Copy the selected pattern to the clipboard</td></tr><tr><td class="keys"><kbd>Y</kbd></td><td>Copy a redis-cli --scan command for the pattern</td></tr><tr><td class="keys"><kbd>r</kbd></td><td>Analyze again (Quick or Deep); old results stay</td></tr><tr><td class="keys"><kbd>s</kbd></td><td>Save a snapshot of the analysis</td></tr><tr><td class="keys"><kbd>x</kbd></td><td>Set a TTL on every key of the pattern (writes)</td></tr><tr><td class="keys"><kbd>D</kbd></td><td>Delete every key of the pattern (writes)</td></tr></tbody></table></div></div>
@@ -1150,6 +1190,166 @@ q          quit</code></pre></div>
 </section>
 
 <!-- ================================================================ -->
+<section class="section" id="dashboard" data-only="dashboard">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Use it</div>
+<h2>The dashboard <a class="anchor" href="#dashboard" aria-label="Link to this section">#</a></h2>
+<p class="lede">Connections, Overview, Server, Pub/Sub and a command line, in your browser.</p>
+<p>The dashboard is served by the same redis-lens process, on <code>127.0.0.1</code> only. One connection is open at a time, shared by every tab. It sends what the TUI sends, through the same code, and keeps to the same rules. It is dark by default, with a light theme.</p>
+<p>It is being built in phases. This is phase 1; <a href="#dash-not-yet">Not in the dashboard yet</a> lists what is still terminal-only.</p>
+</div>
+<div class="rail"></div>
+</div>
+
+<div class="sub" id="dash-start">
+<div class="row">
+<div class="prose">
+<h3>Starting and stopping</h3>
+<ul>
+<li><code>redis-lens</code> (or <code>redis-lens tui</code>) starts the TUI and serves the dashboard beside it on <code>127.0.0.1:7379</code>. The Connections screen shows <code>Dashboard  http://127.0.0.1:7379  ·  ctrl-o opens it</code>, and <kbd>ctrl-o</kbd> opens it in your browser, signed in. Quitting the TUI stops the dashboard. While the TUI runs, the dashboard never writes to the terminal.</li>
+<li><code>redis-lens --dashboard</code> serves only the dashboard. It prints <code>Dashboard: &lt;sign-in link&gt;</code> and <code>Press ctrl-c to stop.</code>, opens your browser unless you pass <code>--no-open</code>, and runs until <kbd>ctrl-c</kbd>.</li>
+<li><code>redis-lens --terminal</code> runs only the TUI; nothing is served.</li>
+<li><code>--port N</code> (1 to 65535) picks the port. <code>--terminal</code> can't be combined with <code>--dashboard</code> or <code>--port</code>, and <code>--no-open</code> needs <code>--dashboard</code>. With any subcommand but <code>tui</code> these flags are a usage error.</li>
+<li>In the config file, <code>[settings] dashboard = false</code> stops it starting beside the TUI (<code>--dashboard</code> still starts it), and <code>dashboard_port = N</code> sets the port. Flags win. A config file that can't be read doesn't start it beside the TUI either, since the file may say not to.</li>
+<li>A port in use: with <code>--dashboard</code> it is an error, "Port N on 127.0.0.1 is in use, so the dashboard did not start. Pick another with --port." Beside the TUI, the TUI carries on and says once "The dashboard is off: port N is in use. --port picks another."</li>
+</ul>
+</div>
+<div class="rail">
+<div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash"># the TUI, with the dashboard on 127.0.0.1:7379
+redis-lens
+redis-lens --port 8080
+
+# the TUI only
+redis-lens --terminal
+
+# the dashboard only; --no-open prints the link
+redis-lens --dashboard
+redis-lens --dashboard --no-open</code></pre></div>
+<div class="codeblock"><div class="cb-head"><span class="cb-title">config.toml</span><span class="cb-lang">toml</span></div><pre><code class="language-toml">[settings]
+dashboard = false      # don't start it beside the TUI
+dashboard_port = 8080  # the port, when it starts</code></pre></div>
+</div>
+</div>
+</div>
+
+<div class="sub" id="dash-access">
+<div class="row">
+<div class="prose">
+<h3>Who can open it</h3>
+<ul>
+<li><strong>This computer only.</strong> It listens on <code>127.0.0.1</code>, and there is no option to listen anywhere else.</li>
+<li><strong>A new token every run.</strong> The sign-in link is <code>http://127.0.0.1:&lt;port&gt;/#token=&lt;token&gt;</code>. The token sits after the <code>#</code>, which a browser never sends to a server. The page takes it from there, removes it from the address bar and keeps it for that tab. The token is printed only by <code>--dashboard</code>; the TUI, its notices and its logs never show it.</li>
+<li><strong>Opening the browser leaks nothing.</strong> <kbd>ctrl-o</kbd> and <code>--dashboard</code> never pass the link as a program argument, where other users of the computer could read it. redis-lens writes a small redirect page that only you can read, opens that, and deletes it after 30 seconds.</li>
+<li><strong>Nothing for other sites.</strong> Every data request needs the token, and there is no cookie for the browser to send on its own. Requests that name another host, and changes that don't come from the dashboard's own page, are refused.</li>
+<li><strong>Passwords never reach the browser.</strong> Adding a connection sends the password once, straight to the OS keychain. It is never sent back, logged or written to the config file. Addresses are shown masked.</li>
+<li><strong>Nothing from other hosts.</strong> The page is plain HTML, CSS and JavaScript inside the binary. It loads no fonts, scripts or anything else from elsewhere, and the server logs no request or reply.</li>
+</ul>
+<p>A tab opened without the link, or after redis-lens restarted, says to open the dashboard from redis-lens: press <kbd>ctrl-o</kbd> in the TUI, or use the link <code>--dashboard</code> printed.</p>
+</div>
+<div class="rail"></div>
+</div>
+</div>
+
+<div class="sub" id="dash-rules">
+<div class="row">
+<div class="prose">
+<h3>The same rules as the terminal</h3>
+<ul>
+<li><strong>Read-only production.</strong> A read-only connection refuses writes in the dashboard too. The saved profile is read again before every write, so turning writes off in the TUI or with <code>conn set</code> stops them in the dashboard at once. See <a href="#safety-gate">the write gate</a>.</li>
+<li><strong>Writes are asked about.</strong> A write the gate would ask about in the TUI comes up as a question in the page: Yes or Cancel, or the connection's name typed on <code>prod</code>. An answer works once, within two minutes, and the gate checks again when it arrives.</li>
+<li><strong>One command budget.</strong> The dashboard has its own connection but takes from the same <a href="#safety-budget">command budget</a> as the TUI, so together they stay within the rate. The live figures are read only while a page is open, every 2 s to start with (1 to 60 s, or paused, from the top bar).</li>
+<li><strong>A missing permission turns one panel off</strong> and says why. Server error text is not shown, except the reply to a command you typed on the command line.</li>
+<li><strong>Values are shown, never saved.</strong> Values, messages and Monitor lines stay in the page. Slow log, Monitor and command-line text is masked as the TUI masks it.</li>
+</ul>
+</div>
+<div class="rail"></div>
+</div>
+</div>
+
+<div class="sub" id="dash-connections">
+<div class="row row-wide"><div class="prose">
+<h3>Connections</h3>
+<p>The saved connections, each with its environment, masked address, tags, whether it is read-only or has writes on, and how it signs in, and below them the Redis and Valkey containers found in Docker. <strong>Connect</strong> reads the server's own figures and no key, then opens the Overview. <strong>Test</strong> runs each permission check and says why a feature is off. <strong>Edit</strong> changes the tags, the writes switch and the options <code>conn set</code> has; <strong>Remove</strong> deletes the connection and its keychain entries.</p>
+<p><strong>Add a connection</strong> takes what <code>conn add</code> takes: address, name, environment, password, tags and writes, and under Advanced a provider, an SSH tunnel, Sentinel, a token command (asked about first, since it runs at every connect), Entra ID when redis-lens is built with it, prefer replica and force standalone. The environment of a saved connection can't be changed, as in the TUI: add it again and replace it. Turning writes on asks first, and on <code>prod</code> you type the name; for a container it lasts for the session.</p>
+<figure class="shot-figure"><img class="shot" src="img/dashboard-connections.png" width="1280" height="800" loading="lazy" decoding="async" alt="The dashboard's Connections screen with the Add a connection dialog open: address redis://127.0.0.1:6391, name demo-cache, environment guessed from the address, an empty password box, tags, the writes setting and an Advanced section"><figcaption>Add a connection. The password box is empty here; a password typed into the address moves to it, and goes to the keychain.</figcaption></figure>
+</div></div>
+</div>
+
+<div class="sub" id="dash-overview">
+<div class="row row-wide"><div class="prose">
+<h3>Overview</h3>
+<p>What the TUI's Overview shows before an analysis: memory, keys, commands per second and clients, polled while the page is open; the server, its version, topology, persistence and figures; a row per shard and a node picker on a cluster; the provider notice; the permission checks; and Things to look at, from the server's own figures by the TUI's rules. The key analysis comes with Browse in a later phase.</p>
+<figure class="shot-figure"><img class="shot" src="img/dashboard-overview.png" width="1280" height="964" loading="lazy" decoding="async" alt="The dashboard's Overview for demo-admin, a local Redis 7.4.12: memory 185M of 768M, 50K keys, about 50 commands a second and 5 clients with small bar charts, the server's figures, Things to look at naming a slow EVAL, and the permission checks"><figcaption>Connected to the demo Redis. No key has been read.</figcaption></figure>
+</div></div>
+</div>
+
+<div class="sub" id="dash-server">
+<div class="row row-wide"><div class="prose">
+<h3>Server</h3>
+<p>Charts of commands per second and connected clients, and three panels.</p>
+<ul>
+<li><strong>Clients</strong> groups the connections by library and by address, as the TUI does. A group opens to its connections.</li>
+<li><strong>Slow log</strong> lists the slowest commands, with their key names, the arguments masked, and a note on commands such as <code>KEYS</code> or a slow whole-key read.</li>
+<li><strong>Monitor</strong> always asks first, with the connection's name typed on <code>prod</code>, and says its limits before it starts: 30 seconds or 10,000 lines. Lines are shown, never saved.</li>
+</ul>
+<div class="screens">
+<figure class="screen" data-label="Clients"><img class="shot" src="img/dashboard-clients.png" width="1280" height="846" loading="lazy" decoding="async" alt="Server, Clients panel: clients by library (ioredis 5.4.1 with 2 connections, go-redis, redis-py and redis-rs with 1 each) and by address, each with the oldest age, longest idle, most common command and memory"><figcaption>Clients grouped by library and by address.</figcaption></figure>
+<figure class="screen" data-label="Slow log"><img class="shot" src="img/dashboard-slowlog.png" width="1280" height="800" loading="lazy" decoding="async" alt="Server, Slow log panel: LRANGE queue:emails 0 -1 twice, 11 and 15 ms, marked as a slow whole-key read, and the seeding EVAL at 1.31 s"><figcaption>A whole-key read, marked with the reason.</figcaption></figure>
+<figure class="screen" data-label="Monitor"><img class="shot" src="img/dashboard-monitor.png" width="1280" height="800" loading="lazy" decoding="async" alt="Server, Monitor panel while running: a Stop button with 27 seconds left, 197 lines kept, and a list of timestamped commands such as STRLEN, PTTL and TYPE from the demo clients"><figcaption>A Monitor run, after its question was answered. It stops by itself after 30 s.</figcaption></figure>
+</div>
+</div></div>
+</div>
+
+<div class="sub" id="dash-pubsub">
+<div class="row row-wide"><div class="prose">
+<h3>Pub/Sub</h3>
+<p>The channels with their subscribers. Subscribe to a channel, a pattern or a shard channel, picked from the list or typed, and the messages appear live, with their rate. Pause, clear and filter the tail; messages are shown, never saved. Subscribing is not a write, so read-only connections can. <strong>Publish</strong> is a write: it goes through the write gate.</p>
+<figure class="shot-figure"><img class="shot" src="img/dashboard-pubsub.png" width="1280" height="800" loading="lazy" decoding="async" alt="Pub/Sub: subscribed to the pattern orders.*, with messages on orders.eu, orders.us and orders.apac, each a small JSON order, a filter box, Pause, Clear and Stop, and a Publish form"><figcaption>A tail of <code>orders.*</code>, with orders being published.</figcaption></figure>
+</div></div>
+</div>
+
+<div class="sub" id="dash-cmdline">
+<div class="row row-wide"><div class="prose">
+<h3>Command line</h3>
+<p><strong>Command line</strong> in the side bar opens the TUI's command line under the current screen, with its rules. Readonly commands are sent; writes go through the write gate; <code>KEYS</code> and other <code>@dangerous</code> commands ask first; scripts, blocking commands and commands that would take over the connection are refused with a note.</p>
+<ul>
+<li>The reply shows as text, a table, JSON or raw.</li>
+<li>A leading count repeats a command, at most 100 times; <strong>Pipeline</strong> sends a readonly repeat in pipelines.</li>
+<li><kbd>tab</kbd> completes command names and subcommands, and the command's help shows under the line.</li>
+<li>One line runs at a time. A line holds at most 8,192 characters, and a reply at most 4 MiB; the rest is dropped and the page says so.</li>
+</ul>
+<figure class="shot-figure"><img class="shot" src="img/dashboard-cmdline.png" width="1280" height="800" loading="lazy" decoding="async" alt="The command line under the Slow log: ZRANGE of a user feed with REV WITHSCORES shown as a table of six members and scores, the Text, Table, JSON, Raw and Pipeline buttons, and the help line for the next command"><figcaption>A sorted set as a table.</figcaption></figure>
+</div></div>
+</div>
+
+<div class="sub" id="dash-theme">
+<div class="row row-wide"><div class="prose">
+<h3>Light theme</h3>
+<p>The button at the right of the top bar switches between the dark and the light theme. The browser remembers the choice.</p>
+<figure class="shot-figure"><img class="shot" src="img/dashboard-light.png" width="1280" height="964" loading="lazy" decoding="async" alt="The Overview in the light theme: the same tiles, server figures, Things to look at and permission checks on a white background"><figcaption>The Overview in the light theme.</figcaption></figure>
+</div></div>
+</div>
+
+<div class="sub" id="dash-not-yet">
+<div class="row">
+<div class="prose">
+<h3>Not in the dashboard yet</h3>
+<p>These come in later phases. Until then the dashboard doesn't show them; use the terminal.</p>
+<ul>
+<li>Browse: key patterns, key lists and values.</li>
+<li>Analyze: the key analysis, Big keys, Expiry, Changes and Hot keys.</li>
+<li>Editing values, and bulk expire and delete.</li>
+<li>Streams and Search.</li>
+</ul>
+<p>Snapshots, reports and <code>--check</code> stay command-line features: see <a href="#snapshots">Snapshots and CI</a>.</p>
+</div>
+<div class="rail"></div>
+</div>
+</div>
+</section>
+
+<!-- ================================================================ -->
 <section class="section" id="connections">
 <div class="row">
 <div class="prose">
@@ -1169,6 +1369,7 @@ q          quit</code></pre></div>
 <li><code>redis://[user[:password]@]host[:port][/db]</code>, and <code>rediss://</code> for TLS;</li>
 <li>a StackExchange.Redis string: <code>host:port,password=…,user=…,ssl=True,defaultDatabase=N</code> (unknown options are ignored).</li>
 </ul>
+<p data-only="dashboard">In the dashboard, <strong>Add a connection</strong> on <a href="#dash-connections">Connections</a> takes the same options. The password goes to the OS keychain the same way and never comes back to the page.</p>
 <p>A password typed into the URL works, with a warning, but it lands in your shell history: prefer <code>--ask-password</code> or <code>--password-stdin</code>. <code>--force</code> replaces a profile with the same name. <code>conn list</code> shows the profiles, <code>conn test</code> connects and runs the permission check, and <code>conn remove</code> deletes the profile and its keychain entries.</p>
 <p>The config file is TOML with <code>[[profile]]</code> tables, written atomically with mode 0600, in the platform config directory (for example <code>~/Library/Application Support/redis-lens/config.toml</code> on macOS). <code>--config &lt;path&gt;</code> or <code>REDIS_LENS_CONFIG</code> points at another one.</p>
 <p><span class="new">New</span> <code>conn add --standalone</code> (or <code>conn set NAME --standalone</code> / <code>--no-standalone</code>) reads one node of a cluster as a standalone server, the way Redis Insight's force-standalone setting does: no discovery, no slot routing, and a <code>MOVED</code> or <code>ASK</code> is never followed. The header shows a <code>standalone</code> mark, and reports note that only one node was read. It can't be combined with Sentinel.</p>
@@ -1365,6 +1566,7 @@ redis-lens scan orders-cluster
 <div class="prose">
 <h3>Docker discovery</h3>
 <p>Lists running containers whose image is redis, valkey, redis-stack or bitnami/redis and that publish port 6379. A password found in <code>--requirepass</code> or in <code>REDIS_PASSWORD</code>/<code>VALKEY_PASSWORD</code> is held in memory only. Without one, discovery sends a single <code>PING</code> with no credentials (1 s timeout) and shows <code>none</code>, <code>required</code> or <code>unknown</code>. Containers are snapshotted under <code>docker:&lt;container&gt;</code>, a prefix saved profiles can't use.</p>
+<p data-only="dashboard">The dashboard's Connections screen lists them too, under Found in Docker, and connects to one without saving it.</p>
 </div>
 <div class="rail"></div>
 </div>
@@ -1378,7 +1580,7 @@ redis-lens scan orders-cluster
 <li><strong>Export</strong> writes the saved profiles as TOML, to a file (mode 0600, never over an existing one without <code>--force</code>) or standard output. It never reads the keychain, so it holds no credential.</li>
 <li><strong>Import</strong> adds every profile of a file, all or none. It stores nothing in the keychain, drops <code>read_only = false</code> so an import can't turn writes on, deletes stale keychain entries under an imported name unless the profile is the same place, and lists the profiles that need <code>conn add &lt;name&gt; --force …</code> to store credentials. A token command asks first.</li>
 <li><strong>Tags</strong>: <code>--tag</code> on <code>conn add</code>, <code>--tag</code>/<code>--untag</code> on <code>conn set</code>. <code>/</code> on Connections filters by name or tag.</li>
-<li><strong>Writes</strong>: <code>conn set &lt;name&gt; --writes on|off</code>, <code>conn add --writes on|off</code>, or <kbd>w</kbd> in the TUI. Turning writes on for a <code>prod</code> profile needs the profile name: typed on the terminal, or given with <code>--confirm &lt;name&gt;</code>; <code>--yes</code> never replaces it.</li>
+<li><strong>Writes</strong>: <code>conn set &lt;name&gt; --writes on|off</code>, <code>conn add --writes on|off</code>, <span data-only="terminal">or <kbd>w</kbd> in the TUI</span><span data-only="dashboard">or Edit, then Allow writes, in the dashboard</span>. Turning writes on for a <code>prod</code> profile needs the profile name: typed on the terminal, or given with <code>--confirm &lt;name&gt;</code>; <code>--yes</code> never replaces it.</li>
 </ul>
 </div>
 <div class="rail">
@@ -1441,7 +1643,8 @@ redis-lens conn set prod-cache --writes on --confirm prod-cache
 
 # off never asks
 redis-lens conn set prod-cache --writes off</code></pre></div>
-<p class="rail-note">Or <kbd>w</kbd> on 0 Connections. Only <code>read_only</code> changes in the config file.</p>
+<p class="rail-note" data-only="terminal">Or <kbd>w</kbd> on 0 Connections. Only <code>read_only</code> changes in the config file.</p>
+<p class="rail-note" data-only="dashboard">In the dashboard: Edit on the connection, then Allow writes. On <code>prod</code> it asks for the name.</p>
 </div>
 </div>
 <div class="row row-wide">
@@ -1470,6 +1673,7 @@ flowchart LR
 <tr><td><code>MONITOR</code></td><td>asks (<code>prod</code>: type the name)</td><td>asks <code>y</code>/<code>n</code></td><td>type the profile name</td></tr>
 </tbody></table></div>
 <p>A write is <em>destructive</em> when it deletes or overwrites data: <code>DEL</code>, <code>UNLINK</code>, the pops, <code>*STORE</code> commands, <code>EXPIRE</code> with a time that is not positive, <code>FLUSHDB</code>, <code>RENAME</code> onto an existing key, <code>FT.DROPINDEX</code>, and every command in the <code>@dangerous</code> ACL category. Bulk actions log each batch's key names to a file under the data directory before sending it; for an expire, <code>PERSIST</code> on those keys undoes it.</p>
+<p data-only="dashboard">In the dashboard the same questions open as dialogs: Yes or Cancel, or the name typed on <code>prod</code>. Monitor always asks, and says its limits first. See <a href="#dash-rules">the same rules as the terminal</a>.</p>
 <div class="screens">
 <figure class="screen" data-label="Delete a key on prod"><div class="term-window" data-cols="80"><div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="term-size">80×24</span></div><pre class="term" aria-label="Terminal screen drawn from redis_lens__tui__app__confirm__tests__delete_key_prod_80x24.snap"><span class="top"> </span><span class="top strong">prod-cache-01</span><span class="top">  </span><span class="top badge-e"> </span><span class="top badge-e e">PROD</span><span class="top badge-e"> </span><span class="top">  </span><span class="top badge-e"> WRITES ON </span><span class="top">   15G / 24G </span><span class="top d">·</span><span class="top"> 7.92M keys   </span><span class="top o">● analyzed 14:02 </span>
 <span class="d">  0 Connections  </span><span class="b">│</span><span class="d">  1 Overview  </span><span class="tab"> 2 Browse </span><span class="d">  3 Analyze   4 Server   5 Pub/Sub    </span>
@@ -1535,6 +1739,7 @@ flowchart LR
 <li>Values are always read in pages. redis-lens never sends <code>KEYS</code>, <code>HGETALL</code>, <code>SMEMBERS</code>, <code>LRANGE 0 -1</code> or another whole-key read on its own; you can still type them on the command line.</li>
 <li>An analysis is opt-in, its cost is shown before it starts, and <kbd>esc</kbd> stops it within one batch.</li>
 </ul>
+<p data-only="dashboard">The dashboard has its own connection but takes from the same budget, so the TUI and the dashboard together stay within the rate. Its live figures are read only while a page is open, and not while paused.</p>
 </div>
 <div class="rail"></div>
 </div>
@@ -1582,6 +1787,7 @@ flowchart LR
 <h3>Values and the screen</h3>
 <p>Values (key values, stream entries, Search results, Pub/Sub messages, Monitor lines, Slow log arguments, command-line replies) are shown on screen only. They are never written to snapshots, reports, logs, error text or <code>Debug</code> output: a value is held in a type whose <code>Debug</code> shows only its length. A value reaches the clipboard only through <kbd>y</kbd> on it, in the format shown.</p>
 <p>Snapshots and reports hold patterns, counts, sizes and (unless you leave them out) example key names, never values or credentials. Key names can still be sensitive, so treat snapshot files like the data they describe; reports leave example names out unless you pass <code>--examples</code>.</p>
+<p data-only="dashboard">In the dashboard, values, Pub/Sub messages and Monitor lines are shown in the page only. The server logs no request, body or reply.</p>
 <p>redis-lens has no telemetry and sends nothing to a third party.</p>
 </div>
 <div class="rail"></div>
@@ -1596,6 +1802,7 @@ flowchart LR
 <div class="eyebrow">Understand</div>
 <h2>Analysis <a class="anchor" href="#analysis" aria-label="Link to this section">#</a></h2>
 <p class="lede">Sample the keyspace, group keys into patterns, and say which ones look like mistakes.</p>
+<div class="note" data-only="dashboard"><p>The analysis is not in the dashboard yet. Run it in the TUI (<kbd>r</kbd> on Overview) or with <code>redis-lens scan</code>.</p></div>
 </div>
 <div class="rail"></div>
 </div>
@@ -1894,7 +2101,10 @@ redis-lens expire prod-cache 'user:{id}:cart' --ttl 7d --apply \
 <div class="eyebrow">Reference</div>
 <h2>Command-line reference <a class="anchor" href="#cli" aria-label="Link to this section">#</a></h2>
 <p class="lede">Every subcommand and flag. <code>redis-lens --help</code> and <code>redis-lens &lt;command&gt; --help</code> describe each one.</p>
-<div class="codeblock"><div class="cb-head"><span class="cb-title">synopsis</span><span class="cb-lang">text</span></div><pre><code>redis-lens                         open the TUI
+<div class="codeblock"><div class="cb-head"><span class="cb-title">synopsis</span><span class="cb-lang">text</span></div><pre><code>redis-lens [tui] [--port N]        open the TUI, with the dashboard beside it on 127.0.0.1
+redis-lens --terminal              open the TUI only
+redis-lens --dashboard [--no-open] [--port N]
+                                   serve the dashboard only
 redis-lens conn add &lt;name&gt; --url &lt;url&gt; [--env prod|stage|local|other] [--password-stdin | --ask-password] [--entra] [--prefer-replica] [--provider P] [--ssh [USER@]HOST[:PORT] [--ssh-identity FILE] [--ssh-known-hosts FILE]] [--force] [--yes] [--writes on|off [--confirm NAME]] [--tag TAG]... [--sentinel HOST:PORT[,…] --sentinel-master NAME [--sentinel-tls] [--sentinel-user USER] [--sentinel-password-stdin | --sentinel-ask-password]] [-- TOKEN_COMMAND...]
 redis-lens conn set &lt;name&gt; [--writes on|off [--confirm NAME] [--yes]] [--tag TAG]... [--untag TAG]...
 redis-lens conn list | remove &lt;name&gt; | test &lt;name&gt;
@@ -1911,6 +2121,16 @@ redis-lens compare &lt;left&gt; &lt;right&gt; [--left-file FILE] [--right-file F
 redis-lens expire &lt;name&gt; &lt;pattern&gt; --ttl DURATION [--apply] [--yes | --confirm PATTERN] [--max-rate N]
 redis-lens discover</code></pre></div>
 <p><code>--config &lt;path&gt;</code> (or <code>REDIS_LENS_CONFIG</code>) works with every command. <span class="new">New</span> in phase 5: <code>conn add --standalone</code>.</p>
+<h3>Dashboard flags and settings</h3>
+<div class="table-wrap"><table><thead><tr><th>Flag or setting</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>--dashboard</code></td><td>Serve only the dashboard, print its sign-in link and run until <kbd>ctrl-c</kbd>.</td></tr>
+<tr><td><code>--no-open</code></td><td>With <code>--dashboard</code>, open no browser.</td></tr>
+<tr><td><code>--terminal</code></td><td>Run only the TUI; serve nothing. Can't be combined with <code>--dashboard</code> or <code>--port</code>.</td></tr>
+<tr><td><code>--port N</code></td><td>The dashboard's port on 127.0.0.1, 1 to 65535. Default 7379.</td></tr>
+<tr><td><code>[settings] dashboard = false</code></td><td>Don't start the dashboard beside the TUI. <code>--dashboard</code> still starts it.</td></tr>
+<tr><td><code>[settings] dashboard_port = N</code></td><td>The port. The flag wins.</td></tr>
+</tbody></table></div>
+<p>These flags work without a subcommand or with <code>tui</code>; with any other subcommand they are a usage error. See <a href="#dashboard">The dashboard</a> for the details.</p>
 <h3>scan flags</h3>
 <div class="table-wrap"><table><thead><tr><th>Flag</th><th>Meaning</th></tr></thead><tbody>
 <tr><td><code>--sample N</code></td><td>Stop after N keys. Default 100,000.</td></tr>
@@ -1948,7 +2168,8 @@ redis-lens discover</code></pre></div>
 <tr><td>Workbench / CLI</td><td>Command line, helper, result views, pipeline mode</td><td><code>:</code> command line with helper and completion; result views, repeat and pipeline <span class="new">New</span></td></tr>
 <tr><td>Streams, Pub/Sub, Search</td><td>Consumer groups, subscribe and publish, search workspace</td><td>All three, plus stream verdicts (stuck, lagging, unbounded) and sharded Pub/Sub</td></tr>
 <tr><td>Per-slot view</td><td>None</td><td>Analyze › Slots from <code>CLUSTER SLOT-STATS</code></td></tr>
-<tr><td>Not in redis-lens</td><td colspan="2">Redis Copilot (AI), RDI pipeline management, tutorials, graph and geo-map plugins, cloud discovery, a GUI, REST API or telemetry</td></tr>
+<tr><td>Where it runs</td><td>Desktop app, or a web app in Docker</td><td>A terminal UI, plus a web dashboard on 127.0.0.1 served by the same process (so far: connections, the server, Pub/Sub and the command line)</td></tr>
+<tr><td>Not in redis-lens</td><td colspan="2">Redis Copilot (AI), RDI pipeline management, tutorials, graph and geo-map plugins, cloud discovery, a public REST API or telemetry</td></tr>
 </tbody></table></div>
 <p>redis-lens reads no Redis Insight code; the comparison is from Redis Insight's documentation and release notes.</p>
 </div>
@@ -1964,6 +2185,7 @@ redis-lens discover</code></pre></div>
 <p class="lede">Rust 2024, ratatui and crossterm on tokio.</p>
 <p>Unit tests sit next to the code and need no Docker; TUI screens are insta snapshots rendered with ratatui's <code>TestBackend</code> (the screens on this page come from them). Integration tests start their own Redis and Valkey containers through testcontainers, behind the <code>integration-tests</code> feature, and also run on Redis 6.2. CI runs fmt, clippy with <code>-D warnings</code>, unit tests on three operating systems, integration tests, the MSRV build, <code>cargo package</code> and a demo seeding check.</p>
 <p><code>demo/record.py</code> drives redis-lens in a pseudo-terminal from a JSON list of keystrokes (<code>demo/gif-steps.json</code>) and writes an asciinema cast. <code>make gif</code> uses its own temporary config file, saves the <code>demo-cache</code> and <code>demo-valkey</code> connections the steps expect, records, renders with <code>agg</code>, then removes those connections and their keychain entries.</p>
+<p><code>demo/record-dashboard.mjs</code> records <code>docs/dashboard.gif</code> from a running dashboard in headless Chrome, with no npm packages, and <code>make dashboard-gif</code> runs it. This page is built from <code>docs/site-src/</code>: <code>make site</code> rebuilds <code>docs/index.html</code> and checks its links.</p>
 <p><a href="https://github.com/magna-nz/redis-lens/blob/main/spec.md" target="_blank" rel="noopener"><code>spec.md</code></a> is the source of truth for behaviour, and <a href="https://github.com/magna-nz/redis-lens/blob/main/status.md" target="_blank" rel="noopener"><code>status.md</code></a> tracks progress.</p>
 </div>
 <div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">make</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">make test       # unit tests, no Docker
@@ -1973,6 +2195,8 @@ make coverage   # line coverage (needs cargo-llvm-cov and Docker)
 make demo-up    # start and seed the demo servers
 make demo-down  # stop the demo and delete its data
 make gif        # record docs/demo.gif (needs the demo up, python3 and agg)
+make dashboard-gif  # record docs/dashboard.gif (a running dashboard, Chrome, Node, ffmpeg)
+make site       # rebuild docs/index.html and check its links
 make help       # the full list</code></pre></div></div>
 </div>
 </section>
@@ -2008,6 +2232,12 @@ make help       # the full list</code></pre></div></div>
 <h3>Does it send data anywhere?</h3>
 <p>No. There is no telemetry, no AI assistant and no cloud sign-in. Values stay on screen; snapshots and reports stay on your disk.</p>
 
+<h3 data-only="dashboard">Can I open the dashboard from another computer?</h3>
+<p data-only="dashboard">No. It listens on <code>127.0.0.1</code> only, and there is no option to change that.</p>
+
+<h3 data-only="dashboard">The dashboard says to open it from redis-lens.</h3>
+<p data-only="dashboard">The tab has no sign-in token, or redis-lens restarted and made a new one. Press <kbd>ctrl-o</kbd> in the TUI, or open the link <code>redis-lens --dashboard</code> printed.</p>
+
 <h3>Limitations</h3>
 <ul>
 <li>No daemon: nothing keeps running after you quit. Schedule <code>scan --save</code> with cron, systemd or CI.</li>
@@ -2018,6 +2248,7 @@ make help       # the full list</code></pre></div></div>
 <li>Docker discovery always connects directly, not through an SSH bastion. If redis-lens is killed with SIGKILL, its ssh processes are left running.</li>
 <li>On Windows the OS root store and the bundled Mozilla roots are trusted together, so a bundled root an administrator removed is still trusted.</li>
 <li>The TUI has no time zone: times are UTC.</li>
+<li data-only="dashboard">The dashboard has no Browse, Analyze, edits, Streams or Search yet. See <a href="#dash-not-yet">Not in the dashboard yet</a>.</li>
 </ul>
 </div>
 <div class="rail"></div>

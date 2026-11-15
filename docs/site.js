@@ -1,5 +1,5 @@
 /* redis-lens docs: syntax highlighting, copy buttons, screen tabs, the mobile
-   nav and the active section in the nav. Everything here is progressive
+   nav, the active section in the nav and the Terminal / Dashboard switch. Everything here is progressive
    enhancement: with JavaScript off the page is complete, code is plain text,
    every terminal screen is shown and the nav still links to every anchor. */
 (function () {
@@ -210,18 +210,25 @@
     }
   }
 
+  function shown(el) { return el.getClientRects().length > 0; }
+
   /* The active entry is the last section or sub-section whose top has passed
      the line just under the top bar. Sub-sections come after their section in
-     document order, so inside one the sub-section wins. */
+     document order, so inside one the sub-section wins. Sections hidden by the
+     Terminal / Dashboard switch are skipped. */
   function update() {
-    var line = 90;
-    var best = targets.length ? targets[0].id : null;
-    for (var i = 0; i < targets.length; i++) {
-      if (targets[i].getBoundingClientRect().top <= line) { best = targets[i].id; }
+    var line = (parseFloat(window.getComputedStyle(document.documentElement).getPropertyValue('--topbar-h')) || 56) + 34;
+    var visible = [];
+    for (var v = 0; v < targets.length; v++) {
+      if (shown(targets[v])) { visible.push(targets[v]); }
+    }
+    var best = visible.length ? visible[0].id : null;
+    for (var i = 0; i < visible.length; i++) {
+      if (visible[i].getBoundingClientRect().top <= line) { best = visible[i].id; }
       else { break; }
     }
-    if ((window.innerHeight + window.scrollY) >= document.documentElement.scrollHeight - 4 && targets.length) {
-      best = targets[targets.length - 1].id;
+    if ((window.innerHeight + window.scrollY) >= document.documentElement.scrollHeight - 4 && visible.length) {
+      best = visible[visible.length - 1].id;
     }
     if (best) { setActive(best); }
   }
@@ -234,6 +241,93 @@
   }, { passive: true });
   window.addEventListener('resize', update);
 
+  /* ---------------- Terminal / Dashboard switch ---------------- */
+
+  /* The head script has already set html[data-ui] from ?ui=, then localStorage,
+     then "terminal", so the page is drawn in the right mode. Content marked
+     data-only="terminal" or "dashboard" shows in that mode; the rest in both. */
+  var root = document.documentElement;
+  var STORE = 'redis-lens.docs.ui';
+  var choices = document.querySelectorAll('.ui-switch [data-ui-choice]');
+
+  function currentUi() { return root.getAttribute('data-ui') === 'dashboard' ? 'dashboard' : 'terminal'; }
+
+  function modeOf(el) {
+    var only = el && el.closest ? el.closest('[data-only]') : null;
+    return only ? only.getAttribute('data-only') : null;
+  }
+
+  function reflect() {
+    var ui = currentUi();
+    for (var i = 0; i < choices.length; i++) {
+      choices[i].setAttribute('aria-pressed', choices[i].getAttribute('data-ui-choice') === ui ? 'true' : 'false');
+    }
+  }
+
+  function remember(ui) {
+    try { window.localStorage.setItem(STORE, ui); } catch (e) { /* storage off: the URL still says it */ }
+    try {
+      var url = new URL(window.location.href);
+      url.searchParams.set('ui', ui);
+      window.history.replaceState(window.history.state, '', url.toString());
+    } catch (e) { /* leave the address alone */ }
+  }
+
+  function setUi(ui) {
+    root.setAttribute('data-ui', ui);
+    reflect();
+  }
+
+  /* Switch by the buttons: keep the reader's place when the section they are in
+     stays; otherwise go to the nearest section before it that does. */
+  function choose(ui) {
+    if (ui === currentUi()) { remember(ui); return; }
+    var here = current ? document.getElementById(current) : null;
+    var before = here && shown(here) ? here.getBoundingClientRect().top : null;
+    setUi(ui);
+    remember(ui);
+    if (here && shown(here) && before !== null) {
+      window.scrollBy(0, here.getBoundingClientRect().top - before);
+    } else if (here) {
+      var index = targets.indexOf(here);
+      var back = null;
+      for (var i = index - 1; i >= 0; i--) {
+        if (shown(targets[i])) { back = targets[i]; break; }
+      }
+      if (back) { back.scrollIntoView(); } else { window.scrollTo(0, 0); }
+    }
+    current = null;
+    update();
+  }
+
+  for (var ch = 0; ch < choices.length; ch++) {
+    choices[ch].addEventListener('click', function (e) {
+      choose(e.currentTarget.getAttribute('data-ui-choice'));
+    });
+  }
+  reflect();
+
+  /* A link to something that only shows in the other mode switches to it for this
+     page view (without changing the remembered choice) and scrolls there. */
+  function followHash() {
+    var id = window.location.hash.slice(1);
+    if (!id) { return false; }
+    var el = document.getElementById(id);
+    if (!el) { return false; }
+    var mode = modeOf(el);
+    if (mode && mode !== currentUi()) {
+      setUi(mode);
+      el.scrollIntoView();
+    }
+    return true;
+  }
+  window.addEventListener('hashchange', function () {
+    followHash();
+    current = null;
+    update();
+  });
+
+  followHash();
   if (window.location.hash && links[window.location.hash.slice(1)]) {
     setActive(window.location.hash.slice(1));
   } else {
