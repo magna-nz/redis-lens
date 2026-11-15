@@ -1222,7 +1222,7 @@ Redis 6.2 stays tested: it runs everything else.
 
 ## Web dashboard
 
-An alternative to the TUI in a web browser, served by the same redis-lens process, with the same features and the same rules. It is being built in phases: phase 1 is Connections, Overview, Server, Pub/Sub and the command line; phase 2 adds Browse, Analyze, snapshots and the database switch. The edits and bulk actions, and Streams and Search, follow; until then the dashboard does not offer them. The routes and their replies are in [docs/dashboard-api.md](docs/dashboard-api.md).
+An alternative to the TUI in a web browser, served by the same redis-lens process, with the same features and the same rules. It is being built in phases: phase 1 is Connections, Overview, Server, Pub/Sub and the command line; phase 2 adds Browse, Analyze, snapshots and the database switch; phase 3 adds the edits and bulk actions. Streams and Search follow; until then the dashboard does not offer them. The routes and their replies are in [docs/dashboard-api.md](docs/dashboard-api.md).
 
 ### Starting it
 
@@ -1274,6 +1274,13 @@ One connection at a time, shared by every tab. Dark by default, with a light the
 - **Questions and new runs:** a question belongs to the run it was asked in. When the session starts a new run before it is answered (a database switch or an analysis), the answer is refused with "Not sent: the connection changed since the question was asked." and nothing is sent, as the TUI drops its question on a new run. This holds for write questions, a `@dangerous` command line's question, and a repeated write that a new run interrupts.
 - **Requests:** a query string that lacks a parameter, or has one of the wrong type, is answered 400 with `{"error": "the query parameters are not the ones this route takes"}`, as a body that does not fit is; the input is never echoed.
 - Not yet: Hot keys from Monitor (the TUI's second Hot keys ranking).
+
+### Screens (phase 3)
+
+- **A key's value:** the edits the TUI offers for its type: a string as text or hex (sent as `SET … KEEPTTL` inside `MULTI`/`EXEC` after `WATCH`, only if unchanged, so it needs `WATCH`, `MULTI` and `EXEC` too); hash fields added, changed, deleted and given a field TTL where the server has one; list elements pushed, changed and removed; set members and sorted set members added, changed (a score) and removed; stream entries added and deleted. A value saved compressed is not edited (saving it would store it uncompressed), and says so. An edit made on a value that changed since it was read is refused, and the value is read again.
+- **Keys:** add a key of any of the six types with its first content (an existing name is never overwritten), set or remove its expiry, rename it (never onto an existing name) and delete it, from the value and from the key list.
+- **Bulk actions:** expire or delete a pattern's keys, as the TUI does: a dry run counts them first (reads only), then the question (the pattern typed on `prod`), then batches of at most 500 through the command budget, per node on a cluster, with progress on the event stream and a summary. Stop ends the run before the next batch: a batch already sent finishes, no further one is sent ("Stopped before the first batch: nothing was sent." when none was). While a bulk action counts or runs, a database switch, an analysis, connect, disconnect and the value edits are refused ("A bulk action is running: wait for it to end, or stop it first."); a typed command on the command line is not.
+- Every write goes through the one write gate. A read-only profile sends nothing, the page shows each write off with the reason, and a refused command (`NOPERM`) turns that action off for the session in the TUI's words. A question answered after a new run or on another connection is refused and nothing is sent. Delete questions end "This can't be undone.", as in the TUI.
 
 ## Quality bar
 

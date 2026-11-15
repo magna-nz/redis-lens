@@ -238,7 +238,7 @@ stream.
 
 | Event | When | Data |
 |---|---|---|
-| `state` | first on every stream, then on every change of connection, phase, node, tail or Monitor | the same body as `GET /api/state` |
+| `state` | first on every stream, then on every change of connection, phase, node, tail or Monitor, and when the server refuses a write for this user (`refused` grows) | the same body as `GET /api/state` |
 | `figures` | at the polling interval (2 s to start with, see `POST /api/polling`), only while at least one stream is open, polling is not paused and the live connection is ready | `{node, info, rates, shards}` for the picked node, where `shards` is every node's headline on a cluster (refreshed less often) |
 | `tail` | pub/sub tail | `{tail, kind: "ready"}`, `{tail, kind: "messages", messages: [...], dropped}`, `{tail, kind: "closed", error}` |
 | `monitor` | Monitor run | `{run, kind: "ready", at_unix_ms, max_lines, max_secs}`, `{run, kind: "lines", lines: [...]}`, `{run, kind: "closed", end: "stopped"\|"line_cap"\|"time_up"\|"lost"\|"failed", error}` |
@@ -413,7 +413,8 @@ this route, every write and every answer read its `read_only` and `env` again, a
 change sends a `state` event (a file that cannot be read, or that no longer has the
 profile, turns writes off). A Docker container's session-only setting stays as set.
 `refused` lists the commands the permission check
-turned off. `nodes` and `picked` describe a cluster (the first primary is picked when the
+turned off, and the writes the server refused this session (each one sends a `state`
+event). `nodes` and `picked` describe a cluster (the first primary is picked when the
 nodes arrive). `polling` is how the live figures are polled (`paused`, `interval_secs`,
 and the `intervals` that can be set). `monitor_limits` is when a Monitor run stops by itself
 (`max_secs`, `max_lines`), known before one starts. `features.entra_id` says whether this
@@ -3289,7 +3290,7 @@ Example, `GET /api/value?key=7374723a706c61696e`. Reply: HTTP 200 (`$.value.form
     "name": "str:plain"
   },
   "kind": "string",
-  "length": null,
+  "length": 11,
   "loaded": 1,
   "loading": false,
   "max_items": 10000,
@@ -3300,7 +3301,7 @@ Example, `GET /api/value?key=7374723a706c61696e`. Reply: HTTP 200 (`$.value.form
     "encoding": null,
     "freq": null,
     "id": "7374723a706c61696e",
-    "length": null,
+    "length": 11,
     "length_unit": "bytes",
     "name": "str:plain",
     "node": null,
@@ -3359,7 +3360,7 @@ Example, `GET /api/value?key=7374723a62696e`. Reply: HTTP 200 (`$.value.formats`
     "name": "str:bin"
   },
   "kind": "string",
-  "length": null,
+  "length": 7,
   "loaded": 1,
   "loading": false,
   "max_items": 10000,
@@ -3370,7 +3371,7 @@ Example, `GET /api/value?key=7374723a62696e`. Reply: HTTP 200 (`$.value.formats`
     "encoding": null,
     "freq": null,
     "id": "7374723a62696e",
-    "length": null,
+    "length": 7,
     "length_unit": "bytes",
     "name": "str:bin",
     "node": null,
@@ -3594,7 +3595,7 @@ Example, `GET /api/value?key=71756575653a6a6f6273`. Reply: HTTP 200
     "freq": null,
     "id": "71756575653a6a6f6273",
     "length": null,
-    "length_unit": "bytes",
+    "length_unit": "items",
     "name": "queue:jobs",
     "node": null,
     "ttl": "never",
@@ -3670,7 +3671,7 @@ Example, `GET /api/value/more?view=5`. Reply: HTTP 200
     "freq": null,
     "id": "71756575653a6a6f6273",
     "length": null,
-    "length_unit": "bytes",
+    "length_unit": "items",
     "name": "queue:jobs",
     "node": null,
     "ttl": "never",
@@ -3738,7 +3739,7 @@ Example, `GET /api/value?key=626f6172643a73636f726573`. Reply: HTTP 200
     "freq": null,
     "id": "626f6172643a73636f726573",
     "length": null,
-    "length_unit": "bytes",
+    "length_unit": "members",
     "name": "board:scores",
     "node": null,
     "ttl": "never",
@@ -3820,7 +3821,7 @@ Example, `GET /api/value?key=6576656e74733a6c6f67`. Reply: HTTP 200
     "freq": null,
     "id": "6576656e74733a6c6f67",
     "length": null,
-    "length_unit": "bytes",
+    "length_unit": "entries",
     "name": "events:log",
     "node": null,
     "ttl": "never",
@@ -4828,8 +4829,15 @@ The rules every route here keeps:
 - **A command the server refused for this user is off** for the rest of the session: the
   first refusal is `"Not written: the server refused HSET for this user."` (422); after
   that it is refused before anything is sent, `"Not sent: the server refused HSET for
-  this user."` (422), and `state.refused` lists it. Neither the username nor the
-  password is in any reply, event or log.
+  this user."` (422), and `state.refused` lists it (a `state` event says so at once).
+  Neither the username nor the password is in any reply, event or log.
+- **Some edits need `WATCH`, `MULTI` and `EXEC` too.** A string edit (`SET … KEEPTTL`), a
+  list element's edit or delete (`LSET`, `LREM`) and a new key of a type other than a
+  string are sent in `MULTI`/`EXEC` after `WATCH`; a set member's edit in `MULTI`/`EXEC`.
+  A user with `+set` but without `+watch`, `+multi` or `+exec` can't make them. A refused
+  `WATCH` is `"Not written: the server refused WATCH for this user."` (422), and it turns
+  the edit off by the edit's own command, as the TUI does: `state.refused` lists `SET`
+  (`LSET`, …), and the next try is `"Not sent: the server refused SET for this user."`.
 - **One write at a time per value.** A second one while the first has not answered is
   409 `{"error":"The last write has not answered yet."}`; the body's `writing` is `true`
   meanwhile.
@@ -5428,27 +5436,40 @@ Body: `{list?, name, type, field?, value, score?}`.
 
 The reply is the write reply above. Once added, `value` is the new key opened (its
 first page read) and `row` its row (`node` on a cluster: the primary that owns its slot).
+`row.length` is in `length_unit`, as on a key list: a string's bytes (5 for `hello`), and
+1 for the other types (`fields`, `items`, `members`, `entries`). `bytes` is the memory
+`MEMORY USAGE` reports, not the length: `null` until the key list reads it. The value's
+`pattern` is the pattern the key belongs to, as `GET /api/value` gives it (the analysis
+report's, else the pattern of the key list it was added from when the key infers to it,
+else `null`); a find's text is never a pattern.
 A key that exists is not overwritten: `done: false`, `"Not added: <key> exists already,
 and adding a key never overwrites one."`. One written meanwhile gives `done: false`,
 `"Not added: <key> was written by someone else meanwhile."`.
 
-Example, `POST /api/keys/add {"list":1,"name":"new:string","type":"string","value":"s"}`. Reply: HTTP 200
+Example, `POST /api/keys/add {"list":1,"name":"new:hello","type":"string","value":"hello"}`. Reply: HTTP 200 (`$.value` cut to some of its fields)
 
 ```json
 {
   "closed": false,
   "done": true,
   "key": {
-    "copy": "new:string",
-    "id": "6e65773a737472696e67",
-    "name": "new:string"
+    "copy": "new:hello",
+    "id": "6e65773a68656c6c6f",
+    "name": "new:hello"
   },
-  "message": "Added new:string.",
+  "message": "Added new:hello.",
   "reply": {
     "kind": "ok"
   },
   "row": {
-    "name": "new:string",
+    "bytes": null,
+    "copy": "new:hello",
+    "encoding": null,
+    "freq": null,
+    "id": "6e65773a68656c6c6f",
+    "length": 5,
+    "length_unit": "bytes",
+    "name": "new:hello",
     "node": null,
     "ttl": "never",
     "ttl_secs": null,
@@ -5457,8 +5478,18 @@ Example, `POST /api/keys/add {"list":1,"name":"new:string","type":"string","valu
   "sent": true,
   "value": {
     "...": "the body of GET /api/value",
+    "kind": "string",
+    "length": 5,
+    "meta": {
+      "bytes": null,
+      "length": 5,
+      "length_unit": "bytes",
+      "...": "the same fields as row"
+    },
+    "pattern": null,
     "rev": 0,
-    "view": 9
+    "type": "string",
+    "view": 15
   }
 }
 ```

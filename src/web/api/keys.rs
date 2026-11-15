@@ -282,16 +282,6 @@ impl KeyList {
             self.rows.push(row);
         }
     }
-
-    /// What a value opened from this list reads its key's row with: the find's text,
-    /// or the pattern (the TUI's `source`).
-    pub(crate) fn source(&self) -> String {
-        self.find
-            .as_ref()
-            .map(|(text, _)| text.clone())
-            .or_else(|| self.pattern.clone())
-            .unwrap_or_default()
-    }
 }
 
 #[derive(Debug, Deserialize)]

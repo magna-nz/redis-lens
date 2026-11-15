@@ -579,7 +579,7 @@ pub async fn add_key(State(app): State<App>, Body(b): Body<AddKey>) -> Response 
         ttl: Ttl::Persistent,
         bytes: None,
         encoding: None,
-        length: Some(1),
+        length: Some(new_length(&new)),
         freq: None,
     };
     let op = WriteOp::NewKey {
@@ -593,6 +593,15 @@ pub async fn add_key(State(app): State<App>, Body(b): Body<AddKey>) -> Response 
         Some(made_for),
     )
     .await
+}
+
+/// A new key's length, in its type's unit (`length_unit`): a string's bytes, else the
+/// one field, element, member or entry it starts with.
+fn new_length(new: &NewKey) -> u64 {
+    match new {
+        NewKey::String(v) => u64::try_from(v.len()).unwrap_or(u64::MAX),
+        _ => 1,
+    }
 }
 
 /// Sends a key edit the gate let through, then reads again what it changed, in a task
@@ -1032,11 +1041,15 @@ async fn new_key_done(
         }
         // On a cluster it went to its slot's owner.
         let node = c.session.owner_of(row.key.as_bytes());
-        let mut pattern = String::new();
+        let mut listed: Option<String> = None;
         if let Some(l) = list.and_then(|l| c.browse.lists.of(conn, l)) {
             l.add_row(row.clone(), node);
-            pattern = l.source();
+            listed = l.pattern.clone();
         }
+        // The pattern the key belongs to, as `GET /api/value` gives it: not the list's
+        // find text, which can be another key's name.
+        let pattern =
+            super::values::key_pattern(c.session.report.as_ref(), &row.key, listed.as_deref());
         Some((c.browse.values.add(conn, row.clone(), pattern), node))
     });
     let (body, node) = match opened.flatten() {
@@ -1061,6 +1074,21 @@ mod tests {
 
     fn raw(s: &str) -> Raw {
         Raw::from(s)
+    }
+
+    /// Item 3: a new string's length is its bytes, not the one item a collection starts
+    /// with.
+    #[test]
+    fn a_new_keys_length_is_in_its_types_unit() {
+        assert_eq!(new_length(&NewKey::String(raw("hello"))), 5);
+        assert_eq!(new_length(&NewKey::String(raw(""))), 0);
+        assert_eq!(new_length(&NewKey::String(Raw::new(vec![0xff; 3]))), 3);
+        let hash = NewKey::Hash {
+            field: raw("f"),
+            value: raw("a long value"),
+        };
+        assert_eq!(new_length(&hash), 1);
+        assert_eq!(new_length(&NewKey::List(raw("abc"))), 1);
     }
 
     #[test]

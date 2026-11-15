@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** the web dashboard, phase 2 of 4, on `claude/dashboard-p2`; phase 1 merged as #26 ([Web dashboard](#web-dashboard-2026-11-15)). On main: Redis Insight parity phases 1 to 5 (#15 to #23), the TUI redesign (#21), the shorter README (#24), Find key (#25) and the release pipeline with the switch to MIT (#27).
-**Last updated:** 2026-11-16 (web dashboard phase 1 merged as #26; phase 2 on `claude/dashboard-p2`)
+**Current milestone:** the web dashboard, phase 3 of 4, on `claude/dashboard-p3`; phases 1 and 2 merged as #26 and #28 ([Web dashboard](#web-dashboard-2026-11-15)). On main: Redis Insight parity phases 1 to 5 (#15 to #23), the TUI redesign (#21), the shorter README (#24), Find key (#25) and the release pipeline with the switch to MIT (#27).
+**Last updated:** 2026-11-16 (web dashboard phase 2 merged as #28; phase 3 on `claude/dashboard-p3`)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -671,8 +671,8 @@ A web UI served by redis-lens on `127.0.0.1`, an alternative to the TUI with the
 | Phase | Content | State |
 |---|---|---|
 | 1 | The server (`src/web/`, axum), sign-in token and request checks, the dashboard's own session through the TUI's runner, the shared command budget, `--dashboard` / `--terminal` / `--port` / `--no-open`, `ctrl-o`, and the screens Connections (add, edit, remove, test, writes), Overview, Server, Pub/Sub and Command line | **done**, merged as #26 |
-| 2 | Browse (patterns, keys, values, Find key) and Analyze (Big keys, Expiry, Changes, Hot keys, Nodes, Slots), snapshots, database switch | **done** on `claude/dashboard-p2` |
-| 3 | Writes: field edits, add key, expiry, rename, delete, bulk actions | next |
+| 2 | Browse (patterns, keys, values, Find key) and Analyze (Big keys, Expiry, Changes, Hot keys, Nodes, Slots), snapshots, database switch | **done**, merged as #28 |
+| 3 | Writes: field edits, add key, expiry, rename, delete, bulk actions | **done** on `claude/dashboard-p3` |
 | 4 | Streams and Search | next |
 
 ### How phase 1 was built
@@ -697,6 +697,18 @@ A web UI served by redis-lens on `127.0.0.1`, an alternative to the TUI with the
 | parser | A `://` inside a StackExchange-style password was taken for a URL scheme (a proptest found it) | `aed7429` | **done** |
 
 Open from phase 2: Hot keys from Monitor (the TUI's second ranking) is not in the dashboard yet; snapshots of two databases of one connection share a directory (as in the TUI), so Changes after a database switch compares across databases; the page polls `GET /api/browse` while names are read (no event for it); ReJSON, binary key names and clusters are checked against the mock and in tests, not on the demo servers.
+
+### How phase 3 was built
+
+| Part | Content | Commits | State |
+|---|---|---|---|
+| server | `src/web/api/edits.rs` (value edits, add key, TTL, rename, delete), `src/web/api/bulk.rs` (dry run, question, batches, `bulk` events, stop); a first agent stopped part way (a hook keeps this session out of other worktrees) and a second continued from its patch | `96b8a2e` | **done**; `tests/web_p3_it.rs` on Redis 7.4, Redis 6.2, Valkey and a cluster: each edit read back, read-only sending nothing (checked in commandstats), typed names on `prod`, NOPERM without the username |
+| verifier | One blocking finding: Stop between batches, or before the first, still sent one more batch of up to 500. Also: an edit decided on one run could be sent on the next; a switch or reconnect during a bulk run under-counted it; edits were not refused during a bulk run | `04acd10` | **done**; the stop tests fail on the old code |
+| page | Edit forms per type, add key, expiry, rename, delete, the bulk card; read-only shown off with the reason; 280 page tests | `8ae1067` | **done**; walked in headless Chrome on demo-admin, demo-prod (read-only, then writes on), demo-redis and demo-valkey; every test key deleted |
+
+Also fixed from the page's real-server walk: a refused write now sends a `state` event; a new string's length is its bytes (in the TUI too); a value's pattern is its own, never the Find text; a value's length unit follows its type; `examples/dashboard_dev.rs` keeps its snapshots and bulk key files in its temp directory. Left as in the TUI: a refused string edit names `WATCH` in its error while the refused list says `SET`.
+
+Decided alone (phase 3): bulk actions run over a pattern's keys only, as in the TUI (none over a Find result); disconnect is refused while a bulk action runs (stop it first); a typed command on the command line is not refused during a bulk run.
 
 ### Decisions taken alone (dashboard)
 

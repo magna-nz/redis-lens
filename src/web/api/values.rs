@@ -204,12 +204,7 @@ pub async fn open(State(app): State<App>, Q(q): Q<OpenQuery>) -> Response {
             .row(&key)
             .or_else(|| c.session.report.as_ref().and_then(|r| sampled_row(r, &key)))
             .unwrap_or_else(|| bare_row(&key, q.key_type.as_deref()));
-        let pattern = c
-            .session
-            .report
-            .as_ref()
-            .map(|r| crate::analysis::pattern_of(r, &key))
-            .unwrap_or_default();
+        let pattern = key_pattern(c.session.report.as_ref(), &key, None);
         let conn = c.id;
         Ok(c.browse.values.add(conn, row, pattern))
     });
@@ -219,6 +214,24 @@ pub async fn open(State(app): State<App>, Q(q): Q<OpenQuery>) -> Response {
         Some(Ok(id)) => id,
     };
     read(&app, id).await
+}
+
+/// The pattern `key` belongs to, as a value shows it: the analysis report's
+/// ([`crate::analysis::pattern_of`]); without a report, the pattern of the key list it
+/// was added from (`list`) when it infers to it; else none (`""`). Never a find's text:
+/// that is what was typed, not a pattern.
+pub(crate) fn key_pattern(
+    report: Option<&crate::model::ScanReport>,
+    key: &str,
+    list: Option<&str>,
+) -> String {
+    match report {
+        Some(r) => crate::analysis::pattern_of(r, key),
+        None => list
+            .filter(|p| crate::analysis::key_in_pattern(key, p))
+            .map(str::to_string)
+            .unwrap_or_default(),
+    }
 }
 
 /// `GET /api/value/more?view=<n>`: the next page, as `n` on the key detail. When there
@@ -524,6 +537,20 @@ fn module(m: &Module, kind: Option<&Kind>) -> serde_json::Value {
     })
 }
 
+/// The key's row as the TUI's facts line above a value shows it: its type as the first
+/// read's `TYPE` says (a row made from the key alone guessed it), so `length_unit` is the
+/// type's; and a string's length the `STRLEN` the read gave when the row has none.
+fn shown_row(r: &KeyRow, s: &ValueState) -> KeyRow {
+    let mut r = r.clone();
+    if let Some(t) = s.type_name.as_deref() {
+        r.key_type = KeyType::from_type_reply(t);
+    }
+    if let Some(Items::String { len: Some(n), .. }) = &s.items {
+        r.length = r.length.or(Some(*n));
+    }
+    r
+}
+
 /// The body of an open value.
 fn body(v: &View, nodes: usize) -> serde_json::Value {
     let s = &v.state;
@@ -584,7 +611,10 @@ fn body(v: &View, nodes: usize) -> serde_json::Value {
         .iter()
         .map(|e| crate::web::wording::server_free(&format!("Left out: {e}.")))
         .collect();
-    let mut meta = row.map(|r| serde_json::json!(KeyDto::of(r, None)));
+    let facts_row = row.map(|r| shown_row(r, s));
+    let mut meta = facts_row
+        .as_ref()
+        .map(|r| serde_json::json!(KeyDto::of(r, None)));
     // A row made from the key alone guessed its type: the first read's TYPE says it.
     if let (Some(m), Some(t)) = (meta.as_mut(), type_name.as_ref()) {
         m["type"] = serde_json::json!(t);
@@ -602,7 +632,7 @@ fn body(v: &View, nodes: usize) -> serde_json::Value {
         "loading": v.loading,
         "pages": s.pages,
         "loaded": s.loaded(),
-        "length": row.and_then(|r| r.length),
+        "length": facts_row.as_ref().and_then(|r| r.length),
         "done": s.done(),
         "more": can_read(s) && s.pages > 0,
         "capped": held_all(s),
@@ -944,6 +974,76 @@ mod tests {
         assert_eq!(b["type"], "stream");
         assert_eq!(b["meta"]["type"], "stream");
         assert_eq!(b["kind"], "stream");
+        // The unit is the read type's, not the guessed string's.
+        assert_eq!(b["meta"]["length_unit"], "entries");
+    }
+
+    fn opened(row: KeyRow, type_name: &str, items: Items) -> serde_json::Value {
+        let mut s = ValueState::default();
+        s.row = Some(row);
+        s.answer(Ok(LiveReply::Value(Reply::Page(Page {
+            type_name: Some(type_name.into()),
+            items,
+            next: None,
+            refused: Vec::new(),
+        }))));
+        body(
+            &View {
+                id: 1,
+                conn: 1,
+                state: s,
+                loading: false,
+                rev: 0,
+                writing: false,
+            },
+            0,
+        )
+    }
+
+    /// Item 4: a value's pattern is the one its key belongs to, never a find's text.
+    #[test]
+    fn a_keys_pattern_is_the_one_it_belongs_to() {
+        assert_eq!(key_pattern(None, "p3test:hash", None), "");
+        assert_eq!(key_pattern(None, "user:7", Some("user:{id}")), "user:{id}");
+        assert_eq!(key_pattern(None, "p3test:hash", Some("user:{id}")), "");
+        let mut r = crate::tui::fixtures::report(false);
+        let mut p = r.patterns[0].clone();
+        p.pattern = "p3test:str".into();
+        r.patterns = vec![p];
+        // A literal pattern of another key is not this key's.
+        assert_eq!(key_pattern(Some(&r), "p3test:hash", None), "p3test:hash");
+        assert_eq!(key_pattern(Some(&r), "p3test:str", None), "p3test:str");
+    }
+
+    /// Item 11: a hash opened by name alone counts fields, as the TUI's facts line does.
+    #[test]
+    fn a_hash_opened_by_name_alone_counts_fields() {
+        let b = opened(bare_row("user:1", None), "hash", Items::Hash(Vec::new()));
+        assert_eq!(b["meta"]["type"], "hash");
+        assert_eq!(b["meta"]["length_unit"], "fields");
+    }
+
+    /// Item 3: a string's length is its bytes: the row's when it has one, else the
+    /// `STRLEN` the read gave (the TUI's `row.length.or(strlen)`). `bytes` is the
+    /// memory `MEMORY USAGE` gave, not the length: unknown here.
+    #[test]
+    fn a_strings_length_is_its_bytes() {
+        let hello = || Items::String {
+            value: Raw::from("hello"),
+            len: Some(5),
+        };
+        let b = opened(bare_row("s", None), "string", hello());
+        assert_eq!(b["length"], 5);
+        assert_eq!(b["meta"]["length"], 5);
+        assert_eq!(b["meta"]["length_unit"], "bytes");
+        assert_eq!(b["meta"]["bytes"], serde_json::Value::Null);
+        let mut row = bare_row("s", None);
+        row.length = Some(7);
+        let b = opened(row, "string", hello());
+        assert_eq!(
+            b["length"], 7,
+            "the row's length comes first, as in the TUI"
+        );
     }
 
     /// Small 2: a database switch closes the values, but the numbers go on, so a view

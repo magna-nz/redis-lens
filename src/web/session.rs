@@ -1543,10 +1543,14 @@ fn apply_to(c: &mut Current, msg: Msg, events: &mut Vec<Event>, state: &mut bool
         Msg::Live {
             id, req_id, result, ..
         } if c.id == id => {
+            // A refusal is part of the state (`refused`): the pages hear of it as of any
+            // other change of state.
             if let Some(name) = c.writes.remove(&req_id)
                 && let Err(LiveError::Denied(_)) = &result
+                && !c.session.refusals.refused(&name)
             {
                 c.session.refusals.add(&name);
+                *state = true;
             }
             if let Some(tx) = c.pending.remove(&req_id) {
                 let _ = tx.send(result);
@@ -2293,6 +2297,25 @@ mod tests {
             Err(LiveError::Denied("PUBLISH".into()))
         );
         assert!(c.session.refusals.refused("PUBLISH"));
+        // The refusal changed the state: a `state` event goes out.
+        assert!(state, "a refused write sends a state event");
+        // Refused again, nothing new: no event.
+        let (tx, _rx) = oneshot::channel();
+        c.pending.insert(ReqId(9), tx);
+        c.writes.insert(ReqId(9), "PUBLISH".into());
+        state = false;
+        apply_to(
+            &mut c,
+            Msg::Live {
+                id: 1,
+                scan: 1,
+                req_id: ReqId(9),
+                result: Err(LiveError::Denied("PUBLISH".into())),
+            },
+            &mut events,
+            &mut state,
+        );
+        assert!(!state);
         // Another connection's reply is not this one's.
         let (tx, mut rx) = oneshot::channel();
         c.pending.insert(ReqId(8), tx);

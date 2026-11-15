@@ -617,7 +617,12 @@ impl KeysState {
                         ttl: Ttl::Persistent,
                         bytes: None,
                         encoding: None,
-                        length: Some(1),
+                        // A string's length is its bytes; the other types start with one
+                        // field, element, member or entry.
+                        length: Some(match value {
+                            NewKey::String(v) => u64::try_from(v.len()).unwrap_or(u64::MAX),
+                            _ => 1,
+                        }),
                         freq: None,
                     };
                     if let Some(id) = act.write(op) {
@@ -1384,6 +1389,34 @@ mod tests {
         assert!(app.views.keys.rows.iter().any(|r| r.key == "user:1:cart"));
         // Its value is read.
         assert_eq!(testing::requests(&e).len(), 1, "{e:?}");
+    }
+
+    #[test]
+    fn a_new_string_keys_length_is_its_bytes() {
+        let mut app = writable();
+        app.handle_key(ch('N'));
+        type_text(&mut app, "1:name");
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(ch('s'));
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "hello");
+        let w = writes(&app.handle_key(key(KeyCode::Enter)));
+        assert!(
+            matches!(
+                &w[..],
+                [(
+                    _,
+                    WriteOp::NewKey {
+                        value: NewKey::String(_),
+                        ..
+                    }
+                )]
+            ),
+            "{w:?}"
+        );
+        testing::reply(&mut app, w[0].0, Ok(LiveReply::Write(WReply::Ok)));
+        let row = app.views.keys.rows.iter().find(|r| r.key == "user:1:name");
+        assert_eq!(row.and_then(|r| r.length), Some(5), "{row:?}");
     }
 
     #[test]

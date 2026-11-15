@@ -535,6 +535,10 @@ async fn edits(kind: &str, server: &common::TestServer) {
     // A string: SET … KEEPTTL, only while the value is the one loaded.
     let v = d.open("str:a").await;
     let view = v["view"].clone();
+    // Opened by name alone: its length is the STRLEN read, in bytes (the TUI's facts).
+    assert_eq!(v["length"], 5, "{kind}: {v}");
+    assert_eq!(v["meta"]["length"], 5, "{kind}: {v}");
+    assert_eq!(v["meta"]["length_unit"], "bytes", "{kind}: {v}");
     let r = d
         .post_yes(
             "/api/value/edit",
@@ -590,6 +594,9 @@ async fn edits(kind: &str, server: &common::TestServer) {
     // A hash: HSET, HSETNX (never over a field), HDEL, and a field's TTL.
     let v = d.open("user:1").await;
     let view = v["view"].clone();
+    // Opened by name alone: the unit is the read type's, not the guessed string's.
+    assert_eq!(v["meta"]["type"], "hash", "{kind}: {v}");
+    assert_eq!(v["meta"]["length_unit"], "fields", "{kind}: {v}");
     let name = index_of(&v, "name", "name");
     let r = d
         .post_yes(
@@ -923,6 +930,19 @@ async fn edits(kind: &str, server: &common::TestServer) {
         assert_eq!(w["message"], format!("Added new:{ty}."), "{kind}: {w}");
         assert_eq!(w["row"]["type"], ty, "{kind}: {w}");
         assert!(w["value"]["view"].is_u64(), "{kind}: the value opens: {w}");
+        // One byte, field, element or member, in the type's unit.
+        let unit = match ty {
+            "string" => "bytes",
+            "hash" => "fields",
+            "list" => "items",
+            _ => "members",
+        };
+        assert_eq!(w["row"]["length"], 1, "{kind} {ty}: {w}");
+        assert_eq!(w["row"]["length_unit"], unit, "{kind} {ty}: {w}");
+        assert_eq!(w["value"]["meta"]["length_unit"], unit, "{kind} {ty}: {w}");
+        // The pattern the key belongs to: none known without an analysis, and never
+        // the find's text (`new:`).
+        assert_eq!(w["value"]["pattern"], Value::Null, "{kind} {ty}: {w}");
         let got: String = q(&mut admin, &check).await;
         assert!(
             ["s", "v", "e", "m", "2"].contains(&got.as_str()),
@@ -939,6 +959,22 @@ async fn edits(kind: &str, server: &common::TestServer) {
         .await;
     done(&r, "stream key");
     assert_eq!(q::<i64>(&mut admin, &["XLEN", "new:stream"]).await, 1);
+    // A new string's length is its bytes, in the reply and when it is opened again.
+    let r = d
+        .post_yes(
+            "/api/keys/add",
+            json!({ "list": list, "name": "new:hello", "type": "string", "value": "hello" }),
+        )
+        .await;
+    let w = done(&r, "a 5-byte string");
+    assert_eq!(w["row"]["length"], 5, "{kind}: {w}");
+    assert_eq!(w["row"]["length_unit"], "bytes", "{kind}: {w}");
+    assert_eq!(w["value"]["length"], 5, "{kind}: {w}");
+    assert_eq!(w["value"]["meta"]["length"], 5, "{kind}: {w}");
+    let v = d.open("new:hello").await;
+    assert_eq!(v["length"], 5, "{kind}: {v}");
+    assert_eq!(v["meta"]["length"], 5, "{kind}: {v}");
+    assert_eq!(v["pattern"], Value::Null, "{kind}: {v}");
     let r = d
         .post_yes(
             "/api/keys/add",
@@ -1673,11 +1709,13 @@ async fn a_refused_write_turns_its_action_off_without_naming_the_user() {
             valkey,
             &[
                 "--user", LIM_USER, "on", &pass, "~*", "+@all", "-acl", "-hset", "-unlink",
+                "-watch",
             ],
         )
         .await;
         let mut admin = server.admin().await;
         cmd(&mut admin, &["HSET", "user:1", "name", "ann"]).await;
+        cmd(&mut admin, &["SET", "str:1", "abc"]).await;
         for i in 0..30 {
             cmd(&mut admin, &["SET", &format!("cart:{i}"), "x"]).await;
         }
@@ -1696,6 +1734,9 @@ async fn a_refused_write_turns_its_action_off_without_naming_the_user() {
         let d = Dash::start_with(vec![p], &format!("acl-{kind}"), store).await;
         let mut rx = d.events().await;
         d.connect("limited").await;
+        // No figures meanwhile: a `state` event after a refusal is the refusal's own.
+        let r = d.post("/api/polling", json!({ "paused": true })).await;
+        assert_eq!(r.status, 200, "{kind}: {}", r.body);
         let v = d.open("user:1").await;
         let view = v["view"].clone();
         let idx = index_of(&v, "name", "name");
@@ -1711,6 +1752,19 @@ async fn a_refused_write_turns_its_action_off_without_naming_the_user() {
             "Not written: the server refused HSET for this user.",
             "{kind}"
         );
+        // The refusal sends a `state` event at once: no page has to ask for it.
+        let refused = |s: &Value, c: &str| {
+            s["refused"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x == c))
+        };
+        let s = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for(&mut rx, "state", |s| refused(s, "HSET")),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{kind}: no state event after the refusal"));
+        assert!(refused(&s, "HSET"), "{kind}: {s}");
         // Off for the session from then on: refused before anything is sent.
         let r = d
             .post(
@@ -1733,6 +1787,40 @@ async fn a_refused_write_turns_its_action_off_without_naming_the_user() {
             q::<String>(&mut admin, &["HGET", "user:1", "name"]).await,
             "ann"
         );
+        // A string edit needs WATCH too: refused, it is named WATCH, and it turns the
+        // edit off as SET, the edit's own command, as the TUI does.
+        let sv = d.open("str:1").await;
+        let r = d
+            .post(
+                "/api/value/edit",
+                json!({ "view": sv["view"], "rev": 0, "index": 0, "value": "xyz" }),
+            )
+            .await;
+        assert_eq!(r.status, 422, "{kind}: {}", r.body);
+        assert_eq!(
+            r.json()["error"],
+            "Not written: the server refused WATCH for this user.",
+            "{kind}"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for(&mut rx, "state", |s| refused(s, "SET")),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{kind}: no state event after the WATCH refusal"));
+        let r = d
+            .post(
+                "/api/value/edit",
+                json!({ "view": sv["view"], "rev": 0, "index": 0, "value": "xyz" }),
+            )
+            .await;
+        assert_eq!(r.status, 422, "{kind}: {}", r.body);
+        assert_eq!(
+            r.json()["error"],
+            "Not sent: the server refused SET for this user.",
+            "{kind}"
+        );
+        assert_eq!(q::<String>(&mut admin, &["GET", "str:1"]).await, "abc");
         // Other writes still go.
         let r = d
             .post("/api/value/ttl", json!({ "view": view, "ttl": "1h" }))
