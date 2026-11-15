@@ -83,7 +83,7 @@ fn start(config: &Path, port: u16) -> Running {
         .strip_prefix("Dashboard: ")
         .unwrap_or_else(|| panic!("not the Dashboard: line: {first:?}"));
     let rest = url
-        .strip_prefix(&format!("http://127.0.0.1:{port}/auth/"))
+        .strip_prefix(&format!("http://127.0.0.1:{port}/#token="))
         .unwrap_or_else(|| panic!("not a sign-in URL on port {port}: {url}"));
     assert_eq!(rest.len(), 64, "a 32-byte hex token");
     assert!(rest.chars().all(|c| c.is_ascii_hexdigit()), "{rest}");
@@ -98,12 +98,12 @@ fn start(config: &Path, port: u16) -> Running {
 }
 
 /// One HTTP/1.1 GET on its own connection: the status code and the head and body.
-fn get(port: u16, path: &str, cookie: Option<&str>) -> (u16, String) {
+fn get(port: u16, path: &str, auth: Option<&str>) -> (u16, String) {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
-    if let Some(c) = cookie {
-        req.push_str(&format!("Cookie: {c}\r\n"));
+    if let Some(a) = auth {
+        req.push_str(&format!("Authorization: {a}\r\n"));
     }
     req.push_str("\r\n");
     s.write_all(req.as_bytes()).unwrap();
@@ -148,26 +148,21 @@ fn dashboard_signs_in_refuses_a_taken_port_and_stops_on_kill() {
     let port = free_port();
     let mut d = start(&config, port);
 
-    // Without the cookie the API answers 401.
+    // Without the token the API answers 401; the page itself is served.
     let (code, _) = get(d.port, "/api/state", None);
     assert_eq!(code, 401);
-    // The sign-in URL: 303 to `/`, with the session cookie.
+    let (code, resp) = get(d.port, "/", None);
+    assert_eq!(code, 200, "{resp}");
+    assert!(header(&resp, "set-cookie").is_none(), "{resp}");
+    // The old sign-in route is gone.
     let (code, resp) = get(d.port, &format!("/auth/{}", d.token), None);
-    assert_eq!(code, 303, "{resp}");
-    assert_eq!(header(&resp, "location"), Some("/"), "{resp}");
-    let cookie = header(&resp, "set-cookie").expect("a cookie");
-    assert!(
-        cookie.starts_with(&format!("rl_session={};", d.token)),
-        "{cookie}"
-    );
-    for attr in ["HttpOnly", "SameSite=Strict", "Path=/"] {
-        assert!(cookie.contains(attr), "{attr} in {cookie}");
-    }
-    let session = format!("rl_session={}", d.token);
-    let (code, resp) = get(d.port, "/api/state", Some(&session));
+    assert_eq!(code, 404, "{resp}");
+    assert!(header(&resp, "set-cookie").is_none(), "{resp}");
+    let bearer = format!("Bearer {}", d.token);
+    let (code, resp) = get(d.port, "/api/state", Some(&bearer));
     assert_eq!(code, 200, "{resp}");
     // A wrong token signs nothing in.
-    let (code, _) = get(d.port, "/api/state", Some("rl_session=00"));
+    let (code, _) = get(d.port, "/api/state", Some("Bearer 00"));
     assert_eq!(code, 401);
 
     // A second run on the same port fails with the fixed message, before printing a URL.
@@ -202,12 +197,12 @@ fn ctrl_c_stops_the_dashboard_cleanly() {
     let port = free_port();
     let mut d = start(&config, port);
     // An event stream open at the time does not keep it running.
-    let session = format!("rl_session={}", d.token);
+    let bearer = format!("Bearer {}", d.token);
     let mut events = TcpStream::connect(("127.0.0.1", port)).unwrap();
     events
         .write_all(
             format!(
-                "GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nCookie: {session}\r\n\r\n"
+                "GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {bearer}\r\n\r\n"
             )
             .as_bytes(),
         )
@@ -256,5 +251,37 @@ fn dashboard_flags_with_a_subcommand_are_refused() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// B1 at the command line: `conn add` refuses another scheme and a host that holds a
+/// user name with fixed text, and saves nothing. The URLs carry a user name but no
+/// password, so even a build without the check would not reach the keychain.
+#[test]
+fn conn_add_refuses_other_schemes_and_userinfo_in_the_host() {
+    let dir = temp_dir("schemes");
+    let config = dir.join("config.toml");
+    for url in [
+        "http://B1user@h:6379",
+        "ftp://B1user@h",
+        "h@B1user:6379",
+        "B1user@h:6379",
+    ] {
+        let out = run(&config, &["conn", "add", "bad", "--url", url]);
+        assert_eq!(out.status.code(), Some(1), "{url}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stdout.contains("B1user") && !stderr.contains("B1user"),
+            "{url}: {stdout} {stderr}"
+        );
+        assert!(
+            stderr.contains("only redis, rediss, valkey and valkeys URLs are supported")
+                || stderr.contains("the host holds a user name, a password or other URL parts"),
+            "{url}: {stderr}"
+        );
+        let file = std::fs::read_to_string(&config).unwrap_or_default();
+        assert!(!file.contains("B1user") && !file.contains("bad"), "{file}");
+    }
     std::fs::remove_dir_all(&dir).ok();
 }

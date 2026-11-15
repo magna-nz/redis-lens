@@ -85,7 +85,13 @@ impl FromRef<App> for Page {
 
 /// `{"error": text}` with `status`.
 pub fn error(status: StatusCode, text: &str) -> Response {
-    let text = crate::web::wording::server_free(text);
+    error_with(status, text, &[])
+}
+
+/// [`error`] of a text that holds user data (`data`: a profile name, a host), which the
+/// wording keeps as it is ([`crate::web::wording::server_free_with`]).
+pub fn error_with(status: StatusCode, text: &str, data: &[&str]) -> Response {
+    let text = crate::web::wording::server_free_with(text, data);
     (status, axum::Json(serde_json::json!({ "error": text }))).into_response()
 }
 
@@ -95,6 +101,8 @@ pub fn error(status: StatusCode, text: &str) -> Response {
 pub struct Refused {
     pub status: StatusCode,
     pub text: String,
+    /// User data the text holds ([`error_with`]).
+    pub data: Vec<String>,
 }
 
 impl Refused {
@@ -102,13 +110,21 @@ impl Refused {
         Self {
             status,
             text: text.into(),
+            data: Vec::new(),
         }
+    }
+
+    /// The same refusal, its text holding `data` ([`error_with`]).
+    pub fn holding(mut self, data: &[&str]) -> Self {
+        self.data = data.iter().map(|d| d.to_string()).collect();
+        self
     }
 }
 
 impl IntoResponse for Refused {
     fn into_response(self) -> Response {
-        error(self.status, &self.text)
+        let data: Vec<&str> = self.data.iter().map(String::as_str).collect();
+        error_with(self.status, &self.text, &data)
     }
 }
 
@@ -200,6 +216,8 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
 
 /// `GET /api/state`.
 pub async fn state(State(app): State<App>) -> Response {
+    // Writes on or off as the config file says now.
+    app.hub.follow_saved_profile().await;
     ok(app.hub.state())
 }
 

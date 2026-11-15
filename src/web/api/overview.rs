@@ -47,7 +47,27 @@ struct Live {
 
 /// `GET /api/overview`.
 pub async fn get(State(app): State<App>) -> Response {
-    let body = app.hub.with(|c| {
+    match app.hub.with(body) {
+        Some(b) => ok(b),
+        None => error(StatusCode::CONFLICT, super::NOT_LIVE),
+    }
+}
+
+/// What the connect read for Overview, without the parts the polls change (`live`,
+/// `shards`): the data of the `overview` event, sent when it changes (the connect's
+/// slow log and client list landing, another node picked, the last analysis found).
+pub(crate) fn connect_parts(c: &crate::web::session::Current) -> serde_json::Value {
+    let mut b = body(c);
+    if let Some(o) = b.as_object_mut() {
+        o.remove("live");
+        o.remove("shards");
+    }
+    b
+}
+
+/// The body of `GET /api/overview` for the current connection.
+pub(crate) fn body(c: &crate::web::session::Current) -> serde_json::Value {
+    {
         let s = &c.session;
         let figures = s.figures.as_ref();
         let shards: Vec<dto::Shard> = s
@@ -96,10 +116,6 @@ pub async fn get(State(app): State<App>) -> Response {
                 .map(dto::Finding::of)
                 .collect::<Vec<_>>(),
         })
-    });
-    match body {
-        Some(b) => ok(b),
-        None => error(StatusCode::CONFLICT, super::NOT_LIVE),
     }
 }
 
@@ -162,6 +178,10 @@ pub async fn poll(hub: Arc<Hub>, mut shutdown: watch::Receiver<bool>) {
                 "error": crate::web::wording::server_free(&e.to_string()),
             })),
         };
+        // A pause (or the last stream closing) that came while that `INFO` was in
+        // flight takes effect here: the shards' `INFO`s are not sent after it. The one in
+        // flight is not called back; the pause holds from the next tick on.
+        let shards_due = shards_due && !hub.polling().paused && hub.listeners() > 0;
         let mut shards = None;
         if shards_due {
             hub.with_mut(|c| c.live.shards_at = Some(std::time::Instant::now()));

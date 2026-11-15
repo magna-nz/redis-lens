@@ -111,18 +111,30 @@ pub fn dashboard_failed(e: &crate::web::StartError) -> String {
     }
 }
 
+/// Why the dashboard did not start beside the TUI when the config file could not be
+/// read: its `[settings] dashboard = false` may be in it.
+pub const DASHBOARD_CONFIG_UNREADABLE: &str = "The dashboard is off: the config file could not be read, so it may say not to start it. Fix the file, then start redis-lens again.";
+
 /// Starts the dashboard beside the TUI unless `--terminal` or `[settings] dashboard =
 /// false` says not to. Silent: nothing goes to the terminal, whatever happens. A start
-/// that fails leaves the TUI as it is, with the reason in the link.
+/// that fails leaves the TUI as it is, with the reason in the link. `settings` is `None`
+/// when the config file could not be read: then it does not start, since the file may
+/// turn it off ([`DASHBOARD_CONFIG_UNREADABLE`]).
 fn start_beside(
     beside: Beside,
-    settings: crate::config::DashboardSettings,
+    settings: Option<crate::config::DashboardSettings>,
     path: &Path,
 ) -> (Option<crate::web::Dashboard>, app::DashboardLink) {
     use app::DashboardLink;
     if beside.terminal {
         return (None, DashboardLink::Terminal);
     }
+    let Some(settings) = settings else {
+        return (
+            None,
+            DashboardLink::Failed(DASHBOARD_CONFIG_UNREADABLE.to_string()),
+        );
+    };
     if !settings.dashboard {
         return (None, DashboardLink::Disabled);
     }
@@ -145,9 +157,10 @@ pub async fn run(config: Option<PathBuf>, beside: Beside) -> anyhow::Result<()> 
         None => Config::default_path()?,
     };
     let loaded = Config::load(&path);
-    // Before the first frame. A file that can't be read leaves the dashboard's settings
-    // at their defaults; the TUI says what is wrong with it.
-    let settings = loaded.as_ref().map(|c| c.dashboard).unwrap_or_default();
+    // Before the first frame. A file that can't be read starts no dashboard (it may say
+    // `dashboard = false`); the TUI says what is wrong with the file, and ctrl-o why the
+    // dashboard is off.
+    let settings = loaded.as_ref().ok().map(|c| c.dashboard);
     let (dashboard, link) = start_beside(beside, settings, &path);
     let open_url = dashboard
         .as_ref()
@@ -2971,7 +2984,7 @@ mod tests {
         fn fail(_: &str) -> std::io::Result<()> {
             Err(std::io::Error::from(std::io::ErrorKind::NotFound))
         }
-        let url = "http://127.0.0.1:7379/auth/00ff";
+        let url = "http://127.0.0.1:7379/#token=00ff";
         let (mut runner, mut rx) = runner();
         runner.open_browser = record;
         runner.dashboard = Some(secrecy::SecretString::from(url));
@@ -3022,7 +3035,24 @@ mod tests {
             terminal: true,
             port: Some(0),
         };
-        let (d, link) = start_beside(terminal, on, &path);
+        let (d, link) = start_beside(terminal, Some(on), &path);
+        assert!(d.is_none());
+        assert_eq!(link, DashboardLink::Terminal);
+        // A config file that could not be read: not started, and the link says why.
+        let (d, link) = start_beside(
+            Beside {
+                terminal: false,
+                port: Some(0),
+            },
+            None,
+            &path,
+        );
+        assert!(d.is_none());
+        assert_eq!(
+            link,
+            DashboardLink::Failed(DASHBOARD_CONFIG_UNREADABLE.to_string())
+        );
+        let (d, link) = start_beside(terminal, None, &path);
         assert!(d.is_none());
         assert_eq!(link, DashboardLink::Terminal);
         let (d, link) = start_beside(
@@ -3030,7 +3060,7 @@ mod tests {
                 terminal: false,
                 port: Some(0),
             },
-            off,
+            Some(off),
             &path,
         );
         assert!(d.is_none());
@@ -3041,7 +3071,7 @@ mod tests {
                 terminal: false,
                 port: Some(0),
             },
-            on,
+            Some(on),
             &path,
         );
         let d = d.expect("started");
@@ -3053,7 +3083,8 @@ mod tests {
                 url: format!("http://127.0.0.1:{port}")
             }
         );
-        let token = d.open_url().rsplit('/').next().unwrap().to_string();
+        let token = d.open_url().rsplit('=').next().unwrap().to_string();
+        assert_eq!(token.len(), 64);
         assert!(!format!("{link:?}").contains(&token));
         // Its port is taken now: a second one says so and starts nothing.
         let (second, link) = start_beside(
@@ -3061,7 +3092,7 @@ mod tests {
                 terminal: false,
                 port: Some(port),
             },
-            on,
+            Some(on),
             &path,
         );
         assert!(second.is_none());

@@ -1,11 +1,16 @@
-//! The dashboard's guard (spec "Web dashboard", Security): the session token and its
-//! cookie, the `Host` check against DNS rebinding, the checks on every request that is
-//! not a `GET`, and the headers every response carries.
+//! The dashboard's guard (spec "Web dashboard", Security): the session token, the
+//! `Host` check against DNS rebinding, the checks on every request that is not a `GET`,
+//! and the headers every response carries.
 //!
-//! - **Token.** 32 random bytes per run, in hex. `GET /auth/<token>` sets it as the
-//!   `rl_session` cookie and redirects to `/`; every `/api/*` route needs that cookie
-//!   (compared in constant time). The token is never logged and never in `Debug`.
-//! - **Host.** Every request's `Host` must be `127.0.0.1:<port>` or `localhost:<port>`.
+//! - **Token.** 32 random bytes per run, in hex. The sign-in URL carries it in its
+//!   fragment, `http://127.0.0.1:<port>/#token=<hex>`, which a browser never sends to a
+//!   server nor puts in a `Referer`. The page keeps it for its own origin and sends it on
+//!   every `/api/*` request as `Authorization: Bearer <hex>` (compared in constant
+//!   time); without it the answer is 401. There is no cookie: a cookie for `127.0.0.1`
+//!   would go to every other port on the host too. `/` and `/assets/*` are the page's
+//!   static files and need no token. The token is never logged and never in `Debug`.
+//! - **Host.** Every request's `Host` must be `127.0.0.1:<port>` or `localhost:<port>`,
+//!   and a request target in absolute form (`GET http://host/...`) must name the same.
 //! - **Not a GET.** `Origin` must be `http://127.0.0.1:<port>` or
 //!   `http://localhost:<port>`, `X-Redis-Lens: 1` must be there, and the body is JSON
 //!   (`Content-Type: application/json`).
@@ -18,12 +23,12 @@ use axum::extract::{Request, State};
 use axum::http::header::{self, HeaderMap, HeaderValue};
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 
 use super::api::error;
 
-/// The cookie that carries the session token.
-pub const COOKIE: &str = "rl_session";
+/// How the page sends the token: `Authorization: Bearer <token>`.
+pub const BEARER: &str = "Bearer ";
 /// The header every request that is not a `GET` must carry, with the value `1`.
 pub const HEADER: &str = "x-redis-lens";
 
@@ -49,7 +54,7 @@ impl Token {
         Ok(Self(hex(&bytes)))
     }
 
-    /// The token as it goes in the URL and the cookie.
+    /// The token as it goes in the sign-in URL's fragment.
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -125,21 +130,35 @@ impl Guard {
             || origin == format!("http://localhost:{}", self.port)
     }
 
-    /// The request carries the session cookie with this run's token.
+    /// The request carries `Authorization: Bearer <token>` with this run's token, once.
     pub fn signed_in(&self, headers: &HeaderMap) -> bool {
-        headers
-            .get_all(header::COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(';'))
-            .filter_map(|pair| pair.trim().split_once('='))
-            .any(|(k, v)| k == COOKIE && self.token.matches(v))
+        let Some(v) = one(headers, header::AUTHORIZATION) else {
+            return false;
+        };
+        let (Some(scheme), Some(given)) = (v.get(..BEARER.len()), v.get(BEARER.len()..)) else {
+            return false;
+        };
+        scheme.eq_ignore_ascii_case(BEARER) && self.token.matches(given)
     }
 
-    /// The `Set-Cookie` value that signs a browser in.
-    pub fn cookie(&self) -> String {
+    /// A request target in absolute form names this server too (`Host` is checked
+    /// apart): `GET http://evil.example/api/state` is refused.
+    pub fn target_ok(&self, uri: &axum::http::Uri) -> bool {
+        match uri.authority() {
+            None => uri.scheme().is_none(),
+            Some(a) => {
+                uri.scheme_str() == Some("http")
+                    && (a.as_str() == format!("127.0.0.1:{}", self.port)
+                        || a.as_str() == format!("localhost:{}", self.port))
+            }
+        }
+    }
+
+    /// The URL that signs a browser in: the token in the fragment.
+    pub fn sign_in_url(&self) -> String {
         format!(
-            "{COOKIE}={}; HttpOnly; SameSite=Strict; Path=/",
+            "http://127.0.0.1:{}/#token={}",
+            self.port,
             self.token.expose()
         )
     }
@@ -172,11 +191,11 @@ pub fn writes_ok(guard: &Guard, headers: &HeaderMap) -> bool {
     guard.origin_ok(headers) && header_ok && json
 }
 
-/// The guard, in front of every route: `Host`, then for anything but `GET` the origin,
-/// header and body checks, then for `/api/*` the session cookie.
+/// The guard, in front of every route: `Host` and the request target, then for anything
+/// but `GET` and `HEAD` the origin, header and body checks, then for `/api/*` the token.
 pub async fn guard(State(guard): State<Guard>, req: Request, next: Next) -> Response {
     let headers = req.headers();
-    if !guard.host_ok(headers) {
+    if !guard.host_ok(headers) || !guard.target_ok(req.uri()) {
         return error(StatusCode::FORBIDDEN, FORBIDDEN);
     }
     if !is_safe(req.method()) && !writes_ok(&guard, headers) {
@@ -212,24 +231,6 @@ pub fn set_security_headers(h: &mut HeaderMap) {
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(CSP),
     );
-}
-
-/// `GET /auth/<token>`: with this run's token, sets the cookie and redirects (303) to
-/// `/`; otherwise 401.
-pub async fn sign_in(
-    State(guard): State<Guard>,
-    axum::extract::Path(given): axum::extract::Path<String>,
-) -> Response {
-    if !guard.token.matches(&given) {
-        return error(StatusCode::UNAUTHORIZED, NOT_SIGNED_IN);
-    }
-    let mut res = StatusCode::SEE_OTHER.into_response();
-    res.headers_mut()
-        .insert(header::LOCATION, HeaderValue::from_static("/"));
-    if let Ok(v) = HeaderValue::from_str(&guard.cookie()) {
-        res.headers_mut().insert(header::SET_COOKIE, v);
-    }
-    res
 }
 
 #[cfg(test)]
@@ -349,26 +350,58 @@ mod tests {
     }
 
     #[test]
-    fn the_cookie_signs_in_and_nothing_else_does() {
+    fn the_bearer_token_signs_in_and_nothing_else_does() {
         let g = guard();
-        let good = format!("{COOKIE}={}", "ab".repeat(32));
-        assert!(g.signed_in(&headers(&[("cookie", &good)])));
-        assert!(g.signed_in(&headers(&[("cookie", &format!("theme=dark; {good}"))])));
-        assert!(!g.signed_in(&headers(&[(
-            "cookie",
-            &format!("{COOKIE}={}", "cd".repeat(32))
+        let good = format!("Bearer {}", "ab".repeat(32));
+        assert!(g.signed_in(&headers(&[("authorization", &good)])));
+        assert!(g.signed_in(&headers(&[(
+            "authorization",
+            &format!("bearer {}", "ab".repeat(32))
         )])));
+        for bad in [
+            format!("Bearer {}", "cd".repeat(32)),
+            format!("Basic {}", "ab".repeat(32)),
+            "ab".repeat(32),
+            format!("Bearer  {}", "ab".repeat(32)),
+            "Bearer ".to_string(),
+            String::new(),
+        ] {
+            assert!(!g.signed_in(&headers(&[("authorization", &bad)])), "{bad}");
+        }
+        // Twice, even both right: refused. A cookie with it: not a sign-in.
+        assert!(!g.signed_in(&headers(&[
+            ("authorization", &good),
+            ("authorization", &good)
+        ])));
         assert!(!g.signed_in(&headers(&[(
             "cookie",
-            &format!("other={}", "ab".repeat(32))
+            &format!("rl_session={}", "ab".repeat(32))
         )])));
         assert!(!g.signed_in(&HeaderMap::new()));
         assert_eq!(
-            g.cookie(),
-            format!(
-                "rl_session={}; HttpOnly; SameSite=Strict; Path=/",
-                "ab".repeat(32)
-            )
+            g.sign_in_url(),
+            format!("http://127.0.0.1:7379/#token={}", "ab".repeat(32))
         );
+    }
+
+    #[test]
+    fn an_absolute_target_must_name_this_server() {
+        let g = guard();
+        for ok in [
+            "/api/state",
+            "/",
+            "http://127.0.0.1:7379/api/state",
+            "http://localhost:7379/",
+        ] {
+            assert!(g.target_ok(&ok.parse().unwrap()), "{ok}");
+        }
+        for bad in [
+            "http://evil.example/api/state",
+            "http://127.0.0.1:7380/api/state",
+            "https://127.0.0.1:7379/api/state",
+            "127.0.0.1:7379",
+        ] {
+            assert!(!g.target_ok(&bad.parse().unwrap()), "{bad}");
+        }
     }
 }

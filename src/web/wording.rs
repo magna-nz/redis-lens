@@ -164,13 +164,29 @@ pub const BANNED: &[&str] = &[
     "ctrl-",
 ];
 
-/// The first [`BANNED`] pattern `text` holds.
-pub fn banned(text: &str) -> Option<&'static str> {
-    BANNED.iter().copied().find(|p| text.contains(p))
+/// Whether `text` holds `pattern` where a flag or a key would be: `--` and `ctrl-`
+/// count at the start of the text or of a word (after a space, a bracket, a quote or a
+/// backtick), and `--` only before a letter, so a name or host such as `cache--eu` or
+/// `xn--bcher-kva.example` is not one. The other patterns count anywhere.
+fn holds(text: &str, pattern: &str) -> bool {
+    if pattern != "--" && pattern != "ctrl-" {
+        return text.contains(pattern);
+    }
+    text.match_indices(pattern).any(|(i, m)| {
+        let before = text[..i].chars().next_back();
+        let starts_word = before.is_none_or(|c| c.is_whitespace() || "([{\"'`".contains(c));
+        let after = text[i + m.len()..].chars().next();
+        starts_word && (pattern != "--" || after.is_some_and(|c| c.is_ascii_lowercase()))
+    })
 }
 
-/// `text` in the dashboard's terms: see the module docs.
-pub fn web(text: &str) -> String {
+/// The first [`BANNED`] pattern `text` holds.
+pub fn banned(text: &str) -> Option<&'static str> {
+    BANNED.iter().copied().find(|p| holds(text, p))
+}
+
+/// `text` with [`SENTENCES`] and [`FLAGS`] mapped, before the [`BANNED`] check.
+fn mapped(text: &str) -> String {
     let mut t = text.to_string();
     for (from, to) in SENTENCES {
         if t.contains(from) {
@@ -182,7 +198,12 @@ pub fn web(text: &str) -> String {
             t = t.replace(flag, field);
         }
     }
-    let t = t.trim_end().to_string();
+    t.trim_end().to_string()
+}
+
+/// `text` in the dashboard's terms: see the module docs.
+pub fn web(text: &str) -> String {
+    let t = mapped(text);
     if banned(&t).is_some() {
         FALLBACK.to_string()
     } else {
@@ -190,22 +211,121 @@ pub fn web(text: &str) -> String {
     }
 }
 
+/// Where a piece of user data stood in a text while the rest is mapped and checked.
+const HOLE: (char, char) = ('\u{E000}', '\u{E001}');
+
+/// `text` with every piece of `data` (three characters or more) taken out where it
+/// stands as a whole word, and the pieces in the order of their holes.
+fn take_out(text: &str, data: &[&str]) -> (String, Vec<String>) {
+    let mut data: Vec<&str> = data
+        .iter()
+        .copied()
+        .filter(|d| d.chars().count() >= 3)
+        .collect();
+    // Longest first, so a name that holds another is taken out whole.
+    data.sort_by_key(|d| std::cmp::Reverse(d.len()));
+    data.dedup();
+    let mut t = text.to_string();
+    let mut kept = Vec::new();
+    for d in data {
+        let hole = format!("{}{}{}", HOLE.0, kept.len(), HOLE.1);
+        let mut out = String::with_capacity(t.len());
+        let mut rest = t.as_str();
+        let mut used = false;
+        while let Some(i) = rest.find(d) {
+            let before = rest[..i].chars().next_back();
+            let after = rest[i + d.len()..].chars().next();
+            let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric());
+            out.push_str(&rest[..i]);
+            if word(before) || word(after) {
+                out.push_str(d);
+            } else {
+                out.push_str(&hole);
+                used = true;
+            }
+            rest = &rest[i + d.len()..];
+        }
+        out.push_str(rest);
+        t = out;
+        if used {
+            kept.push(d.to_string());
+        } else {
+            // No hole was made: the number is free for the next piece.
+            continue;
+        }
+    }
+    (t, kept)
+}
+
+/// `template` with its holes filled from `kept`.
+fn put_back(template: &str, kept: &[String]) -> String {
+    let mut t = template.to_string();
+    for (i, d) in kept.iter().enumerate() {
+        t = t.replace(&format!("{}{i}{}", HOLE.0, HOLE.1), d);
+    }
+    t
+}
+
+/// [`web`] of a text that holds user data (a profile name, a host, a tag): the mapping
+/// and the [`BANNED`] check apply to the fixed words only, so a name such as `cache--eu`
+/// or a host such as `xn--bcher-kva.example` never turns the text into [`FALLBACK`].
+pub fn web_with(text: &str, data: &[&str]) -> String {
+    let whole = web(text);
+    if whole != FALLBACK || text == FALLBACK {
+        return whole;
+    }
+    let (template, kept) = take_out(text, data);
+    let t = web(&template);
+    if t == FALLBACK {
+        t
+    } else {
+        put_back(&t, &kept)
+    }
+}
+
+/// A confirm question in the dashboard's terms, with `data` kept as [`web_with`] keeps
+/// it. `None` when its fixed words still name a TUI key or a flag: the question is never
+/// replaced by [`FALLBACK`] (a yes to a question that does not say what yes does), the
+/// request fails instead with [`NO_QUESTION`].
+pub fn question(text: &str, data: &[&str]) -> Option<String> {
+    let whole = mapped(text);
+    if banned(&whole).is_none() {
+        return Some(whole);
+    }
+    let (template, kept) = take_out(text, data);
+    let t = mapped(&template);
+    banned(&t).is_none().then(|| put_back(&t, &kept))
+}
+
+/// Why a request that needed a question failed: the question could not be put in the
+/// dashboard's terms ([`question`]). Nothing was changed.
+pub const NO_QUESTION: &str =
+    "That needs a question the dashboard cannot ask, so nothing was changed.";
+
 /// [`web`] of an optional text.
 pub fn web_opt(text: Option<&str>) -> Option<String> {
     text.map(web)
 }
 
 /// The error codes a Redis or Valkey server starts an error reply with, as the client
-/// library shows them (`NOAUTH: ...`, `"WRONGPASS": ...`, `ResponseError: ...`).
+/// library shows them (`NOAUTH: ...`, `"WRONGPASS": ...`, `ResponseError: ...`). Any
+/// other leading all-capitals word counts too ([`leading_code`]); these are the ones
+/// that also count after a `: ` inside a longer text.
 const SERVER_CODES: &[&str] = &[
     "ERR",
     "NOAUTH",
     "WRONGPASS",
     "NOPERM",
+    "NOPROTO",
     "WRONGTYPE",
     "LOADING",
     "BUSY",
+    "BUSYKEY",
+    "BUSYGROUP",
+    "NOGROUP",
     "MASTERDOWN",
+    "MISCONF",
+    "DENIED",
     "READONLY",
     "NOSCRIPT",
     "EXECABORT",
@@ -215,61 +335,181 @@ const SERVER_CODES: &[&str] = &[
     "MOVED",
     "ASK",
     "NOREPLICAS",
+    "NOQUORUM",
     "NOTBUSY",
+    "NOSUB",
     "UNKILLABLE",
+    "UNBLOCKED",
+    "INPROG",
+    "IOERR",
     "OOM",
 ];
 
-/// The client library's names for the kinds of error it reports (`... - IoError`,
-/// `... - AuthenticationFailed: detail`), as its `Display` ends them.
+/// All-capitals words that start redis-lens's own sentences (a command it names, a
+/// protocol), so they are not read as a server's error code at the start of a text.
+/// None of them is a code a server answers with ([`SERVER_CODES`] is checked first).
+const OWN_STARTS: &[&str] = &[
+    "ACL",
+    "AUTH",
+    "CLIENT",
+    "CLUSTER",
+    "COMMAND",
+    "CONFIG",
+    "DBSIZE",
+    "DEL",
+    "DNS",
+    "EVAL",
+    "GET",
+    "HELLO",
+    "INFO",
+    "KEYS",
+    "LATENCY",
+    "MEMORY",
+    "MIGRATE",
+    "MONITOR",
+    "MULTI",
+    "OBJECT",
+    "PERSIST",
+    "PING",
+    "PSUBSCRIBE",
+    "PUBLISH",
+    "PUBSUB",
+    "SCAN",
+    "SELECT",
+    "SENTINEL",
+    "SET",
+    "SLOWLOG",
+    "SSH",
+    "SSUBSCRIBE",
+    "SUBSCRIBE",
+    "TCP",
+    "TLS",
+    "TTL",
+    "TYPE",
+    "URL",
+    "WATCH",
+    "XINFO",
+];
+
+/// The client library's names for the kinds of error it reports, as its `Display`
+/// writes them: a server reply's kind (`BusyLoading: detail`), and its own kinds after
+/// a description (`... - AuthenticationFailed`, `... - Server(ResponseError)`). Both the
+/// redis-rs 1.x names and the older ones.
 const LIBRARY_KINDS: &[&str] = &[
-    "AuthenticationFailed",
+    // redis::ServerErrorKind (Debug), redis-rs 1.x.
     "ResponseError",
+    "ExecAbort",
+    "BusyLoading",
+    "NoScript",
+    "Moved",
+    "Ask",
+    "TryAgain",
+    "ClusterDown",
+    "CrossSlot",
+    "MasterDown",
+    "ReadOnly",
+    "NotBusy",
+    "NoSub",
+    "NoPerm",
+    // redis::ErrorKind (Debug), redis-rs 1.x.
+    "Parse",
+    "AuthenticationFailed",
+    "UnexpectedReturnType",
+    "InvalidClientConfig",
+    "Io",
+    "Client",
+    "Extension",
+    "MasterNameNotFoundBySentinel",
+    "NoValidReplicasFoundBySentinel",
+    "EmptySentinelList",
+    "ClusterConnectionNotFound",
+    "Server",
+    "Serialize",
+    "RESP3NotSupported",
+    // Older names.
     "ExtensionError",
     "TypeError",
     "ExecAbortError",
     "BusyLoadingError",
     "NoScriptError",
-    "InvalidClientConfig",
     "ClientError",
     "ParseError",
-    "ReadOnly",
-    "ClusterDown",
-    "CrossSlot",
-    "MasterDown",
-    "TryAgain",
-    "Moved",
-    "Ask",
-    "NoPerm",
+    "IoError",
     "NoAuth",
     "WrongPass",
     "Unexpected",
-    "RESP3NotSupported",
-    "Server(",
-    "Extension",
 ];
+
+/// The all-capitals word `text` starts with (after a quote or a `-`), when it is
+/// followed by a space, a colon, a quote or nothing: how a server's error reply starts,
+/// raw (`MISCONF ...`) or as the library shows an unknown code (`"MISCONF": ...`).
+fn leading_code(text: &str) -> Option<&str> {
+    let t = text.trim_start().trim_start_matches(['"', '-']);
+    let end = t
+        .find(|c: char| !(c.is_ascii_uppercase() || c == '_'))
+        .unwrap_or(t.len());
+    let word = &t[..end];
+    let rest = &t[end..];
+    let ends_well = rest.is_empty() || rest.starts_with([' ', ':', '"']);
+    (word.len() >= 2 && ends_well).then_some(word)
+}
+
+/// Whether `text` holds a library kind name in the forms its `Display` writes:
+/// ` - Kind`, ` - Kind: `, ` - Kind(`, or `Kind: ` at a word's start.
+fn holds_kind(text: &str) -> bool {
+    LIBRARY_KINDS.iter().any(|k| {
+        let after_dash = format!(" - {k}");
+        let dash = text.match_indices(&after_dash).any(|(i, m)| {
+            let rest = &text[i + m.len()..];
+            rest.is_empty() || rest.starts_with([':', '(', ' ', ')', ']', ','])
+        });
+        let colon = format!("{k}: ");
+        let leading = text.match_indices(&colon).any(|(i, _)| {
+            text[..i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_ascii_alphanumeric())
+        });
+        dash || leading
+    })
+}
+
+/// Whether `text` holds a quoted all-capitals code followed by a colon anywhere
+/// (`... failed: "MISCONF": ...`): how the library shows a code it does not know.
+fn holds_quoted_code(text: &str) -> bool {
+    text.match_indices('"').any(|(i, _)| {
+        let rest = &text[i + 1..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_uppercase() || c == '_'))
+            .unwrap_or(rest.len());
+        end >= 2 && rest[end..].starts_with("\":")
+    })
+}
 
 /// Whether `text` reads as a server's (or the client library's) error text rather than
 /// redis-lens's own sentence.
 fn from_server(text: &str) -> bool {
-    let first: String = text
-        .trim_start_matches(['"', '-'])
-        .chars()
-        .take_while(|c| c.is_ascii_alphabetic())
-        .collect();
-    let starts_with_code = SERVER_CODES.contains(&first.as_str())
-        && text
-            .trim_start_matches(['"', '-'])
-            .get(first.len()..)
-            .is_some_and(|rest| rest.starts_with([' ', ':', '"']) || rest.is_empty());
-    starts_with_code
+    let leading = leading_code(text)
+        .is_some_and(|w| SERVER_CODES.contains(&w) || (is_code(w) && !OWN_STARTS.contains(&w)));
+    leading
         || text.contains("An error was signalled by the server")
-        || LIBRARY_KINDS
-            .iter()
-            .any(|k| text.contains(&format!(" - {k}")) || text.contains(&format!("{k}: ")))
+        || holds_kind(text)
+        || holds_quoted_code(text)
         || SERVER_CODES
             .iter()
-            .any(|c| text.contains(&format!("\"{c}\"")) || text.contains(&format!(": {c} ")))
+            .any(|c| text.contains(&format!(": {c} ")) || text.contains(&format!("\"{c}\"")))
+}
+
+/// [`server_free`] of a text that holds user data, kept as [`web_with`] keeps it.
+pub fn server_free_with(text: &str, data: &[&str]) -> String {
+    if from_server(text) {
+        // A name such as `ERR-cache` is not a server's code: decide on the fixed words.
+        let (template, _) = take_out(text, data);
+        if from_server(&template) {
+            return server_free(text);
+        }
+    }
+    web_with(text, data)
 }
 
 /// `text` with any server or client-library error text it holds replaced by a fixed
@@ -486,9 +726,101 @@ mod tests {
             "Connection refused (os error 61)",
             "the server did not answer in time",
             "no Sentinel could be reached",
-            "ERRATIC is not a code",
+            "INFO or DBSIZE could not be read on this node",
+            "XINFO STREAM failed",
+            "TLS handshake failed: the certificate has expired",
+            "SELECT would switch the database under every view",
+            "the host is cache-eu: Ask the owner",
         ] {
             assert_eq!(server_free(own), own);
+        }
+    }
+
+    /// The verifier's list (texts that came through unchanged before), and every form
+    /// redis-rs 1.x's `Display` gives its errors: each becomes a fixed sentence.
+    #[test]
+    fn every_library_error_form_and_unknown_code_becomes_a_fixed_sentence() {
+        let fixed = [NEEDS_PASSWORD, BAD_CREDENTIALS, SERVER_REFUSED];
+        let mut texts: Vec<String> = [
+            "\"MISCONF\": Redis is configured to save RDB snapshots, but it's currently unable to persist to disk.",
+            "\"DENIED\": Redis is running in protected mode because protected mode is enabled",
+            "\"NOPROTO\": unsupported protocol version",
+            "BusyLoading: Redis is loading the dataset in memory",
+            "NoScript: No matching script. Please use EVAL.",
+            "ExecAbort: Transaction discarded because of previous errors.",
+            "NotBusy: No scripts in execution right now.",
+            "NoSub: 'unsubscribe' command without any subscriptions",
+            "\"NOGROUP\": No such key 's' or consumer group 'g'",
+            "\"BUSYGROUP\": Consumer Group name already exists",
+            "\"IOERR\": error or timeout",
+            "\"UNBLOCKED\": client unblocked via CLIENT UNBLOCK",
+            "\"NOQUORUM\": -NOQUORUM not enough good replicas",
+            "\"INPROG\": already in progress",
+            "MISCONF Redis is configured to save RDB snapshots",
+            "DENIED Redis is running in protected mode",
+            "NOSUB not subscribed",
+            "tail: the connection failed: \"MISCONF\": Redis is configured to save",
+            "Pipeline failure: [(Index 0, error: \"MISCONF\": x)]",
+            "Pipeline failure: [(Index 0, error: BusyLoading: x)]",
+        ]
+        .map(String::from)
+        .to_vec();
+        // Every server reply kind, through the library's own parser and Display.
+        for code in [
+            "ERR",
+            "EXECABORT",
+            "LOADING",
+            "NOSCRIPT",
+            "MOVED 1 h:1",
+            "ASK 1 h:1",
+            "TRYAGAIN",
+            "CLUSTERDOWN",
+            "CROSSSLOT",
+            "MASTERDOWN",
+            "READONLY",
+            "NOTBUSY",
+            "NOSUB",
+            "NOPERM",
+            "NOAUTH",
+            "WRONGPASS",
+            "MISCONF",
+            "DENIED",
+            "SOMENEWCODE",
+        ] {
+            let raw = format!("-{code} the server's own words\r\n");
+            match redis::parse_redis_value(raw.as_bytes()).unwrap() {
+                redis::Value::ServerError(e) => {
+                    texts.push(e.to_string());
+                    texts.push(redis::RedisError::from(e).to_string());
+                }
+                v => panic!("{v:?}"),
+            }
+        }
+        // Every library kind, as `desc - Kind` and `desc - Kind: detail`.
+        use redis::ErrorKind as K;
+        for kind in [
+            K::Parse,
+            K::AuthenticationFailed,
+            K::UnexpectedReturnType,
+            K::InvalidClientConfig,
+            K::Io,
+            K::Client,
+            K::Extension,
+            K::MasterNameNotFoundBySentinel,
+            K::NoValidReplicasFoundBySentinel,
+            K::EmptySentinelList,
+            K::ClusterConnectionNotFound,
+            K::RESP3NotSupported,
+        ] {
+            texts.push(redis::RedisError::from((kind, "the library's words")).to_string());
+            texts.push(
+                redis::RedisError::from((kind, "the library's words", "detail".to_string()))
+                    .to_string(),
+            );
+        }
+        for t in &texts {
+            let out = server_free(t);
+            assert!(fixed.contains(&out.as_str()), "{t:?} became {out:?}");
         }
     }
 
@@ -528,6 +860,82 @@ mod tests {
         assert_eq!(
             perm_reason("OBJECT FREQ", false, "INFO is not available: NOAUTH x"),
             "INFO is not available"
+        );
+    }
+
+    /// S2: user data that holds a banned pattern keeps its text; a flag or a key in the
+    /// fixed words still does not reach the page; a question is never the fallback.
+    #[test]
+    fn user_data_never_turns_a_text_into_the_fallback() {
+        // `--` inside a word is not a flag, anywhere.
+        for t in [
+            "writes are off for cache--eu",
+            "connected to xn--bcher-kva.example:6379",
+            "tagged team--a",
+        ] {
+            assert_eq!(banned(t), None, "{t}");
+            assert_eq!(web(t), t);
+            assert_eq!(server_free(t), t);
+        }
+        for t in [
+            "give --force",
+            "--force replaces it",
+            "(`--yes`)",
+            "press ctrl-o",
+        ] {
+            assert!(
+                banned(t).is_some() || banned(&t.replace("press", "Press ")).is_some(),
+                "{t}"
+            );
+        }
+        // Data that holds another pattern: kept, and the fixed words are still mapped.
+        let p = crate::model::Profile {
+            name: "Press (5) cache".into(),
+            env: crate::model::Env::Local,
+            endpoint: crate::model::Endpoint {
+                host: "xn--bcher-kva.example".into(),
+                port: 1,
+                tls: false,
+            },
+            db: 0,
+            auth: crate::model::Auth::None,
+            read_only: Some(true),
+            prefer_replica: false,
+            provider: None,
+            token_command: None,
+            ssh: None,
+            sentinel: None,
+            force_standalone: false,
+            tags: Vec::new(),
+        };
+        let reason = crate::write::read_only_reason(&p);
+        assert_eq!(web(&reason), FALLBACK, "the old check loses it: {reason}");
+        let shown = web_with(&reason, &[&p.name, &p.endpoint.host]);
+        assert_ne!(shown, FALLBACK);
+        assert!(shown.contains("Press (5) cache"), "{shown}");
+        let without = web(&reason.replace(&p.name, "cache"));
+        assert_eq!(shown, without.replace("cache", "Press (5) cache"));
+        // A flag in the fixed words is still refused, data or not.
+        assert_eq!(web_with("cache: pass --frobnicate", &["cache"]), FALLBACK);
+        // Short data is never taken out: it would cut through the fixed words.
+        assert_eq!(web_with("press w on 0 Connections", &["w"]), FALLBACK);
+        // A question keeps its words or is refused, never the fallback.
+        let q =
+            "Turn writes on for Press (5) cache? Each write still asks before it is sent. [y/N] ";
+        let asked = question(q, &["Press (5) cache"]).expect("asked");
+        assert!(
+            asked.contains("Press (5) cache") && !asked.contains("[y/N]"),
+            "{asked}"
+        );
+        assert_eq!(question("Type it, then press ctrl-x", &[]), None);
+        // A name that reads like a server code is the user's.
+        assert_eq!(
+            server_free_with("ERRSOME is read-only", &["ERRSOME"]),
+            "ERRSOME is read-only"
+        );
+        assert_eq!(
+            server_free_with("MISCONF on cache", &["cache"]),
+            SERVER_REFUSED
         );
     }
 }

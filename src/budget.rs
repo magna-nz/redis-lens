@@ -113,7 +113,10 @@ fn registry() -> MutexGuard<'static, Registry> {
 /// (spec "Shared command budget"): the one already in use in this process when there is
 /// one with that limit, otherwise a new one, kept for the next taker while it is in
 /// use. A budget in use with another limit (the profile's rate changed) is replaced
-/// for later takers; whoever holds it keeps it.
+/// for later takers; whoever holds it keeps it. So while both are in use (a TUI session
+/// from before the change and a dashboard session from after it, say) the two do not
+/// share: each stays within its own limit, and together they can send up to the sum of
+/// the two until the older session ends or reconnects.
 pub fn shared(profile: &str, node: &str, per_sec: Option<u32>) -> Arc<Budget> {
     let mut reg = registry();
     reg.retain(|_, b| b.strong_count() > 0);

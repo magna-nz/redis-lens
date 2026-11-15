@@ -9,7 +9,7 @@ repository = "https://github.com/magna-nz/redis-lens"
 readme = "README.md"
 keywords = ["redis", "valkey", "tui", "memory", "profiler"]
 categories = ["command-line-utilities", "database", "development-tools::profiling"]
-exclude = ["/demo", "/.github", "/CLAUDE.md", "/Makefile", "/spec.md", "/status.md", "/docs"]
+exclude = ["/demo", "/.github", "/CLAUDE.md", "/Makefile", "/spec.md", "/status.md", "/docs", "/examples", "/src/web/assets/tests"]
 
 [features]
 default = []
@@ -32,6 +32,10 @@ flate2 = { version = "1.1.11", default-features = false, features = ["rust_backe
 futures = "0.3.34"
 # The dashboard's session token and confirmation ids.
 getrandom = "0.3.4"
+# The dashboard's server loop: a header read timeout and a cap on connections, which
+# `axum::serve` does not set. Both already in the tree through axum.
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "server", "http1", "service", "server-graceful"] }
 keyring = "4.2.0"
 # Values: LZ4 frame decoding only, the safe and bounds-checked decoder.
 lz4_flex = { version = "0.14.0", default-features = false, features = ["frame", "safe-decode", "checked-decode"] }

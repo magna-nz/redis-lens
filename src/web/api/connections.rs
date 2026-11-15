@@ -42,7 +42,9 @@ impl Clone for Secret {
 #[serde(deny_unknown_fields)]
 pub struct AddRequest {
     pub name: String,
-    pub url: String,
+    /// It may hold a user name and password: held as a secret, like the passwords, while
+    /// a question waits, and exposed only where `conn add` reads it.
+    pub url: Secret,
     #[serde(default)]
     pub env: Option<EnvName>,
     /// The server's password: to the keychain only.
@@ -139,7 +141,7 @@ const NEEDS_ANSWER: &str = "needs the question answered";
 fn args_of(r: &AddRequest, token_ok: bool, writes_name: Option<String>) -> ConnAddArgs {
     ConnAddArgs {
         name: r.name.clone(),
-        url: r.url.clone(),
+        url: r.url.0.expose_secret().to_string(),
         env: r.env.map(|e| match e {
             EnvName::Prod => EnvArg::Prod,
             EnvName::Stage => EnvArg::Stage,
@@ -186,7 +188,7 @@ fn clean(text: &str, r: &AddRequest) -> String {
     for p in [&r.password, &r.sentinel_password].into_iter().flatten() {
         t = crate::tui::scrub(t, Some(p.0.expose_secret()));
     }
-    if let Ok(parsed) = crate::conn::parse::parse_connection_string(&r.url)
+    if let Ok(parsed) = crate::conn::parse::parse_connection_string(r.url.0.expose_secret())
         && let Some(c) = parsed.credentials
     {
         t = crate::tui::scrub(t, Some(c.password.expose_secret()));
@@ -277,6 +279,38 @@ async fn saved(app: &App, name: &str) -> Option<dto::Connection> {
     .flatten()
 }
 
+/// The user data a `conn add` message or question can hold: the name, the host, tags.
+fn add_data(r: &AddRequest) -> Vec<&str> {
+    let mut d = vec![r.name.as_str()];
+    let url = r.url.0.expose_secret();
+    if let Ok(parsed) = crate::conn::parse::parse_connection_string(url) {
+        d.push(host_in(url, &parsed.endpoint.host));
+    }
+    d.extend(r.tags.iter().map(String::as_str));
+    d
+}
+
+/// `host` as it stands in `url` (the parsed host borrows nothing from it).
+fn host_in<'a>(url: &'a str, host: &str) -> &'a str {
+    url.find(host).map_or("", |i| &url[i..i + host.len()])
+}
+
+/// The user data a `conn set` message or question can hold: the name, the host, tags.
+fn set_data<'a>(
+    name: &'a str,
+    r: &'a SetRequest,
+    p: Option<&'a crate::model::Profile>,
+) -> Vec<&'a str> {
+    let mut d = vec![name];
+    if let Some(p) = p {
+        d.push(p.endpoint.host.as_str());
+        d.extend(p.tags.iter().map(String::as_str));
+    }
+    d.extend(r.tag.iter().map(String::as_str));
+    d.extend(r.untag.iter().map(String::as_str));
+    d
+}
+
 async fn add_step(app: &App, asked: AddAsked) -> Response {
     let name = asked.req.name.clone();
     let req = asked.req.clone();
@@ -286,7 +320,7 @@ async fn add_step(app: &App, asked: AddAsked) -> Response {
             (
                 StatusCode::CREATED,
                 axum::Json(serde_json::json!({
-                    "message": crate::web::wording::web(&message),
+                    "message": crate::value::escape(&crate::web::wording::web_with(&message, &add_data(&req))),
                     "connection": connection,
                 })),
             )
@@ -319,13 +353,19 @@ async fn add_step(app: &App, asked: AddAsked) -> Response {
             },
         )) => {
             let expect = req.name.clone();
+            let Some(q) = crate::web::wording::question(&q, &add_data(&req)) else {
+                return error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    crate::web::wording::NO_QUESTION,
+                );
+            };
             app.ask(
                 Action::Add(Box::new(AddAsked {
                     req,
                     token_ok: asked.token_ok,
                     writes_name: Some(String::new()),
                 })),
-                Question::typed(crate::value::escape(&crate::web::wording::web(&q)), expect),
+                Question::typed(crate::value::escape(&q), expect),
             )
         }
         Err((why, _)) => error(StatusCode::BAD_REQUEST, &why),
@@ -432,7 +472,10 @@ async fn set_step(
                 }
             }
             ok(serde_json::json!({
-                "message": crate::web::wording::web(&crate::value::escape(&crate::conn::parse::mask(&message))),
+                "message": crate::value::escape(&crate::web::wording::web_with(
+                    &crate::conn::parse::mask(&message),
+                    &set_data(&name, &req, profile.as_ref()),
+                )),
                 "connection": profile.as_ref().map(dto::Connection::of),
             }))
         }
@@ -440,7 +483,15 @@ async fn set_step(
             let prod = profile
                 .as_ref()
                 .is_some_and(|p| p.env == crate::model::Env::Prod);
-            let q = crate::value::escape(&crate::web::wording::web(&q));
+            let Some(q) =
+                crate::web::wording::question(&q, &set_data(&name, &req, profile.as_ref()))
+            else {
+                return error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    crate::web::wording::NO_QUESTION,
+                );
+            };
+            let q = crate::value::escape(&q);
             let question = if prod {
                 Question::typed(q, name.clone())
             } else {
@@ -531,7 +582,7 @@ pub async fn remove(State(app): State<App>, Path(name): Path<String>) -> Respons
         Ok(Ok(message)) => {
             forget(&app);
             ok(
-                serde_json::json!({ "message": crate::web::wording::web(&crate::value::escape(&message)) }),
+                serde_json::json!({ "message": crate::value::escape(&crate::web::wording::web_with(&message, &[name.as_str()])) }),
             )
         }
         Ok(Err((true, _))) => error(StatusCode::NOT_FOUND, NO_SUCH),
@@ -703,7 +754,18 @@ pub async fn test(State(app): State<App>, Path(name): Path<String>) -> Response 
             );
         }
     };
-    let report = crate::conn::check_permissions(&mut conn).await;
+    // The probes take from the profile's command budget, the one a TUI or dashboard
+    // session on the same node takes from (spec "Shared command budget").
+    let budget = crate::budget::shared(
+        &profile.name,
+        &profile.endpoint.to_string(),
+        crate::scan::ScanOptions::for_profile(&profile).max_commands_per_sec,
+    );
+    let report = crate::conn::check_permissions(&mut Budgeted {
+        conn: &mut conn,
+        budget: &budget,
+    })
+    .await;
     let answer = conn.sentinel().cloned();
     drop(conn);
     // Open, but every command refused for want of a password: a failed test, as a
@@ -722,6 +784,44 @@ pub async fn test(State(app): State<App>, Path(name): Path<String>) -> Response 
         "sentinel": answer.as_ref().map(|a| crate::value::escape(&cli::sentinel_line(a))),
         "checks": dto::perms(&report),
     }))
+}
+
+/// A connection that takes one command from `budget` for each command it sends (a
+/// pipeline takes its length). The same adapter as `conn::cluster`'s private one, which
+/// the per-node probes use; that one is not reachable from here.
+struct Budgeted<'a, C> {
+    conn: &'a mut C,
+    budget: &'a crate::budget::Budget,
+}
+
+impl<C: redis::aio::ConnectionLike + Send> redis::aio::ConnectionLike for Budgeted<'_, C> {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        cmd: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        Box::pin(async move {
+            self.budget.take(1).await;
+            self.conn.req_packed_command(cmd).await
+        })
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        cmd: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        Box::pin(async move {
+            self.budget
+                .take(u32::try_from(cmd.len()).unwrap_or(u32::MAX))
+                .await;
+            self.conn.req_packed_commands(cmd, offset, count).await
+        })
+    }
+
+    fn get_db(&self) -> i64 {
+        self.conn.get_db()
+    }
 }
 
 /// Why a connection name finds nothing.

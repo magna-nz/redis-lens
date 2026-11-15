@@ -3,9 +3,10 @@
 //!
 //! - [`start`] binds `127.0.0.1:<port>` (never another address), makes this run's
 //!   session token and spawns the server; [`Dashboard::open_url`] is the URL that signs a
-//!   browser in, [`Dashboard::url`] the one to show.
-//! - [`auth`]: the token and cookie, the `Host`, `Origin` and header checks, and the
-//!   headers every response carries.
+//!   browser in (the token in its fragment), [`Dashboard::url`] the one to show.
+//!   [`open_in_browser`] opens it without putting it on a command line.
+//! - [`auth`]: the token (`Authorization: Bearer`), the `Host`, `Origin` and header
+//!   checks, and the headers every response carries.
 //! - [`assets`]: the page's files, embedded from a fixed list.
 //! - [`session`]: the dashboard's one connection, on the TUI's own runtime.
 //! - [`api`]: the JSON routes and the event stream (`docs/dashboard-api.md`).
@@ -81,13 +82,15 @@ impl Dashboard {
         format!("http://127.0.0.1:{}/", self.port)
     }
 
-    /// The URL that signs a browser in: it holds the token. Open it, never log it.
+    /// The URL that signs a browser in, `http://127.0.0.1:<port>/#token=<hex>`: the token
+    /// is in the fragment, which the browser never sends to a server. Open it with
+    /// [`open_in_browser`], never log it.
     pub fn open_url(&self) -> String {
-        format!(
-            "http://127.0.0.1:{}/auth/{}",
-            self.port,
-            self.token.expose()
-        )
+        auth::Guard {
+            port: self.port,
+            token: self.token.clone(),
+        }
+        .sign_in_url()
     }
 
     pub fn port(&self) -> u16 {
@@ -110,7 +113,74 @@ impl Dashboard {
 impl Drop for Dashboard {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
+        opener::remove_all();
     }
+}
+
+/// How the server treats connections: hyper's header read timeout and a cap on the
+/// connections open at once (a browser opens a few per tab, the event stream one).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    pub header_timeout: std::time::Duration,
+    pub max_connections: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            header_timeout: std::time::Duration::from_secs(10),
+            max_connections: 64,
+        }
+    }
+}
+
+/// Until `stop` turns true (the guard `wait_for` gives is dropped here, not held across
+/// the caller's awaits).
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    let _ = stop.wait_for(|v| *v).await;
+}
+
+/// Accepts connections until `stop` turns true, each served by hyper's HTTP/1 with the
+/// header read timeout, at most `limits.max_connections` at once (the next waits for one
+/// to close). Then the open ones are given 2 s to finish.
+pub(crate) async fn serve(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    mut stop: watch::Receiver<bool>,
+    limits: Limits,
+) {
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    let open = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    loop {
+        let permit = tokio::select! {
+            p = Arc::clone(&open).acquire_owned() => p,
+            () = stopped(&mut stop) => break,
+        };
+        let Ok(permit) = permit else { break };
+        let stream = tokio::select! {
+            r = listener.accept() => match r {
+                Ok((s, _)) => s,
+                // Out of file descriptors and the like: wait, then go on.
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            },
+            () = stopped(&mut stop) => break,
+        };
+        let service = hyper_util::service::TowerToHyperService::new(router.clone());
+        let mut builder = hyper::server::conn::http1::Builder::new();
+        builder
+            .timer(TokioTimer::new())
+            .header_read_timeout(limits.header_timeout);
+        let conn = graceful.watch(builder.serve_connection(TokioIo::new(stream), service));
+        tokio::spawn(async move {
+            let _ = conn.await;
+            drop(permit);
+        });
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), graceful.shutdown()).await;
 }
 
 /// Starts the dashboard: binds `127.0.0.1:<port>` and spawns the server, reading saved
@@ -144,14 +214,10 @@ pub fn start_with(opts: Options, store: Arc<dyn SecretStore>) -> Result<Dashboar
     let app = app_state(Arc::clone(&hub), port, token.clone(), shutdown_rx.clone());
     let router = router(app);
     tokio::spawn(api::overview::poll(Arc::clone(&hub), shutdown_rx.clone()));
-    let mut stop = shutdown_rx;
     let task = tokio::spawn(async move {
-        let _ = axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                let _ = stop.wait_for(|v| *v).await;
-            })
-            .await;
+        serve(listener, router, shutdown_rx, Limits::default()).await;
         hub.close();
+        opener::remove_all();
     });
     Ok(Dashboard {
         port,
@@ -168,9 +234,15 @@ pub(crate) fn app_state(
     token: auth::Token,
     shutdown: watch::Receiver<bool>,
 ) -> api::App {
+    let confirms = Arc::new(Mutex::new(confirm::Pending::default()));
+    tokio::spawn(confirm::prune_on_timer(
+        Arc::downgrade(&confirms),
+        confirm::PRUNE_EVERY,
+        shutdown.clone(),
+    ));
     api::App {
         hub,
-        confirms: Arc::new(Mutex::new(confirm::Pending::default())),
+        confirms,
         page: assets::Page {
             assets: assets::Assets::from_env(),
             guard: auth::Guard { port, token },
@@ -186,7 +258,6 @@ pub(crate) fn router(app: api::App) -> Router {
     Router::new()
         .route("/", get(assets::index))
         .route("/assets/{*path}", get(assets::asset))
-        .route("/auth/{token}", get(auth::sign_in))
         .route("/api/state", get(api::state))
         .route("/api/events", get(api::events))
         .route(
@@ -230,35 +301,36 @@ pub(crate) fn router(app: api::App) -> Router {
         .layer(axum::middleware::from_fn(auth::headers))
 }
 
-/// Opens `url` in the default browser: `open` on macOS, `xdg-open` on Linux and the
-/// BSDs, `rundll32 url.dll,FileProtocolHandler` on Windows. Never through a shell; the
-/// program is not waited for here.
+/// Opens `url` (the sign-in URL) in the default browser without putting it on any
+/// command line, where `ps` would show it to every local user: it is written into a
+/// small HTML file that sends the browser on (`opener`), in a directory only this user
+/// can read, and that file is what `open` (macOS), `xdg-open` (Linux and the BSDs) or
+/// `rundll32 url.dll,FileProtocolHandler` (Windows) gets. Never through a shell. The
+/// file is deleted after [`opener::KEEP`] and when the dashboard stops.
 pub fn open_in_browser(url: &str) -> std::io::Result<()> {
-    use std::process::{Command, Stdio};
-    let mut cmd = if cfg!(target_os = "macos") {
-        let mut c = Command::new("open");
-        c.arg(url);
-        c
-    } else if cfg!(windows) {
-        let mut c = Command::new("rundll32");
-        c.arg("url.dll,FileProtocolHandler").arg(url);
-        c
-    } else {
-        let mut c = Command::new("xdg-open");
-        c.arg(url);
-        c
+    let path = opener::write(url)?;
+    let mut child = match opener::command(&path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            opener::remove(&path);
+            return Err(e);
+        }
     };
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    // Reaped on a thread of its own, so it never lingers as a zombie.
+    // Reaped on a thread of its own, so it never lingers as a zombie; the file goes
+    // once the browser has had time to read it.
     std::thread::spawn(move || {
         let _ = child.wait();
     });
+    opener::remove_after(path, opener::KEEP);
     Ok(())
 }
+
+pub mod opener;
 
 #[cfg(test)]
 mod tests;

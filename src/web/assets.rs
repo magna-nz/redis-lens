@@ -1,8 +1,10 @@
 //! The page's files, embedded in the binary from a fixed list (`src/web/assets/`), served
-//! at `/assets/<path>`; `/` serves `index.html`, or `locked.html` to a browser without
-//! the session cookie. In debug builds only, `REDIS_LENS_DASHBOARD_ASSETS=<dir>` serves
-//! the same files (the same list, nothing else) from `<dir>` instead, so the page can be
-//! edited without rebuilding.
+//! at `/assets/<path>`; `/` serves `index.html`. They are the page's static shell, with
+//! no data in them, so they need no token (the page reads the token from the sign-in
+//! URL's fragment and sends it on its API calls). `mock.js`, the page's invented servers
+//! for working on it without one, is served by debug builds only. In debug builds only,
+//! too, `REDIS_LENS_DASHBOARD_ASSETS=<dir>` serves the same files (the same list, nothing
+//! else) from `<dir>` instead, so the page can be edited without rebuilding.
 
 use std::path::{Path, PathBuf};
 
@@ -45,6 +47,14 @@ assets!(
     "views/streams.js",
     "views/search.js",
 );
+
+/// Files on the list that a release build does not serve.
+pub const DEBUG_ONLY: &[&str] = &["mock.js"];
+
+/// Whether this build serves `path` (on the list, and not debug-only in a release).
+pub fn served(path: &str) -> bool {
+    FILES.iter().any(|(p, _)| *p == path) && (cfg!(debug_assertions) || !DEBUG_ONLY.contains(&path))
+}
 
 /// The content type of `path`, by its extension. `None` for a file not on the list.
 pub fn content_type(path: &str) -> Option<&'static str> {
@@ -91,6 +101,9 @@ impl Assets {
 
     /// The bytes of `path`, when it is on the list.
     async fn get(&self, path: &str) -> Option<Vec<u8>> {
+        if !served(path) {
+            return None;
+        }
         let (name, embedded) = FILES.iter().find(|(p, _)| *p == path)?;
         match &self.dir {
             // Only names on the list: never a path the request made up.
@@ -133,14 +146,9 @@ pub async fn asset(
     file(&page.assets, &path).await
 }
 
-/// `GET /`: the dashboard when signed in, otherwise the page that says how to sign in.
-pub async fn index(State(page): State<Page>, headers: HeaderMap) -> Response {
-    let name = if page.guard.signed_in(&headers) {
-        "index.html"
-    } else {
-        "locked.html"
-    };
-    file(&page.assets, name).await
+/// `GET /`: the page. Without a token it shows how to sign in itself.
+pub async fn index(State(page): State<Page>) -> Response {
+    file(&page.assets, "index.html").await
 }
 
 #[cfg(test)]
@@ -183,6 +191,11 @@ mod tests {
         assert!(a.get("../Cargo.toml").await.is_none());
         // On the list but not in the directory: nothing.
         assert!(a.get("ui.js").await.is_none());
+        // The invented servers only in a debug build.
+        std::fs::write(dir.join("mock.js"), b"// mock").unwrap();
+        assert_eq!(a.get("mock.js").await.is_some(), cfg!(debug_assertions));
+        assert_eq!(served("mock.js"), cfg!(debug_assertions));
+        assert!(served("locked.html") && served("index.html"));
         let embedded = Assets::default();
         assert_eq!(
             embedded.get("mark.svg").await.unwrap(),

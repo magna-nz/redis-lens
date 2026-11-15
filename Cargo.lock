@@ -3230,6 +3230,8 @@ dependencies = [
  "flate2",
  "futures",
  "getrandom 0.3.4",
+ "hyper",
+ "hyper-util",
  "insta",
  "keyring",
  "lz4_flex",

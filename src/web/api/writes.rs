@@ -121,6 +121,14 @@ pub fn decide(app: &App, op: &WriteOp) -> Result<(ConnId, Dest, Decision, String
             let dest = write_dest(&c.session, op)
                 .map_err(|why| Refused::new(StatusCode::UNPROCESSABLE_ENTITY, why))?;
             let decision = write::decide_op(op, c.profile(), &c.settings, &c.session.refusals);
+            let decision = match decision {
+                // The gate's words name the profile: kept as they are ([`holding`]).
+                Decision::Refuse(why) => {
+                    return Err(Refused::new(StatusCode::UNPROCESSABLE_ENTITY, why)
+                        .holding(&profile_data(c.profile())));
+                }
+                d => d,
+            };
             Ok((
                 c.id,
                 dest,
@@ -138,10 +146,19 @@ pub fn grant(app: &App, conn: ConnId, op: WriteOp, answer: &Answer) -> Result<Pe
             if c.id != conn {
                 return Err(Refused::new(StatusCode::CONFLICT, CHANGED));
             }
-            Permit::grant(op, c.profile(), &c.settings, &c.session.refusals, answer)
-                .map_err(|why| Refused::new(StatusCode::UNPROCESSABLE_ENTITY, why))
+            Permit::grant(op, c.profile(), &c.settings, &c.session.refusals, answer).map_err(
+                |why| {
+                    Refused::new(StatusCode::UNPROCESSABLE_ENTITY, why)
+                        .holding(&profile_data(c.profile()))
+                },
+            )
         })
         .unwrap_or_else(|| Err(Refused::new(StatusCode::CONFLICT, CHANGED)))
+}
+
+/// The user data the gate's words can hold about `p`: its name and host.
+pub fn profile_data(p: &crate::model::Profile) -> [&str; 2] {
+    [p.name.as_str(), p.endpoint.host.as_str()]
 }
 
 /// Why an answer is not used: the connection it was about is gone.
@@ -165,6 +182,7 @@ pub async fn send(app: &App, conn: ConnId, dest: Dest, permit: Permit) -> Respon
 
 /// One write, start to end: refused, sent, or asked about.
 pub async fn write_flow(app: &App, op: WriteOp) -> Response {
+    app.hub.follow_saved_profile().await;
     let (conn, dest, decision, profile) = match decide(app, &op) {
         Ok(d) => d,
         Err(r) => return r.into_response(),
@@ -217,6 +235,20 @@ pub async fn answer(
     Path(id): Path<String>,
     Body(a): Body<Answered>,
 ) -> Response {
+    // An answer to a command line's question runs that line: one at a time, as a typed
+    // line does (`POST /api/cmdline` holds the same slot). Taken before the question is,
+    // so a refused answer leaves the question open.
+    let line = app
+        .confirms()
+        .peek_with(&id, |a| {
+            matches!(a, Action::Command(_) | Action::Write { cmd: Some(_), .. })
+        })
+        .unwrap_or(false);
+    let _slot = match line.then(|| app.hub.line_slot()) {
+        Some(None) => return error(StatusCode::CONFLICT, super::cmdline::STILL_RUNNING),
+        Some(slot) => slot,
+        None => None,
+    };
     let taken = app.confirms().take(&id, std::time::Instant::now());
     let Some(action) = taken else {
         return error(StatusCode::GONE, GONE);
@@ -233,6 +265,8 @@ pub async fn answer(
                 Decision::Type(_) => Answer::Typed(a.typed.unwrap_or_default()),
                 _ => Answer::Yes,
             };
+            // The profile may have gone read-only since the question was asked.
+            app.hub.follow_saved_profile().await;
             let permit = match grant(&app, conn, op, &answer) {
                 Ok(p) => p,
                 Err(r) => return r.into_response(),

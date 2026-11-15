@@ -86,8 +86,8 @@ fn setup(tag: &str, profiles: Vec<Profile>) -> T {
     }
 }
 
-fn cookie() -> String {
-    format!("rl_session={}", token())
+fn bearer() -> String {
+    format!("Bearer {}", token())
 }
 
 fn get(path: &str) -> axum::http::request::Builder {
@@ -96,7 +96,7 @@ fn get(path: &str) -> axum::http::request::Builder {
 
 fn signed_get(path: &str) -> Request<Body> {
     get(path)
-        .header(header::COOKIE, cookie())
+        .header(header::AUTHORIZATION, bearer())
         .body(Body::empty())
         .unwrap()
 }
@@ -109,7 +109,7 @@ fn write(method: &str, path: &str, body: &str) -> Request<Body> {
         .header(header::ORIGIN, ORIGIN)
         .header("x-redis-lens", "1")
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::COOKIE, cookie())
+        .header(header::AUTHORIZATION, bearer())
         .body(Body::from(body.to_string()))
         .unwrap()
 }
@@ -159,7 +159,7 @@ async fn every_response_has_the_security_headers() {
             StatusCode::NOT_FOUND,
         ),
         (
-            "api without cookie",
+            "api without the token",
             get("/api/state").body(Body::empty()).unwrap(),
             StatusCode::UNAUTHORIZED,
         ),
@@ -173,11 +173,11 @@ async fn every_response_has_the_security_headers() {
             StatusCode::FORBIDDEN,
         ),
         (
-            "sign in",
+            "no sign-in route",
             get(&format!("/auth/{}", token()))
                 .body(Body::empty())
                 .unwrap(),
-            StatusCode::SEE_OTHER,
+            StatusCode::NOT_FOUND,
         ),
         (
             "wrong method",
@@ -209,7 +209,7 @@ async fn host_must_be_loopback_with_the_port_on_every_route() {
         for path in ["/", "/assets/app.js", "/api/state", "/auth/x"] {
             let req = Request::get(path)
                 .header(header::HOST, host)
-                .header(header::COOKIE, cookie())
+                .header(header::AUTHORIZATION, bearer())
                 .body(Body::empty())
                 .unwrap();
             let res = call(&t, req).await;
@@ -221,7 +221,7 @@ async fn host_must_be_loopback_with_the_port_on_every_route() {
         &t,
         Request::get("/api/state")
             .header(header::HOST, "localhost:7379")
-            .header(header::COOKIE, cookie())
+            .header(header::AUTHORIZATION, bearer())
             .body(Body::empty())
             .unwrap(),
     )
@@ -230,23 +230,72 @@ async fn host_must_be_loopback_with_the_port_on_every_route() {
 }
 
 #[tokio::test]
-async fn the_api_needs_the_cookie() {
-    let t = setup("cookie", Vec::new());
+async fn the_api_needs_the_bearer_token_and_a_cookie_does_not_sign_in() {
+    let t = setup("bearer", Vec::new());
     let res = call(&t, get("/api/state").body(Body::empty()).unwrap()).await;
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(text(res).await, r#"{"error":"not signed in"}"#);
-    let wrong = get("/api/state")
-        .header(header::COOKIE, format!("rl_session={}", "f".repeat(64)))
+    let refused = [
+        (header::AUTHORIZATION, format!("Bearer {}", "f".repeat(64))),
+        (header::AUTHORIZATION, format!("Bearer {}0", token())),
+        (header::AUTHORIZATION, token()),
+        (header::AUTHORIZATION, format!("Basic {}", token())),
+        // The old cookie no longer signs in.
+        (header::COOKIE, format!("rl_session={}", token())),
+    ];
+    for (name, value) in refused {
+        let req = get("/api/state")
+            .header(name.clone(), value.clone())
+            .body(Body::empty())
+            .unwrap();
+        let res = call(&t, req).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{name} {value}");
+        assert!(!text(res).await.contains(&token()));
+    }
+    // Two Authorization headers: refused even when one is right.
+    let two = get("/api/state")
+        .header(header::AUTHORIZATION, bearer())
+        .header(header::AUTHORIZATION, "Bearer x")
         .body(Body::empty())
         .unwrap();
-    assert_eq!(call(&t, wrong).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(call(&t, two).await.status(), StatusCode::UNAUTHORIZED);
+    // The scheme is case-insensitive.
+    let lower = get("/api/state")
+        .header(header::AUTHORIZATION, format!("bearer {}", token()))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(call(&t, lower).await.status(), StatusCode::OK);
     let res = call(&t, signed_get("/api/state")).await;
     assert_eq!(res.status(), StatusCode::OK);
     let body = text(res).await;
     assert!(body.contains(r#""status":"idle""#), "{body}");
+    assert!(res_has_no_cookie(&t).await);
     // The event stream too.
     let res = call(&t, get("/api/events").body(Body::empty()).unwrap()).await;
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let res = call(&t, signed_get("/api/events")).await;
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+/// No response sets a cookie.
+async fn res_has_no_cookie(t: &T) -> bool {
+    for req in [
+        get("/").body(Body::empty()).unwrap(),
+        signed_get("/api/state"),
+        get(&format!("/auth/{}", token()))
+            .body(Body::empty())
+            .unwrap(),
+    ] {
+        if call(t, req)
+            .await
+            .headers()
+            .get(header::SET_COOKIE)
+            .is_some()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 #[tokio::test]
@@ -255,7 +304,7 @@ async fn a_request_that_is_not_a_get_needs_origin_header_and_json() {
     let base = || {
         Request::post("/api/disconnect")
             .header(header::HOST, HOST)
-            .header(header::COOKIE, cookie())
+            .header(header::AUTHORIZATION, bearer())
     };
     let cases = [
         base()
@@ -288,7 +337,7 @@ async fn a_request_that_is_not_a_get_needs_origin_header_and_json() {
     }
     let res = call(&t, write("POST", "/api/disconnect", "")).await;
     assert_eq!(res.status(), StatusCode::OK);
-    // With everything but the cookie: 401.
+    // With everything but the token: 401.
     let req = Request::post("/api/disconnect")
         .header(header::HOST, HOST)
         .header(header::ORIGIN, ORIGIN)
@@ -300,36 +349,7 @@ async fn a_request_that_is_not_a_get_needs_origin_header_and_json() {
 }
 
 #[tokio::test]
-async fn sign_in_sets_the_cookie_and_redirects_once_the_token_matches() {
-    let t = setup("signin", Vec::new());
-    let res = call(
-        &t,
-        get(&format!("/auth/{}", token()))
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    assert_eq!(res.headers()[header::LOCATION], "/");
-    assert_eq!(
-        res.headers()[header::SET_COOKIE],
-        format!("rl_session={}; HttpOnly; SameSite=Strict; Path=/", token()).as_str()
-    );
-    for wrong in ["nope".to_string(), "f".repeat(64), format!("{}0", token())] {
-        let res = call(
-            &t,
-            get(&format!("/auth/{wrong}")).body(Body::empty()).unwrap(),
-        )
-        .await;
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{wrong}");
-        assert!(res.headers().get(header::SET_COOKIE).is_none());
-        let body = text(res).await;
-        assert!(!body.contains(&token()), "{body}");
-    }
-}
-
-#[tokio::test]
-async fn the_page_is_index_or_locked_and_assets_have_their_types() {
+async fn the_page_is_served_without_the_token_and_assets_have_their_types() {
     let t = setup("page", Vec::new());
     let file = |name: &str| {
         assets::FILES
@@ -343,7 +363,7 @@ async fn the_page_is_index_or_locked_and_assets_have_their_types() {
         res.headers()[header::CONTENT_TYPE],
         "text/html; charset=utf-8"
     );
-    assert_eq!(text(res).await.into_bytes(), file("locked.html"));
+    assert_eq!(text(res).await.into_bytes(), file("index.html"));
     let res = call(&t, signed_get("/")).await;
     assert_eq!(text(res).await.into_bytes(), file("index.html"));
     for (path, ct) in [
@@ -640,7 +660,10 @@ fn the_dashboard_never_shows_its_token_in_debug() {
         )
         .unwrap();
         let open = d.open_url();
-        let tok = open.rsplit('/').next().unwrap().to_string();
+        let tok = open
+            .strip_prefix(&format!("{}#token=", d.url()))
+            .expect("the sign-in URL is the page with the token in its fragment")
+            .to_string();
         assert_eq!(tok.len(), 64);
         assert!(!format!("{d:?}").contains(&tok));
         assert!(!d.url().contains(&tok));
@@ -864,4 +887,348 @@ async fn no_reply_names_a_tui_key_a_screen_number_or_a_cli_flag() {
     assert!(all.contains("Turn writes on in Connections."), "{all}");
     assert!(all.contains("use the Pub/Sub screen"), "{all}");
     assert!(all.contains("tick Replace to overwrite it"), "{all}");
+}
+
+/// B1: a URL of another scheme, or a host that holds credentials, is refused with fixed
+/// text and never saved; `valkey://` and `valkeys://` are `redis://` and `rediss://`.
+#[tokio::test]
+async fn other_schemes_and_userinfo_in_a_host_never_reach_the_config_or_a_reply() {
+    let t = setup("schemes", Vec::new());
+    for url in [
+        "http://u:B1-pw-http@h:6379",
+        "https://u:B1-pw-https@h:6379",
+        "foo://B1-pw-foo@h",
+        "u:B1-pw-bare@h:6379",
+        "user:B1-pw-se@h:6379,password=x",
+        "h@B1-pw-at:6379",
+    ] {
+        let body = serde_json::json!({ "name": "bad", "url": url }).to_string();
+        let res = call(&t, write("POST", "/api/connections", &body)).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{url}");
+        let reply = text(res).await;
+        assert!(!reply.contains("B1-pw"), "{url}: {reply}");
+        let v = json(&reply);
+        let e = v["error"].as_str().unwrap();
+        assert!(
+            e.contains(crate::conn::parse::UNSUPPORTED_SCHEME)
+                || e.contains(crate::conn::parse::HOST_WITH_USERINFO),
+            "{url}: {e}"
+        );
+    }
+    let file = std::fs::read_to_string(&t.config).unwrap();
+    assert!(!file.contains("B1-pw") && !file.contains("bad"), "{file}");
+    // valkey:// and valkeys:// are accepted, the credentials go to the store.
+    for (name, url, shown) in [
+        ("vk", "valkey://vu:B1-pw-vk@h:6379/2", "redis://h:6379/2"),
+        ("vks", "valkeys://vu:B1-pw-vks@h:6380", "rediss://h:6380/0"),
+    ] {
+        let body = serde_json::json!({ "name": name, "url": url }).to_string();
+        let res = call(&t, write("POST", "/api/connections", &body)).await;
+        assert_eq!(res.status(), StatusCode::CREATED, "{url}");
+        let reply = text(res).await;
+        assert!(!reply.contains("B1-pw") && !reply.contains("vu"), "{reply}");
+        assert_eq!(json(&reply)["connection"]["url"], shown);
+        let r = SecretRef {
+            service: SECRET_SERVICE.into(),
+            account: format!("profile:{name}"),
+        };
+        let saved = crate::secrets::SecretStore::get(t.store.as_ref(), &r)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.username.as_deref(), Some("vu"));
+    }
+    let file = std::fs::read_to_string(&t.config).unwrap();
+    assert!(!file.contains("B1-pw") && !file.contains("vu"), "{file}");
+    for path in ["/api/connections", "/api/state"] {
+        let body = text(call(&t, signed_get(path)).await).await;
+        assert!(!body.contains("B1-pw"), "{path}: {body}");
+    }
+}
+
+/// S2: a name, a host or a tag holding `--` (every punycode host does) keeps every
+/// message, the question before writes go on, and the read-only reasons.
+#[tokio::test]
+async fn names_and_hosts_with_two_dashes_keep_their_messages_and_questions() {
+    let t = setup("dashes", Vec::new());
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/connections",
+            r#"{"name":"cache--eu","url":"redis://xn--bcher-kva.example:6391","env":"stage","writes":false,"tags":["team--a"]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body = text(res).await;
+    assert!(!body.contains(super::wording::FALLBACK), "{body}");
+    assert!(body.contains("cache--eu"), "{body}");
+    // The question before writes go on says what yes does.
+    let res = call(
+        &t,
+        write("PATCH", "/api/connections/cache--eu", r#"{"writes":true}"#),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let v = json(&text(res).await);
+    let q = v["confirm"]["text"].as_str().unwrap();
+    assert!(q.contains("cache--eu") && q.contains("writes"), "{q}");
+    assert_ne!(q, super::wording::FALLBACK);
+    // Connected to it, read-only: the state, the publish refusal and the command line's
+    // note each say why.
+    let p = crate::config::Config::load(&t.config)
+        .unwrap()
+        .get("cache--eu")
+        .cloned()
+        .unwrap();
+    assert!(p.is_read_only());
+    t.hub.install_for_test(p, false);
+    let state = json(&text(call(&t, signed_get("/api/state")).await).await);
+    let off = state["writes_off"].as_str().unwrap();
+    assert!(off.contains("cache--eu"), "{off}");
+    assert_ne!(off, super::wording::FALLBACK);
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/pubsub/publish",
+            r#"{"channel":"c","message":"m"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let e = json(&text(res).await)["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("cache--eu"), "{e}");
+    let res = call(&t, write("POST", "/api/cmdline", r#"{"line":"SET a b"}"#)).await;
+    let v = json(&text(res).await);
+    let note = v["text"].as_str().unwrap();
+    assert_ne!(note, super::wording::FALLBACK, "{v}");
+}
+
+/// Sets `name`'s writes in the config file as `w` in the TUI or `conn set` would.
+fn flip_writes(t: &T, name: &str, on: bool) {
+    let mut c = crate::config::Config::load(&t.config).unwrap();
+    c.set_writes(name, on).unwrap();
+    c.save(&t.config).unwrap();
+}
+
+/// S3 (rule 2): a profile made read-only in the config file while the dashboard is
+/// connected refuses SET and PUBLISH at once, an answer to a question asked before is
+/// refused, and the state says writes are off.
+#[tokio::test]
+async fn a_profile_made_read_only_elsewhere_refuses_writes_at_once() {
+    let mut p = profile("cache", Env::Stage);
+    p.read_only = Some(false);
+    let mut pr = profile("prod1", Env::Prod);
+    pr.read_only = Some(false);
+    let t = setup("follow", vec![p.clone(), pr.clone()]);
+    t.hub.install_for_test(p, false);
+    let state = json(&text(call(&t, signed_get("/api/state")).await).await);
+    assert_eq!(state["writes"], true, "{state}");
+    flip_writes(&t, "cache", false);
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/pubsub/publish",
+            r#"{"channel":"c","message":"m"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let e = json(&text(res).await);
+    assert!(e["error"].as_str().unwrap().contains("read-only"), "{e}");
+    // (The command line's SET needs a server's COMMAND INFO: web_p1_it checks it.)
+    let state = json(&text(call(&t, signed_get("/api/state")).await).await);
+    assert_eq!(state["writes"], false, "{state}");
+    assert!(state["writes_off"].is_string(), "{state}");
+    // The file says writes on again: the session follows.
+    flip_writes(&t, "cache", true);
+    let state = json(&text(call(&t, signed_get("/api/state")).await).await);
+    assert_eq!(state["writes"], true, "{state}");
+
+    // A question asked while writes were on, answered after they went off: refused.
+    t.hub.install_for_test(pr, false);
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/pubsub/publish",
+            r#"{"channel":"c","message":"m"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let v = json(&text(res).await);
+    let id = v["confirm"]["id"].as_str().unwrap().to_string();
+    flip_writes(&t, "prod1", false);
+    let res = answer(&t, &id, Some("prod1")).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let e = json(&text(res).await);
+    assert!(e["error"].as_str().unwrap().contains("read-only"), "{e}");
+    // A config file that cannot be read turns writes off.
+    std::fs::write(&t.config, "not = [valid").unwrap();
+    let state = json(&text(call(&t, signed_get("/api/state")).await).await);
+    assert_eq!(state["writes"], false, "{state}");
+}
+
+/// S4: a line longer than the TUI's panel takes is refused; one line runs at a time.
+#[tokio::test]
+async fn the_command_line_takes_the_tuis_input_cap_and_one_line_at_a_time() {
+    let t = setup("cmdcaps", Vec::new());
+    let long = "a".repeat(crate::tui::app::views::cmdline::MAX_INPUT + 1);
+    let body = serde_json::json!({ "line": format!("GET {long}") }).to_string();
+    let res = call(&t, write("POST", "/api/cmdline", &body)).await;
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let e = json(&text(res).await);
+    assert_eq!(e["error"], api::cmdline::TOO_LONG);
+    // At the cap it is taken (and refused for another reason: no connection).
+    let at = "a".repeat(crate::tui::app::views::cmdline::MAX_INPUT - 4);
+    let body = serde_json::json!({ "line": format!("GET {at}") }).to_string();
+    let res = call(&t, write("POST", "/api/cmdline", &body)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    // A line is running: the next one is refused with fixed words.
+    let slot = t.hub.line_slot().expect("free");
+    assert!(t.hub.line_slot().is_none());
+    let res = call(&t, write("POST", "/api/cmdline", r#"{"line":"GET k"}"#)).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let e = json(&text(res).await);
+    assert_eq!(e["error"], api::cmdline::STILL_RUNNING);
+    drop(slot);
+    let res = call(&t, write("POST", "/api/cmdline", r#"{"line":"GET k"}"#)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    // The slot is free again after each line.
+    assert!(t.hub.line_slot().is_some());
+}
+
+/// S8: a body over axum's limit is refused in fixed words; `HEAD` is a `GET` without a
+/// body and needs the token the same way; `OPTIONS` is no preflight: refused, and no
+/// response carries a CORS header.
+#[tokio::test]
+async fn a_large_body_head_and_options_are_handled_without_cors() {
+    let t = setup("methods", Vec::new());
+    let big = format!(r#"{{"line":"{}"}}"#, "S3cret".repeat(3 * 1024 * 1024 / 6));
+    let res = call(&t, write("POST", "/api/cmdline", &big)).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = text(res).await;
+    assert_eq!(body, format!(r#"{{"error":"{}"}}"#, api::BAD_BODY));
+    let head = |auth: bool| {
+        let b = Request::head("/api/state").header(header::HOST, HOST);
+        let b = if auth {
+            b.header(header::AUTHORIZATION, bearer())
+        } else {
+            b
+        };
+        b.body(Body::empty()).unwrap()
+    };
+    let res = call(&t, head(false)).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let res = call(&t, head(true)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(text(res).await.is_empty());
+    let res = call(
+        &t,
+        Request::head("/")
+            .header(header::HOST, HOST)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    for (origin, path) in [
+        ("http://evil.example", "/api/connections"),
+        (ORIGIN, "/api/connections"),
+        (ORIGIN, "/"),
+    ] {
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri(path)
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, origin)
+            .header("access-control-request-method", "POST")
+            .header(
+                "access-control-request-headers",
+                "authorization, x-redis-lens",
+            )
+            .body(Body::empty())
+            .unwrap();
+        let res = call(&t, req).await;
+        assert!(
+            res.status() == StatusCode::FORBIDDEN || res.status() == StatusCode::METHOD_NOT_ALLOWED,
+            "{origin} {path}: {}",
+            res.status()
+        );
+        assert_security_headers(&res, "options");
+        for (name, _) in res.headers() {
+            assert!(!name.as_str().starts_with("access-control-"), "{name}");
+        }
+    }
+}
+
+/// N2: a connection that does not finish its headers is closed after the header read
+/// timeout, and past the cap a new connection waits until one closes.
+#[tokio::test]
+async fn the_server_times_out_slow_headers_and_caps_its_connections() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    let serve_with = |limits: Limits| async move {
+        let t = setup("limits", Vec::new());
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(serve(l, t.router.clone(), rx, limits));
+        (t, port, tx)
+    };
+    // Headers never finished: closed after the timeout.
+    let (_t, port, _stop) = serve_with(Limits {
+        header_timeout: std::time::Duration::from_millis(300),
+        max_connections: 8,
+    })
+    .await;
+    let mut slow = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    slow.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1:7379\r\n")
+        .await
+        .unwrap();
+    let t0 = std::time::Instant::now();
+    let mut buf = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        slow.read_to_end(&mut buf),
+    )
+    .await
+    .expect("closed after the header timeout")
+    .ok();
+    assert!(t0.elapsed() >= std::time::Duration::from_millis(250));
+    // At the cap a third connection is not served until one of the two closes.
+    let (_t, port, _stop) = serve_with(Limits {
+        header_timeout: std::time::Duration::from_secs(10),
+        max_connections: 2,
+    })
+    .await;
+    let first = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let _second = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut third = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    third
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1:7379\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut one = [0u8; 1];
+    let early =
+        tokio::time::timeout(std::time::Duration::from_millis(400), third.read(&mut one)).await;
+    assert!(early.is_err(), "served past the cap");
+    drop(first);
+    let mut buf = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        third.read_to_end(&mut buf),
+    )
+    .await
+    .expect("served once one closed")
+    .unwrap();
+    let head = String::from_utf8_lossy(&buf);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
 }

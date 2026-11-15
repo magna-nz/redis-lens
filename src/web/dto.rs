@@ -40,7 +40,25 @@ pub fn auth_name(a: Auth) -> &'static str {
 
 /// The address a profile connects to, as a URL without credentials (there are none in
 /// a profile), masked all the same.
+/// What an address is shown as when its host is not a plain host (a config file written
+/// before such hosts were refused, or by hand): never the text, which can hold a user
+/// name and password.
+pub const HIDDEN_ADDRESS: &str =
+    "(an address with a user name or password in it: add the connection again)";
+
+/// `host:port`, masked, and hidden whole when the host holds userinfo or URL parts.
+pub fn shown_endpoint(ep: &crate::model::Endpoint) -> String {
+    if conn::parse::host_is_plain(&ep.host) {
+        escape(&conn::parse::mask(&ep.to_string()))
+    } else {
+        HIDDEN_ADDRESS.to_string()
+    }
+}
+
 pub fn masked_url(p: &Profile) -> String {
+    if !conn::parse::host_is_plain(&p.endpoint.host) {
+        return HIDDEN_ADDRESS.to_string();
+    }
     let scheme = if p.endpoint.tls { "rediss" } else { "redis" };
     escape(&conn::parse::mask(&format!(
         "{scheme}://{}/{}",
@@ -83,7 +101,7 @@ impl Connection {
             env: env_name(p.env),
             env_label: p.env.label(),
             url: masked_url(p),
-            endpoint: escape(&p.endpoint.to_string()),
+            endpoint: shown_endpoint(&p.endpoint),
             tls: p.endpoint.tls,
             db: p.db,
             auth: auth_name(p.auth),
@@ -124,7 +142,7 @@ impl Docker {
             container: escape(&d.container),
             image: escape(&d.image),
             url: masked_url(&d.profile),
-            endpoint: escape(&d.profile.endpoint.to_string()),
+            endpoint: shown_endpoint(&d.profile.endpoint),
             auth: match d.auth {
                 A::Password => "password",
                 A::None => "none",
@@ -257,7 +275,7 @@ impl Node {
         Self {
             index,
             id: escape(&n.id),
-            endpoint: escape(&n.endpoint.to_string()),
+            endpoint: shown_endpoint(&n.endpoint),
             role: role_name(n.role),
             slots: n.slots.clone(),
             slot_count: n
@@ -657,6 +675,17 @@ mod tests {
             tls: false,
         };
         assert_eq!(Connection::of(&p).url, "redis://h:1/0");
+    }
+
+    #[test]
+    fn a_host_with_userinfo_in_an_old_config_is_never_shown() {
+        let mut p = profile_from_url("redis://u:p@h:1");
+        p.endpoint.host = "valkey://vk-user:Vk-PW-222@127.0.0.1:6391".into();
+        let json = serde_json::to_string(&Connection::of(&p)).unwrap();
+        for secret in ["Vk-PW-222", "vk-user", "valkey://"] {
+            assert!(!json.contains(secret), "{json}");
+        }
+        assert!(json.contains(HIDDEN_ADDRESS), "{json}");
     }
 
     #[test]

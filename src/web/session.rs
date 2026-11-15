@@ -75,6 +75,16 @@ impl Event {
     }
 }
 
+/// A running command line ([`Hub::line_slot`]); the next one may start once it drops.
+#[derive(Debug)]
+pub struct LineSlot<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for LineSlot<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// What to connect to.
 #[derive(Debug, Clone)]
 pub enum Target {
@@ -145,6 +155,8 @@ pub struct Current {
     pub slow_entries: Vec<crate::live::server::SlowEntry>,
     pub client_conns: Vec<crate::live::server::ClientConn>,
     pub live: LiveFigures,
+    /// The last `overview` event's data ([`Hub::emit_overview_if_changed`]).
+    pub last_overview: Option<serde_json::Value>,
 }
 
 impl Current {
@@ -194,6 +206,7 @@ impl Current {
             slow_entries: Vec::new(),
             client_conns: Vec::new(),
             live: LiveFigures::default(),
+            last_overview: None,
         }
     }
 
@@ -268,6 +281,8 @@ pub struct Hub {
     inner: Mutex<Inner>,
     events: broadcast::Sender<Event>,
     clients: AtomicUsize,
+    /// A command line is running ([`Hub::line_slot`]).
+    line_running: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Hub {
@@ -352,6 +367,7 @@ impl Hub {
             }),
             events,
             clients: AtomicUsize::new(0),
+            line_running: std::sync::atomic::AtomicBool::new(false),
         });
         tokio::spawn(pump(Arc::downgrade(&hub), msgs));
         hub
@@ -434,11 +450,84 @@ impl Hub {
         self.emit(Event::new("state", s));
     }
 
+    /// Sends an `overview` event with Overview's connect-time parts
+    /// ([`crate::web::api::overview::connect_parts`]: the findings, figures, checks, last
+    /// analysis, ...) when they differ from the last one sent for this connection: the
+    /// connect's slow log and client list land after the live connection is ready, with
+    /// nothing else to say so. Not sent before the connect has read anything.
+    pub(crate) fn emit_overview_if_changed(&self) {
+        let changed = self
+            .with_mut(|c| {
+                if matches!(c.session.phase, Phase::Connecting) {
+                    return None;
+                }
+                let now = crate::web::api::overview::connect_parts(c);
+                if c.last_overview.as_ref() == Some(&now) {
+                    return None;
+                }
+                c.last_overview = Some(now.clone());
+                Some(now)
+            })
+            .flatten();
+        if let Some(data) = changed {
+            self.emit(Event::new("overview", data));
+        }
+    }
+
+    /// The one command line a session runs at a time, as the TUI's panel runs one: held
+    /// until the returned slot is dropped. `None` while another line runs.
+    pub fn line_slot(&self) -> Option<LineSlot<'_>> {
+        use std::sync::atomic::Ordering;
+        self.line_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| LineSlot(&self.line_running))
+    }
+
+    /// Makes the connected saved profile's `read_only` and `env` what the config file says
+    /// now (rule 2): `w` in the TUI beside it, or `conn set --writes off`, changes the file
+    /// and not this session's copy. Called before every write is decided and before an
+    /// answer is used, so a profile made read-only elsewhere refuses at once. A file that
+    /// cannot be read, or that no longer has the profile, turns writes off. A container
+    /// has no saved profile: its session-only setting stays. Emits `state` when it changed.
+    pub async fn follow_saved_profile(&self) {
+        let Some((id, name)) = self
+            .with(|c| (!c.docker).then(|| (c.id, c.session.profile.name.clone())))
+            .flatten()
+        else {
+            return;
+        };
+        let path = self.config.clone();
+        let saved = tokio::task::spawn_blocking(move || {
+            crate::config::Config::load(&path).map(|c| c.get(&name).map(|p| (p.read_only, p.env)))
+        })
+        .await;
+        let (read_only, env) = match saved {
+            Ok(Ok(Some((read_only, env)))) => (read_only, Some(env)),
+            _ => (Some(true), None),
+        };
+        let changed = self.with_mut(|c| {
+            if c.id != id {
+                return false;
+            }
+            let p = &mut c.session.profile;
+            let before = (p.read_only, p.env);
+            p.read_only = read_only;
+            if let Some(env) = env {
+                p.env = env;
+            }
+            before != (p.read_only, p.env)
+        });
+        if changed == Some(true) {
+            self.emit_state();
+        }
+    }
+
     /// Connects `target`, replacing the current connection. Returns once the connect has
     /// started; how it goes comes as `state` events.
     pub async fn connect(self: &Arc<Self>, target: Target) -> Result<(), ConnectError> {
         let config = self.config.clone();
-        let (profile, source, docker) = match target {
+        let (profile, source, docker, keychain) = match target {
             Target::Profile(name) => {
                 let loaded = tokio::task::spawn_blocking(move || Config::load(&config))
                     .await
@@ -450,10 +539,7 @@ impl Hub {
                 let mem = prefetch_async(Arc::clone(&self.store), profile.clone())
                     .await
                     .map_err(ConnectError::Failed)?;
-                let mut g = lock(&self.inner);
-                g.runner.set_keychain(Arc::new(mem));
-                drop(g);
-                (profile, SecretSource::Keychain, false)
+                (profile, SecretSource::Keychain, false, Some(mem))
             }
             Target::Docker(container) => {
                 let found = crate::conn::docker::discover()
@@ -462,7 +548,12 @@ impl Hub {
                 let Some(d) = found.into_iter().find(|d| d.container == container) else {
                     return Err(ConnectError::NotFound);
                 };
-                (d.profile, SecretSource::Container(d.credentials), true)
+                (
+                    d.profile,
+                    SecretSource::Container(d.credentials),
+                    true,
+                    None,
+                )
             }
         };
         let path = self.config.clone();
@@ -477,6 +568,12 @@ impl Hub {
             cur.settings = settings;
             // The old session goes first: its requests are answered as closed.
             g.cur = Some(cur);
+            // The store and the connect it is for go in under one lock: two connects at
+            // once (two tabs) never start one with the other's credentials. The runner
+            // takes the store when the connect starts.
+            if let Some(mem) = keychain {
+                g.runner.set_keychain(Arc::new(mem));
+            }
             g.runner.run(Effect::Connect {
                 id,
                 scan: 1,
@@ -535,6 +632,7 @@ impl Hub {
             .unwrap_or(false);
         if ok {
             self.emit_state();
+            self.emit_overview_if_changed();
         }
         ok
     }
@@ -542,16 +640,42 @@ impl Hub {
     /// Sends `req` to `dest` on connection `conn` (the current one when `None`) and waits
     /// for its answer.
     pub async fn request(&self, conn: Option<ConnId>, dest: Dest, req: LiveRequest) -> LiveResult {
-        let rx = self.send(conn, dest, req, None)?;
-        wait(rx).await
+        let sent = self.send(conn, dest, req, None)?;
+        self.wait(sent).await
     }
 
     /// Sends a write the gate let through, on connection `conn`: a `NOPERM` turns its
     /// command off for the session (spec "Write permissions", check 1).
     pub async fn write(&self, conn: ConnId, dest: Dest, permit: Permit) -> LiveResult {
         let name = permit.op().command();
-        let rx = self.send(Some(conn), dest, LiveRequest::Write(permit), Some(name))?;
-        wait(rx).await
+        let sent = self.send(Some(conn), dest, LiveRequest::Write(permit), Some(name))?;
+        self.wait(sent).await
+    }
+
+    /// The answer to a request [`Self::send`] sent, or [`TIMED_OUT`] after
+    /// [`REQUEST_TIMEOUT`]: then its entry in `pending` goes, so a request never answered
+    /// leaves nothing behind (a late answer finds no one waiting and is dropped). Its
+    /// entry in `writes` stays until the answer comes, so a late `NOPERM` still turns the
+    /// command off.
+    async fn wait(&self, (conn, req_id, rx): Sent) -> LiveResult {
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err(LiveError::Closed),
+            Err(_) => {
+                self.with_mut(|c| {
+                    if c.id == conn {
+                        c.pending.remove(&req_id);
+                    }
+                });
+                Err(LiveError::Failed(TIMED_OUT.into()))
+            }
+        }
+    }
+
+    /// How many requests wait for an answer: for tests.
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.with(|c| c.pending.len()).unwrap_or(0)
     }
 
     fn send(
@@ -560,7 +684,7 @@ impl Hub {
         dest: Dest,
         req: LiveRequest,
         write: Option<String>,
-    ) -> Result<oneshot::Receiver<LiveResult>, LiveError> {
+    ) -> Result<Sent, LiveError> {
         let mut g = lock(&self.inner);
         let req_id = ReqId(g.next_req);
         g.next_req += 1;
@@ -583,7 +707,7 @@ impl Hub {
             to: dest,
             req,
         });
-        Ok(rx)
+        Ok((id, req_id, rx))
     }
 
     /// Starts the Pub/Sub tail on `to` on node `node`, replacing the session's other
@@ -770,6 +894,7 @@ impl Hub {
             self.emit_state();
         }
         self.emit_all(events);
+        self.emit_overview_if_changed();
     }
 }
 
@@ -817,13 +942,8 @@ pub enum ConnectError {
     Failed(String),
 }
 
-async fn wait(rx: oneshot::Receiver<LiveResult>) -> LiveResult {
-    match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(_)) => Err(LiveError::Closed),
-        Err(_) => Err(LiveError::Failed(TIMED_OUT.into())),
-    }
-}
+/// A request on its way: the connection, its id and where its answer comes.
+type Sent = (ConnId, ReqId, oneshot::Receiver<LiveResult>);
 
 /// Passes the runtime's messages on to the hub until either is gone.
 async fn pump(hub: Weak<Hub>, mut msgs: mpsc::UnboundedReceiver<Msg>) {
@@ -1231,10 +1351,12 @@ impl State {
                 .collect(),
             picked: s.picked,
             writes: !s.profile.is_read_only(),
-            writes_off: s
-                .profile
-                .is_read_only()
-                .then(|| crate::web::wording::web(&crate::write::read_only_reason(&s.profile))),
+            writes_off: s.profile.is_read_only().then(|| {
+                crate::value::escape(&crate::web::wording::web_with(
+                    &crate::write::read_only_reason(&s.profile),
+                    &crate::web::api::writes::profile_data(&s.profile),
+                ))
+            }),
             refused: s.refusals.iter().map(str::to_string).collect(),
             tail: c.tail.as_ref().map(|t| TailDto {
                 id: t.id,
@@ -1315,6 +1437,98 @@ mod tests {
         assert_eq!(user(p.secret_ref()).as_deref(), Some("main"));
         assert_eq!(user(p.ssh_secret_ref()).as_deref(), Some("ssh"));
         assert!(mem.get(&p.sentinel_secret_ref()).unwrap().is_none());
+    }
+
+    /// The connect's slow log and client list land after the live connection is ready:
+    /// an `overview` event says so, with the new findings, and only when they changed.
+    #[tokio::test]
+    async fn overview_findings_landing_send_one_overview_event() {
+        let hub = Hub::new(
+            std::env::temp_dir().join("redis-lens-web-overview-none.toml"),
+            Arc::new(crate::secrets::MemoryStore::default()),
+        );
+        let id = hub.install_for_test(profile(Auth::None), false);
+        let mut l = hub.listen();
+        let idle = |n: u64| crate::live::server::ClientConn {
+            id: n,
+            addr: format!("10.0.9.17:{}", 50_000 + n),
+            name: String::new(),
+            lib_name: String::new(),
+            lib_ver: String::new(),
+            age: 7_200,
+            idle: crate::tui::app::views::server::IDLE_FLAG_SECS,
+            cmd: "get".into(),
+            mem: 0,
+            db: Some(0),
+        };
+        let conns: Vec<_> = (0..crate::tui::app::views::overview::IDLE_CLIENTS_MIN as u64)
+            .map(idle)
+            .collect();
+        let reads = |conns: Vec<crate::live::server::ClientConn>| Msg::ServerReads {
+            id,
+            scan: 1,
+            node: 0,
+            slow: None,
+            clients: Some(Ok(LiveReply::Server(crate::live::server::Reply::Clients(
+                conns,
+            )))),
+        };
+        let overview = |l: &mut Listener| {
+            let mut got = Vec::new();
+            while let Ok(e) = l.rx.try_recv() {
+                if e.name == "overview" {
+                    got.push(e.data);
+                }
+            }
+            got
+        };
+        // Something that changes nothing of Overview's first: the first event says what
+        // it holds now.
+        hub.emit_overview_if_changed();
+        let first = overview(&mut l);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["findings"], serde_json::json!([]));
+        assert!(first[0].get("live").is_none() && first[0].get("shards").is_none());
+        hub.apply(reads(conns.clone()));
+        let got = overview(&mut l);
+        assert_eq!(got.len(), 1, "{got:?}");
+        let f = got[0]["findings"].as_array().unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(
+            f[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("idle for over an hour"),
+            "{f:?}"
+        );
+        // The same again: no event.
+        hub.apply(reads(conns));
+        assert!(overview(&mut l).is_empty());
+        // Gone: an event with no findings.
+        hub.apply(reads(Vec::new()));
+        let got = overview(&mut l);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["findings"], serde_json::json!([]));
+    }
+
+    /// N10: a request that is never answered times out and leaves nothing in `pending`.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_request_leaves_nothing_pending() {
+        let hub = Hub::new(
+            std::env::temp_dir().join("redis-lens-web-n10-none.toml"),
+            Arc::new(crate::secrets::MemoryStore::default()),
+        );
+        let id = hub.install_for_test(profile(Auth::None), false);
+        // A request sent and never answered (no live task answers it here).
+        let (tx, rx) = oneshot::channel();
+        hub.with_mut(|c| c.pending.insert(ReqId(99), tx));
+        assert_eq!(hub.pending_len(), 1);
+        let h = Arc::clone(&hub);
+        let asked = tokio::spawn(async move { h.wait((id, ReqId(99), rx)).await });
+        tokio::time::sleep(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+        let r = asked.await.unwrap();
+        assert_eq!(r, Err(LiveError::Failed(TIMED_OUT.into())));
+        assert_eq!(hub.pending_len(), 0);
     }
 
     #[test]

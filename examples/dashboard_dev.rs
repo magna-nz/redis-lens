@@ -8,7 +8,8 @@
 //! REDIS_LENS_DASHBOARD_ASSETS=src/web/assets cargo run --example dashboard_dev -- 7391
 //! ```
 //!
-//! It prints the URL to open (it holds this run's token) and serves until ctrl-c.
+//! It prints the URL to open, `http://127.0.0.1:<port>/#token=<hex>` (the fragment holds
+//! this run's token; the page sends it as `Authorization: Bearer`), and serves until ctrl-c.
 
 use std::sync::Arc;
 

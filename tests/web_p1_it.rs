@@ -102,15 +102,15 @@ async fn raw(
     method: &str,
     path: &str,
     host: &str,
-    cookie: Option<&str>,
+    auth: Option<&str>,
     body: Option<&str>,
     bare: bool,
 ) -> Res {
     let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let body = body.unwrap_or("");
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
-    if let Some(c) = cookie {
-        req.push_str(&format!("Cookie: {c}\r\n"));
+    if let Some(a) = auth {
+        req.push_str(&format!("Authorization: {a}\r\n"));
     }
     if method != "GET" && !bare {
         req.push_str(&format!(
@@ -170,9 +170,11 @@ fn dechunk(mut s: &str) -> String {
 
 struct Dash {
     port: u16,
-    cookie: String,
+    /// `Bearer <token>`: the `Authorization` header every API call carries.
+    auth: String,
     dashboard: Option<Dashboard>,
     store: Arc<MemoryStore>,
+    config: PathBuf,
 }
 
 impl Dash {
@@ -184,32 +186,36 @@ impl Dash {
         }
         c.save(&config).unwrap();
         let store = Arc::new(MemoryStore::default());
-        let d = web::start_with(Options { port: 0, config }, store.clone()).expect("starts");
+        let d = web::start_with(
+            Options {
+                port: 0,
+                config: config.clone(),
+            },
+            store.clone(),
+        )
+        .expect("starts");
         let port = d.port();
         let open = d.open_url();
-        let path = open
-            .strip_prefix(&format!("http://127.0.0.1:{port}"))
-            .unwrap();
-        let host = format!("127.0.0.1:{port}");
-        let r = raw(port, "GET", path, &host, None, None, false).await;
-        assert_eq!(r.status, 303, "{}", r.body);
-        let cookie = r
-            .header("set-cookie")
-            .expect("a cookie")
-            .split(';')
-            .next()
-            .unwrap()
+        let token = open
+            .strip_prefix(&format!("http://127.0.0.1:{port}/#token="))
+            .expect("the sign-in URL holds the token in its fragment")
             .to_string();
+        assert_eq!(token.len(), 64);
         Self {
             port,
-            cookie,
+            auth: format!("Bearer {token}"),
             dashboard: Some(d),
             store,
+            config,
         }
     }
 
     fn host(&self) -> String {
         format!("127.0.0.1:{}", self.port)
+    }
+
+    fn config(&self) -> PathBuf {
+        self.config.clone()
     }
 
     async fn get(&self, path: &str) -> Res {
@@ -218,7 +224,7 @@ impl Dash {
             "GET",
             path,
             &self.host(),
-            Some(&self.cookie),
+            Some(&self.auth),
             None,
             false,
         )
@@ -232,7 +238,7 @@ impl Dash {
             method,
             path,
             &self.host(),
-            Some(&self.cookie),
+            Some(&self.auth),
             Some(&b),
             false,
         )
@@ -267,9 +273,9 @@ impl Dash {
     async fn events(&self) -> mpsc::UnboundedReceiver<(String, Value)> {
         let mut s = TcpStream::connect(("127.0.0.1", self.port)).await.unwrap();
         let req = format!(
-            "GET /api/events HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\nAccept: text/event-stream\r\n\r\n",
+            "GET /api/events HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\nAccept: text/event-stream\r\n\r\n",
             self.host(),
-            self.cookie
+            self.auth
         );
         s.write_all(req.as_bytes()).await.unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -361,31 +367,49 @@ async fn servers() -> Vec<(&'static str, common::TestServer)> {
 async fn the_guard_refuses_over_real_http() {
     let d = Dash::start(Vec::new(), "guard").await;
     let host = d.host();
-    // No cookie: 401, no detail.
+    // No token: 401, no detail.
     let r = raw(d.port, "GET", "/api/state", &host, None, None, false).await;
     assert_eq!(r.status, 401);
     assert_eq!(r.body, r#"{"error":"not signed in"}"#);
     assert_eq!(r.header("cache-control"), Some("no-store"));
-    // A wrong token: 401, no cookie.
+    // A wrong token: 401.
+    let wrong = format!("Bearer {}", "0".repeat(64));
     let r = raw(
         d.port,
         "GET",
-        &format!("/auth/{}", "0".repeat(64)),
+        "/api/state",
+        &host,
+        Some(&wrong),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(r.status, 401);
+    // The event stream needs it too.
+    let r = raw(d.port, "GET", "/api/events", &host, None, None, false).await;
+    assert_eq!(r.status, 401);
+    // There is no sign-in route and no cookie any more.
+    let token = d.auth.strip_prefix("Bearer ").unwrap().to_string();
+    let r = raw(
+        d.port,
+        "GET",
+        &format!("/auth/{token}"),
         &host,
         None,
         None,
         false,
     )
     .await;
-    assert_eq!(r.status, 401);
+    assert_eq!(r.status, 404);
     assert!(r.header("set-cookie").is_none());
+    assert!(!r.body.contains(&token));
     // DNS rebinding: another Host is 403, even signed in.
     let r = raw(
         d.port,
         "GET",
         "/api/state",
         &format!("evil.example:{}", d.port),
-        Some(&d.cookie),
+        Some(&d.auth),
         None,
         false,
     )
@@ -398,7 +422,7 @@ async fn the_guard_refuses_over_real_http() {
         "POST",
         "/api/disconnect",
         &host,
-        Some(&d.cookie),
+        Some(&d.auth),
         Some("{}"),
         true,
     )
@@ -414,7 +438,11 @@ async fn the_guard_refuses_over_real_http() {
     );
     assert_eq!(r.header("x-content-type-options"), Some("nosniff"));
     assert_eq!(r.header("referrer-policy"), Some("no-referrer"));
-    // Without a cookie `/` is the locked page; an asset is served with its type.
+    assert!(r.header("set-cookie").is_none());
+    // Without the token `/` is the page; an asset is served with its type.
+    let r = raw(d.port, "GET", "/", &host, None, None, false).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("content-type"), Some("text/html; charset=utf-8"));
     let r = raw(d.port, "GET", "/assets/app.js", &host, None, None, false).await;
     assert_eq!(r.status, 200);
     assert_eq!(
@@ -911,5 +939,358 @@ async fn a_server_that_wants_a_password_fails_the_connect_in_fixed_words() {
                 assert!(!b.contains(word), "{kind}: {word} in {b}");
             }
         }
+    }
+}
+
+// -- a fake server that refuses everything with MISCONF --------------------------
+
+const MISCONF: &str = "MISCONF Redis is configured to save RDB snapshots, but it's currently unable to persist to disk.";
+
+/// The complete RESP commands at the start of `buf`, each as its first word in capitals,
+/// and how many bytes they take.
+fn whole_commands(buf: &[u8]) -> (Vec<String>, usize) {
+    fn line(b: &[u8], at: usize) -> Option<(&[u8], usize)> {
+        let rel = b.get(at..)?.windows(2).position(|w| w == b"\r\n")?;
+        Some((&b[at..at + rel], at + rel + 2))
+    }
+    let (mut out, mut at) = (Vec::new(), 0);
+    'cmds: while let Some((head, mut p)) = line(buf, at) {
+        if head.first() != Some(&b'*') {
+            // An inline command.
+            let word = String::from_utf8_lossy(head)
+                .split(' ')
+                .next()
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            out.push(word);
+            at = p;
+            continue;
+        }
+        let count: usize = std::str::from_utf8(&head[1..]).unwrap().parse().unwrap();
+        let mut first = String::new();
+        for i in 0..count {
+            let Some((len, q)) = line(buf, p) else {
+                break 'cmds;
+            };
+            let len: usize = std::str::from_utf8(&len[1..]).unwrap().parse().unwrap();
+            if buf.len() < q + len + 2 {
+                break 'cmds;
+            }
+            if i == 0 {
+                first = String::from_utf8_lossy(&buf[q..q + len]).to_ascii_uppercase();
+            }
+            p = q + len + 2;
+        }
+        out.push(first);
+        at = p;
+    }
+    (out, at)
+}
+
+/// A server on 127.0.0.1 that answers every command with `-MISCONF ...`, or, when
+/// `ping_ok`, `PING` with `PONG` and every other command with `-MISCONF ...`.
+async fn misconf_server(ping_ok: bool) -> u16 {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let Ok(k) = s.read(&mut chunk).await else {
+                        return;
+                    };
+                    if k == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..k]);
+                    let (cmds, used) = whole_commands(&buf);
+                    buf.drain(..used);
+                    let mut out = String::new();
+                    for c in cmds {
+                        if ping_ok && c == "PING" {
+                            out.push_str("+PONG\r\n");
+                        } else {
+                            out.push_str(&format!("-{MISCONF}\r\n"));
+                        }
+                    }
+                    if !out.is_empty() && s.write_all(out.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// Rule 3 with a server error code the old word list did not know: `MISCONF` on the
+/// connect and on the Pub/Sub tail reaches neither the state, nor an event, nor a reply.
+#[tokio::test]
+async fn a_misconf_server_never_reaches_the_page_in_its_own_words() {
+    for ping_ok in [false, true] {
+        let port = misconf_server(ping_ok).await;
+        let d = Dash::start(
+            vec![profile("fake", port, Env::Local, Some(false))],
+            &format!("misconf-{ping_ok}"),
+        )
+        .await;
+        let mut events = d.events().await;
+        let r = d
+            .post("/api/connect", serde_json::json!({ "name": "fake" }))
+            .await;
+        assert_eq!(r.status, 202, "{}", r.body);
+        let mut seen = Vec::new();
+        let t0 = Instant::now();
+        let state = loop {
+            let s = d.get("/api/state").await;
+            let v = s.json();
+            seen.push(s.body);
+            if v["status"] == "failed" || (v["status"] == "connected" && v["live"] != "connecting")
+            {
+                break v;
+            }
+            assert!(t0.elapsed() < WAIT, "{v}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        if state["status"] == "connected" {
+            // The tail opens its own connection: MISCONF there closes it.
+            seen.push(
+                d.post(
+                    "/api/pubsub/subscribe",
+                    serde_json::json!({ "name": "chan1" }),
+                )
+                .await
+                .body,
+            );
+            let tail = wait_for(&mut events, "tail", |v| {
+                v["kind"] == "closed" || v["error"].is_string()
+            })
+            .await;
+            seen.push(tail.to_string());
+            for path in [
+                "/api/overview",
+                "/api/server/clients",
+                "/api/server/slowlog",
+                "/api/pubsub",
+            ] {
+                seen.push(d.get(path).await.body);
+            }
+            seen.push(
+                d.post("/api/cmdline", serde_json::json!({ "line": "GET k" }))
+                    .await
+                    .body,
+            );
+        } else {
+            assert_eq!(state["error"], web::wording::SERVER_REFUSED, "{state}");
+        }
+        seen.push(d.get("/api/state").await.body);
+        while let Ok(Some(e)) =
+            tokio::time::timeout(Duration::from_millis(300), events.recv()).await
+        {
+            seen.push(e.1.to_string());
+        }
+        for s in &seen {
+            assert!(
+                !s.contains("MISCONF") && !s.contains("persist to disk") && !s.contains("RDB"),
+                "ping_ok={ping_ok}: {s}"
+            );
+        }
+    }
+}
+
+/// Sets `name`'s writes in the config file at `path`, as `w` in the TUI beside the
+/// dashboard or `conn set --writes` would.
+fn flip_writes(path: &std::path::Path, name: &str, on: bool) {
+    let mut c = Config::load(path).unwrap();
+    c.set_writes(name, on).unwrap();
+    c.save(path).unwrap();
+}
+
+/// S3 and S8 on Redis and Valkey: a profile made read-only in the file while connected
+/// refuses `SET` on the command line and `PUBLISH` at once and the state says so; an
+/// answer given after the profile went read-only, or after another connect, sends nothing.
+#[tokio::test]
+async fn writes_follow_the_config_file_and_answers_follow_the_connection() {
+    for (kind, server) in servers().await {
+        let mut admin = server.admin().await;
+        let writable = profile("rw", server.port, Env::Stage, Some(false));
+        let prod = profile("prodw", server.port, Env::Prod, Some(false));
+        let d = Dash::start(vec![writable, prod], &format!("follow-{kind}")).await;
+        let config = d.config();
+        d.connect("rw").await;
+        let r = d
+            .post(
+                "/api/cmdline",
+                serde_json::json!({ "line": "SET s3-key before" }),
+            )
+            .await;
+        assert_eq!(r.json()["sent"], 1, "{kind}: {}", r.body);
+        flip_writes(&config, "rw", false);
+        let r = d
+            .post(
+                "/api/cmdline",
+                serde_json::json!({ "line": "SET s3-key after" }),
+            )
+            .await;
+        let v = r.json();
+        assert_eq!(v["sent"], 0, "{kind}: {v}");
+        assert_eq!(v["status"], "note", "{kind}: {v}");
+        let r = d
+            .post(
+                "/api/pubsub/publish",
+                serde_json::json!({ "channel": "c", "message": "m" }),
+            )
+            .await;
+        assert_eq!(r.status, 422, "{kind}: {}", r.body);
+        let s = d.get("/api/state").await.json();
+        assert_eq!(s["writes"], false, "{kind}: {s}");
+        assert!(s["writes_off"].is_string(), "{kind}: {s}");
+        let got: Option<String> = redis::cmd("GET")
+            .arg("s3-key")
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("before"), "{kind}");
+
+        // A question, then the profile goes read-only: the answer sends nothing.
+        d.connect("prodw").await;
+        let ask = || {
+            d.post(
+                "/api/cmdline",
+                serde_json::json!({ "line": "SET s3-key asked" }),
+            )
+        };
+        let r = ask().await;
+        assert_eq!(r.status, 409, "{kind}: {}", r.body);
+        let id = r.json()["confirm"]["id"].as_str().unwrap().to_string();
+        flip_writes(&config, "prodw", false);
+        let r = d
+            .post(
+                &format!("/api/confirm/{id}"),
+                serde_json::json!({ "typed": "prodw" }),
+            )
+            .await;
+        assert_eq!(r.status, 422, "{kind}: {}", r.body);
+        // A question, then another connect: the answer sends nothing either.
+        flip_writes(&config, "prodw", true);
+        let r = ask().await;
+        assert_eq!(r.status, 409, "{kind}: {}", r.body);
+        let id = r.json()["confirm"]["id"].as_str().unwrap().to_string();
+        flip_writes(&config, "rw", true);
+        d.connect("rw").await;
+        let r = d
+            .post(
+                &format!("/api/confirm/{id}"),
+                serde_json::json!({ "typed": "prodw" }),
+            )
+            .await;
+        assert!(
+            r.status == 409 || r.status == 410,
+            "{kind}: {} {}",
+            r.status,
+            r.body
+        );
+        let got: Option<String> = redis::cmd("GET")
+            .arg("s3-key")
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("before"), "{kind}");
+    }
+}
+
+/// S6 and S8 on Redis and Valkey: the dashboard's session takes from the process-wide
+/// budget a TUI session of the same profile and node takes from (`budget::shared`, as
+/// the TUI's connect calls it), and the connection test's probes take from it too.
+#[tokio::test]
+async fn the_dashboard_the_tui_and_the_connection_test_share_one_budget() {
+    for (kind, server) in servers().await {
+        let p = profile("shared", server.port, Env::Stage, Some(false));
+        let rate = redis_lens::scan::ScanOptions::for_profile(&p).max_commands_per_sec;
+        let node = p.endpoint.to_string();
+        let d = Dash::start(vec![p], &format!("budget-{kind}")).await;
+        d.connect("shared").await;
+        // What the TUI's connect of the same profile would get: the dashboard's budget.
+        let b = redis_lens::budget::shared("shared", &node, rate);
+        assert!(
+            b.taken() > 0,
+            "{kind}: the dashboard's connect took from it"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let before = b.taken();
+        let r = d.get("/api/server/clients").await;
+        assert_eq!(r.status, 200, "{kind}: {}", r.body);
+        let after_clients = b.taken();
+        assert!(after_clients > before, "{kind}: a live read takes from it");
+        let r = d
+            .post("/api/connections/shared/test", serde_json::json!({}))
+            .await;
+        assert_eq!(r.status, 200, "{kind}: {}", r.body);
+        let probes = b.taken() - after_clients;
+        assert!(probes >= 5, "{kind}: the test's probes took {probes}");
+    }
+}
+
+/// `INFO` calls so far (`cmdstat_info:calls=N` in `INFO commandstats`, the same name on
+/// Redis 6.2, 7 and Valkey). The read itself counts: each read adds one.
+async fn info_calls(admin: &mut MultiplexedConnection) -> u64 {
+    let text: String = redis::cmd("INFO")
+        .arg("commandstats")
+        .query_async(admin)
+        .await
+        .unwrap();
+    text.lines()
+        .find_map(|l| l.strip_prefix("cmdstat_info:calls="))
+        .and_then(|rest| rest.split(',').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// S8 on Redis and Valkey, counted on the server: the live figures send `INFO` only
+/// while an event stream is open and polling is not paused.
+#[tokio::test]
+async fn no_info_is_sent_while_paused_or_with_no_event_stream() {
+    for (kind, server) in servers().await {
+        let mut admin = server.admin().await;
+        let d = Dash::start(
+            vec![profile("polled", server.port, Env::Local, None)],
+            &format!("paused-{kind}"),
+        )
+        .await;
+        d.connect("polled").await;
+        // Let the connect's own reads land.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // No stream: nothing polls.
+        let a = info_calls(&mut admin).await;
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        let b = info_calls(&mut admin).await;
+        assert_eq!(b - a, 1, "{kind}: no stream, only the count's own INFO");
+        // A stream at 1 s: it polls.
+        let r = d
+            .post("/api/polling", serde_json::json!({ "interval_secs": 1 }))
+            .await;
+        assert_eq!(r.status, 200, "{kind}: {}", r.body);
+        let mut events = d.events().await;
+        wait_for(&mut events, "figures", |_| true).await;
+        let c = info_calls(&mut admin).await;
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        let e = info_calls(&mut admin).await;
+        assert!(e - c >= 2, "{kind}: polled {}", e - c - 1);
+        // Paused: at most the one in flight when the pause came.
+        let r = d
+            .post("/api/polling", serde_json::json!({ "paused": true }))
+            .await;
+        assert_eq!(r.status, 200, "{kind}: {}", r.body);
+        let f = info_calls(&mut admin).await;
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        let g = info_calls(&mut admin).await;
+        assert!(g - f <= 2, "{kind}: paused, {} sent", g - f - 1);
+        let h = info_calls(&mut admin).await;
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        let i = info_calls(&mut admin).await;
+        assert_eq!(i - h, 1, "{kind}: paused, nothing at all once settled");
+        drop(events);
     }
 }

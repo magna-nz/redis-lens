@@ -13,27 +13,54 @@ are cut, and each place that is cut says so.
 - The dashboard binds `127.0.0.1:<port>` only (default 7379; port 0 picks a free one).
   A port in use is `StartError::PortInUse`.
 - Each run makes a session token: 32 random bytes from the OS, written as 64 hex digits.
-  It is only in the URL that `Dashboard::open_url` returns. `Debug`, logs and every reply
-  leave it out.
-- `GET /auth/<token>` answers `303 See Other` with `Location: /` and
-  `Set-Cookie: rl_session=<token>; HttpOnly; SameSite=Strict; Path=/`. A wrong token gets
-  401 `{"error":"not signed in"}`.
-- `GET /` serves `index.html` to a signed-in browser and `locked.html` to anyone else.
-  `GET /assets/<file>` serves the embedded files on a fixed list (404 for anything else).
-  `.js` is `text/javascript; charset=utf-8`. Debug builds only: `REDIS_LENS_DASHBOARD_ASSETS=<dir>`
-  serves the same names from that directory, so the page can be changed without a rebuild.
+  `Debug`, logs and every reply leave it out.
+- The sign-in URL is `http://127.0.0.1:<port>/#token=<64 hex digits>`
+  (`Dashboard::open_url`). The token is in the fragment, which a browser never sends to a
+  server. `redis-lens --dashboard` prints it once, on its `Dashboard:` line. Nothing else
+  shows it.
+- To open a browser (`ctrl-o` in the TUI, `--dashboard` without `--no-open`), the dashboard
+  writes a small HTML file that sends the browser on to the sign-in URL (a meta refresh,
+  and a link if the browser does not follow it). The file goes in a new private directory:
+  on unix the directory is mode `0700`, the file `0600`, and both have random names, under
+  `$XDG_RUNTIME_DIR` or the temp directory; on Windows it goes under the user's temp
+  directory. The opener (`open`, `xdg-open` or `rundll32 url.dll,FileProtocolHandler`) is
+  given that file's path, so the token is never in a process argument. The file is deleted
+  after 30 s, and when the dashboard stops.
+- The page reads the token from `location.hash`, keeps it in memory, and removes it from
+  the address bar. It then sends it on every API call as `Authorization: Bearer <token>`,
+  the event stream included (the page reads `/api/events` with `fetch`, not `EventSource`).
+  There is no cookie and no `/auth/...` route: `GET /auth/<anything>` is 404.
+- `GET /` serves `index.html` and `GET /assets/<file>` serves the embedded files on a fixed
+  list (404 for anything else). Both work without the token, because they are the page's
+  static shell with no data in them. The `Host` check still applies. `.js` is
+  `text/javascript; charset=utf-8`. `locked.html` is on the list and served at
+  `/assets/locked.html`, but `/` no longer serves it. `mock.js` (the page's invented servers)
+  is served by debug builds only; a release build answers 404 for it. Debug builds only:
+  `REDIS_LENS_DASHBOARD_ASSETS=<dir>` serves the same names from that directory, so the page
+  can be changed without a rebuild.
 
 ## Checks on every request
 
 They run in this order, before any route:
 
 1. `Host` must be `127.0.0.1:<port>` or `localhost:<port>`. Anything else gets 403
-   `{"error":"forbidden"}`. This stops DNS rebinding.
+   `{"error":"forbidden"}`. This stops DNS rebinding. A request line in absolute form
+   (`GET http://host:port/path`) must name this server the same way (`http`, and
+   `127.0.0.1:<port>` or `localhost:<port>`), and the authority form (`CONNECT`) is refused.
+   Anything else gets 403.
 2. Any method other than `GET` and `HEAD` must have `Origin: http://127.0.0.1:<port>` (or
    `http://localhost:<port>`), the header `X-Redis-Lens: 1` and
-   `Content-Type: application/json`. Anything else gets 403 `{"error":"forbidden"}`.
-3. Every `/api/...` route needs the `rl_session` cookie, compared in constant time. Without
-   it the reply is 401 `{"error":"not signed in"}`, with no detail.
+   `Content-Type: application/json`. Anything else gets 403 `{"error":"forbidden"}`. That
+   includes `OPTIONS`: there is no CORS preflight, and no response carries an
+   `Access-Control-*` header.
+3. Every `/api/...` route needs exactly one `Authorization: Bearer <token>` header (the
+   scheme in any case), compared in constant time. Without it, with a wrong token, with two
+   such headers or with the old `rl_session` cookie, the reply is 401
+   `{"error":"not signed in"}`, with no detail.
+
+Connections: hyper's header read timeout is 10 s (a connection that has not sent its
+headers by then is closed). At most 64 connections are open at once; the next waits until
+one closes.
 
 Every response, errors and assets included, carries:
 
@@ -47,7 +74,7 @@ Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'
 
 The server logs nothing.
 
-Example, `GET /api/state (no cookie)`. Reply: HTTP 401
+Example, `GET /api/state (no token)`. Reply: HTTP 401
 
 ```json
 {
@@ -73,14 +100,18 @@ Example, `GET /api/state (wrong Host)`. Reply: HTTP 403
   - 200: done.
   - 201: a connection was added.
   - 202: started, with the result arriving as events (connect, subscribe, Monitor).
-  - 400: a body this route does not take, or a change `conn add`/`conn set` refuses (the
-    reason is in `error`).
+  - 400: a body this route does not take (also one over 2 MiB), or a change
+    `conn add`/`conn set` refuses (the reason is in `error`).
   - 404: no such connection or route.
   - 409: there is no live connection (`{"error":"not connected: connect first, or the live connection is closed"}`),
-    or a confirm is needed (see below).
+    a confirm is needed (see below), or a command line is still running
+    (`POST /api/cmdline`).
+  - 413: a command line longer than 8,192 characters.
   - 410: a confirm id that was used, cancelled or expired.
   - 422: refused by the write gate or by a rule (read-only profile, no such node, an
-    interval the TUI does not have, Monitor can't run here, a typed name that does not match).
+    interval the TUI does not have, Monitor can't run here, a typed name that does not
+    match), or a question that could not be put in the dashboard's words
+    (`{"error":"That needs a question the dashboard cannot ask, so nothing was changed."}`).
   - 502: the server failed the request, or did not answer within 60 s.
 - When the server or the user lacks a feature (`NOPERM`, a command Valkey or an old Redis
   does not have), the panel's route answers 200 `{"off": "<why>"}` instead of failing.
@@ -88,7 +119,18 @@ Example, `GET /api/state (wrong Host)`. Reply: HTTP 403
 - Every text that came from the server (keys, client names, channel names, reply values,
   command lines) is escaped with `value::escape` before it goes in a reply.
 - Connection URLs are always masked: the user name and password are never in a reply.
-  `auth` says which kind of credential the profile uses.
+  `auth` says which kind of credential the profile uses. `endpoint` is masked too. A host that is not a plain host name (it holds `@`, `/`, `?`,
+  `#`, a space and the like, as an old config file might) is shown as
+  `(an address with a user name or password in it: add the connection again)`, in both
+  `url` and `endpoint`.
+- Texts that quote a profile name, a host or a tag keep them as they are: a name such as
+  `cache--eu` or a punycode host such as `xn--bcher-kva.example` never turns a message into
+  the fallback sentence. A confirm question is never replaced by the fallback: the request
+  fails with 422 instead (above).
+- Server error text never reaches a reply or an event: a leading all-capitals code (quoted
+  or not, `MISCONF ...` or `"MISCONF": ...`), a quoted code anywhere, or a client-library
+  error kind becomes one of three fixed sentences (needs a password, wrong credentials, or
+  `the server refused the connection`).
 - No reply carries the server's own error text (rule 3: it can name the ACL user). A
   permission check's reason, a connect that failed, a tail or Monitor connection that could
   not open: each is said in redis-lens's own words. The one exception is a command typed
@@ -111,10 +153,12 @@ and so does starting Monitor (it always asks) and turning writes on:
 - `kind: "ask"` is a yes/no question. `kind: "type"` needs the profile's name typed (for
   prod profiles), and `expect` holds that name.
 - `POST /api/confirm/<id>` with `{}` (ask) or `{"typed": "<name>"}` (type) answers yes. The
-  gate checks again at that point: a different connection, a profile that is now
-  read-only, or a wrong typed name means it is not sent.
+  gate checks again at that point, with the profile's `read_only` and `env` read again from
+  the config file: a different connection (409 or 410), a profile that is now read-only
+  (422), or a wrong typed name means it is not sent.
 - `DELETE /api/confirm/<id>` cancels.
 - Each id can be used once and expires after 2 minutes. After that both routes answer 410.
+  Expired questions, and what they held, are dropped every 10 s even when no request comes.
   Connecting or disconnecting clears every open confirm.
 
 Example, `PATCH /api/connections/prod-cache {"writes":true}`. Reply: HTTP 409
@@ -172,7 +216,10 @@ Example, `DELETE /api/confirm/<id>`. Reply: HTTP 200
 
 A `text/event-stream` (SSE) stream with a keep-alive comment every 15 s. Each event's
 `event:` field is its name and `data:` holds JSON. It ends when the dashboard shuts down.
-The page opens one stream per tab.
+The page opens one stream per tab. Like every `/api/...` route it needs
+`Authorization: Bearer <token>`, so the page reads it with `fetch` and a stream reader
+(`EventSource` cannot send that header). Without the token it is 401, as JSON, not a
+stream.
 
 | Event | When | Data |
 |---|---|---|
@@ -180,6 +227,7 @@ The page opens one stream per tab.
 | `figures` | at the polling interval (2 s to start with, see `POST /api/polling`), only while at least one stream is open, polling is not paused and the live connection is ready | `{node, info, rates, shards}` for the picked node, where `shards` is every node's headline on a cluster (refreshed less often) |
 | `tail` | pub/sub tail | `{tail, kind: "ready"}`, `{tail, kind: "messages", messages: [...], dropped}`, `{tail, kind: "closed", error}` |
 | `monitor` | Monitor run | `{run, kind: "ready", at_unix_ms, max_lines, max_secs}`, `{run, kind: "lines", lines: [...]}`, `{run, kind: "closed", end: "stopped"\|"line_cap"\|"time_up"\|"lost"\|"failed", error}` |
+| `overview` | when what the connect read for Overview changes: the connect's slow log and client list landing after the live connection is ready (they fill `findings`), another node picked (its findings go until it is read), the last analysis found, the connect's figures. Sent only when the data differs from the last `overview` event of this connection, never before the connect has read anything | the body of `GET /api/overview` without `live` and `shards` (those come with `figures`) |
 | `notice` | something the user should know that has no panel, such as the live connection closing or a stream that fell behind | `{"text": "..."}` |
 
 A stream that falls more than 1024 events behind skips them and gets a `notice` instead.
@@ -302,7 +350,11 @@ Example, `event: figures`. Event
 
 `status` is `idle`, `connecting`, `connected` or `failed` (`error` says why). `live` is
 `waiting`, `ready` or `closed` (`live_error`). `writes` is true when this connection may
-write, and `writes_off` says why not. `refused` lists the commands the permission check
+write, and `writes_off` says why not. For a saved profile both follow the config file:
+this route, every write and every answer read its `read_only` and `env` again, and a
+change sends a `state` event (a file that cannot be read, or that no longer has the
+profile, turns writes off). A Docker container's session-only setting stays as set.
+`refused` lists the commands the permission check
 turned off. `nodes` and `picked` describe a cluster (the first primary is picked when the
 nodes arrive). `polling` is how the live figures are polled (`paused`, `interval_secs`,
 and the `intervals` that can be set). `monitor_limits` is when a Monitor run stops by itself
@@ -570,7 +622,14 @@ Example, `GET /api/connections`. Reply: HTTP 200 (`$.connections` cut to the fir
 ### `POST /api/connections`
 
 This adds a profile, as `redis-lens conn add` does: the same checks, and credentials go only
-to the OS keychain. Body (only `name` and `url` are required; unknown fields get 400):
+to the OS keychain. `url` is a `redis://` or `rediss://` URL (`valkey://` and `valkeys://`
+are the same two), or `host:port[,password=...]`. Any other scheme gets 400
+`could not parse the connection string: only redis, rediss, valkey and valkeys URLs are supported`,
+and a host that holds a user name, a password or other URL parts gets 400
+`could not parse the connection string: the host holds a user name, a password or other URL parts; give the user name and password in a redis:// URL instead`.
+Neither echoes the URL, and nothing is saved. While a question about the add waits, its
+passwords and URL are held as secrets, and they are dropped when the question is answered,
+cancelled or expires. Body (only `name` and `url` are required; unknown fields get 400):
 
 ```json
 {"name": "staging", "url": "redis://app-user@10.0.0.5:6379/0", "password": "...",
@@ -876,7 +935,7 @@ Example, `GET /api/state (after removing the connected profile)`. Reply: HTTP 20
 
 ### `POST /api/connections/{name}/test`
 
-This is `conn test`: it connects once, as the TUI does (keychain entries are read on a blocking thread), and reports the server and the permission check. A failed connect, a server that wants a password the profile does not send, or a keychain read that fails, is 502 with a fixed reason. An unknown name is 404.
+This is `conn test`: it connects once, as the TUI does (keychain entries are read on a blocking thread), and reports the server and the permission check. The permission probes take from the profile's command budget, the one a TUI or dashboard session on the same node takes from. A failed connect, a server that wants a password the profile does not send, or a keychain read that fails, is 502 with a fixed reason. An unknown name is 404.
 
 Example, `POST /api/connections/cache/test`. Reply: HTTP 200 (`$.checks` cut to the first 3 of 6)
 
@@ -1630,10 +1689,24 @@ terms), and `replies` holds one entry per reply, in the TUI's four views (`text`
 with an error (that reply is the command's own, so it is shown as it is), `cut` when it was
 cut, and `took_ms`.
 
+The TUI panel's limits apply. A line longer than 8,192 characters gets 413
+`{"error":"Not sent: a line holds at most 8,192 characters."}`. One line runs at a time
+per dashboard, answers to its questions included: a second one while the first has not
+answered gets 409
+`{"error":"Not sent: the line before it is still running. Wait for its reply, then send it again."}`.
+A repeat's replies are kept up to the TUI's 4 MiB output cap. Past that the oldest go,
+`dropped` counts them, and `dropped_note` holds the TUI's notice
+(`(the first N replies were dropped: the output keeps at most 4 MiB)`); otherwise
+`dropped` is 0 and `dropped_note` is null. Before every write, a repeat's included, the
+profile's `read_only` and `env` are read again from the config file. A profile made
+read-only elsewhere (`w` in the TUI, `conn set --writes off`) refuses at once.
+
 Example, `POST /api/cmdline {"line":"GET user:1"}`. Reply: HTTP 200
 
 ```json
 {
+  "dropped": 0,
+  "dropped_note": null,
   "line": "GET user:1",
   "node": null,
   "replies": [
@@ -1667,6 +1740,8 @@ Example, `POST /api/cmdline {"line":"HGETALL nope"}`. Reply: HTTP 200
 
 ```json
 {
+  "dropped": 0,
+  "dropped_note": null,
   "line": "HGETALL nope",
   "node": null,
   "replies": [
@@ -1700,6 +1775,8 @@ Example, `POST /api/cmdline {"line":"2 GET user:1"}`. Reply: HTTP 200
 
 ```json
 {
+  "dropped": 0,
+  "dropped_note": null,
   "line": "2 GET user:1",
   "node": null,
   "replies": [
@@ -1750,6 +1827,8 @@ Example, `POST /api/cmdline {"line":"EVAL \"return 1\" 0"}`. Reply: HTTP 200
 
 ```json
 {
+  "dropped": 0,
+  "dropped_note": null,
   "line": "EVAL \"return 1\" 0",
   "node": null,
   "replies": [],
@@ -1765,6 +1844,8 @@ Example, `POST /api/cmdline {"line":"SUBSCRIBE news"}`. Reply: HTTP 200
 
 ```json
 {
+  "dropped": 0,
+  "dropped_note": null,
   "line": "SUBSCRIBE news",
   "node": null,
   "replies": [],
@@ -1780,6 +1861,8 @@ Example, `POST /api/cmdline {"line":"SET user:3 z"}`. Reply: HTTP 200
 
 ```json
 {
+  "dropped": 0,
+  "dropped_note": null,
   "line": "SET user:3 z",
   "node": null,
   "replies": [
@@ -1839,6 +1922,8 @@ Example, `POST /api/confirm/<id> (KEYS)`. Reply: HTTP 200 (`$.replies[].json` cu
 
 ```json
 {
+  "dropped": 0,
+  "dropped_note": null,
   "line": "KEYS user:*",
   "node": null,
   "replies": [
@@ -1882,6 +1967,8 @@ Example, `POST /api/cmdline {"line":"SET user:3 z"} (read-only profile)`. Reply:
 
 ```json
 {
+  "dropped": 0,
+  "dropped_note": null,
   "line": "SET user:3 z",
   "node": null,
   "replies": [],

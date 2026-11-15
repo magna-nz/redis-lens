@@ -22,7 +22,9 @@ use crate::live::command;
 use crate::live::{CANCELLED, Dest, LiveError, LiveReply, LiveRequest};
 use crate::model::Env;
 use crate::tui::app::ConnId;
-use crate::tui::app::views::cmdline::{HELPER_OLD, REPEAT_ASKS, name_of, repeatable};
+use crate::tui::app::views::cmdline::{
+    HELPER_OLD, MAX_INPUT, MAX_OUTPUT_BYTES, REPEAT_ASKS, name_of, repeatable,
+};
 use crate::tui::app::views::{command_to, write_dest};
 use crate::web::dto;
 use crate::write::{Answer, Decision, WriteOp};
@@ -66,6 +68,13 @@ pub struct Ran {
     pub times: u32,
     pub sent: u32,
     pub replies: Vec<dto::Reply>,
+    /// The oldest replies of a repeat dropped to keep the output under the TUI's
+    /// [`MAX_OUTPUT_BYTES`], and the TUI's notice about it (`None` when none was).
+    pub dropped: u32,
+    pub dropped_note: Option<String>,
+    /// The bytes of each reply kept, as the TUI's cap counts them.
+    #[serde(skip)]
+    sizes: Vec<usize>,
 }
 
 fn dashboard_words<S: serde::Serializer, T: AsRef<str>>(
@@ -89,6 +98,9 @@ impl Ran {
             times: meta.times,
             sent: 0,
             replies: Vec::new(),
+            dropped: 0,
+            dropped_note: None,
+            sizes: Vec::new(),
         }
     }
 
@@ -102,6 +114,32 @@ impl Ran {
             times: 1,
             sent: 0,
             replies: Vec::new(),
+            dropped: 0,
+            dropped_note: None,
+            sizes: Vec::new(),
+        }
+    }
+
+    /// Keeps the reply `o`; past [`MAX_OUTPUT_BYTES`] the oldest go, as in the TUI's
+    /// panel, and the TUI's notice says how many.
+    fn push(&mut self, o: &crate::live::cmdline::Output, pairs: bool) {
+        self.replies.push(dto::Reply::of(o, pairs));
+        self.sizes.push(o.bytes());
+        while self.replies.len() > 1 && self.sizes.iter().sum::<usize>() > MAX_OUTPUT_BYTES {
+            self.replies.remove(0);
+            self.sizes.remove(0);
+            self.dropped += 1;
+        }
+        if self.dropped > 0 {
+            let runs = crate::tui::app::views::cmdline::Runs {
+                times: self.times,
+                sent: self.sent,
+                outs: Vec::new(),
+                dropped: self.dropped,
+                stopping: false,
+                end: None,
+            };
+            self.dropped_note = Some(crate::tui::app::views::cmdline::dropped_text(&runs));
         }
     }
 
@@ -158,9 +196,22 @@ async fn info_of(app: &App, conn: ConnId, name: &str) -> Result<Option<CommandIn
     }
 }
 
+/// Why a line is not run: it is longer than the TUI's panel takes.
+pub const TOO_LONG: &str = "Not sent: a line holds at most 8,192 characters.";
+
+/// Why a line is not run: the one before it has not finished.
+pub const STILL_RUNNING: &str =
+    "Not sent: the line before it is still running. Wait for its reply, then send it again.";
+
 /// `POST /api/cmdline` `{"line": "...", "pipeline": false}`: runs a typed line as the
 /// TUI's panel does.
 pub async fn run(State(app): State<App>, Body(l): Body<Line>) -> Response {
+    if l.line.chars().count() > MAX_INPUT {
+        return error(StatusCode::PAYLOAD_TOO_LARGE, TOO_LONG);
+    }
+    let Some(_slot) = app.hub.line_slot() else {
+        return error(StatusCode::CONFLICT, STILL_RUNNING);
+    };
     let all = match command::split(&l.line) {
         Ok(a) => a,
         Err(e) => {
@@ -216,6 +267,7 @@ pub async fn run(State(app): State<App>, Body(l): Body<Line>) -> Response {
                 return *r;
             }
             let op = WriteOp::Command { args, info };
+            app.hub.follow_saved_profile().await;
             let decided = app.hub.with(|c| {
                 let dest = write_dest(&c.session, &op);
                 let d = crate::write::decide_op(&op, c.profile(), &c.settings, &c.session.refusals);
@@ -408,11 +460,12 @@ async fn reads(
             .await
         {
             Ok(LiveReply::Command(CmdReply::Ran(o))) => {
-                out.replies.push(dto::Reply::of(&o, meta.pairs));
+                out.push(&o, meta.pairs);
             }
             Ok(LiveReply::Command(CmdReply::Batch(os))) => {
-                out.replies
-                    .extend(os.iter().map(|o| dto::Reply::of(o, meta.pairs)));
+                for o in &os {
+                    out.push(o, meta.pairs);
+                }
             }
             Ok(_) => return out.with("failed", SHAPE),
             Err(e) => return out.with("failed", e.to_string()),
@@ -427,6 +480,7 @@ async fn reads(
 async fn repeat_writes(app: &App, conn: ConnId, op: WriteOp, dest: Dest, meta: &Meta) -> Ran {
     let mut out = Ran::new(meta);
     while out.sent < meta.times {
+        app.hub.follow_saved_profile().await;
         let decision = app.hub.with(|c| {
             (c.id == conn).then(|| {
                 crate::write::decide_op(&op, c.profile(), &c.settings, &c.session.refusals)
@@ -447,7 +501,7 @@ async fn repeat_writes(app: &App, conn: ConnId, op: WriteOp, dest: Dest, meta: &
         };
         match app.hub.write(conn, dest.clone(), permit).await {
             Ok(LiveReply::Write(crate::live::write::Reply::Ran(o))) => {
-                out.replies.push(dto::Reply::of(&o, meta.pairs));
+                out.push(&o, meta.pairs);
             }
             Ok(_) => return out.with("failed", SHAPE),
             Err(e) => return out.with("failed", e.to_string()),
@@ -468,7 +522,7 @@ pub async fn send_write(
     let mut out = Ran::new(&meta);
     match app.hub.write(conn, dest, permit).await {
         Ok(LiveReply::Write(crate::live::write::Reply::Ran(o))) => {
-            out.replies.push(dto::Reply::of(&o, meta.pairs));
+            out.push(&o, meta.pairs);
             out.sent = 1;
         }
         Ok(_) => out = out.with("failed", SHAPE),
@@ -582,5 +636,58 @@ pub async fn help(State(app): State<App>, Query(q): Query<HashMap<String, String
         Ok(_) => error(StatusCode::BAD_GATEWAY, SHAPE),
         Err(LiveError::Unsupported(_)) => super::off(HELPER_OLD),
         Err(e) => super::live_error(&e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S4: a repeat's replies past the TUI's 4 MiB cap drop the oldest first, with the
+    /// TUI's notice; one reply is always kept.
+    #[test]
+    fn a_repeats_output_keeps_under_the_tuis_cap() {
+        let meta = Meta {
+            line: "8 GET k".into(),
+            pairs: false,
+            node: None,
+            route_note: None,
+            times: 8,
+        };
+        let mut out = Ran::new(&meta);
+        let big = redis::Value::BulkString(vec![b'a'; MAX_OUTPUT_BYTES / 6]);
+        let o = cmdline::Output::of(&big, std::time::Duration::from_micros(1));
+        for _ in 0..8 {
+            out.push(&o, false);
+        }
+        assert!(out.dropped > 0, "{}", out.dropped);
+        assert_eq!(out.replies.len() + out.dropped as usize, 8);
+        assert!(out.sizes.iter().sum::<usize>() <= MAX_OUTPUT_BYTES);
+        let note = out.dropped_note.clone().unwrap();
+        assert_eq!(
+            note,
+            format!(
+                "(the first {} replies were dropped: the output keeps at most 4 MiB)",
+                out.dropped
+            )
+        );
+        // A small repeat drops nothing and says nothing.
+        let mut small = Ran::new(&meta);
+        let one = cmdline::Output::of(&redis::Value::Int(1), std::time::Duration::ZERO);
+        for _ in 0..8 {
+            small.push(&one, false);
+        }
+        assert_eq!((small.dropped, small.replies.len()), (0, 8));
+        assert!(small.dropped_note.is_none());
+        let v = serde_json::to_value(&small).unwrap();
+        assert_eq!(v["dropped"], 0);
+        assert!(v["dropped_note"].is_null());
+        assert!(v.get("sizes").is_none());
+    }
+
+    #[test]
+    fn the_input_cap_is_the_tuis() {
+        assert_eq!(MAX_INPUT, 8_192);
+        assert!(TOO_LONG.contains("8,192"));
     }
 }
