@@ -1,6 +1,6 @@
 DEMO := docker compose -f demo/compose.yml
 
-.PHONY: help build test it coverage lint fmt demo-up demo-seed demo-profiles demo demo-down gif
+.PHONY: help build test it test-page coverage lint fmt demo-up demo-seed demo-profiles demo demo-down gif
 
 help:
 	@echo "make build          build a release binary"
@@ -21,6 +21,10 @@ test:
 
 it:
 	cargo test --locked --features integration-tests --tests
+
+# The dashboard's page (src/web/assets): plain ES modules, no packages. Needs Node 22 or newer.
+test-page:
+	node --test src/web/assets/tests/index.js
 
 # cargo-llvm-cov needs llvm-cov and llvm-profdata. rustup's llvm-tools-preview provides
 # them; without rustup (e.g. Homebrew Rust on macOS) this falls back to Xcode's copies.
