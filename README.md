@@ -4,9 +4,10 @@
   <p><strong>Redis Insight in your terminal, for Redis and Valkey.</strong></p>
   <p>
     <a href="https://github.com/magna-nz/redis-lens/actions/workflows/ci.yml"><img src="https://github.com/magna-nz/redis-lens/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+    <a href="https://crates.io/crates/redis-lens"><img src="https://img.shields.io/crates/v/redis-lens" alt="crates.io"></a>
     <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.89%2B-B7410E" alt="Rust 1.89+"></a>
     <a href="https://valkey.io/"><img src="https://img.shields.io/badge/Redis-6.2%2B%20%7C%20Valkey%208-DC382D" alt="Redis 6.2+ and Valkey 8"></a>
-    <a href="#license"><img src="https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-yellow.svg" alt="License MIT OR Apache-2.0"></a>
+    <a href="#license"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License MIT"></a>
   </p>
   <p><a href="https://magna-nz.github.io/redis-lens/"><strong>Documentation</strong></a></p>
 </div>
@@ -35,8 +36,17 @@ Connections marked as production are read-only unless you turn writes on.
 ## Install
 
 ```sh
-cargo install --git https://github.com/magna-nz/redis-lens
+# Homebrew (macOS, Linux)
+brew install magna-nz/tap/redis-lens
+# Shell installer (macOS, Linux)
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/magna-nz/redis-lens/releases/latest/download/redis-lens-installer.sh | sh
+# PowerShell installer (Windows)
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/magna-nz/redis-lens/releases/latest/download/redis-lens-installer.ps1 | iex"
+# crates.io (Rust 1.89+); add --features entra-id for Microsoft Entra ID sign-in
+cargo install redis-lens --locked
 ```
+
+Or download a binary for macOS, Linux or Windows from [GitHub Releases](https://github.com/magna-nz/redis-lens/releases).
 
 ## Get started
 
@@ -56,7 +66,8 @@ make lint   # rustfmt and clippy
 ```
 
 Behaviour is defined in [`spec.md`](spec.md); a change to behaviour updates it in the same pull request.
+Releases: [`docs/releasing.md`](docs/releasing.md).
 
 ## License
 
-[Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+[MIT](LICENSE)
