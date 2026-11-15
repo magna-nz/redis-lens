@@ -82,13 +82,93 @@ enum Incoming {
 
 type Tx = mpsc::UnboundedSender<Incoming>;
 
-pub async fn run(config: Option<PathBuf>) -> anyhow::Result<()> {
+/// Whether the web dashboard runs beside the TUI: the command line's say. `[settings]`
+/// in the config file has the rest ([`crate::config::DashboardSettings`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Beside {
+    /// `--terminal`: no dashboard.
+    pub terminal: bool,
+    /// `--port`: wins over `dashboard_port`.
+    pub port: Option<u16>,
+}
+
+/// What the dashboard says when it could not start beside the TUI. Fixed words; never
+/// an OS error's text.
+pub fn dashboard_failed(e: &crate::web::StartError) -> String {
+    use crate::web::StartError;
+    match e {
+        StartError::PortInUse(port) => {
+            format!("The dashboard is off: port {port} is in use. --port picks another.")
+        }
+        StartError::Bind { port, .. } => {
+            format!(
+                "The dashboard is off: it could not listen on 127.0.0.1:{port}. --port picks another."
+            )
+        }
+        StartError::Random => {
+            "The dashboard is off: the OS gave no random bytes for its token.".to_string()
+        }
+    }
+}
+
+/// Starts the dashboard beside the TUI unless `--terminal` or `[settings] dashboard =
+/// false` says not to. Silent: nothing goes to the terminal, whatever happens. A start
+/// that fails leaves the TUI as it is, with the reason in the link.
+fn start_beside(
+    beside: Beside,
+    settings: crate::config::DashboardSettings,
+    path: &Path,
+) -> (Option<crate::web::Dashboard>, app::DashboardLink) {
+    use app::DashboardLink;
+    if beside.terminal {
+        return (None, DashboardLink::Terminal);
+    }
+    if !settings.dashboard {
+        return (None, DashboardLink::Disabled);
+    }
+    let opts = crate::web::Options {
+        port: settings.port(beside.port),
+        config: path.to_path_buf(),
+    };
+    match crate::web::start(opts) {
+        Ok(d) => {
+            let url = d.url().trim_end_matches('/').to_string();
+            (Some(d), DashboardLink::On { url })
+        }
+        Err(e) => (None, DashboardLink::Failed(dashboard_failed(&e))),
+    }
+}
+
+pub async fn run(config: Option<PathBuf>, beside: Beside) -> anyhow::Result<()> {
     let path = match config {
         Some(p) => p,
         None => Config::default_path()?,
     };
     let loaded = Config::load(&path);
+    // Before the first frame. A file that can't be read leaves the dashboard's settings
+    // at their defaults; the TUI says what is wrong with it.
+    let settings = loaded.as_ref().map(|c| c.dashboard).unwrap_or_default();
+    let (dashboard, link) = start_beside(beside, settings, &path);
+    let open_url = dashboard
+        .as_ref()
+        .map(|d| secrecy::SecretString::from(d.open_url()));
 
+    let result = run_terminal(path, loaded, (link, open_url)).await;
+    // Quitting shuts the dashboard down: its event streams end, then the server.
+    if let Some(d) = dashboard {
+        d.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(2), d.wait()).await;
+    }
+    result
+}
+
+/// The TUI's own terminal session, `dashboard` the link to show and the URL that signs
+/// a browser in.
+async fn run_terminal(
+    path: PathBuf,
+    loaded: Result<Config, crate::config::ConfigError>,
+    dashboard: (app::DashboardLink, Option<secrecy::SecretString>),
+) -> anyhow::Result<()> {
     let mut terminal = ratatui::try_init()?;
     // ratatui's panic hook restores the terminal; also turn bracketed paste off.
     let prev = std::panic::take_hook();
@@ -97,7 +177,7 @@ pub async fn run(config: Option<PathBuf>) -> anyhow::Result<()> {
         prev(info);
     }));
     let result = match execute!(stdout(), EnableBracketedPaste) {
-        Ok(()) => event_loop(&mut terminal, path, loaded).await,
+        Ok(()) => event_loop(&mut terminal, path, loaded, dashboard).await,
         Err(e) => Err(e.into()),
     };
     let _ = execute!(stdout(), DisableBracketedPaste);
@@ -139,6 +219,7 @@ async fn event_loop(
     terminal: &mut DefaultTerminal,
     path: PathBuf,
     loaded: Result<Config, crate::config::ConfigError>,
+    (link, open_url): (app::DashboardLink, Option<secrecy::SecretString>),
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     // The colours are set once, before the first frame: the theme from the file, and
@@ -159,8 +240,10 @@ async fn event_loop(
             app
         }
     };
+    app.set_dashboard(link);
     spawn_input_thread(tx.clone());
     let mut runner = Runner::new(tx, path);
+    runner.dashboard = open_url;
     // The clock from the start, so a connect that answers before the first tick still
     // has its time in the header ("● connected 14:02 UTC").
     app.set_wall_clock(unix_ms_now() / 1000);
@@ -220,6 +303,11 @@ struct Runner {
     /// the OS keychain in the TUI; the web dashboard's own store
     /// ([`Headless::set_keychain`]).
     keychain: Arc<dyn SecretStore>,
+    /// The URL that signs a browser in to the dashboard beside the TUI, while it runs
+    /// ([`Effect::OpenDashboard`]). It holds the token: only the browser gets it.
+    dashboard: Option<secrecy::SecretString>,
+    /// Starts the browser: [`crate::web::open_in_browser`], a recorder in tests.
+    open_browser: fn(&str) -> std::io::Result<()>,
 }
 
 impl Drop for Runner {
@@ -475,6 +563,8 @@ impl Runner {
             scans: HashMap::new(),
             stop: None,
             keychain: Arc::new(KeyringStore),
+            dashboard: None,
+            open_browser: crate::web::open_in_browser,
         }
     }
 
@@ -699,6 +789,14 @@ impl Runner {
                 if let Some(msg) = copy_to(out, &text) {
                     send(&tx, msg);
                 }
+            }
+            Effect::OpenDashboard => {
+                // Starting a program may take a moment: never on the UI thread.
+                let (url, open) = (self.dashboard.clone(), self.open_browser);
+                tokio::task::spawn_blocking(move || {
+                    let ok = url.is_some_and(|u| open(u.expose_secret()).is_ok());
+                    send(&tx, Msg::DashboardOpened { ok });
+                });
             }
             Effect::Editor(job) => {
                 // Blocks the event loop while the editor runs: nothing is drawn then.
@@ -2859,6 +2957,124 @@ mod tests {
             panic!("no CopyFailed");
         };
         assert_eq!(e, "the key is too long to copy");
+    }
+
+    /// `ctrl-o`'s effect hands the URL that signs in to the browser opener, off the UI
+    /// thread, and says how it went; without a dashboard nothing is opened.
+    #[tokio::test]
+    async fn open_dashboard_hands_the_signed_url_to_the_browser() {
+        static OPENED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        fn record(url: &str) -> std::io::Result<()> {
+            OPENED.lock().unwrap().push(url.to_string());
+            Ok(())
+        }
+        fn fail(_: &str) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        }
+        let url = "http://127.0.0.1:7379/auth/00ff";
+        let (mut runner, mut rx) = runner();
+        runner.open_browser = record;
+        runner.dashboard = Some(secrecy::SecretString::from(url));
+        let mut out = Recorder::default();
+        assert!(!runner.run(Effect::OpenDashboard, &mut out));
+        assert!(out.bytes.is_empty(), "nothing goes to the terminal");
+        let msg = rx.recv().await.map(msg_of);
+        assert!(
+            matches!(msg, Some(Msg::DashboardOpened { ok: true })),
+            "{msg:?}"
+        );
+        assert_eq!(*OPENED.lock().unwrap(), [url]);
+        // The browser could not be started.
+        runner.open_browser = fail;
+        runner.run(Effect::OpenDashboard, &mut out);
+        let msg = rx.recv().await.map(msg_of);
+        assert!(
+            matches!(msg, Some(Msg::DashboardOpened { ok: false })),
+            "{msg:?}"
+        );
+        // No dashboard (the web dashboard's own runner): nothing is opened.
+        let (mut bare, mut rx) = self::runner();
+        bare.open_browser = record;
+        bare.run(Effect::OpenDashboard, &mut out);
+        let msg = rx.recv().await.map(msg_of);
+        assert!(
+            matches!(msg, Some(Msg::DashboardOpened { ok: false })),
+            "{msg:?}"
+        );
+        assert_eq!(OPENED.lock().unwrap().len(), 1);
+        assert!(out.bytes.is_empty());
+    }
+
+    /// `--terminal` and `[settings] dashboard = false` start nothing; otherwise the
+    /// dashboard starts on the port asked for, and a port in use is a reason, not an
+    /// error. The link holds the URL to show, never the token.
+    #[tokio::test]
+    async fn start_beside_starts_the_dashboard_unless_told_not_to() {
+        use crate::config::DashboardSettings;
+        use app::DashboardLink;
+        let path = temp_path("beside");
+        let on = DashboardSettings::default();
+        let off = DashboardSettings {
+            dashboard: false,
+            ..on
+        };
+        let terminal = Beside {
+            terminal: true,
+            port: Some(0),
+        };
+        let (d, link) = start_beside(terminal, on, &path);
+        assert!(d.is_none());
+        assert_eq!(link, DashboardLink::Terminal);
+        let (d, link) = start_beside(
+            Beside {
+                terminal: false,
+                port: Some(0),
+            },
+            off,
+            &path,
+        );
+        assert!(d.is_none());
+        assert_eq!(link, DashboardLink::Disabled);
+
+        let (d, link) = start_beside(
+            Beside {
+                terminal: false,
+                port: Some(0),
+            },
+            on,
+            &path,
+        );
+        let d = d.expect("started");
+        let port = d.port();
+        assert_ne!(port, 0);
+        assert_eq!(
+            link,
+            DashboardLink::On {
+                url: format!("http://127.0.0.1:{port}")
+            }
+        );
+        let token = d.open_url().rsplit('/').next().unwrap().to_string();
+        assert!(!format!("{link:?}").contains(&token));
+        // Its port is taken now: a second one says so and starts nothing.
+        let (second, link) = start_beside(
+            Beside {
+                terminal: false,
+                port: Some(port),
+            },
+            on,
+            &path,
+        );
+        assert!(second.is_none());
+        assert_eq!(
+            link,
+            DashboardLink::Failed(format!(
+                "The dashboard is off: port {port} is in use. --port picks another."
+            ))
+        );
+        d.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), d.wait())
+            .await
+            .expect("it stops");
     }
 
     #[test]

@@ -83,7 +83,15 @@ const DATABASES_KEY: KeyHelp = k(
     false,
 );
 
-static GLOBAL: [KeyHelp; 8] = [
+const DASHBOARD_KEY: KeyHelp = k(
+    "ctrl-o",
+    "ctrl-o",
+    "Dashboard",
+    "Open the web dashboard in your browser",
+    false,
+);
+
+static GLOBAL: [KeyHelp; 9] = [
     CONNECTIONS_KEY,
     AREAS,
     MORE,
@@ -91,6 +99,7 @@ static GLOBAL: [KeyHelp; 8] = [
     COMMAND_LINE_KEY,
     FIND_KEY,
     DATABASES_KEY,
+    DASHBOARD_KEY,
     QUIT,
 ];
 

@@ -205,6 +205,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `:` | Open the command line |
 | `ctrl-f` | Find keys by name or pattern on the whole server |
 | `b` | Switch the database (once connected) |
+| `ctrl-o` | Open the web dashboard in your browser |
 | `q` `ctrl-c` | Quit |
 
 #### Connections

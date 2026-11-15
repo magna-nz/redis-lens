@@ -34,12 +34,104 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ConfigFile", into = "ConfigFile")]
 pub struct Config {
-    /// `[settings]`: absent from the file while every setting is at its default.
-    #[serde(default, skip_serializing_if = "Settings::is_default")]
+    /// `[settings]` the write gate and the colours read. In the file, one `[settings]`
+    /// table holds these and [`Config::dashboard`]; it is absent while every setting in
+    /// it is at its default.
     pub settings: Settings,
-    #[serde(default, rename = "profile")]
+    /// `[settings] dashboard` and `dashboard_port`, in the same table as
+    /// [`Config::settings`].
+    pub dashboard: DashboardSettings,
     pub profiles: Vec<Profile>,
+}
+
+/// `[settings] dashboard = false` never starts the web dashboard beside the TUI (it is
+/// on by default); `dashboard_port = N` is its port (1 to 65535) when `--port` is not
+/// given. Each key is absent from the file while at its default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DashboardSettings {
+    #[serde(default = "on", skip_serializing_if = "is_on")]
+    pub dashboard: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_port: Option<std::num::NonZeroU16>,
+}
+
+fn on() -> bool {
+    true
+}
+
+fn is_on(b: &bool) -> bool {
+    *b
+}
+
+impl Default for DashboardSettings {
+    fn default() -> Self {
+        Self {
+            dashboard: true,
+            dashboard_port: None,
+        }
+    }
+}
+
+impl DashboardSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The dashboard's port: `flag` (`--port`) when given, else `dashboard_port`, else
+    /// [`crate::web::DEFAULT_PORT`].
+    pub fn port(&self, flag: Option<u16>) -> u16 {
+        flag.or(self.dashboard_port.map(std::num::NonZeroU16::get))
+            .unwrap_or(crate::web::DEFAULT_PORT)
+    }
+}
+
+/// [`Config`] as the file holds it: the one `[settings]` table, then the profiles.
+#[derive(Serialize, Deserialize)]
+struct ConfigFile {
+    #[serde(default, skip_serializing_if = "SettingsTable::is_default")]
+    settings: SettingsTable,
+    #[serde(default, rename = "profile")]
+    profiles: Vec<Profile>,
+}
+
+/// `[settings]`: the write gate's and the colours' settings and the dashboard's, side
+/// by side in one table.
+#[derive(Default, Serialize, Deserialize)]
+struct SettingsTable {
+    #[serde(flatten)]
+    write: Settings,
+    #[serde(flatten)]
+    dashboard: DashboardSettings,
+}
+
+impl SettingsTable {
+    fn is_default(&self) -> bool {
+        self.write.is_default() && self.dashboard.is_default()
+    }
+}
+
+impl From<ConfigFile> for Config {
+    fn from(f: ConfigFile) -> Self {
+        Self {
+            settings: f.settings.write,
+            dashboard: f.settings.dashboard,
+            profiles: f.profiles,
+        }
+    }
+}
+
+impl From<Config> for ConfigFile {
+    fn from(c: Config) -> Self {
+        Self {
+            settings: SettingsTable {
+                write: c.settings,
+                dashboard: c.dashboard,
+            },
+            profiles: c.profiles,
+        }
+    }
 }
 
 impl Config {
@@ -601,6 +693,83 @@ mod tests {
             Err(ConfigError::Parse { .. })
         ));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `[settings] dashboard` and `dashboard_port` round-trip in the one `[settings]`
+    /// table beside the other settings, and each is absent while at its default.
+    #[test]
+    fn dashboard_settings_round_trip_and_are_absent_while_default() {
+        use std::num::NonZeroU16;
+        let dir = temp_dir("dashboard");
+        let path = dir.join("config.toml");
+        let mut c = Config::default();
+        assert!(c.dashboard.dashboard);
+        assert_eq!(c.dashboard.dashboard_port, None);
+        assert!(c.dashboard.is_default());
+        c.add(profile("a", 1), false).unwrap();
+        c.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("settings"), "{text}");
+        assert!(!text.contains("dashboard"), "{text}");
+
+        c.dashboard.dashboard = false;
+        c.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[settings]\ndashboard = false"), "{text}");
+        assert!(!text.contains("dashboard_port"), "{text}");
+        assert_eq!(Config::load(&path).unwrap(), c);
+
+        c.dashboard = DashboardSettings {
+            dashboard: true,
+            dashboard_port: NonZeroU16::new(7400),
+        };
+        c.settings.skip_non_prod_confirm = true;
+        c.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("[settings]").count(), 1, "{text}");
+        assert!(text.contains("dashboard_port = 7400"), "{text}");
+        assert!(text.contains("skip_non_prod_confirm = true"), "{text}");
+        assert!(!text.contains("dashboard = "), "{text}");
+        let back = Config::load(&path).unwrap();
+        assert_eq!(back, c);
+        assert!(back.settings.skip_non_prod_confirm);
+        assert!(!back.settings.is_default());
+
+        // Written by hand: both keys, beside the theme.
+        std::fs::write(
+            &path,
+            "[settings]\ntheme = \"light\"\ndashboard = false\ndashboard_port = 8080\n",
+        )
+        .unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!(c.settings.theme, crate::write::Theme::Light);
+        assert!(!c.dashboard.dashboard);
+        assert_eq!(c.dashboard.dashboard_port, NonZeroU16::new(8080));
+        // `dashboard = true` is the default, so the settings stay default and saving
+        // writes no `[settings]`.
+        std::fs::write(&path, "[settings]\ndashboard = true\n").unwrap();
+        let c = Config::load(&path).unwrap();
+        assert!(c.dashboard.is_default() && c.settings.is_default());
+        c.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("settings"));
+        // The flag wins over the file, the file over the default.
+        let set = DashboardSettings {
+            dashboard: true,
+            dashboard_port: NonZeroU16::new(8080),
+        };
+        assert_eq!(set.port(Some(7400)), 7400);
+        assert_eq!(set.port(None), 8080);
+        assert_eq!(DashboardSettings::default().port(None), 7379);
+        assert_eq!(DashboardSettings::default().port(Some(1)), 1);
+        // A port outside 1-65535 fails the load.
+        for bad in ["0", "65536", "-1", "\"7379\""] {
+            std::fs::write(&path, format!("[settings]\ndashboard_port = {bad}\n")).unwrap();
+            assert!(
+                matches!(Config::load(&path), Err(ConfigError::Parse { .. })),
+                "{bad}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -592,12 +592,20 @@ pub enum Effect {
     /// Edit a value in `$EDITOR` on a temporary file ([`crate::tui::editor`]), out of
     /// the TUI until it exits. Answered with [`Msg::Edited`].
     Editor(crate::tui::editor::EditorJob),
+    /// `ctrl-o`: open the web dashboard in the browser, off the UI thread. The URL that
+    /// signs the browser in is the runtime's: the app never holds it. Answered with
+    /// [`Msg::DashboardOpened`].
+    OpenDashboard,
     Quit,
 }
 
 /// Results coming back from the runtime.
 #[derive(Debug)]
 pub enum Msg {
+    /// [`Effect::OpenDashboard`] ran: whether the browser was started.
+    DashboardOpened {
+        ok: bool,
+    },
     /// [`Effect::Editor`] ended: the edited value, or why not. Values: on screen only.
     Edited {
         job: u64,
@@ -1075,6 +1083,31 @@ pub struct HelpFind {
     pub sel: usize,
 }
 
+/// The web dashboard beside the TUI (spec "Web dashboard"): what the Connections screen
+/// says and what `ctrl-o` does. Never the token: only the URL to show.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DashboardLink {
+    /// `--terminal`: not started.
+    #[default]
+    Terminal,
+    /// `[settings] dashboard = false`: not started.
+    Disabled,
+    /// Serving: `url` is [`crate::web::Dashboard::url`], without the token.
+    On { url: String },
+    /// It could not start: why, in redis-lens's words.
+    Failed(String),
+}
+
+/// `ctrl-o` when the dashboard runs and the browser opened.
+pub const DASHBOARD_OPENED: &str = "Opened the dashboard in your browser.";
+/// `ctrl-o` when the browser could not be started.
+pub const DASHBOARD_NO_BROWSER: &str = "Could not open a browser for the dashboard.";
+/// `ctrl-o` after `--terminal`.
+pub const DASHBOARD_OFF_TERMINAL: &str = "The dashboard is off (--terminal).";
+/// `ctrl-o` after `[settings] dashboard = false`.
+pub const DASHBOARD_OFF_SETTING: &str =
+    "The dashboard is off (dashboard = false in the config file).";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub text: String,
@@ -1189,6 +1222,8 @@ pub struct App {
     next_tail: u64,
     /// `[settings]` from the config file.
     pub settings: crate::write::Settings,
+    /// The web dashboard beside the TUI ([`App::set_dashboard`]): off until told.
+    pub dashboard: DashboardLink,
     /// The write gate's question on screen, if any. While it is open every key goes to
     /// it.
     pub confirm: Option<confirm::Confirm>,
@@ -1316,6 +1351,11 @@ fn secret_source(entry: &ConnEntry) -> SecretSource {
     }
 }
 
+/// `ctrl-o`: open the web dashboard.
+fn is_dashboard_key(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o')
+}
+
 fn plain_char(key: &KeyEvent) -> Option<char> {
     match key.code {
         KeyCode::Char(c)
@@ -1366,6 +1406,7 @@ pub fn key_of(token: &str) -> Option<KeyEvent> {
         "ctrl-l" => KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
         "ctrl-u" => KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
         "ctrl-f" => KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        "ctrl-o" => KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
         t => {
             let mut cs = t.chars();
             match (cs.next(), cs.next()) {
@@ -1427,6 +1468,7 @@ impl App {
             next_req: 1,
             next_tail: 1,
             settings: crate::write::Settings::default(),
+            dashboard: DashboardLink::default(),
             confirm: None,
             bulk: None,
             dbs: None,
@@ -1502,6 +1544,36 @@ impl App {
 
     pub fn set_info(&mut self, text: impl Into<String>) {
         self.notice = Some(Notice::info(text, self.tick));
+    }
+
+    /// Where the web dashboard stands, once at start. When it could not start, says
+    /// why as a notice (unless one is already shown, such as a config file error).
+    pub fn set_dashboard(&mut self, link: DashboardLink) {
+        if let DashboardLink::Failed(why) = &link
+            && self.notice.is_none()
+        {
+            self.set_error(why.clone());
+        }
+        self.dashboard = link;
+    }
+
+    /// The dashboard's URL to show (no token), while it runs.
+    pub fn dashboard_url(&self) -> Option<&str> {
+        match &self.dashboard {
+            DashboardLink::On { url } => Some(url),
+            _ => None,
+        }
+    }
+
+    /// `ctrl-o`: open the dashboard in the browser, or say why it is off.
+    fn open_dashboard(&mut self) -> Vec<Effect> {
+        match &self.dashboard {
+            DashboardLink::On { .. } => return vec![Effect::OpenDashboard],
+            DashboardLink::Terminal => self.set_info(DASHBOARD_OFF_TERMINAL),
+            DashboardLink::Disabled => self.set_info(DASHBOARD_OFF_SETTING),
+            DashboardLink::Failed(why) => self.set_error(why.clone()),
+        }
+        Vec::new()
     }
 
     pub fn entry(&self, id: ConnId) -> Option<&ConnEntry> {
@@ -2225,6 +2297,10 @@ impl App {
         }
         if find::is_find(&key) {
             return self.open_find();
+        }
+        // `ctrl-o` opens the web dashboard from anywhere `ctrl-f` works.
+        if is_dashboard_key(&key) {
+            return self.open_dashboard();
         }
         let screen = self.screen();
         if screen == Screen::Patterns && self.patterns.filtering {
@@ -3877,6 +3953,8 @@ impl App {
             }
             Msg::SnapshotFailed(e) => self.set_error(format!("Could not save snapshot: {e}")),
             Msg::CopyFailed(e) => self.set_error(format!("Could not copy: {e}")),
+            Msg::DashboardOpened { ok: true } => self.set_info(DASHBOARD_OPENED),
+            Msg::DashboardOpened { ok: false } => self.set_error(DASHBOARD_NO_BROWSER),
             Msg::LiveReady { id, scan } => {
                 if let Some(s) = self.session.as_mut()
                     && s.id == id
@@ -7642,6 +7720,7 @@ mod tests {
             "shift-tab" => vec![key(KeyCode::BackTab)],
             "ctrl-c" => vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
             "ctrl-f" => vec![KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)],
+            "ctrl-o" => vec![KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)],
             "space" => vec![ch(' ')],
             t if t.chars().count() == 1 => vec![ch(t.chars().next().unwrap())],
             t => panic!("no key events for token {t:?}"),
@@ -7664,6 +7743,7 @@ mod tests {
             KeyCode::BackTab => "shift-tab".into(),
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-c".into(),
             KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-f".into(),
+            KeyCode::Char('o') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-o".into(),
             KeyCode::Char(' ') => "space".into(),
             KeyCode::Char(c) => c.to_string(),
             other => format!("{other:?}"),
@@ -7777,6 +7857,7 @@ mod tests {
         );
         candidates.push(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         candidates.push(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        candidates.push(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         for screen in Screen::ALL {
             let table = tokens(screen);
             for k in &candidates {
@@ -9170,5 +9251,342 @@ mod tests {
         let text = screen_text(&app, 120, 36);
         assert!(text.contains("evil\\x1b[2J"), "{text}");
         assert!(!text.contains('\u{1b}'), "{text}");
+    }
+}
+
+/// `ctrl-o` and the Connections screen's dashboard line (spec "Web dashboard").
+#[cfg(test)]
+mod dashboard_tests {
+    use super::views::testing;
+    use super::*;
+    use crate::model::Env;
+    use crate::tui::fixtures;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    const URL: &str = "http://127.0.0.1:7379";
+
+    fn ch(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn key(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::NONE)
+    }
+
+    fn type_text(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.handle_key(ch(c));
+        }
+    }
+
+    fn on() -> DashboardLink {
+        DashboardLink::On { url: URL.into() }
+    }
+
+    fn port_in_use() -> DashboardLink {
+        DashboardLink::Failed(crate::tui::dashboard_failed(
+            &crate::web::StartError::PortInUse(7379),
+        ))
+    }
+
+    /// The notice and whether it is an error.
+    fn notice(app: &App) -> Option<(String, bool)> {
+        app.notice.as_ref().map(|n| (n.text.clone(), n.error))
+    }
+
+    fn opens(effects: &[Effect]) -> bool {
+        effects.iter().any(|e| matches!(e, Effect::OpenDashboard))
+    }
+
+    fn text(t: &Terminal<TestBackend>) -> String {
+        let buf = t.backend().buffer();
+        let area = buf.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The home screen as the existing Connections snapshots have it: three saved
+    /// profiles and one container.
+    fn home(link: DashboardLink) -> App {
+        let mut app = App::new(fixtures::profiles());
+        app.apply(Msg::DockerFound(vec![fixtures::docker_instance()]));
+        app.set_dashboard(link);
+        app
+    }
+
+    #[test]
+    fn an_app_starts_with_the_dashboard_off_and_no_line() {
+        let app = App::new(fixtures::profiles());
+        assert_eq!(app.dashboard, DashboardLink::Terminal);
+        assert_eq!(app.dashboard_url(), None);
+        assert_eq!(notice(&app), None);
+    }
+
+    #[test]
+    fn ctrl_o_opens_the_dashboard_on_every_screen() {
+        // Before connecting.
+        let mut app = home(on());
+        let effects = app.handle_key(ctrl('o'));
+        assert!(
+            matches!(effects[..], [Effect::OpenDashboard]),
+            "{effects:?}"
+        );
+        assert_eq!(app.screen(), Screen::Connections);
+        for screen in Screen::ALL {
+            if matches!(screen, Screen::Nodes | Screen::Slots) {
+                // Panels of a cluster only.
+                continue;
+            }
+            let mut app = testing::app_on(screen).0;
+            app.set_dashboard(on());
+            let effects = app.handle_key(ctrl('o'));
+            assert!(
+                matches!(effects[..], [Effect::OpenDashboard]),
+                "{screen:?}: {effects:?}"
+            );
+            assert_eq!(app.screen(), screen);
+            // The answer: a notice.
+            app.apply(Msg::DashboardOpened { ok: true });
+            assert_eq!(notice(&app), Some((DASHBOARD_OPENED.into(), false)));
+        }
+    }
+
+    #[test]
+    fn the_answer_is_a_notice() {
+        let mut app = home(on());
+        app.apply(Msg::DashboardOpened { ok: true });
+        assert_eq!(
+            notice(&app),
+            Some(("Opened the dashboard in your browser.".into(), false))
+        );
+        app.apply(Msg::DashboardOpened { ok: false });
+        assert_eq!(
+            notice(&app),
+            Some(("Could not open a browser for the dashboard.".into(), true))
+        );
+        // An error notice goes at the next key.
+        app.handle_key(ch('j'));
+        assert_eq!(notice(&app), None);
+    }
+
+    #[test]
+    fn ctrl_o_says_why_the_dashboard_is_off() {
+        let cases = [
+            (
+                DashboardLink::Terminal,
+                "The dashboard is off (--terminal).",
+                false,
+            ),
+            (
+                DashboardLink::Disabled,
+                "The dashboard is off (dashboard = false in the config file).",
+                false,
+            ),
+            (
+                port_in_use(),
+                "The dashboard is off: port 7379 is in use. --port picks another.",
+                true,
+            ),
+        ];
+        for (link, said, error) in cases {
+            let mut app = testing::app_on(Screen::Patterns).0;
+            app.set_dashboard(link.clone());
+            app.notice = None;
+            let effects = app.handle_key(ctrl('o'));
+            assert!(effects.is_empty(), "{link:?}: {effects:?}");
+            assert_eq!(notice(&app), Some((said.to_string(), error)), "{link:?}");
+            assert_eq!(app.screen(), Screen::Patterns);
+        }
+    }
+
+    #[test]
+    fn a_start_error_is_said_once_at_start() {
+        let mut app = App::new(fixtures::profiles());
+        app.set_dashboard(port_in_use());
+        assert_eq!(
+            notice(&app),
+            Some((
+                "The dashboard is off: port 7379 is in use. --port picks another.".into(),
+                true
+            ))
+        );
+        app.handle_key(ch('j'));
+        assert_eq!(notice(&app), None);
+        app.handle_key(ch('k'));
+        assert_eq!(notice(&app), None, "said once");
+        // The other reasons, in fixed words.
+        use crate::web::StartError;
+        let bind = StartError::Bind {
+            port: 80,
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        assert_eq!(
+            crate::tui::dashboard_failed(&bind),
+            "The dashboard is off: it could not listen on 127.0.0.1:80. --port picks another."
+        );
+        assert_eq!(
+            crate::tui::dashboard_failed(&StartError::Random),
+            "The dashboard is off: the OS gave no random bytes for its token."
+        );
+        // A notice already shown, such as the config file's error, stays.
+        let mut app = App::new(Vec::new());
+        app.set_error("config.toml is not valid");
+        app.set_dashboard(port_in_use());
+        assert_eq!(
+            notice(&app),
+            Some(("config.toml is not valid".into(), true))
+        );
+        // Off by choice, nothing is said at start.
+        for link in [DashboardLink::Terminal, DashboardLink::Disabled, on()] {
+            let mut app = App::new(fixtures::profiles());
+            app.set_dashboard(link.clone());
+            assert_eq!(notice(&app), None, "{link:?}");
+        }
+    }
+
+    #[test]
+    fn ctrl_o_works_in_a_lists_filter_and_keeps_it_open() {
+        let mut app = testing::app_on(Screen::Patterns).0;
+        app.set_dashboard(on());
+        app.handle_key(ch('/'));
+        type_text(&mut app, "us");
+        assert!(opens(&app.handle_key(ctrl('o'))));
+        assert!(app.patterns.filtering);
+        assert_eq!(app.patterns.filter, "us");
+        let mut app = home(on());
+        app.handle_key(ch('/'));
+        type_text(&mut app, "pro");
+        assert!(opens(&app.handle_key(ctrl('o'))));
+        assert!(app.conn_filtering);
+        assert_eq!(app.conn_filter, "pro");
+    }
+
+    #[test]
+    fn ctrl_o_does_nothing_while_a_dialog_the_command_line_the_add_flow_find_or_help_is_open() {
+        let open = |app: &mut App| {
+            app.set_dashboard(on());
+            let effects = app.handle_key(ctrl('o'));
+            assert!(!opens(&effects), "{effects:?}");
+        };
+        // `?` help.
+        let mut app = testing::app_on(Screen::Patterns).0;
+        app.handle_key(ch('?'));
+        open(&mut app);
+        assert!(app.help);
+        assert_eq!(app.help_find.query, "", "not typed as text");
+        // The command line.
+        let mut app = testing::app_on(Screen::Patterns).0;
+        app.handle_key(ch(':'));
+        open(&mut app);
+        assert!(app.views.cmdline.open);
+        // The Find key prompt.
+        let mut app = testing::app_on(Screen::Patterns).0;
+        app.handle_key(ctrl('f'));
+        open(&mut app);
+        assert!(app.find.open);
+        // The database list.
+        let mut app = testing::app_on(Screen::Patterns).0;
+        app.handle_key(ch('b'));
+        open(&mut app);
+        assert!(app.dbs.is_some());
+        // "Analyze the keys?".
+        let mut app = testing::app_on(Screen::Patterns).0;
+        app.handle_key(ch('r'));
+        open(&mut app);
+        assert!(app.analyze.is_some());
+        // The add flow.
+        let mut app = home(on());
+        app.handle_key(ch('a'));
+        open(&mut app);
+        assert!(app.add.is_some());
+        // A bulk dialog, with writes on.
+        let mut app = testing::app_on(Screen::Patterns).0;
+        let s = app.session.as_mut().unwrap();
+        s.profile.env = Env::Local;
+        s.profile.read_only = None;
+        let at = app
+            .pattern_rows()
+            .iter()
+            .position(|r| matches!(r, crate::tui::tree::Row::Pattern { .. }))
+            .unwrap();
+        app.patterns.sel = at;
+        app.handle_key(ch('D'));
+        assert!(app.bulk.is_some());
+        open(&mut app);
+        assert!(app.bulk.is_some());
+        // The write gate's question.
+        let mut app = testing::app_on(Screen::KeyList).0;
+        let s = app.session.as_mut().unwrap();
+        s.profile.env = Env::Prod;
+        s.profile.read_only = Some(false);
+        app.handle_key(ch('N'));
+        type_text(&mut app, "9");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "v");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.confirm.is_some());
+        open(&mut app);
+        assert!(app.confirm.is_some());
+    }
+
+    #[test]
+    fn help_finds_it_and_runs_it() {
+        let mut app = testing::app_on(Screen::Overview).0;
+        app.set_dashboard(on());
+        app.handle_key(ch('?'));
+        type_text(&mut app, "web dashboard");
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert!(!app.help);
+        assert!(
+            matches!(effects[..], [Effect::OpenDashboard]),
+            "{effects:?}"
+        );
+        assert_eq!(app.screen(), Screen::Overview);
+    }
+
+    #[test]
+    fn the_connections_line_shows_only_while_the_dashboard_runs() {
+        let line = "Dashboard  http://127.0.0.1:7379  ·  ctrl-o opens it";
+        for (w, h) in [(80, 24), (120, 36)] {
+            let without = text(&testing::render(&home(DashboardLink::Terminal), w, h));
+            assert!(!without.contains("Dashboard"), "{without}");
+            for link in [DashboardLink::Disabled, port_in_use()] {
+                let mut app = home(link);
+                app.notice = None;
+                assert_eq!(text(&testing::render(&app, w, h)), without);
+            }
+            let with = text(&testing::render(&home(on()), w, h));
+            assert!(with.contains(line), "{with}");
+            assert!(!with.contains("/auth/"), "{with}");
+        }
+        // The list on screen is one row shorter, and PgUp/PgDn page by what is drawn.
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rows = |link| crate::tui::ui::list_rows(area, &home(link));
+        assert_eq!(rows(on()) + 1, rows(DashboardLink::Terminal));
+        // Too short a screen keeps every row for the list.
+        let small = text(&testing::render(&home(on()), 80, 12));
+        assert!(!small.contains("ctrl-o opens it"), "{small}");
+    }
+
+    #[test]
+    fn connections_with_the_dashboard_80x24() {
+        insta::assert_snapshot!(testing::render(&home(on()), 80, 24).backend());
+    }
+
+    #[test]
+    fn connections_with_the_dashboard_120x36() {
+        insta::assert_snapshot!(testing::render(&home(on()), 120, 36).backend());
     }
 }

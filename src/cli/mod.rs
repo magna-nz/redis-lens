@@ -52,8 +52,121 @@ pub struct Cli {
     #[arg(long, global = true, env = "REDIS_LENS_CONFIG")]
     pub config: Option<PathBuf>,
 
+    /// Serve only the web dashboard on 127.0.0.1, without the terminal UI, and open it
+    /// in the browser. Runs until ctrl-c.
+    #[arg(long)]
+    pub dashboard: bool,
+
+    /// Run only the terminal UI: no web dashboard beside it.
+    #[arg(long, conflicts_with = "dashboard")]
+    pub terminal: bool,
+
+    /// The web dashboard's port on 127.0.0.1 (default 7379, or `dashboard_port` in the
+    /// config file).
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..), conflicts_with = "terminal")]
+    pub port: Option<u16>,
+
+    /// With --dashboard, print the address without opening a browser.
+    #[arg(long, requires = "dashboard")]
+    pub no_open: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+impl Cli {
+    /// The flags that only apply to the terminal UI and the dashboard, as given.
+    fn ui_flags(&self) -> Vec<&'static str> {
+        [
+            (self.dashboard, "--dashboard"),
+            (self.terminal, "--terminal"),
+            (self.port.is_some(), "--port"),
+            (self.no_open, "--no-open"),
+        ]
+        .into_iter()
+        .filter_map(|(given, name)| given.then_some(name))
+        .collect()
+    }
+}
+
+/// `--dashboard`, `--terminal`, `--port` and `--no-open` are for the TUI and the
+/// dashboard: with any other subcommand they are a usage error.
+fn check_ui_flags(cli: &Cli) -> anyhow::Result<()> {
+    let sub = match &cli.command {
+        None | Some(Command::Tui) => return Ok(()),
+        Some(c) => subcommand_name(c),
+    };
+    let flags = cli.ui_flags();
+    if let Some(first) = flags.first() {
+        anyhow::bail!(
+            "{first} is for the terminal UI and the dashboard, not for `{sub}`: leave it out, or run redis-lens without a subcommand."
+        );
+    }
+    Ok(())
+}
+
+/// What `--dashboard` says when its port is taken. It names the port and `--port`.
+pub fn port_in_use(port: u16) -> String {
+    format!(
+        "Port {port} on 127.0.0.1 is in use, so the dashboard did not start. Pick another with --port."
+    )
+}
+
+/// `--dashboard`: serve only the dashboard until ctrl-c. The URL printed holds this
+/// run's token: it is the one place it is shown.
+async fn run_dashboard(
+    config: Option<PathBuf>,
+    port: Option<u16>,
+    open: bool,
+) -> anyhow::Result<()> {
+    use crate::web;
+    let path = match config {
+        Some(p) => p,
+        None => crate::config::Config::default_path()?,
+    };
+    // A file that can't be read leaves the port at its default; the dashboard says
+    // what is wrong with the file on its own page.
+    let settings = crate::config::Config::load(&path)
+        .map(|c| c.dashboard)
+        .unwrap_or_default();
+    let port = settings.port(port);
+    let dash = web::start(web::Options { port, config: path }).map_err(|e| match e {
+        web::StartError::PortInUse(p) => anyhow::anyhow!(port_in_use(p)),
+        web::StartError::Bind { port, .. } => anyhow::anyhow!(
+            "The dashboard could not listen on 127.0.0.1:{port}. Pick another port with --port."
+        ),
+        web::StartError::Random => {
+            anyhow::anyhow!(
+                "The dashboard could not start: the OS gave no random bytes for its token."
+            )
+        }
+    })?;
+    let url = dash.open_url();
+    println!("Dashboard: {url}");
+    println!("Press ctrl-c to stop.");
+    if open && web::open_in_browser(&url).is_err() {
+        println!("Could not open a browser: open the address above yourself.");
+    }
+    drop(url);
+    let stopped = tokio::signal::ctrl_c().await;
+    dash.shutdown();
+    // Open event streams end at once; don't hang on one that doesn't.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), dash.wait()).await;
+    stopped.map_err(|e| anyhow::anyhow!("could not wait for ctrl-c: {e}"))
+}
+
+fn subcommand_name(c: &Command) -> &'static str {
+    match c {
+        Command::Tui => "tui",
+        Command::Conn(_) => "conn",
+        Command::Scan(_) => "scan",
+        Command::Discover => "discover",
+        Command::Diff(_) => "diff",
+        Command::Snapshots(_) => "snapshots",
+        Command::Trend(_) => "trend",
+        Command::Compare(_) => "compare",
+        Command::Expire(_) => "expire",
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -436,9 +549,17 @@ pub struct DiffArgs {
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    check_ui_flags(&cli)?;
     let config = cli.config;
     match cli.command.unwrap_or(Command::Tui) {
-        Command::Tui => crate::tui::run(config).await,
+        Command::Tui if cli.dashboard => run_dashboard(config, cli.port, !cli.no_open).await,
+        Command::Tui => {
+            let beside = crate::tui::Beside {
+                terminal: cli.terminal,
+                port: cli.port,
+            };
+            crate::tui::run(config, beside).await
+        }
         Command::Conn(cmd) => conn::run(config, cmd).await,
         Command::Scan(args) => scan::run(config, args).await,
         Command::Discover => conn::discover(config).await,
@@ -533,6 +654,97 @@ mod tests {
             argv.extend(["--sentinel-password-stdin", second]);
             assert_eq!(kind(&argv), ArgumentConflict, "{second}");
         }
+    }
+
+    fn parse(argv: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(argv)
+    }
+
+    #[test]
+    fn dashboard_flags_parse() {
+        let c = parse(&["redis-lens"]).unwrap();
+        assert!(!c.dashboard && !c.terminal && !c.no_open);
+        assert_eq!(c.port, None, "the default port is resolved later: 7379");
+        assert!(c.command.is_none());
+
+        let c = parse(&["redis-lens", "--dashboard"]).unwrap();
+        assert!(c.dashboard && !c.no_open);
+        let c = parse(&["redis-lens", "--dashboard", "--no-open", "--port", "7400"]).unwrap();
+        assert!(c.dashboard && c.no_open);
+        assert_eq!(c.port, Some(7400));
+        let c = parse(&["redis-lens", "--terminal"]).unwrap();
+        assert!(c.terminal && !c.dashboard);
+        let c = parse(&["redis-lens", "--port", "65535"]).unwrap();
+        assert_eq!(c.port, Some(65535));
+        let c = parse(&["redis-lens", "--port", "1", "tui"]).unwrap();
+        assert_eq!(c.port, Some(1));
+        assert!(matches!(c.command, Some(Command::Tui)));
+        assert!(check_ui_flags(&c).is_ok());
+    }
+
+    #[test]
+    fn dashboard_flag_errors() {
+        use clap::error::ErrorKind::*;
+        let kind = |argv: &[&str]| parse(argv).unwrap_err().kind();
+        assert_eq!(
+            kind(&["redis-lens", "--dashboard", "--terminal"]),
+            ArgumentConflict
+        );
+        assert_eq!(
+            kind(&["redis-lens", "--terminal", "--port", "7400"]),
+            ArgumentConflict
+        );
+        assert_eq!(kind(&["redis-lens", "--no-open"]), MissingRequiredArgument);
+        for bad in ["0", "65536", "-1", "x"] {
+            let k = kind(&["redis-lens", "--port", bad]);
+            assert!(
+                matches!(k, ValueValidation | InvalidValue | UnknownArgument),
+                "{bad}: {k:?}"
+            );
+        }
+        // Not global: after a subcommand they are not flags of it.
+        assert_eq!(
+            kind(&["redis-lens", "conn", "list", "--dashboard"]),
+            UnknownArgument
+        );
+    }
+
+    #[test]
+    fn dashboard_flags_with_a_subcommand_are_a_usage_error() {
+        for (argv, flag, sub) in [
+            (
+                &["redis-lens", "--dashboard", "conn", "list"][..],
+                "--dashboard",
+                "conn",
+            ),
+            (
+                &["redis-lens", "--terminal", "discover"][..],
+                "--terminal",
+                "discover",
+            ),
+            (
+                &["redis-lens", "--port", "7400", "scan", "p"][..],
+                "--port",
+                "scan",
+            ),
+            (
+                &["redis-lens", "--dashboard", "--no-open", "trend", "p"][..],
+                "--dashboard",
+                "trend",
+            ),
+        ] {
+            let c = parse(argv).unwrap();
+            let e = check_ui_flags(&c).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "{flag} is for the terminal UI and the dashboard, not for `{sub}`: leave it out, or run redis-lens without a subcommand."
+                )
+            );
+            assert_eq!(exit_code(&e), 1);
+        }
+        assert!(check_ui_flags(&parse(&["redis-lens", "conn", "list"]).unwrap()).is_ok());
+        assert!(check_ui_flags(&parse(&["redis-lens", "--dashboard"]).unwrap()).is_ok());
     }
 
     #[test]
