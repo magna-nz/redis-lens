@@ -26,4 +26,4 @@ expression: t
 "│ WHERE THE MEMORY IS                                                          │"
 "│   session:{uuid}     ███████▎░░░░░░░░  46%     6.1G                          │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   enter Go there   r Analyze keys   v More            : Command  ? Help"
+" ↑↓ Move   enter Go there   r Analyze keys   v More      ctrl-f Find key  ? Help"

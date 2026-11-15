@@ -1197,6 +1197,87 @@ fn the_key_list_of_a_pattern_narrowed_to_a_node_reads_only_that_node() {
     assert!(text(&render(&app, 120, 36)).contains("1 of 1 nodes"));
 }
 
+/// The find pages among `effects`: id, where it goes, and its cursor.
+fn find_pages(effects: &[Effect]) -> Vec<(crate::live::ReqId, Dest, u64)> {
+    sent(effects)
+        .into_iter()
+        .filter_map(|(id, to, r)| match r {
+            LiveRequest::Keys(KeysRequest::Find { cursor, .. }) => Some((id, to, cursor)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn find_text(app: &mut App, text: &str) -> Vec<Effect> {
+    app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    press(app, text);
+    app.handle_key(key(KeyCode::Enter))
+}
+
+/// A find reads every connected node in slot order, each with its own `SCAN` and no
+/// redirect followed, whatever node Patterns is narrowed to.
+#[test]
+fn a_find_walks_every_primary_even_when_patterns_is_narrowed_to_a_node() {
+    let (mut app, _) = live_cluster();
+    show(&mut app, Screen::Nodes);
+    press(&mut app, "j");
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.patterns.node.is_some(), "narrowed to node 1");
+    let effects = find_text(&mut app, "cart");
+    assert_eq!(app.screen(), Screen::KeyList);
+    let p = find_pages(&effects);
+    assert_eq!(
+        p.iter()
+            .map(|(_, d, c)| (d.clone(), *c))
+            .collect::<Vec<_>>(),
+        [(never(0), 0)]
+    );
+    let effects = answer(
+        &mut app,
+        p[0].0,
+        page_reply(vec![key_row("user:1:cart")], 0),
+    );
+    let p = find_pages(&effects);
+    assert_eq!((p[0].1.clone(), p[0].2), (never(1), 0));
+    let effects = answer(&mut app, p[0].0, page_reply(vec![key_row("cart:2")], 0));
+    let p = find_pages(&effects);
+    assert_eq!((p[0].1.clone(), p[0].2), (never(2), 0));
+    let effects = answer(&mut app, p[0].0, page_reply(vec![key_row("a:cart")], 0));
+    assert!(find_pages(&effects).is_empty(), "{effects:?}");
+    let k = &app.views.keys;
+    assert!(k.done);
+    assert_eq!(k.nodes_done, 3);
+    for (key, node) in [("user:1:cart", 0), ("cart:2", 1), ("a:cart", 2)] {
+        assert_eq!(k.row_node.get(key), Some(&node), "{key}");
+    }
+    let wide = text(&render(&app, 120, 36));
+    assert!(wide.contains("3 of 3 nodes"), "{wide}");
+    assert!(wide.contains("3 keys match."), "{wide}");
+    // Back on the narrowed patterns.
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.screen(), Screen::Patterns);
+    assert!(app.patterns.node.is_some());
+}
+
+/// A node without a connection is left out of a find, and the right pane says so.
+#[test]
+fn a_find_leaves_out_a_node_without_a_connection() {
+    let mut app = live_cluster_without_node_3();
+    let effects = find_text(&mut app, "cart");
+    let p = find_pages(&effects);
+    assert_eq!(p[0].1, never(0));
+    let effects = answer(&mut app, p[0].0, page_reply(vec![key_row("cart:1")], 0));
+    let p = find_pages(&effects);
+    assert_eq!(p[0].1, never(1));
+    let effects = answer(&mut app, p[0].0, page_reply(Vec::new(), 0));
+    assert!(find_pages(&effects).is_empty(), "{effects:?}");
+    assert!(app.views.keys.done);
+    assert_eq!(app.views.keys.missing, [2]);
+    let wide = text(&render(&app, 120, 36));
+    assert!(wide.contains("2 of 3 nodes"), "{wide}");
+    assert!(wide.contains(NODE_3_NOT_CONNECTED), "{wide}");
+}
+
 #[test]
 fn the_key_detail_reads_the_slot_owner_and_names_it() {
     let (mut app, _) = live_cluster();

@@ -25,4 +25,4 @@ expression: t
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" esc Stop   p Pause   +- Interval                              : Command  ? Help"
+" esc Stop   p Pause   +- Interval             ctrl-f Find key  : Command  ? Help"

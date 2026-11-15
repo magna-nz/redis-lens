@@ -56,7 +56,7 @@ impl App {
         if self.screen() != Screen::KeyList {
             return Vec::new();
         }
-        let pattern = self.views.keys.pattern.clone().unwrap_or_default();
+        let pattern = self.views.keys.source();
         let mut out = self
             .with_views(Owner::Value, "open", |v, act| {
                 v.value.open(row, pattern, act)

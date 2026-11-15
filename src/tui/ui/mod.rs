@@ -3,7 +3,8 @@
 //! The chrome, from the mockups: a one-line header (the connection and its status), the
 //! tab row of the areas (`0 Connections │ 1 Overview 2 Browse 3 Analyze 4 Server
 //! 5 Pub/Sub`), a sub-tab row on the areas with panels, the body, and a one-line footer
-//! with the 3 to 5 keys of the screen and `: Command  ? Help` on the right. Dialogs
+//! with the 3 to 5 keys of the screen and `ctrl-f Find key  : Command  ? Help` on the
+//! right (the `ctrl-f` prompt takes its place while it is open). Dialogs
 //! (the write gate's question, a bulk action, the database list, "Analyze the keys?",
 //! `?`) draw over the screen dimmed.
 
@@ -787,8 +788,9 @@ fn input_line(label: &str, text: String, hint: &str, w: usize) -> Line<'static> 
     ])
 }
 
-/// The footer's key hints: the screen's 3 to 5 keys, then `: Command  ? Help` against
-/// the right edge. Keys that do not fit are left out from the end.
+/// The footer's key hints: the screen's 3 to 5 keys, then `ctrl-f Find key  : Command
+/// ? Help` against the right edge ([`keymap::footer_fit`]): the screen's keys that do
+/// not fit are left out from the end.
 fn key_line(app: &App, w: usize) -> Line<'static> {
     let screen = app.screen();
     let c = keymap::FooterCtx {
@@ -805,18 +807,7 @@ fn key_line(app: &App, w: usize) -> Line<'static> {
                 Some(crate::live::values::Items::NotRead | crate::live::values::Items::Module(_))
             ),
     };
-    let mut left = keymap::footer(screen, c);
-    let mut right = keymap::footer_right(c.ready);
-    let fits = |l: &[(&str, &str)], r: &[(&str, &str)]| {
-        let rw = keymap::footer_right_width(r);
-        keymap::footer_width(l) + if rw == 0 { 0 } else { 4 + rw } <= w
-    };
-    while !left.is_empty() && !fits(&left, &right) {
-        left.pop();
-    }
-    if !fits(&left, &right) {
-        right.clear();
-    }
+    let (left, right) = keymap::footer_fit(screen, c, w);
     let mut spans = vec![Span::raw(" ")];
     for (i, (k, l)) in left.iter().enumerate() {
         if i > 0 {
@@ -864,6 +855,9 @@ fn help_footer(app: &App) -> Line<'static> {
     }
 }
 
+/// Dim after the `ctrl-f` prompt's text.
+pub const FIND_HINT: &str = "  a name, or a pattern with * ? [ ]";
+
 /// What a dialog that asks a question puts in the footer.
 pub const QUESTION_OPEN: &str = " A question is open: answer it, or esc to cancel.";
 
@@ -894,6 +888,13 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
                 w,
             ),
         }
+    } else if app.find.open {
+        input_line(
+            "Find key:",
+            crate::value::escape(&app.find.text),
+            FIND_HINT,
+            w,
+        )
     } else if app.screen() == Screen::Patterns && app.patterns.filtering {
         input_line(
             "/",

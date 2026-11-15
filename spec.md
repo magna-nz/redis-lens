@@ -203,6 +203,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `v` | Show more columns and details, or fewer again |
 | `?` | Help here; type to find any action |
 | `:` | Open the command line |
+| `ctrl-f` | Find keys by name or pattern on the whole server |
 | `b` | Switch the database (once connected) |
 | `q` `ctrl-c` | Quit |
 
@@ -264,7 +265,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `Home` `End` `g` `G` | Jump to the first or last row |
 | `tab` `shift-tab` | Next or previous panel, nothing else |
 | `→` `l` `enter` | Show the selected key's value |
-| `←` `h` `esc` | Clear the filters first, then back to the patterns |
+| `←` `h` `esc` | Clear the filters first, then go back |
 | `/` | Filter the loaded keys by name |
 | `o` | Sort the loaded keys |
 | `t` | Show one type of the loaded keys |
@@ -485,7 +486,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `ctrl-p` | Pipeline mode: a repeat goes in pipelines |
 | `esc` | Close the command line, stop a repeat, or cancel a question |
 
-The footer shows 3 to 5 of these keys for the screen on show, chosen by its state (before and after an analysis, while one runs, with writes on), then `: Command  ? Help` against the right edge (only `? Help` before connecting); keys that do not fit are left out from the end. On the value of a key redis-lens does not read, or a module type's summary, the footer is `↑↓ Move` and `esc Back`, with `D Delete key` between them when writes are on: there is nothing to format or copy there, and `d` deletes no item. Every other key is in the `?` help ([Help](#help)). A notice or an input line replaces the footer while shown; while the command line is open, its input line does; while a dialog is open the footer says what it wants. A test checks that this table is exactly what `keymap::markdown()` renders.
+The footer shows 3 to 5 of these keys for the screen on show, chosen by its state (before and after an analysis, while one runs, with writes on), then `ctrl-f Find key  : Command  ? Help` against the right edge (only `? Help` before connecting). When they do not all fit, `: Command` is left out first (`?` still finds it), then the screen's keys from the end; `ctrl-f` and `?` stay. At 80 columns that leaves out at most one key of a screen; from 100 columns nothing is left out. On the value of a key redis-lens does not read, or a module type's summary, the footer is `↑↓ Move` and `esc Back`, with `D Delete key` between them when writes are on: there is nothing to format or copy there, and `d` deletes no item. Every other key is in the `?` help ([Help](#help)). A notice or an input line replaces the footer while shown; while the command line is open, its input line does; while a dialog is open the footer says what it wants. A test checks that this table is exactly what `keymap::markdown()` renders.
 
 ### Help
 
@@ -811,7 +812,7 @@ Phase 1 is built: [Navigation](#navigation), the [Shared command budget](#shared
 - **Panels:** `tab` and `shift-tab` switch to the next or previous panel of the area on screen, at the level it was left at, and do nothing else: they never move between panes. Browse has Keys · Streams · Search; Analyze has Big keys · Expiry · Changes · Hot keys, and Nodes · Slots only on a cluster (off a cluster they are not in the cycle, the sub-tab row or the `?` search); Server has Clients · Slow log · Monitor.
 - **Deeper and back:** `→` `l` `enter` go one level deeper or into the right pane: on Browse › Keys a group expands, a pattern lists its keys, a key shows its value, and on a value `→` moves into the value; on Streams and Search `→` moves into the right pane (`enter` lists a stream's entries or opens a result). `←` `h` go back: collapse a group or go up to it, from a key's value to the key list, from the key list to the patterns, from a right pane to the left one, and on a stream's entries or a Search result back to the list. `esc` clears a filter first, then goes back as `←` does (on Browse › Keys it leaves a node narrowing instead of collapsing). On a screen where `esc` has nothing else to do it stops a running analysis and keeps what it sampled ([Analysis](#analysis)).
 - **`v`** shows more columns and details on the area on screen, or fewer again: one setting per area, off by default, kept while the app runs, across connects too. What it adds is said with each screen.
-- **Footer and `?`:** the footer shows the 3 to 5 keys that matter on the screen and `: Command  ? Help` at the right ([Keys](#keys)); `?` lists the rest and finds any action ([Help](#help)). Command names are left out of titles; `v` and `?` show them.
+- **Footer and `?`:** the footer shows the 3 to 5 keys that matter on the screen and `ctrl-f Find key  : Command  ? Help` at the right ([Keys](#keys)); `?` lists the rest and finds any action ([Help](#help)). Command names are left out of titles; `v` and `?` show them.
 - **Clusters:** a cluster connect keeps a live connection to each shard's node and runs the view probes on every node ([Cluster live views](#cluster-live-views-p4)). Overview's live figures, 4 Server (Clients, Slow log, Monitor) and Browse › Search work on the picked node, and Overview adds a row per shard. The key names and a pattern's keys walk every shard (or the node Browse › Keys is narrowed to), a key's value and its edits go to the key's slot owner, Browse › Streams reads each stream on its owner, 5 Pub/Sub counts classic channels on the picked node and shard channels on every primary, and the bulk actions and the command line work per node. Browse › Keys after an analysis and every Analyze panel work on the merged results; Big keys and Expiry cover every node's samples, each big key carries its node, and Big keys reads lengths and encodings on each key's owner.
 - **Command line (P2):** `:` opens it from any screen except the add flow, a filter or query input and an open dialog (the `?` help), where it is text. It is off before the live connection is ready, and says why. On a cluster it routes each command by its keys ([Cluster live views](#cluster-live-views-p4), Command line). See [Command line panel](#command-line-panel).
 - **Screen layout:** from the top, the header (one line), the tab row (one line), the sub-tab row (one line, only on an area with panels), the body, and the footer (one line). 80×24 and 120×36 both work; nothing wraps, text is cut with `…`.
@@ -890,6 +891,17 @@ Phase 1 is built: [Navigation](#navigation), the [Shared command budget](#shared
 - `D`: delete the key, with `UNLINK`. The key list drops it and the value closes.
 
 A string edit, and a list element's edit or delete, is sent with `WATCH` and `MULTI`/`EXEC` after checking the value it was loaded with, so it fails and says so instead of overwriting a value that changed since then; the value is read again. After each write, what changed is read again: the value from its first page, with the selection kept, and the key's row in the key list. One write at a time per view, and one write at a time over the session's connection.
+
+#### Find key (`ctrl-f`)
+
+Finds keys by name on the whole server, from any screen once connected, before an analysis too. It only reads, so read-only profiles find keys as well.
+
+- **Opening it:** `ctrl-f` opens a one-line prompt in place of the footer: `Find key: <text>` and, dim, "a name, or a pattern with * ? [ ]". It starts with the text last searched. Before connecting it says to connect first. While the write gate's question, a bulk action's dialog, the database list, "Analyze the keys?", the command line, the add flow or the `?` help is open, `ctrl-f` does nothing: those take every key. The filter inputs of Connections, Patterns and a key list close, keeping their text; any other text input of a view (a form, the Search query, the Pub/Sub prompt) stays as it is under the prompt and is back after `esc`.
+- **The prompt:** typing edits the text (at most 512 bytes; control characters are left out, typed or pasted), `backspace` deletes, `ctrl-u` clears, `esc` closes it and searches nothing, `enter` searches. Spaces around the text are left out, and on empty text `enter` does nothing. Until the live connection is open `enter` searches nothing and says "Still connecting. Press ctrl-f, then enter, once connected." (the cluster's nodes may not be known yet); once it has closed it says "The live connection is closed, so keys can't be searched. Connect again on 0 Connections." `ctrl-f` brings the text back either way. The text is drawn with control characters and escape sequences as escapes.
+- **The glob:** text with `*`, `?` or `[` in it is a `SCAN MATCH` glob and is sent as typed (`\` escapes the next character, as in Redis). Any other text finds every name that contains it: `*`, the text with each `\` doubled, `*`. So `28648` finds `user:28648:feed`, and `user:*:cart` finds the carts. A typed glob may hold at most 8 `*` wildcards (a run of `*` counts once): one with more is slow to match on every key `SCAN` looks at, and on servers without the CVE-2022-36021 fix can take exponential time, so it is not sent and the notice says "A pattern may have at most 8 * wildcards, so matching it stays cheap for the server. This one has N."
+- **The results** show on 2 Browse › Keys as a key list titled `Find: <glob>`, in place of a pattern's keys: the same columns, sort, `/` filter, `t` type filter, `y` copy and `N`, the same `SCAN MATCH <glob> COUNT 1000` pages with at most 500 `SCAN` calls each, from the [command budget](#shared-command-budget-p1), and the same pipelined facts (type, TTL, size, encoding, length, LFU counter), never a value. Every key `SCAN` returns is listed, since there is no pattern to infer to. Only the first page loads on its own; `n` loads 1,000 more. The bottom line says `N loaded. n loads 1,000 more.` while the walk goes on, then `N keys match.`, `1 key matches.` or `No key matches <glob>.`; a first page that matched nothing yet says `No key matched yet. n scans further.` `→` or `enter` opens a key's value, and `←` there comes back to the results. `esc` or `←` on the results (with no filter to clear) goes back to the screen `ctrl-f` was pressed on, or to Patterns when that was a pattern's keys or a key's value, whose keys the find replaced. A new find replaces the results, also from the results themselves (it keeps where to go back to), and opening a pattern's keys replaces a find. A form open on a key's value (`e`, `+`, `t`, `R`) is dropped by a find, since the list it was opened from is replaced.
+- **On a cluster** the walk reads every connected node in slot order, whatever node Patterns is narrowed to, as a pattern's keys do ([Cluster live views](#cluster-live-views-p4)): each node's own `SCAN`, redirects never followed, a node without a connection left out and named.
+- **Degrading:** a refused `SCAN` says "The server refused SCAN for this user, so keys can't be searched."; other failures say what a pattern's keys say.
 
 #### 3 Analyze
 
@@ -1104,7 +1116,7 @@ Phase 4 closes the topology and connection gaps against Redis Insight: the live 
 - `S` on 5 Pub/Sub: subscribe to a shard channel.
 - `t` on the key list: filter by type.
 - `/` and `esc` on 0 Connections: filter by name or tag, and clear it.
-- Analyze › Slots: the move keys, `tab` `shift-tab`, `o` (order the hottest slots) and `r` (read again). Its footer: the move keys, `tab`, `o` and `r`, then `: Command  ? Help`.
+- Analyze › Slots: the move keys, `tab` `shift-tab`, `o` (order the hottest slots) and `r` (read again). Its footer: the move keys, `tab`, `o` and `r`, then `ctrl-f Find key  : Command  ? Help`.
 
 #### Cluster live views (P4)
 

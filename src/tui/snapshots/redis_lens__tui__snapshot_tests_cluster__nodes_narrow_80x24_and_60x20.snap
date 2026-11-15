@@ -27,7 +27,7 @@ expression: snap
 │                                                                              │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
- ↑↓ Move   enter This node only   tab Next panel               : Command  ? Help
+ ↑↓ Move   enter This node only   tab Next panel         ctrl-f Find key  ? Help
 
 60x20:
  prod-cache-01   PROD   read-only   15G / 24G    ● analyzed 
@@ -49,4 +49,4 @@ expression: snap
 │                                                          │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
- ↑↓ Move   enter This node only            : Command  ? Help
+ ↑↓ Move   enter This node only      ctrl-f Find key  ? Help

@@ -25,4 +25,4 @@ expression: t
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" r Analyze keys   ↑↓ Move   enter Go there   v More            : Command  ? Help"
+" r Analyze keys   ↑↓ Move   enter Go there   v More      ctrl-f Find key  ? Help"

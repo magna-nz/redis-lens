@@ -37,4 +37,4 @@ expression: t.backend()
 "│                                                                         │                                            │"
 "│ partial: 3,200 of 100,000 sampled so far                                │                                            │"
 "└─────────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────┘"
-" ↑↓ Move   → Open   / Filter   n More names   r Analyze                                                : Command  ? Help"
+" ↑↓ Move   → Open   / Filter   n More names   r Analyze                               ctrl-f Find key  : Command  ? Help"

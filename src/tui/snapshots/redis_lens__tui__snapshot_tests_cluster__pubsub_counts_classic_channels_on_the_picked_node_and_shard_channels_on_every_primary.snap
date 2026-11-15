@@ -26,4 +26,4 @@ expression: t.backend()
 "│                                             │                                │"
 "│                                             │                                │"
 "└─────────────────────────────────────────────┴────────────────────────────────┘"
-" ↑↓ Move   enter Subscribe   space Pause   / Filter            : Command  ? Help"
+" ↑↓ Move   enter Subscribe   space Pause   / Filter      ctrl-f Find key  ? Help"

@@ -11,6 +11,10 @@
 //!
 //! `N` (P3) adds a key from a form ([`Form::new_key`]) through the write gate; it never
 //! overwrites one. Once added, `App` lists it and opens its detail ([`KeysState::opened`]).
+//!
+//! The same list shows a find (`ctrl-f`, [`KeysState::open_find`]): the keys of the
+//! whole server whose names match a glob, every key `SCAN` returns kept, with the same
+//! pages, metadata and keys.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -174,8 +178,11 @@ impl TypeFilter {
 
 #[derive(Debug, Default)]
 pub struct KeysState {
-    /// The pattern whose keys are listed, as `PatternStats::pattern`.
+    /// The pattern whose keys are listed, as `PatternStats::pattern`. `None` for a find.
     pub pattern: Option<String>,
+    /// A find (`ctrl-f`): the `SCAN MATCH` glob whose keys are listed instead of a
+    /// pattern's ([`crate::live::keys::find_glob`]).
+    pub find: Option<String>,
     /// The keys loaded so far, in the order they came.
     pub rows: Vec<KeyRow>,
     seen: HashSet<String>,
@@ -276,6 +283,53 @@ impl KeysState {
         };
     }
 
+    /// `ctrl-f`: list the keys of the whole server that `glob` matches. `App` calls this,
+    /// then [`ViewState::on_show`]. It always starts afresh, replacing a pattern's keys
+    /// or an earlier find. On a cluster the walk reads every connected node in slot
+    /// order, whatever node Patterns is narrowed to.
+    pub fn open_find(
+        &mut self,
+        glob: String,
+        nodes: &[crate::live::nodes::NodeInfo],
+        act: &mut Act<'_>,
+    ) {
+        let (walk, missing): (Vec<usize>, Vec<usize>) =
+            (0..nodes.len()).partition(|&i| nodes[i].connected);
+        *self = Self {
+            find: Some(glob),
+            sel_since: act.tick,
+            walk,
+            missing,
+            ..Self::default()
+        };
+    }
+
+    /// What the list's title names, safe to draw: the pattern, or `Find: <glob>`.
+    pub fn heading(&self) -> String {
+        match (&self.find, &self.pattern) {
+            (Some(glob), _) => format!("Find: {}", crate::value::escape(glob)),
+            (None, p) => crate::value::escape(p.as_deref().unwrap_or("")),
+        }
+    }
+
+    /// The `SCAN MATCH` glob the list sends: the find's, or the pattern's.
+    pub fn glob(&self) -> Option<String> {
+        match (&self.find, &self.pattern) {
+            (Some(glob), _) => Some(glob.clone()),
+            (None, Some(p)) => Some(crate::analysis::match_glob(p)),
+            (None, None) => None,
+        }
+    }
+
+    /// What a key's value opened from this list is told it came from: the pattern, or
+    /// the find's glob.
+    pub fn source(&self) -> String {
+        self.find
+            .clone()
+            .or_else(|| self.pattern.clone())
+            .unwrap_or_default()
+    }
+
     /// True on a cluster: the walk goes node by node.
     pub fn by_node(&self) -> bool {
         !self.walk.is_empty() || !self.missing.is_empty()
@@ -343,9 +397,9 @@ impl KeysState {
 
     /// Sends the next page. False when nothing could be sent.
     fn load(&mut self, act: &mut Act<'_>) -> bool {
-        let Some(pattern) = self.pattern.clone() else {
+        if self.find.is_none() && self.pattern.is_none() {
             return false;
-        };
+        }
         if self.rows.is_empty() && self.carry.is_empty() && self.cursor == 0 {
             // The first page: what to read comes from the permission check and policy.
             let allowed = |label: &str| matches!(act.check(label), Some(PermStatus::Allowed));
@@ -355,12 +409,22 @@ impl KeysState {
             self.lfu = act.server().is_some_and(|s| s.lfu_enabled());
             self.freq = self.lfu && allowed(PERM_FREQ);
         }
-        let req = LiveRequest::Keys(Request::Page {
-            pattern,
-            cursor: self.cursor,
-            carry: self.carry.clone(),
-            sizes: self.sizes,
-            freq: self.freq,
+        let (cursor, carry, sizes, freq) = (self.cursor, self.carry.clone(), self.sizes, self.freq);
+        let req = LiveRequest::Keys(match (&self.find, &self.pattern) {
+            (Some(glob), _) => Request::Find {
+                glob: glob.clone(),
+                cursor,
+                carry,
+                sizes,
+                freq,
+            },
+            (None, pattern) => Request::Page {
+                pattern: pattern.clone().unwrap_or_default(),
+                cursor,
+                carry,
+                sizes,
+                freq,
+            },
         });
         let node = self.current_node();
         if self.by_node() && node.is_none() {
@@ -492,9 +556,11 @@ impl KeysState {
 
     /// `N`: the form for a new key, when the gate would let one through.
     fn start_new_key(&mut self, act: &mut Act<'_>) {
-        let Some(pattern) = self.pattern.clone() else {
+        if self.find.is_none() && self.pattern.is_none() {
             return;
-        };
+        }
+        // A find has no pattern: the name starts empty.
+        let pattern = self.pattern.clone().unwrap_or_default();
         let probe = WriteOp::NewKey {
             key: "k".into(),
             value: NewKey::String(crate::value::Raw::from("")),
@@ -647,6 +713,16 @@ pub fn load_error(e: &LiveError) -> String {
     }
 }
 
+/// Why a find's page failed, for the screen.
+pub fn find_error(e: &LiveError) -> String {
+    match e {
+        LiveError::Denied(cmd) if cmd == "SCAN" => {
+            "The server refused SCAN for this user, so keys can't be searched.".to_string()
+        }
+        e => load_error(e),
+    }
+}
+
 impl ViewState for KeysState {
     fn on_show(&mut self, act: &mut Act<'_>) {
         self.keep_going(act);
@@ -759,7 +835,11 @@ impl ViewState for KeysState {
             Ok(_) => {}
             Err(e) => {
                 self.loading_node = None;
-                self.error = Some(load_error(&e));
+                self.error = Some(if self.find.is_some() {
+                    find_error(&e)
+                } else {
+                    load_error(&e)
+                });
             }
         }
     }

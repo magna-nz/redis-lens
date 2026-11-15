@@ -59,6 +59,10 @@ mod dbs;
 #[path = "key_edits.rs"]
 mod key_edits;
 
+/// `ctrl-f`, Find key: the prompt, and its results on the key list.
+#[path = "find.rs"]
+pub mod find;
+
 use views::{Act, Ctx, LiveState, Owner, TailCmd, ViewState, Views};
 
 /// The five areas and the home screen, switched with `0` to `5` (spec "Navigation").
@@ -1156,6 +1160,9 @@ pub struct App {
     pub help: bool,
     /// What is typed into the `?` help, and the picked match.
     pub help_find: HelpFind,
+    /// `ctrl-f`: the Find key prompt, the last text searched, and where its results go
+    /// back to.
+    pub find: find::FindPrompt,
     /// The wall clock, Unix seconds, from [`App::set_wall_clock`]: only for the times
     /// the header shows. The app never reads a clock itself.
     wall: Option<i64>,
@@ -1358,6 +1365,7 @@ pub fn key_of(token: &str) -> Option<KeyEvent> {
         "ctrl-c" => KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
         "ctrl-l" => KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
         "ctrl-u" => KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        "ctrl-f" => KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
         t => {
             let mut cs = t.chars();
             match (cs.next(), cs.next()) {
@@ -1405,6 +1413,7 @@ impl App {
             notice: None,
             help: false,
             help_find: HelpFind::default(),
+            find: find::FindPrompt::default(),
             wall: None,
             tick: 0,
             list_rows: 0,
@@ -2209,6 +2218,14 @@ impl App {
         if self.add.is_some() {
             return self.add_key(key);
         }
+        // The Find key prompt takes every key while it is open (find.rs); `ctrl-f` opens
+        // it from anywhere else, a list's filter input included.
+        if self.find.open {
+            return self.find_key(key);
+        }
+        if find::is_find(&key) {
+            return self.open_find();
+        }
         let screen = self.screen();
         if screen == Screen::Patterns && self.patterns.filtering {
             self.filter_key(key);
@@ -2277,7 +2294,10 @@ impl App {
             Screen::Nodes => self.nodes_key(key),
             Screen::KeyList => {
                 let (handled, mut out) = self.key_to_view(key);
-                if !handled && is_back(&key) {
+                if !handled && is_back(&key) && self.views.keys.find.is_some() {
+                    // A find's results: back to where the find started.
+                    out.extend(self.leave_find());
+                } else if !handled && is_back(&key) {
                     out.extend(self.switch(Screen::Patterns));
                 } else if !handled && is_open(&key) {
                     out.extend(self.open_detail());
@@ -2924,6 +2944,10 @@ impl App {
         if self.views.cmdline.open {
             return self.cmdline_paste(&text);
         }
+        if self.find.open {
+            self.find.paste(&text);
+            return Vec::new();
+        }
         let text = clean_paste(&text);
         if let Some(add) = &mut self.add {
             if add.saving {
@@ -3308,7 +3332,7 @@ impl App {
             self.set_info("No key selected to open.");
             return Vec::new();
         };
-        let pattern = self.views.keys.pattern.clone().unwrap_or_default();
+        let pattern = self.views.keys.source();
         let mut out = self
             .with_views(Owner::Value, "open", |v, act| {
                 v.value.open(row, pattern, act)
@@ -7597,7 +7621,7 @@ mod tests {
                     .as_ref()
                     .map(|s| (s.scan, s.phase.clone(), s.picked)),
                 &app.views,
-                &app.confirm,
+                (&app.confirm, &app.find),
             )
         )
     }
@@ -7617,6 +7641,7 @@ mod tests {
             "tab" => vec![key(KeyCode::Tab)],
             "shift-tab" => vec![key(KeyCode::BackTab)],
             "ctrl-c" => vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
+            "ctrl-f" => vec![KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)],
             "space" => vec![ch(' ')],
             t if t.chars().count() == 1 => vec![ch(t.chars().next().unwrap())],
             t => panic!("no key events for token {t:?}"),
@@ -7638,6 +7663,7 @@ mod tests {
             KeyCode::Tab => "tab".into(),
             KeyCode::BackTab => "shift-tab".into(),
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-c".into(),
+            KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-f".into(),
             KeyCode::Char(' ') => "space".into(),
             KeyCode::Char(c) => c.to_string(),
             other => format!("{other:?}"),
@@ -7750,6 +7776,7 @@ mod tests {
             .map(key),
         );
         candidates.push(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        candidates.push(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         for screen in Screen::ALL {
             let table = tokens(screen);
             for k in &candidates {

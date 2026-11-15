@@ -26,4 +26,4 @@ expression: t.backend()
 "│                           │                                                  │"
 "│                           │                                                  │"
 "└───────────────────────────┴──────────────────────────────────────────────────┘"
-" ↑↓ Move   esc Back                                            : Command  ? Help"
+" ↑↓ Move   esc Back                           ctrl-f Find key  : Command  ? Help"

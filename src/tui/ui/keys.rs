@@ -7,6 +7,9 @@
 //! TYPE, STORED AS, LENGTH and, with an LFU policy, LFU join in; on a cluster NODE as
 //! well. Long names are cut with `…` (the selected one scrolls). Every name from the
 //! server is escaped.
+//!
+//! A find (`ctrl-f`) is drawn the same way, titled `Find: <glob>`, with its own words
+//! for what was or wasn't found.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -142,8 +145,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let visible = state.visible();
     let sel = state.sel.min(visible.len().saturating_sub(1));
     let row = state.selected();
-    let left_title = format!("‹ {}", escape(&pattern));
-    let left_right = title_right(state, &ctx, &pattern, visible.len());
+    let left_title = format!("‹ {}", state.heading());
+    let left_right = title_right(state, &ctx, visible.len());
     let (right_title, right_right) = match row {
         Some(r) => (escape(&r.key), r.key_type.as_str().to_string()),
         None => ("Keys".to_string(), String::new()),
@@ -195,7 +198,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         height: u16::from(left.height >= 2),
         ..left
     };
-    let est = estimate(app, &pattern);
+    // A find has no pattern, so no estimate.
+    let est = state
+        .find
+        .is_none()
+        .then(|| estimate(app, &pattern))
+        .flatten();
     rows(
         frame,
         bottom,
@@ -211,7 +219,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn title_right(state: &KeysState, ctx: &Ctx<'_>, pattern: &str, shown: usize) -> String {
+fn title_right(state: &KeysState, ctx: &Ctx<'_>, shown: usize) -> String {
     let sort = state.sort.effective(state.sizes, state.freq);
     let mut right = format!("by {}", sort.label());
     let typed = state.type_filter != TypeFilter::All;
@@ -236,7 +244,8 @@ fn title_right(state: &KeysState, ctx: &Ctx<'_>, pattern: &str, shown: usize) ->
     }
     // The command only with `v` (brief: command names leave titles).
     if ctx.more {
-        right = format!("SCAN MATCH {} · {right}", match_glob(pattern));
+        let glob = state.glob().unwrap_or_default();
+        right = format!("SCAN MATCH {} · {right}", escape(&glob));
     }
     right
 }
@@ -395,6 +404,20 @@ fn empty_lines(state: &KeysState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>>
             ),
             style::dim(),
         )
+    } else if state.find.is_some() && state.done {
+        // The bottom line names the glob.
+        (
+            " Nothing found. ctrl-f searches again.".to_string(),
+            style::dim(),
+        )
+    } else if let (Some(glob), true) = (&state.find, state.pages > 0 && !state.is_loading()) {
+        (
+            format!(
+                " No key matches {} in the part read so far. n scans further.",
+                escape(glob)
+            ),
+            style::dim(),
+        )
     } else if state.done {
         (
             " No key of this pattern was found.".to_string(),
@@ -430,6 +453,16 @@ fn status(state: &KeysState, est: Option<(u64, bool)>, tick: u64) -> String {
         Some((e, false)) => format!(" of ~{}", format::count(e)),
         None => String::new(),
     };
+    if let (Some(glob), true) = (&state.find, state.done) {
+        return match state.rows.len() {
+            0 => format!(" No key matches {}.", escape(glob)),
+            1 => " 1 key matches.".to_string(),
+            _ => format!(" {n} keys match."),
+        };
+    }
+    if state.find.is_some() && !state.is_loading() && state.rows.is_empty() && state.pages > 0 {
+        return " No key matched yet. n scans further.".to_string();
+    }
     if state.done {
         format!(" All {n} keys loaded.")
     } else if state.is_loading() {

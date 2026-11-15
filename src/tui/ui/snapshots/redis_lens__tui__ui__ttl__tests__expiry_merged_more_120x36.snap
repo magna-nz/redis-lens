@@ -38,4 +38,4 @@ expression: more
 "│                                                                     │                                                │"
 "│                                                                     │                                                │"
 "└─────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────┘"
-" ↑↓ Move   tab Next panel   y Copy   r Analyze   s Snapshot                                            : Command  ? Help"
+" ↑↓ Move   tab Next panel   y Copy   r Analyze   s Snapshot                           ctrl-f Find key  : Command  ? Help"

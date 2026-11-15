@@ -26,4 +26,4 @@ expression: t.backend()
 "│                           │                                                  │"
 "│                           │                                                  │"
 "└───────────────────────────┴──────────────────────────────────────────────────┘"
-" ↑↓ Move   → Value   f Format   y Copy   esc Back              : Command  ? Help"
+" ↑↓ Move   → Value   f Format   y Copy   esc Back        ctrl-f Find key  ? Help"

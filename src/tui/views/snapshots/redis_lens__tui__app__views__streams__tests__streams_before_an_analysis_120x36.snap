@@ -38,4 +38,4 @@ expression: "testing::render(&{ app.handle_key(key(KeyCode::Esc)); app }, 120,\n
 "│                                                                       │                                              │"
 "│                                                                       │                                              │"
 "└───────────────────────────────────────────────────────────────────────┴──────────────────────────────────────────────┘"
-" r Analyze   tab Next panel                                                                            : Command  ? Help"
+" r Analyze   tab Next panel                                                           ctrl-f Find key  : Command  ? Help"

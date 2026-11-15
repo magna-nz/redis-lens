@@ -41,7 +41,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     };
     let state = &app.views.value;
     let keys = &app.views.keys;
-    let left_title = format!("‹ {}", value::escape(keys.pattern.as_deref().unwrap_or("")));
+    let left_title = format!("‹ {}", keys.heading());
     let (title, right) = match &state.row {
         Some(r) => (value::escape(&r.key), title_right(state, &ctx)),
         None => ("Key".to_string(), String::new()),
