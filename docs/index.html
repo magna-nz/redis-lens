@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>redis-lens: a terminal UI for Redis and Valkey</title>
-<meta name="description" content="redis-lens profiles and browses Redis and Valkey from the terminal: what uses the memory, which keys never expire, the server live, values, streams, Pub/Sub and Search, safe to point at production.">
+<meta name="description" content="redis-lens lists your Redis and Valkey keys and shows their values, finds the keys that use the most memory, and shows the server live. Production connections are read-only unless you turn writes on.">
 <meta name="theme-color" content="#111215">
 <link rel="icon" href="mark.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -118,10 +118,10 @@
 <img class="hero-mark" src="mark.svg" alt="redis-lens mark">
 <div class="eyebrow">Overview</div>
 <h1>redis-lens</h1>
-<p class="lede">A terminal UI that shows what is using the memory in Redis and Valkey, and whether any of it is a mistake. Then it lets you browse the keys, watch the server and run commands, like Redis Insight, without leaving the terminal.</p>
+<p class="lede">redis-lens lists your keys and shows their values, finds the keys and key patterns that use the most memory, and shows live server stats, connected clients, the slow log and Pub/Sub messages. You can also run commands and edit keys from it.</p>
 <div class="badges"><span>Redis 6.2 and later</span><span>Valkey 8</span><span>standalone, cluster, Sentinel</span><span>macOS · Linux · Windows</span><span>MIT or Apache-2.0</span></div>
-<p>You have a Redis or Valkey that is using more memory than you expected. <code>INFO memory</code> tells you how much. It does not tell you which keys. redis-lens samples the keyspace, groups keys into patterns such as <code>user:{id}:cart</code>, and shows what each pattern costs: keys, memory, average size and how many have no TTL. Carts that never expire, a cache that only grows, an import job that never cleans up, one huge queue: those show up as rows you can read, each with a sentence saying why it is marked.</p>
-<p>Around that sits a browser for keys and values, a live view of the server (figures, clients, slow log, <code>MONITOR</code>), streams and consumer groups, Pub/Sub, Search indexes, and a <code>:</code> command line. Snapshots, diffs, trends and a <code>--check</code> gate take the same analysis into cron and CI.</p>
+<p>To see what uses the memory, press <kbd>r</kbd>. redis-lens samples the keys with <code>SCAN</code>, groups them into patterns such as <code>user:{id}:cart</code>, and lists each pattern's key count, memory, average size and how many keys have no TTL. A pattern that looks wrong, such as keys that never expire or one very large list, is marked <code>▲</code> with the reason.</p>
+<p>To find a key, press <kbd>ctrl-f</kbd> on any screen and type part of its name or a pattern. Other screens show the server (stats, clients, the slow log, <code>MONITOR</code>), streams and consumer groups, Pub/Sub, Search indexes, and a <code>:</code> command line. Snapshots, diffs, trends and <code>--check</code> rules run the same analysis from cron or CI.</p>
 <h3>Why it is safe on production</h3>
 <ul>
 <li><strong>It reads nothing on connect.</strong> Connecting reads the server's own figures (<code>INFO</code>, <code>DBSIZE</code>, <code>MEMORY STATS</code>) and no key. Keys are sampled only when you press <kbd>r</kbd>.</li>
