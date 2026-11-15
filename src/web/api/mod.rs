@@ -28,11 +28,16 @@ use super::confirm::Pending;
 use super::session::{Event, Hub};
 use crate::live::LiveError;
 
+pub mod analyze;
+pub mod browse;
 pub mod cmdline;
 pub mod connections;
+pub mod keys;
 pub mod overview;
 pub mod pubsub;
 pub mod server;
+pub mod snapshots;
+pub mod values;
 pub mod writes;
 
 /// What every route can reach.
@@ -222,7 +227,8 @@ pub async fn state(State(app): State<App>) -> Response {
 }
 
 /// `GET /api/events`: the one event stream. Starts with the current `state`; then
-/// `state`, `figures`, `tail`, `monitor` and `notice` as they happen. While at least
+/// `state`, `figures`, `overview`, `progress`, `tail`, `monitor` and `notice` as they
+/// happen. While at least
 /// one stream is open the live figures are polled (`overview::poll`).
 pub async fn events(
     State(app): State<App>,

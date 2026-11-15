@@ -56,7 +56,7 @@ pub mod tree;
 pub mod ui;
 
 #[cfg(test)]
-mod fixtures;
+pub(crate) mod fixtures;
 #[cfg(test)]
 mod snapshot_tests;
 /// Snapshots of cluster scans: Nodes, Patterns narrowed to a node, the Hot keys node
@@ -966,7 +966,7 @@ impl Runner {
 
 /// The newest snapshot of `name` (a report name, see [`report_name`]) in `dir`, for
 /// Overview's "Last analysis" line. Reads files only.
-fn last_snapshot(dir: &Path, name: &str) -> Option<app::views::overview::LastSnapshot> {
+pub(crate) fn last_snapshot(dir: &Path, name: &str) -> Option<app::views::overview::LastSnapshot> {
     let r = snapshot::latest_before(dir, name, i64::MAX, None).ok()??;
     Some(app::views::overview::LastSnapshot {
         taken_at_unix: r.taken_at_unix,
@@ -988,7 +988,10 @@ fn load_history(report: &ScanReport) -> Result<Option<diff::ReportDiff>, snapsho
 
 /// The trend over the [`app::TREND_SNAPSHOTS`] newest snapshots in `dir` taken before
 /// `report` with its `MATCH` glob, with `report` itself as the last point.
-fn load_trend(dir: &Path, report: &ScanReport) -> Result<snapshot::Trend, snapshot::SnapshotError> {
+pub(crate) fn load_trend(
+    dir: &Path,
+    report: &ScanReport,
+) -> Result<snapshot::Trend, snapshot::SnapshotError> {
     let mut reports = snapshot::recent_matching(
         dir,
         &report.profile,

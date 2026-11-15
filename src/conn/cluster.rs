@@ -212,10 +212,11 @@ impl ClusterTargets {
 }
 
 /// A connection that takes one command from `budget` for each command it sends (the
-/// length of a pipeline): the per-node probes go through their node's budget.
-struct Budgeted<'a, C> {
-    conn: &'a mut C,
-    budget: &'a crate::budget::Budget,
+/// length of a pipeline): the per-node probes go through their node's budget, and so do
+/// the dashboard's connection test probes (`web::api::connections::test`).
+pub(crate) struct Budgeted<'a, C> {
+    pub(crate) conn: &'a mut C,
+    pub(crate) budget: &'a crate::budget::Budget,
 }
 
 impl<C: ConnectionLike + Send> ConnectionLike for Budgeted<'_, C> {

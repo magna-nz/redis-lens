@@ -1232,3 +1232,249 @@ async fn the_server_times_out_slow_headers_and_caps_its_connections() {
     let head = String::from_utf8_lossy(&buf);
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
 }
+
+// -- phase 2: Browse, Analyze, snapshots, databases --------------------------------
+
+/// A session with `report` as its finished analysis and the live connection closed, so
+/// no route sends anything (there is no server behind it).
+fn analysed(
+    t: &T,
+    report: Option<crate::model::ScanReport>,
+    perms: Option<crate::model::PermissionReport>,
+) {
+    t.hub.install_for_test(profile("cache", Env::Local), false);
+    t.hub.with_mut(|c| {
+        c.session.phase = crate::tui::app::Phase::Done;
+        c.session.live = crate::tui::app::views::LiveState::Closed(None);
+        c.session.server = report.as_ref().map(|r| r.server.clone());
+        c.session.report = report;
+        c.perms = perms;
+    });
+}
+
+async fn get_json(t: &T, path: &str) -> (StatusCode, serde_json::Value) {
+    let res = call(t, signed_get(path)).await;
+    let status = res.status();
+    (status, json(&text(res).await))
+}
+
+#[tokio::test]
+async fn phase_two_routes_need_the_token() {
+    let t = setup("p2guard", Vec::new());
+    for path in [
+        "/api/browse",
+        "/api/dbs",
+        "/api/keys?pattern=61",
+        "/api/find?q=a",
+        "/api/value?key=61",
+        "/api/analysis",
+        "/api/analysis/big_keys",
+        "/api/snapshots",
+    ] {
+        let res = call(&t, get(path).body(Body::empty()).unwrap()).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn without_a_report_the_panels_say_so_and_nothing_is_saved() {
+    let t = setup("p2noreport", Vec::new());
+    analysed(&t, None, None);
+    for panel in ["big_keys", "expiry", "changes", "hot_keys", "nodes"] {
+        let (status, v) = get_json(&t, &format!("/api/analysis/{panel}")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{panel}");
+        assert_eq!(v["error"], super::api::analyze::NO_REPORT, "{panel}");
+    }
+    let res = call(&t, write("POST", "/api/snapshots", "")).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(&text(res).await)["error"],
+        super::api::snapshots::NOTHING_TO_SAVE
+    );
+    let (_, s) = get_json(&t, "/api/state").await;
+    assert_eq!(s["analysis"]["status"], "none", "{s}");
+    assert_eq!(s["analysis"]["report"], serde_json::Value::Null, "{s}");
+}
+
+#[tokio::test]
+async fn hot_keys_degrade_in_the_tuis_words() {
+    let t = setup("p2hot", Vec::new());
+    analysed(&t, Some(crate::tui::fixtures::report_lru()), None);
+    let (status, v) = get_json(&t, "/api/analysis/hot_keys").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        v["off"],
+        "The eviction policy is allkeys-lru, so Redis keeps no LFU counters. Set \
+         maxmemory-policy to allkeys-lfu or volatile-lfu to see hot keys.",
+        "{v}"
+    );
+    analysed(
+        &t,
+        Some(crate::tui::fixtures::report(true)),
+        Some(crate::tui::fixtures::perms_freq_denied()),
+    );
+    let (_, v) = get_json(&t, "/api/analysis/hot_keys").await;
+    assert_eq!(v["off"], "OBJECT FREQ was denied for this user.", "{v}");
+    let mut hot = crate::tui::fixtures::report(true);
+    hot.hot_keys = crate::tui::fixtures::hot_keys();
+    analysed(&t, Some(hot), Some(crate::tui::fixtures::perms_ok()));
+    let (_, v) = get_json(&t, "/api/analysis/hot_keys").await;
+    assert_eq!(v["rows"][1]["key"]["name"], "queue:emails", "{v}");
+    assert_eq!(v["rows"][1]["hot_and_big"], true, "{v}");
+}
+
+#[tokio::test]
+async fn a_standalone_server_has_no_nodes_or_slots_and_a_cluster_no_databases() {
+    let t = setup("p2cluster", Vec::new());
+    analysed(&t, Some(crate::tui::fixtures::report(true)), None);
+    let (_, v) = get_json(&t, "/api/analysis/nodes").await;
+    assert_eq!(v["off"], super::api::analyze::NODES_NOT_CLUSTER);
+    let (_, v) = get_json(&t, "/api/analysis/slots").await;
+    assert_eq!(v["off"], crate::tui::app::views::slots::NOT_CLUSTER, "{v}");
+    t.hub.with_mut(|c| {
+        c.session.nodes = vec![crate::live::nodes::NodeInfo {
+            id: "n1".into(),
+            endpoint: Endpoint {
+                host: "10.0.0.1".into(),
+                port: 7000,
+                tls: false,
+            },
+            role: crate::model::NodeRole::Primary,
+            slots: vec![(0, 16383)],
+            connected: true,
+        }];
+    });
+    let (status, v) = get_json(&t, "/api/dbs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["off"], "A cluster only has database 0.", "{v}");
+    let res = call(&t, write("POST", "/api/db", r#"{"db":1}"#)).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn the_panels_come_from_the_report_with_names_escaped() {
+    let t = setup("p2panels", Vec::new());
+    let mut r = crate::tui::fixtures::report(true);
+    r.patterns[0].examples[0].key = "evil\x1b[2Jkey".into();
+    analysed(&t, Some(r), Some(crate::tui::fixtures::perms_ok()));
+    let (status, v) = get_json(&t, "/api/browse").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["source"], "analysis");
+    let body = v.to_string();
+    assert!(!body.contains('\u{1b}'), "an escape reached the page");
+    assert!(body.contains("evil\\\\x1b[2Jkey"), "{body}");
+    let (_, e) = get_json(&t, "/api/analysis/expiry").await;
+    assert!(e["rows"].as_array().is_some_and(|r| !r.is_empty()), "{e}");
+    let (_, b) = get_json(&t, "/api/analysis/big_keys").await;
+    assert_eq!(b["facts_read"], false, "{b}");
+    assert_eq!(
+        b["notes"][0], "Lengths and encodings are read once the live connection is open.",
+        "{b}"
+    );
+    let (_, c) = get_json(&t, "/api/analysis/changes").await;
+    assert_eq!(c["status"], "pending", "{c}");
+    let (_, s) = get_json(&t, "/api/state").await;
+    assert_eq!(s["analysis"]["status"], "done", "{s}");
+    assert!(
+        s["analysis"]["report"]["age_secs"].as_i64().unwrap() > 0,
+        "{s}"
+    );
+    let (_, o) = get_json(&t, "/api/overview").await;
+    assert!(o["analysis"]["findings"].is_array(), "{o}");
+    let (status, a) = get_json(&t, "/api/analysis").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(a["estimates"][0]["depth"], "quick", "{a}");
+    assert_eq!(a["estimates"][1]["sample_limit"], 100_000, "{a}");
+}
+
+#[tokio::test]
+async fn bad_ids_globs_and_names_are_refused_in_fixed_words() {
+    let t = setup("p2refused", Vec::new());
+    analysed(&t, None, None);
+    let (status, v) = get_json(&t, "/api/keys?pattern=zz").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"], crate::web::keyname::BAD_ID);
+    let (status, v) = get_json(&t, "/api/value?key=fffe").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    let (status, v) = get_json(&t, "/api/find?q=*a*b*c*d*e*f*g*h*i*").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(v["error"].as_str().unwrap().contains("at most 8"), "{v}");
+    let (status, v) = get_json(&t, "/api/find?q=%01%02").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"], super::api::keys::EMPTY_FIND);
+    // The live connection is closed: a find says so.
+    let (status, v) = get_json(&t, "/api/find?q=user").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(v["error"], super::api::keys::FIND_CLOSED);
+    let (status, _) = get_json(&t, "/api/snapshots/compare?a=../config.toml&b=current").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, v) = get_json(&t, "/api/browse?sort=size").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"], super::api::browse::BAD_SORT);
+    let res = call(&t, write("POST", "/api/analysis", r#"{"depth":"full"}"#)).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let res = call(&t, write("DELETE", "/api/analysis", "")).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(&text(res).await)["error"],
+        crate::web::session::NO_ANALYSIS
+    );
+}
+
+#[tokio::test]
+async fn a_saved_snapshot_is_the_tuis_file_and_compares_with_the_current_report() {
+    let dir = temp_config("p2snapdir").parent().unwrap().join("snapshots");
+    let config = temp_config("p2snap");
+    let store = Arc::new(MemoryStore::default());
+    let hub = session::Hub::with_snapshots(config, store, Some(dir.clone()));
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let router = router(app_state(
+        Arc::clone(&hub),
+        PORT,
+        Token::for_test(&token()),
+        rx,
+    ));
+    let t = T {
+        router,
+        hub,
+        store: Arc::new(MemoryStore::default()),
+        config: dir.join("unused.toml"),
+        _shutdown: _tx,
+    };
+    // An older analysis on disk, then the current one.
+    let mut old = crate::tui::fixtures::previous_report(true);
+    old.profile = "cache".into();
+    crate::snapshot::save(&dir, &old).unwrap();
+    let mut r = crate::tui::fixtures::report(true);
+    r.profile = "cache".into();
+    analysed(&t, Some(r.clone()), None);
+    let res = call(&t, write("POST", "/api/snapshots", "")).await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let saved = json(&text(res).await);
+    let file = saved["file"].as_str().unwrap().to_string();
+    assert_eq!(
+        file,
+        format!("{}.json", crate::snapshot::timestamp_name(r.taken_at_unix))
+    );
+    // The TUI's own reader reads it back as the same report.
+    let on_disk = crate::snapshot::list(&dir, "cache").unwrap();
+    assert_eq!(on_disk.len(), 2);
+    assert_eq!(crate::snapshot::load(&on_disk[0].path).unwrap(), r);
+    let (_, l) = get_json(&t, "/api/snapshots").await;
+    assert_eq!(l["snapshots"].as_array().unwrap().len(), 2, "{l}");
+    assert_eq!(l["saved"], true, "{l}");
+    let older = l["snapshots"][1]["file"].as_str().unwrap().to_string();
+    let (status, d) = get_json(&t, &format!("/api/snapshots/compare?a={older}&b={file}")).await;
+    assert_eq!(status, StatusCode::OK, "{d}");
+    assert_eq!(d["before_taken_at_unix"], old.taken_at_unix, "{d}");
+    assert!(d["rows"].as_array().is_some_and(|r| !r.is_empty()), "{d}");
+    let (status, _) = get_json(&t, &format!("/api/snapshots/compare?a=current&b={older}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, v) = get_json(
+        &t,
+        "/api/snapshots/compare?a=20200101T000000Z.json&b=current",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
