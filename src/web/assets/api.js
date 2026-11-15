@@ -121,7 +121,8 @@
 //                 loading, pages, loaded, length, done, more, capped, gone, error, notice,
 //                 refused, fieldTtls, fieldTtlsOff, items: [{ index, name, value, ttl, at,
 //                 fields: [{ name, value }]|null }], value: Shown|null, cut, message,
-//                 module: Module|null, cluster, maxItems }
+//                 module: Module|null, cluster, maxItems, rev (which read of the value
+//                 this is: an edit names it), writing (a write of it has not answered) }
 // Shown         { format, detected, picked, formats, bytes, compression, truncated, note,
 //                 header, lines: [string], copy: string|null, copyRefused }
 // Item          { index, field, name, shown: Shown }
@@ -153,6 +154,17 @@
 // Snapshots     { profile, snapshots: [{ file, takenAt, utc, current }], canSave, saveOff,
 //                 saved }
 // Saved         { file, takenAt, utc, sampledKeys, text }
+//
+// Edits and bulk actions (phase 3):
+// Bytes         a string (text as typed) or { hex } (bytes): what a value field sends
+// WriteResult   { sent, done, message, reply: { kind, value }|null, key: Name|null, closed,
+//                 value: Value|null (read again), row: KeyRow|null (read again) }
+// Bulk          { id, pattern: Name, glob, action: 'delete'|'expire', ttl, ttlSecs, title,
+//                 profile, prod, stage: 'counting'|'counted'|'running'|'done', count: {
+//                 matched, withTtl, otherPattern, unreadable, toChange }, summary: [string],
+//                 nodes: [{ node, endpoint, matched }], at, run: { seen, sent, changed,
+//                 skipped, failed, unreadable, moved, file, stopping }|null, lines, error }
+// BulkReply     { bulk: Bulk|null, text: string|null }
 //
 // =======================================================================================
 // METHODS (all async; each can reject with ApiError, whose `message` is the server's own
@@ -201,6 +213,17 @@
 //   saveSnapshot()                    → Saved         POST   /api/snapshots (201)
 //   listSnapshots()                   → Snapshots     GET    /api/snapshots
 //   compareSnapshots(a, b)            → Diff          GET    /api/snapshots/compare
+//   editValue({ view, rev, index, value }) → WriteResult   POST /api/value/edit
+//   addItem({ view, field, value, score }) → WriteResult   POST /api/value/add
+//   setTtl({ view, ttl, field, rev }) → WriteResult   POST   /api/value/ttl
+//   renameKey({ view, name })         → WriteResult   POST   /api/value/rename
+//   removeItem({ view, rev, index })  → WriteResult   POST   /api/value/remove (asks)
+//   deleteKey({ view })               → WriteResult   POST   /api/value/delete (asks)
+//   addKey({ list, name, type, field, value, score }) → WriteResult   POST /api/keys/add
+//   getBulk()                         → BulkReply     GET    /api/bulk
+//   startBulk({ pattern, action, ttl }) → BulkReply   POST   /api/bulk (202: the dry run)
+//   runBulk(id)                       → BulkReply     POST   /api/bulk/run (asks, then 202)
+//   stopBulk()                        → BulkReply     DELETE /api/bulk
 //
 // A write the gate wants confirmed comes back as HTTP 409 `{ "confirm": … }`. The wrapper
 // here opens the confirm dialog (through the handler app.js registers), answers with
@@ -211,7 +234,7 @@
 // EVENTS: `api.on(name, fn)` returns a function that unsubscribes.
 //   state (State) · figures (Figures) · overview (Overview without `figures` and
 //   `shards`, which come with `figures`) · tail (TailEvent) · monitor (MonitorEvent) ·
-//   progress (Progress, an analysis) · notice (Notice) · link ({ up: bool }, the page's own line to redis-lens) ·
+//   progress (Progress, an analysis) · bulk (BulkReply, a bulk action) · notice (Notice) · link ({ up: bool }, the page's own line to redis-lens) ·
 //   locked ({}): the session is missing or wrong (HTTP 401) · live ({ live: bool }):
 //   raised by app.js when the state's `live` changes, for the views that draw figures.
 
@@ -1209,6 +1232,8 @@ export function adaptValue(j) {
     module: o.module ? adaptModule(o.module) : null,
     cluster: o.cluster === true,
     maxItems: num(o.max_items) ?? 10000,
+    rev: num(o.rev) ?? 0,
+    writing: o.writing === true,
   };
 }
 
@@ -1395,6 +1420,118 @@ export function adaptSaved(j) {
   return { file: str(o.file), takenAt: num(o.taken_at_unix), utc: str(o.taken_at_utc), sampledKeys: num(o.sampled_keys), text: str(o.text) };
 }
 
+// ---------------------------------------------------------------------------------------
+// Edits and bulk actions (phase 3). A value the page sends is text as typed, or bytes as
+// hex (`{ hex }`); nothing a request carries is kept anywhere by the page.
+// ---------------------------------------------------------------------------------------
+
+/** A value for a request body: text as typed, or `{ hex }` for bytes (lower case, no
+ *  spaces). Anything else is the empty text. */
+export function bytesBody(v) {
+  if (typeof v === 'string') return v;
+  if (v && typeof v === 'object' && typeof v.hex === 'string') return { hex: v.hex.replace(/\s+/g, '').toLowerCase() };
+  return '';
+}
+
+/** The body of POST /api/value/edit. */
+export function editRequest({ view, rev, index = 0, value }) {
+  return { view: Number(view), rev: Number(rev), index: Number(index) || 0, value: bytesBody(value) };
+}
+
+/** The body of POST /api/value/add: `field` for a hash or a stream, `score` for a sorted
+ *  set; only what is given is sent (the server takes no unknown or extra field). */
+export function addItemRequest({ view, field, value, score }) {
+  const body = { view: Number(view), value: bytesBody(value) };
+  if (field !== undefined && field !== null) body.field = bytesBody(field);
+  if (score !== undefined && score !== null) body.score = String(score);
+  return body;
+}
+
+/** The body of POST /api/value/ttl: the key's TTL, or a hash field's (its index, with the
+ *  `rev` that index is of). */
+export function ttlRequest({ view, ttl, field, rev }) {
+  const body = { view: Number(view), ttl: String(ttl ?? '').trim() };
+  if (typeof field === 'number') {
+    body.field = field;
+    body.rev = Number(rev);
+  }
+  return body;
+}
+
+/** The body of POST /api/keys/add. */
+export function addKeyRequest({ list, name, type, field, value, score }) {
+  const body = { name: String(name ?? ''), type: String(type ?? ''), value: bytesBody(value) };
+  if (typeof list === 'number') body.list = list;
+  if (field !== undefined && field !== null) body.field = bytesBody(field);
+  if (score !== undefined && score !== null) body.score = String(score);
+  return body;
+}
+
+/** The body of POST /api/bulk: the pattern's id, the action, an expire's TTL. */
+export function bulkRequest({ pattern, action, ttl }) {
+  const body = { pattern: String(pattern ?? ''), action: action === 'expire' ? 'expire' : 'delete' };
+  if (body.action === 'expire' && ttl !== undefined && ttl !== null && String(ttl).trim()) body.ttl = String(ttl).trim();
+  return body;
+}
+
+/** The reply of every edit (and of the answer to its question). */
+export function adaptWrite(j) {
+  const o = obj(j);
+  const reply = o.reply ? obj(o.reply) : null;
+  return {
+    sent: o.sent === true,
+    done: o.done === true,
+    message: str(o.message),
+    reply: reply ? { kind: str(reply.kind), value: reply.value ?? null } : null,
+    key: o.key ? adaptName(o.key) : null,
+    closed: o.closed === true,
+    value: o.value && typeof o.value === 'object' && o.value.view !== undefined ? adaptValue(o.value) : null,
+    row: o.row ? adaptKeyRow(o.row) : null,
+  };
+}
+
+const BULK_STAGES = ['counting', 'counted', 'running', 'done'];
+
+/** A bulk action (`bulk` of every bulk reply and event), or null. */
+export function adaptBulk(j) {
+  if (!j || typeof j !== 'object') return null;
+  const o = obj(j);
+  const c = obj(o.count);
+  const r = o.run ? obj(o.run) : null;
+  return {
+    id: num(o.id),
+    pattern: adaptName(o.pattern),
+    glob: text(o.glob),
+    action: o.action === 'expire' ? 'expire' : 'delete',
+    ttl: str(o.ttl),
+    ttlSecs: num(o.ttl_secs),
+    title: str(o.title) ?? (o.action === 'expire' ? 'Set a TTL on every key of the pattern' : 'Delete every key of the pattern'),
+    profile: str(o.profile),
+    prod: o.prod === true,
+    stage: oneOf(o.stage, BULK_STAGES, 'done'),
+    count: {
+      matched: num(c.matched) ?? 0, withTtl: num(c.with_ttl) ?? 0, otherPattern: num(c.other_pattern) ?? 0,
+      unreadable: num(c.unreadable) ?? 0, toChange: num(c.to_change) ?? 0,
+    },
+    summary: strings(o.summary),
+    nodes: arr(o.nodes).map((n) => ({ node: num(obj(n).node), endpoint: str(obj(n).endpoint) ?? '', matched: num(obj(n).matched) ?? 0 })),
+    at: num(o.at),
+    run: r ? {
+      seen: num(r.seen) ?? 0, sent: num(r.sent) ?? 0, changed: num(r.changed) ?? 0, skipped: num(r.skipped) ?? 0,
+      failed: num(r.failed) ?? 0, unreadable: num(r.unreadable) ?? 0, moved: num(r.moved) ?? 0, file: str(r.file), stopping: r.stopping === true,
+    } : null,
+    lines: strings(o.lines),
+    error: o.error === true,
+  };
+}
+
+/** `{ bulk }` of GET/POST /api/bulk, POST /api/bulk/run, the `bulk` event; with `text`
+ *  for DELETE /api/bulk. */
+export function adaptBulkReply(j) {
+  const o = obj(j);
+  return { bulk: adaptBulk(o.bulk), text: str(o.text) };
+}
+
 /** A failed reply → the sentence to show. Only the server's `error` field, which is
  *  redis-lens's own wording, is ever shown; any other body is replaced by a fixed line. */
 export function adaptError(status, j) {
@@ -1497,6 +1634,17 @@ export const ROUTES = {
   snapshots: () => ['GET', '/api/snapshots'],
   snapshotSave: () => ['POST', '/api/snapshots'],
   snapshotCompare: (a, b) => ['GET', `/api/snapshots/compare${query({ a, b })}`],
+  valueEdit: () => ['POST', '/api/value/edit'],
+  valueAdd: () => ['POST', '/api/value/add'],
+  valueTtl: () => ['POST', '/api/value/ttl'],
+  valueRename: () => ['POST', '/api/value/rename'],
+  valueRemove: () => ['POST', '/api/value/remove'],
+  valueDelete: () => ['POST', '/api/value/delete'],
+  keyAdd: () => ['POST', '/api/keys/add'],
+  bulk: () => ['GET', '/api/bulk'],
+  bulkStart: () => ['POST', '/api/bulk'],
+  bulkRun: () => ['POST', '/api/bulk/run'],
+  bulkStop: () => ['DELETE', '/api/bulk'],
   confirm: (id) => ['POST', `/api/confirm/${seg(id)}`],
   confirmCancel: (id) => ['DELETE', `/api/confirm/${seg(id)}`],
   events: () => ['GET', '/api/events'],
@@ -1509,6 +1657,7 @@ const EVENT_ADAPTERS = {
   tail: adaptTailEvent,
   monitor: adaptMonitorEvent,
   progress: adaptProgress,
+  bulk: adaptBulkReply,
   notice: adaptNotice,
 };
 
@@ -1906,6 +2055,18 @@ export function createReal({ fetchFn = (...a) => fetch(...a), tokens = null, tok
     listSnapshots: () => request(ROUTES.snapshots(), null, adaptSnapshots),
     compareSnapshots: (a, b) => request(ROUTES.snapshotCompare(a, b), null, adaptDiff),
 
+    editValue: (q) => request(ROUTES.valueEdit(), editRequest(q), adaptWrite),
+    addItem: (q) => request(ROUTES.valueAdd(), addItemRequest(q), adaptWrite),
+    setTtl: (q) => request(ROUTES.valueTtl(), ttlRequest(q), adaptWrite),
+    renameKey: ({ view, name }) => request(ROUTES.valueRename(), { view: Number(view), name: String(name ?? '') }, adaptWrite),
+    removeItem: ({ view, rev, index }) => request(ROUTES.valueRemove(), { view: Number(view), rev: Number(rev), index: Number(index) }, adaptWrite),
+    deleteKey: ({ view }) => request(ROUTES.valueDelete(), { view: Number(view) }, adaptWrite),
+    addKey: (q) => request(ROUTES.keyAdd(), addKeyRequest(q), adaptWrite),
+    getBulk: () => request(ROUTES.bulk(), null, adaptBulkReply),
+    startBulk: (q) => request(ROUTES.bulkStart(), bulkRequest(q), adaptBulkReply),
+    runBulk: (id) => request(ROUTES.bulkRun(), { bulk: Number(id) }, adaptBulkReply),
+    stopBulk: () => request(ROUTES.bulkStop(), {}, adaptBulkReply),
+
     answerConfirm: (confirm, typed, adapt) => request(ROUTES.confirm(confirm.id), confirm.kind === 'type' ? { typed } : {}, adapt),
     cancelConfirm: (id) => request(ROUTES.confirmCancel(id), {}, () => ({})),
   };
@@ -1923,6 +2084,7 @@ export const METHODS = [
   'getDbs', 'switchDb', 'getBrowse', 'moreNames', 'getKeys', 'findKeys', 'moreKeys', 'openValue', 'moreValue', 'getItem',
   'getAnalysis', 'startAnalysis', 'stopAnalysis', 'getBigKeys', 'getExpiry', 'getChanges', 'getHotKeys', 'getNodes', 'getSlots',
   'saveSnapshot', 'listSnapshots', 'compareSnapshots',
+  'editValue', 'addItem', 'setTtl', 'renameKey', 'removeItem', 'deleteKey', 'addKey', 'getBulk', 'startBulk', 'runBulk', 'stopBulk',
 ];
 
 /** The methods whose reply is the new State: it is also sent to `state` subscribers, so

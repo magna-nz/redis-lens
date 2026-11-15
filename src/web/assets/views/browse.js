@@ -4,11 +4,19 @@
 // Everything a key holds is drawn with textContent, as redis-lens escaped it. A key is
 // named in a request by the hex id redis-lens gave for it, never by the text shown. Values
 // stay in this page's memory while it is open: nothing goes to storage, the console or an
-// address. Copying is the browser's clipboard, at a click. Edits arrive later.
+// address. Copying is the browser's clipboard, at a click.
+//
+// Writes (phase 3) are the TUI's: a value's edits per type, add key, the key's TTL and a hash
+// field's, rename, delete, and a bulk expire or delete over a pattern's keys. Each is asked
+// of redis-lens, which builds the TUI's own write and puts it through the one write gate; a
+// question it asks comes back as the confirm dialog. What a form holds stays in the form: it
+// is never kept once the form closes, and its boxes have autocomplete off, so the browser
+// does not remember them either.
 
 import {
   h, fill, refill, DASH, fmtBytes, fmtCount, fmtGrouped, fmtPercent, plural, barPercent, meter,
   notice, emptyState, connectFirst, analyzing, errorText, copyText, expiryText, fmtSignedBytes,
+  openDialog, readOnlyNote,
 } from '../ui.js';
 
 // ---------------------------------------------------------------------------------------
@@ -129,7 +137,9 @@ export function valueFacts(v, nodeName = null) {
   const m = v.meta || {};
   const parts = [];
   const length = v.length ?? m.length;
-  if (typeof length === 'number') parts.push(m.lengthUnit === 'bytes' || v.kind === 'string' ? plural(length, 'byte', 'bytes') : `${fmtGrouped(length)} ${m.lengthUnit || 'items'}`);
+  const unit = m.lengthUnit || 'items';
+  const one = { fields: 'field', elements: 'element', members: 'member', entries: 'entry', items: 'item' }[unit] || unit;
+  if (typeof length === 'number') parts.push(m.lengthUnit === 'bytes' || v.kind === 'string' ? plural(length, 'byte', 'bytes') : plural(length, one, unit));
   if (typeof m.bytes === 'number') parts.push(`${fmtBytes(m.bytes)} in memory`);
   const exp = expiryText(m.ttl);
   if (exp) parts.push(exp);
@@ -179,7 +189,7 @@ export function blank() {
     who: null, conn: null, tree: null, treeError: null, sort: null, node: null, filter: '', closed: new Set(),
     picked: null, list: null, listError: null, listFilter: '', listShown: CHUNK, finding: null, back: null,
     value: null, valueError: null, valueId: null, item: null, shown: null, format: null, itemsShown: CHUNK,
-    dbs: null, dbsError: null, pending: null,
+    dbs: null, dbsError: null, pending: null, bulk: null,
   };
 }
 
@@ -200,6 +210,216 @@ export function follow(store, state) {
     return 'run';
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------------------
+// Writes (phase 3): what each kind of value offers, why an action is off, values as text
+// or hex, and the key list after a write. Pure, tested in tests/edits.test.js.
+// ---------------------------------------------------------------------------------------
+
+/** The edits each kind of value offers, as the TUI's key detail offers them, with the
+ *  commands each sends (a command the server refused for this user turns it off). */
+export const EDITS = {
+  // `cmds`: what each write sends, so a command the server refused for this user turns it
+  // off. An edit that must not overwrite a change made meanwhile sends WATCH first.
+  string: { edit: { label: 'Edit value', what: 'value', cmds: ['WATCH', 'SET'] } },
+  json: { edit: { label: 'Edit document', what: 'document', cmds: ['JSON.SET'] } },
+  hash: {
+    item: 'field',
+    edit: { label: 'Edit value', what: 'value', cmds: ['HSET'] },
+    add: { label: 'Add field', cmds: ['HSETNX'], note: 'A field that exists already is never overwritten: edit it instead.' },
+    remove: { label: 'Delete field', cmds: ['HDEL'] },
+    fieldTtl: { label: 'Field TTL', cmds: ['HEXPIRE'] },
+  },
+  list: {
+    item: 'element',
+    edit: { label: 'Edit element', what: 'element', cmds: ['WATCH', 'LSET'] },
+    add: { label: 'Add element', cmds: ['RPUSH'], note: 'Added at the end of the list (RPUSH).' },
+    remove: { label: 'Delete element', cmds: ['WATCH', 'LSET', 'LREM'] },
+  },
+  set: {
+    item: 'member',
+    edit: { label: 'Edit member', what: 'member', cmds: ['SREM', 'SADD'] },
+    add: { label: 'Add member', cmds: ['SADD'], note: 'A member that is there already is left as it is.' },
+    remove: { label: 'Delete member', cmds: ['SREM'] },
+  },
+  zset: {
+    item: 'member',
+    edit: { label: 'Edit score', what: 'score', cmds: ['ZADD'] },
+    add: { label: 'Add member', cmds: ['ZADD'], note: 'A member that is there already keeps its score (ZADD NX).' },
+    remove: { label: 'Delete member', cmds: ['ZREM'] },
+  },
+  stream: {
+    item: 'entry',
+    noEdit: 'A stream entry can\'t be edited: add an entry, or delete this one.',
+    add: { label: 'Add entry', cmds: ['XADD'], note: 'The server picks the entry\'s ID (XADD *).' },
+    remove: { label: 'Delete entry', cmds: ['XDEL'] },
+  },
+};
+
+/** The commands of the key's own actions. */
+/** What the server says to a key write while a bulk action counts or runs. */
+export const BULK_RUNS = 'A bulk action is running: wait for it to end, or stop it first.';
+
+export const KEY_CMDS = { ttl: ['EXPIRE'], rename: ['RENAMENX'], delete: ['UNLINK'], bulkExpire: ['EXPIRE'], bulkDelete: ['UNLINK'] };
+
+/** The types a new key can have, with how the page names them. */
+export const NEW_KEY_TYPES = [['string', 'String'], ['hash', 'Hash'], ['list', 'List'], ['set', 'Set'], ['zset', 'Sorted set'], ['stream', 'Stream']];
+
+/** Why a read-only connection writes nothing, in the dashboard's words. */
+export function readOnlyText(conn) {
+  if (!conn) return 'Connect first.';
+  return conn.env === 'PROD'
+    ? 'Read-only: this is a production connection, so nothing is written to it. Turn writes on in Connections.'
+    : `Read-only: nothing is written to ${conn.name}. Turn writes on in Connections.`;
+}
+
+/** Why a write that sends `cmds` is off now, or null when it may be tried: no
+ *  connection, a read-only one, a command the server refused for this user this session,
+ *  and, given the value, a key that is gone, still loading or with a write on its way.
+ *  The server decides in the end; this only keeps a button from offering what it would
+ *  refuse anyway. */
+export function writeOff(conn, cmds = [], v = null) {
+  if (!conn) return 'Connect first.';
+  if (conn.readOnly) return readOnlyText(conn);
+  const refused = (conn.refused || []).map((c) => String(c).toUpperCase());
+  const hit = cmds.find((c) => refused.includes(c));
+  if (hit) return `Off: the server refused ${hit} for this user.`;
+  if (v) {
+    if (v.gone) return 'The key no longer exists.';
+    if (v.loading) return 'Still loading the value: wait for it.';
+    if (v.writing) return 'The last write has not answered yet.';
+  }
+  return null;
+}
+
+/** Why a value's own edit (the string, the document, the selected item) is off for its
+ *  kind, before any connection rule; null when the kind can be edited. */
+export function editOff(v) {
+  const e = EDITS[v.kind];
+  if (!e) {
+    if (v.kind === 'vector') return 'redis-lens does not edit vector sets.';
+    if (v.kind === 'array') return 'redis-lens does not edit arrays.';
+    return `redis-lens does not edit values of type ${v.type || v.kind}.`;
+  }
+  if (!e.edit) return e.noEdit;
+  if (v.kind === 'json' && !v.value) return 'The document is not read, so it can\'t be edited here.';
+  if (v.kind === 'string' && v.cut) return 'Editing is off: only the first 64 KiB of this string is loaded, and an edit needs the whole value.';
+  if (v.kind === 'json' && v.cut) return 'Editing is off: only the first 64 KiB of this document is loaded, and an edit needs the whole document.';
+  return null;
+}
+
+/** Hex digits as typed (spaces allowed), lower case; null when they are not whole bytes. */
+export function cleanHex(s) {
+  const t = String(s ?? '').replace(/\s+/g, '').toLowerCase();
+  return /^(?:[0-9a-f]{2})*$/.test(t) ? t : null;
+}
+
+/** Text as the hex of its UTF-8 bytes. */
+export function hexOfText(s) {
+  return Array.from(new TextEncoder().encode(String(s ?? '')), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Characters a text box can't hold faithfully, or that would hide what is there: control
+// characters but tab and newline (a text box turns CR into a newline), DEL and the C1
+// controls, the bidirectional controls, the line and paragraph separators and the byte
+// order mark.
+const NOT_TYPABLE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/;
+
+/** The text that hex holds, when it is UTF-8 that can be typed in a text box as it is;
+ *  null otherwise (then it is edited as hex). */
+export function textOfHex(hex) {
+  const clean = cleanHex(hex);
+  if (clean === null) return null;
+  const bytes = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < bytes.length; i += 1) bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  let s;
+  try {
+    s = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+  return NOT_TYPABLE.test(s) ? null : s;
+}
+
+/** How an edit starts from the value's bytes (hex): as text when it can be typed, else as hex. */
+export function editStart(hex) {
+  const text = textOfHex(hex);
+  return text === null ? { hex: true, text: cleanHex(hex) ?? '' } : { hex: false, text };
+}
+
+/** What a value box sends: the text, or `{ hex }`; `{ error }` for hex that is not whole bytes. */
+export function valueFrom(hex, typed) {
+  if (!hex) return { value: String(typed ?? '') };
+  const clean = cleanHex(typed);
+  return clean === null ? { error: 'Hex digits come in pairs, 0 to 9 and a to f, two for each byte.' } : { value: { hex: clean } };
+}
+
+/** A key list with one row replaced (after an edit, its TTL, size and length read again;
+ *  after a rename, under its new name). */
+export function replaceRow(list, id, row) {
+  if (!list || !row) return list;
+  const at = list.rows.findIndex((r) => r.id === id);
+  if (at < 0) return list;
+  const rows = list.rows.slice();
+  rows[at] = row;
+  return { ...list, rows };
+}
+
+/** A key list without a deleted key. */
+export function dropRow(list, id) {
+  if (!list) return list;
+  const rows = list.rows.filter((r) => r.id !== id);
+  if (rows.length === list.rows.length) return list;
+  return { ...list, rows, loaded: Math.max(0, list.loaded - 1) };
+}
+
+/** A key list with a key added (first), or its row replaced when it is listed already. */
+export function addRow(list, row) {
+  if (!list || !row) return list;
+  if (list.rows.some((r) => r.id === row.id)) return replaceRow(list, row.id, row);
+  return { ...list, rows: [row].concat(list.rows), loaded: list.loaded + 1 };
+}
+
+/** The item an index names now: the same index, or the last one when it is past the end
+ *  (after a delete), as the TUI keeps its selection. */
+export function itemAt(v, index) {
+  if (!v || !v.items.length) return null;
+  return v.items.find((i) => i.index === index) || v.items[Math.min(Math.max(0, index ?? 0), v.items.length - 1)];
+}
+
+/** The name of a new key's first guess: the pattern's text before its first placeholder. */
+export function newKeyName(pattern) {
+  return String(pattern ?? '').split('{')[0];
+}
+
+/** What an item is called, to name it on its buttons: `field coupon`, `element #3`. */
+export function itemLabel(v, item) {
+  if (!item) return '';
+  const what = (EDITS[v.kind] && EDITS[v.kind].item) || 'item';
+  if (v.kind === 'list') return `element #${item.index}`;
+  return `${what} ${item.name ?? item.value ?? ''}`;
+}
+
+/** A bulk action's progress: how far the run is, for the meter and its words. */
+export function bulkProgress(b) {
+  if (!b) return null;
+  if (b.stage === 'counting') return { pct: null, text: `Dry run: ${plural(b.count.matched, 'key', 'keys')} of the pattern counted so far. Nothing is written.` };
+  if (!b.run) return null;
+  const r = b.run;
+  const total = b.count.matched || 0;
+  const pct = total ? Math.min(100, Math.round((r.seen / total) * 100)) : 0;
+  const did = b.action === 'expire' ? `${plural(r.changed, 'key', 'keys')} given a TTL of ${b.ttl || '?'}` : `${plural(r.changed, 'key', 'keys')} deleted`;
+  const parts = [did, `${fmtGrouped(r.seen)} of about ${fmtGrouped(total)} looked at`];
+  if (r.skipped) parts.push(`${fmtGrouped(r.skipped)} left alone`);
+  if (r.failed) parts.push(`${fmtGrouped(r.failed)} failed`);
+  return { pct, text: `${parts.join(' · ')}.` };
+}
+
+/** What a bulk action's button that starts the run says. */
+export function bulkRunLabel(b) {
+  const n = b.count.toChange;
+  return b.action === 'expire' ? `Set the TTL on ${plural(n, 'key', 'keys')}…` : `Delete ${plural(n, 'key', 'keys')}…`;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -280,7 +500,9 @@ export function mount(root, ctx) {
 
   const keysCard = h('div', { class: 'card stack browse-col keys' });
   const valueCard = h('div', { class: 'card stack browse-col value', 'aria-live': 'polite', 'aria-busy': 'false' });
-  view.append(h('div', { class: 'browse' }, patCard, keysCard, valueCard));
+  // A bulk action over a pattern's keys: its dry run, question, progress and summary.
+  const bulkBox = h('section', { class: 'card stack bulk', 'aria-label': 'Bulk action', hidden: true });
+  view.append(bulkBox, h('div', { class: 'browse' }, patCard, keysCard, valueCard));
 
   // ---------- the database picker ----------
   async function loadDbs() {
@@ -580,9 +802,12 @@ export function mount(root, ctx) {
     const title = store.finding !== null
       ? `Find: ${l && l.find ? l.find.glob : store.finding}`
       : store.picked ? store.picked.name : 'Keys';
+    const addOff = keyOff(ctx.state().conn);
     const head = h('div', { class: 'card-head' },
       h('h2', { class: 'mono key-title clip', text: title, title }),
-      store.finding !== null ? h('button', { type: 'button', class: 'btn quiet', text: 'Clear search', onclick: clearFind }) : null);
+      h('div', { class: 'row-actions' },
+        store.finding !== null ? h('button', { type: 'button', class: 'btn quiet', text: 'Clear search', onclick: clearFind }) : null,
+        h('button', { type: 'button', class: 'btn', text: 'Add key', disabled: !!addOff, title: addOff || 'Add a key with its first value. An existing key is never overwritten.', onclick: () => addKeyDialog() })));
     if (busy) {
       fill(keysCard, head, h('p', { class: 'muted', text: busy }));
       return;
@@ -636,6 +861,7 @@ export function mount(root, ctx) {
     const nodes = ctx.state().conn ? ctx.state().conn.nodes : [];
     refill(box, shown.length ? shown.map((r) => {
       const on = store.valueId === r.id;
+      const open = on && store.value && store.value.key && store.value.key.id === r.id;
       return h('li', null, h('button', {
         type: 'button', class: `row row-key${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null,
         onclick: () => openValue(r),
@@ -644,7 +870,9 @@ export function mount(root, ctx) {
       h('span', { class: 'badge mono', text: r.type || DASH }),
       h('span', { class: 'mono right', text: fmtBytes(r.bytes) }),
       h('span', { class: 'mono right muted', text: r.ttl || DASH }),
-      typeof r.node === 'number' && nodes[r.node] ? h('span', { class: 'sr-only', text: `on node ${nodes[r.node].address}` }) : null));
+      typeof r.node === 'number' && nodes[r.node] ? h('span', { class: 'sr-only', text: `on node ${nodes[r.node].address}` }) : null),
+      // The open key's own writes, beside its row as well as above its value.
+      open ? h('div', { class: 'row-tools', role: 'group', 'aria-label': `Write to ${r.name}` }, keyButtons(store.value, true)) : null);
     }) : h('li', { class: 'muted pad', text: q ? 'No loaded key matches the filter.' : listFoot(l) }));
     fill(showBox, rows.length > shown.length
       ? h('button', {
@@ -682,6 +910,7 @@ export function mount(root, ctx) {
       h('p', { text: parts.join(' · ') }),
       r.marked && r.reason ? notice(r.reason) : r.reason ? h('p', { class: 'muted small', text: r.reason }) : null,
       h('div', { class: 'row-actions' }, copyButton('Copy pattern', r.pattern.copy, 'the pattern', 'The pattern has control characters, so it is not copied: a pasted copy would name other keys.')),
+      bulkButtons(r.pattern),
       h('details', { class: 'advanced' }, h('summary', { text: 'About this pattern' }), h('div', { class: 'details-body' }, details)));
   }
 
@@ -696,10 +925,7 @@ export function mount(root, ctx) {
     store.shown = null;
     store.format = null;
     store.itemsShown = CHUNK;
-    if (store.list) {
-      const box = keysCard.querySelector('ul.list[aria-label="Keys"]');
-      if (box) drawKeyRows(box, box.nextElementSibling);
-    }
+    redrawKeyRows();
     drawValue('Reading the value…', key);
     try {
       const v = await ctx.api.openValue({ key: key.id, type: key.type || null });
@@ -713,6 +939,14 @@ export function mount(root, ctx) {
       store.valueError = errorText(err);
     }
     drawValue();
+    redrawKeyRows();
+  }
+
+  /** Draw the key list's rows again (the open key, its tools), as they are. */
+  function redrawKeyRows() {
+    if (!store.list) return;
+    const box = keysCard.querySelector('ul.list[aria-label="Keys"]');
+    if (box) drawKeyRows(box, box.nextElementSibling);
   }
 
   async function moreValue(button) {
@@ -803,9 +1037,7 @@ export function mount(root, ctx) {
       h('div', { class: 'row-actions' },
         copyButton('Copy name', copyName, 'the key name', 'The name has control characters, so it is not copied: a pasted copy would name another key.'),
         shown ? copyButton('Copy value', shown.copy, 'the value', shown.copyRefused || 'This value is not copied as text: show it as hex to copy it.') : null),
-      h('p', { class: 'note muted small', text: s.conn && s.conn.readOnly
-        ? 'Read-only connection. Editing, expiry, rename and delete arrive later in the dashboard.'
-        : 'Editing, expiry, rename and delete arrive later in the dashboard: here a key is only read.' }),
+      writeBar(v),
     ];
     const notes = [];
     if (v.gone) notes.push(notice(v.notice || 'The key no longer exists.'));
@@ -850,6 +1082,7 @@ export function mount(root, ctx) {
     return h('div', { class: 'items-box' },
       h('div', { class: `cols-head row-item cols-${cols.length}`, 'aria-hidden': 'true' }, cols.map((c) => h('span', { text: c }))),
       list,
+      itemBar(v),
       v.items.length > shown.length ? h('button', {
         type: 'button', class: 'btn quiet', text: `Show ${fmtGrouped(Math.min(CHUNK, v.items.length - shown.length))} more of the ${fmtGrouped(v.items.length)} loaded`,
         onclick: () => {
@@ -918,6 +1151,615 @@ export function mount(root, ctx) {
       }));
   }
 
+  // ---------- writes: the buttons ----------
+
+  const conn = () => ctx.state().conn;
+
+  /** Why a write to a key is off now: `writeOff`'s reasons, and a bulk action counting or
+   *  running (the server takes no key write until it ends). */
+  function keyOff(c, cmds, v = null) {
+    const b = store.bulk;
+    return writeOff(c, cmds, v) || (b && (b.stage === 'counting' || b.stage === 'running') ? BULK_RUNS : null);
+  }
+
+  /** A button for one write: off, saying why in its title, when it can't be sent. */
+  function writeButton(label, off, run, { primary = false, quiet = false, aria = null } = {}) {
+    return h('button', {
+      type: 'button', class: primary ? 'btn primary' : quiet ? 'btn quiet' : 'btn', text: label, disabled: !!off, title: off || null, 'aria-label': aria,
+      onclick: (e) => run(e.currentTarget),
+    });
+  }
+
+  /** The key's own writes: its expiry, rename, delete. `beside` names the key in each
+   *  button's label, for the copies beside its row in the key list. */
+  function keyButtons(v, beside = false) {
+    const c = conn();
+    const name = v.key ? v.key.name : '';
+    const opt = (what) => (beside ? { quiet: true, aria: `${what} ${name}` } : {});
+    return [
+      writeButton('Set expiry', keyOff(c, KEY_CMDS.ttl, v), () => ttlDialog(null), opt('Set the expiry of')),
+      writeButton('Rename', keyOff(c, KEY_CMDS.rename, v), () => renameDialog(), opt('Rename')),
+      writeButton('Delete key', keyOff(c, KEY_CMDS.delete, v), (b) => deleteKey(b), opt('Delete')),
+    ];
+  }
+
+  /** The writes above a value: its own edit (a string, a document), adding to it (the
+   *  collections), then the key's. Below them, why the ones that are off are off. */
+  function writeBar(v) {
+    const c = conn();
+    const e = EDITS[v.kind];
+    const buttons = [];
+    if (e && e.edit && !e.item) buttons.push(writeButton(e.edit.label, editOff(v) || keyOff(c, e.edit.cmds, v), (b) => startEdit(b, null)));
+    if (e && e.add) buttons.push(writeButton(e.add.label, keyOff(c, e.add.cmds, v), () => startAdd()));
+    buttons.push(...keyButtons(v));
+    let why;
+    if (c && c.readOnly) {
+      why = [readOnlyNote(readOnlyText(c)), h('a', { href: '#/connections', class: 'small', text: 'Open Connections' })];
+    } else {
+      const seen = new Set();
+      why = buttons.filter((b) => b.disabled && b.title && !seen.has(b.title) && seen.add(b.title)).map((b) => notice(b.title, 'info'));
+    }
+    return h('div', { class: 'stack-sm write-bar' },
+      h('div', { class: 'row-actions', role: 'group', 'aria-label': 'Write to this key' }, buttons),
+      why);
+  }
+
+  /** The writes of the selected field, element, member or entry, under the items. */
+  function itemBar(v) {
+    const e = EDITS[v.kind];
+    if (!e || !e.item || !store.item) return null;
+    const item = v.items.find((i) => i.index === store.item.index);
+    if (!item) return null;
+    const c = conn();
+    const label = itemLabel(v, item);
+    const buttons = [];
+    if (e.edit) {
+      const aria = v.kind === 'zset' ? `Edit the score of ${label}` : `Edit ${label}`;
+      buttons.push(writeButton(e.edit.label, editOff(v) || keyOff(c, e.edit.cmds, v), (b) => startEdit(b, item), { aria }));
+    }
+    if (e.fieldTtl) {
+      const off = v.fieldTtls ? keyOff(c, e.fieldTtl.cmds, v) : v.fieldTtlsOff || 'Field TTLs need Redis 7.4 or later, or Valkey 9.0 or later.';
+      buttons.push(writeButton(e.fieldTtl.label, off, () => ttlDialog(item), { aria: `Set the TTL of ${label}` }));
+    }
+    if (e.remove) buttons.push(writeButton(e.remove.label, keyOff(c, e.remove.cmds, v), (b) => removeItem(b, item), { aria: `Delete ${label}` }));
+    return h('div', { class: 'item-actions', role: 'group', 'aria-label': `Write to the selected ${label}` },
+      h('p', { class: 'small muted wrap-any' }, 'Selected: ', h('span', { class: 'mono', text: label })),
+      h('div', { class: 'row-actions' }, buttons),
+      e.noEdit ? h('p', { class: 'muted small', text: e.noEdit }) : null);
+  }
+
+  // ---------- writes: the forms ----------
+
+  let formSeq = 0;
+
+  /** One box of a write form. `f`: `{ name, label (text, or a function of the form's
+   *  choices), kind: 'text' | 'value' | 'select', value, hex, options, hint, placeholder,
+   *  required (what to say when it is left empty), show (a function of the choices) }`.
+   *  A `value` box is a text area with "As hex" beside it. */
+  function fieldRow(f, id, onChoice) {
+    const err = h('p', { class: 'field-error', id: `${id}-err`, role: 'alert' });
+    const hint = f.hint ? h('p', { class: 'hint', id: `${id}-hint`, text: f.hint }) : null;
+    const label = h('label', { htmlFor: id });
+    let el;
+    let hexBox = null;
+    let read;
+    if (f.kind === 'select') {
+      el = h('select', { class: 'field', id, onchange: onChoice }, f.options.map(([value, text]) => h('option', { value, text, selected: value === f.value })));
+      read = () => ({ value: el.value });
+    } else if (f.kind === 'value') {
+      el = h('textarea', { class: 'field mono', id, rows: '4', autocomplete: 'off', spellcheck: false, autocapitalize: 'off', value: f.value ?? '' });
+      const box = h('input', {
+        type: 'checkbox', id: `${id}-hex`, checked: !!f.hex,
+        onchange: () => {
+          if (box.checked) {
+            el.value = hexOfText(el.value);
+            err.textContent = '';
+            return;
+          }
+          const back = textOfHex(el.value);
+          if (back === null) {
+            box.checked = true;
+            err.textContent = cleanHex(el.value) === null
+              ? 'Hex digits come in pairs, 0 to 9 and a to f, two for each byte.'
+              : 'These bytes are not text that can be typed here as it is, so they stay as hex.';
+          } else {
+            el.value = back;
+            err.textContent = '';
+          }
+        },
+      });
+      hexBox = h('div', { class: 'check compact' }, box, h('label', { htmlFor: box.id, text: 'As hex, two digits a byte' }));
+      read = () => valueFrom(box.checked, el.value);
+    } else {
+      el = h('input', { class: 'field mono', type: 'text', id, autocomplete: 'off', spellcheck: false, autocapitalize: 'off', value: f.value ?? '', placeholder: f.placeholder || null });
+      read = () => ({ value: el.value });
+    }
+    el.setAttribute('aria-describedby', [hint ? hint.id : null, err.id].filter(Boolean).join(' '));
+    const row = h('div', { class: 'form-row' }, label, el, hexBox, hint, err);
+    return {
+      f, el, row,
+      setLabel(choices) {
+        label.textContent = typeof f.label === 'function' ? f.label(choices) : f.label;
+      },
+      read() {
+        const got = read();
+        if (!got.error && f.required && got.value === '') return { error: f.required };
+        return got;
+      },
+      fail(text) {
+        err.textContent = text || '';
+        el.setAttribute('aria-invalid', text ? 'true' : 'false');
+      },
+    };
+  }
+
+  /** A small form in a dialog for one write. `send(values)` makes the request: its reply
+   *  closes the form and goes to `done`; a refusal stays in the form, in the server's words.
+   *  A question the server asks opens over it. Cancelled, or when the value was read again
+   *  meanwhile, the form closes and says so. `more`: other buttons, `{ label, send }`, which
+   *  send without reading the boxes. */
+  function writeDialog({ title, sub = null, fields, notes = [], yes = 'Save', send, done, more = [], value = true }) {
+    formSeq += 1;
+    const seq = formSeq;
+    openDialog({
+      title,
+      build(close) {
+        const error = h('p', { class: 'form-error', role: 'alert' });
+        const rows = [];
+        const choices = () => {
+          const out = {};
+          for (const r of rows) if (r.f.kind === 'select') out[r.f.name] = r.el.value;
+          return out;
+        };
+        const sync = () => {
+          const c = choices();
+          for (const r of rows) {
+            r.row.hidden = r.f.show ? !r.f.show(c) : false;
+            r.setLabel(c);
+          }
+        };
+        fields.forEach((f, i) => rows.push(fieldRow(f, `wf-${seq}-${i}`, sync)));
+        sync();
+        const first = rows.find((r) => r.f.kind !== 'select');
+        if (first) first.el.setAttribute('data-autofocus', '');
+        const buttons = [];
+        // `check`: read and check the boxes first (an extra button such as "Remove the TTL"
+        // sends without them).
+        const go = async (sender, check = true) => {
+          const values = {};
+          for (const r of check ? rows : []) {
+            if (r.row.hidden) continue;
+            const got = r.read();
+            r.fail(got.error);
+            if (got.error) {
+              r.el.focus();
+              return;
+            }
+            values[r.f.name] = got.value;
+          }
+          buttons.forEach((b) => { b.disabled = true; });
+          error.textContent = '';
+          try {
+            const result = await sender(values);
+            close(true);
+            if (alive) done(result);
+          } catch (err) {
+            buttons.forEach((b) => { b.disabled = false; });
+            if (err.cancelled || (value && stale(err))) {
+              close(null);
+              writeFailed(err, value);
+              return;
+            }
+            error.textContent = errorText(err);
+            learnRefusal(err.message);
+          }
+        };
+        const submit = h('button', { type: 'submit', class: 'btn primary', text: yes });
+        const extra = (m) => h('button', {
+          type: 'button', class: 'btn', text: m.label,
+          onclick: () => {
+            for (const r of rows) r.fail(null);
+            go(m.send, false);
+          },
+        });
+        buttons.push(submit, ...more.map(extra));
+        return h('form', {
+          class: 'form', autocomplete: 'off',
+          onsubmit: (e) => {
+            e.preventDefault();
+            go(send);
+          },
+        },
+        sub ? h('p', { class: 'mono wrap-any muted', text: sub }) : null,
+        rows.map((r) => r.row),
+        notes.filter(Boolean).map((t) => h('p', { class: 'hint', text: t })),
+        error,
+        h('div', { class: 'dialog-actions' },
+          h('button', { type: 'button', class: 'btn', text: 'Cancel', onclick: () => close(null) }),
+          buttons.slice(1),
+          submit));
+      },
+    });
+  }
+
+  /** The server refused a command for this user: it is off for the rest of the session,
+   *  and `state.refused` lists it, but no `state` event says so; read the state, so the
+   *  buttons that send it turn off. */
+  function learnRefusal(text) {
+    if (/the server refused \S+ for this user/.test(text || '')) ctx.api.getState().catch(() => {});
+  }
+
+  const STALE = /^The value was read again since the page showed it/;
+  /** The value the request named is not the one on the page any more: read again (404:
+   *  closed meanwhile; 409: read again since). */
+  const stale = (err) => err.status === 404 || (err.status === 409 && STALE.test(err.message || ''));
+
+  /** Say why a write was not sent; when the value moved on meanwhile, read it again. */
+  function writeFailed(err, value = true) {
+    ctx.notify(errorText(err), err.cancelled ? 'info' : 'error');
+    learnRefusal(err.message);
+    if (value && stale(err) && store.valueId) {
+      const v = store.value;
+      openValue({ id: store.valueId, name: v && v.key ? v.key.name : '', type: v && v.meta ? v.meta.type : null });
+    }
+  }
+
+  /** A write's reply: say what happened, then show the value and the key's row as read
+   *  again (or drop them, once the key is deleted). */
+  function applyWrite(r, keyId) {
+    if (!r) return;
+    ctx.notify(r.message || (r.done ? 'Done.' : 'Nothing changed.'), r.done ? 'ok' : 'info');
+    if (store.list) store.list = r.closed ? dropRow(store.list, keyId) : replaceRow(store.list, keyId, r.row);
+    if (store.valueId === keyId) {
+      if (r.closed) {
+        valueSeq += 1;
+        Object.assign(store, { value: null, valueId: null, valueError: null, item: null, shown: null, format: null });
+      } else if (r.value) takeValue(r.value);
+    }
+    drawKeys();
+    drawValue();
+  }
+
+  /** Show a value read again after a write, keeping the item picked (the next one, after a
+   *  delete) and the format. */
+  function takeValue(v) {
+    valueSeq += 1;
+    const keep = store.item;
+    store.value = v;
+    store.valueId = v.key ? v.key.id : store.valueId;
+    store.valueError = null;
+    store.shown = v.value;
+    const item = itemAt(v, keep ? keep.index : 0);
+    if (item) pickItem(item, keep && keep.field !== null ? keep.field : 0, false);
+    else {
+      store.item = null;
+      if (store.format) loadShown(v);
+    }
+  }
+
+  /** Edit the string, the document or the selected item. Its whole value is read first,
+   *  as hex (every byte), and shown as text when it can be typed as it is. */
+  async function startEdit(button, item) {
+    const v = store.value;
+    if (!v || !v.key) return;
+    const e = EDITS[v.kind];
+    const key = v.key;
+    const label = item ? itemLabel(v, item) : null;
+    let start;
+    if (v.kind === 'zset') start = { hex: false, text: item ? item.value ?? '' : '' };
+    else {
+      button.disabled = true;
+      try {
+        const it = await ctx.api.getItem({ view: v.view, index: item ? item.index : 0, format: 'hex' });
+        if (it.shown.compression) {
+          ctx.notify(`This value is stored compressed (${it.shown.compression}) and shown decompressed, so it is not edited here: saving it would store it uncompressed.`, 'info');
+          return;
+        }
+        if (it.shown.truncated || it.shown.copy === null) {
+          ctx.notify('This value is too big to edit here whole.', 'info');
+          return;
+        }
+        start = editStart(it.shown.copy);
+      } catch (err) {
+        writeFailed(err);
+        return;
+      } finally {
+        if (button.isConnected) button.disabled = false;
+      }
+      if (!alive || store.value !== v) return;
+    }
+    const notes = [];
+    if (v.kind === 'string' || v.kind === 'list') notes.push('Sent only while it is still the one loaded: if it changed meanwhile, nothing is written and it is read again.');
+    if (v.kind === 'string') notes.push('The key keeps its TTL.');
+    if (v.kind === 'set') notes.push('The member is removed and the new one added.');
+    if (start.hex) notes.push('It holds bytes that are not text you can type here, so it is edited as hex.');
+    const field = v.kind === 'zset'
+      ? { name: 'value', label: 'Score', kind: 'text', value: start.text, hint: 'A number, such as 1.5, or inf or -inf.', required: 'Type the score.' }
+      : { name: 'value', label: e.edit.what === 'value' ? 'Value' : e.edit.what === 'document' ? 'Document' : e.edit.what === 'element' ? 'Element' : 'Member', kind: 'value', value: start.text, hex: start.hex };
+    writeDialog({
+      title: item ? (v.kind === 'zset' ? `Edit the score of ${label}` : `Edit ${label}`) : e.edit.label,
+      sub: key.name,
+      fields: [field],
+      notes,
+      send: (values) => ctx.api.editValue({ view: v.view, rev: v.rev, index: item ? item.index : 0, value: values.value }),
+      done: (r) => applyWrite(r, key.id),
+    });
+  }
+
+  /** Add a field, element, member or entry. */
+  function startAdd() {
+    const v = store.value;
+    if (!v || !v.key) return;
+    const e = EDITS[v.kind];
+    const key = v.key;
+    const name = (label) => ({ name: 'field', label, kind: 'text', required: `Type the ${label.toLowerCase()}'s name.` });
+    const fields = {
+      hash: [name('Field'), { name: 'value', label: 'Value', kind: 'value' }],
+      list: [{ name: 'value', label: 'Element', kind: 'value' }],
+      set: [{ name: 'value', label: 'Member', kind: 'value' }],
+      zset: [{ name: 'value', label: 'Member', kind: 'value' }, { name: 'score', label: 'Score', kind: 'text', hint: 'A number, such as 1.5, or inf or -inf.', required: 'Type the score.' }],
+      stream: [name('Field'), { name: 'value', label: 'Value', kind: 'value' }],
+    }[v.kind];
+    writeDialog({
+      title: e.add.label,
+      sub: key.name,
+      fields,
+      notes: [e.add.note],
+      yes: 'Add',
+      send: (values) => ctx.api.addItem({ view: v.view, field: values.field, value: values.value, score: values.score }),
+      done: (r) => applyWrite(r, key.id),
+    });
+  }
+
+  /** Set or remove the key's TTL, or a hash field's. */
+  function ttlDialog(item) {
+    const v = store.value;
+    if (!v || !v.key) return;
+    const key = v.key;
+    const ttl = item ? item.ttl : v.meta && v.meta.ttl;
+    const now = expiryText(ttl);
+    const has = !!ttl && ttl !== 'never';
+    const send = (text) => ctx.api.setTtl(item ? { view: v.view, ttl: text, field: item.index, rev: v.rev } : { view: v.view, ttl: text });
+    writeDialog({
+      title: item ? `Set the TTL of ${itemLabel(v, item)}` : 'Set the expiry',
+      sub: key.name,
+      fields: [{
+        name: 'ttl', label: 'Expires in', kind: 'text', placeholder: '24h', required: 'Type how long until it expires, such as 24h.',
+        hint: 'Seconds, or a number with s, m, h, d or w, several in a row: 90s, 10m, 1h30m, 7d.',
+      }],
+      notes: [
+        now ? `Now it ${now}.` : null,
+        item ? 'Only this field expires; the key keeps its own TTL.' : 'A TTL of 0 would delete the key: delete the key instead.',
+      ],
+      yes: 'Set the TTL',
+      more: has ? [{ label: 'Remove the TTL', send: () => send('-') }] : [],
+      send: (values) => send(values.ttl),
+      done: (r) => applyWrite(r, key.id),
+    });
+  }
+
+  function renameDialog() {
+    const v = store.value;
+    if (!v || !v.key) return;
+    const key = v.key;
+    writeDialog({
+      title: 'Rename the key',
+      sub: key.name,
+      fields: [{ name: 'name', label: 'New name', kind: 'text', value: key.copy ?? key.name, required: 'Type the new name.' }],
+      notes: [
+        'It is sent with RENAMENX: a key that exists already is never overwritten.',
+        v.cluster ? 'On a cluster both names must be in the same slot: keep the part in { } the same.' : null,
+      ],
+      yes: 'Rename',
+      send: (values) => ctx.api.renameKey({ view: v.view, name: values.name }),
+      done: (r) => applyWrite(r, key.id),
+    });
+  }
+
+  /** Delete the key, or the selected item: redis-lens asks first, as the TUI does. */
+  async function sendDelete(button, request, keyId) {
+    button.disabled = true;
+    try {
+      applyWrite(await request(), keyId);
+    } catch (err) {
+      writeFailed(err);
+    } finally {
+      if (button.isConnected) button.disabled = false;
+    }
+  }
+
+  function deleteKey(button) {
+    const v = store.value;
+    if (!v || !v.key) return;
+    sendDelete(button, () => ctx.api.deleteKey({ view: v.view }), v.key.id);
+  }
+
+  function removeItem(button, item) {
+    const v = store.value;
+    if (!v || !v.key) return;
+    sendDelete(button, () => ctx.api.removeItem({ view: v.view, rev: v.rev, index: item.index }), v.key.id);
+  }
+
+  /** Add a key with its first value: from the key list of a pattern its name starts with
+   *  the pattern's text before its first placeholder, and it is listed there once added. */
+  function addKeyDialog() {
+    const list = store.list;
+    const pattern = store.finding === null && store.picked ? store.picked : null;
+    const is = (...types) => (c) => types.includes(c.type);
+    writeDialog({
+      title: 'Add a key',
+      fields: [
+        { name: 'name', label: 'Name', kind: 'text', value: pattern ? newKeyName(pattern.copy ?? pattern.name) : '', required: 'Type the key\'s name.' },
+        { name: 'type', label: 'Type', kind: 'select', value: 'string', options: NEW_KEY_TYPES },
+        { name: 'field', label: 'Field', kind: 'text', show: is('hash', 'stream'), required: 'Type the field\'s name.' },
+        { name: 'value', label: (c) => ({ list: 'First element', set: 'First member', zset: 'First member' }[c.type] || 'Value'), kind: 'value' },
+        { name: 'score', label: 'Score', kind: 'text', show: is('zset'), hint: 'A number, such as 1.5, or inf or -inf.', required: 'Type the score.' },
+      ],
+      notes: ['A key that exists already is never overwritten.', list ? 'Once added it is listed with the keys shown, and opened.' : 'Once added it is opened.'],
+      yes: 'Add the key',
+      value: false,
+      send: (values) => ctx.api.addKey({ list: list ? list.list : undefined, ...values }),
+      done: (r) => {
+        ctx.notify(r.message || (r.done ? 'Added.' : 'Not added.'), r.done ? 'ok' : 'info');
+        if (!r.done || !r.value) return;
+        if (store.list && list && store.list.list === list.list && r.row) store.list = addRow(store.list, r.row);
+        store.item = null;
+        store.format = null;
+        store.itemsShown = CHUNK;
+        takeValue(r.value);
+        drawKeys();
+        drawValue();
+      },
+    });
+  }
+
+  // ---------- bulk actions over a pattern's keys ----------
+
+  const bulkBusy = () => !!store.bulk && (store.bulk.stage === 'counting' || store.bulk.stage === 'running');
+
+  function bulkButtons(pattern) {
+    const c = conn();
+    const busy = bulkBusy() ? 'A bulk action is running already: wait for it to end, or stop it first.' : null;
+    const expire = writeOff(c, KEY_CMDS.bulkExpire) || busy;
+    const remove = writeOff(c, KEY_CMDS.bulkDelete) || busy;
+    return h('div', { class: 'stack-sm' },
+      h('p', { class: 'lbl', text: 'Every key of the pattern' }),
+      h('div', { class: 'row-actions' },
+        writeButton('Set a TTL on every key…', expire, () => bulkExpireDialog(pattern)),
+        writeButton('Delete every key…', remove, (b) => startBulk(b, pattern))),
+      c && c.readOnly ? null : h('p', { class: 'muted small', text: [expire || remove, 'A dry run counts the keys first: nothing is written until you confirm.'].filter(Boolean).join(' ') }));
+  }
+
+  function bulkExpireDialog(pattern) {
+    writeDialog({
+      title: 'Set a TTL on every key of the pattern',
+      sub: pattern.name,
+      fields: [{ name: 'ttl', label: 'TTL', kind: 'text', value: '24h', required: 'Type the TTL, such as 24h.', hint: 'Seconds, or a number with s, m, h or d: 90s, 10m, 24h, 7d.' }],
+      notes: [
+        'Only keys without a TTL get it; the others keep theirs.',
+        'First a dry run counts the keys. Nothing is written until you confirm.',
+        'It sends EXPIRE … NX, which needs Redis 7.0 or later, or Valkey.',
+      ],
+      yes: 'Count the keys',
+      value: false,
+      send: (values) => ctx.api.startBulk({ pattern: pattern.id, action: 'expire', ttl: values.ttl }),
+      done: (r) => takeBulk(r.bulk, true),
+    });
+  }
+
+  async function startBulk(button, pattern) {
+    button.disabled = true;
+    try {
+      takeBulk((await ctx.api.startBulk({ pattern: pattern.id, action: 'delete' })).bulk, true);
+    } catch (err) {
+      ctx.notify(errorText(err), 'error');
+      learnRefusal(err.message);
+    } finally {
+      if (button.isConnected) button.disabled = false;
+    }
+  }
+
+  async function bulkCall(button, call, quiet = false) {
+    if (button) button.disabled = true;
+    try {
+      const r = await call();
+      const ends = r.bulk && r.bulk.stage === 'done' && r.bulk.lines.length && store.bulk && store.bulk.id === r.bulk.id && store.bulk.stage !== 'done';
+      if (r.text && !quiet && !ends) ctx.notify(r.text, 'info');
+      takeBulk(r.bulk);
+    } catch (err) {
+      ctx.notify(errorText(err), err.cancelled ? 'info' : 'error');
+      learnRefusal(err.message);
+      refreshBulk();
+    }
+  }
+
+  async function refreshBulk() {
+    try {
+      const r = await ctx.api.getBulk();
+      if (alive) takeBulk(r.bulk);
+    } catch {
+      // Not connected, or no live connection yet: nothing to show.
+    }
+  }
+
+  /** A bulk action as it now is (a reply, or the `bulk` event). */
+  function takeBulk(b, focus = false) {
+    const was = store.bulk;
+    const busy = bulkBusy();
+    store.bulk = b;
+    if (b && b.stage === 'done' && was && was.id === b.id && was.stage !== 'done' && b.lines.length) {
+      ctx.notify(b.lines[0], b.error ? 'error' : 'ok');
+      if (b.error) learnRefusal(b.lines[0]);
+    }
+    drawBulk();
+    // The pattern's bulk buttons are off while one runs.
+    if (busy !== bulkBusy()) {
+      drawKeys();
+      drawValue();
+    }
+    if (focus && b) {
+      const head = bulkBox.querySelector('h2');
+      if (head) head.focus();
+    }
+  }
+
+  function drawBulk() {
+    const b = store.bulk;
+    if (!b) {
+      bulkBox.hidden = true;
+      fill(bulkBox);
+      return;
+    }
+    bulkBox.hidden = false;
+    // Each event draws the card anew: whoever was in it (on Stop, say) stays on the same
+    // button, or on its title when that button is gone.
+    const was = bulkBox.contains(document.activeElement) ? document.activeElement : null;
+    const wasText = was && was.tagName === 'BUTTON' ? was.textContent : null;
+    const stage = { counting: 'Dry run', counted: 'Counted', running: 'Running', done: b.error ? 'Stopped' : 'Ended' }[b.stage];
+    const progress = bulkProgress(b);
+    const buttons = [];
+    if (b.stage === 'counting') buttons.push(h('button', { type: 'button', class: 'btn', text: 'Stop the dry run', onclick: (e) => bulkCall(e.currentTarget, () => ctx.api.stopBulk()) }));
+    if (b.stage === 'counted') {
+      const off = writeOff(conn(), b.action === 'expire' ? KEY_CMDS.bulkExpire : KEY_CMDS.bulkDelete);
+      buttons.push(writeButton(bulkRunLabel(b), off, (button) => bulkCall(button, () => ctx.api.runBulk(b.id)), { primary: true }));
+      buttons.push(h('button', { type: 'button', class: 'btn', text: 'Cancel', onclick: (e) => bulkCall(e.currentTarget, () => ctx.api.stopBulk()) }));
+    }
+    if (b.stage === 'running') {
+      const stopping = !!(b.run && b.run.stopping);
+      buttons.push(h('button', { type: 'button', class: 'btn', text: stopping ? 'Stopping after this batch…' : 'Stop', disabled: stopping, onclick: (e) => bulkCall(e.currentTarget, () => ctx.api.stopBulk()) }));
+    }
+    if (b.stage === 'done') {
+      if (store.list && store.list.kind === 'pattern' && store.picked && store.picked.id === b.pattern.id && b.run && b.run.changed) {
+        buttons.push(h('button', { type: 'button', class: 'btn', text: 'Read the keys again', onclick: () => openPattern(store.picked) }));
+      }
+      buttons.push(h('button', { type: 'button', class: 'btn', text: 'Close', onclick: (e) => bulkCall(e.currentTarget, () => ctx.api.stopBulk(), true) }));
+    }
+    const cluster = b.nodes.length
+      ? h('p', { class: 'muted small', text: `${plural(b.nodes.length, 'primary', 'primaries')}, one at a time: ${b.nodes.map((n, i) => `${n.endpoint} ${fmtGrouped(n.matched)}${b.at === i && b.stage !== 'done' ? ' (now)' : ''}`).join(' · ')}.` })
+      : null;
+    let bar = null;
+    if (progress && progress.pct !== null && b.stage !== 'counted') {
+      bar = meter(progress.pct, b.error ? 'warn' : '');
+      bar.setAttribute('aria-hidden', 'true');
+    }
+    refill(bulkBox, [
+      h('div', { class: 'card-head' },
+        h('h2', { class: 'bulk-title wrap-any', tabIndex: -1 }, `${b.title} `, h('span', { class: 'mono', text: b.pattern.name }), b.action === 'expire' && b.ttl ? ` · TTL ${b.ttl}` : ''),
+        h('span', { class: `badge${b.prod ? ' env-prod' : ''}`, text: `${stage} · ${b.profile || ''}`.trim() })),
+      bar,
+      progress ? h('p', { role: 'status', text: progress.text }) : null,
+      b.summary.length ? h('ul', { class: 'bulk-lines' }, b.summary.map((t) => h('li', { text: t }))) : null,
+      cluster,
+      b.stage === 'done' && b.lines.length ? h('div', { class: 'stack-sm' }, b.lines.map((t, i) => (b.error && i === 0 ? notice(t) : h('p', { class: 'wrap-any', text: t })))) : null,
+      b.stage === 'counted' ? h('p', { class: 'muted small', text: b.prod ? 'Running it asks you to type the pattern first.' : 'Running it asks first.' }) : null,
+      h('div', { class: 'row-actions' }, buttons),
+    ]);
+    if (was) {
+      const same = wasText && Array.from(bulkBox.querySelectorAll('button')).find((x) => x.textContent === wasText && !x.disabled);
+      (same || bulkBox.querySelector('h2')).focus();
+    }
+  }
+
   // ---------- what other areas asked for ----------
   function takePending() {
     const p = store.pending;
@@ -937,6 +1779,9 @@ export function mount(root, ctx) {
   }
 
   // ---------- following the session ----------
+  // The writes the server refused this session turn their buttons off.
+  const refusedKey = (s) => (s.conn ? s.conn.refused.join(',') : '');
+  let refusedNow = refusedKey(ctx.state());
   function onState(next) {
     if (!alive) return;
     const what = follow(store, next);
@@ -945,7 +1790,17 @@ export function mount(root, ctx) {
       drawValue();
       loadTree();
       loadDbs();
+      if (what === 'reset') {
+        drawBulk();
+        refreshBulk();
+      }
     } else if (store.tree) drawPatFoot(next.analysis.report);
+    if (refusedKey(next) !== refusedNow) {
+      refusedNow = refusedKey(next);
+      drawKeys();
+      drawValue();
+      drawBulk();
+    }
   }
   let lastProgress = 0;
   function onProgress(p) {
@@ -956,7 +1811,9 @@ export function mount(root, ctx) {
       loadTree();
     } else if (p.kind === 'done' || p.kind === 'compared' || p.kind === 'failed' || p.kind === 'stopped') loadTree();
   }
-  const offs = [ctx.api.on('state', onState), ctx.api.on('progress', onProgress)];
+  const offs = [ctx.api.on('state', onState), ctx.api.on('progress', onProgress), ctx.api.on('bulk', (r) => {
+    if (alive) takeBulk(r.bulk);
+  })];
 
   active = { takePending };
   // Draw what is kept at once, then read what may have changed meanwhile.
@@ -965,8 +1822,10 @@ export function mount(root, ctx) {
   else drawRows();
   drawKeys();
   drawValue();
+  drawBulk();
   loadTree();
   loadDbs();
+  refreshBulk();
   if (store.pending) takePending();
   else if (store.list && store.list.kind === 'pattern' && !store.list.done && store.picked) {
     // Nothing to do: the list is as it was; more pages load on request.

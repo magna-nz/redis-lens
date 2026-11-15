@@ -95,6 +95,8 @@ function savedProfiles() {
         'MEMORY USAGE': noperm('MEMORY USAGE'), 'OBJECT FREQ': noperm('OBJECT FREQ'), 'MEMORY STATS': noperm('MEMORY STATS'), SLOWLOG: noperm('SLOWLOG LEN'),
         'CLIENT LIST': noperm('CLIENT LIST'), XINFO: noperm('XINFO'), PUBSUB: noperm('PUBSUB NUMPAT'),
       },
+      // Writes this user's ACL refuses: found when one is sent, then off for the session.
+      writeDenied: ['HSET', 'UNLINK'],
     }),
   ];
 }
@@ -502,11 +504,16 @@ export function createMockServer({ entra = false } = {}) {
 
   // ---------- confirms ----------
 
-  function ask(question, run) {
+  function ask(question, run, { keep = false, cancel = null } = {}) {
     confirmSeq += 1;
     const id = `${String(confirmSeq).padStart(4, '0')}${'0'.repeat(28)}`;
-    confirms.set(id, { question, run });
+    confirms.set(id, { question, run, keep, cancel });
     return [409, { confirm: { expect: question.expect ?? null, id, kind: question.kind, text: question.text } }];
+  }
+
+  /** A new run: every pending question goes but a write's, whose answer is then refused. */
+  function dropQuestions() {
+    for (const [id, c] of Array.from(confirms)) if (!c.keep) confirms.delete(id);
   }
 
   // ---------- routes ----------
@@ -775,7 +782,7 @@ export function createMockServer({ entra = false } = {}) {
   /** The patterns of the database shown, with their key counts. */
   function space() {
     const p = session.profile;
-    const specs = session.db === 0 ? SPACE : OTHER_DBS[session.db] || [];
+    const specs = (session.db === 0 ? SPACE : OTHER_DBS[session.db] || []).filter((spec) => !session.wiped.has(spec.name));
     return specs.map((spec) => ({ spec, count: spec.literal ? 1 : spec.fixed ? spec.keys : Math.max(1, Math.round(spec.keys * p.sim.scale)) }));
   }
   const dbsize = () => space().reduce((n, x) => n + x.count, 0);
@@ -961,7 +968,12 @@ export function createMockServer({ entra = false } = {}) {
   function listReply(l, from) {
     const p = session.profile;
     const rows = [];
-    for (let j = from; j < l.loaded; j += 1) rows.push(l.row(j));
+    for (let j = from; j < l.loaded; j += 1) {
+      const row = l.row(j);
+      const own = session.store.get(fromHex(row.id));
+      if (!own) rows.push(row);
+      else if (!own.gone) rows.push({ ...row, ...rowOf(own.spec, own.i, fromHex(row.id)) });
+    }
     const done = l.loaded >= l.total;
     const nodes = p.sim.nodes.length;
     return {
@@ -1028,6 +1040,8 @@ export function createMockServer({ entra = false } = {}) {
   // ---------- values ----------
 
   function findKey(raw) {
+    const own = session.store.get(raw);
+    if (own) return own.gone ? null : [own.spec, own.i];
     for (const { spec, count } of space()) {
       if (spec.literal) {
         if (spec.key(0) === raw) return [spec, 0];
@@ -1043,11 +1057,12 @@ export function createMockServer({ entra = false } = {}) {
     const p = session.profile;
     const base = {
       capped: false, cluster: isCluster(p), command: null, cut: null, done: true, error: null, field_ttls: false, field_ttls_off: null, gone: false, items: [], key: nameOf(v.raw), kind: 'other',
-      length: null, loaded: 0, loading: false, max_items: 10000, message: null, meta: null, module: null, more: false, notice: null, pages: v.pages, pattern: null, refused: [], type: null, value: null, view: v.id,
+      length: null, loaded: 0, loading: false, max_items: 10000, message: null, meta: null, module: null, more: false, notice: null, pages: v.pages, pattern: null, refused: [], rev: v.rev, type: null, value: null, view: v.id,
+      writing: !!v.writing,
     };
     if (!v.spec) return { ...base, gone: true, notice: 'The key no longer exists: it expired or was deleted.' };
     const val = v.value;
-    const out = { ...base, kind: val.kind, type: v.spec.type, meta: keyRow(v.spec, v.i), pattern: nameOf(v.spec.name), refused: refusals(p) };
+    const out = { ...base, kind: val.kind, type: v.spec.type, meta: rowOf(v.spec, v.i, v.raw), pattern: nameOf(v.spec.name), refused: refusals(p) };
     const fieldTtls = p.sim.flavor === 'redis' && p.sim.version >= '7.4';
     if (val.kind === 'string') return { ...out, command: 'GETRANGE', loaded: 1, value: render(val.raw), notice: 'The value is loaded.' };
     if (val.kind === 'module') return { ...out, command: 'BF.INFO', loaded: 1, module: val.module, notice: 'The summary is loaded.' };
@@ -1059,8 +1074,8 @@ export function createMockServer({ entra = false } = {}) {
         const [id, fields] = val.entry(n);
         items.push({ at: null, fields: fields.map(([name, value]) => ({ name, value })), index: n, name: id, ttl: null, value: null });
       } else {
-        const [name, value] = val.item(n);
-        items.push({ at: null, fields: null, index: n, name, ttl: val.kind === 'hash' && fieldTtls ? 'never' : null, value });
+        const [name, value, fieldTtl] = val.item(n);
+        items.push({ at: null, fields: null, index: n, name, ttl: val.kind === 'hash' && fieldTtls ? ttlText(fieldTtl ?? null) : null, value });
       }
     }
     const n = (x) => x.toLocaleString('en-US');
@@ -1077,9 +1092,10 @@ export function createMockServer({ entra = false } = {}) {
     if (!q.get('key') || raw === null) return [400, { error: 'a key is named by the hex of its bytes: ?key=6b6579' }];
     const found = findKey(raw);
     session.viewSeq += 1;
-    const v = { id: session.viewSeq, raw, spec: found ? found[0] : null, i: found ? found[1] : 0, loaded: 0, pages: 1, value: null };
+    const v = { id: session.viewSeq, raw, spec: found ? found[0] : null, i: found ? found[1] : 0, loaded: 0, pages: 1, value: null, rev: 0, writing: false };
     if (found) {
-      v.value = valueOf(v.spec, v.i, raw);
+      const own = session.store.get(raw);
+      v.value = own ? storedValue(own) : valueOf(v.spec, v.i, raw);
       v.loaded = v.value.length ? Math.min(v.value.length, v.value.page || v.value.length) : 1;
     }
     keep(session.views, v.id, v, 8);
@@ -1126,6 +1142,612 @@ export function createMockServer({ entra = false } = {}) {
     return [200, { field, index, name, shown: render(raw, format) }];
   }
 
+  // ---------- writes (phase 3) ----------
+  //
+  // What the session wrote is kept over the generated keyspace in `session.store`, by key:
+  // the value as it is now (its items materialised, at most 10,000 of them), its TTL, or
+  // `gone`. Every write goes through `gate()`, as the server's one write gate: read-only
+  // first, a command the server refused, then the question prod or a delete asks.
+
+  const CHANGED = 'Not sent: the connection changed since the question was asked.';
+  const STALE = 'The value was read again since the page showed it: look at it again, then try once more.';
+  const WRITING = 'The last write has not answered yet.';
+  const KEY_GONE = 'The key no longer exists.';
+  const NO_ITEM = 'There is no such item in what is loaded.';
+  const BAD_HEX = 'a value given as hex must be an even number of hex digits';
+  const BAD_TTL = 'Type a TTL such as 90s, 10m, 24h or 7d, or - to remove it.';
+  const BAD_SCORE = 'Type the score as a number, such as 1.5, or inf or -inf.';
+  const ZERO_TTL = 'A TTL of 0 would delete the key: delete the key instead.';
+  const BULK_GONE = 'That bulk action is no longer open: start it again from its pattern.';
+  const BULK_BUSY = 'A bulk action is running already: wait for it to end, or stop it first.';
+  // What every key write, database switch, analysis, connect and disconnect gets while a
+  // bulk action counts or runs.
+  const BULK_RUNS = 'A bulk action is running: wait for it to end, or stop it first.';
+  const UNDO = " This can't be undone.";
+  const NEW_TYPES = ['string', 'hash', 'list', 'set', 'zset', 'stream'];
+  const UNITS = { string: 'bytes', hash: 'fields', list: 'elements', set: 'members', zset: 'members', stream: 'entries' };
+  const ENCODINGS = { string: 'embstr', hash: 'listpack', list: 'quicklist', set: 'listpack', zset: 'listpack', stream: 'stream' };
+  let bulkSeq = 0;
+  const isErr = (x) => Array.isArray(x);
+  const n0 = (x) => x.toLocaleString('en-US');
+
+  /** A value field of a request: text as typed, or `{hex}` as its bytes. */
+  function bytesOf(x) {
+    if (typeof x === 'string') return x;
+    if (x && typeof x === 'object' && !Array.isArray(x) && Object.keys(x).length === 1 && typeof x.hex === 'string') {
+      const h = x.hex.toLowerCase();
+      if (!/^(?:[0-9a-f]{2})*$/.test(h)) return [400, { error: BAD_HEX }];
+      return (h.match(/../g) || []).map((b) => String.fromCharCode(parseInt(b, 16))).join('');
+    }
+    return [400, { error: SHAPE }];
+  }
+
+  /** A TTL as typed: seconds, `persist` for `-`, or an error (what was typed is never echoed). */
+  function ttlOf(x, zero = ZERO_TTL, bad = BAD_TTL) {
+    if (typeof x === 'number') return Number.isInteger(x) && x > 0 ? x : x === 0 ? [422, { error: zero }] : [422, { error: bad }];
+    if (typeof x !== 'string') return [400, { error: SHAPE }];
+    const t = x.trim().toLowerCase();
+    if (['-', 'persist', 'none'].includes(t)) return 'persist';
+    if (!/^(?:\d+[smhdw]?)+$/.test(t)) return [422, { error: bad }];
+    const unit = { s: 1, m: 60, h: 3600, d: 86400, w: 604800 };
+    let secs = 0;
+    for (const [, n, u] of t.matchAll(/(\d+)([smhdw]?)/g)) secs += Number(n) * unit[u || 's'];
+    return secs > 0 ? secs : [422, { error: zero }];
+  }
+
+  /** A TTL as the TUI's message gives it: `1h 30m`, `1h 00m`, `5m 07s`. */
+  function ttlSet(secs) {
+    const d = Math.floor(secs / 86400);
+    const hh = Math.floor((secs % 86400) / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    const two = (x) => String(x).padStart(2, '0');
+    if (d) return `${d}d ${two(hh)}h`;
+    if (hh) return `${hh}h ${two(m)}m`;
+    if (m) return `${m}m ${two(s)}s`;
+    return `${s}s`;
+  }
+
+  const scoreOf = (x) => (typeof x === 'string' && /^\s*(?:[+-]?inf|[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)\s*$/i.test(x) ? x.trim().toLowerCase() : null);
+  /** A value inside a question: short, and never with control characters. */
+  const said = (raw) => (raw === null || raw === undefined ? '' : /[\x00-\x1f\x7f-\xff]/.test(raw) ? `<${n0(raw.length)} bytes>` : raw.length > 40 ? `${raw.slice(0, 40)}…` : raw);
+
+  /** The key `raw` as this session wrote it, made the first time it is written. */
+  function owned(v) {
+    let s = session.store.get(v.raw);
+    if (s && !s.gone) return s;
+    const val = v.value;
+    s = { spec: v.spec, i: v.i, kind: val.kind, ttl: keyRow(v.spec, v.i).ttl_secs, page: val.page, tail: 0 };
+    if (val.kind === 'string') s.raw = val.raw;
+    else if (val.kind === 'module') s.module = val.module;
+    else {
+      const n = Math.min(val.length, 10000);
+      s.items = Array.from({ length: n }, (_, k) => (val.kind === 'stream' ? val.entry(k) : [...val.item(k)]));
+      s.tail = val.length - n;
+    }
+    session.store.set(v.raw, s);
+    return s;
+  }
+
+  /** The value a stored key holds now, in `valueOf`'s shape. */
+  function storedValue(s) {
+    if (s.kind === 'string') return { kind: 'string', raw: s.raw };
+    if (s.kind === 'module') return { kind: 'module', module: s.module };
+    return { kind: s.kind, length: s.items.length + s.tail, page: s.page, item: (n) => s.items[n], entry: (n) => s.items[n] };
+  }
+
+  /** A key's row, with what this session wrote. */
+  function rowOf(spec, i, raw = spec.key(i)) {
+    const row = keyRow(spec, i);
+    const s = session.store.get(raw);
+    if (!s || s.gone) return row;
+    const length = s.kind === 'string' ? s.raw.length : s.kind === 'module' ? row.length : s.items.length + s.tail;
+    return { ...row, ...nameOf(raw), length, ttl: ttlText(s.ttl), ttl_secs: s.ttl, type: s.spec.type };
+  }
+
+  /** A made-up pattern entry for a key this session added. */
+  const newSpec = (raw, type) => ({
+    name: raw, glob: null, literal: true, type, keys: 1, avg: 64, ttl: null, noTtl: 1, enc: ENCODINGS[type], unit: UNITS[type], len: 1, hot: 0, key: () => raw, value: null,
+  });
+
+  /** The server refusing a write for this user, once: then the command is off. */
+  function refusedOnce(cmds) {
+    const cmd = cmds.find((c) => (session.profile.sim.writeDenied || []).includes(c));
+    if (!cmd) return null;
+    if (!session.refused.includes(cmd)) {
+      session.refused.push(cmd);
+      emitState();
+    }
+    return [422, { error: `Not written: the server refused ${cmd} for this user.` }];
+  }
+
+  /**
+   * The one write gate. `op`: `cmds` (the commands sent), `text` (the command as the
+   * question gives it), `destructive`, `typed` (what prod types for a destructive one) and,
+   * for a bulk action, `ask`/`type` (its own questions). `send()` is the write.
+   */
+  function gate(op, send) {
+    const p = session.profile;
+    if (p.read_only) return [422, { error: readOnly(p) }];
+    const off = op.cmds.find((c) => session.refused.includes(c));
+    if (off) return [422, { error: `Not sent: the server refused ${off} for this user.` }];
+    const conn = connSeq;
+    const run = session.an.run;
+    const answer = () => {
+      if (!session || connSeq !== conn || session.an.run !== run) return [409, { error: CHANGED }];
+      if (session.profile.read_only) return [422, { error: readOnly(session.profile) }];
+      return send();
+    };
+    if (op.ask) {
+      const question = p.env === 'prod' ? { kind: 'type', expect: op.typed, text: op.type } : { kind: 'ask', text: op.ask };
+      return ask(question, answer, { keep: true, cancel: op.cancel });
+    }
+    if (p.env === 'prod') {
+      if (op.destructive) return ask({ kind: 'type', expect: op.typed, text: `Type ${op.typed} to send ${op.text} to ${p.name}.${UNDO}` }, answer, { keep: true });
+      return ask({ kind: 'ask', text: `Send ${op.text} to ${p.name}?` }, answer, { keep: true });
+    }
+    if (op.destructive) return ask({ kind: 'ask', text: `Send ${op.text} to ${p.name}?${UNDO}` }, answer, { keep: true });
+    return send();
+  }
+
+  /** The open value a write names, after the read-only rule and the body's shape. */
+  function writeView(body, fields, { rev = false, index = false } = {}) {
+    if (!known(body, fields) || !Number.isInteger(body.view)) return [400, { error: SHAPE }];
+    if ((rev && !Number.isInteger(body.rev)) || (index && !Number.isInteger(body.index))) return [400, { error: SHAPE }];
+    if (session.profile.read_only) return [422, { error: readOnly(session.profile) }];
+    if (bulkBusy()) return [409, { error: BULK_RUNS }];
+    if (!live()) return [409, { error: NOT_LIVE }];
+    const v = session.views.get(body.view);
+    if (!v) return [404, { error: NO_VIEW }];
+    if (v.writing) return [409, { error: WRITING }];
+    if (rev && body.rev !== v.rev) return [409, { error: STALE }];
+    if (!v.spec) return [422, { error: KEY_GONE }];
+    if (index && v.value.kind !== 'string' && v.value.kind !== 'module' && (body.index < 0 || body.index >= v.loaded)) return [422, { error: NO_ITEM }];
+    return v;
+  }
+
+  /** Sends a write: one at a time per value, refused by the server for a denied command. */
+  async function sending(v, cmds, apply) {
+    v.writing = true;
+    try {
+      await later(80);
+      if (!session || !session.views.has(v.id)) return [409, { error: NOT_LIVE }];
+      return refusedOnce(cmds) || apply();
+    } finally {
+      v.writing = false;
+    }
+  }
+
+  /** A write's reply: the value read again (when `reread`), the row read again. */
+  function written(v, { done = true, message, reply, reread = true }) {
+    if (reread && done) {
+      const s = session.store.get(v.raw);
+      v.rev += 1;
+      if (s && s.gone) v.spec = null;
+      else if (s) {
+        v.value = storedValue(s);
+        v.loaded = v.value.length ? Math.min(v.value.length, v.value.page || v.value.length) : v.value.kind === 'string' || v.value.kind === 'module' ? 1 : 0;
+        v.pages = 1;
+      }
+    }
+    return [200, { closed: false, done, key: nameOf(v.raw), message, reply, row: v.spec ? rowOf(v.spec, v.i, v.raw) : null, sent: true, value: viewReply(v) }];
+  }
+
+  /** A collection that lost its last item is deleted by the server: the key goes. */
+  function emptied(v, s) {
+    if (s.items && s.items.length + s.tail === 0) {
+      session.store.set(v.raw, { gone: true });
+      return true;
+    }
+    return false;
+  }
+
+  function editValue(body) {
+    const v = writeView(body, ['view', 'rev', 'index', 'value'], { rev: true });
+    if (isErr(v)) return v;
+    const kind = v.value.kind;
+    const index = body.index ?? 0;
+    if (!Number.isInteger(index)) return [400, { error: SHAPE }];
+    if (kind === 'stream') return [422, { error: "A stream entry can't be edited: add an entry, or delete this one." }];
+    if (kind === 'module') return [422, { error: `redis-lens does not edit values of type ${v.spec.type}.` }];
+    if (kind === 'string' ? index !== 0 : index < 0 || index >= v.loaded) return [422, { error: NO_ITEM }];
+    const value = bytesOf(body.value);
+    if (isErr(value)) return value;
+    const score = kind === 'zset' ? scoreOf(value) : null;
+    if (kind === 'zset' && score === null) return [422, { error: BAD_SCORE }];
+    const key = nameOf(v.raw).name;
+    const before = kind === 'string' ? v.value.raw : v.value.item(index);
+    const now = kind === 'string' ? before : before[1];
+    if ((kind === 'zset' ? String(Number(now)) === String(Number(score)) : now === value)) {
+      return [200, { closed: false, done: false, key: nameOf(v.raw), message: 'Not changed, so nothing was sent.', reply: null, sent: false }];
+    }
+    const op = {
+      string: { cmds: ['SET'], text: `SET ${key} ${said(value)} KEEPTTL (in MULTI/EXEC after WATCH, only if unchanged)` },
+      hash: { cmds: ['HSET'], text: `HSET ${key} ${said(before[0])} ${said(value)}` },
+      list: { cmds: ['LSET'], text: `LSET ${key} ${index} ${said(value)} (only while it is the element loaded)` },
+      set: { cmds: ['SREM', 'SADD'], text: `SREM ${key} ${said(before[1])} and SADD ${key} ${said(value)} (in MULTI/EXEC)` },
+      zset: { cmds: ['ZADD'], text: `ZADD ${key} XX ${score} ${said(before[0])}` },
+    }[kind];
+    return gate(op, () => sending(v, op.cmds, () => {
+      const s = owned(v);
+      if (kind === 'string') s.raw = value;
+      else s.items[index][1] = kind === 'zset' ? score : value;
+      return written(v, { message: 'Saved.', reply: kind === 'hash' || kind === 'zset' ? { kind: 'int', value: 0 } : { kind: 'ok' } });
+    }));
+  }
+
+  function addItem(body) {
+    const v = writeView(body, ['view', 'field', 'value', 'score']);
+    if (isErr(v)) return v;
+    const kind = v.value.kind;
+    if (!['hash', 'list', 'set', 'zset', 'stream'].includes(kind)) return [422, { error: 'Adding works on a hash, list, set, sorted set or stream: edit this value instead.' }];
+    const value = bytesOf(body.value);
+    if (isErr(value)) return value;
+    const field = body.field === undefined ? null : bytesOf(body.field);
+    if (isErr(field)) return field;
+    if ((kind === 'hash' || kind === 'stream') && !field) return [422, { error: 'Type the field.' }];
+    const score = kind === 'zset' ? scoreOf(body.score) : null;
+    if (kind === 'zset' && score === null) return [422, { error: BAD_SCORE }];
+    const key = nameOf(v.raw).name;
+    const op = {
+      hash: { cmds: ['HSETNX'], text: `HSETNX ${key} ${said(field)} ${said(value)}` },
+      list: { cmds: ['RPUSH'], text: `RPUSH ${key} ${said(value)}` },
+      set: { cmds: ['SADD'], text: `SADD ${key} ${said(value)}` },
+      zset: { cmds: ['ZADD'], text: `ZADD ${key} NX ${score} ${said(value)}` },
+      stream: { cmds: ['XADD'], text: `XADD ${key} * ${said(field)} ${said(value)}` },
+    }[kind];
+    return gate(op, () => sending(v, op.cmds, () => {
+      const s = owned(v);
+      const exists = kind === 'hash' ? (it) => it[0] === field : kind === 'set' ? (it) => it[1] === value : kind === 'zset' ? (it) => it[0] === value : () => false;
+      if (s.items.some(exists)) {
+        return written(v, { done: false, message: kind === 'hash' ? 'Not added: the field exists already. Edit it instead.' : 'Not added: the member exists already.', reply: { kind: 'int', value: 0 } });
+      }
+      if (kind === 'hash') s.items.push([field, value]);
+      else if (kind === 'set') s.items.push([null, value]);
+      else if (kind === 'zset') s.items.push([value, score]);
+      else if (kind === 'list') {
+        if (s.tail) s.tail += 1;
+        else s.items.push([null, value]);
+      } else s.items.unshift([`${Date.now()}-0`, [[field, value]]]);
+      return written(v, { message: 'Added.', reply: { kind: 'int', value: kind === 'list' ? s.items.length + s.tail : 1 } });
+    }));
+  }
+
+  function setTtl(body) {
+    const v = writeView(body, ['view', 'ttl', 'field', 'rev'], { rev: body.field !== undefined });
+    if (isErr(v)) return v;
+    const ttl = ttlOf(body.ttl);
+    if (isErr(ttl)) return ttl;
+    const key = nameOf(v.raw).name;
+    if (body.field !== undefined) {
+      if (!Number.isInteger(body.field)) return [400, { error: SHAPE }];
+      if (v.value.kind !== 'hash') return [422, { error: 'Only a hash field has a TTL of its own.' }];
+      const p = session.profile;
+      if (!(p.sim.flavor === 'redis' && p.sim.version >= '7.4')) return [422, { error: 'Field TTLs need Redis 7.4 or later, or Valkey 9.0 or later.' }];
+      if (body.field < 0 || body.field >= v.loaded) return [422, { error: NO_ITEM }];
+      const name = v.value.item(body.field)[0];
+      const op = ttl === 'persist' ? { cmds: ['HPERSIST'], text: `HPERSIST ${key} FIELDS 1 ${said(name)}` } : { cmds: ['HEXPIRE'], text: `HEXPIRE ${key} ${ttl} FIELDS 1 ${said(name)}` };
+      return gate(op, () => sending(v, op.cmds, () => {
+        const s = owned(v);
+        s.items[body.field][2] = ttl === 'persist' ? null : ttl;
+        return written(v, { message: ttl === 'persist' ? 'Field TTL removed.' : 'Field TTL set.', reply: { kind: 'int', value: 1 } });
+      }));
+    }
+    const op = ttl === 'persist' ? { cmds: ['PERSIST'], text: `PERSIST ${key}` } : { cmds: ['EXPIRE'], text: `EXPIRE ${key} ${ttl}` };
+    return gate(op, () => sending(v, op.cmds, () => {
+      const s = owned(v);
+      if (ttl === 'persist') {
+        const had = s.ttl !== null;
+        s.ttl = null;
+        return written(v, { done: had, message: had ? 'TTL removed: the key no longer expires.' : 'The key had no TTL.', reply: { kind: 'int', value: had ? 1 : 0 }, reread: false });
+      }
+      s.ttl = ttl;
+      return written(v, { message: `TTL set to ${ttlSet(ttl)}.`, reply: { kind: 'int', value: 1 }, reread: false });
+    }));
+  }
+
+  function renameKey(body) {
+    const v = writeView(body, ['view', 'name']);
+    if (isErr(v)) return v;
+    if (typeof body.name !== 'string') return [400, { error: SHAPE }];
+    if (!body.name) return [422, { error: 'Type the new name.' }];
+    const to = body.name;
+    const key = nameOf(v.raw).name;
+    const op = { cmds: ['RENAMENX'], text: `RENAMENX ${key} ${nameOf(to).name}` };
+    return gate(op, () => sending(v, op.cmds, () => {
+      if (to === v.raw || findKey(to)) {
+        return written(v, { done: false, message: `Not renamed: ${nameOf(to).name} exists already, and a rename never overwrites a key.`, reply: { kind: 'int', value: 0 }, reread: false });
+      }
+      const s = owned(v);
+      session.store.set(v.raw, { gone: true });
+      session.store.set(to, s);
+      v.raw = to;
+      return written(v, { message: `Renamed to ${nameOf(to).name}.`, reply: { kind: 'int', value: 1 }, reread: false });
+    }));
+  }
+
+  function removeItem(body) {
+    const v = writeView(body, ['view', 'rev', 'index'], { rev: true, index: true });
+    if (isErr(v)) return v;
+    const kind = v.value.kind;
+    if (!['hash', 'list', 'set', 'zset', 'stream'].includes(kind)) return [422, { error: 'Removing works on a field, element, member or entry: delete the key instead.' }];
+    const key = nameOf(v.raw).name;
+    const it = kind === 'stream' ? v.value.entry(body.index) : v.value.item(body.index);
+    const op = {
+      hash: { cmds: ['HDEL'], text: `HDEL ${key} ${said(it[0])}` },
+      list: { cmds: ['LSET', 'LREM'], text: `LSET ${key} ${body.index} <marker> then LREM ${key} 1 <marker> (only while it is the element loaded)` },
+      set: { cmds: ['SREM'], text: `SREM ${key} ${said(it[1])}` },
+      zset: { cmds: ['ZREM'], text: `ZREM ${key} ${said(it[0])}` },
+      stream: { cmds: ['XDEL'], text: `XDEL ${key} ${it[0]}` },
+    }[kind];
+    return gate({ ...op, destructive: true, typed: key }, () => sending(v, op.cmds, () => {
+      const s = owned(v);
+      s.items.splice(body.index, 1);
+      if (!emptied(v, s)) return written(v, { message: 'Deleted.', reply: { kind: 'int', value: 1 } });
+      // The last item: the server deleted the key, so the value read again is gone.
+      v.rev += 1;
+      v.spec = null;
+      return [200, { closed: false, done: true, key: nameOf(v.raw), message: 'Deleted.', reply: { kind: 'int', value: 1 }, row: null, sent: true, value: viewReply(v) }];
+    }));
+  }
+
+  function deleteKey(body) {
+    const v = writeView(body, ['view']);
+    if (isErr(v)) return v;
+    const key = nameOf(v.raw).name;
+    return gate({ cmds: ['UNLINK'], text: `UNLINK ${key}`, destructive: true, typed: key }, () => sending(v, ['UNLINK'], () => {
+      session.store.set(v.raw, { gone: true });
+      session.views.delete(v.id);
+      return [200, { closed: true, done: true, key: nameOf(v.raw), message: `Deleted ${key}.`, reply: { kind: 'int', value: 1 }, row: null, sent: true, value: null }];
+    }));
+  }
+
+  function addKey(body) {
+    if (!known(body, ['list', 'name', 'type', 'field', 'value', 'score']) || typeof body.name !== 'string' || typeof body.type !== 'string') return [400, { error: SHAPE }];
+    if (body.list !== undefined && !Number.isInteger(body.list)) return [400, { error: SHAPE }];
+    if (!NEW_TYPES.includes(body.type)) return [400, { error: 'the type must be string, hash, list, set, zset or stream' }];
+    const p = session.profile;
+    if (p.read_only) return [422, { error: readOnly(p) }];
+    if (bulkBusy()) return [409, { error: BULK_RUNS }];
+    if (!live()) return [409, { error: NOT_LIVE }];
+    if (body.list !== undefined && !session.lists.has(body.list)) return [404, { error: NO_LIST }];
+    const raw = body.name;
+    if (!raw) return [422, { error: "Type the new key's name." }];
+    const type = body.type;
+    const value = bytesOf(body.value);
+    if (isErr(value)) return value;
+    const field = body.field === undefined ? null : bytesOf(body.field);
+    if (isErr(field)) return field;
+    if ((type === 'hash' || type === 'stream') && !field) return [422, { error: 'Type the field.' }];
+    const score = type === 'zset' ? scoreOf(body.score) : null;
+    if (type === 'zset' && score === null) return [422, { error: BAD_SCORE }];
+    const key = nameOf(raw).name;
+    const cmd = { string: 'SET', hash: 'HSET', list: 'RPUSH', set: 'SADD', zset: 'ZADD', stream: 'XADD' }[type];
+    const op = {
+      cmds: [cmd],
+      text: {
+        string: `SET ${key} ${said(value)} NX`, hash: `HSET ${key} ${said(field)} ${said(value)}`, list: `RPUSH ${key} ${said(value)}`, set: `SADD ${key} ${said(value)}`,
+        zset: `ZADD ${key} ${score} ${said(value)}`, stream: `XADD ${key} * ${said(field)} ${said(value)}`,
+      }[type],
+    };
+    return gate(op, async () => {
+      await later(80);
+      if (!session) return [409, { error: NOT_LIVE }];
+      const refused = refusedOnce(op.cmds);
+      if (refused) return refused;
+      if (findKey(raw)) {
+        return [200, { closed: false, done: false, key: nameOf(raw), message: `Not added: ${key} exists already, and adding a key never overwrites one.`, reply: { kind: 'exists' }, row: null, sent: true, value: null }];
+      }
+      const spec = newSpec(raw, type);
+      const s = { spec, i: 0, kind: type, ttl: null, page: undefined, tail: 0 };
+      if (type === 'string') s.raw = value;
+      else if (type === 'hash') s.items = [[field, value]];
+      else if (type === 'list' || type === 'set') s.items = [[null, value]];
+      else if (type === 'zset') s.items = [[value, score]];
+      else s.items = [[`${Date.now()}-0`, [[field, value]]]];
+      session.store.set(raw, s);
+      session.viewSeq += 1;
+      const v = { id: session.viewSeq, raw, spec, i: 0, loaded: 1, pages: 1, value: storedValue(s), rev: 0, writing: false };
+      keep(session.views, v.id, v, 8);
+      return [200, { closed: false, done: true, key: nameOf(raw), message: `Added ${key}.`, reply: type === 'string' ? { kind: 'ok' } : { kind: 'int', value: 1 }, row: rowOf(spec, 0, raw), sent: true, value: viewReply(v) }];
+    });
+  }
+
+  // ---------- bulk actions ----------
+
+  const BULK_FIELDS = ['action', 'at', 'count', 'error', 'glob', 'id', 'lines', 'nodes', 'pattern', 'prod', 'profile', 'run', 'stage', 'summary', 'title', 'ttl', 'ttl_secs'];
+  const bulkBody = (b) => (b ? JSON.parse(JSON.stringify(Object.fromEntries(BULK_FIELDS.map((f) => [f, b[f]])))) : null);
+  const emitBulk = () => emit('bulk', { bulk: bulkBody(session && session.bulk) });
+  const bulkBusy = () => !!session && !!session.bulk && ['counting', 'running'].includes(session.bulk.stage);
+  const bulkFile = (b) => `~/.local/share/redis-lens/bulk/${b.profile}/${new Date().toISOString().replace(/[-:]/g, '').slice(0, 15)}Z-${b.action}.txt`;
+
+  function bulkSummary(b) {
+    const c = b.count;
+    const lines = b.action === 'delete'
+      ? [`Dry run: ${n0(c.matched)} keys of the pattern will be deleted with UNLINK.`]
+      : [`Dry run: ${n0(c.matched)} keys of the pattern, ${n0(c.with_ttl)} with a TTL already.`, `${n0(c.to_change)} keys without a TTL get ${b.ttl}; the others are left alone.`];
+    if (c.other_pattern) lines.push(`${n0(c.other_pattern)} other keys matched the glob but belong to other patterns: left alone.`);
+    return lines;
+  }
+
+  function startBulk(body) {
+    if (!known(body, ['pattern', 'action', 'ttl']) || typeof body.pattern !== 'string') return [400, { error: SHAPE }];
+    if (!['expire', 'delete'].includes(body.action)) return [400, { error: 'the action must be expire or delete' }];
+    if (body.action === 'delete' && body.ttl !== undefined) return [400, { error: SHAPE }];
+    const p = session.profile;
+    const cmd = body.action === 'delete' ? 'UNLINK' : 'EXPIRE';
+    if (p.read_only) return [422, { error: readOnly(p) }];
+    if (session.refused.includes(cmd)) return [422, { error: `Not sent: the server refused ${cmd} for this user.` }];
+    if (bulkBusy()) return [409, { error: BULK_BUSY }];
+    let secs = null;
+    let ttl = null;
+    if (body.action === 'expire') {
+      const t = body.ttl ?? '24h';
+      secs = ttlOf(t, 'the TTL must be at least 1s', 'not a duration: use 90s, 10m, 24h or 7d');
+      if (secs === 'persist') secs = [422, { error: 'not a duration: use 90s, 10m, 24h or 7d' }];
+      if (isErr(secs)) return secs;
+      ttl = typeof t === 'number' ? `${t}s` : t.trim();
+    }
+    if (!live()) return [409, { error: NOT_LIVE }];
+    const x = space().find(({ spec }) => hexOf(spec.name) === body.pattern);
+    if (!x) return [404, { error: 'There is no such pattern in the patterns shown: read them again.' }];
+    if (!x.spec.glob) return [422, { error: 'This pattern has no glob to walk: open its key and delete it there.' }];
+    const re = globRe(x.spec.glob);
+    const other = space().filter((y) => y.spec !== x.spec && re.test(y.spec.key(0))).reduce((n, y) => n + y.count, 0);
+    const nodes = p.sim.nodes;
+    bulkSeq += 1;
+    const b = {
+      id: bulkSeq, pattern: nameOf(x.spec.name), glob: nameOf(x.spec.glob).name, action: body.action, ttl, ttl_secs: secs,
+      title: body.action === 'expire' ? 'Set a TTL on every key of the pattern' : 'Delete every key of the pattern', profile: p.name, prod: p.env === 'prod',
+      stage: 'counting', count: { matched: 0, other_pattern: 0, to_change: 0, unreadable: 0, with_ttl: 0 }, summary: [],
+      nodes: nodes.map(([endpoint], node) => ({ endpoint, matched: 0, node })), at: nodes.length ? 0 : null, run: null, lines: [], error: false,
+      spec: x.spec, total: x.count, other, ranOn: session.an.run, conn: connSeq, stop: false,
+    };
+    session.bulk = b;
+    const steps = 6;
+    let step = 0;
+    const tickCount = () => {
+      if (!session || session.bulk !== b || b.stage !== 'counting') return;
+      step += 1;
+      const share = step / steps;
+      const matched = Math.round(b.total * share);
+      const withTtl = Math.round(matched * (1 - b.spec.noTtl));
+      Object.assign(b.count, { matched, with_ttl: withTtl, other_pattern: Math.round(b.other * share), to_change: b.action === 'delete' ? matched : matched - withTtl });
+      if (nodes.length) {
+        b.at = Math.min(nodes.length - 1, Math.floor(share * nodes.length));
+        b.nodes.forEach((n, k) => { n.matched = Math.round(matched / nodes.length) + (k === 0 ? matched % nodes.length : 0); });
+      }
+      if (step >= steps) {
+        b.summary = bulkSummary(b).filter(Boolean);
+        if (!b.count.to_change) {
+          b.stage = 'done';
+          b.lines = [b.action === 'expire' ? `Every key of ${b.pattern.name} (${n0(b.count.matched)}) has a TTL already. Nothing was sent.` : `No key of ${b.pattern.name} is left. Nothing was sent.`];
+        } else b.stage = 'counted';
+        if (nodes.length) b.at = null;
+      }
+      emitBulk();
+      if (b.stage === 'counting') later(200).then(tickCount);
+    };
+    later(200).then(tickCount);
+    return [202, { bulk: bulkBody(b) }];
+  }
+
+  function bulkEnd(b, lines, error = false) {
+    b.stage = 'done';
+    b.lines = lines;
+    b.error = error;
+    if (b.nodes.length) b.at = null;
+    emitBulk();
+  }
+
+  function bulkDone(b, head) {
+    const r = b.run;
+    const verb = b.action === 'delete' ? `deleted ${n0(r.changed)} keys of ${b.pattern.name}` : `set a TTL of ${b.ttl} on ${n0(r.changed)} keys of ${b.pattern.name}`;
+    const lines = [head(verb)];
+    if (b.action === 'expire' && r.skipped) lines.push(`${n0(r.skipped)} keys left alone: a TTL already, or gone.`);
+    if (r.failed) lines.push(`${n0(r.failed)} keys failed.`);
+    lines.push(b.nodes.length ? `Key names, each after its node and a tab: ${r.file}` : `Key names: ${r.file}`);
+    if (b.action === 'expire') lines.push('PERSIST on those keys undoes it.');
+    return lines;
+  }
+
+  function runBulk(body) {
+    if (!known(body, ['bulk']) || !Number.isInteger(body.bulk)) return [400, { error: SHAPE }];
+    const p = session.profile;
+    if (p.read_only) return [422, { error: readOnly(p) }];
+    const b = session.bulk;
+    if (!b || b.id !== body.bulk) return [404, { error: BULK_GONE }];
+    if (b.stage === 'counting') return [409, { error: 'The dry run has not finished: wait for its count.' }];
+    if (b.stage === 'running') return [409, { error: 'That bulk action has started already.' }];
+    if (b.stage === 'done') return b.run || b.count.to_change ? [404, { error: BULK_GONE }] : [422, { error: 'Nothing to run: the dry run found nothing to change.' }];
+    if (b.ranOn !== session.an.run || b.conn !== connSeq) return [409, { error: CHANGED }];
+    const cmd = b.action === 'delete' ? 'UNLINK' : 'EXPIRE';
+    const sends = b.action === 'delete' ? 'UNLINK <key>' : `EXPIRE <key> ${b.ttl_secs} NX`;
+    const nodes = b.nodes.length ? ` It runs on each of the ${b.nodes.length} primaries in turn, in slot order.` : '';
+    const undo = b.action === 'delete' ? UNDO : ' PERSIST on the keys in the key file undoes it.';
+    const what = `${b.summary.join(' ')}${nodes}${undo} Sends: ${sends} for each key of SCAN MATCH ${b.glob}, 500 at a time.`;
+    return gate({
+      cmds: [cmd], typed: b.pattern.name,
+      ask: `${b.title} ${b.pattern.name} on ${p.name}? ${what}`,
+      type: `Type ${b.pattern.name} to start: ${b.title} ${b.pattern.name} on ${p.name}. ${what}`,
+      cancel: () => {
+        if (session && session.bulk === b && b.stage === 'counted') bulkEnd(b, [CANCELLED]);
+      },
+    }, () => {
+      if (!session || session.bulk !== b || b.stage !== 'counted') return [410, { error: BULK_GONE }];
+      b.stage = 'running';
+      b.run = { changed: 0, failed: 0, file: null, moved: 0, seen: 0, sent: 0, skipped: 0, stopping: false, unreadable: 0 };
+      if (b.nodes.length) b.at = 0;
+      const total = b.count.matched;
+      const batch = Math.max(500, Math.ceil(total / 12 / 500) * 500);
+      const tickRun = () => {
+        if (!session || session.bulk !== b || b.stage !== 'running') return;
+        const r = b.run;
+        r.file = r.file || bulkFile(b);
+        if (session.profile.read_only) {
+          bulkEnd(b, bulkDone(b, (verb) => `Stopped: ${session.profile.name} is now read-only. Before that, ${verb}.`));
+          return;
+        }
+        if (b.ranOn !== session.an.run || b.conn !== connSeq) {
+          bulkEnd(b, bulkDone(b, (verb) => `Stopped: the connection changed. Before that, ${verb}.`));
+          return;
+        }
+        if ((session.profile.sim.writeDenied || []).includes(cmd)) {
+          r.failed = Math.min(total, batch);
+          r.seen = r.failed;
+          if (!session.refused.includes(cmd)) {
+            session.refused.push(cmd);
+            emitState();
+          }
+          bulkEnd(b, bulkDone(b, (verb) => `Stopped: the server refused ${cmd} for this user. Before that, ${verb}.`), true);
+          return;
+        }
+        const n = Math.min(batch, total - r.seen);
+        const change = Math.round(((r.seen + n) * b.count.to_change) / Math.max(1, total)) - r.changed;
+        r.seen += n;
+        r.changed += change;
+        r.sent += change;
+        r.skipped = r.seen - r.changed;
+        if (b.nodes.length) b.at = Math.min(b.nodes.length - 1, Math.floor((r.seen / Math.max(1, total)) * b.nodes.length));
+        if (r.seen >= total) {
+          if (b.action === 'delete') session.wiped.add(b.spec.name);
+          bulkEnd(b, bulkDone(b, (verb) => `Done: ${verb}.`));
+          return;
+        }
+        if (r.stopping) {
+          bulkEnd(b, bulkDone(b, (verb) => `Stopped after the batch: ${verb}.`));
+          return;
+        }
+        emitBulk();
+        later(250).then(tickRun);
+      };
+      later(250).then(tickRun);
+      return [202, { bulk: bulkBody(b) }];
+    });
+  }
+
+  function stopBulk() {
+    const b = session.bulk;
+    if (!b) return [200, { bulk: null }];
+    if (b.stage === 'counting') {
+      b.summary = [];
+      bulkEnd(b, ['Dry run stopped. Nothing was sent.']);
+      return [200, { bulk: bulkBody(b), text: 'Dry run stopped. Nothing was sent.' }];
+    }
+    if (b.stage === 'counted') {
+      bulkEnd(b, ['Bulk action cancelled. Nothing was sent.']);
+      return [200, { bulk: bulkBody(b), text: 'Bulk action cancelled. Nothing was sent.' }];
+    }
+    if (b.stage === 'running') {
+      b.run.stopping = true;
+      emitBulk();
+      return [200, { bulk: bulkBody(b), text: 'Stopping after the batch on its way.' }];
+    }
+    session.bulk = null;
+    emitBulk();
+    return [200, { bulk: null }];
+  }
+
   // ---------- the analysis ----------
 
   function analysisState() {
@@ -1163,14 +1785,16 @@ export function createMockServer({ entra = false } = {}) {
     const depth = body.depth ?? 'quick';
     if (!['quick', 'deep'].includes(depth)) return [400, { error: 'the depth must be quick or deep' }];
     if (running()) return [409, { error: 'An analysis is already running.' }];
+    if (bulkBusy()) return [409, { error: BULK_RUNS }];
     if (!live()) return [409, { error: STILL_CONNECTING }];
     const p = session.profile;
     const a = session.an;
     const est = estimates().find((e) => e.depth === depth);
     runSeq += 1;
     Object.assign(a, { run: runSeq, status: 'connecting', depth, sampled: null, target: null, startedAt: unix(), error: null, note: null, stop: false });
-    // A new run: the key lists, open values and pending questions go.
-    confirms.clear();
+    // A new run: the key lists, open values and pending questions go (a write's question
+    // stays, and its answer is refused as asked in another run).
+    dropQuestions();
     session.lists.clear();
     session.views.clear();
     session.names = null;
@@ -1505,6 +2129,7 @@ export function createMockServer({ entra = false } = {}) {
     if (!known(body, ['db']) || !Number.isInteger(body.db)) return [400, { error: SHAPE }];
     if (isCluster(session.profile)) return [422, { error: 'A cluster only has database 0.' }];
     if (running()) return [409, { error: 'An analysis is running: wait for it to finish, then pick a database.' }];
+    if (bulkBusy()) return [409, { error: BULK_RUNS }];
     if (!live()) return [409, { error: 'The connection is not ready yet: wait for it, then pick a database.' }];
     if (![0, 1, 3].includes(body.db)) return [422, { error: 'Pick a database the list shows (read the list first): it shows the databases with keys.' }];
     if (body.db === session.db) return [200, { db: body.db, run: null, switched: false, text: null }];
@@ -1512,7 +2137,7 @@ export function createMockServer({ entra = false } = {}) {
     Object.assign(session, { db: body.db, an: freshAnalysis(), names: null, slots: null });
     session.lists.clear();
     session.views.clear();
-    confirms.clear();
+    dropQuestions();
     emitState();
     later(200).then(() => emitOverview());
     return [202, { db: body.db, run: session.an.run, switched: true, text: `Switched to db ${body.db} for this session. The saved profile is unchanged.` }];
@@ -1520,7 +2145,8 @@ export function createMockServer({ entra = false } = {}) {
 
   const P2 = ['/api/dbs', '/api/db', '/api/browse', '/api/browse/more', '/api/keys', '/api/keys/more', '/api/find', '/api/value', '/api/value/more', '/api/value/item',
     '/api/analysis', '/api/analysis/big_keys', '/api/analysis/expiry', '/api/analysis/changes', '/api/analysis/hot_keys', '/api/analysis/nodes', '/api/analysis/slots',
-    '/api/snapshots', '/api/snapshots/compare'];
+    '/api/snapshots', '/api/snapshots/compare',
+    '/api/value/edit', '/api/value/add', '/api/value/ttl', '/api/value/rename', '/api/value/remove', '/api/value/delete', '/api/keys/add', '/api/bulk', '/api/bulk/run'];
 
   /** Phase 2's routes, or null for another route. */
   async function phase2(method, path, query, body) {
@@ -1558,6 +2184,17 @@ export function createMockServer({ entra = false } = {}) {
       case 'GET /api/snapshots': return [200, snapshotList()];
       case 'POST /api/snapshots': return saveSnapshot(body);
       case 'GET /api/snapshots/compare': return compareSnapshots(q);
+      case 'POST /api/value/edit': return editValue(body);
+      case 'POST /api/value/add': return addItem(body);
+      case 'POST /api/value/ttl': return setTtl(body);
+      case 'POST /api/value/rename': return renameKey(body);
+      case 'POST /api/value/remove': return removeItem(body);
+      case 'POST /api/value/delete': return deleteKey(body);
+      case 'POST /api/keys/add': return addKey(body);
+      case 'GET /api/bulk': return [200, { bulk: bulkBody(session.bulk) }];
+      case 'POST /api/bulk': return startBulk(body);
+      case 'DELETE /api/bulk': return stopBulk();
+      case 'POST /api/bulk/run': return runBulk(body);
       default: return [405, { error: 'method not allowed' }];
     }
   }
@@ -1582,6 +2219,7 @@ export function createMockServer({ entra = false } = {}) {
     session = {
       profile: p, docker: !!target.docker, status: 'connecting', error: null, live: 'waiting', liveError: null, connectedAt: null, picked: 0, refused: [], tail: null, monitor: null,
       db: p.db, an: freshAnalysis(), names: null, lists: new Map(), views: new Map(), listSeq: 0, viewSeq: 0, slots: null,
+      store: new Map(), wiped: new Set(), bulk: null,
     };
     emitState();
     later(600).then(() => {
@@ -1716,6 +2354,7 @@ export function createMockServer({ entra = false } = {}) {
       await later(300);
       return [200, { instances: docker.map((d) => ({ auth: d.auth, container: d.container, endpoint: d.endpoint, image: d.image, url: `redis://${d.endpoint}/0` })) }];
     }
+    if ((key === 'POST /api/connect' || key === 'POST /api/disconnect') && bulkBusy()) return [409, { error: BULK_RUNS }];
     if (key === 'POST /api/connect') return connect(body);
     if (key === 'POST /api/disconnect') {
       session = null;
@@ -1727,7 +2366,10 @@ export function createMockServer({ entra = false } = {}) {
       const held = confirms.get(parts[2]);
       confirms.delete(parts[2]);
       if (!held) return [410, { error: GONE }];
-      if (method === 'DELETE') return [200, { cancelled: true, text: CANCELLED }];
+      if (method === 'DELETE') {
+        if (held.cancel) held.cancel();
+        return [200, { cancelled: true, text: CANCELLED }];
+      }
       if (held.question.kind === 'type' && body.typed !== held.question.expect) {
         const [status, error] = held.question.mismatch || [422, 'Not sent: the name typed did not match.'];
         return [status, { error }];
