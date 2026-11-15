@@ -42,6 +42,9 @@ pub struct Table<C> {
     nodes: Vec<Node<C>>,
     /// False for a standalone server: every request goes to the one node.
     cluster: bool,
+    /// A cluster node read alone on purpose (`Profile::force_standalone`): a redirect
+    /// is answered with [`super::STANDALONE_REDIRECT`], never followed.
+    forced: bool,
     state: Mutex<State>,
 }
 
@@ -89,11 +92,25 @@ impl<C: Clone> Table<C> {
                 budget,
             }],
             cluster: false,
+            forced: false,
             state: Mutex::new(State {
                 owner: Vec::new(),
                 lost: vec![false],
             }),
         }
+    }
+
+    /// [`Table::single`] for a node of a cluster that is read alone on purpose.
+    pub fn single_forced(conn: C, budget: Arc<Budget>) -> Self {
+        Self {
+            forced: true,
+            ..Self::single(conn, budget)
+        }
+    }
+
+    /// Whether this is a cluster node read alone on purpose.
+    pub fn is_forced_standalone(&self) -> bool {
+        self.forced
     }
 
     /// A cluster's nodes, in slot order, as discovery left them.
@@ -111,6 +128,7 @@ impl<C: Clone> Table<C> {
         Self {
             nodes,
             cluster: true,
+            forced: false,
             state: Mutex::new(State { owner, lost }),
         }
     }

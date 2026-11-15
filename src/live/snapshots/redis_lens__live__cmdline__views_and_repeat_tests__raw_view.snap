@@ -1,0 +1,71 @@
+---
+source: src/live/cmdline.rs
+expression: "sampled(View::Raw)"
+---
+## HGETALL user:1 (RESP2, flat pairs)
+[array] *4
+  [bulk string] $4 "name"
+  [bulk string] $3 "Ada"
+  [bulk string] $6 "visits"
+  [bulk string] $2 "12"
+## LRANGE l 0 -1 (flat, even, not pairs)
+[array] *4
+  [bulk string] $1 "a"
+  [bulk string] $1 "b"
+  [bulk string] $1 "c"
+  [bulk string] $1 "d"
+## HGETALL over RESP3 (a map)
+[map] %2
+  [bulk string] $4 "name"
+  [bulk string] $3 "Ada"
+  [bulk string] $6 "visits"
+  [integer] :12
+## ZRANGE z 0 -1 WITHSCORES over RESP3 (pairs)
+[array] *2
+  [array] *2
+    [bulk string] $3 "ada"
+    [double] ,1.5
+  [array] *2
+    [bulk string] $3 "cyd"
+    [double] ,2
+## XRANGE s - + (arrays of arrays)
+[array] *2
+  [array] *3
+    [bulk string] $3 "1-0"
+    [array] *2
+      [bulk string] $1 "f"
+      [bulk string] $1 "v"
+    [bulk string] $5 "extra"
+  [array] *2
+    [bulk string] $3 "2-0"
+    [array] *0
+## scalars
+[array] *9
+  [null] _
+  [integer] :-7
+  [double] ,inf
+  [boolean] #t
+  [big number] (123456789012345678901234567890
+  [simple string] +OK
+  [simple string] +PONG
+  [verbatim string] =17 txt "line 1\nline 2"
+  [bulk string] $0 ""
+## a set, an error and a NOPERM inside a reply
+[array] *3
+  [set] ~2
+    [bulk string] $1 "x"
+    [bulk string] $1 "y"
+  [error] -ERR syntax error
+  [error] -NOPERM the server refused this for this user
+## a map with a key that is not a string
+[map] %1
+  [integer] :1
+  [bulk string] $3 "one"
+## control and bidi characters
+[array] *2
+  [bulk string] $25 "tab\there\x1b[31m red \u{202e}evil"
+  [bulk string] $3 "\xffa\a"
+## one integer
+[integer] :42
+## an empty array
+[array] *0

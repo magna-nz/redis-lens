@@ -889,6 +889,17 @@ impl Session {
         !self.nodes.is_empty()
     }
 
+    /// True when a cluster-mode server is read as a standalone one because the profile
+    /// says so (`force_standalone`): only that node's keys are seen. Shown as the
+    /// `standalone` mark.
+    pub fn read_alone(&self) -> bool {
+        self.profile.force_standalone
+            && self
+                .server
+                .as_ref()
+                .is_some_and(|i| i.mode == crate::model::ServerMode::Cluster)
+    }
+
     /// The picked node, on a cluster.
     pub fn picked_node(&self) -> Option<&crate::live::nodes::NodeInfo> {
         self.nodes.get(self.picked)
@@ -1276,11 +1287,17 @@ fn is_press(key: &KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
-/// `y` and `Y` copy on Patterns, TTL, Diff and Hot keys.
+/// `y` and `Y` copy on Patterns, TTL, Diff and Hot keys; `y` alone on the Slow log
+/// and Monitor.
 fn copies(screen: Screen) -> bool {
     matches!(
         screen,
-        Screen::Patterns | Screen::Ttl | Screen::Diff | Screen::HotKeys
+        Screen::Patterns
+            | Screen::Ttl
+            | Screen::Diff
+            | Screen::HotKeys
+            | Screen::SlowLog
+            | Screen::Monitor
     )
 }
 
@@ -1702,7 +1719,7 @@ impl App {
             format!(
                 "The eviction policy is {}, so Redis keeps no LFU counters. Set \
                  maxmemory-policy to allkeys-lfu or volatile-lfu to see hot keys.",
-                r.server.maxmemory_policy
+                r.server.policy_label()
             )
         } else if r.sampled_keys == 0 {
             "The analysis sampled no keys.".to_string()
@@ -1740,9 +1757,10 @@ impl App {
     pub fn is_cluster(&self) -> bool {
         self.session.as_ref().is_some_and(|s| {
             s.is_cluster()
-                || s.server
-                    .as_ref()
-                    .is_some_and(|i| i.mode == crate::model::ServerMode::Cluster)
+                || (!s.profile.force_standalone
+                    && s.server
+                        .as_ref()
+                        .is_some_and(|i| i.mode == crate::model::ServerMode::Cluster))
                 || s.report.as_ref().is_some_and(|r| r.nodes.is_some())
         })
     }
@@ -2792,6 +2810,10 @@ impl App {
             }
         };
         let text = match self.screen() {
+            // A command line has no scan command: `Y` does nothing there.
+            Screen::SlowLog | Screen::Monitor if command => return Vec::new(),
+            Screen::SlowLog => self.views.server.slow.copy_text().map(Some),
+            Screen::Monitor => self.views.server.monitor.copy_text().map(Some),
             Screen::Patterns => self.selected_pattern_label().map(of_pattern),
             Screen::Ttl => self.selected_ttl_pattern().map(of_pattern),
             Screen::Diff => self.selected_diff_pattern().map(of_pattern),
@@ -3048,6 +3070,7 @@ impl App {
             token_command: None,
             ssh: None,
             sentinel: None,
+            force_standalone: false,
             tags: Vec::new(),
         };
         if let Some(add) = self.add.as_mut() {

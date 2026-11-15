@@ -211,6 +211,7 @@ impl ValueState {
                     | Items::ZSet(_)
                     | Items::Stream(_)
                     | Items::Vector(_)
+                    | Items::Array(_)
             )
         )
     }
@@ -230,7 +231,10 @@ impl ValueState {
             Items::Hash(f) => f.get(i).map(|f| &f.value),
             Items::List(v) | Items::Set(v) | Items::Vector(v) => v.get(i),
             Items::ZSet(m) => m.get(i).map(|m| &m.member),
-            Items::Stream(_) | Items::JsonNotRead { .. } | Items::NotRead => None,
+            Items::Array(v) => v.get(i).map(|e| &e.value),
+            Items::Stream(_) | Items::Module(_) | Items::JsonNotRead { .. } | Items::NotRead => {
+                None
+            }
         }
     }
 
@@ -331,6 +335,7 @@ impl ValueState {
             Items::Vector(v) => Items::Vector(cap_vec(v, room, &mut cut)),
             Items::ZSet(v) => Items::ZSet(cap_vec(v, room, &mut cut)),
             Items::Stream(v) => Items::Stream(cap_vec(v, room, &mut cut)),
+            Items::Array(v) => Items::Array(cap_vec(v, room, &mut cut)),
             other => other,
         };
         if cut || (self.loaded() + items.len() >= MAX_ITEMS && self.next.is_some()) {
@@ -356,6 +361,10 @@ impl ValueState {
             (Some(Items::Stream(mut a)), Items::Stream(b)) => {
                 a.extend(b);
                 Items::Stream(a)
+            }
+            (Some(Items::Array(mut a)), Items::Array(b)) => {
+                a.extend(b);
+                Items::Array(a)
             }
             (_, b) => b,
         });
@@ -398,6 +407,7 @@ impl ValueState {
                     "Vector sets can't be read in pages: these are {VECTOR_SAMPLE} random elements."
                 ),
                 Some(Kind::String | Kind::Json) => "The value is loaded.".to_string(),
+                Some(k) if k.is_module() => "The value is loaded.".to_string(),
                 Some(Kind::Other(_)) => "This type's value is not read.".to_string(),
                 _ => format!(
                     "All {} items are loaded.",
@@ -410,6 +420,10 @@ impl ValueState {
     }
 
     fn copy(&mut self, act: &mut Act<'_>) {
+        if matches!(self.items, Some(Items::Module(_))) {
+            act.info("A module type's summary is not copied: only values are.");
+            return;
+        }
         if matches!(self.items, Some(Items::Stream(_))) {
             act.info("A stream entry has several fields, so y does not copy it.");
             return;
@@ -1099,10 +1113,11 @@ impl ValueState {
                 );
             }
             Items::Vector(_) => return Err("redis-lens does not edit vector sets.".into()),
+            Items::Array(_) => return Err("redis-lens does not edit arrays.".into()),
             Items::JsonNotRead { .. } => {
                 return Err("The document is not read, so it can't be edited here.".into());
             }
-            Items::NotRead => {
+            Items::NotRead | Items::Module(_) => {
                 return Err(format!(
                     "redis-lens does not edit values of type {}.",
                     value::escape(self.type_name.as_deref().unwrap_or("this"))
@@ -1370,7 +1385,7 @@ impl ValueState {
                 act.info("d deletes a field, element, member or entry: D deletes the key.");
                 return;
             }
-            Some(Items::Vector(_) | Items::NotRead) => {
+            Some(Items::Vector(_) | Items::Array(_) | Items::Module(_) | Items::NotRead) => {
                 act.info("redis-lens does not delete items of this type: D deletes the key.");
                 return;
             }
@@ -1644,6 +1659,10 @@ impl ViewState for ValueState {
             return true;
         }
         match plain(&key) {
+            Some('f') if matches!(self.items, Some(Items::Module(_))) => {
+                act.info("A module type's summary has no formats: f works on values.");
+                true
+            }
             Some('f') => {
                 match self.format_source() {
                     Some(raw) => {
@@ -2111,10 +2130,14 @@ mod tests {
     #[test]
     fn other_types_json_and_vector_sets() {
         let (mut app, id, _) = open(row("idx:x", KeyType::Other, None, Some(80)));
-        testing::reply(&mut app, id, page(Some("TSDB-TYPE"), Items::NotRead, None));
+        testing::reply(
+            &mut app,
+            id,
+            page(Some("custom-TYPE"), Items::NotRead, None),
+        );
         let all = text(&testing::render(&app, 120, 36));
         assert!(
-            all.contains("redis-lens does not read values of type TSDB-TYPE."),
+            all.contains("redis-lens does not read values of type custom-TYPE."),
             "{all}"
         );
         let (mut app, id, req) = open(row("doc:1", KeyType::Json, None, None));
@@ -3274,5 +3297,226 @@ mod tests {
             "value_writes_on_120x36",
             testing::render(&app, 120, 36).backend()
         );
+    }
+
+    // ---- module types and arrays --------------------------------------------------
+
+    use crate::live::values::{Element, Module, Sample};
+
+    fn info(pairs: &[(&str, &str)]) -> Vec<(Raw, Raw)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (Raw::from(*k), Raw::from(*v)))
+            .collect()
+    }
+
+    fn time_series() -> Module {
+        Module {
+            info: info(&[
+                ("totalSamples", "40"),
+                ("memoryUsage", "5336"),
+                ("firstTimestamp", "1700000000000"),
+                ("lastTimestamp", "1700000039000"),
+                ("retentionTime", "3600000"),
+                ("chunkCount", "1"),
+                ("duplicatePolicy", "block"),
+                ("labels", "sensor=temp, room=kitchen"),
+                ("sourceKey", ""),
+                ("rules", "temp:avg 60000 AVG 0"),
+            ]),
+            samples: (0..40)
+                .rev()
+                .map(|i| Sample {
+                    ts: 1_700_000_000_000 + i * 1000,
+                    value: Raw::from(format!("{}.5", 20 + (i % 7)).as_str()),
+                })
+                .collect(),
+            ..Module::default()
+        }
+    }
+
+    fn open_module(type_name: &str, m: Module) -> App {
+        let (mut app, id, req) = open(row("mod:1", KeyType::Other, None, Some(4_096)));
+        assert_eq!(req.kind, Kind::Other("other".into()));
+        testing::reply(
+            &mut app,
+            id,
+            page(Some(type_name), Items::Module(Box::new(m)), None),
+        );
+        app
+    }
+
+    #[test]
+    fn a_time_series_shows_its_info_a_sparkline_and_its_samples() {
+        let mut app = open_module("TSDB-TYPE", time_series());
+        assert_eq!(app.views.value.kind(), Some(Kind::TimeSeries));
+        snap(&app, "timeseries");
+        let all = text(&testing::render(&app, 120, 36));
+        assert!(
+            all.contains("2023-11-14 22:13:20.000 · 1700000000000"),
+            "{all}"
+        );
+        assert!(all.contains("Last 40 samples, oldest to newest"), "{all}");
+        // The move keys scroll the summary; n, f and y say what they do here.
+        app.handle_key(key(KeyCode::End));
+        assert!(app.views.value.scroll > 0);
+        app.handle_key(ch('n'));
+        assert_eq!(notice(&app), "The value is loaded.");
+        app.handle_key(ch('f'));
+        assert!(notice(&app).contains("no formats"), "{}", notice(&app));
+        app.handle_key(ch('y'));
+        assert!(notice(&app).contains("not copied"), "{}", notice(&app));
+    }
+
+    #[test]
+    fn bloom_cuckoo_cms_topk_and_tdigest_panels() {
+        let bloom = Module {
+            info: info(&[
+                ("Capacity", "100"),
+                ("Size", "240"),
+                ("Number of filters", "1"),
+                ("Number of items inserted", "1"),
+                ("Expansion rate", "2"),
+            ]),
+            ..Module::default()
+        };
+        for t in ["MBbloom--", "bloomfltr"] {
+            let app = open_module(t, bloom.clone());
+            assert_eq!(app.views.value.kind(), Some(Kind::Bloom));
+        }
+        snap(&open_module("MBbloom--", bloom), "bloom");
+        let top = Module {
+            info: info(&[("k", "3"), ("width", "8"), ("depth", "7"), ("decay", "0.9")]),
+            top: vec![
+                (Raw::from("page:/home"), Raw::from("3")),
+                (Raw::from("page:/cart"), Raw::from("2")),
+                (Raw::from("page:/\x1b[2J"), Raw::from("1")),
+            ],
+            ..Module::default()
+        };
+        snap(&open_module("TopK-TYPE", top), "topk");
+        let td = Module {
+            info: info(&[("Compression", "100"), ("Observations", "6")]),
+            stats: vec![
+                ("p50", Raw::from("4")),
+                ("p90", Raw::from("100")),
+                ("p99", Raw::from("100")),
+                ("min", Raw::from("1")),
+                ("max", Raw::from("100")),
+            ],
+            missing: vec!["Maximum not read: the server refused TDIGEST.MAX for this user.".into()],
+            ..Module::default()
+        };
+        snap(&open_module("TDIS-TYPE", td), "tdigest");
+        for (t, k) in [("MBbloomCF", Kind::Cuckoo), ("CMSk-TYPE", Kind::Cms)] {
+            let app = open_module(t, Module::default());
+            assert_eq!(app.views.value.kind(), Some(k));
+        }
+    }
+
+    #[test]
+    fn a_refused_or_missing_module_command_is_one_line() {
+        let m = Module {
+            unavailable: Some(
+                "Time series not read: the server refused TS.INFO for this user.".into(),
+            ),
+            ..Module::default()
+        };
+        let app = open_module("TSDB-TYPE", m);
+        snap(&app, "module_unavailable");
+        let all = text(&testing::render(&app, 120, 36));
+        assert!(all.contains("Time series not read: the server refused TS.INFO"));
+        assert!(!all.contains('✗'), "not an error screen: {all}");
+    }
+
+    #[test]
+    fn an_array_lists_its_elements_by_index_and_pages_on() {
+        let (mut app, id, _) = open(row("arr:1", KeyType::Other, None, Some(190)));
+        let items = Items::Array(
+            [0u64, 1, 2, 1000]
+                .iter()
+                .map(|&i| Element {
+                    index: i,
+                    value: Raw::from(format!("v{i}").as_str()),
+                })
+                .collect(),
+        );
+        testing::reply(
+            &mut app,
+            id,
+            page(Some("array"), items, Some(At::Index(1001))),
+        );
+        assert_eq!(app.views.value.kind(), Some(Kind::Array));
+        snap(&app, "array");
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.views.value.selected_value(), Some(&Raw::from("v1000")));
+        let effects = app.handle_key(ch('n'));
+        let (_, req) = one_request(&effects);
+        assert_eq!((req.kind, req.at), (Kind::Array, Some(At::Index(1001))));
+        app.handle_key(ch('e'));
+        assert_eq!(notice(&app), "redis-lens does not edit arrays.");
+    }
+
+    #[test]
+    fn module_values_never_reach_debug() {
+        let m = Module {
+            info: info(&[("labels", MARK)]),
+            top: vec![(Raw::from(MARK), Raw::from("1"))],
+            samples: vec![Sample {
+                ts: 1,
+                value: Raw::from(MARK),
+            }],
+            ..Module::default()
+        };
+        let app = open_module("TopK-TYPE", m);
+        let dbg = format!("{:?}", app.views.value);
+        assert!(!crate::value::leaks(&dbg, MARK), "{dbg}");
+    }
+
+    /// The footer of a module type's summary (TimeSeries and the like) has no `f Format`
+    /// and no `y Copy`: neither does anything there.
+    #[test]
+    fn a_module_summary_footer_has_no_format_or_copy() {
+        let (mut app, id, _) = open(row("ts:1", KeyType::Other, None, Some(80)));
+        testing::reply(&mut app, id, page(Some("TSDB-TYPE"), Items::NotRead, None));
+        let all = text(&testing::render(&app, 120, 36));
+        let footer = all.lines().rev().find(|l| l.contains("Back")).unwrap_or("");
+        assert!(
+            !footer.contains("Format") && !footer.contains("Copy"),
+            "{footer}"
+        );
+        snap(&app, "module_summary_footer");
+    }
+
+    /// A cluster-mode server read with `force_standalone` carries a `standalone` mark in
+    /// the header; without the field, or on a plain standalone server, there is none.
+    #[test]
+    fn header_marks_a_cluster_node_read_alone() {
+        use crate::model::ServerMode;
+        let header = |app: &App| {
+            text(&testing::render(app, 120, 36))
+                .lines()
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let (mut app, _, _) = open(row("k", KeyType::String, Some(2), Some(80)));
+        let s = app.session.as_mut().unwrap();
+        let mut server = s
+            .server
+            .clone()
+            .unwrap_or_else(crate::tui::fixtures::server);
+        server.mode = ServerMode::Cluster;
+        s.server = Some(server);
+        assert!(!header(&app).contains("standalone"), "{}", header(&app));
+        let s = app.session.as_mut().unwrap();
+        s.profile.force_standalone = true;
+        assert!(s.read_alone());
+        assert!(header(&app).contains("standalone"), "{}", header(&app));
+        // Not a cluster node: nothing to mark.
+        let s = app.session.as_mut().unwrap();
+        s.server.as_mut().unwrap().mode = ServerMode::Standalone;
+        assert!(!s.read_alone());
+        assert!(!header(&app).contains("standalone"), "{}", header(&app));
     }
 }

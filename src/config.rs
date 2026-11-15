@@ -155,6 +155,17 @@ impl Config {
         Ok(())
     }
 
+    /// Turns "force standalone" on or off for profile `name`; nothing else changes.
+    pub fn set_force_standalone(&mut self, name: &str, on: bool) -> Result<(), ConfigError> {
+        let p = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.name == name)
+            .ok_or_else(|| ConfigError::NotFound(name.to_string()))?;
+        p.force_standalone = on;
+        Ok(())
+    }
+
     /// Replaces the tags of profile `name`; nothing else changes.
     pub fn set_tags(&mut self, name: &str, tags: Vec<String>) -> Result<(), ConfigError> {
         let p = self
@@ -276,6 +287,7 @@ mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            force_standalone: false,
             tags: Vec::new(),
         }
     }
@@ -596,5 +608,63 @@ mod tests {
         if let Ok(p) = Config::default_path() {
             assert!(p.ends_with("config.toml"));
         }
+    }
+
+    #[test]
+    fn force_standalone_round_trips_and_is_absent_when_off() {
+        let dir = temp_dir("standalone");
+        let path = dir.join("config.toml");
+        let mut forced = profile("a", 7000);
+        forced.force_standalone = true;
+        let mut c = Config::default();
+        c.add(forced, false).unwrap();
+        c.add(profile("b", 7001), false).unwrap();
+        c.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("force_standalone").count(), 1, "{text}");
+        assert!(text.contains("force_standalone = true"), "{text}");
+        let back = Config::load(&path).unwrap();
+        assert_eq!(back, c);
+        assert!(back.get("a").unwrap().force_standalone);
+        assert!(!back.get("b").unwrap().force_standalone);
+        // Setting it changes nothing else, and off writes no key.
+        let mut c = back.clone();
+        c.set_force_standalone("a", false).unwrap();
+        c.set_force_standalone("b", true).unwrap();
+        assert!(matches!(
+            c.set_force_standalone("nope", true),
+            Err(ConfigError::NotFound(_))
+        ));
+        let mut expect_a = back.get("a").unwrap().clone();
+        expect_a.force_standalone = false;
+        let mut expect_b = back.get("b").unwrap().clone();
+        expect_b.force_standalone = true;
+        assert_eq!(c.profiles, vec![expect_a, expect_b]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A config file written before the field existed loads with it off.
+    #[test]
+    fn old_files_load_without_force_standalone() {
+        let dir = temp_dir("standalone-old");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[[profile]]\nname = \"old\"\nenv = \"stage\"\nprefer_replica = true\n[profile.endpoint]\nhost = \"h\"\nport = 6379\ntls = false\n",
+        )
+        .unwrap();
+        let c = Config::load(&path).unwrap();
+        let p = c.get("old").unwrap();
+        assert!(!p.force_standalone);
+        assert!(p.prefer_replica);
+        // Saving it again adds nothing.
+        c.save(&path).unwrap();
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("force_standalone")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

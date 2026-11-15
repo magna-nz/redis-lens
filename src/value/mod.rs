@@ -13,20 +13,31 @@
 //! - **Bounded.** Decompression stops at [`MAX_DECOMPRESSED`] bytes, and the renderers
 //!   at [`MAX_LINES`] lines, whatever the input.
 //!
-//! The flow: [`decode`] undoes compression (gzip, zlib, LZ4 frame, zstd) and detects
-//! the format (JSON, MessagePack, UTF-8 text, otherwise hex); [`render`] draws it in the
-//! detected format or the one `f` picked; [`preview`] is the one-line form for list
-//! cells; [`copy_text`] is what `y` copies.
+//! The flow: [`decode`] undoes compression (gzip, zlib, LZ4 frame, zstd, Snappy) and
+//! detects the format (Java serialization, Pickle, JSON, PHP `serialize()`, MessagePack,
+//! UTF-8 text, otherwise hex); [`render`] draws it in the detected format or the one `f`
+//! picked; [`preview`] is the one-line form for list cells; [`copy_text`] is what `y`
+//! copies.
+//!
+//! PHP, Pickle, Protobuf and Java are drawn as trees (`tree.rs`) by readers written for
+//! untrusted bytes: each bounds its depth, its item count and its output, never builds
+//! or calls anything the value names, and never panics.
 
 use std::fmt;
 use std::fmt::Write as _;
 
 mod compress;
+mod java;
 mod json;
 mod lines;
 mod memo;
+mod php;
+mod pickle;
+mod protobuf;
+mod snappy;
 #[cfg(test)]
 mod tests;
+mod tree;
 
 /// Test helper: `text` (some `Debug`, notice or snapshot output) holds `mark` in any
 /// form a value could leak in: as text, as the decimal list a derived `Debug` of its
@@ -138,28 +149,55 @@ pub enum Format {
     Hex,
     Json,
     MsgPack,
+    /// PHP `serialize()`.
+    Php,
+    /// Python Pickle, protocols 0 to 5.
+    Pickle,
+    /// Protobuf wire format, without a schema. Never detected: only picked with `f`.
+    Protobuf,
+    /// Java serialization (`AC ED 00 05`), read in part.
+    Java,
 }
 
 impl Format {
-    pub const ALL: [Format; 4] = [Format::Text, Format::Hex, Format::Json, Format::MsgPack];
+    pub const ALL: [Format; 8] = [
+        Format::Text,
+        Format::Hex,
+        Format::Json,
+        Format::MsgPack,
+        Format::Php,
+        Format::Pickle,
+        Format::Protobuf,
+        Format::Java,
+    ];
 
-    /// For the panel title and the notice: `text`, `hex`, `JSON`, `MessagePack`.
+    /// For the panel title and the notice: `text`, `hex`, `JSON`, `MessagePack`, `PHP`,
+    /// `Pickle`, `Protobuf`, `Java`.
     pub fn label(self) -> &'static str {
         match self {
             Self::Text => "text",
             Self::Hex => "hex",
             Self::Json => "JSON",
             Self::MsgPack => "MessagePack",
+            Self::Php => "PHP",
+            Self::Pickle => "Pickle",
+            Self::Protobuf => "Protobuf",
+            Self::Java => "Java",
         }
     }
 
-    /// The next format for `f`: text → hex → JSON → MessagePack → text.
+    /// The next format for `f`: text → hex → JSON → MessagePack → PHP → Pickle →
+    /// Protobuf → Java → text.
     pub fn next(self) -> Self {
         match self {
             Self::Text => Self::Hex,
             Self::Hex => Self::Json,
             Self::Json => Self::MsgPack,
-            Self::MsgPack => Self::Text,
+            Self::MsgPack => Self::Php,
+            Self::Php => Self::Pickle,
+            Self::Pickle => Self::Protobuf,
+            Self::Protobuf => Self::Java,
+            Self::Java => Self::Text,
         }
     }
 }
@@ -171,16 +209,19 @@ pub enum Compression {
     Zlib,
     Lz4,
     Zstd,
+    /// Snappy, framed (by its stream identifier) or a raw block (see [`decode`]).
+    Snappy,
 }
 
 impl Compression {
-    /// For the panel: `gzip`, `zlib`, `LZ4`, `zstd`.
+    /// For the panel: `gzip`, `zlib`, `LZ4`, `zstd`, `Snappy`.
     pub fn label(self) -> &'static str {
         match self {
             Self::Gzip => "gzip",
             Self::Zlib => "zlib",
             Self::Lz4 => "LZ4",
             Self::Zstd => "zstd",
+            Self::Snappy => "Snappy",
         }
     }
 }
@@ -216,39 +257,100 @@ impl fmt::Debug for Decoded {
     }
 }
 
-/// Undoes compression and detects the format (spec "Formats"): gzip, zlib, LZ4 frame and
-/// zstd first; then JSON, MessagePack, UTF-8 text, otherwise hex.
+/// Undoes compression and detects the format (spec "Formats"): gzip, zlib, LZ4 frame,
+/// zstd and framed Snappy first, by their magic; then Java serialization, Pickle, JSON,
+/// PHP `serialize()`, MessagePack, UTF-8 text, otherwise hex.
 ///
 /// Only one layer of compression is undone. Bytes that start with a compression's
 /// magic but do not decompress are kept as they are, with `compression: None`.
-/// Detection: JSON when the bytes (trimmed of ASCII whitespace) are one complete JSON
-/// object or array (a bare number, string or word is text); MessagePack when they are
-/// not UTF-8 and are exactly one MessagePack map or array; text when they are UTF-8
-/// (when decompression was cut, an incomplete character at the end is allowed);
-/// otherwise hex.
+/// Detection: Java when the bytes start with `AC ED 00 05`; Pickle when they start
+/// with `PROTO` 2 to 5 and are one complete pickle; JSON when the bytes (trimmed of
+/// ASCII whitespace) are one complete JSON object or array (a bare number, string or
+/// word is text); PHP when they are exactly one serialized array or object (`a:`,
+/// `O:`, `C:`); MessagePack when they are not UTF-8 and are exactly one MessagePack
+/// map or array; text when they are UTF-8 (when decompression was cut, an incomplete
+/// character at the end is allowed); otherwise hex. Protobuf is never detected.
+///
+/// A raw Snappy block has no magic. Bytes that would be hex are tried as one, and
+/// shown decompressed when the whole block is valid and what it holds is longer than
+/// the bytes or is detected as something other than hex.
 pub fn decode(raw: &[u8]) -> Decoded {
-    let (compression, bytes, truncated) = match compress::decompress(raw) {
-        Some((c, bytes, truncated)) => (Some(c), bytes, truncated),
-        None => (None, raw.to_vec(), false),
-    };
-    let detected = detect(&bytes, truncated);
+    if let Some((c, bytes, truncated)) = compress::decompress(raw) {
+        let detected = detect(&bytes, truncated);
+        return Decoded {
+            compression: Some(c),
+            truncated,
+            detected,
+            bytes,
+        };
+    }
+    let detected = detect(raw, false);
+    if detected == Format::Hex
+        && let Some((bytes, truncated)) = compress::raw_snappy(raw)
+    {
+        let inner = detect(&bytes, truncated);
+        if bytes.len() > raw.len() || inner != Format::Hex {
+            return Decoded {
+                compression: Some(Compression::Snappy),
+                truncated,
+                detected: inner,
+                bytes,
+            };
+        }
+    }
     Decoded {
-        compression,
-        truncated,
+        compression: None,
+        truncated: false,
         detected,
-        bytes,
+        bytes: raw.to_vec(),
     }
 }
 
 fn detect(bytes: &[u8], truncated: bool) -> Format {
+    if java::detect(bytes) {
+        return Format::Java;
+    }
+    if pickle::detect(bytes) {
+        return Format::Pickle;
+    }
     match std::str::from_utf8(bytes) {
         Ok(s) if json::is_json_document(s) => Format::Json,
+        Ok(_) if php::is_container(bytes) => Format::Php,
         Ok(_) => Format::Text,
+        Err(_) if php::is_container(bytes) => Format::Php,
         Err(_) if json::is_msgpack_container(bytes) => Format::MsgPack,
         // Cut in the middle of a character by the decompression cap.
         Err(e) if truncated && e.error_len().is_none() => Format::Text,
         Err(_) => Format::Hex,
     }
+}
+
+/// `bytes` drawn by the reader for the tree format `format` into `out`. False when
+/// they are not valid in it.
+fn tree_of(bytes: &[u8], format: Format, out: &mut tree::Tree) -> bool {
+    match format {
+        Format::Php => php::render(bytes, out),
+        Format::Pickle => pickle::render(bytes, out),
+        Format::Protobuf => protobuf::render(bytes, out),
+        Format::Java => java::render(bytes, out),
+        Format::Text | Format::Hex | Format::Json | Format::MsgPack => false,
+    }
+}
+
+/// Whether `bytes` are valid in the tree format `format`, without drawing them.
+fn tree_ok(bytes: &[u8], format: Format) -> bool {
+    match format {
+        Format::Protobuf => protobuf::valid(bytes),
+        Format::Java => java::detect(bytes),
+        f => tree_of(bytes, f, &mut tree::Tree::with_limit(0)),
+    }
+}
+
+/// The one-line form of a tree format, escaped, at most about `limit` bytes.
+fn compact_tree(bytes: &[u8], format: Format, limit: usize) -> String {
+    let mut t = tree::Tree::with_limit(limit.saturating_add(1));
+    tree_of(bytes, format, &mut t);
+    escape(&t.compact(limit))
 }
 
 /// The format `d` is drawn or copied in when `format` is asked for, and the note when
@@ -260,6 +362,7 @@ fn resolve(d: &Decoded, format: Format) -> (Format, Option<&'static str>) {
         Format::Text | Format::Hex => true,
         Format::Json => utf8.is_some_and(json::is_json),
         Format::MsgPack => json::msgpack_value(&d.bytes).is_some(),
+        f => tree_ok(&d.bytes, f),
     };
     if ok {
         return (format, None);
@@ -267,6 +370,14 @@ fn resolve(d: &Decoded, format: Format) -> (Format, Option<&'static str>) {
     let note = match (format, utf8.is_some()) {
         (Format::Json, true) => "not valid JSON, shown as text",
         (Format::Json, false) => "not valid JSON, shown as hex",
+        (Format::Php, true) => "not valid PHP serialize, shown as text",
+        (Format::Php, false) => "not valid PHP serialize, shown as hex",
+        (Format::Pickle, true) => "not valid Pickle, shown as text",
+        (Format::Pickle, false) => "not valid Pickle, shown as hex",
+        (Format::Protobuf, true) => "not valid Protobuf, shown as text",
+        (Format::Protobuf, false) => "not valid Protobuf, shown as hex",
+        (Format::Java, true) => "not Java serialization, shown as text",
+        (Format::Java, false) => "not Java serialization, shown as hex",
         (_, true) => "not valid MessagePack, shown as text",
         (_, false) => "not valid MessagePack, shown as hex",
     };
@@ -312,7 +423,9 @@ impl fmt::Debug for Rendered {
 /// - hex: offset, hex and the printable ASCII beside it, 16, 8 or 4 bytes a line,
 ///   the most that fit in `width`;
 /// - JSON: pretty-printed with two-space indents;
-/// - MessagePack: decoded and drawn like pretty JSON.
+/// - MessagePack: decoded and drawn like pretty JSON;
+/// - PHP, Pickle, Protobuf and Java: a tree, a part a line, indented two spaces a
+///   level (up to 16 levels), with a last line saying so when the tree was cut.
 ///
 /// When `d` isn't valid in `format` (JSON asked for bytes that are not JSON, say), it
 /// is drawn as text if it is UTF-8, else as hex, and [`Rendered::note`] says so.
@@ -346,6 +459,20 @@ pub fn render(d: &Decoded, format: Format, width: usize) -> Rendered {
                 let mut s = String::new();
                 json::msgpack_to_json(&v, &mut s, usize::MAX);
                 pretty_lines(&s, &mut sink);
+            }
+        }
+        f => {
+            let mut t = tree::Tree::new();
+            tree_of(&d.bytes, f, &mut t);
+            for (depth, text) in t.lines() {
+                // Indents stop growing past 16 levels, so a deep line keeps some room.
+                sink.spaces(2 * (*depth).min(16));
+                sink.str(text);
+                sink.break_line();
+            }
+            if t.is_cut() {
+                sink.str("… the rest is not shown: too many parts");
+                sink.break_line();
             }
         }
     }
@@ -442,6 +569,7 @@ pub fn preview(raw: &[u8], max_chars: usize) -> String {
             let n = d.bytes.len().min(max_chars / 3 + 2);
             hex_digits(&d.bytes[..n], " ")
         }
+        f => compact_tree(&d.bytes, f, limit),
     };
     cut(s, max_chars)
 }
@@ -471,6 +599,8 @@ pub enum CopyRefusal {
 /// - hex: the hex digits, no spaces;
 /// - JSON and MessagePack: the value as compact one-line JSON (which escapes control
 ///   characters inside strings);
+/// - PHP, Pickle, Protobuf and Java: the tree on one line, each part's children in
+///   `{…}` after it, control characters escaped;
 ///
 /// falling back the way [`render`] does when `d` isn't valid in `format`.
 ///
@@ -490,6 +620,7 @@ pub fn copy_text(d: &Decoded, format: Format) -> Result<String, CopyRefusal> {
             usize::MAX,
         )),
         Format::MsgPack => Ok(compact_msgpack(&d.bytes, usize::MAX).unwrap_or_default()),
+        f => Ok(compact_tree(&d.bytes, f, usize::MAX)),
     }
 }
 

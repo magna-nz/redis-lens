@@ -419,6 +419,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("redis-lens-diff-pre-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let report = ScanReport {
+            note: None,
             profile: "p".into(),
             taken_at_unix: 100,
             server: ServerInfo {

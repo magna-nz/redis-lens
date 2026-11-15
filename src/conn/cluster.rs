@@ -337,6 +337,10 @@ pub(crate) fn merge_permissions(reports: &[PermissionReport]) -> PermissionRepor
 /// A cluster only has database 0: a profile with another `db` is refused with an error
 /// before any other node is connected to.
 ///
+/// A profile with [`Profile::force_standalone`] is never discovered either: its
+/// endpoint is connected to, `CLUSTER SHARDS` and `CLUSTER SLOTS` are not sent, and
+/// the result is [`ScanTargets::Single`] on that one node (no replica step).
+///
 /// A Sentinel profile is never a cluster: its primary is asked from the Sentinels and
 /// checked (a cluster node is refused), and its `endpoint` is never dialled.
 pub async fn connect_targets(
@@ -372,6 +376,14 @@ pub async fn connect_targets(
             return Err(e);
         }
     };
+    if profile.force_standalone {
+        // Force standalone: the seed alone, whatever it is. No `CLUSTER SHARDS` or
+        // `CLUSTER SLOTS`, no replica step (a replica is another node), no slot routing.
+        return Ok(ScanTargets::Single {
+            conn: seed,
+            target: ScanTarget::Primary,
+        });
+    }
     if !is_cluster(&mut seed).await {
         if profile.prefer_replica {
             // The replica step of `connect_for_scan`, on the seed's connection.
@@ -2319,5 +2331,120 @@ mod tests {
                 proptest::collection::vec((inner.clone(), inner), 0..4).prop_map(Value::Map),
             ]
         })
+    }
+
+    // -- Force standalone ----------------------------------------------------------
+
+    /// A server that says it is a cluster node and records every command it is sent
+    /// (its first two words, upper case).
+    async fn cluster_node_that_records() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&log);
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let (r, mut w) = sock.into_split();
+                    let mut r = BufReader::new(r);
+                    loop {
+                        let mut line = String::new();
+                        if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let Some(n) = line.trim().strip_prefix('*') else {
+                            continue;
+                        };
+                        let n: usize = n.parse().unwrap_or(0);
+                        let mut words = Vec::new();
+                        for _ in 0..n {
+                            let mut len = String::new();
+                            let _ = r.read_line(&mut len).await;
+                            let len: usize =
+                                len.trim().trim_start_matches('$').parse().unwrap_or(0);
+                            let mut buf = vec![0u8; len + 2];
+                            let _ = r.read_exact(&mut buf).await;
+                            words.push(String::from_utf8_lossy(&buf[..len]).to_uppercase());
+                        }
+                        let name = words.iter().take(2).cloned().collect::<Vec<_>>().join(" ");
+                        seen.lock().unwrap().push(name);
+                        let reply: &[u8] = match words.first().map(String::as_str) {
+                            Some("INFO") => {
+                                let body =
+                                    "# Server\r\nredis_version:7.2.0\r\nredis_mode:cluster\r\n";
+                                let out = format!("${}\r\n{body}\r\n", body.len());
+                                if w.write_all(out.as_bytes()).await.is_err() {
+                                    return;
+                                }
+                                continue;
+                            }
+                            Some("CLUSTER") => b"-ERR no cluster here\r\n",
+                            _ => b"+OK\r\n",
+                        };
+                        if w.write_all(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, log)
+    }
+
+    fn fake_profile(port: u16, force_standalone: bool) -> Profile {
+        Profile {
+            name: "node".into(),
+            env: crate::model::Env::Local,
+            endpoint: Endpoint {
+                host: "127.0.0.1".into(),
+                port,
+                tls: false,
+            },
+            db: 0,
+            auth: crate::model::Auth::None,
+            read_only: None,
+            prefer_replica: false,
+            provider: None,
+            token_command: None,
+            ssh: None,
+            sentinel: None,
+            force_standalone,
+            tags: Vec::new(),
+        }
+    }
+
+    /// With the field on, a node that says `redis_mode:cluster` is taken as one
+    /// standalone server and is sent neither `INFO` (the cluster check) nor any
+    /// `CLUSTER` command.
+    #[tokio::test]
+    async fn force_standalone_skips_discovery() {
+        let (port, log) = cluster_node_that_records().await;
+        let store = crate::secrets::MemoryStore::default();
+        let t = connect_targets(&fake_profile(port, true), &store)
+            .await
+            .map_err(|e| e.to_string());
+        assert!(matches!(t, Ok(ScanTargets::Single { .. })), "{:?}", t.err());
+        let sent = log.lock().unwrap().clone();
+        assert!(
+            !sent
+                .iter()
+                .any(|c| c.starts_with("CLUSTER") || c.starts_with("INFO")),
+            "{sent:?}"
+        );
+    }
+
+    /// Without it the same node is discovered: `CLUSTER SHARDS` is sent.
+    #[tokio::test]
+    async fn without_force_standalone_the_cluster_is_discovered() {
+        let (port, log) = cluster_node_that_records().await;
+        let store = crate::secrets::MemoryStore::default();
+        let _ = connect_targets(&fake_profile(port, false), &store).await;
+        let sent = log.lock().unwrap().clone();
+        assert!(sent.iter().any(|c| c == "CLUSTER SHARDS"), "{sent:?}");
     }
 }

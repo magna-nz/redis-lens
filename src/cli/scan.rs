@@ -103,9 +103,10 @@ pub async fn scan_profile_with_target(
     let target = targets.target();
     let perms = targets.check_permissions().await;
     let opts = scan_options(profile, sample, match_glob, max_rate);
-    let report =
+    let mut report =
         scan::cluster::scan_targets(&profile.name, &mut targets, &opts, &perms, progress, None)
             .await?;
+    report.note_standalone_read(profile);
     Ok((report, perms, target))
 }
 
@@ -145,6 +146,7 @@ pub(crate) fn profile_in(env: crate::model::Env) -> Profile {
         token_command: None,
         ssh: None,
         sentinel: None,
+        force_standalone: false,
         tags: Vec::new(),
     }
 }
@@ -278,7 +280,7 @@ pub fn render_table_for(
         "Memory:  {} used of {}   eviction: {}",
         format::bytes(s.used_memory),
         limit,
-        s.maxmemory_policy
+        s.policy_label()
     ));
     let share = if s.total_keys == 0 {
         0.0
@@ -299,7 +301,7 @@ pub fn render_table_for(
     if !s.lfu_enabled() {
         degraded.push(format!(
             "hot keys unavailable: eviction policy is {}",
-            s.maxmemory_policy
+            s.policy_label()
         ));
     } else if perms
         .checks
@@ -323,6 +325,7 @@ pub fn render_table_for(
             .collect();
         lines.push(format!("Hot:     {}", top.join(", ")));
     }
+    degraded.extend(report.note.clone());
     for d in &degraded {
         lines.push(format!("Note:    {d}"));
     }
@@ -667,6 +670,7 @@ mod tests {
 
     fn report(patterns: Vec<PatternStats>, sizes: bool, policy: &str) -> ScanReport {
         ScanReport {
+            note: None,
             profile: "local".into(),
             taken_at_unix: 0,
             server: ServerInfo {
@@ -969,5 +973,21 @@ mod tests {
         now.match_glob = Some("order:*".into());
         assert!(baseline_diff(&|| Ok(dir.clone()), &now).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cluster node read alone says so in the table, and in the Markdown facts.
+    #[test]
+    fn one_node_note_is_in_the_table_and_the_markdown() {
+        let mut r = report(vec![], true, "allkeys-lfu");
+        let plain = render_table(&r, &perms(), 100);
+        assert!(!plain.contains("only one node"), "{plain}");
+        r.note = Some(crate::model::NOTE_ONE_NODE.to_string());
+        let t = render_table(&r, &perms(), 100);
+        assert!(
+            t.contains("Note:    only one node of a cluster was read"),
+            "{t}"
+        );
+        let md = crate::report::md::render(&r, None, false);
+        assert!(md.contains("only one node of a cluster was read"), "{md}");
     }
 }

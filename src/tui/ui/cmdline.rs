@@ -5,8 +5,6 @@
 //! ([`crate::live::command::masked_line`]), replies were escaped by
 //! [`crate::live::cmdline::format_reply`], notes are redis-lens's own words.
 
-use std::time::Duration;
-
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -15,8 +13,11 @@ use ratatui::widgets::{Block, Clear};
 
 use super::style;
 use super::widgets::{char_width, rows, trunc, width};
+use crate::live::cmdline::View;
 use crate::tui::app::views::Ctx;
-use crate::tui::app::views::cmdline::{Body, CmdlineState, Entry};
+use crate::tui::app::views::cmdline::{
+    Body, CmdlineState, Entry, Tone, dropped_text, numbered, runs_end, took_text,
+};
 
 /// The panel's height in a body `body` rows tall: half of it, 6 to 16 rows.
 pub fn height(body: u16) -> u16 {
@@ -43,7 +44,16 @@ pub fn draw(frame: &mut Frame, body: Rect, state: &CmdlineState, ctx: &Ctx<'_>) 
     } else {
         "writes ask as usual"
     };
-    let right = format!("{} · {access}", ctx.profile().name);
+    // The view and pipeline mode, when not the defaults (text, off), before the access
+    // text, which a narrow title cuts first.
+    let mut right = ctx.profile().name.clone();
+    if state.view != View::Text {
+        right.push_str(&format!(" · {} view", state.view.label()));
+    }
+    if state.pipeline {
+        right.push_str(" · pipeline");
+    }
+    right.push_str(&format!(" · {access}"));
     let inner = amber_panel(frame, area, ": Command line", &right);
     let helper_rows = if inner.height >= HELPER_ROWS + 2 {
         HELPER_ROWS
@@ -113,7 +123,7 @@ fn output(frame: &mut Frame, area: Rect, state: &CmdlineState, tick: u64) {
     let mut shown: Vec<Line<'static>> = Vec::new();
     let mut all = true;
     for (i, e) in state.entries.iter().enumerate().rev() {
-        let mut r = entry_rows(e, w, tick);
+        let mut r = entry_rows(e, w, tick, state.view);
         r.append(&mut shown);
         shown = r;
         if shown.len() >= want && i > 0 {
@@ -139,7 +149,7 @@ fn output(frame: &mut Frame, area: Rect, state: &CmdlineState, tick: u64) {
 }
 
 /// The rows of one entry: its command, then the reply or why it was not sent.
-fn entry_rows(e: &Entry, w: usize, tick: u64) -> Vec<Line<'static>> {
+fn entry_rows(e: &Entry, w: usize, tick: u64, view: View) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     if let Some(line) = &e.line {
         let mut first = true;
@@ -179,10 +189,36 @@ fn entry_rows(e: &Entry, w: usize, tick: u64) -> Vec<Line<'static>> {
                 plain(&mut out, why, style::amber());
             }
             let s = if o.error { style::warn() } else { style::fg() };
-            for l in o.lines() {
+            for l in o.lines_in(view, e.pairs) {
                 plain(&mut out, l, s);
             }
             plain(&mut out, &format!("({})", took_text(o.took)), style::dim());
+        }
+        Body::Runs(r) => {
+            if let Some(node) = &e.node {
+                plain(&mut out, &format!("{node}>"), style::dim());
+            }
+            if let Some(why) = e.route_note {
+                plain(&mut out, why, style::amber());
+            }
+            if r.dropped > 0 {
+                plain(&mut out, &dropped_text(r), style::dim());
+            }
+            for (line, error) in numbered(r, view, e.pairs) {
+                let s = if error { style::warn() } else { style::fg() };
+                plain(&mut out, &line, s);
+            }
+            let (text, tone) = runs_end(r);
+            match tone {
+                Tone::Running => out.push(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(super::spinner(tick), style::amber()),
+                    Span::styled(format!(" {text}"), style::dim()),
+                ])),
+                Tone::Done => plain(&mut out, &text, style::dim()),
+                Tone::Stopped => plain(&mut out, &text, style::amber()),
+                Tone::Failed => plain(&mut out, &text, style::warn()),
+            }
         }
     }
     out
@@ -207,20 +243,10 @@ fn wrap(s: &str, w: usize) -> Vec<String> {
     out
 }
 
-/// The time a command took, as `0.42 ms`, `12 ms` or `1.30 s`.
-pub fn took_text(d: Duration) -> String {
-    let us = d.as_micros();
-    if us < 10_000 {
-        format!("{:.2} ms", us as f64 / 1000.0)
-    } else if us < 1_000_000 {
-        format!("{} ms", us / 1000)
-    } else {
-        format!("{:.2} s", d.as_secs_f64())
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]

@@ -522,6 +522,10 @@ fn connected_header(app: &App, s: &Session, w: usize) -> Line<'static> {
             Span::styled(trunc(&s.endpoint().to_string(), 40), style::dim()),
         )),
     }
+    if s.read_alone() {
+        // A cluster node read alone on purpose: only its keys are seen.
+        parts.push((1, Span::styled("standalone", style::amber())));
+    }
     match &s.target {
         Some(ScanTarget::Replica(ep)) => parts.push((
             3,
@@ -795,6 +799,11 @@ fn key_line(app: &App, w: usize) -> Line<'static> {
             .session
             .as_ref()
             .is_some_and(|s| !s.profile.is_read_only()),
+        not_read: screen == Screen::KeyDetail
+            && matches!(
+                app.views.value.items,
+                Some(crate::live::values::Items::NotRead | crate::live::values::Items::Module(_))
+            ),
     };
     let mut left = keymap::footer(screen, c);
     let mut right = keymap::footer_right(c.ready);

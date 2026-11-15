@@ -1,6 +1,6 @@
 # redis-lens vs Redis Insight: gap analysis
 
-Research date: 2026-11-12. These are proposals; nothing here is built, and `spec.md` is unchanged.
+Research date: 2026-11-12. Updated 2026-11-15: phases 1 to 5 are built, and the "redis-lens" column below says what is true now. The Tier, Fit and Effort columns and the notes on Redis Insight are as researched. `spec.md` describes what is built.
 Redis Insight version compared: v3.8.0 (July 2026). The comparison covers features only; no Redis Insight source code was read or copied. Redis Insight is source-available under a restrictive licence.
 
 **Grounding:**
@@ -31,7 +31,7 @@ My recommendation: do A now. Do B behind a per-profile `show_values` setting tha
 
 ## Gap matrix
 
-Fit: how well it works in a TUI (✓ good, ~ workable, ✗ poor). Effort: S = days, M = 1-2 weeks, L = more. "Have" means redis-lens has it on `main` today.
+Fit: how well it works in a TUI (✓ good, ~ workable, ✗ poor). Effort: S = days, M = 1-2 weeks, L = more. "Have" means redis-lens has it, built by phase 5 (on `claude/insight-phase5` until it is merged). "Skipped" is a deliberate choice, "Missing" is not built.
 
 ### Connections
 
@@ -39,94 +39,94 @@ Fit: how well it works in a TUI (✓ good, ~ workable, ✗ poor). Effort: S = da
 |---|---|---|---|---|---|
 | Standalone, TLS (CA, client cert, SNI), ACL users | **Have** | – | ✓ | – | We also have the OS trust store and the keychain. Redis Insight optionally encrypts its local store. |
 | Local auto-discovery | **Have, better** | – | ✓ | – | Docker discovery each run, not just on first launch. |
-| Azure discovery with Entra ID | Part | – | ✓ | M | Entra ID is developer-tools only (feature idea 10). Redis Insight discovers across subscriptions. |
-| Redis Cloud and Redis Software discovery | Missing | A | ~ | M | Cloud API sign-in. Low priority for our users. |
-| AWS ElastiCache discovery | Missing (Redis Insight lacks it too) | A | ✓ | M | A place we could lead, with feature idea 9 (IAM). |
-| Cluster, including force-standalone | Missing | A | ✓ | L | Already v0.3 (`spec.md:327`). |
-| Sentinel | Missing | A | ✓ | M | Already "later" (`spec.md:328`). |
-| SSH tunnel (password or key) | Missing | A | ✓ | M | Already "later". The key passphrase goes in the keychain (rule 1). |
-| Switch DB index while connected | Missing in the TUI (profile `db` only) | A | ✓ | S | Indexes from `INFO keyspace`, then `SELECT`. |
-| Import and export a connection list | Missing | A | ✓ | S | Profiles only, never credentials. |
-| Preset connections from env or a file | Part (`--config`, `REDIS_LENS_CONFIG`) | A | ✓ | S | |
+| Azure discovery with Entra ID | Part | – | ✓ | M | Entra ID sign-in is built for developer tools (feature idea 10). Discovery across subscriptions is not built: it needs cloud accounts and can't be tested in CI. |
+| Redis Cloud and Redis Software discovery | Missing | A | ~ | M | Not built in phase 5: needs cloud accounts and can't be tested in CI. Low priority for our users. |
+| AWS ElastiCache discovery | Missing (Redis Insight lacks it too) | A | ✓ | M | Not built in phase 5, for the same reason. A token command covers ElastiCache IAM today (feature idea 9). |
+| Cluster, including force-standalone | **Have** | A | ✓ | L | Cluster since v0.3, live views since Phase 4, force standalone (`conn add --standalone`) since Phase 5. |
+| Sentinel | **Have** | A | ✓ | M | Phase 4: Sentinel credentials kept apart in the keychain; `--prefer-replica` uses `SENTINEL REPLICAS`. |
+| SSH tunnel (password or key) | Part | A | ✓ | M | Key login through a bastion since v0.3, the key passphrase in the keychain (rule 1). Password login is not built: a large change on a security-sensitive path. |
+| Switch DB index while connected | **Have** | A | ✓ | S | Phase 4: `b` lists the indexes from `INFO keyspace`. |
+| Import and export a connection list | **Have** | A | ✓ | S | Phase 4: `conn export` and `conn import`, profiles only, never credentials. |
+| Preset connections from env or a file | Part (`--config`, `REDIS_LENS_CONFIG`) | A | ✓ | S | Presets from environment variables are not built: they conflict with rule 1, so that is the owner's call. |
 | Dev/Production label | **Have, stricter** | – | ✓ | – | Our `env` plus `read_only`. Redis Insight only asks for confirmation. |
-| Tags and aliases on connections | Part (name, env) | A | ✓ | S | |
+| Tags and aliases on connections | Part (name, env, tags) | A | ✓ | S | Tags are built (Phase 4). Aliases are not: low value. |
 
 ### Overview and monitoring
 
 | Redis Insight feature | redis-lens | Tier | Fit | Effort | Notes |
 |---|---|---|---|---|---|
-| Live overview: CPU, memory, ops/s, clients, network, keys | Part (one-off context strip) | A | ✓ | M | A new **Server** view polling `INFO` every few seconds, with sparklines. It counts against the command budget, and polling can be stopped. Add hit ratio, evictions and expired keys, which Redis Insight leaves out. |
-| Per-shard overview on cluster | Missing | A | ✓ | M | After v0.3. |
-| Slow Log viewer | Missing | A | ✓ | S | `SLOWLOG GET`. Needs `@admin`, so degrade on `NOPERM`. The arguments in an entry can hold values, so redact them unless values are allowed (tier B). Redis Insight also edits the threshold with `CONFIG SET`; that is tier C, and ElastiCache blocks it. |
-| `CLIENT LIST` view | Missing | A | ✓ | S | Idle, age, command, memory per client, grouped by `lib-name` and address. Good for finding leaks of connections. |
-| Profiler (`MONITOR`) | Missing | A | ~ | M | Read-only but heavy, and the spec already lists it as a hot-keys fallback (`spec.md:59`). Time-limited, off for prod, or prefer server-side `HOTKEYS` (feature idea 12). |
+| Live overview: CPU, memory, ops/s, clients, network, keys | **Have, better** | A | ✓ | M | Overview's "Now": six figures with sparklines (twelve with `v`), through the budget, pausable. Adds hit rate, evictions and expired keys, which Redis Insight leaves out. |
+| Per-shard overview on cluster | **Have** | A | ✓ | M | Phase 4: one row per shard on Overview, from a per-shard poll. |
+| Slow Log viewer | **Have** | A | ✓ | S | Arguments shown masked; `NOPERM` degrades; threshold edit and reset through the write gate; `y` copies the masked command line (Phase 5). |
+| `CLIENT LIST` view | **Have** | A | ✓ | S | Grouped by library and by address; `K` kills a connection through the write gate. |
+| Profiler (`MONITOR`) | **Have** | A | ~ | M | Server › Monitor, time-limited, asks first, credentials masked as lines arrive; `y` copies a masked line (Phase 5). Server-side `HOTKEYS` is not built: not confirmed on any image. |
 
 ### Browser (key level)
 
 | Redis Insight feature | redis-lens | Tier | Fit | Effort | Notes |
 |---|---|---|---|---|---|
 | Tree view by namespace | **Have, better** | – | ✓ | – | Our pattern inference finds `{uuid}`, `{id}` and the rest, not just a delimiter. |
-| Filter by name and type | Part (`/` filter on patterns) | A | ✓ | S | Add a type filter. |
-| Key list for a pattern, with size and TTL | Missing (examples only) | A | ✓ | M | `enter` on a pattern runs `SCAN MATCH`, budgeted and paged, showing type, TTL, size, encoding and length. Metadata only, so it stays tier A. Needs a scan `Effect`/`Msg` for TUI-driven work and the limiter applied to it. |
-| Key details: type, TTL, encoding, length | Missing | A | ✓ | S | `OBJECT ENCODING` plus `STRLEN`/`HLEN`/`LLEN`/`SCARD`/`ZCARD`/`XLEN`, along with the encoding thresholds. |
-| View values for each type | Missing | **B** | ✓ | M | `GETRANGE`, `HSCAN`, `SSCAN`, `ZSCAN`, `LRANGE`, `XRANGE`, `JSON.GET`, always paged and capped in size. |
-| Formatters: UTF-8, hex, JSON, MessagePack, Protobuf, Pickle, PHP, Java | Missing | B | ✓ | M | Start with UTF-8, hex, JSON and MessagePack. Decompression (gzip, LZ4, zstd, Snappy) is cheap to add. |
-| Copy a value | Missing | B | ✓ | S | OSC 52 is already in place. The `CopyText` limits would need to grow. |
-| Add, edit and delete keys of each type, TTL edit, rename | Missing | **C** | ~ | L | Editing a field at a time works in a TUI. Large JSON editing does not; hand off to `$EDITOR` instead. |
-| Hash field TTL | Missing | A (read), C (set) | ✓ | M | Reading it is feature idea 8 (`HEXPIRE`, `HTTL`). |
-| JSON, Vector Sets, Arrays (Redis 8.8) | Missing | B, C | ~ | M each | View them first. Vector similarity search is niche in a TUI. |
-| Sample data loader | Missing | C | ✓ | S | Already done better by our `make demo-up`. |
+| Filter by name and type | **Have** | A | ✓ | S | `/` filters by name and `t` by type (Phase 4). |
+| Key list for a pattern, with size and TTL | **Have** | A | ✓ | M | `→` on a pattern runs a budgeted, paged `SCAN MATCH`, with type, TTL, size, encoding and length. |
+| Key details: type, TTL, encoding, length | **Have** | A | ✓ | S | In a key's value: facts line with length, size, expiry, encoding and LFU counter. |
+| View values for each type | **Have** | **B** | ✓ | M | Strings, hashes, lists, sets, sorted sets, streams, JSON and vector sets, paged and capped; arrays and the module types in Phase 5. |
+| Formatters: UTF-8, hex, JSON, MessagePack, Protobuf, Pickle, PHP, Java | **Have** | B | ✓ | M | All eight, cycled with `f`; Protobuf and Pickle protocols 0 and 1 are picked by hand, never auto-detected. Decompression: gzip, zlib, LZ4, zstd and Snappy (Phase 5). |
+| Copy a value | **Have** | B | ✓ | S | `y` on a value, in the format shown, through OSC 52; text with control characters is not copied. |
+| Add, edit and delete keys of each type, TTL edit, rename | **Have** | **C** | ~ | L | Field-at-a-time edits, with `$EDITOR` for big values, behind the write gate. Creating JSON keys is not built. |
+| Hash field TTL | **Have** (read and set) | A (read), C (set) | ✓ | M | `HTTL` on Redis 7.4 and Valkey 9.0 and later; `HEXPIRE` through the write gate. |
+| JSON, Vector Sets, Arrays (Redis 8.8) | **Have** (view) | B, C | ~ | M each | JSON, vector sets (100 random elements) and arrays (`ARSCAN`, Phase 5) are viewed. Vector similarity search is not built: niche in a TUI. |
+| Sample data loader | Skipped | C | ✓ | S | Done better by our `make demo-up`. |
 
 ### Analysis
 
 | Redis Insight feature | redis-lens | Tier | Fit | Effort | Notes |
 |---|---|---|---|---|---|
-| Database Analysis: memory by type and namespace, top keys | **Have, better** | – | ✓ | – | Redis Insight stops at 10,000 keys. We default to 100,000, with budget, scaling and verdicts. |
-| "Memory freed by TTL over time" | Part (TTL histogram) | A | ✓ | S | Project expiring bytes from the PTTL already sampled. No new commands. |
-| Biggest keys list | Part (max per pattern) | A | ✓ | S | A top-N list across all patterns, from data already sampled. |
+| Database Analysis: memory by type and namespace, top keys | **Have, better** | – | ✓ | – | Redis Insight stops at 10,000 keys. We offer Quick (10,000) and Deep (100,000), with budget, scaling and verdicts. |
+| "Memory freed by TTL over time" | **Have** | A | ✓ | S | Analyze › Expiry's forecast, also on Overview. |
+| Biggest keys list | **Have** | A | ✓ | S | Analyze › Big keys: the 50 biggest sampled keys across all patterns. |
 | Historical reports | **Have, better** | – | ✓ | – | Snapshots, diff, trend and compare. |
-| Recommendations | Part (TTL verdicts, `--check`) | A | ✓ | M | Add rules for encoding thresholds, big keys, oversized hashes, `maxmemory-policy` with no TTLs, and LFU being off. Use `INFO` and `OBJECT ENCODING`, not `CONFIG GET`, which is blocked on ElastiCache. |
-| Hot keys | **Have (Redis Insight has none)** | – | ✓ | – | |
+| Recommendations | **Have** | A | ✓ | M | "Things to look at": big keys, encodings, no-TTL patterns, memory that never expires, and from Phase 5 the eviction policy (volatile with few TTLs, full `noeviction`, LFU off). Uses `INFO` and `OBJECT ENCODING`, not `CONFIG GET`. |
+| Hot keys | **Have (Redis Insight has none)** | – | ✓ | – | Under an LFU policy, or from a Monitor run. |
 
 ### Workbench and CLI
 
 | Redis Insight feature | redis-lens | Tier | Fit | Effort | Notes |
 |---|---|---|---|---|---|
-| Command line | Missing | C | ✓ | M | A `:` prompt. On read-only profiles, refuse any command whose `COMMAND INFO` flags aren't `readonly`, which makes even this safe on prod. Type-to-confirm for `@dangerous`. History lives in memory only, since commands can hold values or `AUTH`. |
-| Command helper and autocomplete | Missing | A | ✓ | S | From `COMMAND DOCS`, so it works offline from the server. |
-| Result views: text, table, JSON, raw | Missing | A | ✓ | S | Comes with the command line. |
-| Pipeline mode, `N cmd` repeat | Missing | C | ~ | S | |
-| Graphical plugins: Search table, TimeSeries chart, Graph, Geo map | Missing | A | ~ / ✗ | M | TimeSeries as a sparkline and Search as a table work. Graph is retired upstream; Geo maps don't fit a TUI. |
-| Bulk upload of a commands file | Missing | C | ✓ | S | `redis-cli < file` already does this. Low value. |
+| Command line | **Have** | C | ✓ | M | `:` panel. Readonly commands run, writes go through the write gate, `@dangerous` asks, scripts and module commands not known to read are not sent. History in memory only, credentials masked. |
+| Command helper and autocomplete | **Have** | A | ✓ | S | From `COMMAND DOCS` and `COMMAND LIST`, with `tab`. |
+| Result views: text, table, JSON, raw | **Have** | A | ✓ | S | `ctrl-t` cycles them (Phase 5). |
+| Pipeline mode, `N cmd` repeat | **Have** | C | ~ | S | `N cmd` (at most 100) and `ctrl-p` pipelines (Phase 5). A write that asks is not repeated. |
+| Graphical plugins: Search table, TimeSeries chart, Graph, Geo map | Part | A | ~ / ✗ | M | Search results are listed in Browse › Search, and a time series key shows a sparkline with its samples (Phase 5). Graph is retired upstream and Geo maps don't fit a TUI: skipped. |
+| Bulk upload of a commands file | Missing | C | ✓ | S | Not built: `redis-cli < file` already does this. Low value. |
 
 ### Bulk actions
 
 | Redis Insight feature | redis-lens | Tier | Fit | Effort | Notes |
 |---|---|---|---|---|---|
-| Bulk delete by filter, with a count preview and a file of deleted keys | Missing | C | ✓ | M | Rejected before (`docs/feature-ideas.md`). If tier C goes ahead: `--dry-run` by default, `UNLINK` in budgeted batches, type-to-confirm, never on prod. |
-| Bulk expire | Missing (planned exception) | C | ✓ | M | `spec.md:11` and `:328` already allow this one. It fits naturally with "set a TTL on this leaking pattern". |
+| Bulk delete by filter, with a count preview and a file of deleted keys | **Have** | C | ✓ | M | Dry run first, `UNLINK` in pipelines of 500 within the budget, the deleted key names appended to a file, a confirmation each time (the pattern typed on `prod`). |
+| Bulk expire | **Have** | C | ✓ | M | `x` on a pattern and `redis-lens expire` (a dry run, then `--apply`). A read-only profile refuses `expire`, dry run included. |
 
 ### Pub/Sub and Streams
 
 | Redis Insight feature | redis-lens | Tier | Fit | Effort | Notes |
 |---|---|---|---|---|---|
-| Subscribe and pattern-subscribe, live message list | Missing | B | ✓ | M | Payloads are values (tier B). `PUBSUB CHANNELS` and `NUMSUB` without payloads are tier A. |
-| Publish | Missing | C | ✓ | S | |
-| Stream consumer groups: lag, pending, consumers | Missing | A | ✓ | M | `XINFO GROUPS`, `XINFO CONSUMERS`, `XPENDING` summary. Fits "is any of it a mistake": stuck consumers, a growing PEL, and old streams that are never trimmed (a stream does not store its `MAXLEN`; the age of the oldest entry stands in). A strong addition. |
-| Acknowledge and claim | Missing | C | ~ | S | |
+| Subscribe and pattern-subscribe, live message list | **Have** | B | ✓ | M | The Pub/Sub live tail, with sharded Pub/Sub on a cluster. |
+| Publish | **Have** | C | ✓ | S | `P`, through the write gate. |
+| Stream consumer groups: lag, pending, consumers | **Have** | A | ✓ | M | Browse › Streams: groups, lag, pending, consumers, and untrimmed streams. |
+| Acknowledge and claim | **Have** | C | ~ | S | `A`, `c` and `X` on Streams, through the write gate. |
 
 ### Search, AI and the rest
 
 | Redis Insight feature | redis-lens | Tier | Fit | Effort | Notes |
 |---|---|---|---|---|---|
-| Search index list and details | Missing | A | ✓ | S | `FT._LIST` and `FT.INFO`: docs, size, indexing failures, memory. Hidden when the module is missing. |
-| Query editor, Explain and Profile | Missing | B | ~ | M | `FT.SEARCH` returns values. |
-| Create and drop an index | Missing | C | ~ | M | |
+| Search index list and details | **Have** | A | ✓ | S | Hidden when the module is missing. |
+| Query editor, Explain and Profile | **Have** | B | ~ | M | Browse › Search. |
+| Create and drop an index | **Have** | C | ~ | M | `C` and `D` on Search, through the write gate. |
 | Redis Copilot (AI) | Missing | – | ✗ | – | **Skip.** It sends schemas and keys to Redis and OpenAI and needs a Redis Cloud sign-in. That conflicts with rule 1 and "safe on prod". |
 | RDI pipeline management | Missing | – | ✗ | – | **Skip.** A separate product's management API. |
 | Tutorials, guides, What's New | Missing | – | ✗ | – | **Skip.** The `?` help overlay covers us. |
 | Triggers and Functions | Missing | – | ✗ | – | **Skip.** Deprecated upstream. |
-| Themes, keyboard shortcuts | Part | A | ✓ | S | A light theme and a `NO_COLOR` setting. |
+| Themes, keyboard shortcuts | **Have** | A | ✓ | S | A light theme and `NO_COLOR` (Phase 4); the `?` help lists and runs every action. |
 | Telemetry | None | – | – | – | Keep it that way. |
 | REST API, Docker image, VS Code extension | Missing | – | ✗ | – | Out of scope for a TUI. |
 
@@ -168,7 +168,22 @@ Phases 1 to 3 cover the roadmap above. Cluster (v0.3) and SSH tunnels have lande
 | 4 | **Slots panel** from `CLUSTER SLOT-STATS` (Redis 8.2+, Valkey 8.0+) | M | Feature idea 13. Redis Insight has no per-slot view. |
 | 5 | Type filter on the key list, `conn export`/`import`, tags, a light theme and `NO_COLOR` | S each | Export and import carry profiles only, never credentials. |
 
-**Built, which Redis Insight also has:** cluster (v0.3, live views in Phase 4), Sentinel (Phase 4), SSH tunnels (v0.3).
+**Phase 5: the rest of the matrix (built 2026-11-15; spec.md "Milestones")**
+
+Phases 1 to 4 left the gaps below. Phase 5 closes the ones that fit a TUI and are safe to test.
+
+| # | Feature | Effort | Notes |
+|---|---|---|---|
+| 1 | **Eviction findings**: a `volatile-*` policy with few TTLs, a full `noeviction` server, LFU off | S | The "Recommendations" row. No new commands. |
+| 2 | **`y` on Slow log and Monitor** | S | Copies the masked command line, never the raw arguments. |
+| 3 | **Command line**: result views (text, table, JSON, raw), `N cmd` repeats, pipeline mode | M | The "Result views" and "Pipeline mode" rows. A repeat of a write that asks is refused, not asked once. |
+| 4 | **Values**: Snappy, PHP, Pickle, Protobuf and Java formats, arrays and the TimeSeries, Bloom, Cuckoo, Count-Min Sketch, Top-K and t-digest types | M | The "Formatters" and "JSON, Vector Sets, Arrays" rows. The readers are bounded, and Pickle is read, never run. |
+| 5 | **Force standalone** | M | Built: `conn add --standalone`; redirects are never followed. |
+| 6 | A documentation site and a shorter README | S | Not a matrix row. |
+
+Not built, with reasons: cloud discovery (needs cloud accounts, can't be tested in CI), SSH password login (a large change on a security-sensitive path), connection presets from environment variables (conflict with rule 1, the owner's call), aliases (low value), server-side `HOTKEYS` (not confirmed on any image), uploading a commands file (low value), Vector Set similarity search, and creating JSON keys.
+
+**Built, which Redis Insight also has:** cluster (v0.3, live views in Phase 4), Sentinel (Phase 4), SSH tunnels (v0.3, key login).
 
 **Where we already lead, and should keep leading:** pattern inference, sampling budget, TTL verdicts, snapshots, diff, trend and compare, `--check` for CI, hot keys, a strict prod mode with no writes at all, keychain-only credentials.
 

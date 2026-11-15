@@ -191,12 +191,13 @@ pub enum ConnCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Change a saved connection: turn writes on or off, add or remove tags.
+    /// Change a saved connection: turn writes on or off, add or remove tags, force
+    /// standalone on or off.
     #[command(group(
         clap::ArgGroup::new("change")
             .required(true)
             .multiple(true)
-            .args(["writes", "tag", "untag"])
+            .args(["writes", "tag", "untag", "standalone", "no_standalone"])
     ))]
     Set {
         /// Profile name.
@@ -217,6 +218,13 @@ pub enum ConnCommand {
         /// Remove a tag. Repeatable.
         #[arg(long, value_name = "TAG")]
         untag: Vec<String>,
+        /// Read the profile's server alone as a standalone server, even when it is a
+        /// cluster node: no discovery, no slot routing. Refused for a Sentinel profile.
+        #[arg(long, conflicts_with = "no_standalone")]
+        standalone: bool,
+        /// Go back to discovering the cluster the server is a node of.
+        #[arg(long)]
+        no_standalone: bool,
     },
 }
 
@@ -252,6 +260,9 @@ pub struct ConnAddArgs {
     /// Scan a replica instead of the primary when one is reachable.
     #[arg(long)]
     pub prefer_replica: bool,
+    /// Read the seed node alone as a standalone server, even when it is a cluster node.
+    #[arg(long)]
+    pub standalone: bool,
     /// The managed service, when the host name doesn't show it.
     #[arg(long, value_enum)]
     pub provider: Option<ProviderArg>,

@@ -1,0 +1,86 @@
+---
+source: src/live/cmdline.rs
+expression: "sampled(View::Json)"
+---
+## HGETALL user:1 (RESP2, flat pairs)
+[
+  "name",
+  "Ada",
+  "visits",
+  "12"
+]
+## LRANGE l 0 -1 (flat, even, not pairs)
+[
+  "a",
+  "b",
+  "c",
+  "d"
+]
+## HGETALL over RESP3 (a map)
+{
+  "name": "Ada",
+  "visits": 12
+}
+## ZRANGE z 0 -1 WITHSCORES over RESP3 (pairs)
+[
+  [
+    "ada",
+    1.5
+  ],
+  [
+    "cyd",
+    2
+  ]
+]
+## XRANGE s - + (arrays of arrays)
+[
+  [
+    "1-0",
+    [
+      "f",
+      "v"
+    ],
+    "extra"
+  ],
+  [
+    "2-0",
+    []
+  ]
+]
+## scalars
+[
+  null,
+  -7,
+  "inf",
+  true,
+  "123456789012345678901234567890",
+  "OK",
+  "PONG",
+  "line 1\nline 2",
+  ""
+]
+## a set, an error and a NOPERM inside a reply
+[
+  [
+    "x",
+    "y"
+  ],
+  {"error": "ERR syntax error"},
+  {"error": "NOPERM the server refused this for this user"}
+]
+## a map with a key that is not a string
+[
+  [
+    1,
+    "one"
+  ]
+]
+## control and bidi characters
+[
+  "tab\there\u001b[31m red \u202eevil",
+  "\\xffa\u0007"
+]
+## one integer
+42
+## an empty array
+[]

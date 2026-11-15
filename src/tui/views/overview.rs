@@ -380,6 +380,9 @@ fn rec_target(rec: &Recommendation, has_diff: bool) -> Screen {
         | RecKind::MixedTtl
         | RecKind::PersistentStable => Screen::Ttl,
         RecKind::BigKey | RecKind::Encoding => Screen::BigKeys,
+        RecKind::VolatileNoTtl => Screen::Ttl,
+        RecKind::NoEvictionFull => Screen::BigKeys,
+        RecKind::LfuOff => Screen::HotKeys,
     }
 }
 
@@ -496,6 +499,7 @@ fn empty_profile() -> Profile {
         token_command: None,
         ssh: None,
         sentinel: None,
+        force_standalone: false,
         tags: Vec::new(),
     }
 }
@@ -522,6 +526,7 @@ pub(crate) mod tests {
             token_command: None,
             ssh: None,
             sentinel: None,
+            force_standalone: false,
             tags: Vec::new(),
         }
     }
@@ -704,6 +709,9 @@ pub(crate) mod tests {
             (RecKind::PersistentStable, true, Screen::Ttl),
             (RecKind::PersistentGrowing, true, Screen::Diff),
             (RecKind::PersistentGrowing, false, Screen::Ttl),
+            (RecKind::VolatileNoTtl, false, Screen::Ttl),
+            (RecKind::NoEvictionFull, false, Screen::BigKeys),
+            (RecKind::LfuOff, false, Screen::HotKeys),
         ];
         for (kind, diff, want) in cases {
             assert_eq!(rec_target(&rec(kind), diff), want, "{kind:?} {diff}");

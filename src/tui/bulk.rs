@@ -238,9 +238,10 @@ impl App {
             return Vec::new();
         };
         let cluster = matches!(s.target, Some(ScanTarget::Cluster(_)))
-            || s.server
-                .as_ref()
-                .is_some_and(|i| i.mode == crate::model::ServerMode::Cluster)
+            || (!s.profile.force_standalone
+                && s.server
+                    .as_ref()
+                    .is_some_and(|i| i.mode == crate::model::ServerMode::Cluster))
             || self.report().is_some_and(|r| r.nodes.is_some())
             || s.is_cluster();
         if matches!(s.target, Some(ScanTarget::Replica(_))) {

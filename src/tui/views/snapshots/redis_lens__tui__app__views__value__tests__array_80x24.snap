@@ -1,0 +1,28 @@
+---
+source: src/tui/views/value.rs
+expression: t.backend()
+---
+" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
+"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+"    Keys  ·  Streams  ·  Search                                                 "
+"┌─ ‹ user:{id}:cart ────────┬─ arr:1 ─────────────────────── array · 4 loaded ─┐"
+"│ KEY                       │ 190B · expires in 6d 04h   stored as listpack    │"
+"│ arr:1                     │                                                  │"
+"│                           │  INDEX ELEMENT                                   │"
+"│                           │›     0 v0                                        │"
+"│                           │      1 v1                                        │"
+"│                           │      2 v2                                        │"
+"│                           │   1000 v1000                                     │"
+"│                           │                                                  │"
+"│                           │── n loads more ──────────────────────────────────│"
+"│                           │ #0 · text · 2 bytes · auto-detected              │"
+"│                           │ v0                                               │"
+"│                           │                                                  │"
+"│                           │                                                  │"
+"│                           │                                                  │"
+"│                           │                                                  │"
+"│                           │                                                  │"
+"│                           │                                                  │"
+"│                           │                                                  │"
+"└───────────────────────────┴──────────────────────────────────────────────────┘"
+" ↑↓ Move   → Value   f Format   y Copy   esc Back              : Command  ? Help"

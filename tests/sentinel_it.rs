@@ -56,6 +56,7 @@ fn profile(s: &TestSentinel, master: &str) -> Profile {
             nodes: s.sentinel_ports.iter().map(|&p| node(p)).collect(),
             tls: false,
         }),
+        force_standalone: false,
         tags: Vec::new(),
     }
 }
@@ -176,6 +177,7 @@ async fn scan_and_conn_test(valkey: bool) {
         sentinel_user: None,
         sentinel_password_stdin: false,
         sentinel_ask_password: false,
+        standalone: false,
         tags: Vec::new(),
     };
     let cli_store = MemoryStore::default();

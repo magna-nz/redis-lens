@@ -44,6 +44,7 @@ fn profile() -> Profile {
         token_command: None,
         ssh: None,
         sentinel: None,
+        force_standalone: false,
         tags: Vec::new(),
     }
 }
