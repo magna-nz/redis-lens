@@ -1,0 +1,64 @@
+name: Publish crate
+
+# Publishes redis-lens to crates.io so `cargo install redis-lens` works.
+#
+# Called by the dist release pipeline as a custom publish job (see `publish-jobs` in
+# dist-workspace.toml), which runs it only for a real release, after the GitHub Release
+# exists. Callers must pass `secrets: inherit`.
+# `plan` is optional and unused: dist passes it to every custom job, and an undeclared
+# input is a hard error, so it is declared and ignored.
+# `workflow_dispatch` lets the owner re-run only this step from the Actions tab, on the
+# release tag, if the publish failed after the GitHub Release went out.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: false
+        type: string
+  workflow_dispatch:
+
+# No `permissions:` block on purpose: as a called workflow it may not ask for more than the
+# caller's `custom-publish-crates` job grants, and the crates.io token does the work.
+concurrency:
+  # `github.workflow` is the CALLER's name for a reusable workflow, so a run started by
+  # Release lands in a different group than a manual one.
+  group: publish-crates-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # A crates.io version is immutable, and a re-run of a release would otherwise
+      # fail the whole pipeline on "crate version already uploaded".
+      - name: Check whether this version is already published
+        id: check
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "redis-lens") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: redis-lens release workflow (github.com/magna-nz/redis-lens)' \
+            "https://crates.io/api/v1/crates/redis-lens/$version")
+          if [ "$code" = "200" ]; then
+            echo "redis-lens $version is already on crates.io: skipping publish"
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to crates.io
+        if: steps.check.outputs.published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked

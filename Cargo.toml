@@ -3,13 +3,14 @@ name = "redis-lens"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "A terminal UI that shows what's using memory in Redis and Valkey: key patterns, TTL hygiene, snapshot diffs and hot keys."
-license = "MIT OR Apache-2.0"
+description = "A terminal UI for Redis and Valkey: browse keys and values, find what uses the memory, watch the server and run commands."
+license = "MIT"
 repository = "https://github.com/magna-nz/redis-lens"
+homepage = "https://magna-nz.github.io/redis-lens/"
 readme = "README.md"
 keywords = ["redis", "valkey", "tui", "memory", "profiler"]
 categories = ["command-line-utilities", "database", "development-tools::profiling"]
-exclude = ["/demo", "/.github", "/CLAUDE.md", "/Makefile", "/spec.md", "/status.md", "/docs", "/examples", "/src/web/assets/tests"]
+exclude = ["/demo", "/.github", "/CLAUDE.md", "/Makefile", "/spec.md", "/status.md", "/docs", "/dist-workspace.toml", "/examples", "/src/web/assets/tests"]
 
 [features]
 default = []
@@ -108,3 +109,8 @@ print_stderr = "allow"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
