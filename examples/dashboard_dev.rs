@@ -1,7 +1,9 @@
 //! Development launcher for the web dashboard against the demo servers (`make demo-up`).
 //!
-//! It never touches the real config file or the OS keychain: profiles go in a temporary
-//! config file and the demo passwords (read from `demo/users.acl`) in a `MemoryStore`.
+//! It never touches the real config file, the OS keychain or the data directory:
+//! profiles go in a temporary config file, the demo passwords (read from
+//! `demo/users.acl`) in a `MemoryStore`, and snapshots and bulk key files in the same
+//! temporary directory (`snapshots/` and `bulk/` beside the config file).
 //!
 //! ```sh
 //! make demo-up
@@ -96,7 +98,10 @@ async fn main() -> anyhow::Result<()> {
     }
     cfg.save(&config)?;
 
-    let dashboard = web::start_with(Options { port, config }, store)?;
+    // Snapshots go in `dir/snapshots`, and with them a bulk action's key files go in
+    // `dir/bulk`: nothing is written to the user's data directory.
+    let dashboard =
+        web::start_with_snapshots(Options { port, config }, store, Some(dir.join("snapshots")))?;
     println!("{}", dashboard.open_url());
     dashboard.wait().await;
     Ok(())

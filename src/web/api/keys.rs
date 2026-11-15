@@ -228,6 +228,60 @@ impl Lists {
     pub fn clear(&mut self) {
         self.lists.clear();
     }
+
+    /// The key list `id` of connection `conn`, when it is kept.
+    pub(crate) fn of(&mut self, conn: ConnId, id: u64) -> Option<&mut KeyList> {
+        self.get_mut(id).filter(|l| l.conn == conn)
+    }
+
+    /// `key` was deleted: no list shows it any more (the TUI's `drop_key`).
+    pub(crate) fn drop_key(&mut self, key: &str) {
+        for l in &mut self.lists {
+            l.rows.retain(|r| r.key != key);
+            l.seen.remove(key);
+            l.row_node.remove(key);
+        }
+    }
+
+    /// `old` was renamed `new` (`RENAMENX` keeps it on its node: both names share a
+    /// slot).
+    pub(crate) fn rename_key(&mut self, old: &str, new: &str) {
+        for l in &mut self.lists {
+            for r in l.rows.iter_mut().filter(|r| r.key == old) {
+                r.key = new.to_string();
+            }
+            if l.seen.remove(old) {
+                l.seen.insert(new.to_string());
+            }
+            if let Some(n) = l.row_node.remove(old) {
+                l.row_node.insert(new.to_string(), n);
+            }
+        }
+    }
+
+    /// The TTL and length of `row`'s key, read again after a write (the TUI's
+    /// `update_row`).
+    pub(crate) fn update_row(&mut self, row: &KeyRow) {
+        for l in &mut self.lists {
+            for r in l.rows.iter_mut().filter(|r| r.key == row.key) {
+                r.ttl = row.ttl;
+                r.length = row.length;
+            }
+        }
+    }
+}
+
+impl KeyList {
+    /// A key added to the database: listed, on `node` of a cluster (the TUI's
+    /// `add_row`).
+    pub(crate) fn add_row(&mut self, row: KeyRow, node: Option<usize>) {
+        if let Some(n) = node {
+            self.row_node.insert(row.key.clone(), n);
+        }
+        if self.seen.insert(row.key.clone()) {
+            self.rows.push(row);
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

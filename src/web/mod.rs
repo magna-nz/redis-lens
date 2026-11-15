@@ -266,8 +266,8 @@ pub(crate) fn app_state(
 /// Every route, behind the guard, every response with the security headers.
 pub(crate) fn router(app: api::App) -> Router {
     use api::{
-        analyze, browse, cmdline, connections, keys, overview, pubsub, server, snapshots, values,
-        writes,
+        analyze, browse, bulk, cmdline, connections, edits, keys, overview, pubsub, server,
+        snapshots, values, writes,
     };
     let guard = app.page.guard.clone();
     Router::new()
@@ -313,6 +313,18 @@ pub(crate) fn router(app: api::App) -> Router {
         .route("/api/value", get(values::open))
         .route("/api/value/more", get(values::more))
         .route("/api/value/item", get(values::item_route))
+        .route("/api/value/edit", post(edits::edit))
+        .route("/api/value/add", post(edits::add))
+        .route("/api/value/ttl", post(edits::ttl))
+        .route("/api/value/rename", post(edits::rename))
+        .route("/api/value/remove", post(edits::remove))
+        .route("/api/value/delete", post(edits::delete))
+        .route("/api/keys/add", post(edits::add_key))
+        .route(
+            "/api/bulk",
+            get(bulk::get).post(bulk::start).delete(bulk::stop),
+        )
+        .route("/api/bulk/run", post(bulk::run))
         .route(
             "/api/analysis",
             get(analyze::get).post(analyze::start).delete(analyze::stop),

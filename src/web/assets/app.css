@@ -625,6 +625,19 @@ fieldset.group > legend { padding: 0 6px; font-size: 12px; font-weight: 600; let
 .value-label { padding: 6px 12px; border-bottom: 1px solid var(--line); font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .value-pre { margin: 0; padding: 10px 12px; max-height: 480px; overflow: auto; font-size: 13px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 
+/* Writes: the buttons above a value and under its items, beside the open key's row, the
+   forms, and a bulk action's card. */
+.write-bar .note { font-size: 13px; }
+.item-actions { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel2); }
+.row-tools { display: flex; flex-wrap: wrap; gap: 2px; padding: 0 4px 6px 10px; }
+.row-tools .btn { min-height: 36px; font-size: 13px; }
+textarea.field { min-height: 96px; padding: 10px 12px; resize: vertical; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.check.compact { min-height: 0; padding: 2px 0; }
+.check.compact label { font-size: 13px; color: var(--muted); }
+.bulk { margin-bottom: 16px; border-color: var(--accent); }
+.bulk-title { font-size: 15px; font-weight: 600; min-width: 0; }
+.bulk-lines { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+
 /* ---------- Analyze ---------- */
 
 .row-finding.static { min-height: 0; padding: 4px 0; align-items: start; }

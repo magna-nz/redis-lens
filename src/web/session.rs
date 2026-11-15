@@ -168,6 +168,9 @@ pub struct Current {
     /// The tail to subscribe again once a database switch's live connection is ready,
     /// as the TUI does.
     resub: Option<(Subscription, usize)>,
+    /// The bulk expire or delete of this connection (one at a time, as the TUI's
+    /// dialog): its dry run, its question, its run and how it ended.
+    pub bulk: Option<crate::web::api::bulk::Bulk>,
 }
 
 /// How this session's analyses went, beside what the TUI's [`Session`] keeps (the
@@ -244,6 +247,7 @@ impl Current {
             browse: Default::default(),
             own_snapshots: false,
             resub: None,
+            bulk: None,
         }
     }
 
@@ -343,6 +347,10 @@ pub struct Hub {
     /// Where snapshots are saved and read: `None` for the TUI's own directory
     /// ([`crate::snapshot::default_dir`]); the integration tests give their own.
     snapshots: Option<PathBuf>,
+    /// Where a bulk action's key files go: `None` for the TUI's own directory
+    /// ([`crate::live::bulk::default_dir`]); beside the tests' own snapshot directory
+    /// when they give one.
+    bulk_files: Option<PathBuf>,
     /// Tests: requests sent through [`Hub::send`], and whether they are held (kept
     /// waiting for [`Hub::answer_oldest`]) instead of going to the runtime.
     #[cfg(test)]
@@ -444,6 +452,10 @@ impl Hub {
             events,
             clients: AtomicUsize::new(0),
             line_running: std::sync::atomic::AtomicBool::new(false),
+            bulk_files: snapshots
+                .as_ref()
+                .and_then(|d| d.parent())
+                .map(|d| d.join("bulk")),
             snapshots,
             #[cfg(test)]
             test_sent: AtomicUsize::new(0),
@@ -607,6 +619,9 @@ impl Hub {
     /// Connects `target`, replacing the current connection. Returns once the connect has
     /// started; how it goes comes as `state` events.
     pub async fn connect(self: &Arc<Self>, target: Target) -> Result<(), ConnectError> {
+        if self.bulk_busy() {
+            return Err(ConnectError::Busy);
+        }
         let config = self.config.clone();
         let (profile, source, docker, keychain) = match target {
             Target::Profile(name) => {
@@ -641,8 +656,18 @@ impl Hub {
         let settings = tokio::task::spawn_blocking(move || settings_of(&path))
             .await
             .unwrap_or_default();
-        {
+        let had_bulk = {
             let mut g = lock(&self.inner);
+            // Checked again under the lock that replaces the session: a bulk action
+            // started while the profile was read.
+            if g.cur
+                .as_ref()
+                .and_then(|c| c.bulk.as_ref())
+                .is_some_and(crate::web::api::bulk::Bulk::busy)
+            {
+                return Err(ConnectError::Busy);
+            }
+            let had_bulk = g.cur.as_ref().is_some_and(|c| c.bulk.is_some());
             let id = g.next_conn;
             g.next_conn += 1;
             let mut cur = Current::new(id, profile.clone(), source.clone(), docker);
@@ -663,8 +688,12 @@ impl Hub {
                 secrets: source,
                 sample: None,
             });
-        }
+            had_bulk
+        };
         self.emit_state();
+        if had_bulk {
+            self.emit_bulk_closed();
+        }
         if self.snapshots.is_some() {
             self.find_last_snapshot();
         }
@@ -735,6 +764,18 @@ impl Hub {
                     return Err(Refused::new(StatusCode::CONFLICT, ANALYSIS_RUNS));
                 }
                 Phase::Connected | Phase::Done => {}
+            }
+            // The TUI's bulk dialog takes every key until it ends: a new run would close
+            // the live connection under a batch on its way, and its outcome would go
+            // uncounted.
+            if c.bulk
+                .as_ref()
+                .is_some_and(crate::web::api::bulk::Bulk::busy)
+            {
+                return Err(Refused::new(
+                    StatusCode::CONFLICT,
+                    crate::web::api::bulk::BUSY,
+                ));
             }
             let tail = c.tail.take();
             if let Some(t) = &tail {
@@ -915,12 +956,54 @@ impl Hub {
 
     /// Ends the current connection, its tail and its Monitor run.
     pub fn disconnect(&self) {
-        {
+        let had_bulk = {
             let mut g = lock(&self.inner);
             g.runner.close();
+            let had_bulk = g.cur.as_ref().is_some_and(|c| c.bulk.is_some());
             g.cur = None;
-        }
+            had_bulk
+        };
         self.emit_state();
+        if had_bulk {
+            self.emit_bulk_closed();
+        }
+    }
+
+    /// [`Self::disconnect`], unless a bulk action counts or runs (the TUI's bulk dialog
+    /// takes every key until it ends): then false, and nothing changes.
+    pub fn disconnect_unless_busy(&self) -> bool {
+        let had_bulk = {
+            let mut g = lock(&self.inner);
+            let bulk = g.cur.as_ref().and_then(|c| c.bulk.as_ref());
+            if bulk.is_some_and(crate::web::api::bulk::Bulk::busy) {
+                return false;
+            }
+            let had_bulk = bulk.is_some();
+            g.runner.close();
+            g.cur = None;
+            had_bulk
+        };
+        self.emit_state();
+        if had_bulk {
+            self.emit_bulk_closed();
+        }
+        true
+    }
+
+    /// A bulk action counts or runs on the current connection.
+    pub fn bulk_busy(&self) -> bool {
+        self.with(|c| {
+            c.bulk
+                .as_ref()
+                .is_some_and(crate::web::api::bulk::Bulk::busy)
+        })
+        .unwrap_or(false)
+    }
+
+    /// The `bulk` event of a bulk action gone with its session (a connect, a
+    /// disconnect): a page that follows only events closes its panel.
+    fn emit_bulk_closed(&self) {
+        self.emit(Event::new("bulk", serde_json::json!({ "bulk": null })));
     }
 
     /// Picks node `index` of a cluster for the views that read one node. False when there
@@ -962,6 +1045,35 @@ impl Hub {
         let name = permit.op().command();
         let sent = self.send(Some(conn), dest, LiveRequest::Write(permit), Some(name))?;
         self.wait(sent).await
+    }
+
+    /// Sends a step of a bulk action on connection `conn`: a dry-run step (a read), or a
+    /// batch, which only holds a [`Permit`] the gate gave for the bulk op. A `NOPERM` on a
+    /// batch turns its command off for the session, as [`Self::write`] does.
+    pub async fn bulk_step(
+        &self,
+        conn: ConnId,
+        dest: Dest,
+        req: crate::live::bulk::Request,
+    ) -> LiveResult {
+        let name = match &req {
+            crate::live::bulk::Request::Batch { permit, .. } => Some(permit.op().command()),
+            crate::live::bulk::Request::Count { .. } => None,
+        };
+        let sent = self.send(Some(conn), dest, LiveRequest::Bulk(req), name)?;
+        self.wait(sent).await
+    }
+
+    /// Where a bulk run's key file goes for `profile`: the TUI's directory, or the
+    /// tests' own.
+    pub fn bulk_file(&self, profile: String) -> crate::live::bulk::FileAt {
+        match &self.bulk_files {
+            Some(dir) => crate::live::bulk::FileAt::NewIn {
+                dir: dir.clone(),
+                profile,
+            },
+            None => crate::live::bulk::FileAt::New { profile },
+        }
     }
 
     /// The answer to a request [`Self::send`] sent, or [`TIMED_OUT`] after
@@ -1332,6 +1444,9 @@ pub enum ConnectError {
     NotFound,
     /// In words safe to show (masked).
     Failed(String),
+    /// A bulk action counts or runs on the current connection
+    /// ([`crate::web::api::bulk::BUSY`]).
+    Busy,
 }
 
 /// A request on its way: the connection, its id and where its answer comes.
@@ -1428,10 +1543,14 @@ fn apply_to(c: &mut Current, msg: Msg, events: &mut Vec<Event>, state: &mut bool
         Msg::Live {
             id, req_id, result, ..
         } if c.id == id => {
+            // A refusal is part of the state (`refused`): the pages hear of it as of any
+            // other change of state.
             if let Some(name) = c.writes.remove(&req_id)
                 && let Err(LiveError::Denied(_)) = &result
+                && !c.session.refusals.refused(&name)
             {
                 c.session.refusals.add(&name);
+                *state = true;
             }
             if let Some(tx) = c.pending.remove(&req_id) {
                 let _ = tx.send(result);
@@ -2178,6 +2297,25 @@ mod tests {
             Err(LiveError::Denied("PUBLISH".into()))
         );
         assert!(c.session.refusals.refused("PUBLISH"));
+        // The refusal changed the state: a `state` event goes out.
+        assert!(state, "a refused write sends a state event");
+        // Refused again, nothing new: no event.
+        let (tx, _rx) = oneshot::channel();
+        c.pending.insert(ReqId(9), tx);
+        c.writes.insert(ReqId(9), "PUBLISH".into());
+        state = false;
+        apply_to(
+            &mut c,
+            Msg::Live {
+                id: 1,
+                scan: 1,
+                req_id: ReqId(9),
+                result: Err(LiveError::Denied("PUBLISH".into())),
+            },
+            &mut events,
+            &mut state,
+        );
+        assert!(!state);
         // Another connection's reply is not this one's.
         let (tx, mut rx) = oneshot::channel();
         c.pending.insert(ReqId(8), tx);

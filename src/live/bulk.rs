@@ -123,6 +123,9 @@ pub enum FileAt {
     /// Not created yet: the first batch with keys creates it under [`default_dir`],
     /// in `profile`'s directory, named by the time it is created.
     New { profile: String },
+    /// As [`FileAt::New`], under `dir` instead of [`default_dir`]: the web dashboard's
+    /// integration tests, which never write to the user's data directory.
+    NewIn { dir: PathBuf, profile: String },
     /// Created by an earlier batch of the same run.
     Path(PathBuf),
 }
@@ -240,6 +243,12 @@ pub async fn run(
                             "Not sent: no data directory for the key file was found".into(),
                         )
                     })?;
+                    KeyFile::new(&dir, &profile, action, now_unix())
+                }
+                FileAt::NewIn { dir, profile } => {
+                    let WriteOp::Bulk { action, .. } = permit.op() else {
+                        return Err(not_bulk());
+                    };
                     KeyFile::new(&dir, &profile, action, now_unix())
                 }
             };

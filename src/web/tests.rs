@@ -1290,7 +1290,13 @@ const PHASE_TWO: &[(&str, &str)] = &[
 async fn phase_two_routes_need_the_token_and_writes_the_guard() {
     let t = setup("p2guard", Vec::new());
     analysed(&t, Some(crate::tui::fixtures::report(true)), None);
-    for (method, path) in PHASE_TWO {
+    guarded(&t, PHASE_TWO).await;
+}
+
+/// Every route of `routes` needs the token, the loopback `Host`, and (all but `GET`) the
+/// dashboard's Origin, its header and a JSON body.
+async fn guarded(t: &T, routes: &[(&str, &str)]) {
+    for (method, path) in routes {
         let req = Request::builder()
             .method(*method)
             .uri(*path)
@@ -1300,7 +1306,7 @@ async fn phase_two_routes_need_the_token_and_writes_the_guard() {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from("{}"))
             .unwrap();
-        let res = call(&t, req).await;
+        let res = call(t, req).await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
         assert_security_headers(&res, path);
         let wrong_host = Request::builder()
@@ -1310,7 +1316,7 @@ async fn phase_two_routes_need_the_token_and_writes_the_guard() {
             .header(header::AUTHORIZATION, bearer())
             .body(Body::empty())
             .unwrap();
-        let res = call(&t, wrong_host).await;
+        let res = call(t, wrong_host).await;
         assert_eq!(res.status(), StatusCode::FORBIDDEN, "{method} {path}");
         if *method == "GET" {
             continue;
@@ -1332,7 +1338,7 @@ async fn phase_two_routes_need_the_token_and_writes_the_guard() {
             if let Some(m) = marker {
                 req = req.header("x-redis-lens", m);
             }
-            let res = call(&t, req.body(Body::from("{}")).unwrap()).await;
+            let res = call(t, req.body(Body::from("{}")).unwrap()).await;
             assert_eq!(
                 res.status(),
                 StatusCode::FORBIDDEN,
@@ -1887,4 +1893,940 @@ async fn a_write_question_is_not_answered_on_a_new_run() {
     assert_eq!(res.status(), StatusCode::CONFLICT);
     assert_eq!(json(&text(res).await)["error"], super::api::writes::CHANGED);
     assert_eq!(t.hub.sent_count(), sent, "nothing is sent");
+}
+
+// -- phase 3: key edits and bulk actions ----------------------------------------------
+
+/// Every phase 3 route and method, as the router serves them.
+const PHASE_THREE: &[(&str, &str)] = &[
+    ("POST", "/api/value/edit"),
+    ("POST", "/api/value/add"),
+    ("POST", "/api/value/ttl"),
+    ("POST", "/api/value/rename"),
+    ("POST", "/api/value/remove"),
+    ("POST", "/api/value/delete"),
+    ("POST", "/api/keys/add"),
+    ("GET", "/api/bulk"),
+    ("POST", "/api/bulk"),
+    ("DELETE", "/api/bulk"),
+    ("POST", "/api/bulk/run"),
+];
+
+/// S3: every phase 3 route needs the token; every write route the guard's Origin,
+/// header and JSON body.
+#[tokio::test]
+async fn phase_three_routes_need_the_token_and_writes_the_guard() {
+    let t = setup("p3guard", Vec::new());
+    let mut p = profile("cache", Env::Local);
+    p.read_only = Some(false);
+    t.hub.install_for_test(p, false);
+    guarded(&t, PHASE_THREE).await;
+}
+
+fn hexed(s: &str) -> String {
+    s.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A value open on view 1 as if its first page had been read: a hash of two fields.
+fn open_hash(t: &T) -> u64 {
+    use crate::live::values::{Field, Items, Kind};
+    t.hub
+        .with_mut(|c| {
+            let conn = c.id;
+            let mut row = key_row("user:1");
+            row.key_type = crate::model::KeyType::Hash;
+            let id = c.browse.values.add(conn, row, "user:{id}".into());
+            let v = c.browse.values.get_mut(id).unwrap();
+            v.state.items = Some(Items::Hash(
+                ["name", "mail"]
+                    .iter()
+                    .map(|f| Field {
+                        name: crate::value::Raw::from(*f),
+                        value: crate::value::Raw::from("v"),
+                        ttl: None,
+                    })
+                    .collect(),
+            ));
+            v.state.kind = Some(Kind::Hash);
+            v.state.type_name = Some("hash".into());
+            v.state.pages = 1;
+            id
+        })
+        .unwrap()
+}
+
+/// Rule 2: a read-only profile is refused every phase 3 write with the gate's words,
+/// whatever else the request names, and nothing reaches the live connection.
+#[tokio::test]
+async fn a_read_only_profile_is_refused_every_edit_and_bulk_action_and_nothing_is_sent() {
+    let mut p = profile("cache", Env::Local);
+    p.read_only = Some(true);
+    let t = setup("p3ro", vec![p.clone()]);
+    t.hub.install_for_test(p, false);
+    let view = open_hash(&t);
+    t.hub.hold_requests(true);
+    let pattern = hexed("user:{id}");
+    let bodies = [
+        (
+            "/api/value/edit",
+            format!(r#"{{"view":{view},"rev":0,"index":0,"value":"x"}}"#),
+        ),
+        (
+            "/api/value/add",
+            format!(r#"{{"view":{view},"field":"f","value":"x"}}"#),
+        ),
+        ("/api/value/ttl", format!(r#"{{"view":{view},"ttl":"1h"}}"#)),
+        // Even a TTL the TUI's parser refuses is the gate's refusal first.
+        ("/api/value/ttl", format!(r#"{{"view":{view},"ttl":"0"}}"#)),
+        (
+            "/api/value/rename",
+            format!(r#"{{"view":{view},"name":"user:2"}}"#),
+        ),
+        (
+            "/api/value/remove",
+            format!(r#"{{"view":{view},"rev":0,"index":1}}"#),
+        ),
+        ("/api/value/delete", format!(r#"{{"view":{view}}}"#)),
+        // A view that is not open: still the gate's words.
+        ("/api/value/delete", r#"{"view":99}"#.to_string()),
+        (
+            "/api/keys/add",
+            r#"{"name":"k","type":"string","value":"v"}"#.to_string(),
+        ),
+        (
+            "/api/bulk",
+            format!(r#"{{"pattern":"{pattern}","action":"delete"}}"#),
+        ),
+        (
+            "/api/bulk",
+            format!(r#"{{"pattern":"{pattern}","action":"expire","ttl":"1d"}}"#),
+        ),
+    ];
+    for (path, body) in &bodies {
+        let res = call(&t, write("POST", path, body)).await;
+        assert_eq!(
+            res.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{path} {body}"
+        );
+        let e = json(&text(res).await);
+        assert_eq!(
+            e["error"], "Not sent: cache is read-only. Turn writes on in Connections.",
+            "{path} {body}"
+        );
+    }
+    assert_eq!(t.hub.sent_count(), 0, "nothing went to the live connection");
+    assert_eq!(t.hub.pending_len(), 0);
+    let (_, b) = get_json(&t, "/api/bulk").await;
+    assert_eq!(b["bulk"], serde_json::Value::Null, "{b}");
+}
+
+/// Answers the oldest held request with `reply` once one waits.
+async fn answer_next(t: &T, reply: session::LiveResult) {
+    let hub = Arc::clone(&t.hub);
+    until("a request waits", || hub.pending_len() == 1).await;
+    assert!(t.hub.answer_oldest(reply));
+}
+
+fn hash_page(fields: &[(&str, &str)]) -> session::LiveResult {
+    use crate::live::values::{Field, Items, Page, Reply};
+    Ok(crate::live::LiveReply::Value(Reply::Page(Page {
+        type_name: Some("hash".into()),
+        items: Items::Hash(
+            fields
+                .iter()
+                .map(|(f, v)| Field {
+                    name: crate::value::Raw::from(*f),
+                    value: crate::value::Raw::from(*v),
+                    ttl: None,
+                })
+                .collect(),
+        ),
+        next: None,
+        refused: Vec::new(),
+    })))
+}
+
+fn wrote(r: crate::live::write::Reply) -> session::LiveResult {
+    Ok(crate::live::LiveReply::Write(r))
+}
+
+/// An edit is sent through the gate at once outside prod, then the value is read again
+/// from its first page (`rev` goes up) and the key's row: as the TUI's `e`. A stale
+/// `rev`, an item past what is loaded and an unchanged value send nothing.
+#[tokio::test]
+async fn an_edit_writes_then_reads_the_value_and_its_row_again() {
+    let mut p = profile("cache", Env::Local);
+    p.read_only = Some(false);
+    let t = setup("p3edit", vec![p.clone()]);
+    t.hub.install_for_test(p, false);
+    let view = open_hash(&t);
+    t.hub.hold_requests(true);
+
+    for (body, status, error) in [
+        (
+            format!(r#"{{"view":{view},"rev":3,"index":0,"value":"x"}}"#),
+            StatusCode::CONFLICT,
+            super::api::edits::STALE,
+        ),
+        (
+            format!(r#"{{"view":{view},"rev":0,"index":2,"value":"x"}}"#),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            super::api::values::NO_ITEM,
+        ),
+        (
+            r#"{"view":42,"rev":0,"index":0,"value":"x"}"#.to_string(),
+            StatusCode::NOT_FOUND,
+            super::api::values::NO_VIEW,
+        ),
+    ] {
+        let res = call(&t, write("POST", "/api/value/edit", &body)).await;
+        assert_eq!(res.status(), status, "{body}");
+        assert_eq!(json(&text(res).await)["error"], error, "{body}");
+    }
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/value/edit",
+            &format!(r#"{{"view":{view},"rev":0,"index":1,"value":"v"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = json(&text(res).await);
+    assert_eq!(v["sent"], false, "{v}");
+    assert_eq!(v["message"], super::api::edits::UNCHANGED, "{v}");
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/value/edit",
+            &format!(r#"{{"view":{view},"rev":0,"value":{{"hex":"0"}}}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(t.hub.sent_count(), 0, "none of those sent anything");
+
+    let edit = spawn_call(
+        &t,
+        write(
+            "POST",
+            "/api/value/edit",
+            &format!(r#"{{"view":{view},"rev":0,"index":1,"value":"new@example"}}"#),
+        ),
+    );
+    // The write, then the value's first page, then the key's row.
+    answer_next(&t, wrote(crate::live::write::Reply::Int(0))).await;
+    // One write at a time per value: a second edit while the first is on its way.
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/value/delete",
+            &format!(r#"{{"view":{view}}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    answer_next(&t, hash_page(&[("name", "v"), ("mail", "new@example")])).await;
+    answer_next(&t, keys_page(&["user:1"], 0)).await;
+    let res = edit.await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = json(&text(res).await);
+    assert_eq!(v["sent"], true, "{v}");
+    assert_eq!(v["done"], true, "{v}");
+    assert_eq!(v["message"], "Saved.", "{v}");
+    assert_eq!(v["reply"]["kind"], "int", "{v}");
+    assert_eq!(v["key"]["name"], "user:1", "{v}");
+    assert_eq!(v["value"]["rev"], 1, "{v}");
+    assert_eq!(v["value"]["writing"], false, "{v}");
+    assert_eq!(v["value"]["items"][1]["value"], "new@example", "{v}");
+    assert_eq!(v["row"]["name"], "user:1", "{v}");
+    assert_eq!(t.hub.sent_count(), 3);
+    // The old rev is stale now.
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/value/remove",
+            &format!(r#"{{"view":{view},"rev":0,"index":0}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(t.hub.sent_count(), 3);
+}
+
+/// On prod with writes on an edit asks yes or no, and a delete needs the key's name
+/// typed and says it can't be undone; a wrong name sends nothing, the right one sends
+/// the write, and the value closes with the key dropped from the lists.
+#[tokio::test]
+async fn on_prod_edits_ask_and_deletes_need_the_key_typed() {
+    let mut p = profile("prod1", Env::Prod);
+    p.read_only = Some(false);
+    let t = setup("p3prod", vec![p.clone()]);
+    t.hub.install_for_test(p, false);
+    let view = open_hash(&t);
+    t.hub.hold_requests(true);
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/value/add",
+            &format!(r#"{{"view":{view},"field":"age","value":"42"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let q = json(&text(res).await);
+    assert_eq!(q["confirm"]["kind"], "ask", "{q}");
+    assert_eq!(
+        q["confirm"]["text"], "Send HSETNX user:1 age 42 to prod1?",
+        "{q}"
+    );
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/value/delete",
+            &format!(r#"{{"view":{view}}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let q = json(&text(res).await);
+    assert_eq!(q["confirm"]["kind"], "type", "{q}");
+    assert_eq!(q["confirm"]["expect"], "user:1", "{q}");
+    assert_eq!(
+        q["confirm"]["text"], "Type user:1 to send UNLINK user:1 to prod1. This can't be undone.",
+        "{q}"
+    );
+    let id = q["confirm"]["id"].as_str().unwrap().to_string();
+    assert_eq!(t.hub.sent_count(), 0, "questions send nothing");
+    let res = answer(&t, &id, Some("user:2")).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        json(&text(res).await)["error"],
+        "Not sent: the name typed did not match."
+    );
+    assert_eq!(t.hub.sent_count(), 0);
+    // The question was used: ask again, answer right.
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/value/delete",
+            &format!(r#"{{"view":{view}}}"#),
+        ),
+    )
+    .await;
+    let id = json(&text(res).await)["confirm"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let done = {
+        let router = t.router.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            router
+                .oneshot(write(
+                    "POST",
+                    &format!("/api/confirm/{id}"),
+                    r#"{"typed":"user:1"}"#,
+                ))
+                .await
+                .unwrap()
+        })
+    };
+    answer_next(&t, wrote(crate::live::write::Reply::Int(1))).await;
+    let res = done.await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = json(&text(res).await);
+    assert_eq!(v["done"], true, "{v}");
+    assert_eq!(v["closed"], true, "{v}");
+    assert_eq!(v["message"], "Deleted user:1.", "{v}");
+    assert_eq!(v["value"], serde_json::Value::Null, "{v}");
+    assert_eq!(
+        t.hub.sent_count(),
+        1,
+        "the write alone: nothing is read again"
+    );
+    let (status, _) = get_json(&t, &format!("/api/value/more?view={view}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "the value closed");
+}
+
+fn count_reply(walk: crate::live::bulk::Walk, matched: u64) -> session::LiveResult {
+    Ok(crate::live::LiveReply::Bulk(
+        crate::live::bulk::Reply::Count(crate::live::bulk::Count {
+            walk: Some(walk),
+            matched,
+            with_ttl: 0,
+            other_pattern: 1,
+            unreadable: 0,
+        }),
+    ))
+}
+
+/// A bulk delete: the dry run's steps as events, nothing asked when nothing would
+/// change, then the question (yes or no off prod), and only its answer starts the
+/// batches; a stop is honoured after the batch on its way. A database switch between
+/// the question and the answer refuses it.
+#[tokio::test]
+async fn a_bulk_delete_counts_asks_then_runs_and_stops_when_asked() {
+    use crate::live::bulk::{Batch, Reply, Walk};
+    let mut p = profile("cache", Env::Local);
+    p.read_only = Some(false);
+    p.endpoint = Endpoint {
+        host: "127.0.0.1".into(),
+        port: 1,
+        tls: false,
+    };
+    let t = setup("p3bulk", vec![p.clone()]);
+    t.hub.install_for_test(p, false);
+    t.hub.hold_requests(true);
+    let mut l = t.hub.listen();
+    let pattern = hexed("cart:{id}");
+    let body = format!(r#"{{"pattern":"{pattern}","action":"delete"}}"#);
+    let res = call(&t, write("POST", "/api/bulk", &body)).await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let b = json(&text(res).await);
+    assert_eq!(b["bulk"]["stage"], "counting", "{b}");
+    assert_eq!(b["bulk"]["glob"], "cart:*", "{b}");
+    let id = b["bulk"]["id"].as_u64().unwrap();
+    // One at a time.
+    let res = call(&t, write("POST", "/api/bulk", &body)).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(&text(res).await)["error"],
+        super::api::bulk::ONE_AT_A_TIME
+    );
+    let res = call(
+        &t,
+        write("POST", "/api/bulk/run", &format!(r#"{{"bulk":{id}}}"#)),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT, "not counted yet");
+    answer_next(&t, count_reply(Walk::At(5), 2)).await;
+    answer_next(&t, count_reply(Walk::Done, 1)).await;
+    let hub = Arc::clone(&t.hub);
+    until("counted", || {
+        hub.with(|c| {
+            c.bulk
+                .as_ref()
+                .is_some_and(|b| matches!(b.stage, super::api::bulk::Stage::Counted))
+        })
+        .unwrap_or(false)
+    })
+    .await;
+    let (_, b) = get_json(&t, "/api/bulk").await;
+    assert_eq!(b["bulk"]["count"]["matched"], 3, "{b}");
+    assert_eq!(b["bulk"]["count"]["other_pattern"], 2, "{b}");
+    assert_eq!(
+        b["bulk"]["summary"][0], "Dry run: 3 keys of the pattern will be deleted with UNLINK.",
+        "{b}"
+    );
+    let mut events = 0;
+    while let Ok(e) = l.rx.try_recv() {
+        events += usize::from(e.name == "bulk");
+    }
+    assert!(events >= 3, "{events} bulk events");
+    let sent = t.hub.sent_count();
+    assert_eq!(sent, 2, "the two dry-run steps");
+
+    // Asked, then cancelled: closed, nothing sent.
+    let res = call(
+        &t,
+        write("POST", "/api/bulk/run", &format!(r#"{{"bulk":{id}}}"#)),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let q = json(&text(res).await);
+    assert_eq!(q["confirm"]["kind"], "ask", "{q}");
+    let text_of = q["confirm"]["text"].as_str().unwrap().to_string();
+    assert!(
+        text_of.starts_with("Delete every key of the pattern cart:{id} on cache? Dry run: 3 keys"),
+        "{text_of}"
+    );
+    assert!(text_of.ends_with("500 at a time."), "{text_of}");
+    let qid = q["confirm"]["id"].as_str().unwrap().to_string();
+    let res = call(&t, write("DELETE", &format!("/api/confirm/{qid}"), "")).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let (_, b) = get_json(&t, "/api/bulk").await;
+    assert_eq!(b["bulk"]["stage"], "done", "{b}");
+    assert_eq!(b["bulk"]["lines"][0], crate::live::CANCELLED, "{b}");
+    assert_eq!(t.hub.sent_count(), sent);
+
+    // A stop is honoured exactly: a run held before each batch (`bulk::hold`) is
+    // stopped before its first batch, then another between two batches; a third is
+    // stopped while a batch is on its way. In no case is a batch sent after the stop.
+    let batch = |walk: Walk, changed: u64| {
+        Ok(crate::live::LiveReply::Bulk(Reply::Batch(Batch {
+            walk,
+            carry: Vec::new(),
+            seen: changed,
+            sent: changed,
+            changed,
+            skipped: 0,
+            failed: 0,
+            denied: false,
+            moved: 0,
+            unreadable: 0,
+            file: None,
+        })))
+    };
+    let counted_and_asked = |label: &'static str| {
+        let t = &t;
+        let body = &body;
+        let hub = Arc::clone(&hub);
+        async move {
+            let res = call(t, write("POST", "/api/bulk", body)).await;
+            assert_eq!(res.status(), StatusCode::ACCEPTED, "{label}");
+            let id = json(&text(res).await)["bulk"]["id"].as_u64().unwrap();
+            answer_next(t, count_reply(Walk::Done, 600)).await;
+            until("counted", || {
+                hub.with(|c| {
+                    c.bulk
+                        .as_ref()
+                        .is_some_and(|b| matches!(b.stage, super::api::bulk::Stage::Counted))
+                })
+                .unwrap_or(false)
+            })
+            .await;
+            let res = call(
+                t,
+                write("POST", "/api/bulk/run", &format!(r#"{{"bulk":{id}}}"#)),
+            )
+            .await;
+            json(&text(res).await)["confirm"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let settle = || tokio::time::sleep(std::time::Duration::from_millis(30));
+    use super::api::bulk::hold;
+
+    // 1. Stopped after the answer, before the first batch went: none goes.
+    let qid = counted_and_asked("before the first batch").await;
+    hold::hold(&t.config);
+    let res = answer(&t, &qid, None).await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    assert_eq!(json(&text(res).await)["bulk"]["stage"], "running");
+    until("the run waits before its first batch", || {
+        hold::arrived(&t.config) == 1
+    })
+    .await;
+    let sent = t.hub.sent_count();
+    let res = call(&t, write("DELETE", "/api/bulk", "")).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = json(&text(res).await);
+    assert_eq!(v["text"], super::api::bulk::STOPPED, "{v}");
+    assert_eq!(v["bulk"]["stage"], "done", "ended at once: {v}");
+    assert_eq!(
+        v["bulk"]["lines"][0],
+        super::api::bulk::STOPPED_FIRST,
+        "{v}"
+    );
+    assert_eq!(v["bulk"]["error"], false, "{v}");
+    hold::release(&t.config);
+    settle().await;
+    assert_eq!(t.hub.sent_count(), sent, "no batch after the stop");
+    assert_eq!(t.hub.pending_len(), 0, "no batch after the stop");
+
+    // 2. Stopped between two batches: the first answered, the second not sent.
+    let res = call(&t, write("DELETE", "/api/bulk", "")).await;
+    assert_eq!(json(&text(res).await)["bulk"], serde_json::Value::Null);
+    let qid = counted_and_asked("between batches").await;
+    hold::hold(&t.config);
+    let res = answer(&t, &qid, None).await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    until("the run waits before its first batch", || {
+        hold::arrived(&t.config) == 1
+    })
+    .await;
+    hold::step(&t.config);
+    answer_next(&t, batch(Walk::At(9), 500)).await;
+    until("the run waits before its second batch", || {
+        hold::arrived(&t.config) == 2
+    })
+    .await;
+    let sent = t.hub.sent_count();
+    let res = call(&t, write("DELETE", "/api/bulk", "")).await;
+    let v = json(&text(res).await);
+    assert_eq!(v["text"], super::api::bulk::STOPPED, "{v}");
+    assert_eq!(v["bulk"]["stage"], "done", "{v}");
+    assert_eq!(
+        v["bulk"]["lines"][0], "Stopped after the batch: deleted 500 keys of cart:{id}.",
+        "{v}"
+    );
+    assert_eq!(v["bulk"]["run"]["changed"], 500, "{v}");
+    hold::release(&t.config);
+    settle().await;
+    assert_eq!(t.hub.sent_count(), sent, "no second batch after the stop");
+    assert_eq!(t.hub.pending_len(), 0, "no second batch after the stop");
+    let (_, b) = get_json(&t, "/api/bulk").await;
+    assert_eq!(b["bulk"]["run"]["changed"], 500, "{b}");
+
+    // 3. Stopped while a batch is on its way: that batch lands, no other is sent.
+    let res = call(&t, write("DELETE", "/api/bulk", "")).await;
+    assert_eq!(json(&text(res).await)["bulk"], serde_json::Value::Null);
+    let qid = counted_and_asked("a batch on its way").await;
+    let res = answer(&t, &qid, None).await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let h = Arc::clone(&t.hub);
+    until("the first batch is on its way", || h.pending_len() == 1).await;
+    let sent = t.hub.sent_count();
+    let res = call(&t, write("DELETE", "/api/bulk", "")).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = json(&text(res).await);
+    assert_eq!(v["text"], super::api::bulk::STOPPING, "{v}");
+    assert_eq!(v["bulk"]["stage"], "running", "{v}");
+    assert_eq!(v["bulk"]["run"]["stopping"], true, "{v}");
+    assert!(t.hub.answer_oldest(batch(Walk::At(9), 500)));
+    until("stopped", || {
+        hub.with(|c| {
+            c.bulk
+                .as_ref()
+                .is_some_and(|b| matches!(b.stage, super::api::bulk::Stage::Done(_)))
+        })
+        .unwrap_or(false)
+    })
+    .await;
+    let (_, b) = get_json(&t, "/api/bulk").await;
+    assert_eq!(
+        b["bulk"]["lines"][0], "Stopped after the batch: deleted 500 keys of cart:{id}.",
+        "{b}"
+    );
+    assert_eq!(b["bulk"]["run"]["changed"], 500, "{b}");
+    settle().await;
+    assert_eq!(t.hub.sent_count(), sent, "the batch on its way only");
+    assert_eq!(t.hub.pending_len(), 0, "no batch after the stop");
+
+    // A database switch between the question and its answer: refused, nothing sent.
+    let res = call(&t, write("DELETE", "/api/bulk", "")).await;
+    assert_eq!(json(&text(res).await)["bulk"], serde_json::Value::Null);
+    let res = call(&t, write("POST", "/api/bulk", &body)).await;
+    let id = json(&text(res).await)["bulk"]["id"].as_u64().unwrap();
+    answer_next(&t, count_reply(Walk::Done, 4)).await;
+    until("counted", || {
+        hub.with(|c| {
+            c.bulk
+                .as_ref()
+                .is_some_and(|b| matches!(b.stage, super::api::bulk::Stage::Counted))
+        })
+        .unwrap_or(false)
+    })
+    .await;
+    let res = call(
+        &t,
+        write("POST", "/api/bulk/run", &format!(r#"{{"bulk":{id}}}"#)),
+    )
+    .await;
+    let qid = json(&text(res).await)["confirm"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    t.hub.hold_requests(false);
+    t.hub.with_mut(|c| c.browse.dbs = Some(vec![0, 1]));
+    let res = call(&t, write("POST", "/api/db", r#"{"db":1}"#)).await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    new_run_ready(&t).await;
+    t.hub.hold_requests(true);
+    let sent = t.hub.sent_count();
+    let res = answer(&t, &qid, None).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(json(&text(res).await)["error"], super::api::writes::CHANGED);
+    assert_eq!(t.hub.sent_count(), sent, "nothing is sent to db 1");
+}
+
+// -- the phase 3 verifier's findings: S1, S2, S3, Small 5, 6, 8 ------------------------
+
+fn writable_cache() -> Profile {
+    let mut p = profile("cache", Env::Local);
+    p.read_only = Some(false);
+    // Nothing listens there: a new run's connect fails at once.
+    p.endpoint = Endpoint {
+        host: "127.0.0.1".into(),
+        port: 1,
+        tls: false,
+    };
+    p
+}
+
+/// S1 (rule 2): an op built from what the session held is decided only on that
+/// connection and run: a new run since (a database switch) is refused with CHANGED
+/// before anything is sent. A write not built from the session (`made_for` none) is
+/// decided on the session as it is.
+#[tokio::test]
+async fn an_edit_is_decided_only_for_the_run_it_was_made_on() {
+    let p = writable_cache();
+    let t = setup("p3s1", vec![p.clone()]);
+    t.hub.install_for_test(p, false);
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let app = app_state(Arc::clone(&t.hub), PORT, Token::for_test(&token()), rx);
+    let op = crate::write::WriteOp::Unlink {
+        key: "user:1".into(),
+    };
+    let made_for = t.hub.with(super::api::writes::run_of).unwrap();
+    assert!(super::api::writes::decide(&app, &op, Some(made_for)).is_ok());
+    t.hub.with_mut(|c| c.browse.dbs = Some(vec![0, 1]));
+    let res = call(&t, write("POST", "/api/db", r#"{"db":1}"#)).await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    new_run_ready(&t).await;
+    let r = super::api::writes::decide(&app, &op, Some(made_for)).unwrap_err();
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    assert_eq!(r.text, super::api::writes::CHANGED);
+    assert!(super::api::writes::decide(&app, &op, None).is_ok());
+    // Another connection altogether: refused the same way.
+    t.hub.install_for_test(writable_cache(), false);
+    let r = super::api::writes::decide(&app, &op, Some(made_for)).unwrap_err();
+    assert_eq!(r.text, super::api::writes::CHANGED);
+}
+
+/// S2, S3 (the TUI's bulk dialog takes every key until it ends): while a bulk action
+/// counts or runs, a database switch, an analysis, a connect, a disconnect and every
+/// key edit are refused in the dashboard's words, and nothing is sent. Small 8: once
+/// it ended, a connect replaces it with a `bulk` event of `null`.
+#[tokio::test]
+async fn while_a_bulk_action_counts_or_runs_the_session_and_its_keys_stay_put() {
+    use super::api::bulk::{BUSY, hold};
+    use crate::live::bulk::{Batch, Reply, Walk};
+    let p = writable_cache();
+    let t = setup("p3busy", vec![p.clone()]);
+    t.hub.install_for_test(p, false);
+    let view = open_hash(&t);
+    t.hub.with_mut(|c| c.browse.dbs = Some(vec![0, 1]));
+    t.hub.hold_requests(true);
+    let pattern = hexed("user:{id}");
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/bulk",
+            &format!(r#"{{"pattern":"{pattern}","action":"delete"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let id = json(&text(res).await)["bulk"]["id"].as_u64().unwrap();
+    let hub = Arc::clone(&t.hub);
+    until("the count step waits", || hub.pending_len() == 1).await;
+    let refused = |what: &'static str| {
+        let t = &t;
+        async move {
+            let session = [
+                ("/api/db", r#"{"db":1}"#.to_string()),
+                ("/api/analysis", r#"{"depth":"quick"}"#.to_string()),
+                ("/api/connect", r#"{"name":"cache"}"#.to_string()),
+                ("/api/disconnect", "{}".to_string()),
+            ];
+            let edits = [
+                (
+                    "/api/value/edit",
+                    format!(r#"{{"view":{view},"rev":0,"index":0,"value":"x"}}"#),
+                ),
+                (
+                    "/api/value/add",
+                    format!(r#"{{"view":{view},"field":"f","value":"x"}}"#),
+                ),
+                ("/api/value/ttl", format!(r#"{{"view":{view},"ttl":"1h"}}"#)),
+                (
+                    "/api/value/rename",
+                    format!(r#"{{"view":{view},"name":"user:2"}}"#),
+                ),
+                (
+                    "/api/value/remove",
+                    format!(r#"{{"view":{view},"rev":0,"index":1}}"#),
+                ),
+                ("/api/value/delete", format!(r#"{{"view":{view}}}"#)),
+                (
+                    "/api/keys/add",
+                    r#"{"name":"user:9","type":"string","value":"v"}"#.to_string(),
+                ),
+            ];
+            let sent = t.hub.sent_count();
+            for (path, body) in session.iter().chain(&edits) {
+                let res = call(t, write("POST", path, body)).await;
+                assert_eq!(res.status(), StatusCode::CONFLICT, "{what}: {path}");
+                assert_eq!(json(&text(res).await)["error"], BUSY, "{what}: {path}");
+            }
+            assert_eq!(t.hub.sent_count(), sent, "{what}: nothing sent");
+            assert_eq!(
+                t.hub.with(|c| c.session.scan),
+                Some(1),
+                "{what}: no new run"
+            );
+        }
+    };
+    refused("counting").await;
+
+    // Counted and answered: running, held before its first batch.
+    assert!(t.hub.answer_oldest(count_reply(Walk::Done, 5)));
+    until("counted", || {
+        hub.with(|c| {
+            c.bulk
+                .as_ref()
+                .is_some_and(|b| matches!(b.stage, super::api::bulk::Stage::Counted))
+        })
+        .unwrap_or(false)
+    })
+    .await;
+    let res = call(
+        &t,
+        write("POST", "/api/bulk/run", &format!(r#"{{"bulk":{id}}}"#)),
+    )
+    .await;
+    let qid = json(&text(res).await)["confirm"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    hold::hold(&t.config);
+    let res = answer(&t, &qid, None).await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    until("held", || hold::arrived(&t.config) == 1).await;
+    refused("running").await;
+    // One batch on its way: still refused.
+    hold::release(&t.config);
+    until("the batch is on its way", || hub.pending_len() == 1).await;
+    refused("a batch on its way").await;
+    let res = call(&t, write("DELETE", "/api/bulk", "")).await;
+    assert_eq!(json(&text(res).await)["text"], super::api::bulk::STOPPING);
+    assert!(
+        t.hub
+            .answer_oldest(Ok(crate::live::LiveReply::Bulk(Reply::Batch(Batch {
+                walk: Walk::At(3),
+                carry: Vec::new(),
+                seen: 5,
+                sent: 5,
+                changed: 5,
+                skipped: 0,
+                failed: 0,
+                denied: false,
+                moved: 0,
+                unreadable: 0,
+                file: None,
+            }))))
+    );
+    until("done", || {
+        hub.with(|c| c.bulk.as_ref().is_some_and(|b| !b.busy()))
+            .unwrap_or(false)
+    })
+    .await;
+
+    // Ended: an edit goes again, and a connect replaces the session; the page hears
+    // that the bulk action went.
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/value/edit",
+            &format!(r#"{{"view":{view},"rev":0,"index":0,"value":"v"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK, "unchanged, so nothing sent");
+    let mut l = t.hub.listen();
+    let res = call(&t, write("POST", "/api/connect", r#"{"name":"cache"}"#)).await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let mut closed = false;
+    while let Ok(e) = l.rx.try_recv() {
+        if e.name == "bulk" {
+            closed = true;
+            assert_eq!(
+                serde_json::to_value(&e.data).unwrap(),
+                serde_json::json!({ "bulk": null })
+            );
+        }
+    }
+    assert!(closed, "a bulk event of null");
+}
+
+/// Small 5: a write's value stays `writing` until it was read again, so no edit is made
+/// from the items before the reread; the reply's body says `writing: false`.
+#[tokio::test]
+async fn a_value_stays_writing_until_it_was_read_again() {
+    let p = writable_cache();
+    let t = setup("p3s5", vec![p.clone()]);
+    t.hub.install_for_test(p, false);
+    let view = open_hash(&t);
+    t.hub.hold_requests(true);
+    let edit = spawn_call(
+        &t,
+        write(
+            "POST",
+            "/api/value/edit",
+            &format!(r#"{{"view":{view},"rev":0,"index":1,"value":"new"}}"#),
+        ),
+    );
+    answer_next(&t, wrote(crate::live::write::Reply::Int(0))).await;
+    // The reread is on its way.
+    let hub = Arc::clone(&t.hub);
+    until("the reread waits", || hub.pending_len() == 1).await;
+    let writing = |t: &T| {
+        t.hub
+            .with(|c| c.browse.values.get(view).map(|v| v.writing))
+            .flatten()
+    };
+    assert_eq!(writing(&t), Some(true), "still writing during the reread");
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/value/remove",
+            &format!(r#"{{"view":{view},"rev":0,"index":0}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(json(&text(res).await)["error"], super::api::edits::WRITING);
+    answer_next(&t, hash_page(&[("name", "v"), ("mail", "new")])).await;
+    answer_next(&t, keys_page(&["user:1"], 0)).await;
+    let v = json(&text(edit.await.unwrap()).await);
+    assert_eq!(v["value"]["rev"], 1, "{v}");
+    assert_eq!(v["value"]["writing"], false, "{v}");
+    assert_eq!(writing(&t), Some(false));
+}
+
+/// Small 6: a write that answers while a page of the value is on its way (another
+/// tab's `GET /api/value/more`) waits for that page, then reads the value again: the
+/// reply's body is the reread one and its `rev` moved.
+#[tokio::test]
+async fn a_write_answered_while_a_page_loads_still_reads_the_value_again() {
+    let p = writable_cache();
+    let t = setup("p3s6", vec![p.clone()]);
+    t.hub.install_for_test(p, false);
+    let view = open_hash(&t);
+    t.hub.hold_requests(true);
+    let edit = spawn_call(
+        &t,
+        write(
+            "POST",
+            "/api/value/edit",
+            &format!(r#"{{"view":{view},"rev":0,"index":1,"value":"new"}}"#),
+        ),
+    );
+    let hub = Arc::clone(&t.hub);
+    until("the write waits", || hub.pending_len() == 1).await;
+    // Another tab's page read starts while the write is on its way.
+    let set_loading = |on: bool| {
+        t.hub.with_mut(|c| {
+            c.browse.values.get_mut(view).unwrap().set_loading(on);
+        });
+    };
+    set_loading(true);
+    assert!(
+        t.hub
+            .answer_oldest(wrote(crate::live::write::Reply::Int(0)))
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(t.hub.pending_len(), 0, "the reread waits for the page");
+    // The other tab's page lands.
+    set_loading(false);
+    answer_next(&t, hash_page(&[("name", "v"), ("mail", "new")])).await;
+    answer_next(&t, keys_page(&["user:1"], 0)).await;
+    let v = json(&text(edit.await.unwrap()).await);
+    assert_eq!(v["value"]["rev"], 1, "read again: {v}");
+    assert_eq!(v["value"]["items"][1]["value"], "new", "{v}");
 }

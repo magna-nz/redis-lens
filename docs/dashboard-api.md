@@ -157,8 +157,12 @@ and so does starting Monitor (it always asks) and turning writes on:
 {"confirm": {"id": "<32 hex>", "kind": "ask" | "type", "text": "<question>", "expect": "<name to type>" | null}}
 ```
 
-- `kind: "ask"` is a yes/no question. `kind: "type"` needs the profile's name typed (for
-  prod profiles), and `expect` holds that name.
+- `kind: "ask"` is a yes/no question. `kind: "type"` needs a name typed, and `expect`
+  holds it: the profile's name to turn writes on for a prod profile, the key's name for
+  a destructive write on prod (deleting a key, a field, an element), the pattern for a
+  bulk action on prod.
+- The question of a destructive write (one that deletes data) ends with "This can't be
+  undone.", the TUI's warning; this holds for a command line's destructive command too.
 - `POST /api/confirm/<id>` with `{}` (ask) or `{"typed": "<name>"}` (type) answers yes. The
   gate checks again at that point, with the profile's `read_only` and `env` read again from
   the config file: a different connection (409 or 410), a new run of the same connection
@@ -234,12 +238,13 @@ stream.
 
 | Event | When | Data |
 |---|---|---|
-| `state` | first on every stream, then on every change of connection, phase, node, tail or Monitor | the same body as `GET /api/state` |
+| `state` | first on every stream, then on every change of connection, phase, node, tail or Monitor, and when the server refuses a write for this user (`refused` grows) | the same body as `GET /api/state` |
 | `figures` | at the polling interval (2 s to start with, see `POST /api/polling`), only while at least one stream is open, polling is not paused and the live connection is ready | `{node, info, rates, shards}` for the picked node, where `shards` is every node's headline on a cluster (refreshed less often) |
 | `tail` | pub/sub tail | `{tail, kind: "ready"}`, `{tail, kind: "messages", messages: [...], dropped}`, `{tail, kind: "closed", error}` |
 | `monitor` | Monitor run | `{run, kind: "ready", at_unix_ms, max_lines, max_secs}`, `{run, kind: "lines", lines: [...]}`, `{run, kind: "closed", end: "stopped"\|"line_cap"\|"time_up"\|"lost"\|"failed", error}` |
 | `overview` | when what the connect read for Overview changes: the connect's slow log and client list landing after the live connection is ready (they fill `findings`), another node picked (its findings go until it is read), the last analysis found, the connect's figures. Sent only when the data differs from the last `overview` event of this connection, never before the connect has read anything | the body of `GET /api/overview` without `live` and `shards` (those come with `figures`) |
 | `progress` | an analysis: started, sampling, stopping, done, stopped, failed, and compared with the last snapshot (see [The `progress` event](#the-progress-event)) | `{run, kind, ...}` |
+| `bulk` | a bulk action: after each step of the dry run's walk (one `SCAN` step and its type and TTL reads), counted, after each batch of the run, done, closed, and when a connect or a disconnect replaces the session it was of (see [Bulk actions](#bulk-actions)) | `{"bulk": <the body of GET /api/bulk>}`, `{"bulk": null}` once it is closed or its session is gone |
 | `notice` | something the user should know that has no panel, such as the live connection closing or a stream that fell behind | `{"text": "..."}` |
 
 A stream that falls more than 1024 events behind skips them and gets a `notice` instead.
@@ -388,6 +393,15 @@ Example, `event: figures`. Event
 | GET | `/api/analysis/slots` | Slots (a cluster) |
 | GET, POST | `/api/snapshots` | list, save snapshots |
 | GET | `/api/snapshots/compare?a=&b=` | compare two snapshots |
+| POST | `/api/value/edit` | edit a string, a hash field, a list element, a set member, a sorted set score |
+| POST | `/api/value/add` | add a field, element, member or stream entry |
+| POST | `/api/value/ttl` | set or remove the key's TTL, or a hash field's |
+| POST | `/api/value/rename` | rename the key (`RENAMENX`) |
+| POST | `/api/value/remove` | delete one field, element, member or entry |
+| POST | `/api/value/delete` | delete the key (`UNLINK`) |
+| POST | `/api/keys/add` | add a key with its first item |
+| GET, POST, DELETE | `/api/bulk` | the bulk action; count one (the dry run); stop or close it |
+| POST | `/api/bulk/run` | run the counted bulk action (asks first) |
 | POST, DELETE | `/api/confirm/{id}` | answer or cancel a question |
 
 ### `GET /api/state`
@@ -399,7 +413,8 @@ this route, every write and every answer read its `read_only` and `env` again, a
 change sends a `state` event (a file that cannot be read, or that no longer has the
 profile, turns writes off). A Docker container's session-only setting stays as set.
 `refused` lists the commands the permission check
-turned off. `nodes` and `picked` describe a cluster (the first primary is picked when the
+turned off, and the writes the server refused this session (each one sends a `state`
+event). `nodes` and `picked` describe a cluster (the first primary is picked when the
 nodes arrive). `polling` is how the live figures are polled (`paused`, `interval_secs`,
 and the `intervals` that can be set). `monitor_limits` is when a Monitor run stops by itself
 (`max_secs`, `max_lines`), known before one starts. `features.entra_id` says whether this
@@ -1126,6 +1141,11 @@ Example, `GET /api/docker`. Reply: HTTP 200
 TUI makes it (same code). It replaces the current connection, its tail, its Monitor and its
 open confirms. The reply is 202 with the state; progress arrives as `state` events, and
 `status` turns to `connected` or `failed`. All tabs share the one connection.
+
+While a bulk action counts or runs (see [Bulk actions](#bulk-actions)), both are 409
+`{"error":"A bulk action is running: wait for it to end, or stop it first."}` and nothing changes: the TUI's bulk dialog takes every key until it
+ends. A bulk action that waits for its question or has ended goes with the session, and a
+`bulk` event of `{"bulk": null}` says so.
 
 Example, `POST /api/connect {"name":"cache"}`. Reply: HTTP 202 (`$.polling.intervals` cut to the first 3 of 8)
 
@@ -2503,7 +2523,9 @@ Browse reads the new database's key names. For this session only: the saved prof
 changed. The reply is 202 with the run; a `state` event follows, and
 `state.analysis.db` says the database. The current database is 200
 `{"db": n, "switched": false, "run": null, "text": null}` (nothing changes). 409 on a
-cluster (`A cluster only has database 0.`), while an analysis runs, and when no run can
+cluster (`A cluster only has database 0.`), while an analysis runs, while a bulk action
+counts or runs (`A bulk action is running: wait for it to end, or stop it first.`), and
+when no run can
 start: no session (`not connected: connect first, or the live connection is closed`), the
 switch before still connecting
 (`Still connecting: wait until the connection is ready.`) or a failed connect
@@ -3268,7 +3290,7 @@ Example, `GET /api/value?key=7374723a706c61696e`. Reply: HTTP 200 (`$.value.form
     "name": "str:plain"
   },
   "kind": "string",
-  "length": null,
+  "length": 11,
   "loaded": 1,
   "loading": false,
   "max_items": 10000,
@@ -3279,7 +3301,7 @@ Example, `GET /api/value?key=7374723a706c61696e`. Reply: HTTP 200 (`$.value.form
     "encoding": null,
     "freq": null,
     "id": "7374723a706c61696e",
-    "length": null,
+    "length": 11,
     "length_unit": "bytes",
     "name": "str:plain",
     "node": null,
@@ -3338,7 +3360,7 @@ Example, `GET /api/value?key=7374723a62696e`. Reply: HTTP 200 (`$.value.formats`
     "name": "str:bin"
   },
   "kind": "string",
-  "length": null,
+  "length": 7,
   "loaded": 1,
   "loading": false,
   "max_items": 10000,
@@ -3349,7 +3371,7 @@ Example, `GET /api/value?key=7374723a62696e`. Reply: HTTP 200 (`$.value.formats`
     "encoding": null,
     "freq": null,
     "id": "7374723a62696e",
-    "length": null,
+    "length": 7,
     "length_unit": "bytes",
     "name": "str:bin",
     "node": null,
@@ -3573,7 +3595,7 @@ Example, `GET /api/value?key=71756575653a6a6f6273`. Reply: HTTP 200
     "freq": null,
     "id": "71756575653a6a6f6273",
     "length": null,
-    "length_unit": "bytes",
+    "length_unit": "items",
     "name": "queue:jobs",
     "node": null,
     "ttl": "never",
@@ -3649,7 +3671,7 @@ Example, `GET /api/value/more?view=5`. Reply: HTTP 200
     "freq": null,
     "id": "71756575653a6a6f6273",
     "length": null,
-    "length_unit": "bytes",
+    "length_unit": "items",
     "name": "queue:jobs",
     "node": null,
     "ttl": "never",
@@ -3717,7 +3739,7 @@ Example, `GET /api/value?key=626f6172643a73636f726573`. Reply: HTTP 200
     "freq": null,
     "id": "626f6172643a73636f726573",
     "length": null,
-    "length_unit": "bytes",
+    "length_unit": "members",
     "name": "board:scores",
     "node": null,
     "ttl": "never",
@@ -3799,7 +3821,7 @@ Example, `GET /api/value?key=6576656e74733a6c6f67`. Reply: HTTP 200
     "freq": null,
     "id": "6576656e74733a6c6f67",
     "length": null,
-    "length_unit": "bytes",
+    "length_unit": "entries",
     "name": "events:log",
     "node": null,
     "ttl": "never",
@@ -4055,7 +4077,8 @@ Example, `GET /api/value?key=757365723a313a70726f66696c65`. Reply: HTTP 200 [val
   TUI's Analyze does: a Quick one samples up to 10,000 keys, a Deep one up to 100,000. The
   reply is 202 `{run, depth, sample_limit, estimate}`; progress comes as `progress`
   events. 400 for another depth, 409 while one runs, while connecting or after a failed
-  connect.
+  connect, and while a bulk action counts or runs
+  (`A bulk action is running: wait for it to end, or stop it first.`).
 - `DELETE /api/analysis` stops the running one: it stops within one batch, and what it
   sampled becomes the report, marked stopped (partial, not saved). Stopped before any key
   is sampled, nothing changes. 200 `{stopping, text}`; 409 when none runs.
@@ -4770,5 +4793,1459 @@ Example, `GET /api/snapshots/compare?a=20261115T122502Z.json&b=20261115T122503Z.
   "trend_points": null,
   "used_memory_after": 2018832,
   "used_memory_before": 1944104
+}
+```
+
+## Edits and bulk actions
+
+Every write Browse can make in the TUI (spec "Edits on a key's value (P3)", "Bulk actions
+(P3)"): the open value's edits, a new key, the key's TTL, rename and delete, and a bulk
+expire or delete over a pattern's keys. Each one is the TUI's own write: the dashboard
+builds the TUI's `WriteOp` from what the open value or the pattern holds, and it goes
+through the one write gate (spec "Write permissions") as every other write does. That is:
+decided, then asked about with a 409 `confirm` when the gate asks, a permit given once it
+is answered, then sent through the live layer. Nothing is built from the request alone,
+and no route sends a command of its own.
+
+The rules every route here keeps:
+
+- **A read-only profile is refused first**, with the gate's words, before anything else is
+  looked at, and nothing is sent, `SCAN` included:
+  422 `{"error":"Not sent: ro is read-only. Turn writes on in Connections."}`. The
+  profile's `read_only` and `env` are read again from the config file before each write
+  and each answer, so writes turned off in another window stop the next one.
+- **Prod asks.** An edit asks yes or no. Deleting a key, a field, an element, a member or
+  an entry needs the key's name typed. A bulk action needs the pattern typed. On every
+  other profile an edit is sent at once, a bulk action asks yes or no, and a delete asks
+  yes or no unless the `skip_non_prod_confirm` setting is on (the TUI's table).
+- **An answer is for the run it was asked in.** After a database switch, an analysis
+  started or a reconnect, the answer is refused: 409
+  `{"error":"Not sent: the connection changed since the question was asked."}`. An edit
+  is also decided only for the run its value was read in: one that started while the
+  request was on its way gets the same 409, and nothing is sent.
+- **No edit while a bulk action counts or runs**, as the TUI's bulk dialog takes every key
+  until it ends: 409 `{"error":"A bulk action is running: wait for it to end, or stop it first."}`. A key added or written behind the walk
+  would otherwise outlive "every key of the pattern".
+- **A command the server refused for this user is off** for the rest of the session: the
+  first refusal is `"Not written: the server refused HSET for this user."` (422); after
+  that it is refused before anything is sent, `"Not sent: the server refused HSET for
+  this user."` (422), and `state.refused` lists it (a `state` event says so at once).
+  Neither the username nor the password is in any reply, event or log.
+- **Some edits need `WATCH`, `MULTI` and `EXEC` too.** A string edit (`SET … KEEPTTL`), a
+  list element's edit or delete (`LSET`, `LREM`) and a new key of a type other than a
+  string are sent in `MULTI`/`EXEC` after `WATCH`; a set member's edit in `MULTI`/`EXEC`.
+  A user with `+set` but without `+watch`, `+multi` or `+exec` can't make them. A refused
+  `WATCH` is `"Not written: the server refused WATCH for this user."` (422), and it turns
+  the edit off by the edit's own command, as the TUI does: `state.refused` lists `SET`
+  (`LSET`, …), and the next try is `"Not sent: the server refused SET for this user."`.
+- **One write at a time per value.** A second one while the first has not answered is
+  409 `{"error":"The last write has not answered yet."}`; the body's `writing` is `true`
+  meanwhile.
+- **Values are never logged.** The request bodies print no value in `Debug`, and the
+  replies show values only where `GET /api/value` shows them.
+
+### The open value's edits
+
+Each route names the value with `view` (from `GET /api/value`). The routes that pick an
+item also give `rev`: the `rev` of the value body the item's `index` was read from. Each
+reread of the value after a write adds one to `rev` (every write but the key's TTL, which
+reads the key's row only and leaves `rev` as it is); an older `rev` is refused, so an
+index never points at another item than the one the page showed. The value stays
+`writing` until it was read again, and a page of it still on its way when the write
+answers (another tab's `GET /api/value/more`) lands first: the reread waits for it, so
+`rev` always moves.
+
+| Route | Body | Sends |
+|---|---|---|
+| `POST /api/value/edit` | `{view, rev, index, value}` (`index` 0 for a string) | a string: `SET … KEEPTTL`, in `MULTI`/`EXEC` after `WATCH`, only while it is the string loaded. A hash field: `HSET`. A list element: `LSET`, only while it is the element loaded. A set member: `SREM` and `SADD` in `MULTI`/`EXEC`. A sorted set member: its score, `ZADD … XX` (`value` is the score as text). A RedisJSON document: `JSON.SET … $`. A stream entry is not edited (422) |
+| `POST /api/value/add` | `{view, field?, value, score?}` | a hash: `HSETNX field value`, never over a field. A list: `RPUSH value`. A set: `SADD value`. A sorted set: `ZADD … NX score value`. A stream: `XADD * field value` |
+| `POST /api/value/ttl` | `{view, ttl, field?, rev?}` | the key: `EXPIRE` or, for `-` (`persist`, `none`), `PERSIST`. A hash field (`field` is its index, `rev` is needed with it): `HEXPIRE` or `HPERSIST`, where field TTLs are read (Redis 7.4 and later, Valkey 9.0 and later) |
+| `POST /api/value/rename` | `{view, name}` | `RENAMENX`: it never overwrites a key. On a cluster both names must be in the same slot |
+| `POST /api/value/remove` | `{view, rev, index}` | a hash field: `HDEL`. A set member: `SREM`. A sorted set member: `ZREM`. A stream entry: `XDEL`. A list element: `LSET` to a marker then `LREM` of the marker, only while it is the element loaded |
+| `POST /api/value/delete` | `{view}` | `UNLINK` |
+
+- **`value`, `field`**: text as typed (`"42"`), or bytes as hex (`{"hex": "00ff"}`). An odd
+  or non-hex `hex` is 400
+  `{"error":"a value given as hex must be an even number of hex digits"}`.
+- **`ttl`**: seconds (`90`), or a number with `s`, `m`, `h`, `d` or `w`, several in a row
+  (`1h30m`); `-`, `persist` or `none` removes it. 0 is refused:
+  422 `{"error":"A TTL of 0 would delete the key: delete the key instead."}`. Anything
+  else is 422 `{"error":"Type a TTL such as 90s, 10m, 24h or 7d, or - to remove it."}`;
+  what was typed is never echoed.
+- **`score`**: a number, `inf` or `-inf`;
+  otherwise 422 `{"error":"Type the score as a number, such as 1.5, or inf or -inf."}`.
+- Unknown fields in a body are 400 ("Conventions").
+
+Refusals before anything is sent (besides the read-only one above):
+
+| Status | When | `error` |
+|---|---|---|
+| 404 | `view` is not open (another value replaced it, or the session changed) | `That value is no longer open (a newer one replaced it, or the session changed): open it again.` |
+| 409 | `rev` is not the value's `rev` now | `The value was read again since the page showed it: look at it again, then try once more.` |
+| 409 | the value is still loading | `Still loading the value: wait for it.` |
+| 409 | another write of this value has not answered, or it is being read again after one | `The last write has not answered yet.` |
+| 409 | a bulk action counts or runs | `A bulk action is running: wait for it to end, or stop it first.` |
+| 409 | the session started another run (another database, an analysis) or connection after the edit was made from the value | `Not sent: the connection changed since the question was asked.` |
+| 409 | no live connection | `not connected: connect first, or the live connection is closed` |
+| 422 | the key no longer exists | `The key no longer exists.` |
+| 422 | `index` is past what is loaded | `There is no such item in what is loaded.` |
+| 422 | a stream entry edited | `A stream entry can't be edited: add an entry, or delete this one.` |
+| 422 | adding to a string or a document | `Adding works on a hash, list, set, sorted set or stream: edit this value instead.` |
+| 422 | removing from a string or a document | `Removing works on a field, element, member or entry: delete the key instead.` |
+| 422 | a field TTL on another type than a hash | `Only a hash field has a TTL of its own.` |
+| 422 | a field TTL where the server has none | `Field TTLs need Redis 7.4 or later, or Valkey 9.0 or later.` |
+| 422 | a rename to an empty name, or across slots on a cluster | `Type the new name.`; `Not sent: the keys are in different slots (CROSSSLOT), …` |
+
+**The reply** of a write that was sent (200, the same for the answer of a question):
+
+| Field | What |
+|---|---|
+| `sent` | `true`: the command was sent. `false` only for an edit that changes nothing (`"message":"Not changed, so nothing was sent."`) |
+| `done` | whether it did what was asked: `false` when the value changed since it was loaded, a field or member exists already, the new name is taken, the key is gone |
+| `message` | what happened, in the TUI's words without its keys: `Saved.`, `Added.`, `Deleted.`, `Deleted <key>.`, `Renamed to <name>.`, `TTL set to 1h 30m.`, `TTL removed: the key no longer expires.`, `The key had no TTL.`, `Field TTL set.`, `Not written: the value changed since it was loaded. It is read again now.`, `Not added: the field exists already. Edit it instead.`, `Not added: the member exists already.`, `Not renamed: <name> exists already, and a rename never overwrites a key.`, `Not set: the key no longer exists.`, `Nothing deleted: it was gone already.` |
+| `reply` | the server's answer, as `POST /api/cmdline` gives one (`{"kind":"ok"}`, `{"kind":"int","value":1}`, `{"kind":"changed"}`, `{"kind":"exists"}`) |
+| `key` | the key's name (the new one after a rename), as "Key and pattern names" says |
+| `closed` | `true` when the key was deleted: the value is closed (its `view` is 404 from then on) and the key is gone from every key list |
+| `value` | the value read again from its first page (the body of `GET /api/value`, `rev` one higher), or `null` once closed. The key's TTL alone does not reread the value (a field's does) |
+| `row` | the key's row read again (TTL, size, length, encoding), as the key lists now show it; `null` once closed |
+
+A failure the server gave is 422 `{"error":"Not written: <why>."}`. A live connection
+closed meanwhile is 409. A cancelled question is 200 from `DELETE /api/confirm/<id>`.
+
+In the examples after the first, `value` and `row` are cut short.
+
+Example, `POST /api/value/edit {"index":0,"rev":0,"value":"world","view":1}`. Reply: HTTP 200
+
+```json
+{
+  "closed": false,
+  "done": true,
+  "key": {
+    "copy": "str:a",
+    "id": "7374723a61",
+    "name": "str:a"
+  },
+  "message": "Saved.",
+  "reply": {
+    "kind": "ok"
+  },
+  "row": {
+    "bytes": null,
+    "copy": "str:a",
+    "encoding": "embstr",
+    "freq": null,
+    "id": "7374723a61",
+    "length": 5,
+    "length_unit": "bytes",
+    "name": "str:a",
+    "node": null,
+    "ttl": "1d 03h",
+    "ttl_secs": 99999,
+    "type": "string"
+  },
+  "sent": true,
+  "value": {
+    "capped": false,
+    "cluster": false,
+    "command": "GETRANGE",
+    "cut": null,
+    "done": true,
+    "error": null,
+    "field_ttls": true,
+    "field_ttls_off": null,
+    "gone": false,
+    "items": [],
+    "key": {
+      "copy": "str:a",
+      "id": "7374723a61",
+      "name": "str:a"
+    },
+    "kind": "string",
+    "length": 5,
+    "loaded": 1,
+    "loading": false,
+    "max_items": 10000,
+    "message": null,
+    "meta": {
+      "bytes": null,
+      "copy": "str:a",
+      "encoding": "embstr",
+      "freq": null,
+      "id": "7374723a61",
+      "length": 5,
+      "length_unit": "bytes",
+      "name": "str:a",
+      "node": null,
+      "ttl": "1d 03h",
+      "ttl_secs": 99999,
+      "type": "string"
+    },
+    "module": null,
+    "more": false,
+    "notice": "The value is loaded.",
+    "pages": 1,
+    "pattern": null,
+    "refused": [],
+    "rev": 1,
+    "type": "string",
+    "value": {
+      "bytes": 5,
+      "compression": null,
+      "copy": "world",
+      "copy_refused": null,
+      "detected": "text",
+      "format": "text",
+      "formats": [
+        "text",
+        "hex",
+        "JSON",
+        "MessagePack",
+        "PHP",
+        "Pickle",
+        "Protobuf",
+        "Java"
+      ],
+      "header": "value · text · 5 bytes · auto-detected",
+      "lines": [
+        "world"
+      ],
+      "note": null,
+      "picked": null,
+      "truncated": false
+    },
+    "view": 1,
+    "writing": false
+  }
+}
+```
+
+The value changed behind the page's back: not written, and read again.
+
+Example, `POST /api/value/edit {"rev":1,"value":"mine","view":1}`. Reply: HTTP 200
+
+```json
+{
+  "closed": false,
+  "done": false,
+  "key": {
+    "copy": "str:a",
+    "id": "7374723a61",
+    "name": "str:a"
+  },
+  "message": "Not written: the value changed since it was loaded. It is read again now.",
+  "reply": {
+    "kind": "changed"
+  },
+  "row": {
+    "name": "str:a",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "string"
+  },
+  "sent": true,
+  "value": {
+    "...": "the body of GET /api/value",
+    "rev": 2,
+    "view": 1
+  }
+}
+```
+
+Example, `POST /api/value/edit {"rev":1,"value":"mine","view":1}`. Reply: HTTP 409
+
+```json
+{
+  "error": "The value was read again since the page showed it: look at it again, then try once more."
+}
+```
+
+Example, `POST /api/value/add {"field":"age","value":"42","view":2}`. Reply: HTTP 200
+
+```json
+{
+  "closed": false,
+  "done": true,
+  "key": {
+    "copy": "user:1",
+    "id": "757365723a31",
+    "name": "user:1"
+  },
+  "message": "Added.",
+  "reply": {
+    "kind": "int",
+    "value": 1
+  },
+  "row": {
+    "name": "user:1",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "hash"
+  },
+  "sent": true,
+  "value": {
+    "...": "the body of GET /api/value",
+    "rev": 2,
+    "view": 2
+  }
+}
+```
+
+Example, `POST /api/value/add {"field":"age","value":"7","view":2}`. Reply: HTTP 200
+
+```json
+{
+  "closed": false,
+  "done": false,
+  "key": {
+    "copy": "user:1",
+    "id": "757365723a31",
+    "name": "user:1"
+  },
+  "message": "Not added: the field exists already. Edit it instead.",
+  "reply": {
+    "kind": "int",
+    "value": 0
+  },
+  "row": {
+    "name": "user:1",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "hash"
+  },
+  "sent": true,
+  "value": {
+    "...": "the body of GET /api/value",
+    "rev": 2,
+    "view": 2
+  }
+}
+```
+
+On every profile a delete asks.
+
+Example, `POST /api/value/remove {"index":1,"rev":2,"view":2}`. Reply: HTTP 409
+
+```json
+{
+  "confirm": {
+    "expect": null,
+    "id": "b92d295ebb1139de93c82a4b3007b04c",
+    "kind": "ask",
+    "text": "Send HDEL user:1 mail to local? This can't be undone."
+  }
+}
+```
+
+Example, `POST /api/confirm/<id> {}`. Reply: HTTP 200
+
+```json
+{
+  "closed": false,
+  "done": true,
+  "key": {
+    "copy": "user:1",
+    "id": "757365723a31",
+    "name": "user:1"
+  },
+  "message": "Deleted.",
+  "reply": {
+    "kind": "int",
+    "value": 1
+  },
+  "row": {
+    "name": "user:1",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "hash"
+  },
+  "sent": true,
+  "value": {
+    "...": "the body of GET /api/value",
+    "rev": 3,
+    "view": 2
+  }
+}
+```
+
+Example, `POST /api/value/ttl {"field":1,"rev":3,"ttl":"1h","view":2}`. Reply: HTTP 200
+
+```json
+{
+  "closed": false,
+  "done": true,
+  "key": {
+    "copy": "user:1",
+    "id": "757365723a31",
+    "name": "user:1"
+  },
+  "message": "Field TTL set.",
+  "reply": {
+    "kind": "int",
+    "value": 1
+  },
+  "row": {
+    "name": "user:1",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "hash"
+  },
+  "sent": true,
+  "value": {
+    "...": "the body of GET /api/value",
+    "rev": 4,
+    "view": 2
+  }
+}
+```
+
+Example, `POST /api/value/ttl {"ttl":"-","view":2}`. Reply: HTTP 200
+
+```json
+{
+  "closed": false,
+  "done": true,
+  "key": {
+    "copy": "user:1",
+    "id": "757365723a31",
+    "name": "user:1"
+  },
+  "message": "TTL removed: the key no longer expires.",
+  "reply": {
+    "kind": "int",
+    "value": 1
+  },
+  "row": {
+    "name": "user:1",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "hash"
+  },
+  "sent": true,
+  "value": {
+    "...": "the body of GET /api/value",
+    "rev": 4,
+    "view": 2
+  }
+}
+```
+
+Example, `POST /api/value/ttl {"ttl":"0","view":2}`. Reply: HTTP 422
+
+```json
+{
+  "error": "A TTL of 0 would delete the key: delete the key instead."
+}
+```
+
+Example, `POST /api/value/edit {"index":0,"rev":0,"value":"x","view":6}`. Reply: HTTP 422
+
+```json
+{
+  "error": "A stream entry can't be edited: add an entry, or delete this one."
+}
+```
+
+Example, `POST /api/value/rename {"name":"taken:1","view":7}`. Reply: HTTP 200
+
+```json
+{
+  "closed": false,
+  "done": false,
+  "key": {
+    "copy": "tags:1",
+    "id": "746167733a31",
+    "name": "tags:1"
+  },
+  "message": "Not renamed: taken:1 exists already, and a rename never overwrites a key.",
+  "reply": {
+    "kind": "int",
+    "value": 0
+  },
+  "row": {
+    "name": "tags:1",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "set"
+  },
+  "sent": true,
+  "value": {
+    "...": "the body of GET /api/value",
+    "rev": 0,
+    "view": 7
+  }
+}
+```
+
+Example, `POST /api/value/rename {"name":"tags:2","view":7}`. Reply: HTTP 200
+
+```json
+{
+  "closed": false,
+  "done": true,
+  "key": {
+    "copy": "tags:2",
+    "id": "746167733a32",
+    "name": "tags:2"
+  },
+  "message": "Renamed to tags:2.",
+  "reply": {
+    "kind": "int",
+    "value": 1
+  },
+  "row": {
+    "name": "tags:2",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "set"
+  },
+  "sent": true,
+  "value": {
+    "...": "the body of GET /api/value",
+    "rev": 0,
+    "view": 7
+  }
+}
+```
+
+Example, `POST /api/value/delete {"view":8}`. Reply: HTTP 409
+
+```json
+{
+  "confirm": {
+    "expect": null,
+    "id": "44256ebe5f8c20e2940d68b48da3c199",
+    "kind": "ask",
+    "text": "Send UNLINK rank:1 to local? This can't be undone."
+  }
+}
+```
+
+Example, `POST /api/confirm/<id> {}`. Reply: HTTP 200
+
+```json
+{
+  "closed": true,
+  "done": true,
+  "key": {
+    "copy": "rank:1",
+    "id": "72616e6b3a31",
+    "name": "rank:1"
+  },
+  "message": "Deleted rank:1.",
+  "reply": {
+    "kind": "int",
+    "value": 1
+  },
+  "row": null,
+  "sent": true,
+  "value": null
+}
+```
+
+On prod an edit asks yes or no, and a delete needs the key typed:
+
+Example, `POST /api/value/edit {"rev":0,"value":"prod-edit","view":1}`. Reply: HTTP 409
+
+```json
+{
+  "confirm": {
+    "expect": null,
+    "id": "f70bf2d3ba03ad359879438e425921d1",
+    "kind": "ask",
+    "text": "Send SET str:a prod-edit KEEPTTL  (in MULTI/EXEC after WATCH, only if unchanged) to prod1?"
+  }
+}
+```
+
+Example, `POST /api/value/delete {"view":1}`. Reply: HTTP 409
+
+```json
+{
+  "confirm": {
+    "expect": "str:a",
+    "id": "d4c5243a2451656816a56e9e186ccc3a",
+    "kind": "type",
+    "text": "Type str:a to send UNLINK str:a to prod1. This can't be undone."
+  }
+}
+```
+
+Example, `POST /api/confirm/<id> {"typed":"prod1"}`. Reply: HTTP 422
+
+```json
+{
+  "error": "Not sent: the name typed did not match."
+}
+```
+
+Example, `POST /api/confirm/<id> {"typed":"str:a"}`. Reply: HTTP 200
+
+```json
+{
+  "closed": true,
+  "done": true,
+  "key": {
+    "copy": "str:a",
+    "id": "7374723a61",
+    "name": "str:a"
+  },
+  "message": "Deleted str:a.",
+  "reply": {
+    "kind": "int",
+    "value": 1
+  },
+  "row": null,
+  "sent": true,
+  "value": null
+}
+```
+
+An answer after a database switch:
+
+Example, `POST /api/confirm/<id> {}`. Reply: HTTP 409
+
+```json
+{
+  "error": "Not sent: the connection changed since the question was asked."
+}
+```
+
+### `POST /api/keys/add`
+
+The TUI's `N`: a key with its first item, only when it does not exist. A string is
+`SET … NX`. The other types go in `MULTI`/`EXEC` after `WATCH` and `EXISTS`, so a key
+written by someone else meanwhile is not overwritten.
+
+Body: `{list?, name, type, field?, value, score?}`.
+
+- `type` is one of `string`, `hash`, `list`, `set`, `zset` or `stream`; anything else is
+  422 `{"error":"the type must be one of string, hash, list, set, zset or stream"}`.
+- `field` is a hash's first field or a stream entry's field. `value` is the value,
+  element or member. `score` is a sorted set's first member's score.
+- `list`, when given, is the key list it is added from (`GET /api/keys` or
+  `/api/find`). The key is listed there once added. A list that is gone is 404
+  `{"error":"That key list is gone (a newer one replaced it, or the session changed): open it again."}`.
+
+The reply is the write reply above. Once added, `value` is the new key opened (its
+first page read) and `row` its row (`node` on a cluster: the primary that owns its slot).
+`row.length` is in `length_unit`, as on a key list: a string's bytes (5 for `hello`), and
+1 for the other types (`fields`, `items`, `members`, `entries`). `bytes` is the memory
+`MEMORY USAGE` reports, not the length: `null` until the key list reads it. The value's
+`pattern` is the pattern the key belongs to, as `GET /api/value` gives it (the analysis
+report's, else the pattern of the key list it was added from when the key infers to it,
+else `null`); a find's text is never a pattern.
+A key that exists is not overwritten: `done: false`, `"Not added: <key> exists already,
+and adding a key never overwrites one."`. One written meanwhile gives `done: false`,
+`"Not added: <key> was written by someone else meanwhile."`.
+
+Example, `POST /api/keys/add {"list":1,"name":"new:hello","type":"string","value":"hello"}`. Reply: HTTP 200 (`$.value` cut to some of its fields)
+
+```json
+{
+  "closed": false,
+  "done": true,
+  "key": {
+    "copy": "new:hello",
+    "id": "6e65773a68656c6c6f",
+    "name": "new:hello"
+  },
+  "message": "Added new:hello.",
+  "reply": {
+    "kind": "ok"
+  },
+  "row": {
+    "bytes": null,
+    "copy": "new:hello",
+    "encoding": null,
+    "freq": null,
+    "id": "6e65773a68656c6c6f",
+    "length": 5,
+    "length_unit": "bytes",
+    "name": "new:hello",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "string"
+  },
+  "sent": true,
+  "value": {
+    "...": "the body of GET /api/value",
+    "kind": "string",
+    "length": 5,
+    "meta": {
+      "bytes": null,
+      "length": 5,
+      "length_unit": "bytes",
+      "...": "the same fields as row"
+    },
+    "pattern": null,
+    "rev": 0,
+    "type": "string",
+    "view": 15
+  }
+}
+```
+
+Example, `POST /api/keys/add {"name":"taken:1","type":"string","value":"over"}`. Reply: HTTP 200
+
+```json
+{
+  "closed": false,
+  "done": false,
+  "key": {
+    "copy": "taken:1",
+    "id": "74616b656e3a31",
+    "name": "taken:1"
+  },
+  "message": "Not added: taken:1 exists already, and adding a key never overwrites one.",
+  "reply": {
+    "kind": "exists"
+  },
+  "row": null,
+  "sent": true,
+  "value": null
+}
+```
+
+Example, `POST /api/keys/add {"list":999,"name":"taken:1","type":"string","value":"over"}`. Reply: HTTP 404
+
+```json
+{
+  "error": "That key list is gone (a newer one replaced it, or the session changed): open it again."
+}
+```
+
+### Bulk actions
+
+A bulk expire or delete over **one pattern's keys** (Browse › Keys, a pattern row): the
+TUI's `x` and `D` on a pattern. There is no bulk action over a Find result. It is the
+TUI's run, step for step:
+
+1. `POST /api/bulk` checks it can run, then starts the **dry run**. The dry run walks the
+   pattern's glob with `SCAN MATCH … COUNT`, reads each key's type and TTL, and counts:
+   - the keys of the pattern
+   - those with a TTL already
+   - the keys the glob matched but another pattern owns (they are left alone)
+   - the keys it could not read
+
+   Nothing is written during the dry run.
+2. Once counted, `POST /api/bulk/run` asks. Prod needs the pattern typed; any other
+   profile asks yes or no. The question gives the dry run's numbers and what is sent.
+   When nothing would change, the dry run ends saying so and nothing is asked.
+3. Answered yes, the run starts. Batches of 500 keys, each read again by the walk, so a
+   key that left the pattern or got a TTL meanwhile is skipped:
+   - **expire**: `EXPIRE <key> <secs> NX` on the keys without a TTL. This needs Redis 7.0
+     or later, or any Valkey.
+   - **delete**: `UNLINK <key>`.
+
+   Each batch is booked on the command budget. Each key a batch sends a command for is
+   written to a **key file** before the batch goes, so an expire can be undone with
+   `PERSIST` and a delete is on record. It lists the keys sent, those whose command then
+   failed or was refused included (a batch refused with `NOPERM` leaves its keys listed
+   and none changed); `run.changed` says how many changed. On a
+   cluster each primary is walked in turn, in slot order, with no redirect followed;
+   each line of the key file is the node's address, a tab, then the key.
+4. `DELETE /api/bulk` stops it. A dry run stops at once and nothing was sent. A run with
+   a batch on its way stops once that batch answers; a run between two batches, or
+   answered but before its first batch, stops at once. No batch is sent after a stop.
+
+Before every batch after the first, the profile is read again from the config file. A
+profile turned read-only stops the run (`"Stopped: <name> is now read-only. …"`), and so
+would a new run of the session (`"Stopped: the connection changed. …"`), which the
+dashboard refuses while a bulk action runs (below). A batch the server
+refuses with `NOPERM` stops the run, and that command is off for the session.
+
+One bulk action per connection: a new one replaces one that ended or waits for its
+question. While one is counting
+or running, `POST /api/bulk` is 409 `{"error":"A bulk action is running already: wait for it to end, or stop it first."}`.
+Meanwhile nothing else may change the session or the keys, as the TUI's bulk dialog takes
+every key until it ends: a database switch (`POST /api/db`), an analysis
+(`POST /api/analysis`), a connect or a disconnect, and every key edit ("The open value's
+edits", `POST /api/keys/add`) are 409 `{"error":"A bulk action is running: wait for it to end, or stop it first."}`. A dry run whose session
+started another run anyway ends with
+`"The dry run stopped: the connection changed. Nothing was sent."` (`error: true`).
+
+**Routes.** Every reply, and every `bulk` event, is `{"bulk": <body> | null}`:
+
+- **`GET /api/bulk`**: the connection's bulk action, or `null`.
+- **`POST /api/bulk {pattern, action, ttl?}`**: 202. `pattern` is the pattern's `id`
+  ("Key and pattern names"). `action` is `delete` or `expire`; anything else is 400
+  `{"error":"the action must be expire or delete"}`. `ttl` is for `expire` only, and
+  defaults to `24h`. It takes seconds, or a number with `s`, `m`, `h` or `d`. A TTL that
+  is not a duration is 422 `{"error":"not a duration: use 90s, 10m, 24h or 7d"}` (what
+  was typed is never echoed); 0 is 422 `{"error":"the TTL must be at least 1s"}`. The
+  refusals, in the order they are checked:
+  - the gate: a read-only profile (422), or a command already refused for this user
+    (422)
+  - another bulk action counting or running (409)
+  - a replica, or a cluster whose slots are not known (422, the TUI's words)
+  - an expire on Redis before 7.0 (422, `"… needs Redis 7.0 or later …"`)
+  - no live connection (409)
+- **`POST /api/bulk/run {bulk}`**: `bulk` is the body's `id`. It answers 409 with a
+  `confirm`, and the answer is 202 with the running body. The refusals:
+  - 404 `That bulk action is no longer open: start it again from its pattern.`
+  - 409 `The dry run has not finished: wait for its count.`
+  - 409 `That bulk action has started already.`
+  - 422 `Nothing to run: the dry run found nothing to change.`
+  - 409 `Not sent: the connection changed since the question was asked.` (another run
+    since it was counted)
+
+  A wrong typed name is 422 and keeps the bulk action counted, to be asked again.
+  Cancelling the question (`DELETE /api/confirm/<id>`) ends the bulk action:
+  `"lines": ["Cancelled: nothing was sent."]`. The answer
+  (`POST /api/confirm/<id>`) is 410
+  `That bulk action is no longer open: start it again from its pattern.` when the bulk
+  action ended meanwhile (stopped, or its other question cancelled) or another replaced
+  it, and 409 `That bulk action has started already.` when another answer started it.
+- **`DELETE /api/bulk`**: 200 with the body and a `text`:
+  - a dry run: stopped, `Dry run stopped. Nothing was sent.`
+  - counted, not run: closed, `Bulk action cancelled. Nothing was sent.`
+  - a run with a batch on its way: still `running`, `"stopping": true`,
+    `Stopping after the batch on its way.`; done once that batch answered
+    (`Stopped after the batch: …`), with no batch after it.
+  - a run between two batches, or before its first: done at once,
+    `Stopped: no batch was on its way, and no more is sent.`, its lines
+    `Stopped after the batch: …` or `Stopped before the first batch: nothing was sent.`
+  - an ended one: cleared, `{"bulk": null}`.
+
+**The body:**
+
+| Field | What |
+|---|---|
+| `id` | names it for `POST /api/bulk/run` |
+| `pattern`, `glob` | the pattern ("Key and pattern names") and the glob `SCAN MATCH` walks |
+| `action`, `ttl`, `ttl_secs`, `title` | `delete` or `expire`; an expire's TTL (`2h`) and in seconds; the title (`Delete every key of the pattern`, `Set a TTL on every key of the pattern`) |
+| `profile`, `prod` | the profile it runs on, and whether it is a prod one (the pattern is typed) |
+| `stage` | `counting`, `counted`, `running`, `done` |
+| `count` | the dry run: `matched` (keys of the pattern), `with_ttl`, `other_pattern` (matched the glob, left alone), `unreadable`, `to_change` |
+| `summary` | the dry run in sentences, the TUI's, once the count is complete (empty while counting, and after a dry run stopped part way) |
+| `nodes`, `at` | a cluster: each primary walked, `{node, endpoint, matched}`, and the index in `nodes` the walk is on (`[]` and `null` on one server) |
+| `run` | once it runs: `seen`, `sent`, `changed`, `skipped` (a TTL already, or gone), `failed`, `unreadable`, `moved` (in a slot that moved: left alone), `file` (the key file), `stopping` |
+| `lines` | once done: what happened, the TUI's lines without its keys. `Done: deleted 1,200 keys of cart:{id}.` / `Stopped after the batch: …` / `Stopped before the first batch: nothing was sent.` / `Stopped: <why>. Before that, …`, then the skipped, unreadable, moved and failed counts, `Key names: <file>` and, for an expire, `PERSIST on those keys undoes it.` |
+| `error` | `true` when it stopped on a failure |
+
+The key files are the TUI's: in the `bulk` directory of redis-lens's data directory, one
+subdirectory per profile, named `<UTC time>-<action>.txt`. They hold key names only,
+never a value or a credential. In the examples below their directory is shortened to
+`<data dir>`.
+
+Example, `POST /api/bulk {"action":"expire","pattern":"636172743a7b69647d","ttl":"2h"}`. Reply: HTTP 202
+
+```json
+{
+  "bulk": {
+    "action": "expire",
+    "at": null,
+    "count": {
+      "matched": 0,
+      "other_pattern": 0,
+      "to_change": 0,
+      "unreadable": 0,
+      "with_ttl": 0
+    },
+    "error": false,
+    "glob": "cart:*",
+    "id": 5,
+    "lines": [],
+    "nodes": [],
+    "pattern": {
+      "copy": "cart:{id}",
+      "id": "636172743a7b69647d",
+      "name": "cart:{id}"
+    },
+    "prod": false,
+    "profile": "local",
+    "run": null,
+    "stage": "counting",
+    "summary": [],
+    "title": "Set a TTL on every key of the pattern",
+    "ttl": "2h",
+    "ttl_secs": 7200
+  }
+}
+```
+
+Event `bulk`:
+
+```json
+{
+  "bulk": {
+    "action": "expire",
+    "at": null,
+    "count": {
+      "matched": 1200,
+      "other_pattern": 20,
+      "to_change": 1150,
+      "unreadable": 0,
+      "with_ttl": 50
+    },
+    "error": false,
+    "glob": "cart:*",
+    "id": 5,
+    "lines": [],
+    "nodes": [],
+    "pattern": {
+      "copy": "cart:{id}",
+      "id": "636172743a7b69647d",
+      "name": "cart:{id}"
+    },
+    "prod": false,
+    "profile": "local",
+    "run": null,
+    "stage": "counted",
+    "summary": [
+      "Dry run: 1,200 keys of the pattern, 50 with a TTL already.",
+      "1,150 keys without a TTL get 2h; the others are left alone.",
+      "20 other keys matched the glob but belong to other patterns: left alone."
+    ],
+    "title": "Set a TTL on every key of the pattern",
+    "ttl": "2h",
+    "ttl_secs": 7200
+  }
+}
+```
+
+Example, `POST /api/bulk/run {"bulk":5}`. Reply: HTTP 409
+
+```json
+{
+  "confirm": {
+    "expect": null,
+    "id": "878bc337aeddbf929ccc9d3e3ee3cd28",
+    "kind": "ask",
+    "text": "Set a TTL on every key of the pattern cart:{id} on local? Dry run: 1,200 keys of the pattern, 50 with a TTL already. 1,150 keys without a TTL get 2h; the others are left alone. 20 other keys matched the glob but belong to other patterns: left alone. PERSIST on the keys in the key file undoes it. Sends: EXPIRE <key> 7200 NX  for each key of SCAN MATCH cart:*, 500 at a time."
+  }
+}
+```
+
+Example, `POST /api/confirm/<id> {}`. Reply: HTTP 202
+
+```json
+{
+  "bulk": {
+    "action": "expire",
+    "at": null,
+    "count": {
+      "matched": 1200,
+      "other_pattern": 20,
+      "to_change": 1150,
+      "unreadable": 0,
+      "with_ttl": 50
+    },
+    "error": false,
+    "glob": "cart:*",
+    "id": 5,
+    "lines": [],
+    "nodes": [],
+    "pattern": {
+      "copy": "cart:{id}",
+      "id": "636172743a7b69647d",
+      "name": "cart:{id}"
+    },
+    "prod": false,
+    "profile": "local",
+    "run": {
+      "changed": 0,
+      "failed": 0,
+      "file": null,
+      "moved": 0,
+      "seen": 0,
+      "sent": 0,
+      "skipped": 0,
+      "stopping": false,
+      "unreadable": 0
+    },
+    "stage": "running",
+    "summary": [
+      "Dry run: 1,200 keys of the pattern, 50 with a TTL already.",
+      "1,150 keys without a TTL get 2h; the others are left alone.",
+      "20 other keys matched the glob but belong to other patterns: left alone."
+    ],
+    "title": "Set a TTL on every key of the pattern",
+    "ttl": "2h",
+    "ttl_secs": 7200
+  }
+}
+```
+
+Event `bulk`:
+
+```json
+{
+  "bulk": {
+    "action": "expire",
+    "at": null,
+    "count": {
+      "matched": 1200,
+      "other_pattern": 20,
+      "to_change": 1150,
+      "unreadable": 0,
+      "with_ttl": 50
+    },
+    "error": false,
+    "glob": "cart:*",
+    "id": 5,
+    "lines": [
+      "Done: set a TTL of 2h on 1,150 keys of cart:{id}.",
+      "50 keys left alone: a TTL already, or gone.",
+      "Key names: <data dir>/bulk/local-249f1fb6f3a6/20261115T145622Z-expire.txt",
+      "PERSIST on those keys undoes it."
+    ],
+    "nodes": [],
+    "pattern": {
+      "copy": "cart:{id}",
+      "id": "636172743a7b69647d",
+      "name": "cart:{id}"
+    },
+    "prod": false,
+    "profile": "local",
+    "run": {
+      "changed": 1150,
+      "failed": 0,
+      "file": "<data dir>/bulk/local-249f1fb6f3a6/20261115T145622Z-expire.txt",
+      "moved": 0,
+      "seen": 1200,
+      "sent": 1150,
+      "skipped": 50,
+      "stopping": false,
+      "unreadable": 0
+    },
+    "stage": "done",
+    "summary": [
+      "Dry run: 1,200 keys of the pattern, 50 with a TTL already.",
+      "1,150 keys without a TTL get 2h; the others are left alone.",
+      "20 other keys matched the glob but belong to other patterns: left alone."
+    ],
+    "title": "Set a TTL on every key of the pattern",
+    "ttl": "2h",
+    "ttl_secs": 7200
+  }
+}
+```
+
+Event `bulk`:
+
+```json
+{
+  "bulk": {
+    "action": "expire",
+    "at": null,
+    "count": {
+      "matched": 1200,
+      "other_pattern": 20,
+      "to_change": 0,
+      "unreadable": 0,
+      "with_ttl": 1200
+    },
+    "error": false,
+    "glob": "cart:*",
+    "id": 6,
+    "lines": [
+      "Every key of cart:{id} (1,200) has a TTL already. Nothing was sent."
+    ],
+    "nodes": [],
+    "pattern": {
+      "copy": "cart:{id}",
+      "id": "636172743a7b69647d",
+      "name": "cart:{id}"
+    },
+    "prod": false,
+    "profile": "local",
+    "run": null,
+    "stage": "done",
+    "summary": [
+      "Dry run: 1,200 keys of the pattern, 1,200 with a TTL already.",
+      "0 keys without a TTL get 24h; the others are left alone.",
+      "20 other keys matched the glob but belong to other patterns: left alone."
+    ],
+    "title": "Set a TTL on every key of the pattern",
+    "ttl": "24h",
+    "ttl_secs": 86400
+  }
+}
+```
+
+Example, `POST /api/bulk/run {"bulk":6}`. Reply: HTTP 422
+
+```json
+{
+  "error": "Nothing to run: the dry run found nothing to change."
+}
+```
+
+A delete, its question cancelled:
+
+Example, `POST /api/bulk/run {"bulk":7}`. Reply: HTTP 409
+
+```json
+{
+  "confirm": {
+    "expect": null,
+    "id": "95bdef0b8a9bf6c7dec65ed19b389217",
+    "kind": "ask",
+    "text": "Delete every key of the pattern cart:{id} on local? Dry run: 1,200 keys of the pattern will be deleted with UNLINK. 20 other keys matched the glob but belong to other patterns: left alone. This can't be undone. Sends: UNLINK <key>  for each key of SCAN MATCH cart:*, 500 at a time."
+  }
+}
+```
+
+Example, `DELETE /api/confirm/<id>`. Reply: HTTP 200
+
+```json
+{
+  "cancelled": true,
+  "text": "Cancelled: nothing was sent."
+}
+```
+
+Event `bulk`:
+
+```json
+{
+  "bulk": {
+    "action": "delete",
+    "at": null,
+    "count": {
+      "matched": 1200,
+      "other_pattern": 20,
+      "to_change": 1200,
+      "unreadable": 0,
+      "with_ttl": 1200
+    },
+    "error": false,
+    "glob": "cart:*",
+    "id": 7,
+    "lines": [
+      "Cancelled: nothing was sent."
+    ],
+    "nodes": [],
+    "pattern": {
+      "copy": "cart:{id}",
+      "id": "636172743a7b69647d",
+      "name": "cart:{id}"
+    },
+    "prod": false,
+    "profile": "local",
+    "run": null,
+    "stage": "done",
+    "summary": [
+      "Dry run: 1,200 keys of the pattern will be deleted with UNLINK.",
+      "20 other keys matched the glob but belong to other patterns: left alone."
+    ],
+    "title": "Delete every key of the pattern",
+    "ttl": null,
+    "ttl_secs": null
+  }
+}
+```
+
+A dry run stopped:
+
+Example, `DELETE /api/bulk`. Reply: HTTP 200
+
+```json
+{
+  "bulk": {
+    "action": "delete",
+    "at": null,
+    "count": {
+      "matched": 0,
+      "other_pattern": 0,
+      "to_change": 0,
+      "unreadable": 0,
+      "with_ttl": 0
+    },
+    "error": false,
+    "glob": "cart:*",
+    "id": 8,
+    "lines": [
+      "Dry run stopped. Nothing was sent."
+    ],
+    "nodes": [],
+    "pattern": {
+      "copy": "cart:{id}",
+      "id": "636172743a7b69647d",
+      "name": "cart:{id}"
+    },
+    "prod": false,
+    "profile": "local",
+    "run": null,
+    "stage": "done",
+    "summary": [],
+    "title": "Delete every key of the pattern",
+    "ttl": null,
+    "ttl_secs": null
+  },
+  "text": "Dry run stopped. Nothing was sent."
+}
+```
+
+A run stopped while its first batch was on its way (on a stage profile, whose command
+budget spaces the batches): the reply says it stops after that batch, and the `bulk`
+event after it says so:
+
+Example, `DELETE /api/bulk`. Reply: HTTP 200
+
+```json
+{
+  "bulk": {
+    "action": "delete",
+    "at": null,
+    "count": {
+      "matched": 4000,
+      "other_pattern": 0,
+      "to_change": 4000,
+      "unreadable": 0,
+      "with_ttl": 0
+    },
+    "error": false,
+    "glob": "job:*",
+    "id": 10,
+    "lines": [],
+    "nodes": [],
+    "pattern": {
+      "copy": "job:{id}",
+      "id": "6a6f623a7b69647d",
+      "name": "job:{id}"
+    },
+    "prod": false,
+    "profile": "stage1",
+    "run": {
+      "changed": 0,
+      "failed": 0,
+      "file": null,
+      "moved": 0,
+      "seen": 0,
+      "sent": 0,
+      "skipped": 0,
+      "stopping": true,
+      "unreadable": 0
+    },
+    "stage": "running",
+    "summary": [
+      "Dry run: 4,000 keys of the pattern will be deleted with UNLINK."
+    ],
+    "title": "Delete every key of the pattern",
+    "ttl": null,
+    "ttl_secs": null
+  },
+  "text": "Stopping after the batch on its way."
+}
+```
+
+Event `bulk`:
+
+```json
+{
+  "bulk": {
+    "action": "delete",
+    "at": null,
+    "count": {
+      "matched": 4000,
+      "other_pattern": 0,
+      "to_change": 4000,
+      "unreadable": 0,
+      "with_ttl": 0
+    },
+    "error": false,
+    "glob": "job:*",
+    "id": 10,
+    "lines": [
+      "Stopped after the batch: deleted 500 keys of job:{id}.",
+      "Key names: <data dir>/bulk/stage1-5948f06dc12d/20261115T145623Z-delete.txt"
+    ],
+    "nodes": [],
+    "pattern": {
+      "copy": "job:{id}",
+      "id": "6a6f623a7b69647d",
+      "name": "job:{id}"
+    },
+    "prod": false,
+    "profile": "stage1",
+    "run": {
+      "changed": 500,
+      "failed": 0,
+      "file": "<data dir>/bulk/stage1-5948f06dc12d/20261115T145623Z-delete.txt",
+      "moved": 0,
+      "seen": 500,
+      "sent": 500,
+      "skipped": 0,
+      "stopping": true,
+      "unreadable": 0
+    },
+    "stage": "done",
+    "summary": [
+      "Dry run: 4,000 keys of the pattern will be deleted with UNLINK."
+    ],
+    "title": "Delete every key of the pattern",
+    "ttl": null,
+    "ttl_secs": null
+  }
+}
+```
+
+On prod the pattern is typed:
+
+Example, `POST /api/bulk/run {"bulk":11}`. Reply: HTTP 409
+
+```json
+{
+  "confirm": {
+    "expect": "job:{id}",
+    "id": "6f238e3011d4fcecd98be68ff794e1c7",
+    "kind": "type",
+    "text": "Type job:{id} to start: Delete every key of the pattern job:{id} on prod1. Dry run: 3,500 keys of the pattern will be deleted with UNLINK. This can't be undone. Sends: UNLINK <key>  for each key of SCAN MATCH job:*, 500 at a time."
+  }
+}
+```
+
+Example, `POST /api/confirm/<id> {"typed":"prod1"}`. Reply: HTTP 422
+
+```json
+{
+  "error": "Not sent: the name typed did not match."
+}
+```
+
+On a cluster, each primary in turn:
+
+Event `bulk`:
+
+```json
+{
+  "bulk": {
+    "action": "delete",
+    "at": 2,
+    "count": {
+      "matched": 300,
+      "other_pattern": 0,
+      "to_change": 300,
+      "unreadable": 0,
+      "with_ttl": 0
+    },
+    "error": false,
+    "glob": "item:*",
+    "id": 1,
+    "lines": [],
+    "nodes": [
+      {
+        "endpoint": "127.0.0.1:52168",
+        "matched": 98,
+        "node": 0
+      },
+      {
+        "endpoint": "127.0.0.1:52169",
+        "matched": 107,
+        "node": 1
+      },
+      {
+        "endpoint": "127.0.0.1:52170",
+        "matched": 95,
+        "node": 2
+      }
+    ],
+    "pattern": {
+      "copy": "item:{id}",
+      "id": "6974656d3a7b69647d",
+      "name": "item:{id}"
+    },
+    "prod": false,
+    "profile": "cl",
+    "run": null,
+    "stage": "counted",
+    "summary": [
+      "Dry run: 300 keys of the pattern will be deleted with UNLINK."
+    ],
+    "title": "Delete every key of the pattern",
+    "ttl": null,
+    "ttl_secs": null
+  }
+}
+```
+
+Example, `POST /api/bulk/run {"bulk":1}`. Reply: HTTP 409
+
+```json
+{
+  "confirm": {
+    "expect": null,
+    "id": "21800052ba1540477c2b954e5cca84a6",
+    "kind": "ask",
+    "text": "Delete every key of the pattern item:{id} on cl? Dry run: 300 keys of the pattern will be deleted with UNLINK. It runs on each of the 3 primaries in turn, in slot order. This can't be undone. Sends: UNLINK <key>  for each key of SCAN MATCH item:*, 500 at a time."
+  }
+}
+```
+
+Event `bulk`:
+
+```json
+{
+  "bulk": {
+    "action": "delete",
+    "at": 2,
+    "count": {
+      "matched": 300,
+      "other_pattern": 0,
+      "to_change": 300,
+      "unreadable": 0,
+      "with_ttl": 0
+    },
+    "error": false,
+    "glob": "item:*",
+    "id": 1,
+    "lines": [
+      "Done: deleted 300 keys of item:{id}.",
+      "Key names, each after its node and a tab: <data dir>/bulk/cl-08a25a07b54a/20261115T145619Z-delete.txt"
+    ],
+    "nodes": [
+      {
+        "endpoint": "127.0.0.1:52168",
+        "matched": 98,
+        "node": 0
+      },
+      {
+        "endpoint": "127.0.0.1:52169",
+        "matched": 107,
+        "node": 1
+      },
+      {
+        "endpoint": "127.0.0.1:52170",
+        "matched": 95,
+        "node": 2
+      }
+    ],
+    "pattern": {
+      "copy": "item:{id}",
+      "id": "6974656d3a7b69647d",
+      "name": "item:{id}"
+    },
+    "prod": false,
+    "profile": "cl",
+    "run": {
+      "changed": 300,
+      "failed": 0,
+      "file": "<data dir>/bulk/cl-08a25a07b54a/20261115T145619Z-delete.txt",
+      "moved": 0,
+      "seen": 300,
+      "sent": 300,
+      "skipped": 0,
+      "stopping": false,
+      "unreadable": 0
+    },
+    "stage": "done",
+    "summary": [
+      "Dry run: 300 keys of the pattern will be deleted with UNLINK."
+    ],
+    "title": "Delete every key of the pattern",
+    "ttl": null,
+    "ttl_secs": null
+  }
 }
 ```
