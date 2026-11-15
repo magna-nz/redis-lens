@@ -116,7 +116,7 @@ pub(crate) fn facts(report: &ScanReport) -> Vec<(&'static str, String)> {
                 "{} used of {}, eviction {}",
                 format::bytes(s.used_memory),
                 limit,
-                s.maxmemory_policy
+                s.policy_label()
             ),
         ),
         (
@@ -458,6 +458,30 @@ mod tests {
         let failed = node_cells(&nodes[2]);
         assert_eq!((failed[3].as_str(), failed[4].as_str()), ("failed", "-"));
         assert_eq!(failed[6], "-");
+    }
+
+    /// A server whose `INFO` gave no eviction policy reads "unknown" in Markdown and
+    /// HTML, as in the text table, not "eviction " and nothing.
+    #[test]
+    fn an_unknown_policy_says_unknown() {
+        let mut r = fixtures::report(vec![], true, 0);
+        for (policy, shown) in [
+            ("", "unknown"),
+            ("  ", "unknown"),
+            ("allkeys-lfu", "allkeys-lfu"),
+        ] {
+            r.server.maxmemory_policy = policy.into();
+            let memory = facts(&r)
+                .into_iter()
+                .find(|(k, _)| *k == "Memory")
+                .unwrap()
+                .1;
+            assert!(memory.ends_with(&format!("eviction {shown}")), "{memory:?}");
+            for format in [ReportFormat::Md, ReportFormat::Html] {
+                let out = render(format, &r, None, false);
+                assert!(out.contains(&format!("eviction {shown}")), "{format:?}");
+            }
+        }
     }
 
     #[test]

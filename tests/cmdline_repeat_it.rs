@@ -3,7 +3,8 @@
 //! (`run_cmdline_for_tests`: connect, `:`, type, `enter`), with the TUI's own live
 //! connection: a readonly repeat one at a time and in a pipeline, a write repeat on a
 //! profile with writes on (the count applied), a write repeat refused on a read-only
-//! profile with nothing sent, and the budget limiting a repeat. Also on Redis 6.2
+//! profile with nothing sent, destructive and `@dangerous` repeats refused under
+//! `skip_non_prod_confirm`, and the budget limiting a repeat. Also on Redis 6.2
 //! (`REDIS_LENS_IT_REDIS_IMAGE=redis:6.2-alpine`).
 #![cfg(feature = "integration-tests")]
 
@@ -18,7 +19,10 @@ use redis::aio::MultiplexedConnection;
 use redis_lens::budget::Budget;
 use redis_lens::live::cmdline::{self, Args, CommandInfo, Reply, Request, pipeline_batch};
 use redis_lens::model::{Auth, Endpoint, Env, Profile};
-use redis_lens::tui::app::views::cmdline::{CmdlineForTests, CmdlineStep, run_cmdline_for_tests};
+use redis_lens::tui::app::views::cmdline::{
+    CmdlineForTests, CmdlineStep, REPEAT_ASKS, run_cmdline_for_tests,
+};
+use redis_lens::write::Settings;
 
 fn profile(port: u16, env: Env, read_only: Option<bool>) -> Profile {
     Profile {
@@ -232,6 +236,57 @@ async fn a_write_repeat_on_a_read_only_profile_redis() {
 #[tokio::test]
 async fn a_write_repeat_on_a_read_only_profile_valkey() {
     a_write_repeat_on_a_read_only_profile(common::valkey().await).await;
+}
+
+/// `skip_non_prod_confirm` takes the question away from one destructive or
+/// `@dangerous` write on a profile that is not `prod`, but such a write is still not
+/// repeated: nothing is sent. A plain edit still repeats.
+async fn a_skipped_question_does_not_repeat(server: common::TestServer) {
+    let mut admin = server.admin().await;
+    let _: () = redis::cmd("RPUSH")
+        .arg("jobs")
+        .arg(&["a", "b", "c", "d"])
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    reset_stats(&mut admin).await;
+    let seen = panel(
+        profile(server.port, Env::Stage, Some(false)),
+        vec![
+            CmdlineStep::Settings(Settings {
+                skip_non_prod_confirm: true,
+                ..Settings::default()
+            }),
+            line("3 LPOP jobs"),
+            line("3 FLUSHALL"),
+            line("3 INCR c"),
+        ],
+    )
+    .await;
+    for cmd in ["3 LPOP jobs", "3 FLUSHALL"] {
+        assert_eq!(entry(&seen, cmd), [REPEAT_ASKS], "{cmd}");
+    }
+    assert_eq!(calls(&mut admin, "lpop").await, 0);
+    assert_eq!(calls(&mut admin, "flushall").await, 0);
+    let len: u64 = redis::cmd("LLEN")
+        .arg("jobs")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    assert_eq!(len, 4);
+    assert_eq!(get(&mut admin, "c").await.as_deref(), Some("3"));
+    assert_eq!(calls(&mut admin, "incr").await, 3);
+    assert_eq!(sent(&seen, "Write("), 3, "{:?}", seen.requests);
+}
+
+#[tokio::test]
+async fn a_skipped_question_does_not_repeat_redis() {
+    a_skipped_question_does_not_repeat(common::redis().await).await;
+}
+
+#[tokio::test]
+async fn a_skipped_question_does_not_repeat_valkey() {
+    a_skipped_question_does_not_repeat(common::valkey().await).await;
 }
 
 async fn info(c: &mut MultiplexedConnection, name: &str) -> CommandInfo {

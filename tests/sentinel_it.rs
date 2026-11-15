@@ -202,6 +202,55 @@ async fn scan_and_conn_test(valkey: bool) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A hand-edited file with both `force_standalone = true` and a Sentinel table (which
+/// `conn add` refuses) is refused at connect with `conn add`'s line, instead of being
+/// read through the Sentinel; without `force_standalone` the same profile connects.
+async fn standalone_and_sentinel_refused(valkey: bool) {
+    let s = sentinel(SentinelSetup::new(valkey)).await;
+    let mut p = profile(&s, MASTER);
+    let secrets = store(&s, &p);
+    p.force_standalone = true;
+    let dir = std::env::temp_dir().join(format!(
+        "redis-lens-sentinel-standalone-it-{}-{}",
+        std::process::id(),
+        s.primary_port
+    ));
+    let path = dir.join("config.toml");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The hand edit: `Config::save` checks nothing, like an editor.
+    Config {
+        profiles: vec![p.clone()],
+        ..Config::default()
+    }
+    .save(&path)
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("force_standalone = true") && text.contains("[profile.sentinel]"));
+    let loaded = Config::load(&path).unwrap();
+    let p = loaded.get(&p.name).unwrap().clone();
+
+    let Err(e) = connect_targets(&p, &secrets).await else {
+        panic!("a Sentinel profile with force_standalone connected");
+    };
+    assert_eq!(e.to_string(), conn::STANDALONE_SENTINEL);
+    let e = conn::connect(&p, &secrets).await.err().unwrap();
+    assert_eq!(e.to_string(), conn::STANDALONE_SENTINEL);
+    let e = conn::connect_for_scan(&p, &secrets).await.err().unwrap();
+    assert_eq!(e.to_string(), conn::STANDALONE_SENTINEL);
+    // `conn test` says it too.
+    let out = match cli_conn::test(&path, &secrets, &p.name).await {
+        Ok(out) => out,
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(out.contains(conn::STANDALONE_SENTINEL), "{out}");
+
+    let mut through = p.clone();
+    through.force_standalone = false;
+    let c = conn::connect(&through, &secrets).await.unwrap();
+    assert_eq!(c.sentinel().unwrap().primary, primary_ep(s.primary_port));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A master name no Sentinel knows is a fixed error.
 async fn wrong_master_name(valkey: bool) {
     let s = sentinel(SentinelSetup::new(valkey)).await;
@@ -445,6 +494,16 @@ async fn redis_tail_and_monitor() {
 #[tokio::test]
 async fn valkey_tail_and_monitor() {
     tail_and_monitor(true).await;
+}
+
+#[tokio::test]
+async fn redis_standalone_and_sentinel_refused() {
+    standalone_and_sentinel_refused(false).await;
+}
+
+#[tokio::test]
+async fn valkey_standalone_and_sentinel_refused() {
+    standalone_and_sentinel_refused(true).await;
 }
 
 #[tokio::test]

@@ -647,14 +647,21 @@ impl Output {
         }
     }
 
-    /// The bytes held, every view counted.
+    /// The bytes of the largest view: what the output cap counts (spec "Command line
+    /// panel"), so it bounds what is drawn whichever view is shown. Each view is cut at
+    /// [`MAX_REPLY_BYTES`], so all of them together hold at most a few times this.
     pub fn bytes(&self) -> usize {
         let sum = |l: &[String]| l.iter().map(String::len).sum::<usize>();
-        sum(&self.lines)
-            + sum(&self.table)
-            + self.table_pairs.as_deref().map_or(0, sum)
-            + sum(&self.json)
-            + sum(&self.raw)
+        [
+            sum(&self.lines),
+            sum(&self.table),
+            self.table_pairs.as_deref().map_or(0, sum),
+            sum(&self.json),
+            sum(&self.raw),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0)
     }
 
     /// One error line (from [`run_error`]), as the reply: the same in every view.
@@ -1820,6 +1827,32 @@ mod tests {
 
     fn lines(v: &Value) -> Vec<String> {
         format_reply(v).0
+    }
+
+    /// The output cap counts the largest view, not every view together (spec "Command
+    /// line panel": counted by the largest of its result views).
+    #[test]
+    fn output_bytes_are_the_largest_view() {
+        let size = |o: &Output, v: View, pairs: bool| -> usize {
+            o.lines_in(v, pairs).iter().map(String::len).sum()
+        };
+        let views = [View::Text, View::Table, View::Json, View::Raw];
+        for v in [
+            b(&"a".repeat(100_000)),
+            Value::Array(vec![b("f"), b("v"), b("g"), b(&"w".repeat(5_000))]),
+            Value::Int(5),
+        ] {
+            let o = Output::of(&v, Duration::ZERO);
+            let largest = views
+                .iter()
+                .flat_map(|&x| [size(&o, x, false), size(&o, x, true)])
+                .max()
+                .unwrap();
+            assert_eq!(o.bytes(), largest);
+        }
+        // A big string is about its size in each view, so it counts about once.
+        let o = Output::of(&b(&"a".repeat(100_000)), Duration::ZERO);
+        assert!(o.bytes() < 110_000, "{}", o.bytes());
     }
 
     /// A script or function runs commands the gate never sees: refused whatever its

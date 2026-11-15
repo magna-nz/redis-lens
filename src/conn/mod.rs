@@ -54,7 +54,16 @@ pub enum ConnError {
     /// texts only: never a server's error text or a credential.
     #[error(transparent)]
     Sentinel(#[from] sentinel::SentinelError),
+    /// The profile asks for two things that do not go together (a hand-edited config
+    /// file: `conn add`, `conn set` and `conn import` refuse them). A fixed text.
+    #[error("{0}")]
+    Profile(&'static str),
 }
+
+/// Why a profile with both `force_standalone` and a Sentinel table is refused: by
+/// `conn add`, `conn set` and, for a hand-edited file, at connect.
+pub const STANDALONE_SENTINEL: &str =
+    "--standalone conflicts with a Sentinel profile: Sentinel already names one primary";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -306,6 +315,11 @@ impl Route {
         profile: &Profile,
         secrets: &dyn SecretStore,
     ) -> Result<Arc<Self>, ConnError> {
+        // Every connect starts here: a hand-edited profile with both is refused, not
+        // read through its Sentinel (`conn add` and `conn set` refuse the same).
+        if profile.force_standalone && profile.sentinel.is_some() {
+            return Err(ConnError::Profile(STANDALONE_SENTINEL));
+        }
         Ok(Arc::new(match &profile.ssh {
             None => Self::Direct,
             Some(tunnel) => Self::Ssh(ssh::Bastion::new(profile, tunnel, secrets)?),
@@ -1850,6 +1864,44 @@ mod tests {
             matches!(e, ConnError::Ssh(ssh::SshError::InvalidHost)),
             "{e:?}"
         );
+    }
+
+    /// A hand-edited config file can hold both `force_standalone = true` and a
+    /// Sentinel table, which `conn add` refuses. Every connect refuses it too, with the
+    /// same line, before anything is resolved or sent (the port here is closed, and the
+    /// Sentinel names nothing): it never quietly takes the Sentinel path.
+    #[tokio::test]
+    async fn force_standalone_with_a_sentinel_is_refused_at_connect() {
+        let store = crate::secrets::MemoryStore::default();
+        let mut p = ssh::tests::profile(None);
+        p.endpoint.host = "127.0.0.1".into();
+        p.endpoint.port = 1;
+        p.sentinel = Some(crate::model::Sentinel {
+            master: "m".into(),
+            nodes: vec![crate::model::SentinelNode {
+                host: "127.0.0.1".into(),
+                port: 1,
+            }],
+            tls: false,
+        });
+        p.force_standalone = true;
+        let refused = |e: ConnError| {
+            assert!(matches!(e, ConnError::Profile(_)), "{e:?}");
+            assert_eq!(e.to_string(), STANDALONE_SENTINEL);
+        };
+        refused(Route::for_profile(&p, &store).await.err().unwrap());
+        refused(connect(&p, &store).await.err().unwrap());
+        refused(connect_for_scan(&p, &store).await.err().unwrap());
+        refused(cluster::connect_targets(&p, &store).await.err().unwrap());
+        refused(open_subscriber(&p, &store, None).await.err().unwrap());
+        // Either alone still gets as far as the network.
+        for (standalone, sentinel) in [(true, None), (false, p.sentinel.clone())] {
+            let mut q = p.clone();
+            q.force_standalone = standalone;
+            q.sentinel = sentinel;
+            let e = connect(&q, &store).await.err().unwrap();
+            assert!(!matches!(e, ConnError::Profile(_)), "{e:?}");
+        }
     }
 
     /// Behind a bastion, "on this machine" means on the bastion: judged from the host

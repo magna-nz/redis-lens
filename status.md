@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** Redis Insight parity phase 5, built on branch `claude/insight-phase5` for one PR that is not merged yet ([Phase 5](#phase-5-2026-11-15-the-rest-of-redis-insight-parity)). On main: parity phases 1 to 4 (#15, #16, #17, #18, #19), the phase 4 follow-up PR #20 (merged 2026-11-14, merge commit `9e031cb`) and the TUI redesign (#21, merged 2026-11-15, merge commit `dec974e`).
-**Last updated:** 2026-11-15 (phase 5 built on its branch, in draft PR #22; not merged yet)
+**Current milestone:** Redis Insight parity phase 5, merged as #22, with the verifier's fixes in the follow-up branch `claude/insight-phase5-followups` ([Phase 5](#phase-5-2026-11-15-the-rest-of-redis-insight-parity)). On main: parity phases 1 to 4 (#15, #16, #17, #18, #19), the phase 4 follow-up PR #20 (merged 2026-11-14, merge commit `9e031cb`) and the TUI redesign (#21, merged 2026-11-15, merge commit `dec974e`).
+**Last updated:** 2026-11-15 (phase 5 merged as #22; the verifier's fixes and the docs update that landed after that merge are in a follow-up PR)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -610,7 +610,7 @@ Built on branch `claude/tui-redesign-ab602a` and merged by the owner as [#21](ht
 
 ## Phase 5 (2026-11-15): the rest of Redis Insight parity
 
-Built on `claude/insight-phase5`, cut from main at `dec974e`, for one PR that is not merged yet. The parts were built in separate worktrees and merged into the branch as each passed its checks. The behaviour is in spec.md ("Recommendations (P1)", "Copy", "Command line panel", "Values", "Browse › Keys › a key's value", "Permission check, additions", "Server versions" and "Milestones").
+Built on `claude/insight-phase5`, cut from main at `dec974e`. Merged as #22 at `2dfbd53`; the commits after that (the verifier's fixes, the docs update, this section) are in a follow-up PR from `claude/insight-phase5-followups`. The parts were built in separate worktrees and merged into the branch as each passed its checks. The behaviour is in spec.md ("Recommendations (P1)", "Copy", "Command line panel", "Values", "Browse › Keys › a key's value", "Permission check, additions", "Server versions" and "Milestones").
 
 | Part | Content | Commits | State |
 |---|---|---|---|
@@ -620,6 +620,9 @@ Built on `claude/insight-phase5`, cut from main at `dec974e`, for one PR that is
 | docs | A GitHub Pages site in `docs/` (`index.html`, `site.css`, `site.js`, `.nojekyll`) and a README cut from 412 to 93 lines; the site's text on `expire` dry runs was corrected to match spec.md (a read-only profile refuses, dry run included) | `e22599c`, `6176202`; merge `1270a0c` | **done**; Pages is not enabled yet (see the questions) |
 | spec and status | spec.md, this section and the parity doc brought up to date | this commit | **done** |
 | force standalone | `conn add --standalone`, `conn set --standalone/--no-standalone`: one node of a cluster read as a standalone server, redirects never followed, a `standalone` mark and a report note; plus the module summary footer (`↑↓ Move`, `D`, `esc Back`) | `f77ecaf`, merge `59f2a74` (with a Java-reader fix from the proptests: a handle cleared by `TC_RESET` is no longer indexed) | **done**; `tests/cluster_standalone_it.rs` on Redis and Valkey |
+| GIF | `docs/demo.gif` re-recorded for the redesigned UI (63 s): connect, Overview, a Quick analysis, Browse to a value and `f`, Analyze, Server, the command line's table view | `2abccc2` | **done** |
+| verifier | Verifier [opus] on the whole phase: **APPROVE**, no blockers. Fixed from its notes, each with a test: a write that would ask is never repeated, even with `skip_non_prod_confirm` (N1, `e66b4cc`); the output cap counts each reply's largest view (N2, `40ac698`); the Java reader formats only kept lines, shares class fields and stops when its tree is full (N3, `d76d192`); reports say "unknown" for an empty policy (N4, `3a09164`); Sentinel plus `force_standalone` is refused at connect (N6, `e355ad1`); `CopyText::masked_line` is crate-only (N7, `abae0c8`). Left: N5 (snapshots saved before `5488e27` keep the old `noeviction` default), N9 (`Debug` shows a time series sample's timestamp and an array element's index, never a value). Report: session notes, `phase5-verify.md` | | **done** |
+| integration suite | `cargo test --features integration-tests --tests --no-fail-fast` on the merged branch: 2,001 passed, 1 failed (`stream_writes_valkey`: the test's connection reached something other than Redis on its port, the known port flake), which passed on a rerun | | **done** |
 
 Tests: the keymap test `tui::keymap::tests::spec_lists_every_key` checks the key tables in spec.md against `src/tui/keymap.rs`; the key rows for the small and cmdline parts were added with their parts. Module values need no new ACL rule: their commands are in `+@read` on Redis 8 (checked on 8.10.1).
 

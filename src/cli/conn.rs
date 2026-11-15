@@ -14,6 +14,9 @@ use super::{ConnAddArgs, ConnCommand, WritesArg};
 use crate::config::Config;
 use crate::conn::docker::DiscoveredInstance;
 use crate::conn::token::display_command;
+// The refusal for `--standalone` on a Sentinel profile; connecting a hand-edited
+// profile with both says the same.
+use crate::conn::STANDALONE_SENTINEL;
 use crate::conn::{self, parse_connection_string, provider, ssh};
 use crate::model::{
     Auth, Credentials, Env, PermStatus, Profile, SecretRef, Sentinel, SentinelNode, SshTunnel,
@@ -870,10 +873,6 @@ pub fn set(
     config.save(path)?;
     Ok(lines.join("\n"))
 }
-
-/// The refusal for `--standalone` on a Sentinel profile.
-const STANDALONE_SENTINEL: &str =
-    "--standalone conflicts with a Sentinel profile: Sentinel already names one primary";
 
 /// `conn set <name> --writes on|off` alone.
 pub fn set_writes(

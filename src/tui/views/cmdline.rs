@@ -46,11 +46,19 @@ use crate::live::{CANCELLED, Dest, LiveError, LiveReply, LiveRequest, ReqId};
 use crate::model::Env;
 use crate::tui::app::{App, Effect};
 use crate::value;
-use crate::write::{Decision, WriteOp};
+use crate::write::{Decision, Kind, WriteOp};
 
 /// Why a repeated write that would ask first is not sent.
 pub const REPEAT_ASKS: &str = "Not sent: this write asks first, and the write gate's \
      question covers one command, so it is not repeated. Send it without the count.";
+
+/// Whether a write may be repeated: only a plain edit the write gate runs without a
+/// question. A destructive or `@dangerous` write would ask without
+/// `skip_non_prod_confirm`, so it is never repeated, whatever the setting; an edit on
+/// `prod` asks, so it is not repeated either.
+fn repeatable(op: &WriteOp, decision: &Decision) -> bool {
+    op.kind() == Kind::Edit && *decision == Decision::Run
+}
 
 /// Why a write [`Act::write`] did not take was not sent.
 const WRITE_NOT_SENT: &str =
@@ -973,8 +981,10 @@ impl CmdlineState {
                 }
                 if times > 1 {
                     // The write gate's question is about one command: a write that
-                    // asks is not repeated, and nothing is sent.
-                    if decision != Decision::Run {
+                    // asks is not repeated, and nothing is sent. That is any write but
+                    // a plain edit, also when `skip_non_prod_confirm` takes the
+                    // question away (spec "Repeat").
+                    if !repeatable(&op, &decision) {
                         self.set_body(entry, Body::Note(REPEAT_ASKS.into()));
                         return;
                     }
@@ -1129,12 +1139,12 @@ impl CmdlineState {
                 args: r.args,
                 info: r.info,
             };
-            match act.write_decision(&op) {
-                Decision::Run => {}
-                Decision::Refuse(why) => return self.end_repeat(RunEnd::Failed(why)),
-                Decision::Ask | Decision::Type(_) => {
-                    return self.end_repeat(RunEnd::Failed(REPEAT_ASKS.into()));
-                }
+            let decision = act.write_decision(&op);
+            if let Decision::Refuse(why) = decision {
+                return self.end_repeat(RunEnd::Failed(why));
+            }
+            if !repeatable(&op, &decision) {
+                return self.end_repeat(RunEnd::Failed(REPEAT_ASKS.into()));
             }
             let Some(id) = act.write(op) else {
                 return self.end_repeat(RunEnd::Failed(WRITE_NOT_SENT.into()));
@@ -1850,6 +1860,8 @@ pub enum CmdlineStep {
     Line(String),
     /// Presses the key: `ctrl-p`, `ctrl-t`, `y` for a question …
     Key(KeyEvent),
+    /// Replaces the `[settings]` from here on (`skip_non_prod_confirm` …).
+    Settings(crate::write::Settings),
 }
 
 /// What [`run_cmdline_for_tests`] saw. Holds replies: for tests only, so no `Debug`.
@@ -1973,6 +1985,7 @@ pub async fn run_cmdline_for_tests(
                 let effects = app.handle_key(k);
                 carry_out(effects, &slot, &mut requests);
             }
+            CmdlineStep::Settings(settings) => app.settings = settings,
         }
         while busy(&app) {
             assert!(pump(&mut app, &mut rx, &slot, &mut requests).await);
@@ -3030,6 +3043,42 @@ mod tests {
     }
 
     #[test]
+    fn skip_non_prod_confirm_does_not_repeat_destructive_or_dangerous_writes() {
+        // The setting takes the question away for one command, but the spec says a
+        // write that would ask without it is never repeated.
+        let mut app = opened();
+        writable(&mut app, Env::Stage);
+        app.settings.skip_non_prod_confirm = true;
+        let lpop = info("lpop", &["write", "fast"], &["@write", "@list", "@fast"]);
+        let flushall = info(
+            "flushall",
+            &["write"],
+            &["@keyspace", "@write", "@slow", "@dangerous"],
+        );
+        for (line, i) in [("3 LPOP jobs", lpop), ("3 FLUSHALL", flushall)] {
+            let e = enter_all(&mut app, line, Some(i));
+            assert!(writes(&e).is_empty(), "{line}: {e:?}");
+            assert!(app.confirm.is_none(), "{line}");
+            assert!(last_body(&app) == Body::Note(REPEAT_ASKS.into()), "{line}");
+            assert!(!app.views.cmdline.running(), "{line}");
+        }
+        // A plain edit still repeats, one write at a time.
+        let e = enter_all(&mut app, "3 INCR c", Some(incr_info()));
+        let mut w = writes(&e);
+        let mut sent = 0;
+        while let [(id, op)] = &w[..] {
+            let WriteOp::Command { args, .. } = op else {
+                panic!()
+            };
+            assert_eq!(args.as_slice(), [b"INCR".to_vec(), b"c".to_vec()]);
+            sent += 1;
+            w = writes(&wrote(&mut app, *id, Value::Int(sent)));
+        }
+        assert_eq!(sent, 3);
+        assert!(text(&app, 120, 36).contains("(3 replies in 3 round trips"));
+    }
+
+    #[test]
     fn esc_stops_a_repeat_and_keeps_the_replies() {
         let mut app = opened();
         let next = enter_with(&mut app, "5 GET k", Some(get_info()));
@@ -3221,10 +3270,42 @@ mod tests {
     }
 
     #[test]
+    fn three_one_mib_replies_fit_under_the_output_cap() {
+        // The cap counts the largest view of each reply, not all four together: three
+        // replies of about 1 MiB (each about that size in every view) are all kept.
+        let big = || Value::BulkString(vec![b'a'; 1_000_000]);
+        let mut app = opened();
+        let run = enter_with(&mut app, "GET a", Some(get_info()));
+        reply(&mut app, run[0].0, ran(big()));
+        for k in ["GET b", "GET c"] {
+            let run = reqs(&enter_cached(&mut app, k));
+            reply(&mut app, run[0].0, ran(big()));
+        }
+        let lines: Vec<_> = app
+            .views
+            .cmdline
+            .entries
+            .iter()
+            .filter_map(|e| e.line.clone())
+            .collect();
+        assert_eq!(lines, ["GET a", "GET b", "GET c"]);
+
+        // A repeat keeps all three too, and drops none.
+        let mut next = reqs(&enter_cached(&mut app, "3 GET k"));
+        while let [(id, _)] = &next[..] {
+            next = reqs(&reply(&mut app, *id, ran(big())));
+        }
+        let Body::Runs(r) = last_body(&app) else {
+            panic!()
+        };
+        assert_eq!((r.answered(), r.outs.len(), r.dropped), (3, 3, 0));
+    }
+
+    #[test]
     fn a_long_repeat_keeps_the_output_under_its_cap() {
         let mut app = opened();
         let mut next = enter_with(&mut app, "8 GET k", Some(get_info()));
-        // 8 replies of about 1 MiB in each of 4 views: the oldest go first.
+        // 8 replies of about 0.7 MiB in each view: the oldest go first.
         let big = Value::BulkString(vec![b'a'; MAX_OUTPUT_BYTES / 6]);
         while let [(id, _)] = &next[..] {
             next = reqs(&reply(&mut app, *id, ran(big.clone())));
