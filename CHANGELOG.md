@@ -4,64 +4,47 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+`dist` reads this file when it cuts a GitHub Release: the section whose heading names the
+tagged version becomes the release notes, and the heading becomes the release title. A
+section headed only `## [Unreleased]` is not used. Before you tag, give the changes their
+version heading, `## [X.Y.Z]` or `## [X.Y.Z] - YYYY-MM-DD` (see
+[docs/releasing.md](docs/releasing.md)).
+
+## [0.1.0]
+
+The first release.
 
 ### Added
 
-- Snapshots. `s` in the TUI and `redis-lens scan --save` write the scan as JSON to the data directory.
-- `redis-lens diff <profile>`: scans, compares with the newest earlier snapshot (or `--against <file>`), then saves
-  the new scan. Supports `--json` and `--max-rate`.
-- TTL view: patterns ranked by TTL risk (mixed, persistent and growing, persistent and stable, ok) with a TTL
-  histogram.
-- Diff view: before, after and change per pattern, and whether growth came from more keys or bigger values.
-- Hot keys view: keys ranked by LFU counter, with hot and big keys flagged. Hot keys are also in scan reports.
-- A change-since-last-snapshot column in the Patterns view.
-- `--max-rate` on `scan` and `diff`. `0` means no limit.
-- Optional Microsoft Entra ID sign-in, behind the `entra-id` cargo feature (developer-tools credential).
-- `make gif`, a Makefile target that records the demo GIF.
-- Scan a replica instead of the primary: `conn add --prefer-replica`. redis-lens reads `INFO replication`, uses the
-  first online replica, and falls back to the primary (saying why) if it can't reach it.
-- Replica verification: before a replica is scanned, its `INFO replication` must show it is a replica with the
-  primary's replication ID (`master_replid`). An unrelated server on the announced address fails the check and is
-  not scanned; one built to imitate a replica could pass it, but never receives credentials. A replica that passes without credentials is scanned without them. Credentials go only to a
-  candidate that demands auth and is on the primary's host or not loopback after DNS resolution; the resolved
-  address is the one connected to. Announced addresses of `0.0.0.0`, `::` or empty are skipped;
-  IPv6 addresses and host names are accepted.
-- The TUI says when it is waiting on the OS keychain, so a hidden macOS permission dialog doesn't look like a hang.
-
-### Changed
-
-- Local profiles have no command budget by default. Other profiles keep 5,000 commands per second.
-- Documentation: a full README, a logo, a demo GIF, and a changelog.
-- Profile names starting with `docker:`, in any case, are reserved for containers found by discovery.
-- A pattern that only appears after a sampled (partial) scan no longer counts as growing unless it passes a
-  threshold: more than 1 MiB with sizes, or without sizes at least 50 sampled keys and 1% of the newer scan's
-  sampled keys.
-- `--prefer-replica` reads the keychain once per scan and uses the same credentials for the primary and the replica.
-  The 2 s replica timeout covers only connecting to and verifying the replica.
-- `make gif` uses a temporary config with its own demo connections and removes them afterwards.
-- IPv6 endpoints are shown in brackets, such as `[::1]:6379`.
-
-## [0.1.0] - unreleased
-
-### Added
-
-- Saved connections in a TOML config file, with usernames and passwords stored only in the OS keychain
-  (`conn add`, `list`, `remove`, `test`). `--password-stdin` and `--ask-password` keep passwords out of shell history.
-- Connection strings: `redis://`, `rediss://` and the StackExchange.Redis format. Azure hosts are recognised.
-- TLS, ACL users and password-only auth.
-- Docker discovery of Redis and Valkey containers (`redis-lens discover`).
-- Permission check that probes each command redis-lens needs and degrades instead of failing.
-- The scanner: `SCAN`-based sampling with pipelined per-key commands and a command budget.
-- Pattern inference: UUID, ULID, numeric id, hash and IPv4 placeholders, with high-cardinality segments collapsed
-  to `{var}`.
-- `redis-lens scan` with table and `--json` output, `--sample` and `--match`.
-- The TUI: Connections view (including an add-connection flow with a masked preview) and Patterns view.
-- CI for fmt, clippy, tests on three operating systems, integration tests against Redis and Valkey, MSRV and
-  packaging, plus a release workflow and a seeded demo environment.
-
-### Security
-
-- Password input is masked as fixed-width bullets, so its length is not revealed.
-- A half-typed URL password is masked before the `@` is entered.
-- Fixes to credential handling when saving a connection fails part-way (credential rollback).
+- **A terminal UI for Redis and Valkey** with six areas: Connections, Overview, Browse, Analyze, Server and Pub/Sub.
+  `?` lists every key and runs any action. A light theme, and `NO_COLOR` is respected.
+- **Find any key:** `ctrl-f` on any screen searches the whole server by name or pattern.
+- **Browse keys and values:** every Redis type, plus JSON, streams and consumer groups, Search indexes, and the
+  time series, Bloom, Cuckoo, Count-Min Sketch, Top-K and t-digest module types. Values are decoded as JSON,
+  MessagePack, hex and more, including gzip, zlib, LZ4, zstd and Snappy compression and PHP, Pickle, Protobuf
+  and Java serialization.
+- **See what uses memory:** an analysis on `r` (Quick or Deep) samples keys with `SCAN`, groups them into
+  patterns such as `user:{id}:cart`, and shows each pattern's key count, memory and TTL coverage. Analyze has
+  Big keys, Expiry (with a forecast of memory freed by TTLs), Changes since the last snapshot, Hot keys (LFU),
+  and on a cluster Nodes and Slots.
+- **Watch the server:** Overview with the server's own figures and findings, Clients, the slow log, `MONITOR`,
+  and a live Pub/Sub tail, including sharded Pub/Sub.
+- **Run commands:** a `:` command line with completion and help, replies as text, a table, JSON or raw, repeats
+  and pipeline mode.
+- **Edit data:** add, edit, expire and delete keys, bulk expire and delete, stream claim, ack and trim, publish,
+  Search index create and drop, kill a client, and slow log settings. Every write goes through one write gate:
+  production profiles are read-only unless writes are turned on (`w`, `conn set --writes`).
+- **Connect to anything:** saved connections in a TOML config file, with usernames and passwords only in the OS
+  keychain (`conn add`, `list`, `remove`, `test`, `export`, `import`). `redis://`, `rediss://` and
+  StackExchange.Redis connection strings, TLS, ACL users, cluster, Sentinel, the database switch, SSH tunnels
+  through a bastion, a token command for cloud IAM sign-in, Microsoft Entra ID behind the `entra-id` feature,
+  scanning a verified replica (`conn add --prefer-replica`), and Docker discovery (`redis-lens discover`).
+- **A permission check** that probes each command redis-lens needs and turns one feature off, saying why,
+  instead of failing.
+- **Check it in CI:** `redis-lens scan` (table, `--json`, Markdown, HTML and CSV reports, `--check` rules with
+  exit codes), snapshots (`scan --save`, `s` in the TUI), `diff`, `snapshots`, `trend` and `compare`.
+- **Gentle on the server:** `SCAN`, never `KEYS`, per-key commands pipelined in batches, and one command budget
+  every view shares (`--max-rate`; 5,000 commands a second by default, none for local profiles).
+- Supports Redis 6.2 and later and Valkey 8, on macOS, Linux and Windows.
+- Releases: prebuilt binaries for five targets, shell and PowerShell installers, a Homebrew formula and
+  crates.io, built only after fmt, clippy, the unit tests and the integration tests pass.
