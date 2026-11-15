@@ -10,7 +10,7 @@ section headed only `## [Unreleased]` is not used. Before you tag, give the chan
 version heading, `## [X.Y.Z]` or `## [X.Y.Z] - YYYY-MM-DD` (see
 [docs/releasing.md](docs/releasing.md)).
 
-## [0.1.0]
+## [0.1.0] - 2026-11-16
 
 The first release.
 
@@ -39,6 +39,9 @@ The first release.
   StackExchange.Redis connection strings, TLS, ACL users, cluster, Sentinel, the database switch, SSH tunnels
   through a bastion, a token command for cloud IAM sign-in, Microsoft Entra ID behind the `entra-id` feature,
   scanning a verified replica (`conn add --prefer-replica`), and Docker discovery (`redis-lens discover`).
+- **A web dashboard:** the same screens in a browser on your own computer (`ctrl-o` in the TUI, `--dashboard`
+  for the dashboard alone). It listens on 127.0.0.1 only, behind a session token, and follows the terminal's
+  rules: read-only production profiles, every write asked about first, passwords only in the keychain.
 - **A permission check** that probes each command redis-lens needs and turns one feature off, saying why,
   instead of failing.
 - **Check it in CI:** `redis-lens scan` (table, `--json`, Markdown, HTML and CSV reports, `--check` rules with
