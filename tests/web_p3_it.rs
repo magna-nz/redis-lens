@@ -27,6 +27,7 @@ use redis::aio::MultiplexedConnection;
 use redis_lens::config::Config;
 use redis_lens::model::{Auth, Credentials, Endpoint, Env, Profile};
 use redis_lens::secrets::{MemoryStore, SecretStore};
+use redis_lens::web::api::bulk::hold;
 use redis_lens::web::wording;
 use redis_lens::web::{self, Dashboard, Options};
 use serde_json::{Value, json};
@@ -397,6 +398,28 @@ async fn wait_for(
         if got.0 == name && want(&got.1) {
             return got.1;
         }
+    }
+}
+
+/// Starts a bulk delete of `job:{id}`: its id.
+async fn job_delete(d: &Dash) -> Value {
+    let r = d
+        .post(
+            "/api/bulk",
+            json!({ "pattern": hex("job:{id}"), "action": "delete" }),
+        )
+        .await;
+    assert_eq!(r.status, 202, "{}", r.body);
+    r.json()["bulk"]["id"].clone()
+}
+
+/// Waits until the dashboard's bulk run held with [`hold::hold`] came to its point
+/// (before a batch) `n` times.
+async fn arrived(d: &Dash, n: u64) {
+    let t0 = Instant::now();
+    while hold::arrived(&d.config) < n {
+        assert!(t0.elapsed() < WAIT, "the run did not reach batch {n}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -1379,22 +1402,33 @@ async fn bulk(kind: &str, server: &common::TestServer) {
     assert_eq!(b["lines"][0], "Cancelled: nothing was sent.", "{kind}: {b}");
     assert_eq!(count_keys(&mut admin, "cart:*").await, 1_220, "{kind}");
 
-    // Delete, a dry run stopped: nothing deleted.
+    // Delete, a dry run stopped: nothing deleted. The stop lands while it counts, or
+    // just after its count (a local walk of 1,220 keys is quick): either way it ends at
+    // once, in its own words, and nothing was sent.
     let r = d
         .post(
             "/api/bulk",
             json!({ "pattern": pattern, "action": "delete" }),
         )
         .await;
-    let id = r.json()["bulk"]["id"].clone();
+    assert_eq!(r.status, 202, "{kind}: {}", r.body);
     let r = d.send("DELETE", "/api/bulk", json!({})).await;
     assert_eq!(r.status, 200, "{kind}: {}", r.body);
     let v = r.json();
+    let text = v["text"].as_str().unwrap_or_default().to_string();
     assert!(
-        v["bulk"]["stage"] == "done" || v["text"] == "Dry run stopped. Nothing was sent.",
+        text == "Dry run stopped. Nothing was sent."
+            || text == "Bulk action cancelled. Nothing was sent.",
         "{kind}: {v}"
     );
-    let _ = id;
+    assert_eq!(v["bulk"]["stage"], "done", "{kind}: {v}");
+    assert_eq!(v["bulk"]["lines"], json!([text]), "{kind}: {v}");
+    assert_eq!(v["bulk"]["run"], Value::Null, "{kind}: {v}");
+    // A count step still on its way is dropped when it lands: the stop stays.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let b = d.get("/api/bulk").await.json();
+    assert_eq!(b["bulk"]["lines"], json!([text]), "{kind}: {b}");
+    assert_eq!(count_keys(&mut admin, "cart:*").await, 1_220, "{kind}");
 
     // Delete, run to its end: exactly the pattern's keys.
     let r = d
@@ -1403,19 +1437,6 @@ async fn bulk(kind: &str, server: &common::TestServer) {
             json!({ "pattern": pattern, "action": "delete" }),
         )
         .await;
-    if r.status == 409 {
-        // The stopped dry run's step was still on its way: once it lands, go on.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    let r = if r.status == 409 {
-        d.post(
-            "/api/bulk",
-            json!({ "pattern": pattern, "action": "delete" }),
-        )
-        .await
-    } else {
-        r
-    };
     assert_eq!(r.status, 202, "{kind}: {}", r.body);
     let id = r.json()["bulk"]["id"].clone();
     bulk_at(&mut rx, &id, "counted").await;
@@ -1437,22 +1458,119 @@ async fn bulk(kind: &str, server: &common::TestServer) {
     assert_eq!(count_keys(&mut admin, "cart:*:items").await, 20, "{kind}");
     assert_eq!(count_keys(&mut admin, "user:*").await, 10, "{kind}");
 
-    // On stage (a command budget): a stop is honoured after the batch on its way.
+    // On stage (a command budget): a stop is honoured exactly. The run is held before
+    // each batch (`bulk::hold`, built for the integration tests only), so the stops
+    // below land where the test says.
     let mut pipe = redis::pipe();
     for i in 0..4_000 {
         pipe.cmd("SET").arg(format!("job:{i}")).arg("x").ignore();
     }
     pipe.query_async::<()>(&mut admin).await.unwrap();
+    // A key in db 1, so the database list offers it.
+    cmd(&mut admin, &["SELECT", "1"]).await;
+    cmd(&mut admin, &["SET", "other:db", "x"]).await;
+    cmd(&mut admin, &["SELECT", "0"]).await;
     d.connect("stage1").await;
-    let r = d
-        .post(
-            "/api/bulk",
-            json!({ "pattern": hex("job:{id}"), "action": "delete" }),
-        )
-        .await;
-    let id = r.json()["bulk"]["id"].clone();
+    let job = d.open("job:7").await["view"].clone();
+    let dbs = d.get("/api/dbs").await;
+    assert_eq!(dbs.status, 200, "{kind}: {}", dbs.body);
+    let id = job_delete(&d).await;
     let b = bulk_at(&mut rx, &id, "counted").await;
     assert_eq!(b["count"]["matched"], 4_000, "{kind}: {b}");
+    let r = d.post("/api/bulk/run", json!({ "bulk": id })).await;
+    let c = r.json()["confirm"].clone();
+    hold::hold(&d.config);
+    let r = d
+        .post(
+            &format!("/api/confirm/{}", c["id"].as_str().unwrap()),
+            json!({}),
+        )
+        .await;
+    assert_eq!(r.status, 202, "{kind}: {}", r.body);
+    arrived(&d, 1).await;
+    // While it runs: no database switch, analysis, connect, disconnect or key edit
+    // (the TUI's bulk dialog takes every key until it ends).
+    for (path, body) in [
+        ("/api/db", json!({ "db": 1 })),
+        ("/api/analysis", json!({ "depth": "quick" })),
+        ("/api/connect", json!({ "name": "local" })),
+        ("/api/disconnect", json!({})),
+        ("/api/value/delete", json!({ "view": job })),
+        (
+            "/api/keys/add",
+            json!({ "name": "job:late", "type": "string", "value": "x" }),
+        ),
+    ] {
+        let r = d.post(path, body).await;
+        assert_eq!(r.status, 409, "{kind}: {path}: {}", r.body);
+        assert_eq!(
+            r.json()["error"],
+            "A bulk action is running: wait for it to end, or stop it first.",
+            "{kind}: {path}"
+        );
+    }
+    let s = d.get("/api/state").await.json();
+    assert_eq!(s["connection"]["db"], 0, "{kind}: {s}");
+    assert_eq!(s["connection"]["name"], "stage1", "{kind}: {s}");
+    assert_eq!(q::<i64>(&mut admin, &["EXISTS", "job:late"]).await, 0);
+    // One batch, then a stop between it and the next: no further batch is sent.
+    hold::step(&d.config);
+    arrived(&d, 2).await;
+    let r = d.send("DELETE", "/api/bulk", json!({})).await;
+    assert_eq!(r.status, 200, "{kind}: {}", r.body);
+    let v = r.json();
+    assert_eq!(
+        v["text"], "Stopped: no batch was on its way, and no more is sent.",
+        "{kind}: {v}"
+    );
+    assert_eq!(v["bulk"]["stage"], "done", "{kind}: {v}");
+    let changed = v["bulk"]["run"]["changed"].as_u64().unwrap();
+    assert!(changed > 0 && changed <= 500, "{kind}: one batch: {v}");
+    assert_eq!(
+        v["bulk"]["lines"][0],
+        format!("Stopped after the batch: deleted {changed} keys of job:{{id}}."),
+        "{kind}: {v}"
+    );
+    hold::release(&d.config);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let left = count_keys(&mut admin, "job:*").await as u64;
+    assert_eq!(left, 4_000 - changed, "{kind}: the one batch only");
+    let b = d.get("/api/bulk").await.json();
+    assert_eq!(b["bulk"]["run"]["changed"], changed, "{kind}: {b}");
+    let s = d.get("/api/state").await.json();
+    assert_eq!(s["connection"]["name"], "stage1", "{kind}: {s}");
+
+    // A stop after the answer, before the first batch: nothing is sent at all.
+    let id = job_delete(&d).await;
+    bulk_at(&mut rx, &id, "counted").await;
+    let r = d.post("/api/bulk/run", json!({ "bulk": id })).await;
+    let c = r.json()["confirm"].clone();
+    hold::hold(&d.config);
+    let r = d
+        .post(
+            &format!("/api/confirm/{}", c["id"].as_str().unwrap()),
+            json!({}),
+        )
+        .await;
+    assert_eq!(r.status, 202, "{kind}: {}", r.body);
+    arrived(&d, 1).await;
+    let r = d.send("DELETE", "/api/bulk", json!({})).await;
+    let v = r.json();
+    assert_eq!(
+        v["bulk"]["lines"][0], "Stopped before the first batch: nothing was sent.",
+        "{kind}: {v}"
+    );
+    hold::release(&d.config);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        count_keys(&mut admin, "job:*").await as u64,
+        left,
+        "{kind}: nothing deleted"
+    );
+
+    // Not held, stopped as it runs: the batch on its way (if one is) lands, no other.
+    let id = job_delete(&d).await;
+    bulk_at(&mut rx, &id, "counted").await;
     let r = d.post("/api/bulk/run", json!({ "bulk": id })).await;
     let c = r.json()["confirm"].clone();
     let r = d
@@ -1463,21 +1581,29 @@ async fn bulk(kind: &str, server: &common::TestServer) {
         .await;
     assert_eq!(r.status, 202, "{kind}: {}", r.body);
     let r = d.send("DELETE", "/api/bulk", json!({})).await;
-    assert_eq!(
-        r.json()["text"],
-        "Stopping after the batch on its way.",
-        "{kind}"
-    );
-    let b = bulk_at(&mut rx, &id, "done").await;
+    let v = r.json();
+    let at_stop = v["bulk"]["run"]["changed"].as_u64().unwrap();
+    let b = if v["text"] == "Stopping after the batch on its way." {
+        bulk_at(&mut rx, &id, "done").await
+    } else {
+        assert_eq!(
+            v["text"], "Stopped: no batch was on its way, and no more is sent.",
+            "{kind}: {v}"
+        );
+        v["bulk"].clone()
+    };
     let head = b["lines"][0].as_str().unwrap().to_string();
-    assert!(
-        head.starts_with("Stopped after the batch: deleted "),
-        "{kind}: {b}"
-    );
+    assert!(head.starts_with("Stopped "), "{kind}: {b}");
     let changed = b["run"]["changed"].as_u64().unwrap();
-    assert!(changed > 0 && changed < 4_000, "{kind}: {changed}");
-    let left = count_keys(&mut admin, "job:*").await as u64;
-    assert_eq!(left, 4_000 - changed, "{kind}: exactly the keys it says");
+    assert!(
+        changed - at_stop <= 500,
+        "{kind}: one batch at most after the stop: {b}"
+    );
+    assert!(changed < left, "{kind}: {changed} of {left}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let now = count_keys(&mut admin, "job:*").await as u64;
+    assert_eq!(now, left - changed, "{kind}: exactly the keys it says");
+    let left = now;
 
     // On prod the pattern is typed.
     d.connect("prod1").await;

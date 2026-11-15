@@ -244,7 +244,7 @@ stream.
 | `monitor` | Monitor run | `{run, kind: "ready", at_unix_ms, max_lines, max_secs}`, `{run, kind: "lines", lines: [...]}`, `{run, kind: "closed", end: "stopped"\|"line_cap"\|"time_up"\|"lost"\|"failed", error}` |
 | `overview` | when what the connect read for Overview changes: the connect's slow log and client list landing after the live connection is ready (they fill `findings`), another node picked (its findings go until it is read), the last analysis found, the connect's figures. Sent only when the data differs from the last `overview` event of this connection, never before the connect has read anything | the body of `GET /api/overview` without `live` and `shards` (those come with `figures`) |
 | `progress` | an analysis: started, sampling, stopping, done, stopped, failed, and compared with the last snapshot (see [The `progress` event](#the-progress-event)) | `{run, kind, ...}` |
-| `bulk` | a bulk action: after each step of the dry run's walk (one `SCAN` step and its type and TTL reads), counted, after each batch of the run, done, closed (see [Bulk actions](#bulk-actions)) | `{"bulk": <the body of GET /api/bulk>}`, `{"bulk": null}` once it is closed |
+| `bulk` | a bulk action: after each step of the dry run's walk (one `SCAN` step and its type and TTL reads), counted, after each batch of the run, done, closed, and when a connect or a disconnect replaces the session it was of (see [Bulk actions](#bulk-actions)) | `{"bulk": <the body of GET /api/bulk>}`, `{"bulk": null}` once it is closed or its session is gone |
 | `notice` | something the user should know that has no panel, such as the live connection closing or a stream that fell behind | `{"text": "..."}` |
 
 A stream that falls more than 1024 events behind skips them and gets a `notice` instead.
@@ -1140,6 +1140,11 @@ Example, `GET /api/docker`. Reply: HTTP 200
 TUI makes it (same code). It replaces the current connection, its tail, its Monitor and its
 open confirms. The reply is 202 with the state; progress arrives as `state` events, and
 `status` turns to `connected` or `failed`. All tabs share the one connection.
+
+While a bulk action counts or runs (see [Bulk actions](#bulk-actions)), both are 409
+`{"error":"A bulk action is running: wait for it to end, or stop it first."}` and nothing changes: the TUI's bulk dialog takes every key until it
+ends. A bulk action that waits for its question or has ended goes with the session, and a
+`bulk` event of `{"bulk": null}` says so.
 
 Example, `POST /api/connect {"name":"cache"}`. Reply: HTTP 202 (`$.polling.intervals` cut to the first 3 of 8)
 
@@ -2517,7 +2522,9 @@ Browse reads the new database's key names. For this session only: the saved prof
 changed. The reply is 202 with the run; a `state` event follows, and
 `state.analysis.db` says the database. The current database is 200
 `{"db": n, "switched": false, "run": null, "text": null}` (nothing changes). 409 on a
-cluster (`A cluster only has database 0.`), while an analysis runs, and when no run can
+cluster (`A cluster only has database 0.`), while an analysis runs, while a bulk action
+counts or runs (`A bulk action is running: wait for it to end, or stop it first.`), and
+when no run can
 start: no session (`not connected: connect first, or the live connection is closed`), the
 switch before still connecting
 (`Still connecting: wait until the connection is ready.`) or a failed connect
@@ -4069,7 +4076,8 @@ Example, `GET /api/value?key=757365723a313a70726f66696c65`. Reply: HTTP 200 [val
   TUI's Analyze does: a Quick one samples up to 10,000 keys, a Deep one up to 100,000. The
   reply is 202 `{run, depth, sample_limit, estimate}`; progress comes as `progress`
   events. 400 for another depth, 409 while one runs, while connecting or after a failed
-  connect.
+  connect, and while a bulk action counts or runs
+  (`A bulk action is running: wait for it to end, or stop it first.`).
 - `DELETE /api/analysis` stops the running one: it stops within one batch, and what it
   sampled becomes the report, marked stopped (partial, not saved). Stopped before any key
   is sampled, nothing changes. 200 `{stopping, text}`; 409 when none runs.
@@ -4811,7 +4819,12 @@ The rules every route here keeps:
   yes or no unless the `skip_non_prod_confirm` setting is on (the TUI's table).
 - **An answer is for the run it was asked in.** After a database switch, an analysis
   started or a reconnect, the answer is refused: 409
-  `{"error":"Not sent: the connection changed since the question was asked."}`.
+  `{"error":"Not sent: the connection changed since the question was asked."}`. An edit
+  is also decided only for the run its value was read in: one that started while the
+  request was on its way gets the same 409, and nothing is sent.
+- **No edit while a bulk action counts or runs**, as the TUI's bulk dialog takes every key
+  until it ends: 409 `{"error":"A bulk action is running: wait for it to end, or stop it first."}`. A key added or written behind the walk
+  would otherwise outlive "every key of the pattern".
 - **A command the server refused for this user is off** for the rest of the session: the
   first refusal is `"Not written: the server refused HSET for this user."` (422); after
   that it is refused before anything is sent, `"Not sent: the server refused HSET for
@@ -4827,8 +4840,12 @@ The rules every route here keeps:
 
 Each route names the value with `view` (from `GET /api/value`). The routes that pick an
 item also give `rev`: the `rev` of the value body the item's `index` was read from. Each
-reread of the value (after a write, or after a reload) adds one to `rev`; an older `rev`
-is refused, so an index never points at another item than the one the page showed.
+reread of the value after a write adds one to `rev` (every write but the key's TTL, which
+reads the key's row only and leaves `rev` as it is); an older `rev` is refused, so an
+index never points at another item than the one the page showed. The value stays
+`writing` until it was read again, and a page of it still on its way when the write
+answers (another tab's `GET /api/value/more`) lands first: the reread waits for it, so
+`rev` always moves.
 
 | Route | Body | Sends |
 |---|---|---|
@@ -4858,7 +4875,9 @@ Refusals before anything is sent (besides the read-only one above):
 | 404 | `view` is not open (another value replaced it, or the session changed) | `That value is no longer open (a newer one replaced it, or the session changed): open it again.` |
 | 409 | `rev` is not the value's `rev` now | `The value was read again since the page showed it: look at it again, then try once more.` |
 | 409 | the value is still loading | `Still loading the value: wait for it.` |
-| 409 | another write of this value has not answered | `The last write has not answered yet.` |
+| 409 | another write of this value has not answered, or it is being read again after one | `The last write has not answered yet.` |
+| 409 | a bulk action counts or runs | `A bulk action is running: wait for it to end, or stop it first.` |
+| 409 | the session started another run (another database, an analysis) or connection after the edit was made from the value | `Not sent: the connection changed since the question was asked.` |
 | 409 | no live connection | `not connected: connect first, or the live connection is closed` |
 | 422 | the key no longer exists | `The key no longer exists.` |
 | 422 | `index` is past what is loaded | `There is no such item in what is loaded.` |
@@ -5476,7 +5495,7 @@ Example, `POST /api/keys/add {"list":999,"name":"taken:1","type":"string","value
 ### Bulk actions
 
 A bulk expire or delete over **one pattern's keys** (Browse › Keys, a pattern row): the
-TUI's `X` and `D` on a pattern. There is no bulk action over a Find result. It is the
+TUI's `x` and `D` on a pattern. There is no bulk action over a Find result. It is the
 TUI's run, step for step:
 
 1. `POST /api/bulk` checks it can run, then starts the **dry run**. The dry run walks the
@@ -5496,21 +5515,32 @@ TUI's run, step for step:
      or later, or any Valkey.
    - **delete**: `UNLINK <key>`.
 
-   Each batch is booked on the command budget. Each key changed is written to a **key
-   file**, so an expire can be undone with `PERSIST` and a delete is on record. On a
+   Each batch is booked on the command budget. Each key a batch sends a command for is
+   written to a **key file** before the batch goes, so an expire can be undone with
+   `PERSIST` and a delete is on record. It lists the keys sent, those whose command then
+   failed or was refused included (a batch refused with `NOPERM` leaves its keys listed
+   and none changed); `run.changed` says how many changed. On a
    cluster each primary is walked in turn, in slot order, with no redirect followed;
    each line of the key file is the node's address, a tab, then the key.
-4. `DELETE /api/bulk` stops it. A dry run stops at once and nothing was sent. A run
-   stops after the batch on its way, and the key file lists what it changed.
+4. `DELETE /api/bulk` stops it. A dry run stops at once and nothing was sent. A run with
+   a batch on its way stops once that batch answers; a run between two batches, or
+   answered but before its first batch, stops at once. No batch is sent after a stop.
 
 Before every batch after the first, the profile is read again from the config file. A
 profile turned read-only stops the run (`"Stopped: <name> is now read-only. …"`), and so
-does a database switch (`"Stopped: the connection changed. …"`). A batch the server
+would a new run of the session (`"Stopped: the connection changed. …"`), which the
+dashboard refuses while a bulk action runs (below). A batch the server
 refuses with `NOPERM` stops the run, and that command is off for the session.
 
 One bulk action per connection: a new one replaces one that ended or waits for its
 question. While one is counting
 or running, `POST /api/bulk` is 409 `{"error":"A bulk action is running already: wait for it to end, or stop it first."}`.
+Meanwhile nothing else may change the session or the keys, as the TUI's bulk dialog takes
+every key until it ends: a database switch (`POST /api/db`), an analysis
+(`POST /api/analysis`), a connect or a disconnect, and every key edit ("The open value's
+edits", `POST /api/keys/add`) are 409 `{"error":"A bulk action is running: wait for it to end, or stop it first."}`. A dry run whose session
+started another run anyway ends with
+`"The dry run stopped: the connection changed. Nothing was sent."` (`error: true`).
 
 **Routes.** Every reply, and every `bulk` event, is `{"bulk": <body> | null}`:
 
@@ -5539,11 +5569,20 @@ or running, `POST /api/bulk` is 409 `{"error":"A bulk action is running already:
 
   A wrong typed name is 422 and keeps the bulk action counted, to be asked again.
   Cancelling the question (`DELETE /api/confirm/<id>`) ends the bulk action:
-  `"lines": ["Cancelled: nothing was sent."]`.
+  `"lines": ["Cancelled: nothing was sent."]`. The answer
+  (`POST /api/confirm/<id>`) is 410
+  `That bulk action is no longer open: start it again from its pattern.` when the bulk
+  action ended meanwhile (stopped, or its other question cancelled) or another replaced
+  it, and 409 `That bulk action has started already.` when another answer started it.
 - **`DELETE /api/bulk`**: 200 with the body and a `text`:
   - a dry run: stopped, `Dry run stopped. Nothing was sent.`
   - counted, not run: closed, `Bulk action cancelled. Nothing was sent.`
-  - a run: `"stopping": true`, `Stopping after the batch on its way.`
+  - a run with a batch on its way: still `running`, `"stopping": true`,
+    `Stopping after the batch on its way.`; done once that batch answered
+    (`Stopped after the batch: …`), with no batch after it.
+  - a run between two batches, or before its first: done at once,
+    `Stopped: no batch was on its way, and no more is sent.`, its lines
+    `Stopped after the batch: …` or `Stopped before the first batch: nothing was sent.`
   - an ended one: cleared, `{"bulk": null}`.
 
 **The body:**
@@ -5559,7 +5598,7 @@ or running, `POST /api/bulk` is 409 `{"error":"A bulk action is running already:
 | `summary` | the dry run in sentences, the TUI's, once the count is complete (empty while counting, and after a dry run stopped part way) |
 | `nodes`, `at` | a cluster: each primary walked, `{node, endpoint, matched}`, and the index in `nodes` the walk is on (`[]` and `null` on one server) |
 | `run` | once it runs: `seen`, `sent`, `changed`, `skipped` (a TTL already, or gone), `failed`, `unreadable`, `moved` (in a slot that moved: left alone), `file` (the key file), `stopping` |
-| `lines` | once done: what happened, the TUI's lines without its keys. `Done: deleted 1,200 keys of cart:{id}.` / `Stopped after the batch: …` / `Stopped: <why>. Before that, …`, then the skipped, unreadable, moved and failed counts, `Key names: <file>` and, for an expire, `PERSIST on those keys undoes it.` |
+| `lines` | once done: what happened, the TUI's lines without its keys. `Done: deleted 1,200 keys of cart:{id}.` / `Stopped after the batch: …` / `Stopped before the first batch: nothing was sent.` / `Stopped: <why>. Before that, …`, then the skipped, unreadable, moved and failed counts, `Key names: <file>` and, for an expire, `PERSIST on those keys undoes it.` |
 | `error` | `true` when it stopped on a failure |
 
 The key files are the TUI's: in the `bulk` directory of redis-lens's data directory, one
@@ -5917,7 +5956,9 @@ Example, `DELETE /api/bulk`. Reply: HTTP 200
 }
 ```
 
-A run stopped (on a stage profile, whose command budget spaces the batches):
+A run stopped while its first batch was on its way (on a stage profile, whose command
+budget spaces the batches): the reply says it stops after that batch, and the `bulk`
+event after it says so:
 
 Example, `DELETE /api/bulk`. Reply: HTTP 200
 

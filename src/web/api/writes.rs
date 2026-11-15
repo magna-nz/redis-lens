@@ -156,10 +156,19 @@ pub struct Decided {
 }
 
 /// Where `op` goes and what the gate says about it on the current connection, or why it
-/// is not sent.
-pub fn decide(app: &App, op: &WriteOp) -> Result<Decided, Refused> {
+/// is not sent. `made_for` is the connection and run `op` was built from (a key edit
+/// reads the open value): another one since is refused with [`CHANGED`], so an edit
+/// never lands on another database or server than the one it was made for.
+pub fn decide(
+    app: &App,
+    op: &WriteOp,
+    made_for: Option<(ConnId, u64)>,
+) -> Result<Decided, Refused> {
     app.hub
         .with(|c| {
+            if made_for.is_some_and(|m| m != run_of(c)) {
+                return Err(Refused::new(StatusCode::CONFLICT, CHANGED));
+            }
             if !c.live_ready() {
                 return Err(Refused::new(StatusCode::CONFLICT, super::NOT_LIVE));
             }
@@ -183,7 +192,14 @@ pub fn decide(app: &App, op: &WriteOp) -> Result<Decided, Refused> {
                 profile: crate::value::escape(&c.profile().name),
             })
         })
-        .unwrap_or_else(|| Err(Refused::new(StatusCode::CONFLICT, super::NOT_LIVE)))
+        .unwrap_or_else(|| {
+            let why = if made_for.is_some() {
+                CHANGED
+            } else {
+                super::NOT_LIVE
+            };
+            Err(Refused::new(StatusCode::CONFLICT, why))
+        })
 }
 
 /// The permit for `op` on connection `conn` in run `run` with `answer`, from the gate
@@ -237,16 +253,18 @@ pub async fn send(app: &App, conn: ConnId, dest: Dest, permit: Permit) -> Respon
 
 /// One write, start to end: refused, sent, or asked about.
 pub async fn write_flow(app: &App, op: WriteOp) -> Response {
-    write_flow_then(app, op, None).await
+    write_flow_then(app, op, None, None).await
 }
 
 /// [`write_flow`] for a key edit: once sent (now, or when its question is answered),
 /// what `edit` names is read again and the reply says how it went
-/// ([`super::edits::send`]).
+/// ([`super::edits::send`]). `made_for` is the connection and run the op was built
+/// from: refused with [`CHANGED`] when the session is another since ([`decide`]).
 pub async fn write_flow_then(
     app: &App,
     op: WriteOp,
     edit: Option<super::edits::After>,
+    made_for: Option<(ConnId, u64)>,
 ) -> Response {
     app.hub.follow_saved_profile().await;
     let Decided {
@@ -255,7 +273,7 @@ pub async fn write_flow_then(
         dest,
         decision,
         profile,
-    } = match decide(app, &op) {
+    } = match decide(app, &op, made_for) {
         Ok(d) => d,
         Err(r) => return r.into_response(),
     };

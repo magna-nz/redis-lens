@@ -128,6 +128,10 @@ impl Refusals {
     }
 }
 
+/// Why [`Permit::grant`] refuses a typed answer that is not the name asked for. Callers
+/// that keep a question open after a wrong name compare with this, not a copy of it.
+pub const TYPED_MISMATCH: &str = "Not sent: the name typed did not match.";
+
 /// What reads the profile is read-only, said the same way everywhere.
 pub fn read_only_reason(profile: &Profile) -> String {
     format!(
@@ -208,9 +212,7 @@ impl Permit {
             (Decision::Refuse(why), _) => Err(why),
             (Decision::Run, _) | (Decision::Ask, Answer::Yes) => Ok(Self { op }),
             (Decision::Type(want), Answer::Typed(got)) if *got == want => Ok(Self { op }),
-            (Decision::Type(_), Answer::Typed(_)) => {
-                Err("Not sent: the name typed did not match.".to_string())
-            }
+            (Decision::Type(_), Answer::Typed(_)) => Err(TYPED_MISMATCH.to_string()),
             (Decision::Ask | Decision::Type(_), _) => {
                 Err("Not sent: it was not confirmed.".to_string())
             }

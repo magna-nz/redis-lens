@@ -79,6 +79,12 @@ impl View {
         self.loading
     }
 
+    /// Tests: as if a page of it were on its way (`on`), or had landed.
+    #[cfg(test)]
+    pub(crate) fn set_loading(&mut self, on: bool) {
+        self.loading = on;
+    }
+
     /// Starts reading the value again from its first page, as the TUI's key detail does
     /// after a write ([`ValueState::clear_loaded`]): what was loaded goes; the key, its
     /// type, the format picked, the selection and what was learned about refused

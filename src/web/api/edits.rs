@@ -132,11 +132,16 @@ fn words(text: &str) -> String {
 
 /// The gate's own refusal for a read-only profile, before anything about the value is
 /// looked at (the TUI's `may_write` asks the gate first): a read-only profile is refused
-/// every edit with the same words, whatever the edit.
+/// every edit with the same words, whatever the edit. Then, while a bulk action counts
+/// or runs, no edit (the TUI's bulk dialog takes every key until it ends: a key added
+/// or written behind the walk would survive "every key of the pattern").
 fn writable(c: &Current) -> Result<(), Refused> {
     let p = c.profile();
     if p.is_read_only() {
         return Err(no(crate::write::read_only_reason(p)).holding(&super::writes::profile_data(p)));
+    }
+    if c.bulk.as_ref().is_some_and(super::bulk::Bulk::busy) {
+        return Err(Refused::new(StatusCode::CONFLICT, super::bulk::BUSY));
     }
     if !c.live_ready() {
         return Err(Refused::new(StatusCode::CONFLICT, super::NOT_LIVE));
@@ -201,17 +206,20 @@ enum Prepared {
 
 /// An edit of view `view`: the saved profile read again (a profile made read-only
 /// elsewhere refuses at once), the op made by `prepare` from what the view holds, then
-/// the one write flow.
+/// the one write flow, for the connection and run the op was made on only.
 async fn flow(
     app: &App,
     view: u64,
     prepare: impl FnOnce(&mut Current) -> Result<Prepared, Refused>,
 ) -> Response {
     app.hub.follow_saved_profile().await;
-    match app.hub.with_mut(prepare) {
+    let made = app
+        .hub
+        .with_mut(|c| prepare(c).map(|p| (p, super::writes::run_of(c))));
+    match made {
         None => error(StatusCode::CONFLICT, super::NOT_LIVE),
         Some(Err(r)) => r.into_response(),
-        Some(Ok(Prepared::Unchanged)) => ok(serde_json::json!({
+        Some(Ok((Prepared::Unchanged, _))) => ok(serde_json::json!({
             "sent": false,
             "done": false,
             "message": UNCHANGED,
@@ -221,8 +229,9 @@ async fn flow(
             "value": super::values::body_of(app, view),
             "row": row_of(app, view),
         })),
-        Some(Ok(Prepared::Op(op))) => {
-            super::writes::write_flow_then(app, op, Some(After::Value { view })).await
+        Some(Ok((Prepared::Op(op), made_for))) => {
+            super::writes::write_flow_then(app, op, Some(After::Value { view }), Some(made_for))
+                .await
         }
     }
 }
@@ -528,13 +537,13 @@ pub async fn add_key(State(app): State<App>, Body(b): Body<AddKey>) -> Response 
         {
             return Err(Refused::new(StatusCode::NOT_FOUND, super::keys::NO_LIST));
         }
-        Ok(())
+        Ok(super::writes::run_of(c))
     });
-    match checked {
+    let made_for = match checked {
         None => return error(StatusCode::CONFLICT, super::NOT_LIVE),
         Some(Err(r)) => return r.into_response(),
-        Some(Ok(())) => {}
-    }
+        Some(Ok(m)) => m,
+    };
     if b.name.is_empty() {
         return no(NO_KEY_NAME).into_response();
     }
@@ -577,7 +586,13 @@ pub async fn add_key(State(app): State<App>, Body(b): Body<AddKey>) -> Response 
         key: b.name,
         value: new,
     };
-    super::writes::write_flow_then(&app, op, Some(After::NewKey { list: b.list, row })).await
+    super::writes::write_flow_then(
+        &app,
+        op,
+        Some(After::NewKey { list: b.list, row }),
+        Some(made_for),
+    )
+    .await
 }
 
 /// Sends a key edit the gate let through, then reads again what it changed, in a task
@@ -630,10 +645,14 @@ async fn send_now(app: &App, conn: ConnId, dest: Dest, permit: Permit, after: Af
         return error(StatusCode::CONFLICT, WRITING);
     }
     let result = app.hub.write(conn, dest, permit).await;
+    // Still writing while what it changed is read again (`answered` ends it before the
+    // reply's body): another edit made from the items before the reread is refused
+    // meanwhile, not built from them. Ended here too when it answered early.
+    let reply = answered(app, conn, &op, after, result).await;
     if let Some(v) = view {
         stop_writing(app, conn, v);
     }
-    answered(app, conn, &op, after, result).await
+    reply
 }
 
 /// What the TUI's `write_done` does after the write `op` answered `reply`: whether it
@@ -835,6 +854,8 @@ async fn answered(
     if o.meta {
         read_row(app, conn, view).await;
     }
+    // Read again: the next edit may be made from what the body shows.
+    stop_writing(app, conn, view);
     let body = if closed {
         None
     } else {
@@ -880,22 +901,37 @@ fn row_of(app: &App, id: u64) -> Option<KeyDto> {
         .flatten()
 }
 
-/// The TUI's `reload`: the value from its first page, the selection kept.
+/// The TUI's `reload`: the value from its first page, the selection kept. A page of it
+/// on its way (another tab's `GET /api/value/more`) lands first: the reread waits for
+/// it, so it is never skipped and `rev` always moves after a write. A page read ends
+/// within the request timeout, so the wait does too.
 async fn reload(app: &App, conn: ConnId, id: u64) {
-    let restarted = app
-        .hub
-        .with_mut(|c| match c.browse.values.get_mut(id) {
-            Some(v) if c.id == conn && v.conn() == conn && !v.loading() => {
-                v.restart();
-                true
-            }
-            _ => false,
-        })
-        .unwrap_or(false);
-    if restarted {
-        // Why a read failed is in the value's body.
-        let _ = super::values::read_body(app, id).await;
+    let deadline = std::time::Instant::now()
+        + crate::web::session::REQUEST_TIMEOUT
+        + std::time::Duration::from_secs(1);
+    loop {
+        let restarted = app
+            .hub
+            .with_mut(|c| match c.browse.values.get_mut(id) {
+                Some(v) if c.id == conn && v.conn() == conn => {
+                    if v.loading() {
+                        return None;
+                    }
+                    v.restart();
+                    Some(true)
+                }
+                _ => Some(false),
+            })
+            .unwrap_or(Some(false));
+        match restarted {
+            Some(true) => break,
+            Some(false) => return,
+            None if std::time::Instant::now() >= deadline => return,
+            None => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+        }
     }
+    // Why a read failed is in the value's body.
+    let _ = super::values::read_body(app, id).await;
 }
 
 /// The TUI's `read_meta` and `meta_done`: the key list's own read of one key (its TTL,

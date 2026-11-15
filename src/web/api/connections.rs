@@ -831,12 +831,15 @@ pub async fn connect(State(app): State<App>, Body(to): Body<ConnectTo>) -> Respo
         Err(ConnectError::Failed(why)) => {
             error(StatusCode::BAD_GATEWAY, &crate::value::escape(&why))
         }
+        Err(ConnectError::Busy) => error(StatusCode::CONFLICT, super::bulk::BUSY),
     }
 }
 
-/// `POST /api/disconnect`.
+/// `POST /api/disconnect`. Refused while a bulk action counts or runs, as a connect is.
 pub async fn disconnect(State(app): State<App>) -> Response {
-    app.hub.disconnect();
+    if !app.hub.disconnect_unless_busy() {
+        return error(StatusCode::CONFLICT, super::bulk::BUSY);
+    }
     app.confirms().clear();
     ok(app.hub.state())
 }

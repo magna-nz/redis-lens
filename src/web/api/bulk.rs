@@ -96,6 +96,12 @@ pub struct Run {
     pub file: Option<std::path::PathBuf>,
     /// A stop was asked for: no batch after the one on its way.
     pub stopping: bool,
+    /// A batch is on its way: set under the lock that hands it to the live layer,
+    /// cleared under the lock that takes its answer. A stop without one ends the run
+    /// at once.
+    in_flight: bool,
+    /// Batches answered so far.
+    batches: u64,
 }
 
 /// How it ended, as lines safe to show.
@@ -122,8 +128,23 @@ pub const BAD_TTL: &str = "not a duration: use 90s, 10m, 24h or 7d";
 pub const DRY_RUN_STOPPED: &str = "Dry run stopped. Nothing was sent.";
 pub const BULK_CANCELLED: &str = "Bulk action cancelled. Nothing was sent.";
 pub const STOPPING: &str = "Stopping after the batch on its way.";
+/// A stop between two batches (or before the first): the run ends at once.
+pub const STOPPED: &str = "Stopped: no batch was on its way, and no more is sent.";
+/// The line of a run stopped before its first batch was sent.
+pub const STOPPED_FIRST: &str = "Stopped before the first batch: nothing was sent.";
+/// Why a database switch, an analysis, a connect, a disconnect or a key edit waits
+/// while a bulk action counts or runs: the TUI's bulk dialog takes every key until it
+/// ends.
+pub const BUSY: &str = "A bulk action is running: wait for it to end, or stop it first.";
+/// The dry run's walk ended because the session started a new run (another database).
+pub const COUNT_CHANGED: &str = "The dry run stopped: the connection changed. Nothing was sent.";
 
 impl Bulk {
+    /// It counts or runs: nothing else may change the session or its keys meanwhile.
+    pub fn busy(&self) -> bool {
+        matches!(self.stage, Stage::Counting { .. } | Stage::Running(_))
+    }
+
     /// The question's title, as the TUI's dialog has it.
     pub fn title(&self) -> &'static str {
         match self.action {
@@ -316,14 +337,14 @@ pub async fn start(State(app): State<App>, Body(b): Body<Start>) -> Response {
     };
     app.hub.follow_saved_profile().await;
     let made = app.hub.with_mut(|c| open(c, pattern, action));
-    let conn = match made {
+    let (conn, id) = match made {
         None => return error(StatusCode::CONFLICT, super::NOT_LIVE),
         Some(Err(r)) => return r.into_response(),
-        Some(Ok(conn)) => conn,
+        Some(Ok(made)) => made,
     };
     emit(&app, conn);
     let task = app.clone();
-    tokio::spawn(async move { count_loop(task, conn).await });
+    tokio::spawn(async move { count_loop(task, conn, id).await });
     accepted(&app)
 }
 
@@ -336,9 +357,10 @@ fn accepted(app: &App) -> Response {
     (StatusCode::ACCEPTED, axum::Json(body)).into_response()
 }
 
-/// The checks of the TUI's `bulk_start`, then the bulk action in its dry run. The gate
-/// is asked first, so a read-only profile is refused in its words whatever else holds.
-fn open(c: &mut Current, pattern: String, action: BulkAction) -> Result<ConnId, Refused> {
+/// The checks of the TUI's `bulk_start`, then the bulk action in its dry run: its
+/// connection and its number. The gate is asked first, so a read-only profile is
+/// refused in its words whatever else holds.
+fn open(c: &mut Current, pattern: String, action: BulkAction) -> Result<(ConnId, u64), Refused> {
     let glob = crate::analysis::match_glob(&pattern);
     let op = WriteOp::Bulk {
         pattern: pattern.clone(),
@@ -354,10 +376,7 @@ fn open(c: &mut Current, pattern: String, action: BulkAction) -> Result<ConnId, 
     {
         return Err(refused(why, c));
     }
-    if c.bulk
-        .as_ref()
-        .is_some_and(|b| matches!(b.stage, Stage::Counting { .. } | Stage::Running(_)))
-    {
+    if c.bulk.as_ref().is_some_and(Bulk::busy) {
         return Err(Refused::new(StatusCode::CONFLICT, ONE_AT_A_TIME));
     }
     let report_nodes = c.session.report.as_ref().is_some_and(|r| r.nodes.is_some());
@@ -376,8 +395,9 @@ fn open(c: &mut Current, pattern: String, action: BulkAction) -> Result<ConnId, 
         .as_ref()
         .map_or_else(|| c.report_name(), |r| r.profile.clone());
     let per_node = vec![Count::default(); nodes.len()];
+    let id = NEXT_BULK.fetch_add(1, Ordering::Relaxed);
     c.bulk = Some(Bulk {
-        id: NEXT_BULK.fetch_add(1, Ordering::Relaxed),
+        id,
         conn: c.id,
         run: c.session.scan,
         pattern,
@@ -392,7 +412,7 @@ fn open(c: &mut Current, pattern: String, action: BulkAction) -> Result<ConnId, 
         count: Count::default(),
         stage: Stage::Counting { walk: Walk::Start },
     });
-    Ok(c.id)
+    Ok((c.id, id))
 }
 
 /// The bulk action `id` of connection `conn`, when it is still the open one.
@@ -405,40 +425,55 @@ fn this(c: &mut Current, conn: ConnId, id: Option<u64>) -> Option<&mut Bulk> {
         .filter(|b| b.conn == conn && id.is_none_or(|i| b.id == i))
 }
 
-/// The dry run: one count step at a time until the walk is over on every primary, a
-/// stop, or a failure.
-async fn count_loop(app: App, conn: ConnId) {
-    let Some(id) = app.hub.with(|c| c.bulk.as_ref().map(|b| b.id)).flatten() else {
-        return;
-    };
+/// The dry run of bulk action `id` (the one [`open`] made, never whichever is open when
+/// the task first runs): one count step at a time until the walk is over on every
+/// primary, a stop, a failure, or a new run of the session (another database: its
+/// count would mix two).
+async fn count_loop(app: App, conn: ConnId, id: u64) {
     loop {
         let step = app
             .hub
             .with_mut(|c| {
+                let scan = c.session.scan;
                 let b = this(c, conn, Some(id))?;
                 let Stage::Counting { walk } = b.stage else {
                     return None;
                 };
-                Some((
+                if b.run != scan {
+                    // Ended here: said in a `bulk` event below.
+                    count_changed(b);
+                    return Some(None);
+                }
+                Some(Some((
                     b.dest(),
                     Request::Count {
                         pattern: b.pattern.clone(),
                         glob: b.glob.clone(),
                         walk,
                     },
-                ))
+                )))
             })
             .flatten();
-        let Some((dest, req)) = step else {
-            return;
+        let (dest, req) = match step {
+            None => return,
+            Some(None) => {
+                emit(&app, conn);
+                return;
+            }
+            Some(Some(s)) => s,
         };
         let result = app.hub.bulk_step(conn, dest, req).await;
         let more = app
             .hub
             .with_mut(|c| {
+                let scan = c.session.scan;
                 let b = this(c, conn, Some(id))?;
                 // Stopped meanwhile: its answer is dropped.
                 if !matches!(b.stage, Stage::Counting { .. }) {
+                    return None;
+                }
+                if b.run != scan {
+                    count_changed(b);
                     return None;
                 }
                 Some(counted_step(b, result))
@@ -449,6 +484,15 @@ async fn count_loop(app: App, conn: ConnId) {
             return;
         }
     }
+}
+
+/// The dry run ends: the session started a new run since it began.
+fn count_changed(b: &mut Bulk) {
+    b.stage = Stage::Done(Done {
+        lines: vec![COUNT_CHANGED.to_string()],
+        error: true,
+        run: None,
+    });
 }
 
 /// A dry-run step answered: the counts so far, then the next step (true), or the end.
@@ -638,19 +682,19 @@ pub async fn answered(
     app.hub.follow_saved_profile().await;
     let open = app
         .hub
-        .with_mut(|c| this(c, conn, Some(bulk)).map(|b| matches!(b.stage, Stage::Counted)))
+        .with_mut(|c| this(c, conn, Some(bulk)).map(|b| Waits::of(&b.stage)))
         .flatten();
     match open {
-        None => return error(StatusCode::GONE, NO_BULK),
-        Some(false) => return error(StatusCode::CONFLICT, RUNNING),
-        Some(true) => {}
+        None | Some(Waits::Ended) => return error(StatusCode::GONE, NO_BULK),
+        Some(Waits::Started) => return error(StatusCode::CONFLICT, RUNNING),
+        Some(Waits::Yes) => {}
     }
     let permit = match super::writes::grant(app, (conn, run), op, answer) {
         Ok(p) => p,
         Err(r) => {
             // A wrong name typed leaves the question's bulk action to be asked again,
             // as the TUI's typed name sends nothing; any other refusal ends it.
-            if r.text != "Not sent: the name typed did not match." {
+            if r.text != crate::write::TYPED_MISMATCH {
                 let ended = app.hub.with_mut(|c| {
                     if let Some(b) = this(c, conn, Some(bulk)) {
                         b.stage = Stage::Done(Done {
@@ -670,9 +714,10 @@ pub async fn answered(
     let started = app
         .hub
         .with_mut(|c| {
-            let b = this(c, conn, Some(bulk))?;
-            if !matches!(b.stage, Stage::Counted) {
-                return None;
+            let b = this(c, conn, Some(bulk)).ok_or(Waits::Ended)?;
+            let waits = Waits::of(&b.stage);
+            if waits != Waits::Yes {
+                return Err(waits);
             }
             // The run walks the primaries again from the first.
             b.at = 0;
@@ -689,12 +734,17 @@ pub async fn answered(
                 moved: 0,
                 file: None,
                 stopping: false,
+                in_flight: false,
+                batches: 0,
             }));
-            Some(())
+            Ok(())
         })
-        .flatten();
-    if started.is_none() {
-        return error(StatusCode::CONFLICT, RUNNING);
+        .unwrap_or(Err(Waits::Ended));
+    match started {
+        Ok(()) => {}
+        Err(Waits::Started) => return error(StatusCode::CONFLICT, RUNNING),
+        // Stopped, cancelled or replaced meanwhile: nothing ran.
+        Err(_) => return error(StatusCode::GONE, NO_BULK),
     }
     emit(app, conn);
     let task = app.clone();
@@ -702,8 +752,31 @@ pub async fn answered(
     accepted(app)
 }
 
+/// Whether a bulk action still waits for its question's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waits {
+    /// Counted: the answer starts it.
+    Yes,
+    /// It runs already (another tab's answer started it).
+    Started,
+    /// It ended (stopped, cancelled, its other question cancelled) or is not open: the
+    /// answer finds nothing to start.
+    Ended,
+}
+
+impl Waits {
+    fn of(stage: &Stage) -> Self {
+        match stage {
+            Stage::Counted => Self::Yes,
+            Stage::Running(_) => Self::Started,
+            Stage::Counting { .. } | Stage::Done(_) => Self::Ended,
+        }
+    }
+}
+
 /// The run: one batch at a time, each sent once the last answered, until the walk is
-/// over on every primary, a stop, a refusal, or the profile turning read-only.
+/// over on every primary, a stop, a refusal, or the profile turning read-only. A stop
+/// asked for between two batches (or before the first) ends it before the next one.
 async fn run_loop(app: App, conn: ConnId, id: u64) {
     let mut first = true;
     loop {
@@ -712,6 +785,8 @@ async fn run_loop(app: App, conn: ConnId, id: u64) {
             app.hub.follow_saved_profile().await;
         }
         first = false;
+        #[cfg(any(test, feature = "integration-tests"))]
+        hold::point(&app.hub.config).await;
         let step = app
             .hub
             .with_mut(|c| {
@@ -734,17 +809,25 @@ async fn run_loop(app: App, conn: ConnId, id: u64) {
                     finish(b, Some("the connection changed".to_string()));
                     return None;
                 }
-                let Stage::Running(r) = &b.stage else {
+                // A stop asked for while no batch was on its way: none is sent.
+                if matches!(&b.stage, Stage::Running(r) if r.stopping) {
+                    finish(b, None);
+                    return None;
+                }
+                let (dest, files_as, node) = (b.dest(), b.files_as.clone(), b.node());
+                let Stage::Running(r) = &mut b.stage else {
                     return None;
                 };
+                // On its way from here: a stop now waits for its answer.
+                r.in_flight = true;
                 Some((
-                    b.dest(),
+                    dest,
                     r.permit.clone(),
                     r.walk,
                     r.carry.clone(),
                     r.file.clone(),
-                    b.files_as.clone(),
-                    b.node(),
+                    files_as,
+                    node,
                 ))
             })
             .flatten();
@@ -791,6 +874,10 @@ fn batch_done(
     result: Result<LiveReply, LiveError>,
     refuse: &mut Option<String>,
 ) -> bool {
+    if let Stage::Running(r) = &mut b.stage {
+        r.in_flight = false;
+        r.batches += 1;
+    }
     let batch: Batch = match result {
         Ok(LiveReply::Bulk(Reply::Batch(batch))) => batch,
         other => {
@@ -878,6 +965,7 @@ fn finish(b: &mut Bulk, why: Option<String>) {
     };
     let mut lines = vec![match (&why, r.stopping) {
         (Some(why), _) => format!("Stopped: {why}. Before that, {did}."),
+        (None, true) if r.batches == 0 => STOPPED_FIRST.to_string(),
         (None, true) => format!("Stopped after the batch: {did}."),
         (None, false) => format!("Done: {did}."),
     }];
@@ -960,7 +1048,14 @@ pub async fn stop(State(app): State<App>) -> Response {
             }
             Stage::Running(r) => {
                 r.stopping = true;
-                STOPPING
+                if r.in_flight {
+                    STOPPING
+                } else {
+                    // Between two batches, or before the first: no batch is on its
+                    // way, so the run ends now and none is sent.
+                    finish(b, None);
+                    STOPPED
+                }
             }
             Stage::Done(_) => {
                 c.bulk = None;
@@ -998,6 +1093,78 @@ pub fn cancelled(app: &App, conn: ConnId, bulk: u64) {
     });
     if closed.flatten().is_some() {
         emit(app, conn);
+    }
+}
+
+/// Tests only (unit tests, and the integration tests' `integration-tests` feature; not
+/// in a normal build): holds a bulk run before each batch it sends, so a test can stop
+/// it between two batches and know none was on its way. Keyed by the dashboard's
+/// config file, so dashboards of tests running at once never hold each other.
+#[cfg(any(test, feature = "integration-tests"))]
+#[doc(hidden)]
+pub mod hold {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct Gate {
+        /// How many times a run came to the point (before each batch).
+        arrived: AtomicU64,
+        go: Notify,
+    }
+
+    static GATES: Mutex<Vec<(PathBuf, Arc<Gate>)>> = Mutex::new(Vec::new());
+
+    fn gate(config: &Path) -> Option<Arc<Gate>> {
+        let g = GATES.lock().unwrap_or_else(|e| e.into_inner());
+        g.iter()
+            .find(|(p, _)| p == config)
+            .map(|(_, g)| Arc::clone(g))
+    }
+
+    /// From now on the bulk runs of the dashboard on `config` wait before each batch.
+    pub fn hold(config: &Path) {
+        let mut g = GATES.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.iter().any(|(p, _)| p == config) {
+            g.push((config.to_path_buf(), Arc::default()));
+        }
+    }
+
+    /// How many times a run came to the point since [`hold`].
+    pub fn arrived(config: &Path) -> u64 {
+        gate(config).map_or(0, |g| g.arrived.load(Ordering::SeqCst))
+    }
+
+    /// Lets the run waiting at the point (or the next to come) send one batch.
+    pub fn step(config: &Path) {
+        if let Some(g) = gate(config) {
+            g.go.notify_one();
+        }
+    }
+
+    /// No more holding: a run waiting goes on.
+    pub fn release(config: &Path) {
+        let gone = {
+            let mut g = GATES.lock().unwrap_or_else(|e| e.into_inner());
+            let at = g.iter().position(|(p, _)| p == config);
+            at.map(|i| g.remove(i).1)
+        };
+        if let Some(g) = gone {
+            g.go.notify_one();
+        }
+    }
+
+    /// Where a run waits while held: before it takes the next batch.
+    pub(crate) async fn point(config: &Path) {
+        let Some(g) = gate(config) else {
+            return;
+        };
+        let go = g.go.notified();
+        g.arrived.fetch_add(1, Ordering::SeqCst);
+        go.await;
     }
 }
 
@@ -1051,6 +1218,8 @@ mod tests {
             moved: 0,
             file: None,
             stopping: false,
+            in_flight: true,
+            batches: 0,
         }));
     }
 
@@ -1219,6 +1388,126 @@ mod tests {
         assert!(lines(&b)[1].starts_with("Key names, each after its node and a tab: "));
     }
 
+    /// Small 1: two dry-run tasks first polled only after a second bulk action replaced
+    /// the first (`POST`, `DELETE`, `POST` before either task ran): each counts the bulk
+    /// action it was started for, so the first ends at once and the second's counts
+    /// are not doubled.
+    #[tokio::test]
+    async fn a_dry_run_task_counts_only_the_bulk_action_it_was_started_for() {
+        use std::sync::Arc;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "redis-lens-web-bulk-two-loops-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        let profile = crate::model::Profile {
+            name: "cache".into(),
+            env: crate::model::Env::Local,
+            endpoint: crate::model::Endpoint {
+                host: "127.0.0.1".into(),
+                port: 1,
+                tls: false,
+            },
+            db: 0,
+            auth: crate::model::Auth::None,
+            read_only: Some(false),
+            prefer_replica: false,
+            provider: None,
+            token_command: None,
+            ssh: None,
+            sentinel: None,
+            force_standalone: false,
+            tags: Vec::new(),
+        };
+        let mut c = crate::config::Config::default();
+        c.add(profile.clone(), false).unwrap();
+        c.save(&config).unwrap();
+        let hub =
+            crate::web::session::Hub::new(config, Arc::new(crate::secrets::MemoryStore::default()));
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let app = crate::web::app_state(
+            Arc::clone(&hub),
+            7379,
+            crate::web::auth::Token::for_test(&"ab".repeat(32)),
+            rx,
+        );
+        hub.install_for_test(profile, false);
+        hub.hold_requests(true);
+        let (conn, first) = hub
+            .with_mut(|c| open(c, "cart:{id}".into(), BulkAction::Delete))
+            .unwrap()
+            .unwrap();
+        hub.with_mut(|c| {
+            c.bulk.as_mut().unwrap().stage = Stage::Done(Done {
+                lines: vec![DRY_RUN_STOPPED.into()],
+                error: false,
+                run: None,
+            });
+        });
+        let (_, second) = hub
+            .with_mut(|c| open(c, "cart:{id}".into(), BulkAction::Delete))
+            .unwrap()
+            .unwrap();
+        assert_ne!(first, second);
+        let one = tokio::spawn(count_loop(app.clone(), conn, first));
+        let two = tokio::spawn(count_loop(app.clone(), conn, second));
+        tokio::time::timeout(std::time::Duration::from_secs(5), one)
+            .await
+            .expect("the first bulk's task ends at once")
+            .unwrap();
+        for _ in 0..200 {
+            if hub.pending_len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(hub.pending_len(), 1, "one count step: the second's own");
+        assert_eq!(hub.sent_count(), 1);
+        assert!(hub.answer_oldest(count(Walk::Done, 7, 0)));
+        tokio::time::timeout(std::time::Duration::from_secs(5), two)
+            .await
+            .expect("the second's task ends once counted")
+            .unwrap();
+        let matched = hub.with(|c| c.bulk.as_ref().map(|b| b.count.matched));
+        assert_eq!(matched, Some(Some(7)), "counted once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Small 4: a dry run whose session started a new run (another database) ends
+    /// there, in the dashboard's words, instead of mixing two databases' counts.
+    #[test]
+    fn a_dry_run_ends_when_the_connection_changed() {
+        let mut b = bulk(BulkAction::Delete, 0);
+        count_changed(&mut b);
+        assert_eq!(lines(&b), [COUNT_CHANGED]);
+        assert_eq!(b.body()["error"], true);
+        assert!(!b.busy());
+    }
+
+    /// Small 2: an answer finds the bulk action waiting for it, started already, or
+    /// ended (stopped, cancelled): each its own refusal.
+    #[test]
+    fn an_answer_knows_a_started_bulk_from_an_ended_one() {
+        let mut b = bulk(BulkAction::Delete, 0);
+        assert_eq!(Waits::of(&b.stage), Waits::Ended, "still counting");
+        b.stage = Stage::Counted;
+        assert_eq!(Waits::of(&b.stage), Waits::Yes);
+        running(&mut b);
+        assert_eq!(Waits::of(&b.stage), Waits::Started);
+        b.stage = Stage::Done(Done {
+            lines: vec![crate::live::CANCELLED.into()],
+            error: false,
+            run: None,
+        });
+        assert_eq!(Waits::of(&b.stage), Waits::Ended);
+    }
+
     #[test]
     fn every_text_is_the_dashboards_own() {
         for t in [
@@ -1232,6 +1521,10 @@ mod tests {
             DRY_RUN_STOPPED,
             BULK_CANCELLED,
             STOPPING,
+            STOPPED,
+            STOPPED_FIRST,
+            BUSY,
+            COUNT_CHANGED,
         ] {
             assert_eq!(crate::web::wording::banned(t), None, "{t}");
             assert_eq!(crate::web::wording::server_free(t), t, "{t}");

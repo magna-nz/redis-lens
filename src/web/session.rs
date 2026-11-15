@@ -619,6 +619,9 @@ impl Hub {
     /// Connects `target`, replacing the current connection. Returns once the connect has
     /// started; how it goes comes as `state` events.
     pub async fn connect(self: &Arc<Self>, target: Target) -> Result<(), ConnectError> {
+        if self.bulk_busy() {
+            return Err(ConnectError::Busy);
+        }
         let config = self.config.clone();
         let (profile, source, docker, keychain) = match target {
             Target::Profile(name) => {
@@ -653,8 +656,18 @@ impl Hub {
         let settings = tokio::task::spawn_blocking(move || settings_of(&path))
             .await
             .unwrap_or_default();
-        {
+        let had_bulk = {
             let mut g = lock(&self.inner);
+            // Checked again under the lock that replaces the session: a bulk action
+            // started while the profile was read.
+            if g.cur
+                .as_ref()
+                .and_then(|c| c.bulk.as_ref())
+                .is_some_and(crate::web::api::bulk::Bulk::busy)
+            {
+                return Err(ConnectError::Busy);
+            }
+            let had_bulk = g.cur.as_ref().is_some_and(|c| c.bulk.is_some());
             let id = g.next_conn;
             g.next_conn += 1;
             let mut cur = Current::new(id, profile.clone(), source.clone(), docker);
@@ -675,8 +688,12 @@ impl Hub {
                 secrets: source,
                 sample: None,
             });
-        }
+            had_bulk
+        };
         self.emit_state();
+        if had_bulk {
+            self.emit_bulk_closed();
+        }
         if self.snapshots.is_some() {
             self.find_last_snapshot();
         }
@@ -747,6 +764,18 @@ impl Hub {
                     return Err(Refused::new(StatusCode::CONFLICT, ANALYSIS_RUNS));
                 }
                 Phase::Connected | Phase::Done => {}
+            }
+            // The TUI's bulk dialog takes every key until it ends: a new run would close
+            // the live connection under a batch on its way, and its outcome would go
+            // uncounted.
+            if c.bulk
+                .as_ref()
+                .is_some_and(crate::web::api::bulk::Bulk::busy)
+            {
+                return Err(Refused::new(
+                    StatusCode::CONFLICT,
+                    crate::web::api::bulk::BUSY,
+                ));
             }
             let tail = c.tail.take();
             if let Some(t) = &tail {
@@ -927,12 +956,54 @@ impl Hub {
 
     /// Ends the current connection, its tail and its Monitor run.
     pub fn disconnect(&self) {
-        {
+        let had_bulk = {
             let mut g = lock(&self.inner);
             g.runner.close();
+            let had_bulk = g.cur.as_ref().is_some_and(|c| c.bulk.is_some());
             g.cur = None;
-        }
+            had_bulk
+        };
         self.emit_state();
+        if had_bulk {
+            self.emit_bulk_closed();
+        }
+    }
+
+    /// [`Self::disconnect`], unless a bulk action counts or runs (the TUI's bulk dialog
+    /// takes every key until it ends): then false, and nothing changes.
+    pub fn disconnect_unless_busy(&self) -> bool {
+        let had_bulk = {
+            let mut g = lock(&self.inner);
+            let bulk = g.cur.as_ref().and_then(|c| c.bulk.as_ref());
+            if bulk.is_some_and(crate::web::api::bulk::Bulk::busy) {
+                return false;
+            }
+            let had_bulk = bulk.is_some();
+            g.runner.close();
+            g.cur = None;
+            had_bulk
+        };
+        self.emit_state();
+        if had_bulk {
+            self.emit_bulk_closed();
+        }
+        true
+    }
+
+    /// A bulk action counts or runs on the current connection.
+    pub fn bulk_busy(&self) -> bool {
+        self.with(|c| {
+            c.bulk
+                .as_ref()
+                .is_some_and(crate::web::api::bulk::Bulk::busy)
+        })
+        .unwrap_or(false)
+    }
+
+    /// The `bulk` event of a bulk action gone with its session (a connect, a
+    /// disconnect): a page that follows only events closes its panel.
+    fn emit_bulk_closed(&self) {
+        self.emit(Event::new("bulk", serde_json::json!({ "bulk": null })));
     }
 
     /// Picks node `index` of a cluster for the views that read one node. False when there
@@ -1373,6 +1444,9 @@ pub enum ConnectError {
     NotFound,
     /// In words safe to show (masked).
     Failed(String),
+    /// A bulk action counts or runs on the current connection
+    /// ([`crate::web::api::bulk::BUSY`]).
+    Busy,
 }
 
 /// A request on its way: the connection, its id and where its answer comes.
