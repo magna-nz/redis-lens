@@ -96,14 +96,19 @@ Example, `GET /api/state (wrong Host)`. Reply: HTTP 403
 - Bodies are JSON. An empty body counts as `{}`. A body this route does not take
   (wrong shape, unknown field) gets 400 `{"error":"the request body is not the JSON this route takes"}`.
   The input is never echoed back.
+- A query string this route does not take (a parameter missing, or not of its type, such
+  as `GET /api/find` without `q`, `GET /api/value/item?view=abc` or
+  `GET /api/analysis/slots?refresh=true`) gets 400
+  `{"error":"the query parameters are not the ones this route takes"}`, as JSON like every
+  other refusal. The input is never echoed back.
 - Errors are `{"error": "<text>"}`.
 - Status codes:
   - 200: done.
   - 201: a connection was added, or a snapshot saved.
   - 202: started, with the result arriving as events (connect, subscribe, Monitor, an
     analysis, a database switch).
-  - 400: a body this route does not take (also one over 2 MiB), or a change
-    `conn add`/`conn set` refuses (the reason is in `error`).
+  - 400: a body or a query string this route does not take (also a body over 2 MiB), or
+    a change `conn add`/`conn set` refuses (the reason is in `error`).
   - 404: no such connection or route.
   - 409: there is no live connection (`{"error":"not connected: connect first, or the live connection is closed"}`),
     a confirm is needed (see below), or a command line is still running
@@ -156,8 +161,12 @@ and so does starting Monitor (it always asks) and turning writes on:
   prod profiles), and `expect` holds that name.
 - `POST /api/confirm/<id>` with `{}` (ask) or `{"typed": "<name>"}` (type) answers yes. The
   gate checks again at that point, with the profile's `read_only` and `env` read again from
-  the config file: a different connection (409 or 410), a profile that is now read-only
-  (422), or a wrong typed name means it is not sent.
+  the config file: a different connection (409 or 410), a new run of the same connection
+  since the question (a database switch or an analysis started: 409
+  `{"error":"Not sent: the connection changed since the question was asked."}`), a profile
+  that is now read-only (422), or a wrong typed name means it is not sent. The same holds
+  for a `@dangerous` command line's question, and for a repeated write that a new run
+  interrupts.
 - `DELETE /api/confirm/<id>` cancels.
 - Each id can be used once and expires after 2 minutes. After that both routes answer 410.
   Expired questions, and what they held, are dropped every 10 s even when no request comes.
@@ -2232,9 +2241,22 @@ Example, `event: progress` (`stopped`). Event
 }
 ```
 
-No `failed` event was captured live (a seeded server does not fail a scan); its shape is
-`{"run": 4, "kind": "failed", "error": "<fixed sentence>"}`, checked by the unit test
-`a_failed_analysis_keeps_the_session_and_says_why_in_fixed_words` in `src/web/session.rs`.
+A `failed` event's `error` (and `state.analysis.error`) says that the analysis failed,
+never that the connection was refused, in one of these sentences: `The analysis failed:
+the server refused a command it needs.` (a command refused or answered with an error, such
+as `SCAN` for a user without it), `The analysis failed: the connection to the server
+broke.`, the two password sentences of a refused login, or redis-lens's own sentence when
+it gave one. The server's text never reaches it.
+
+Example, `event: progress` (`failed`), a user without `SCAN`. Event
+
+```json
+{
+  "error": "The analysis failed: the server refused a command it needs.",
+  "kind": "failed",
+  "run": 2
+}
+```
 
 ### `state.analysis`
 
@@ -2479,8 +2501,19 @@ new run that reads no key: the earlier results go, the live connection opens aga
 new database, a running pub/sub tail is subscribed again, a running Monitor is stopped, and
 Browse reads the new database's key names. For this session only: the saved profile is not
 changed. The reply is 202 with the run; a `state` event follows, and
-`state.analysis.db` says the database. The current database is 200 `{"switched": false}`.
-409 on a cluster or while an analysis runs.
+`state.analysis.db` says the database. The current database is 200
+`{"db": n, "switched": false, "run": null, "text": null}` (nothing changes). 409 on a
+cluster (`A cluster only has database 0.`), while an analysis runs, and when no run can
+start: no session (`not connected: connect first, or the live connection is closed`), the
+switch before still connecting
+(`Still connecting: wait until the connection is ready.`) or a failed connect
+(`The connect failed: connect again first.`).
+
+The switch drops Browse's key names, key lists and open values (they were of the other
+database); their `list` and `view` numbers are not given again, so an old number answers
+404. A write question asked before the switch is refused when answered after it (409, see
+"Confirms"). An analysis, a run on the same database, keeps the key lists and values
+open.
 
 Example, `POST /api/db {"db":1}`. Reply: HTTP 202
 
@@ -2490,6 +2523,17 @@ Example, `POST /api/db {"db":1}`. Reply: HTTP 202
   "run": 2,
   "switched": true,
   "text": "Switched to db 1 for this session. The saved profile is unchanged."
+}
+```
+
+Example, `POST /api/db {"db":0}` on database 0. Reply: HTTP 200
+
+```json
+{
+  "db": 0,
+  "run": null,
+  "switched": false,
+  "text": null
 }
 ```
 
@@ -2505,7 +2549,10 @@ Example, `POST /api/db {"db":7}`. Reply: HTTP 422
 
 Browse › Keys: the pattern tree. `?sort=` is one of `sorts` (`memory`, `keys`, `avg_size`,
 `no_ttl`, `name`: sizes need an analysis; 400 for anything else), `?node=<i>` narrows an
-analysis of a cluster to one shard (`nodes` lists them; 422 for one not there).
+analysis of a cluster to one shard (`nodes` lists them; 422 for one not there; 400 for
+one that is not a number). `node` in the reply is the node the rows are narrowed to: only
+an analysis's rows can be, so it is `null` for rows from key names or from partial
+results, whatever `?node=` asked.
 
 `source` says where the rows come from:
 
@@ -2891,17 +2938,30 @@ A key list, as Browse › Keys lists a pattern's keys and Find key finds keys:
 - `GET /api/find?q=<text>`: the keys of the whole database whose names match: text with
   `*`, `?` or `[` is a glob used as typed, other text means "contains" (`*text*`). Control
   characters are dropped, the text is cut at 512 bytes and trimmed. 400 for empty text;
-  422 for a glob the TUI refuses (too many wildcards, in its words); 409 while connecting
-  or once the live connection is closed.
+  then, as the TUI checks them, 409 while connecting or once the live connection is
+  closed, and 422 for a glob the TUI refuses (too many wildcards, in its words).
 - `GET /api/keys/more?list=<n>`: the next page of list `n`. 404 for a list no longer kept
-  (the newest 16 are), 409 while it loads a page or when it is complete.
+  (the newest 16 are, and a database switch drops them all), 409 while it loads a page,
+  when it is complete, or once it holds 50,000 keys or more
+  (`{"error":"This list holds 50,000 keys or more, so no more are loaded. Find a narrower name to see others."}`).
 
-The first page is read before the reply. A list: `list` (its number), `kind` (`pattern` or
-`find`), `pattern` or `find` (`{text, glob}`), `glob`, `rows`, `loaded`, `new_from` (the
-first row of the last page), `pages`, `page_keys`, `done`, `error`, `refused` (metadata the
-server refused, in fixed words), `other_pattern` (matched the glob but belong to another
-pattern), `unreadable`, `sizes`, `lfu`, `freq` and, on a cluster, `cluster` (`walk`: the
-shards in order, `at`, `nodes_done`, `missing`, `narrowed`). A row is a key name with
+`GET /api/keys` is 422 `{"error":"That node is not one of this analysis's nodes."}` for a
+`node` the analysis does not have. Every route of the three is 400 for a parameter
+missing or not of its type ("Conventions").
+
+The first page is read before the reply. If the browser drops the request while a page is
+read, the page still lands in the list: the next `more` reads on from it. A list: `list`
+(its number), `kind` (`pattern` or `find`), `pattern` or `find` (`{text, glob}`), `glob`,
+`rows`, `loaded` (rows held), `new_from`, `pages`, `page_keys`, `done`, `capped` (it holds
+`max_rows` keys or more: no more pages are read), `max_rows` (50,000), `error`, `refused`
+(metadata the server refused, in fixed words), `other_pattern` (matched the glob but
+belong to another pattern), `unreadable`, `sizes`, `lfu`, `freq` and, on a cluster,
+`cluster` (`walk`: the shards in order, `at`, `nodes_done`, `missing`, `narrowed`).
+
+`rows` holds the rows the reply's page added, from row `new_from` on: every row for
+`GET /api/keys` and `GET /api/find` (`new_from` is 0), only the new ones for
+`GET /api/keys/more` (`new_from` is the number held before it). The page appends them to
+the rows it has. A row is a key name with
 `type`, `ttl` (`never` or the TUI's `59m 59s`), `ttl_secs`, `bytes`, `encoding`, `length`,
 `length_unit`, `freq` (the LFU counter, when the policy keeps them) and `node`.
 
@@ -2909,6 +2969,7 @@ Example, `GET /api/keys?pattern=636172743a7b69647d`. Reply: HTTP 200 (`$.rows` c
 
 ```json
 {
+  "capped": false,
   "cluster": null,
   "done": true,
   "error": null,
@@ -2919,6 +2980,7 @@ Example, `GET /api/keys?pattern=636172743a7b69647d`. Reply: HTTP 200 (`$.rows` c
   "lfu": true,
   "list": 1,
   "loaded": 60,
+  "max_rows": 50000,
   "new_from": 0,
   "other_pattern": 0,
   "page_keys": 1000,
@@ -2968,6 +3030,7 @@ Example, `GET /api/find?q=user`. Reply: HTTP 200
 
 ```json
 {
+  "capped": false,
   "cluster": null,
   "done": true,
   "error": null,
@@ -2981,6 +3044,7 @@ Example, `GET /api/find?q=user`. Reply: HTTP 200
   "lfu": true,
   "list": 2,
   "loaded": 1,
+  "max_rows": 50000,
   "new_from": 0,
   "other_pattern": 0,
   "page_keys": 1000,
@@ -3012,6 +3076,7 @@ Example, `GET /api/find?q=evil%2A`. Reply: HTTP 200
 
 ```json
 {
+  "capped": false,
   "cluster": null,
   "done": true,
   "error": null,
@@ -3025,6 +3090,7 @@ Example, `GET /api/find?q=evil%2A`. Reply: HTTP 200
   "lfu": true,
   "list": 3,
   "loaded": 1,
+  "max_rows": 50000,
   "new_from": 0,
   "other_pattern": 0,
   "page_keys": 1000,
@@ -3072,6 +3138,7 @@ Example, `GET /api/keys?pattern=6974656d3a7b69647d`. Reply: HTTP 200 (`$.cluster
 
 ```json
 {
+  "capped": false,
   "cluster": {
     "at": 2,
     "missing": [],
@@ -3091,6 +3158,7 @@ Example, `GET /api/keys?pattern=6974656d3a7b69647d`. Reply: HTTP 200 (`$.cluster
   "lfu": false,
   "list": 1,
   "loaded": 90,
+  "max_rows": 50000,
   "new_from": 0,
   "other_pattern": 0,
   "page_keys": 1000,
@@ -3146,14 +3214,21 @@ at most 10,000 items held):
   sampled of it, else only the name, with the type the first read says. The newest 8
   values are kept open.
 - `GET /api/value/more?view=<n>` reads the next page. When there is none it reads nothing
-  and `notice` says why, in the TUI's words. 404 for a view no longer open, 409 while one
-  loads.
+  and `notice` says why, in the TUI's words. 404 for a view no longer open (a database
+  switch closes them all), 409 `{"error":"Still loading the value: wait for it."}` while a
+  page of it loads: one page of a value is read at a time, so two requests at once never
+  read the same page twice. If the browser drops a request while its page is read, the
+  page still lands in the value.
 - `GET /api/value/item?view=<n>&index=<i>[&field=<j>][&format=<f>][&width=<w>]` renders one
   item whole: a hash field's value, a list, set or vector element, a sorted set member, a
   stream entry's field `field` (a stream entry needs one: 422), or `index=0` for a string
   or a JSON document. `format` is one of the value's `formats` (`text`, `hex`, `JSON`,
   `MessagePack`, `PHP`, `Pickle`, `Protobuf`, `Java`, any case; `msgpack` too); without
   one the format is detected.
+
+Every route of the three is 400 for a parameter missing or not of its type
+("Conventions"): `key`, `view`, `index`, `field` and `width` are numbers, `index` 0 or
+more.
 
 A value: `view`, `key` (a name), `type` (the server's), `kind` (`string`, `hash`, `list`,
 `set`, `zset`, `stream`, `json`, `vector`, `array`, `module`, `other`), `command` (what
@@ -4082,8 +4157,10 @@ there are no rows).
 - `GET /api/analysis/big_keys`: the biggest sampled keys (`rows`: `key`, `pattern`,
   `length`, `length_unit`, `encoding`, `big`, `node`), and the recommendations ("Things to
   look at": `severity`, `text`, `hint`). Lengths and encodings are read for the listed keys
-  (pipelined, per shard); `facts_read` says they were, `notes` what was refused.
-  `big_key_bytes` is the TUI's size for a big key.
+  (pipelined, per shard) once per report: a request that comes while they are read waits
+  for that read instead of reading them again, and an `overview` event follows once they
+  are in (Overview's findings use them). `facts_read` says they were, `notes` what was
+  refused. `big_key_bytes` is the TUI's size for a big key.
 - `GET /api/analysis/expiry`: patterns by TTL risk in the TUI's order (`status`,
   `explain`, `ttl_hist`, `no_ttl`, ...), and `freed`: the memory freed by TTL within each
   `within` horizon, `later`, `never` and `never_share`; `freed_off` says why it is not
@@ -4572,16 +4649,28 @@ UTC).
 - `POST /api/snapshots` saves the current report, as the TUI saves one: 201 `{file,
   taken_at_unix, taken_at_utc, sampled_keys, text}`, and Overview's `last_analysis`
   follows. 409, in the TUI's words, for no report, a running analysis, partial results or
-  a report stopped early.
+  a report stopped early
+  (`{"error":"This analysis was stopped early, so its results are partial and are not saved. Analyze again to save one."}`).
+  500 `{"error":"The snapshot could not be saved: the snapshot directory could not be written."}`
+  when the file can't be written (the file system's text, which names paths, is never
+  passed on).
+- Snapshots of every database of a profile go to the same directory, as in the TUI: after
+  a database switch, Changes and `compare` set the new database's analysis against the
+  other database's snapshots.
 - `GET /api/snapshots`: the connection's snapshots, newest first (`file`, `taken_at_unix`,
   `taken_at_utc`, `current`: the report the panels show), `profile`, `can_save`,
-  `save_off` (why not) and `saved` (the current report is saved).
+  `save_off` (why not) and `saved` (the current report is saved). 500
+  `{"error":"The snapshots could not be listed: the snapshot directory could not be read."}`
+  when the directory can't be read.
 - `GET /api/snapshots/compare?a=<file|current>&b=<file|current>`: the newer of the two
   against the older, as the Changes panel shows it (the `diff` body above without
   `status` and `report`, with `before_sampled_keys` and `after_sampled_keys`). A name is a
   file name exactly as `GET /api/snapshots` gives it, or `current`; anything else is 400
   before any file is opened, a file of another connection or none is 404, the same name
-  twice is 422, a file that is not a snapshot is 422.
+  twice is 422, a file that is not a snapshot is 422, `current` without a finished report
+  (none yet, or an analysis running) is 409
+  `{"error":"No analysis yet: analyze the keys first."}`, a directory that can't be read
+  is 500 (the listing's sentence above). A missing `a` or `b` is 400 ("Conventions").
 
 Example, `POST /api/snapshots {}`. Reply: HTTP 201
 

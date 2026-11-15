@@ -343,6 +343,12 @@ pub struct Hub {
     /// Where snapshots are saved and read: `None` for the TUI's own directory
     /// ([`crate::snapshot::default_dir`]); the integration tests give their own.
     snapshots: Option<PathBuf>,
+    /// Tests: requests sent through [`Hub::send`], and whether they are held (kept
+    /// waiting for [`Hub::answer_oldest`]) instead of going to the runtime.
+    #[cfg(test)]
+    test_sent: AtomicUsize,
+    #[cfg(test)]
+    test_hold: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Hub {
@@ -439,6 +445,10 @@ impl Hub {
             clients: AtomicUsize::new(0),
             line_running: std::sync::atomic::AtomicBool::new(false),
             snapshots,
+            #[cfg(test)]
+            test_sent: AtomicUsize::new(0),
+            #[cfg(test)]
+            test_hold: std::sync::atomic::AtomicBool::new(false),
         });
         tokio::spawn(pump(Arc::downgrade(&hub), msgs));
         hub
@@ -980,6 +990,35 @@ impl Hub {
         self.with(|c| c.pending.len()).unwrap_or(0)
     }
 
+    /// Tests: from now on requests wait until [`Self::answer_oldest`] answers them
+    /// (`true`), or go to the runtime as usual (`false`).
+    #[cfg(test)]
+    pub(crate) fn hold_requests(&self, hold: bool) {
+        self.test_hold.store(hold, Ordering::SeqCst);
+    }
+
+    /// Tests: how many requests (reads and writes) were sent so far.
+    #[cfg(test)]
+    pub(crate) fn sent_count(&self) -> usize {
+        self.test_sent.load(Ordering::SeqCst)
+    }
+
+    /// Tests: answers the oldest request still waiting with `result`. False when none
+    /// waits.
+    #[cfg(test)]
+    pub(crate) fn answer_oldest(&self, result: LiveResult) -> bool {
+        self.with_mut(|c| {
+            let Some(id) = c.pending.keys().min_by_key(|r| r.0).copied() else {
+                return false;
+            };
+            c.writes.remove(&id);
+            c.pending
+                .remove(&id)
+                .is_some_and(|tx| tx.send(result).is_ok())
+        })
+        .unwrap_or(false)
+    }
+
     fn send(
         &self,
         conn: Option<ConnId>,
@@ -1003,6 +1042,13 @@ impl Hub {
             c.writes.insert(req_id, name);
         }
         let id = c.id;
+        #[cfg(test)]
+        {
+            self.test_sent.fetch_add(1, Ordering::SeqCst);
+            if self.test_hold.load(Ordering::SeqCst) {
+                return Ok((id, req_id, rx));
+            }
+        }
         runner.run(Effect::Live {
             id,
             req_id,
@@ -1611,7 +1657,7 @@ fn apply_to(c: &mut Current, msg: Msg, events: &mut Vec<Event>, state: &mut bool
             } else {
                 Phase::Connected
             };
-            let why = crate::value::escape(&crate::web::wording::server_free(&error));
+            let why = crate::value::escape(&crate::web::wording::analysis_failed(&error));
             c.analysis.error = Some(why.clone());
             events.push(Event::new(
                 "progress",
@@ -2268,6 +2314,9 @@ mod tests {
         assert_eq!(events[0].data["kind"], "failed");
         let why = events[0].data["error"].as_str().unwrap();
         assert!(!why.contains("lim") && !why.contains("NOPERM"), "{why}");
+        // The analysis failed, not the connection: it says so.
+        assert_eq!(why, crate::web::wording::ANALYSIS_REFUSED);
+        assert_eq!(c.analysis.error.as_deref(), Some(why));
         assert_eq!(c.session.phase, Phase::Connected);
         assert!(c.live_ready(), "the live views go on");
         assert_eq!(AnalysisDto::of(Some(&c)).status, "none");

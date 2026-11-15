@@ -23,6 +23,11 @@ pub const BAD_CREDENTIALS: &str =
 /// Why a connect failed when the server or the client library said why in its own
 /// words.
 pub const SERVER_REFUSED: &str = "the server refused the connection";
+/// Why an analysis failed when the server's (or the client library's) text said why: a
+/// command it needs was refused, or answered with an error.
+pub const ANALYSIS_REFUSED: &str = "The analysis failed: the server refused a command it needs.";
+/// Why an analysis failed when the client library says the connection broke under it.
+pub const ANALYSIS_BROKE: &str = "The analysis failed: the connection to the server broke.";
 
 /// The sentences of the TUI and the CLI, and what the dashboard says instead. Applied in
 /// order, as plain substrings.
@@ -457,7 +462,12 @@ fn leading_code(text: &str) -> Option<&str> {
 /// Whether `text` holds a library kind name in the forms its `Display` writes:
 /// ` - Kind`, ` - Kind: `, ` - Kind(`, or `Kind: ` at a word's start.
 fn holds_kind(text: &str) -> bool {
-    LIBRARY_KINDS.iter().any(|k| {
+    holds_kind_of(text, LIBRARY_KINDS)
+}
+
+/// [`holds_kind`] for the kinds in `kinds` only.
+fn holds_kind_of(text: &str, kinds: &[&str]) -> bool {
+    kinds.iter().any(|k| {
         let after_dash = format!(" - {k}");
         let dash = text.match_indices(&after_dash).any(|(i, m)| {
             let rest = &text[i + m.len()..];
@@ -531,6 +541,22 @@ pub fn server_free(text: &str) -> String {
         BAD_CREDENTIALS.to_string()
     } else {
         SERVER_REFUSED.to_string()
+    }
+}
+
+/// Why an analysis failed, in redis-lens's words: a server's or the library's text
+/// becomes [`ANALYSIS_REFUSED`] (or [`ANALYSIS_BROKE`] for a broken connection, and the
+/// password sentences of [`server_free`] for a refused login); redis-lens's own
+/// sentence is kept, in the dashboard's terms.
+pub fn analysis_failed(text: &str) -> String {
+    let free = server_free(text);
+    if free != SERVER_REFUSED || !from_server(text) {
+        return free;
+    }
+    if holds_kind_of(text, &["Io", "IoError"]) {
+        ANALYSIS_BROKE.to_string()
+    } else {
+        ANALYSIS_REFUSED.to_string()
     }
 }
 
@@ -733,6 +759,41 @@ mod tests {
             "the host is cache-eu: Ask the owner",
         ] {
             assert_eq!(server_free(own), own);
+        }
+    }
+
+    #[test]
+    fn a_failed_analysis_says_what_failed_in_fixed_words() {
+        for (raw, want) in [
+            (
+                "SCAN failed: NOPERM User lim has no permissions to run the 'scan' command",
+                ANALYSIS_REFUSED,
+            ),
+            (
+                "An error was signalled by the server - ResponseError: ERR max clients",
+                ANALYSIS_REFUSED,
+            ),
+            (
+                "Connection reset by peer (os error 54) - IoError",
+                ANALYSIS_BROKE,
+            ),
+            ("broken pipe - Io", ANALYSIS_BROKE),
+            ("NOAUTH: Authentication required.", NEEDS_PASSWORD),
+            (
+                "WRONGPASS: invalid username-password pair or user is disabled.",
+                BAD_CREDENTIALS,
+            ),
+            // redis-lens's own sentence stays.
+            (
+                "INFO or DBSIZE could not be read on this node",
+                "INFO or DBSIZE could not be read on this node",
+            ),
+        ] {
+            assert_eq!(analysis_failed(raw), want, "{raw}");
+        }
+        for t in [ANALYSIS_REFUSED, ANALYSIS_BROKE] {
+            assert_eq!(banned(t), None, "{t}");
+            assert_eq!(server_free(t), t, "{t}");
         }
     }
 

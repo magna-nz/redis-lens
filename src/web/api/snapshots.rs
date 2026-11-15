@@ -9,12 +9,12 @@
 //! directory only: a name never leads anywhere else. File system errors are never
 //! passed on (they name paths): the reply says what could not be done.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use super::{App, error, ok};
+use super::{App, Q, error, ok};
 use crate::model::ScanReport;
 use crate::snapshot;
 
@@ -156,7 +156,7 @@ pub fn parse_name(name: &str) -> Result<Option<i64>, &'static str> {
 
 /// `GET /api/snapshots/compare?a=<file|current>&b=<file|current>`: the Changes of the
 /// newer of the two against the older, as the TUI's Changes panel shows them.
-pub async fn compare(State(app): State<App>, Query(q): Query<CompareQuery>) -> Response {
+pub async fn compare(State(app): State<App>, Q(q): Q<CompareQuery>) -> Response {
     let (Ok(a), Ok(b)) = (parse_name(&q.a), parse_name(&q.b)) else {
         return error(StatusCode::BAD_REQUEST, BAD_NAME);
     };

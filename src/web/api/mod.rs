@@ -6,15 +6,17 @@
 //! panel whose feature the server refuses answers 200 with `{"off": "<why>"}` (rule 3:
 //! one feature off, said in redis-lens's own words).
 //!
-//! Request bodies are read by [`Body`], whose refusal is one fixed sentence: never the
-//! parser's text, which could quote a value from the body (a password).
+//! Request bodies are read by [`Body`] and query strings by [`Q`], whose refusals are one
+//! fixed sentence each: never the parser's text, which could quote a value from the
+//! request (a password), and always JSON.
 
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use axum::extract::{FromRef, FromRequest, Request, State};
+use axum::extract::{FromRef, FromRequest, FromRequestParts, Request, State};
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::Stream;
@@ -195,6 +197,8 @@ pub fn live_error(e: &LiveError) -> Response {
 pub const NOT_LIVE: &str = "not connected: connect first, or the live connection is closed";
 /// Why a request body was refused.
 pub const BAD_BODY: &str = "the request body is not the JSON this route takes";
+/// Why a query string was refused: a parameter missing, or not of its type.
+pub const BAD_QUERY: &str = "the query parameters are not the ones this route takes";
 /// An answer of an unexpected shape.
 pub const SHAPE: &str = "the live connection gave an answer of another kind";
 
@@ -216,6 +220,21 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
         serde_json::from_slice(text)
             .map(Body)
             .map_err(|_| error(StatusCode::BAD_REQUEST, BAD_BODY))
+    }
+}
+
+/// A query string read into `T`. A parameter missing or of the wrong type is refused
+/// with 400 `{"error": BAD_QUERY}`, never axum's plain-text rejection (which quotes the
+/// parser's text).
+pub struct Q<T>(pub T);
+
+impl<S: Send + Sync, T: DeserializeOwned> FromRequestParts<S> for Q<T> {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        axum::extract::Query::<T>::try_from_uri(&parts.uri)
+            .map(|axum::extract::Query(t)| Q(t))
+            .map_err(|_| error(StatusCode::BAD_REQUEST, BAD_QUERY))
     }
 }
 

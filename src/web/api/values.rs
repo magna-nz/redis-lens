@@ -16,13 +16,13 @@
 
 use std::collections::VecDeque;
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 use super::keys::{KeyDto, ttl_text};
-use super::{App, Refused, error, ok};
+use super::{App, Q, Refused, error, ok};
 use crate::live::keys::KeyRow;
 use crate::live::values::{
     Items, JSON_MAX_SIZE, JSON_SHOWN, Kind, MAX_ITEMS, Module, STRING_BYTES, VECTOR_SAMPLE,
@@ -98,8 +98,18 @@ impl Views {
         self.views.iter().find(|v| v.id == id)
     }
 
-    pub fn clear(&mut self) {
+    /// Tests: whether view `id` is loading a page; `None` when there is no such view.
+    #[cfg(test)]
+    pub(crate) fn loading_of(&self, id: u64) -> Option<bool> {
+        self.get(id).map(|v| v.loading)
+    }
+
+    /// Closes every value and forgets what was learned about field TTLs (a database
+    /// switch). The numbers go on from where they were: one from before never names a
+    /// value opened after.
+    pub fn restart(&mut self) {
         self.views.clear();
+        self.httl_off = None;
     }
 }
 
@@ -131,7 +141,7 @@ pub struct ItemQuery {
 /// `GET /api/value?key=<id>[&type=<t>]`: opens a key's value and reads its first page.
 /// The key's metadata (type, TTL, size, length) is its row in the newest key list that
 /// has it, else what the analysis sampled of it, else only the type given.
-pub async fn open(State(app): State<App>, Query(q): Query<OpenQuery>) -> Response {
+pub async fn open(State(app): State<App>, Q(q): Q<OpenQuery>) -> Response {
     let key = match keyname::decode(&q.key) {
         Ok(k) => k,
         Err(r) => return r.into_response(),
@@ -164,66 +174,63 @@ pub async fn open(State(app): State<App>, Query(q): Query<OpenQuery>) -> Respons
 }
 
 /// `GET /api/value/more?view=<n>`: the next page, as `n` on the key detail. When there
-/// is none to read the reply says why in `notice`, as the TUI does.
-pub async fn more(State(app): State<App>, Query(q): Query<ViewQuery>) -> Response {
-    let known = app.hub.with(|c| {
-        c.browse
-            .values
-            .get(q.view)
-            .filter(|v| v.conn == c.id)
-            .map(|v| v.loading)
-    });
-    match known.flatten() {
-        None => error(StatusCode::NOT_FOUND, NO_VIEW),
-        Some(true) => error(StatusCode::CONFLICT, STILL_LOADING),
-        Some(false) => read(&app, q.view).await,
-    }
+/// is none to read the reply says why in `notice`, as the TUI does. 409 while a page of
+/// it is loading.
+pub async fn more(State(app): State<App>, Q(q): Q<ViewQuery>) -> Response {
+    read(&app, q.view).await
 }
 
 /// Reads the next page of view `id` when there is one to read, then answers with it.
+/// One page of a view at a time: refused while one loads, checked under the same lock
+/// that marks it loading, so two requests never read the same page twice.
+///
+/// The page is read and answered into the view in a task of its own, awaited here:
+/// when the request goes (the browser closed it), the view still gets its page and
+/// never stays loading.
 async fn read(app: &App, id: u64) -> Response {
-    let step = app
-        .hub
-        .with_mut(|c| {
-            let conn = c.id;
-            let server = c.session.server.clone();
-            let v = c.browse.values.get_mut(id).filter(|v| v.conn == conn)?;
-            Some((
-                conn,
-                can_read(&v.state).then(|| {
-                    v.loading = true;
-                    v.state.next_request(server.as_ref())
-                }),
-            ))
-        })
-        .flatten();
-    let Some((conn, req)) = step else {
-        return error(StatusCode::NOT_FOUND, NO_VIEW);
+    let step = app.hub.with_mut(|c| {
+        let conn = c.id;
+        let server = c.session.server.clone();
+        let Some(v) = c.browse.values.get_mut(id).filter(|v| v.conn == conn) else {
+            return Err(Refused::new(StatusCode::NOT_FOUND, NO_VIEW));
+        };
+        if v.loading {
+            return Err(Refused::new(StatusCode::CONFLICT, STILL_LOADING));
+        }
+        if !can_read(&v.state) {
+            return Ok(None);
+        }
+        let next = v.state.next_request(server.as_ref());
+        v.loading = next.is_some();
+        Ok(next.map(|r| (conn, r)))
+    });
+    let next = match step {
+        None => return error(StatusCode::NOT_FOUND, NO_VIEW),
+        Some(Err(r)) => return r.into_response(),
+        Some(Ok(next)) => next,
     };
-    if let Some(Some((dest, req))) = req {
-        let result = app
-            .hub
-            .request(Some(conn), dest, crate::live::LiveRequest::Value(req))
-            .await;
-        app.hub.with_mut(|c| {
-            if c.id != conn {
-                return;
-            }
-            let Some(v) = c.browse.values.get_mut(id) else {
-                return;
-            };
-            v.loading = false;
-            v.state.answer(result);
-            if v.state.httl_off.is_some() {
-                c.browse.values.httl_off = v.state.httl_off.clone();
-            }
-        });
-    } else if req.is_some() {
-        app.hub.with_mut(|c| {
-            if let Some(v) = c.browse.values.get_mut(id) {
+    if let Some((conn, (dest, req))) = next {
+        let task = app.clone();
+        let _ = tokio::spawn(async move {
+            let result = task
+                .hub
+                .request(Some(conn), dest, crate::live::LiveRequest::Value(req))
+                .await;
+            task.hub.with_mut(|c| {
+                if c.id != conn {
+                    return;
+                }
+                let Some(v) = c.browse.values.get_mut(id) else {
+                    return;
+                };
                 v.loading = false;
-            }
-        });
+                v.state.answer(result);
+                if v.state.httl_off.is_some() {
+                    c.browse.values.httl_off = v.state.httl_off.clone();
+                }
+            });
+        })
+        .await;
     }
     match app
         .hub
@@ -648,7 +655,7 @@ pub fn format_of(name: &str) -> Option<Format> {
 /// item's whole value, rendered: a hash field's value, a list, set, vector or array
 /// element, a sorted set member, a stream entry's field `field`, or (index 0) the
 /// string or document.
-pub async fn item_route(State(app): State<App>, Query(q): Query<ItemQuery>) -> Response {
+pub async fn item_route(State(app): State<App>, Q(q): Q<ItemQuery>) -> Response {
     let picked = match q.format.as_deref().map(format_of) {
         Some(None) => return error(StatusCode::BAD_REQUEST, BAD_FORMAT),
         Some(Some(f)) => Some(f),
@@ -876,6 +883,23 @@ mod tests {
         assert_eq!(b["type"], "stream");
         assert_eq!(b["meta"]["type"], "stream");
         assert_eq!(b["kind"], "stream");
+    }
+
+    /// Small 2: a database switch closes the values, but the numbers go on, so a view
+    /// number from before never names a value of the new database.
+    #[test]
+    fn view_numbers_go_on_after_a_database_switch() {
+        let mut b = crate::web::api::browse::Browse::default();
+        let first = b.values.add(1, bare_row("k", None), String::new());
+        b.values.httl_off = Some("off".into());
+        b.new_run(true);
+        assert!(b.values.get(first).is_none());
+        assert_eq!(b.values.httl_off, None);
+        assert!(b.values.add(1, bare_row("k", None), String::new()) > first);
+        // An analysis keeps them.
+        let open = b.values.views.back().map(|v| v.id).unwrap();
+        b.new_run(false);
+        assert!(b.values.get(open).is_some());
     }
 
     #[test]

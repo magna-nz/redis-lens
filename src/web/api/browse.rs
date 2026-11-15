@@ -10,12 +10,12 @@
 //! The TUI has no server-side glob filter on this tree (its `/` filters the rows on
 //! screen), so neither has this route: the page filters the rows it has.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
-use super::{App, Body, Refused, error, ok};
+use super::{App, Body, Q, Refused, error, ok};
 use crate::conn::ScanTarget;
 use crate::diff::ReportDiff;
 use crate::live::dbs::{Reply as DbsReply, Request as DbsRequest};
@@ -41,6 +41,9 @@ pub struct Browse {
     pub dbs: Option<Vec<u32>>,
     /// Big keys' lengths and encodings, for the report they were read for.
     pub facts: Option<super::analyze::Facts>,
+    /// The report whose facts are being read, and when the read ends: a second
+    /// request waits for it instead of reading them again.
+    pub facts_reading: Option<((i64, u64), tokio::sync::watch::Receiver<bool>)>,
     /// Slots, for the run it was read in.
     pub slots: Option<(u64, SlotsState)>,
 }
@@ -48,11 +51,19 @@ pub struct Browse {
 impl Browse {
     /// A new run started: a page of names in flight is asked again on the new live
     /// connection; a database switch starts everything afresh (another database's keys).
+    /// The key lists' and values' numbers go on from where they were, so a number from
+    /// before the switch never names a list or a value of the new database.
     pub fn new_run(&mut self, db_switch: bool) {
         self.names.lost();
         self.slots = None;
         if db_switch {
-            *self = Self::default();
+            self.lists.clear();
+            self.values.restart();
+            *self = Self {
+                lists: std::mem::take(&mut self.lists),
+                values: std::mem::take(&mut self.values),
+                ..Self::default()
+            };
         }
     }
 }
@@ -108,7 +119,7 @@ pub const BAD_NODE: &str = "That node is not one of this analysis's nodes.";
 
 /// `GET /api/browse[?sort=<s>][&node=<i>]`: the pattern tree. Before an analysis it
 /// reads the first pages of key names when none were read yet.
-pub async fn tree(State(app): State<App>, Query(q): Query<TreeQuery>) -> Response {
+pub async fn tree(State(app): State<App>, Q(q): Q<TreeQuery>) -> Response {
     let sort = match q.sort.as_deref().map(sort_of) {
         Some(None) => return error(StatusCode::BAD_REQUEST, BAD_SORT),
         Some(Some(s)) => s,
@@ -165,7 +176,16 @@ pub async fn more(State(app): State<App>, Body(b): Body<MoreBody>) -> Response {
 /// Reads the pages of key names that are due, one at a time, as the TUI's
 /// `read_names` does: only once the live connection is ready, with no analysis
 /// running and no report to show.
+///
+/// The reading runs in a task of its own, awaited here: when the request that started
+/// it goes (the browser closed it), the page in flight is still answered into the
+/// state, so the names never stay "reading".
 pub async fn read_names(app: &App) {
+    let app = app.clone();
+    let _ = tokio::spawn(async move { read_names_now(&app).await }).await;
+}
+
+async fn read_names_now(app: &App) {
     loop {
         let step = app
             .hub
@@ -551,7 +571,8 @@ fn body(c: &Current, sort: SortBy, node: Option<usize>) -> Result<serde_json::Va
             vec!["keys", "no_ttl", "name"]
         },
         "sizes": sizes,
-        "node": node,
+        // The node the rows are narrowed to: only an analysis's rows can be.
+        "node": node.filter(|_| source == "analysis"),
         "nodes": node_rows,
         "previous": s.previous.is_some() && s.report.is_some(),
         "partial": s.partial.as_deref().filter(|_| source == "partial").map(|p| serde_json::json!({

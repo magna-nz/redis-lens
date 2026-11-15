@@ -12,14 +12,14 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::browse::{Change, Sample};
-use super::{App, Body, Refused, error, off, ok};
+use super::{App, Body, Q, Refused, error, off, ok};
 use crate::analysis::{BIG_KEY_BYTES, KeyFacts, Severity, keys_to_check, length_unit, pattern_of};
 use crate::diff::ReportDiff;
 use crate::live::keys::{FactKey, Reply as KeysReply, Request as KeysRequest};
@@ -222,15 +222,40 @@ pub fn severity_name(s: Severity) -> &'static str {
     }
 }
 
+/// What [`read_facts`] has to do.
+enum FactsTodo {
+    /// Read them: the connection, the report, the requests by node, and the sender that
+    /// says when the read ended.
+    Read(
+        crate::tui::app::ConnId,
+        (i64, u64),
+        Vec<(Dest, Vec<FactKey>)>,
+        tokio::sync::watch::Sender<bool>,
+    ),
+    /// Another request reads them now: wait for it.
+    Wait(tokio::sync::watch::Receiver<bool>),
+}
+
 /// Reads Big keys' lengths and encodings for the session's report when they are
-/// missing, one request per node (each key on its slot's owner), as the TUI does.
+/// missing, one request per node (each key on its slot's owner), as the TUI does. Once
+/// per report: a request that comes while they are read waits for that read. The read
+/// runs in a task of its own, so it ends (and the next request does not wait for
+/// nothing) even when the request that started it goes. Overview's findings use the
+/// facts: an `overview` event goes out once they are in.
 async fn read_facts(app: &App) {
     let todo = app
         .hub
-        .with(|c| {
+        .with_mut(|c| {
             let r = c.session.report.as_ref()?;
             if facts_of(c).is_some() || !c.live_ready() {
                 return None;
+            }
+            let rid = report_id(r);
+            if let Some((at, rx)) = &c.browse.facts_reading
+                && *at == rid
+                && rx.has_changed().is_ok()
+            {
+                return Some(FactsTodo::Wait(rx.clone()));
             }
             let big: std::collections::HashSet<&str> =
                 r.big_keys().iter().map(|k| k.key.as_str()).collect();
@@ -243,12 +268,33 @@ async fn read_facts(app: &App) {
                 })
                 .collect();
             let groups = crate::tui::app::views::analysis::split_by_node(&c.session, keys);
-            Some((c.id, report_id(r), groups))
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            c.browse.facts_reading = Some((rid, rx));
+            Some(FactsTodo::Read(c.id, rid, groups, tx))
         })
         .flatten();
-    let Some((conn, rid, groups)) = todo else {
-        return;
-    };
+    match todo {
+        None => {}
+        Some(FactsTodo::Wait(mut rx)) => {
+            let _ = rx.wait_for(|done| *done).await;
+        }
+        Some(FactsTodo::Read(conn, rid, groups, tx)) => {
+            let app = app.clone();
+            let _ = tokio::spawn(async move {
+                read_facts_now(&app, conn, rid, groups).await;
+                let _ = tx.send(true);
+            })
+            .await;
+        }
+    }
+}
+
+async fn read_facts_now(
+    app: &App,
+    conn: crate::tui::app::ConnId,
+    rid: (i64, u64),
+    groups: Vec<(Dest, Vec<FactKey>)>,
+) {
     let mut facts = Facts {
         report: rid,
         ..Facts::default()
@@ -266,6 +312,7 @@ async fn read_facts(app: &App) {
         .buffer_unordered(AT_ONCE)
         .collect()
         .await;
+    let mut closed = false;
     for a in answers {
         match a {
             Ok(LiveReply::Keys(KeysReply::Facts { facts: f, refused })) => {
@@ -277,7 +324,7 @@ async fn read_facts(app: &App) {
                 }
             }
             Ok(_) => {}
-            Err(LiveError::Closed) => return,
+            Err(LiveError::Closed) => closed = true,
             Err(e) => {
                 if facts.error.is_none() {
                     facts.error = Some(format!("Could not read the lengths: {e}."));
@@ -285,12 +332,24 @@ async fn read_facts(app: &App) {
             }
         }
     }
-    app.hub.with_mut(|c| {
+    let stored = app.hub.with_mut(|c| {
+        if c.browse
+            .facts_reading
+            .as_ref()
+            .is_some_and(|(at, _)| *at == rid)
+        {
+            c.browse.facts_reading = None;
+        }
+        // A closed connection read nothing: the next request reads them again.
         let same = c.id == conn && c.session.report.as_ref().map(report_id) == Some(rid);
-        if same {
+        if same && !closed {
             c.browse.facts = Some(facts);
         }
+        same && !closed
     });
+    if stored == Some(true) {
+        app.hub.emit_overview_if_changed();
+    }
 }
 
 /// `GET /api/analysis/big_keys`: the report's biggest sampled keys, with their lengths
@@ -646,7 +705,7 @@ pub const BAD_ORDER: &str = "the order must be one of keys, cpu, net_in or net_o
 /// node's slot ranges (at most four nodes at once), the hottest slots by `order`, and
 /// the sampled keys in each. Read once per run. Off on a standalone server, on a
 /// version without the command, or when it is refused.
-pub async fn slots(State(app): State<App>, Query(q): Query<SlotsQuery>) -> Response {
+pub async fn slots(State(app): State<App>, Q(q): Q<SlotsQuery>) -> Response {
     let order = match q.order.as_deref().map(order_of) {
         None => Order::Keys,
         Some(Some(o)) => o,

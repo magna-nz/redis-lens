@@ -10,16 +10,18 @@
 //! when the list opens; every next one when the page asks.
 //!
 //! Lists are kept server side, at most [`KEPT`] of them (the oldest goes first), each
-//! named by its `list` number.
+//! named by its `list` number; no more pages are read once one holds [`MAX_ROWS`] keys.
+//! The first page's reply holds every row; a next page's holds only the rows it added
+//! (from `new_from`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
-use super::{App, Refused, error, ok};
+use super::{App, Q, Refused, error, ok};
 use crate::live::keys::{KeyRow, PAGE_KEYS, Page, Reply, Request, find_glob, find_refusal};
 use crate::live::{Dest, Follow, LiveError, LiveReply, LiveRequest};
 use crate::model::{PERM_FREQ, PERM_MEMORY, PermStatus, Ttl};
@@ -29,6 +31,8 @@ use crate::web::keyname::{self, Name};
 
 /// Key lists kept at once.
 pub const KEPT: usize = 16;
+/// Once a list holds this many keys, no more of its pages are read.
+pub const MAX_ROWS: usize = 50_000;
 
 /// Why a find was refused.
 pub const EMPTY_FIND: &str = "Type a name or a pattern to find.";
@@ -36,6 +40,7 @@ pub const NO_LIST: &str =
     "That key list is gone (a newer one replaced it, or the session changed): open it again.";
 pub const LIST_DONE: &str = "Every key of this list is loaded.";
 pub const LOADING: &str = "This list is loading a page already: wait for it.";
+pub const LIST_FULL: &str = "This list holds 50,000 keys or more, so no more are loaded. Find a narrower name to see others.";
 
 /// One key list.
 #[derive(Debug, Default)]
@@ -155,6 +160,22 @@ impl KeyList {
         next
     }
 
+    /// Why `GET /api/keys/more` reads no next page now (`live`: the live connection is
+    /// ready), or `None` when it does.
+    fn more_refused(&self, live: bool) -> Option<&'static str> {
+        if self.loading {
+            Some(LOADING)
+        } else if self.done {
+            Some(LIST_DONE)
+        } else if self.rows.len() >= MAX_ROWS {
+            Some(LIST_FULL)
+        } else if !live {
+            Some(super::NOT_LIVE)
+        } else {
+            None
+        }
+    }
+
     fn failed(&mut self, e: &LiveError) {
         self.loading_node = None;
         self.error = Some(if self.find.is_some() {
@@ -196,6 +217,14 @@ impl Lists {
             .find_map(|l| l.rows.iter().find(|r| r.key == key).cloned())
     }
 
+    /// Tests: whether list `id` is loading a page; `None` when there is no such list.
+    #[cfg(test)]
+    pub(crate) fn loading_of(&self, id: u64) -> Option<bool> {
+        self.lists.iter().find(|l| l.id == id).map(|l| l.loading)
+    }
+
+    /// Drops every list (a database switch). The numbers go on from where they were:
+    /// one from before never names a list opened after.
     pub fn clear(&mut self) {
         self.lists.clear();
     }
@@ -220,7 +249,7 @@ pub struct MoreQuery {
 }
 
 /// `GET /api/keys?pattern=<id>[&node=<i>]`: the keys of a pattern, first page.
-pub async fn open(State(app): State<App>, Query(q): Query<OpenQuery>) -> Response {
+pub async fn open(State(app): State<App>, Q(q): Q<OpenQuery>) -> Response {
     let pattern = match keyname::decode(&q.pattern) {
         Ok(p) => p,
         Err(r) => return r.into_response(),
@@ -267,21 +296,22 @@ pub const NO_NODE: &str = "That node is not one of this analysis's nodes.";
 /// `GET /api/find?q=<text>`: the keys of the whole server whose names match `text`
 /// (the TUI's Find key: text with `*`, `?` or `[` is a glob, any other text means
 /// "contains"), first page.
-pub async fn find(State(app): State<App>, Query(q): Query<FindQuery>) -> Response {
+pub async fn find(State(app): State<App>, Q(q): Q<FindQuery>) -> Response {
     let text = find_text(&q.q);
     if text.is_empty() {
         return error(StatusCode::BAD_REQUEST, EMPTY_FIND);
     }
-    if let Some(why) = find_refusal(&text) {
-        return error(StatusCode::UNPROCESSABLE_ENTITY, &why);
-    }
     let made = app.hub.with_mut(|c| {
+        // The live state first, then the glob, as the TUI checks them.
         match &c.session.live {
             _ if c.live_ready() => {}
             crate::tui::app::views::LiveState::Closed(_) => {
                 return Err(Refused::new(StatusCode::CONFLICT, FIND_CLOSED));
             }
             _ => return Err(Refused::new(StatusCode::CONFLICT, FIND_NOT_YET)),
+        }
+        if let Some(why) = find_refusal(&text) {
+            return Err(Refused::new(StatusCode::UNPROCESSABLE_ENTITY, why));
         }
         let nodes = &c.session.nodes;
         let (walk, missing) = (0..nodes.len()).partition(|&i| nodes[i].connected);
@@ -319,21 +349,15 @@ pub fn find_text(raw: &str) -> String {
 }
 
 /// `GET /api/keys/more?list=<n>`: the next page of a list.
-pub async fn more(State(app): State<App>, Query(q): Query<MoreQuery>) -> Response {
+pub async fn more(State(app): State<App>, Q(q): Q<MoreQuery>) -> Response {
     let ready = app.hub.with_mut(|c| {
         let conn = c.id;
         let live = c.live_ready();
         let Some(l) = c.browse.lists.get_mut(q.list).filter(|l| l.conn == conn) else {
             return Err(Refused::new(StatusCode::NOT_FOUND, NO_LIST));
         };
-        if l.loading {
-            return Err(Refused::new(StatusCode::CONFLICT, LOADING));
-        }
-        if l.done {
-            return Err(Refused::new(StatusCode::CONFLICT, LIST_DONE));
-        }
-        if !live {
-            return Err(Refused::new(StatusCode::CONFLICT, super::NOT_LIVE));
+        if let Some(why) = l.more_refused(live) {
+            return Err(Refused::new(StatusCode::CONFLICT, why));
         }
         l.page_rows = 0;
         l.new_from = l.rows.len();
@@ -373,9 +397,7 @@ async fn finish(app: &App, made: Option<Result<u64, Refused>>) -> Response {
         Some(Err(r)) => return r.into_response(),
         Some(Ok(id)) => id,
     };
-    if let Err(r) = load_page(app, id).await {
-        return r.into_response();
-    }
+    load_page(app, id).await;
     match app.hub.with(|c| list_body(c, id)).flatten() {
         Some(b) => ok(b),
         None => error(StatusCode::NOT_FOUND, NO_LIST),
@@ -384,7 +406,16 @@ async fn finish(app: &App, made: Option<Result<u64, Refused>>) -> Response {
 
 /// Reads one page of list `id`, going on to the next node of a cluster while the page
 /// is not full, as the TUI does.
-async fn load_page(app: &App, id: u64) -> Result<(), Refused> {
+///
+/// The page is read in a task of its own, awaited here: when the request that asked
+/// goes (the browser closed it), the page still lands in the list, which never stays
+/// loading.
+async fn load_page(app: &App, id: u64) {
+    let app = app.clone();
+    let _ = tokio::spawn(async move { load_page_now(&app, id).await }).await;
+}
+
+async fn load_page_now(app: &App, id: u64) {
     loop {
         let step = app
             .hub
@@ -400,7 +431,7 @@ async fn load_page(app: &App, id: u64) -> Result<(), Refused> {
             })
             .flatten();
         let Some((conn, dest, req)) = step else {
-            return Ok(());
+            return;
         };
         let result = app.hub.request(Some(conn), dest, req).await;
         let again = app
@@ -419,7 +450,7 @@ async fn load_page(app: &App, id: u64) -> Result<(), Refused> {
             })
             .flatten();
         if again != Some(true) {
-            return Ok(());
+            return;
         }
     }
 }
@@ -477,11 +508,14 @@ pub fn ttl_secs(t: Ttl) -> Option<u64> {
     }
 }
 
-/// The body of a list: every row loaded so far.
+/// The body of a list: the rows the last page added (every row, after the first
+/// page), from `new_from` on.
 fn list_body(c: &crate::web::session::Current, id: u64) -> Option<serde_json::Value> {
     let l = c.browse.lists.lists.iter().find(|l| l.id == id)?;
     let rows: Vec<KeyDto> = l
         .rows
+        .get(l.new_from..)
+        .unwrap_or_default()
         .iter()
         .map(|r| KeyDto::of(r, l.row_node.get(&r.key).copied()))
         .collect();
@@ -523,6 +557,8 @@ fn list_body(c: &crate::web::session::Current, id: u64) -> Option<serde_json::Va
         "lfu": l.lfu,
         "freq": l.freq,
         "page_keys": PAGE_KEYS,
+        "capped": l.rows.len() >= MAX_ROWS,
+        "max_rows": MAX_ROWS,
         "cluster": l.by_node().then(|| serde_json::json!({
             "walk": l.walk,
             "missing": l.missing.iter().filter_map(node).collect::<Vec<_>>(),
@@ -614,6 +650,35 @@ mod tests {
         assert!(l.done);
         assert_eq!(l.row_node.get("x2"), Some(&2));
         assert_eq!(l.nodes_done, 2);
+    }
+
+    #[test]
+    fn a_full_list_reads_no_more_and_says_why() {
+        let mut l = KeyList {
+            pattern: Some("cart:{id}".into()),
+            ..KeyList::default()
+        };
+        assert_eq!(l.more_refused(true), None);
+        assert_eq!(l.more_refused(false), Some(super::super::NOT_LIVE));
+        l.rows = (0..MAX_ROWS).map(|i| row(&format!("cart:{i}"))).collect();
+        assert_eq!(l.more_refused(true), Some(LIST_FULL));
+        l.loading = true;
+        assert_eq!(l.more_refused(true), Some(LOADING));
+        for t in [LIST_FULL, LOADING, LIST_DONE, NO_LIST, EMPTY_FIND, NO_NODE] {
+            assert_eq!(crate::web::wording::banned(t), None, "{t}");
+            assert_eq!(crate::web::wording::server_free(t), t, "{t}");
+        }
+    }
+
+    /// Small 2: a database switch drops the lists, but the numbers go on, so a list
+    /// number from before never names one of the new database.
+    #[test]
+    fn list_numbers_go_on_after_a_database_switch() {
+        let mut b = crate::web::api::browse::Browse::default();
+        let first = b.lists.add(KeyList::default());
+        b.new_run(true);
+        assert!(b.lists.get_mut(first).is_none());
+        assert!(b.lists.add(KeyList::default()) > first);
     }
 
     #[test]
