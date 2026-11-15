@@ -42,7 +42,10 @@ test('before a connect: idle, the saved connections and the Docker containers', 
   assert.deepEqual(list.profiles.map((p) => p.name), ['prod-cache-01', 'staging-cache', 'demo-cluster', 'limited-user']);
   assert.equal(list.connected, null);
   assert.equal(list.profiles[0].readOnly, true, 'production is read-only by default');
-  assert.deepEqual((await api.listDocker()).containers.map((p) => [p.name, p.docker]), [['demo-redis', true], ['demo-valkey', true]]);
+  assert.deepEqual((await api.listDocker()).containers.map((p) => [p.name, p.docker]), [['demo-redis', true], ['demo-valkey', true], ['legacy-redis', true]]);
+  assert.equal(state.live, true);
+  assert.equal(state.polling.intervalSecs, 2, 'the figures are read every 2 s to start with');
+  assert.deepEqual(state.monitorLimits, { maxLines: 10000, maxSecs: 30 }, 'known before a run starts');
   await assert.rejects(api.getClients(), (err) => err.notLive === true);
   await assert.rejects(api.getOverview(), (err) => err.status === 409);
 });
@@ -60,6 +63,7 @@ test('connect goes through connecting to connected, then the live connection is 
   assert.equal(overview.keys.total, 7920114);
   assert.equal(overview.shards.length, 0, 'no shard rows on a standalone server');
   assert.ok(overview.lastAnalysis, 'this profile has a saved analysis');
+  assert.deepEqual(overview.findings.map((f) => [f.severity, f.where, f.label]), [['note', 'slowlog', 'Server › Slow log'], ['warn', 'clients', 'Server › Clients']]);
   assert.equal((await api.listConnections()).connected, 'prod-cache-01');
 });
 
@@ -81,10 +85,48 @@ test('a connect to a closed port fails, in the server\'s words, and can be disco
   assert.equal((await api.disconnect()).status, 'idle');
 });
 
+test('a connect that cannot authenticate ends failed, never connected', async () => {
+  const { api } = mockApi();
+  const states = [];
+  api.on('state', (s) => states.push(s));
+  api.start();
+  await api.connect({ docker: 'legacy-redis' });
+  await wait(900);
+  api.stop();
+  const last = states[states.length - 1];
+  assert.equal(last.status, 'failed');
+  assert.equal(last.connected, false);
+  assert.match(last.failed, /^the server asks for a password, and this connection has none/);
+  assert.equal(states.some((s) => s.connected), false);
+});
+
+test('pausing stops the figures; the interval spaces them; both are in the state for every tab', async () => {
+  const { api } = mockApi();
+  const figures = [];
+  const states = [];
+  api.on('figures', (f) => figures.push(f));
+  await connected(api, { name: 'staging-cache' });
+  api.on('state', (s) => states.push(s));
+  assert.deepEqual(await api.setPolling({ paused: true }), { paused: true, intervalSecs: 2, intervals: [1, 2, 3, 5, 10, 15, 30, 60] });
+  await wait(100);
+  const before = figures.length;
+  await wait(2300);
+  assert.equal(figures.length, before, 'paused: no figures arrive');
+  assert.equal(states[states.length - 1].live, false);
+  const fast = await api.setPolling({ paused: false, intervalSecs: 1 });
+  assert.equal(fast.intervalSecs, 1);
+  await wait(2300);
+  api.stop();
+  assert.ok(figures.length - before >= 2, 'every second again');
+  assert.equal(states[states.length - 1].polling.intervalSecs, 1);
+  await assert.rejects(api.setPolling({ intervalSecs: 4 }), (err) => err.status === 422 && /must be one of/.test(err.message));
+});
+
 test('live figures arrive as events: no rate on the first poll, rates after', async () => {
   const { api } = mockApi();
   const figures = [];
   api.on('figures', (f) => figures.push(f));
+  await api.setPolling({ intervalSecs: 1 });
   await connected(api, { name: 'staging-cache' });
   await wait(2300);
   api.stop();
@@ -112,6 +154,19 @@ test('a cluster has nodes, shard rows and a picked node that can be changed', as
   api.stop();
 });
 
+test('the slow log says why its settings are missing in every reading, not only the first', async () => {
+  const { api } = mockApi();
+  await connected(api, { name: 'staging-cache' });
+  for (let i = 0; i < 2; i += 1) {
+    const slow = await api.getSlowlog();
+    assert.equal(slow.off, null);
+    assert.equal(slow.settings, null);
+    assert.equal(slow.settingsOff, 'the server refused CONFIG GET for this user');
+    assert.ok(slow.entries.length > 0);
+  }
+  api.stop();
+});
+
 test('a limited user: panels are off with the reason, and nothing is invented', async () => {
   const { api } = mockApi();
   await connected(api, { name: 'limited-user' });
@@ -128,6 +183,7 @@ test('a limited user: panels are off with the reason, and nothing is invented', 
   const result = await api.testConnection('limited-user');
   assert.equal(result.ok, false);
   // A refused subscribe and a refused MONITOR are told as events.
+  api.setConfirmHandler(async (c) => ({ typed: c.expect }));
   const events = [];
   api.on('tail', (e) => events.push(`tail ${e.kind} ${e.error || ''}`));
   api.on('monitor', (e) => events.push(`monitor ${e.kind} ${e.stopped || ''}`));
@@ -191,6 +247,34 @@ test('a destructive command asks; Cancel sends nothing; a question can be answer
   await assert.rejects(backend.answerConfirm(question, ''), (err) => err.status === 410);
 });
 
+test('the writes switch of the session: off at once, on after a question; a container for the session only', async () => {
+  const { api } = mockApi();
+  const states = [];
+  await connected(api, { name: 'staging-cache' });
+  api.on('state', (s) => states.push(s));
+  api.setConfirmHandler(async () => assert.fail('turning writes off never asks'));
+  const off = await api.setSessionWrites(false);
+  assert.equal(off.profile.readOnly, true);
+  assert.match(off.message, /^Writes are off for staging-cache/);
+  await wait(50);
+  assert.equal(states[states.length - 1].conn.readOnly, true, 'the state follows');
+  assert.match((await api.runCommand('SET a b')).text, /read-only\. Turn writes on in Connections\.$/);
+  let asked = null;
+  api.setConfirmHandler(async (c) => { asked = c; return { typed: '' }; });
+  assert.equal((await api.setSessionWrites(true)).profile.readOnly, false);
+  assert.equal(asked.kind, 'ask');
+  assert.equal((await api.listConnections()).profiles.find((p) => p.name === 'staging-cache').readOnly, false, 'a saved connection is saved');
+
+  await connected(api, { docker: 'demo-valkey' });
+  api.setConfirmHandler(async () => assert.fail('turning writes off never asks'));
+  const container = await api.setSessionWrites(false);
+  assert.match(container.message, /in this session only/);
+  assert.equal(container.profile.readOnly, true);
+  api.stop();
+  await api.disconnect();
+  await assert.rejects(api.setSessionWrites(true), (err) => err.status === 409);
+});
+
 test('the command line: views, a repeat, an error reply, refusals and masking', async () => {
   const { api } = mockApi();
   await connected(api, { name: 'staging-cache' });
@@ -247,12 +331,38 @@ test('the tail: ready, then messages; a published message arrives; stop closes i
   await assert.rejects(api.subscribe({ name: 'a*', kind: 'shard' }), (err) => err.status === 422);
 });
 
+test('Monitor always asks first: yes or no, or the name typed on production; Cancel starts nothing', async () => {
+  const { api } = mockApi();
+  await connected(api, { name: 'prod-cache-01' });
+  const events = [];
+  api.on('monitor', (e) => events.push(e));
+  api.setConfirmHandler(async () => null);
+  await assert.rejects(api.startMonitor(), (err) => err.cancelled === true);
+  let asked = null;
+  api.setConfirmHandler(async (c) => { asked = c; return { typed: 'prod-cache-1' }; });
+  await assert.rejects(api.startMonitor(), (err) => err.status === 422 && err.message === 'MONITOR not started: the name typed did not match.');
+  assert.equal(asked.kind, 'type', 'a read-only production connection is asked too, by name');
+  assert.equal(asked.expect, 'prod-cache-01');
+  assert.match(asked.text, /It stops after 30 s or 10,000 lines\./);
+  await wait(400);
+  assert.deepEqual(events, [], 'nothing started');
+  api.setConfirmHandler(async (c) => ({ typed: c.expect }));
+  const run = await api.startMonitor();
+  assert.equal(typeof run.run, 'number');
+  await assert.rejects(api.startMonitor(), (err) => err.status === 422 && /already running/.test(err.message));
+  await api.stopMonitor();
+  api.stop();
+});
+
 test('Monitor: ready with its limits, lines, then stopped', async () => {
   const { api } = mockApi();
   await connected(api, { name: 'staging-cache' });
   const events = [];
   api.on('monitor', (e) => events.push(e));
+  let asked = null;
+  api.setConfirmHandler(async (c) => { asked = c; return { typed: '' }; });
   const run = await api.startMonitor();
+  assert.equal(asked.kind, 'ask');
   assert.deepEqual([run.maxSecs, run.maxLines], [30, 10000]);
   await wait(1500);
   assert.deepEqual(await api.stopMonitor(), { stopped: true });
@@ -326,6 +436,8 @@ test('like the real server, the mock refuses a body with a field it does not kno
   assert.equal(await post('/api/connections', { name: 'a', url: 'redis://h', token_command_confirmed: true }), 400);
   assert.equal(await post('/api/connect', { name: 'prod-cache-01', extra: 1 }), 400);
   assert.equal(await post('/api/connect', { name: 'prod-cache-01', docker: 'demo-redis' }), 400);
+  assert.equal(await post('/api/polling', { live: false }), 400);
+  assert.equal(await post('/api/session/writes', { writes: true }), 400);
   assert.equal((await server.fetchFn('/api/connections/prod-cache-01', { method: 'PATCH', body: JSON.stringify({ env: 'stage' }) })).status, 400);
 });
 
@@ -333,7 +445,16 @@ test('removing a connection; a Docker container connects by its name', async () 
   const { api } = mockApi();
   assert.deepEqual(await api.removeConnection('staging-cache'), { message: 'Removed staging-cache.' });
   assert.equal((await api.listConnections()).profiles.some((p) => p.name === 'staging-cache'), false);
-  await assert.rejects(api.removeConnection('staging-cache'), /no profile named/);
+  await assert.rejects(api.removeConnection('staging-cache'), (err) => err.status === 404 && err.message === 'there is no saved connection by that name');
+  // Removing the connection the session is on closes it: no disconnect is needed.
+  const during = await connected(api, { name: 'prod-cache-01' });
+  assert.equal(during[during.length - 1].connected, true);
+  const after = [];
+  api.on('state', (s) => after.push(s));
+  await api.removeConnection('prod-cache-01');
+  await wait(50);
+  assert.equal(after[after.length - 1].status, 'idle');
+  assert.equal((await api.getState()).conn, null);
   const states = await connected(api, { docker: 'demo-valkey' });
   api.stop();
   const conn = states[states.length - 1].conn;

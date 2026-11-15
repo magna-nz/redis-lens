@@ -163,6 +163,12 @@ export function mount(root, ctx) {
       p.providerNotice ? notice(p.providerNotice) : null,
       h('div', { class: 'conn-actions' },
         main,
+        p.docker && here && conn ? h('div', { class: 'conn-more' },
+          h('button', {
+            type: 'button', class: 'btn quiet', text: conn.readOnly ? 'Turn writes on' : 'Turn writes off',
+            'aria-label': `${conn.readOnly ? 'Turn writes on' : 'Turn writes off'} for ${p.name}, for this session`,
+            onclick: () => sessionWrites(conn.readOnly),
+          })) : null,
         p.docker ? null : h('div', { class: 'conn-more' },
           h('button', { type: 'button', class: 'btn quiet', text: 'Test', 'aria-label': `Test ${p.name}`, onclick: () => testDialog(ctx, p) }),
           h('button', { type: 'button', class: 'btn quiet', text: 'Edit', 'aria-label': `Edit ${p.name}`, onclick: () => editDialog(ctx, p, load) }),
@@ -173,6 +179,18 @@ export function mount(root, ctx) {
     button.disabled = true;
     button.textContent = 'Connecting…';
     ctx.connect(p.docker ? { docker: p.container } : { name: p.name });
+  }
+
+  /** A container has no saved profile: its writes switch is the session's. */
+  async function sessionWrites(on) {
+    try {
+      const done = await ctx.api.setSessionWrites(on);
+      ctx.notify(done.message || (on ? 'Writes are on for this session.' : 'Writes are off for this session.'), 'ok');
+    } catch (err) {
+      ctx.notify(errorText(err), err.cancelled ? 'info' : 'error');
+    }
+    if (alive) load();
+    if (alive) loadDocker();
   }
 
   async function disconnect() {
@@ -190,12 +208,9 @@ export function mount(root, ctx) {
     });
     if (!answer) return;
     try {
+      // Removing the connection the session is on closes it: the state goes back to idle.
       const done = await ctx.api.removeConnection(p.name);
       ctx.notify(done.message || `Removed ${p.name}.`, 'ok');
-      // A removed connection must not stay open (or stay shown as failed): close it when
-      // it is this one. The new state draws this screen again, without it.
-      const c = ctx.state().conn;
-      if (c && !c.docker && c.name === p.name) await ctx.api.disconnect();
     } catch (err) {
       ctx.notify(errorText(err), err.cancelled ? 'info' : 'error');
     }
@@ -285,18 +300,38 @@ function editDialog(ctx, p, reload) {
           }
           save.disabled = true;
           error.textContent = '';
+          let savedPart = false;
           try {
-            const done = await ctx.api.updateConnection(p.name, changes);
-            ctx.notify(done.message || `Saved ${p.name}.`, 'ok');
+            // The writes of the connection the session is on are the session's switch (the
+            // TUI's w); everything else, and any other connection, is the saved profile's.
+            const c = ctx.state().conn;
+            const mine = !!c && !c.docker && c.name === p.name;
+            const { writes: wanted, ...rest } = changes;
+            const saved = mine ? rest : changes;
+            let message = null;
+            if (saved.addTags.length || saved.removeTags.length || saved.writes !== undefined || saved.standalone !== undefined) {
+              message = (await ctx.api.updateConnection(p.name, saved)).message;
+              savedPart = true;
+            }
+            if (mine && wanted !== undefined) message = (await ctx.api.setSessionWrites(wanted)).message;
+            ctx.notify(message || `Saved ${p.name}.`, 'ok');
             close(true);
             reload();
           } catch (err) {
+            // The tags or the standalone switch may be saved already while the writes
+            // question was cancelled or refused: say so, and show the card as it now is.
+            if (savedPart) {
+              ctx.notify(`Saved ${p.name}, but not its writes: ${errorText(err)}`, err.cancelled ? 'info' : 'error');
+              close(true);
+              reload();
+              return;
+            }
             error.textContent = errorText(err);
             save.disabled = false;
           }
         },
       },
-      h('p', { class: 'muted' }, 'Environment ', envBadge(p.env), ' and the address are set when a connection is added. To change them, add it again.'),
+      h('p', { class: 'muted' }, 'Environment ', envBadge(p.env), ' To change the environment, add the connection again with Replace ticked.'),
       h('div', { class: 'form-row' }, h('label', { htmlFor: tagsId, text: 'Tags' }), tags, h('p', { class: 'hint', text: 'Separate tags with commas.' })),
       h('div', { class: 'form-row' },
         h('div', { class: 'switch' }, writes, h('label', { htmlFor: writesId, text: 'Allow writes' })),
@@ -389,7 +424,7 @@ function addDialog(ctx, reload) {
       const entra = features.entraId ? checkbox('entra', 'Sign in with Microsoft Entra ID', 'Uses your developer tools (az login). No password is stored.') : null;
       const preferReplica = checkbox('preferReplica', 'Prefer a replica', 'An analysis reads a verified replica when there is one.');
       const standalone = checkbox('standalone', 'Force standalone', 'Read a cluster node as a single server.');
-      const force = checkbox('force', 'Replace a saved connection of the same name', 'Without this, a name that is already saved is refused.');
+      const force = checkbox('force', 'Replace', 'Overwrite a saved connection of the same name. Without this, a name that is already saved is refused.');
 
       // A message under a box goes as soon as the box is changed.
       for (const { el, err } of errors.values()) {

@@ -7,7 +7,7 @@ import {
   ROUTES, METHODS, SIGN_IN, DOCKER_SIGN_IN, TEXT, addRequest, updateRequest, fmtSlots, adaptState, adaptConnections, adaptDocker,
   adaptTestResult, adaptAdded, adaptUpdated, adaptOverview, adaptFigures, adaptClients, adaptSlowlog, adaptMonitorRun, adaptMonitorEvent,
   adaptChannels, adaptSubscription, adaptTailEvent, adaptPublished, adaptReply, adaptNames, adaptHelp, adaptConfirm, adaptNotice,
-  adaptError, wantsMock, createReal,
+  adaptError, adaptPolling, pollingRequest, adaptSessionWrites, adaptFinding, wantsMock, createReal,
 } from '../api.js';
 
 const CONNECTION = {
@@ -18,7 +18,9 @@ const CONNECTION = {
 const SERVER = { flavor: 'redis', keys: 85963, lfu: true, maxmemory: 805306368, mode: 'standalone', policy: 'allkeys-lfu', used_memory: 218425448, version: '7.4.12' };
 const IDLE = {
   connected_at_unix: null, connection: null, docker: false, error: null, features: { entra_id: false, version: '0.1.0' }, live: 'waiting', live_error: null,
-  monitor: null, nodes: [], picked: 0, refused: [], sentinel: null, server: null, status: 'idle', tail: null, target: null, writes: false, writes_off: null,
+  monitor: null, monitor_limits: { max_lines: 10000, max_secs: 30 }, nodes: [], picked: 0,
+  polling: { interval_secs: 2, intervals: [1, 2, 3, 5, 10, 15, 30, 60], paused: false },
+  refused: [], sentinel: null, server: null, status: 'idle', tail: null, target: null, writes: false, writes_off: null,
 };
 const CONNECTED = { ...IDLE, connected_at_unix: 1794725725, connection: CONNECTION, live: 'ready', refused: ['SET'], server: SERVER, status: 'connected', target: 'primary', writes: true };
 
@@ -51,7 +53,6 @@ test('state: connected, with what the server is and the writes it refused', () =
   assert.deepEqual(c.tags, ['team-a']);
   assert.equal(c.signIn, SIGN_IN.keychain);
   assert.equal(c.pickedNode, null, 'no node picker on a standalone server');
-  assert.equal(c.monitorSeconds, 30);
   assert.equal(c.connectedAt, 1794725725);
   assert.equal(c.docker, false);
 });
@@ -68,6 +69,47 @@ test('state: connecting, failed, and a closed live connection', () => {
   assert.equal(adaptState({ ...CONNECTED, live: 'closed' }).lost, 'The live connection is closed.');
   assert.equal(adaptState({ ...CONNECTED, live: 'closed', live_error: 'the connection to the server was lost' }).lost, 'The live connection is closed: the connection to the server was lost');
   assert.equal(adaptState({ ...CONNECTED, live: 'waiting' }).lost, null);
+});
+
+test('state: how the live figures are polled, and when a Monitor run stops by itself', () => {
+  const s = adaptState(IDLE);
+  assert.deepEqual(s.polling, { paused: false, intervalSecs: 2, intervals: [1, 2, 3, 5, 10, 15, 30, 60] });
+  assert.equal(s.live, true);
+  assert.deepEqual(s.monitorLimits, { maxLines: 10000, maxSecs: 30 });
+  const paused = adaptState({ ...CONNECTED, polling: { interval_secs: 5, intervals: [1, 2, 3, 5, 10, 15, 30, 60], paused: true }, monitor_limits: { max_lines: 500, max_secs: 10 } });
+  assert.equal(paused.live, false);
+  assert.equal(paused.polling.intervalSecs, 5);
+  assert.deepEqual(paused.monitorLimits, { maxLines: 500, maxSecs: 10 });
+  assert.equal('monitorSeconds' in paused.conn, false, 'the limits are the state\'s, not the connection\'s');
+  const old = adaptState({ status: 'idle' });
+  assert.deepEqual(old.polling, { paused: false, intervalSecs: 2, intervals: [1, 2, 3, 5, 10, 15, 30, 60] }, 'a reply without it falls back to the defaults');
+  assert.deepEqual(old.monitorLimits, { maxLines: 10000, maxSecs: 30 });
+});
+
+test('state: a connect that cannot authenticate is failed, with the server\'s fixed reason', () => {
+  const s = adaptState({ ...IDLE, connection: { ...CONNECTION, name: 'locked', auth: 'none' }, status: 'failed', live: 'closed', error: 'the server asks for a password, and this connection has none: add the connection again with its password' });
+  assert.equal(s.connected, false);
+  assert.match(s.failed, /^the server asks for a password/);
+  assert.equal(s.lost, null, 'a failed connect is not a lost connection');
+});
+
+test('polling: the reply and the request', () => {
+  assert.deepEqual(adaptPolling({ interval_secs: 5, intervals: [1, 2, 3], paused: true }), { paused: true, intervalSecs: 5, intervals: [1, 2, 3] });
+  assert.deepEqual(pollingRequest({ paused: true }), { paused: true });
+  assert.deepEqual(pollingRequest({ intervalSecs: '10' }), { interval_secs: 10 });
+  assert.deepEqual(pollingRequest({ paused: false, intervalSecs: 1 }), { paused: false, interval_secs: 1 });
+  assert.deepEqual(pollingRequest({}), {});
+});
+
+test('session writes: a saved connection answers with it, a container with the state', () => {
+  const saved = adaptSessionWrites({ connection: { ...CONNECTION, read_only: true, writes: false }, message: 'Writes are off for demo-redis: it is read-only.' });
+  assert.equal(saved.profile.readOnly, true);
+  assert.equal(saved.message, 'Writes are off for demo-redis: it is read-only.');
+  const container = adaptSessionWrites({ message: 'Writes are on for redis-lens-demo-valkey-1 in this session only (a container has no saved profile).', state: { ...CONNECTED, docker: true, connection: { ...CONNECTION, name: 'redis-lens-demo-valkey-1' } } });
+  assert.equal(container.profile.name, 'redis-lens-demo-valkey-1');
+  assert.equal(container.profile.readOnly, false);
+  assert.match(container.message, /in this session only/);
+  assert.deepEqual(adaptSessionWrites({}), { profile: null, message: null });
 });
 
 test('state: a read-only connection says why writes are off', () => {
@@ -280,7 +322,9 @@ const OVERVIEW = {
     gaps: ['This server has no INFO keysizes (Redis 8 and later have it), so there is no exact size histogram', 'MEMORY STATS is denied for this user (ACL +memory|stats), so dataset.bytes is missing'],
     keys: 85963, overhead_bytes: null, server: SERVER, ttl_share: 0.8330444493561183, with_ttl: 71611,
   },
-  figures_failed: null, last_analysis: null, live: null,
+  figures_failed: null,
+  findings: [{ area: 'Server', panel: 'Slow log', screen: 'slow_log', severity: 'note', text: 'EVAL took 1.3 s at 06:52 UTC.' }],
+  last_analysis: null, live: null,
   perms: [
     { label: 'SCAN', reason: null, status: 'allowed' },
     { label: 'MEMORY STATS', reason: 'NOPERM MEMORY STATS is not allowed for this user', status: 'denied' },
@@ -303,6 +347,18 @@ test('overview: as captured from the demo Redis', () => {
   assert.equal(o.figures, null);
   assert.equal(o.lastAnalysis, null);
   assert.deepEqual(o.shards, []);
+  assert.deepEqual(o.findings, [{ text: 'EVAL took 1.3 s at 06:52 UTC.', severity: 'note', screen: 'slow_log', label: 'Server › Slow log', where: 'slowlog' }]);
+});
+
+test('findings: the server\'s words; a link only to a panel this page has', () => {
+  assert.deepEqual(adaptFinding({ area: 'Server', panel: 'Clients', screen: 'clients', severity: 'warn', text: '212 connections from 10.0.9.17 idle for over an hour.' }),
+    { text: '212 connections from 10.0.9.17 idle for over an hour.', severity: 'warn', screen: 'clients', label: 'Server › Clients', where: 'clients' });
+  const big = adaptFinding({ area: 'Analyze', panel: 'Big keys', screen: 'big_keys', severity: 'warn', text: '3 big keys, counted by the server (INFO keysizes).' });
+  assert.equal(big.where, null, 'Analyze arrives later: named, not linked');
+  assert.equal(big.label, 'Analyze › Big keys');
+  assert.equal(adaptFinding({ text: 'x', severity: 'loud' }).severity, 'note');
+  assert.deepEqual(adaptOverview({ ...OVERVIEW, findings: [{ text: '' }, { text: 'kept', screen: 'slow_log' }] }).findings.map((f) => f.text), ['kept']);
+  assert.deepEqual(adaptOverview({ ...OVERVIEW, findings: undefined }).findings, []);
 });
 
 test('overview: a failed connect, a provider, a last analysis, live figures', () => {
@@ -512,7 +568,8 @@ test('routes: as docs/dashboard-api.md lists them, with names escaped into the p
   assert.deepEqual(ROUTES.commandHelp('config|get'), ['GET', '/api/cmdline/help?name=config%7Cget']);
   assert.deepEqual(ROUTES.update('demo redis/x'), ['PATCH', '/api/connections/demo%20redis%2Fx']);
   assert.deepEqual(ROUTES.confirm('../state'), ['POST', '/api/confirm/..%2Fstate']);
-  assert.equal('live' in ROUTES, false, 'the server has no route to pause its poll');
+  assert.deepEqual(ROUTES.polling(), ['POST', '/api/polling']);
+  assert.deepEqual(ROUTES.sessionWrites(), ['POST', '/api/session/writes']);
   const real = createReal({ fetchFn: async () => ({ status: 200, ok: true, json: async () => ({}) }) });
   for (const name of METHODS) assert.equal(typeof real[name], 'function', name);
   for (const [name, route] of Object.entries(ROUTES)) {

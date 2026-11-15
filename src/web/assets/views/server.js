@@ -1,15 +1,15 @@
 // Server: two live charts, and the panels Clients · Slow log · Monitor.
 //
-// Monitor is time-boxed: it always asks first, counts down, and stops by itself; Stop ends
-// it early. Its lines stay in memory for the session and are never saved. Slow log and
+// Monitor is time-boxed: the server always asks first (the confirm dialog), it counts down,
+// and stops by itself; Stop ends it early. Its lines stay in memory for the session and are never saved. Slow log and
 // Monitor lines arrive already masked by redis-lens.
 
 import {
   h, fill, refill, DASH, fmtBytes, fmtCount, fmtDuration, fmtRate, fmtTook, fmtClock, fmtGrouped, plural,
   barPercent, barChart, meter, table, pills, notice, emptyState, connectFirst, nodePicker,
-  fillLog, confirmDialog, errorText,
+  fillLog, errorText,
 } from '../ui.js';
-import { spanText, setSlowlogMemory } from './overview.js';
+import { spanText } from './overview.js';
 
 const TABS = [
   { id: 'clients', label: 'Clients', href: '#/server/clients' },
@@ -26,18 +26,6 @@ export function monitorNew() {
 }
 
 const mon = monitorNew();
-
-/** Why the slow log's settings or key names are missing. The server says so once (it
- *  stops asking after a refusal), so the page keeps the reason for the connection. */
-const slowWhy = { conn: null, settingsOff: null, keysOff: null };
-
-/** A slow-log reading with the reasons remembered from earlier readings filled in. */
-export function slowlogRemember(why, conn, data) {
-  if (why.conn !== conn) Object.assign(why, { conn, settingsOff: null, keysOff: null });
-  if (data.settingsOff) why.settingsOff = data.settingsOff;
-  if (data.keysOff) why.keysOff = data.keysOff;
-  return { ...data, settingsOff: data.settings ? null : data.settingsOff || why.settingsOff, keysOff: data.keysOff || why.keysOff };
-}
 
 /** A run was asked for (the reply to Start, or a state that names a run this page did
  *  not know): start with an empty list and count down from now, or from when it began. */
@@ -102,7 +90,6 @@ export function monitorFollow(m, state, now = Date.now()) {
 
 /** Called once at boot: keep the Monitor lines whatever view is on screen. */
 export function init(api) {
-  setSlowlogMemory((conn, data) => slowlogRemember(slowWhy, conn, data));
   api.on('monitor', (e) => monitorApply(mon, e));
   api.on('state', (s) => monitorFollow(mon, s));
 }
@@ -283,7 +270,7 @@ export function mount(root, ctx, route) {
     fill(panel, h('div', { class: 'card' }, emptyState('Reading the slow log…')));
     poll(async () => {
       try {
-        const data = slowlogRemember(slowWhy, `${conn.name}|${conn.docker}|${conn.connectedAt}`, await ctx.api.getSlowlog());
+        const data = await ctx.api.getSlowlog();
         if (alive && changed(data)) fill(panel, drawSlow(data));
       } catch (err) {
         drawn = '';
@@ -328,7 +315,8 @@ export function mount(root, ctx, route) {
 
     function draw(force = false) {
       const left = monitorLeft(mon);
-      button.textContent = mon.running ? `Stop (${left} s left)` : `Watch commands for ${mon.maxSecs} seconds`;
+      const limits = ctx.state().monitorLimits;
+      button.textContent = mon.running ? `Stop (${left} s left)` : `Watch commands for ${limits.maxSecs} seconds`;
       button.disabled = busy;
       const count = plural(mon.kept, 'line', 'lines');
       if (mon.running) status.textContent = `running · ${count} · ${left} s left · UTC`;
@@ -346,22 +334,8 @@ export function mount(root, ctx, route) {
       }
     }
 
-    /** MONITOR always asks first, read-only connections too: it writes nothing but slows
-     *  the server. On production the connection's name is typed. */
-    async function ask() {
-      const prod = conn.env === 'PROD';
-      return confirmDialog({
-        kind: prod ? 'type' : 'ask', expect: conn.name, title: `Send MONITOR to ${conn.name}?`, yes: 'Start',
-        text: `MONITOR runs on a connection of its own, and the server copies every command it runs to it. That slows a busy server.\n\nIt stops after ${mon.maxSecs} s or ${fmtGrouped(mon.maxLines)} lines, or when you press Stop. The lines stay in memory.`,
-      });
-    }
-
     button.addEventListener('click', async () => {
       const stopping = mon.running;
-      if (!stopping && !(await ask())) {
-        ctx.notify('Cancelled: nothing was sent.', 'info');
-        return;
-      }
       busy = true;
       draw();
       try {

@@ -1,9 +1,9 @@
-// The pure pieces of the views: Overview's lines and findings, the Connections card, the
+// The pure pieces of the views: Overview's lines, the Connections card, the
 // slow log's wording, and the Monitor run's bookkeeping.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spanText, memorySub, keysSub, persistenceText, analysisWhen, serverFindings, offLines } from '../views/overview.js';
-import { monitorNew, monitorBegin, monitorApply, monitorLeft, monitorFollow, slowlogSettingsText, slowEntryFacts, slowlogRemember } from '../views/server.js';
+import { spanText, memorySub, keysSub, persistenceText, analysisWhen, offLines } from '../views/overview.js';
+import { monitorNew, monitorBegin, monitorApply, monitorLeft, monitorFollow, slowlogSettingsText, slowEntryFacts } from '../views/server.js';
 import { profileStatus, accessText, tagChanges } from '../views/connections.js';
 
 test('a live tile says how far back its bars go', () => {
@@ -39,35 +39,6 @@ test('the last analysis: today, or the date on another day', () => {
   const now = Date.UTC(2026, 10, 15, 14, 0, 0);
   assert.equal(analysisWhen(Date.UTC(2026, 10, 15, 9, 12, 40), now), 'today 09:12 UTC');
   assert.equal(analysisWhen(Date.UTC(2026, 10, 12, 23, 5, 0), now), '2026-11-12 23:05 UTC');
-});
-
-const slowlog = (entries) => ({ off: null, entries });
-const clientList = (connections) => ({ off: null, connections });
-const idle = (addr, idleSecs, own = false) => ({ addr, idleSecs, own });
-
-test('what stands out: the slowest slow-log entry, by its command name and duration only', () => {
-  const found = serverFindings({ slowlog: slowlog([
-    { name: 'GET', micros: 12000, at: Date.UTC(2026, 10, 15, 13, 0, 0), command: 'GET secret-key' },
-    { name: 'keys', micros: 812000, at: Date.UTC(2026, 10, 15, 14, 1, 9), command: 'KEYS user:*:very-private' },
-  ]) });
-  assert.deepEqual(found, [{ text: 'KEYS took 812 ms at 14:01 UTC.', where: 'slowlog' }]);
-  assert.equal(JSON.stringify(found).includes('very-private'), false, 'never the arguments or the keys');
-});
-
-test('what stands out: ten or more connections from one address, each idle for an hour or more', () => {
-  const many = Array.from({ length: 12 }, (_, i) => idle(`10.0.9.17:${4000 + i}`, 3600 + i));
-  const found = serverFindings({ clients: clientList(many.concat([idle('10.0.4.2:1', 9000), idle('10.0.9.17:1', 20)])) });
-  assert.deepEqual(found, [{ text: '12 connections from 10.0.9.17 idle for over an hour.', where: 'clients' }]);
-  assert.deepEqual(serverFindings({ clients: clientList(many.slice(0, 9)) }), [], 'nine is not many');
-  assert.deepEqual(serverFindings({ clients: clientList(many.map((c) => ({ ...c, own: true }))) }), [], 'redis-lens\'s own connections do not count');
-});
-
-test('what stands out: big keys the server counted; nothing when nothing is known', () => {
-  assert.deepEqual(serverFindings({ bigKeys: 3 }), [{ text: '3 big keys, counted by the server (INFO keysizes).', where: null }]);
-  assert.deepEqual(serverFindings({ bigKeys: 0 }), []);
-  assert.deepEqual(serverFindings({}), []);
-  assert.deepEqual(serverFindings({ slowlog: { off: 'refused', entries: [] }, clients: { off: 'refused', connections: [] } }), []);
-  assert.deepEqual(serverFindings({ slowlog: slowlog([]) }), []);
 });
 
 test('"Turned off, and why": the gaps, each refused check, the provider notice; no line twice', () => {
@@ -139,18 +110,6 @@ test('under a slow-log command: its keys, its client, what was cut, the note', (
   assert.equal(slowEntryFacts({ keys: [], moreKeys: 0, client: null, clientName: null, argsCut: 0, note: null }), '');
 });
 
-test('why the slow log\'s settings are missing is remembered for the connection', () => {
-  const why = { conn: null, settingsOff: null, keysOff: null };
-  const first = slowlogRemember(why, 'demo|1', { settings: null, settingsOff: 'the server refused CONFIG GET for this user', keysOff: null });
-  assert.equal(first.settingsOff, 'the server refused CONFIG GET for this user');
-  const later = slowlogRemember(why, 'demo|1', { settings: null, settingsOff: null, keysOff: null });
-  assert.equal(later.settingsOff, 'the server refused CONFIG GET for this user', 'the server says it only once');
-  const other = slowlogRemember(why, 'other|2', { settings: null, settingsOff: null, keysOff: null });
-  assert.equal(other.settingsOff, null, 'another connection starts clean');
-  const known = slowlogRemember(why, 'other|2', { settings: { thresholdMicros: 10000, maxLen: 128 }, settingsOff: null, keysOff: null });
-  assert.equal(known.settingsOff, null);
-});
-
 // ---- Monitor ----
 
 const ready = (run, startedAt) => ({ run, kind: 'ready', startedAt, maxSecs: 30, maxLines: 10000, lines: [], stopped: null });
@@ -215,4 +174,12 @@ test('monitor: the state names a run this page did not start, ends one it missed
   monitorFollow(m, state('other', null));
   assert.equal(m.run, null);
   assert.deepEqual(m.lines, []);
+});
+
+test('the server asks before Monitor, so the page asks nothing of its own; Overview reads no panel of its own', async () => {
+  const { readFileSync } = await import('node:fs');
+  const read = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
+  assert.equal(/confirmDialog/.test(read('views/server.js')), false, 'Monitor is asked about once, by the server');
+  const overview = read('views/overview.js');
+  assert.equal(/getSlowlog|getClients/.test(overview), false, 'the findings come with GET /api/overview');
 });

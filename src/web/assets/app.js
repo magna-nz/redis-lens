@@ -23,18 +23,19 @@ const $ = (id) => document.getElementById(id);
 const IDLE = {
   status: 'idle', connected: false, connecting: null, failed: null, conn: null, liveState: 'waiting', lost: null,
   tail: null, monitor: null, features: { entraId: false, version: null },
+  polling: { paused: false, intervalSecs: 2, intervals: [1, 2, 3, 5, 10, 15, 30, 60] }, live: true,
+  monitorLimits: { maxLines: 10000, maxSecs: 30 },
 };
 
 const store = {
-  /** The server's state, plus `live`: this page's own Live / Paused switch. */
-  state: { ...IDLE, live: true },
-  series: { ops: [], clients: [], everySecs: null },
+  /** The server's state. `live` and `polling` are the dashboard's, shared by every tab. */
+  state: { ...IDLE },
+  series: { ops: [], clients: [], everySecs: IDLE.polling.intervalSecs },
   figures: null,
   /** Why the live figures are off (the server refused INFO), in its words. */
   figuresOff: null,
   linkUp: true,
   locked: false,
-  paused: false,
   /** What Reconnect connects to again: `{ name }` or `{ docker }`. */
   lastTarget: null,
   /** The connect this tab started, until it is connected or has failed. */
@@ -168,7 +169,15 @@ function renderChrome() {
   live.disabled = !s.connected;
   live.querySelector('.dot').classList.toggle('ok', s.connected && s.live);
   $('live-label').textContent = s.live ? 'Live' : 'Paused';
-  live.setAttribute('aria-label', s.live ? 'Live: pause the live figures on this page' : 'Paused: resume the live figures');
+  live.setAttribute('aria-label', s.live ? 'Live: pause the live figures' : 'Paused: resume the live figures');
+
+  // How often the figures are read: the TUI's + and -, as one quiet list.
+  const every = $('poll-interval');
+  every.disabled = !s.connected;
+  if (every.options.length !== s.polling.intervals.length) {
+    fill(every, s.polling.intervals.map((n) => h('option', { value: String(n), text: `every ${n} s` })));
+  }
+  if (document.activeElement !== every) every.value = String(s.polling.intervalSecs);
 
   renderBanner();
 }
@@ -220,6 +229,7 @@ function showLocked() {
         h('p', { class: 'muted', text: 'The session this page had is gone: redis-lens was started again, or the page was opened without it.' }))));
   $('conn-pill').hidden = true;
   $('live-toggle').hidden = true;
+  $('poll-interval').hidden = true;
 }
 
 // ---------- The command line panel ----------
@@ -247,17 +257,22 @@ function applyState(next) {
   const prev = store.state;
   const was = prev.conn;
   const now = next.conn;
-  store.state = { ...next, live: !store.paused };
+  store.state = next;
   if (now && (next.connected || next.connecting)) store.lastTarget = targetOf(now);
+  // The bars are one reading apart: start them again when what they show changes (another
+  // connection or node) or when the readings get another spacing.
   const moved = (was && was.name) !== (now && now.name) || (was && was.pickedNode) !== (now && now.pickedNode) || prev.status !== next.status;
-  if (moved) {
-    store.series = { ops: [], clients: [], everySecs: null };
-    store.figures = null;
-    store.figuresOff = null;
+  if (moved || prev.polling.intervalSecs !== next.polling.intervalSecs) {
+    store.series = { ops: [], clients: [], everySecs: next.polling.intervalSecs };
+    if (moved) {
+      store.figures = null;
+      store.figuresOff = null;
+    }
   }
   renderChrome();
   render();
   if (commandLine) commandLine.refresh();
+  if (prev.live !== next.live || prev.polling.intervalSecs !== next.polling.intervalSecs) api.emit('live', { live: next.live });
 
   // The outcome of a connect this tab started.
   if (store.intent && now && now.name === store.intent) {
@@ -280,8 +295,6 @@ function applyFigures(f) {
     store.figuresOff = f.error;
     return;
   }
-  const last = store.figures;
-  if (last && f.at > last.at && !store.series.everySecs) store.series.everySecs = Math.max(1, Math.round((f.at - last.at) / 1000));
   store.figuresOff = null;
   store.figures = f;
   store.series.ops = pushSeries(store.series.ops, f.opsPerSec);
@@ -312,14 +325,19 @@ function boot() {
     themes.save(theme);
     applyTheme();
   });
-  // Live / Paused is this page's own: paused, it stops drawing the figures and stops its
-  // own reads of the panels. The server has no route to pause its poll.
-  $('live-toggle').addEventListener('click', () => {
-    store.paused = !store.paused;
-    store.state = { ...store.state, live: !store.paused };
-    renderChrome();
-    api.emit('live', { live: store.state.live });
-  });
+  // Live / Paused and the interval are the dashboard's, for every tab: the server stops
+  // or slows its poll, and says so in the state that follows.
+  const setPolling = async (change) => {
+    try {
+      const polling = await api.setPolling(change);
+      applyState({ ...store.state, polling, live: !polling.paused });
+    } catch (err) {
+      notify(errorText(err), 'error');
+      renderChrome();
+    }
+  };
+  $('live-toggle').addEventListener('click', () => setPolling({ paused: store.state.live }));
+  $('poll-interval').addEventListener('change', (e) => setPolling({ intervalSecs: Number(e.target.value) }));
   $('cmd-toggle').addEventListener('click', () => setCommandLine($('cmdline').hidden));
 
   // The stores that keep running whatever view is shown (the tail, Monitor) hear about a

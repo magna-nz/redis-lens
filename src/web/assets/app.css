@@ -124,6 +124,10 @@ input::placeholder { color: var(--muted); opacity: 1; }
 .conn-pill .name { font-size: 13px; min-width: 0; }
 
 .topbar-end { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+/* How often the live figures are read: quiet until it is pointed at or focused. */
+.field.poll { width: auto; background: transparent; border-color: transparent; color: var(--muted); font-size: 13px; padding: 0 4px 0 8px; cursor: pointer; }
+.field.poll:hover:not(:disabled), .field.poll:focus-visible { border-color: var(--line); color: var(--text); }
+.field.poll:disabled { opacity: .55; cursor: default; }
 
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
 .dot.ok { background: var(--ok); }

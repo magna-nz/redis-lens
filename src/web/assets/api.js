@@ -15,14 +15,15 @@
 //                 conn: Conn | null, liveState: 'waiting'|'ready'|'closed',
 //                 lost: string | null (the live connection closed), tail: { id, kind, name,
 //                 node, ready } | null, monitor: { run, node, startedAt, maxLines, maxSecs }
-//                 | null, features: { entraId: bool, version } }
-//               app.js adds `live: bool` (the page's own Live / Paused switch).
+//                 | null, features: { entraId: bool, version }, polling: Polling,
+//                 live: bool (the live figures are polled: not paused),
+//                 monitorLimits: { maxLines, maxSecs } }
+// Polling       { paused: bool, intervalSecs, intervals: [number] }   (shared by every tab)
 // Conn          Profile plus { docker: bool, readOnly: bool, writesOff: string|null,
 //                 server: 'Redis'|'Valkey'|null, version, topology: 'standalone'|'cluster'|
 //                 'sentinel'|null, policy, target, via: string|null (Sentinel answer),
 //                 refused: [string] (writes the server refused this session),
-//                 nodes: [Node], pickedNode: id|null, monitorSeconds: number,
-//                 connectedAt (unix seconds) }
+//                 nodes: [Node], pickedNode: id|null, connectedAt (unix seconds) }
 // Node          { id (the index as text), index, address, role, slots: '0-5460', connected }
 // Profile       { name, env: 'PROD'|'STAGE'|'LOCAL'|'OTHER', address (never a credential),
 //                 url (masked), tls, db, auth, signIn: string (where the credentials live),
@@ -37,7 +38,10 @@
 //                 max }, keys: { total, ttlShare, withTtl, dataBytes, overheadBytes,
 //                 bigKeys }, figuresFailed: string|null, gaps: [string], checks: [Check],
 //                 provider: { label, notice }|null, lastAnalysis: { at (ms), sampledKeys }
-//                 |null, target, figures: Figures|null, shards: [Shard] }
+//                 |null, target, figures: Figures|null, shards: [Shard],
+//                 findings: [{ text, severity: 'warn'|'note'|'info', screen, label
+//                 ('Server › Slow log'), where: 'slowlog'|'clients'|null (the page's
+//                 own panel for it, when this phase has one) }] }
 // Shard         { id, index, slots, address, role, opsPerSec, usedMemory, keys,
 //                 status: 'ok'|'not-connected'|'no-answer', note }
 // Figures       { at (ms), node: id|null, error: string|null, opsPerSec, opsNow, clients,
@@ -87,10 +91,12 @@
 //   connect({ name } | { docker })    → State         POST   /api/connect      (202)
 //   disconnect()                      → State         POST   /api/disconnect
 //   pickNode(index)                   → State         POST   /api/node
+//   setPolling({ paused, intervalSecs }) → Polling    POST   /api/polling
+//   setSessionWrites(on)              → { profile, message }   POST /api/session/writes
 //   getOverview()                     → Overview      GET    /api/overview
 //   getClients()                      → Clients       GET    /api/server/clients
 //   getSlowlog()                      → Slowlog       GET    /api/server/slowlog
-//   startMonitor()                    → MonitorRun    POST   /api/server/monitor (202)
+//   startMonitor()                    → MonitorRun    POST   /api/server/monitor (asks, then 202)
 //   stopMonitor()                     → { stopped }   DELETE /api/server/monitor
 //   getChannels()                     → Channels      GET    /api/pubsub/channels
 //   subscribe({ name, kind })         → Subscription  POST   /api/pubsub/subscribe (202)
@@ -109,8 +115,8 @@
 // EVENTS: `api.on(name, fn)` returns a function that unsubscribes.
 //   state (State) · figures (Figures) · tail (TailEvent) · monitor (MonitorEvent) ·
 //   notice (Notice) · link ({ up: bool }, the page's own line to redis-lens) ·
-//   locked ({}): the session is missing or wrong (HTTP 401) · live ({ live: bool }): the
-//   page's own Live / Paused switch, raised by app.js.
+//   locked ({}): the session is missing or wrong (HTTP 401) · live ({ live: bool }):
+//   raised by app.js when the state's `live` changes, for the views that draw figures.
 
 import { createMockServer } from './mock.js';
 
@@ -282,6 +288,7 @@ export function adaptState(j) {
   const monitor = o.monitor ? obj(o.monitor) : null;
   const tail = o.tail ? obj(o.tail) : null;
   const liveError = str(o.live_error);
+  const limits = obj(o.monitor_limits);
   const conn = o.connection
     ? {
       ...adaptProfile(o.connection),
@@ -297,10 +304,10 @@ export function adaptState(j) {
       refused: strings(o.refused),
       nodes,
       pickedNode: nodes.length ? String(num(o.picked) ?? 0) : null,
-      monitorSeconds: num(monitor && monitor.max_secs) ?? 30,
       connectedAt: num(o.connected_at_unix),
     }
     : null;
+  const polling = adaptPolling(o.polling);
   return {
     status,
     connected: status === 'connected' && !!conn,
@@ -314,7 +321,33 @@ export function adaptState(j) {
     tail: tail ? { id: num(tail.id), kind: oneOf(tail.kind, ['channel', 'pattern', 'shard'], 'channel'), name: str(tail.name) ?? '', node: num(tail.node), ready: tail.ready === true } : null,
     monitor: monitor ? { run: num(monitor.run), node: num(monitor.node), startedAt: num(monitor.started_at_unix_ms), maxLines: num(monitor.max_lines), maxSecs: num(monitor.max_secs) } : null,
     features: { entraId: obj(o.features).entra_id === true, version: str(obj(o.features).version) },
+    polling,
+    live: !polling.paused,
+    monitorLimits: { maxLines: num(limits.max_lines) ?? 10000, maxSecs: num(limits.max_secs) ?? 30 },
   };
+}
+
+/** `state.polling` and the reply of POST /api/polling: how the live figures are polled. */
+export function adaptPolling(j) {
+  const o = obj(j);
+  const intervals = arr(o.intervals).filter((n) => num(n) !== null);
+  return { paused: o.paused === true, intervalSecs: num(o.interval_secs) ?? 2, intervals: intervals.length ? intervals : [1, 2, 3, 5, 10, 15, 30, 60] };
+}
+
+/** The body of POST /api/polling: `{ paused, interval_secs }`, either or both. */
+export function pollingRequest(change) {
+  const body = {};
+  if (change.paused !== undefined) body.paused = change.paused === true;
+  if (change.intervalSecs !== undefined) body.interval_secs = Number(change.intervalSecs);
+  return body;
+}
+
+/** POST /api/session/writes: `{ connection, message }` for a saved connection,
+ *  `{ message, state }` for a Docker container (its writes change for the session only). */
+export function adaptSessionWrites(j) {
+  const o = obj(j);
+  const connection = o.connection || obj(o.state).connection;
+  return { profile: connection ? adaptProfile(connection) : null, message: str(o.message) };
 }
 
 /** GET /api/connections. */
@@ -492,6 +525,21 @@ export function adaptOverview(j) {
     target: str(o.target),
     figures: o.live ? adaptFigures(o.live) : null,
     shards: arr(o.shards).map(adaptShard),
+    findings: arr(o.findings).map(adaptFinding).filter((f) => f.text),
+  };
+}
+
+/** One of Overview's findings "from the server": `{ severity, text, screen, area, panel }`.
+ *  `where` is this page's panel for it, when this phase has one. */
+export function adaptFinding(j) {
+  const o = obj(j);
+  const screen = str(o.screen);
+  return {
+    text: str(o.text) ?? '',
+    severity: oneOf(o.severity, ['warn', 'note', 'info'], 'note'),
+    screen,
+    label: [str(o.area), str(o.panel)].filter(Boolean).join(' › ') || null,
+    where: { slow_log: 'slowlog', clients: 'clients' }[screen] ?? null,
   };
 }
 
@@ -757,6 +805,8 @@ export const ROUTES = {
   connect: () => ['POST', '/api/connect'],
   disconnect: () => ['POST', '/api/disconnect'],
   node: () => ['POST', '/api/node'],
+  polling: () => ['POST', '/api/polling'],
+  sessionWrites: () => ['POST', '/api/session/writes'],
   overview: () => ['GET', '/api/overview'],
   clients: () => ['GET', '/api/server/clients'],
   slowlog: () => ['GET', '/api/server/slowlog'],
@@ -879,6 +929,8 @@ export function createReal({ fetchFn = (...a) => fetch(...a), EventSourceFn = nu
     connect: (target) => request(ROUTES.connect(), target && target.docker ? { docker: target.docker } : { name: target && target.name }, adaptState),
     disconnect: () => request(ROUTES.disconnect(), {}, adaptState),
     pickNode: (index) => request(ROUTES.node(), { index: Number(index) }, adaptState),
+    setPolling: (change) => request(ROUTES.polling(), pollingRequest(change), adaptPolling),
+    setSessionWrites: (on) => request(ROUTES.sessionWrites(), { on: on === true }, adaptSessionWrites),
     getOverview: () => request(ROUTES.overview(), null, adaptOverview),
     getClients: () => request(ROUTES.clients(), null, adaptClients),
     getSlowlog: () => request(ROUTES.slowlog(), null, adaptSlowlog),
@@ -907,7 +959,7 @@ export function createReal({ fetchFn = (...a) => fetch(...a), EventSourceFn = nu
 
 export const METHODS = [
   'getState', 'listConnections', 'listDocker', 'addConnection', 'updateConnection', 'removeConnection',
-  'testConnection', 'connect', 'disconnect', 'pickNode', 'getOverview', 'getClients', 'getSlowlog',
+  'testConnection', 'connect', 'disconnect', 'pickNode', 'setPolling', 'setSessionWrites', 'getOverview', 'getClients', 'getSlowlog',
   'startMonitor', 'stopMonitor', 'getChannels', 'subscribe', 'unsubscribe', 'publish', 'runCommand',
   'getCommandNames', 'getCommandHelp',
 ];

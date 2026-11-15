@@ -1,27 +1,16 @@
 // Overview: the first screen after a connect. Live figures on top, then what the server
 // says about itself. A connect reads no key, and neither does anything here.
 //
-// The two cards that need an analysis of the keys ("Things to look at" beyond what the
-// server reports, and "Memory by key pattern") say that analysis arrives with Browse.
+// "Things to look at" lists the server's own findings (`overview.findings`); what a sample
+// of the keys would add, and "Memory by key pattern", say that analysis arrives with Browse.
 // Nothing is made up: a figure the server did not give shows as "—".
 
 import {
-  h, fill, DASH, fmtBytes, fmtCount, fmtDuration, fmtPercent, fmtRate, fmtTook, fmtClock, fmtGrouped, plural, barPercent,
+  h, fill, DASH, fmtBytes, fmtCount, fmtDuration, fmtPercent, fmtRate, fmtClock, fmtGrouped, plural, barPercent,
   barChart, meter, setVar, table, notice, emptyState, connectFirst, nodePicker, errorText,
 } from '../ui.js';
 
 const NEXT = 'Analysis arrives with Browse in the next update.';
-
-/** Set by server.js (which imports this module): keeps why the slow log's settings are
- *  missing, since the server says so only on the first reading of a connection. */
-let rememberSlowlog = (conn, data) => data;
-export function setSlowlogMemory(fn) {
-  rememberSlowlog = fn;
-}
-
-/** What the page read once for this connection, to say what stands out: the slow log and
- *  the client list (as the TUI reads them once on connect). Kept per connection. */
-const once = { key: null, slowlog: null, clients: null, reading: null };
 
 /** The line under a live tile: how far back the bars go, or that they are paused. */
 export function spanText(points, everySecs, live) {
@@ -59,35 +48,6 @@ export function analysisWhen(at, now = Date.now()) {
   const day = (ms) => new Date(ms).toISOString().slice(0, 10);
   const time = `${fmtClock(at).slice(0, 5)} UTC`;
   return day(at) === day(now) ? `today ${time}` : `${day(at)} ${time}`;
-}
-
-/** What stands out in what the server reports on its own, no key read: big keys the
- *  server counted, the slowest slow-log entry (its command name and duration only, never
- *  its arguments), and many idle connections from one address (10 or more, each idle for
- *  an hour or more). */
-export function serverFindings({ bigKeys = null, slowlog = null, clients = null } = {}) {
-  const out = [];
-  if (typeof bigKeys === 'number' && bigKeys > 0) {
-    out.push({ text: `${plural(bigKeys, 'big key', 'big keys')}, counted by the server (INFO keysizes).`, where: null });
-  }
-  if (slowlog && !slowlog.off && slowlog.entries.length) {
-    const slowest = slowlog.entries.reduce((a, b) => ((b.micros ?? 0) > (a.micros ?? 0) ? b : a));
-    if (slowest.name && slowest.micros !== null) {
-      const at = slowest.at === null ? '' : ` at ${fmtClock(slowest.at).slice(0, 5)} UTC`;
-      out.push({ text: `${slowest.name.toUpperCase()} took ${fmtTook(slowest.micros)}${at}.`, where: 'slowlog' });
-    }
-  }
-  if (clients && !clients.off) {
-    const idle = new Map();
-    for (const c of clients.connections) {
-      if (c.own || c.idleSecs === null || c.idleSecs < 3600) continue;
-      const ip = c.addr.replace(/:\d+$/, '');
-      idle.set(ip, (idle.get(ip) || 0) + 1);
-    }
-    const worst = Array.from(idle.entries()).sort((a, b) => b[1] - a[1])[0];
-    if (worst && worst[1] >= 10) out.push({ text: `${fmtGrouped(worst[1])} connections from ${worst[0]} idle for over an hour.`, where: 'clients' });
-  }
-  return out;
 }
 
 /** The lines of "Turned off, and why": the figures that could not be read, the gaps, each
@@ -259,25 +219,21 @@ export function mount(root, ctx) {
   }
 
   function drawFindings() {
-    const where = { slowlog: ['#/server/slowlog', 'Server › Slow log'], clients: ['#/server/clients', 'Server › Clients'] };
-    const found = serverFindings({ bigKeys: data ? data.keys.bigKeys : null, slowlog: once.slowlog, clients: once.clients });
-    const rows = found.map((f) => {
-      const [href, label] = where[f.where] || [null, null];
+    // "From the server": what the server reports on its own, worked out by redis-lens. A
+    // finding links to its panel when this page has it; the others arrive with Browse.
+    const href = { slowlog: '#/server/slowlog', clients: '#/server/clients' };
+    const rows = (data ? data.findings : []).map((f) => {
+      const to = href[f.where] || null;
       const inner = [
-        h('span', { class: 'glyph', 'aria-hidden': 'true', text: '▲' }),
-        h('span', null, h('span', { text: f.text }), label ? h('span', { class: 'sub', text: label }) : null),
-        h('span', { class: 'chev', 'aria-hidden': 'true', text: href ? '›' : '' }),
+        h('span', { class: f.severity === 'warn' ? 'glyph' : 'muted', 'aria-hidden': 'true', text: f.severity === 'warn' ? '▲' : '•' }),
+        h('span', null, h('span', { text: f.text }), f.label ? h('span', { class: 'sub', text: f.label }) : null),
+        h('span', { class: 'chev', 'aria-hidden': 'true', text: to ? '›' : '' }),
       ];
-      return h('li', null, href ? h('a', { class: 'row row-finding', href }, inner) : h('div', { class: 'row row-finding' }, inner));
+      return h('li', null, to ? h('a', { class: 'row row-finding', href: to }, inner) : h('div', { class: 'row row-finding' }, inner));
     });
-    const reasons = [
-      once.slowlog && once.slowlog.off ? `Slow log is off: ${once.slowlog.off}.` : null,
-      once.clients && once.clients.off ? `Idle clients are off: ${once.clients.off}.` : null,
-    ].filter(Boolean);
     fill(findings,
       h('h2', { class: 'lbl', text: 'Things to look at' }),
       rows.length ? h('ul', { class: 'list' }, rows) : h('p', { text: 'Nothing stands out in what the server reports.' }),
-      reasons.map((r) => h('p', { class: 'muted small', text: r })),
       h('p', { class: 'muted small', text: `From what the server reports: no keys were read. What a sample of the keys finds comes later. ${NEXT}` }));
   }
 
@@ -311,55 +267,35 @@ export function mount(root, ctx) {
             c.why ? h('span', { class: 'sub', text: c.why }) : null))))) : null));
   }
 
+  /** What each part was last drawn from: a part is drawn again only when it changed, so
+   *  an open list of checks stays open. */
+  const drawnFrom = { findings: null, shards: null, off: null };
+  const changed = (part, value) => {
+    const signature = JSON.stringify(value);
+    if (drawnFrom[part] === signature) return false;
+    drawnFrom[part] = signature;
+    return true;
+  };
+
   async function load() {
     try {
       const next = await ctx.api.getOverview();
       if (!alive) return;
+      const first = data === null;
       data = next;
-      drawSubtitle();
+      if (first) {
+        drawSubtitle();
+        drawPatterns();
+      }
       drawLive();
-      drawShards();
-      drawFindings();
-      drawPatterns();
-      drawOff();
-      readOnce();
+      if (changed('shards', data.shards)) drawShards();
+      if (changed('findings', data.findings)) drawFindings();
+      if (changed('off', [data.figuresFailed, data.gaps, data.checks, data.provider])) drawOff();
     } catch (err) {
       if (!alive) return;
+      drawnFrom.findings = null;
       fill(findings, h('h2', { class: 'lbl', text: 'Things to look at' }), notice(errorText(err)));
     }
-  }
-
-  /** Once per connection and node, where the permission check allowed it: the slow log
-   *  and the client list, for "Things to look at". Nothing polls them here. */
-  async function readOnce() {
-    if (ctx.state().liveState !== 'ready') return;
-    const key = [conn.name, conn.docker, conn.connectedAt, conn.pickedNode].join('|');
-    if (once.key === key) {
-      // Already read, or being read by an earlier draw of this screen.
-      await once.reading;
-      if (alive) drawFindings();
-      return;
-    }
-    once.key = key;
-    once.slowlog = null;
-    once.clients = null;
-    const allowed = (name) => !data.checks.some((c) => c.name === name && c.status !== 'allowed');
-    const read = async (name, get, slot) => {
-      if (!allowed(name)) {
-        const check = data.checks.find((c) => c.name === name);
-        once[slot] = { off: (check && check.why) || 'the permission check turned it off', entries: [], connections: [] };
-        return;
-      }
-      try {
-        once[slot] = await get();
-      } catch {
-        once[slot] = null;
-      }
-    };
-    const slow = async () => rememberSlowlog(`${conn.name}|${conn.docker}|${conn.connectedAt}`, await ctx.api.getSlowlog());
-    once.reading = Promise.all([read('SLOWLOG', slow, 'slowlog'), read('CLIENT LIST', ctx.api.getClients, 'clients')]);
-    await once.reading;
-    if (alive) drawFindings();
   }
 
   const redraw = (f) => {
@@ -374,9 +310,17 @@ export function mount(root, ctx) {
   drawLive();
   drawPatterns();
   load();
+  // The findings come from the slow log and client list the connect reads once its live
+  // connection is open, and from the Server panels read since; no event says they moved.
+  // GET /api/overview answers from what redis-lens already holds (nothing goes to the
+  // server), so it is read again now and then while the figures are live.
+  const again = setInterval(() => {
+    if (ctx.state().live && !document.hidden) load();
+  }, 5000);
 
   return () => {
     alive = false;
+    clearInterval(again);
     offs.forEach((off) => off());
   };
 }

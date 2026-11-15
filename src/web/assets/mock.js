@@ -76,7 +76,7 @@ function savedProfiles() {
   return [
     profile('prod-cache-01', 'prod', 'cache-01.prod.internal:6379', { tls: true, tags: ['cache', 'eu'] }, { analysed: true }),
     profile('staging-cache', 'stage', 'staging.internal:6379', { tags: ['cache'] }, {
-      version: '7.2.5', scale: 0.08, policy: 'noeviction', lfu: false, denied: { 'MEMORY STATS': noperm('MEMORY STATS') },
+      version: '7.2.5', scale: 0.08, policy: 'noeviction', lfu: false, denied: { 'MEMORY STATS': noperm('MEMORY STATS') }, configDenied: true,
     }),
     profile('demo-cluster', 'local', '127.0.0.1:7001', { auth: 'none' }, {
       flavor: 'valkey', version: '8.0.1', mode: 'cluster', scale: 0.3, policy: 'allkeys-lru', lfu: false,
@@ -96,6 +96,7 @@ function containers() {
   return [
     { container: 'demo-redis', image: 'redis:8', endpoint: '127.0.0.1:6390', auth: 'password', sim: { flavor: 'redis', version: '8.0.2', scale: 0.002, policy: 'noeviction', lfu: false } },
     { container: 'demo-valkey', image: 'valkey/valkey:8', endpoint: '127.0.0.1:6391', auth: 'none', sim: { flavor: 'valkey', version: '8.0.1', scale: 0.002, policy: 'noeviction', lfu: false } },
+    { container: 'legacy-redis', image: 'redis:6.2', endpoint: '127.0.0.1:6392', auth: 'required', sim: { flavor: 'redis', version: '6.2.14', scale: 0.002, policy: 'noeviction', lfu: false } },
   ];
 }
 
@@ -129,6 +130,8 @@ export function createMockServer({ entra = false } = {}) {
   let tick = 0;
   let timer = null;
   let lastOps = null;
+  const polling = { paused: false, interval_secs: 2, intervals: [1, 2, 3, 5, 10, 15, 30, 60] };
+  const limits = { max_lines: 10000, max_secs: 30 };
 
   const features = { entra_id: entra, version: '0.1.0' };
   const later = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -158,7 +161,8 @@ export function createMockServer({ entra = false } = {}) {
     const s = session;
     if (!s) {
       return {
-        connected_at_unix: null, connection: null, docker: false, error: null, features, live: 'waiting', live_error: null, monitor: null, nodes: [], picked: 0,
+        connected_at_unix: null, connection: null, docker: false, error: null, features, live: 'waiting', live_error: null, monitor: null,
+        monitor_limits: limits, nodes: [], picked: 0, polling,
         refused: [], sentinel: null, server: null, status: 'idle', tail: null, target: null, writes: false, writes_off: null,
       };
     }
@@ -167,14 +171,14 @@ export function createMockServer({ entra = false } = {}) {
     return {
       connected_at_unix: s.connectedAt, connection: connection(p), docker: s.docker, error: s.error, features, live: s.live, live_error: s.liveError,
       monitor: s.monitor ? { run: s.monitor.run, node: s.picked, started_at_unix_ms: s.monitor.startedAt, max_lines: 10000, max_secs: 30 } : null,
-      nodes: up ? nodesOf(p) : [], picked: s.picked, refused: s.refused, sentinel: null, server: up ? server(p) : null, status: s.status,
+      monitor_limits: limits, nodes: up ? nodesOf(p) : [], picked: s.picked, polling, refused: s.refused, sentinel: null, server: up ? server(p) : null, status: s.status,
       tail: s.tail ? { id: s.tail.id, kind: s.tail.kind, name: s.tail.name, node: s.picked, ready: s.tail.ready } : null,
       target: up ? (p.sim.mode === 'cluster' ? `cluster · ${p.sim.nodes.length} shards` : 'primary') : null,
       writes: !p.read_only, writes_off: p.read_only ? readOnly(p) : null,
     };
   }
 
-  const readOnly = (p) => `Not sent: ${p.name} is read-only. Writes are turned on with w on 0 Connections.`;
+  const readOnly = (p) => `Not sent: ${p.name} is read-only. Turn writes on in Connections.`;
   const live = () => session && session.status === 'connected' && session.live === 'ready';
 
   // ---------- events ----------
@@ -199,7 +203,8 @@ export function createMockServer({ entra = false } = {}) {
   function onTick() {
     tick += 1;
     const s = session;
-    if (live()) {
+    // The live figures: at the polling interval, and not at all while paused.
+    if (live() && !polling.paused && tick % polling.interval_secs === 0) {
       const p = s.profile;
       const i = info(p, s.picked);
       const data = {
@@ -211,8 +216,8 @@ export function createMockServer({ entra = false } = {}) {
           ops: lastOps === null ? null : i.ops_now + (Math.random() - 0.5) * 0.02 * i.ops_now, used_memory: i.used_memory,
         },
       };
+      if (p.sim.nodes.length && (tick % 5 === 0 || lastOps === null || polling.interval_secs >= 5)) data.shards = p.sim.nodes.map((_, n) => ({ node: n, info: info(p, n), failed: false }));
       lastOps = i.ops_now;
-      if (p.sim.nodes.length && tick % 5 === 1) data.shards = p.sim.nodes.map((_, n) => ({ node: n, info: info(p, n), failed: false }));
       emit('figures', data);
     }
     if (s && s.monitor && s.monitor.startedAt) {
@@ -330,8 +335,15 @@ export function createMockServer({ entra = false } = {}) {
     const p = session.profile;
     const up = session.status === 'connected';
     const nodes = up ? nodesOf(p) : [];
+    const findings = [];
+    if (up && p.sim.scale === 1) {
+      findings.push(
+        { area: 'Server', panel: 'Slow log', screen: 'slow_log', severity: 'note', text: 'LRANGE took 912 ms at 13:58 UTC.' },
+        { area: 'Server', panel: 'Clients', screen: 'clients', severity: 'warn', text: '38 connections from 10.0.9.17 idle for over an hour.' },
+      );
+    }
     return {
-      figures: up ? figures(p) : null, figures_failed: null,
+      figures: up ? figures(p) : null, figures_failed: null, findings,
       last_analysis: up && p.sim.analysed ? { taken_at_unix: unix() - 3 * 3600, sampled_keys: 100000 } : null,
       live: null, perms: up ? perms(p) : [], provider: null, server: up ? server(p) : null,
       shards: nodes.map((node) => ({ node, figures: figures(p, 1 / nodes.length), note: null, live: null, failed: false })),
@@ -390,7 +402,10 @@ export function createMockServer({ entra = false } = {}) {
         entry(39, at(12, 20, 15), 96000, 'HGETALL', 'HGETALL cache:product:51007', ['cache:product:51007'], '10.0.4.31:38806', 'Reads a whole hash.'),
         entry(38, at(11, 2, 33), 41000, 'SCAN', 'SCAN 0 MATCH tmp:import:* COUNT 10000', [], '10.0.4.17:51122', null),
       ],
-      keys_off: null, node: session.picked, settings: { max_len: 128, threshold_micros: 10000 }, settings_off: null,
+      // Like the real server, the reason the settings are missing comes in every reply.
+      keys_off: null, node: session.picked,
+      settings: session.profile.sim.configDenied ? null : { max_len: 128, threshold_micros: 10000 },
+      settings_off: session.profile.sim.configDenied ? 'the server refused CONFIG GET for this user' : null,
     };
   }
 
@@ -483,9 +498,9 @@ export function createMockServer({ entra = false } = {}) {
         ? ask({ kind: 'type', expect: p.name, text: `KEYS is @dangerous: it can slow the server down. Type the profile name ${p.name} to send it: ${text}` }, done)
         : ask({ kind: 'ask', text: `KEYS is @dangerous: it can slow the server down. Send it? ${text}` }, done);
     }
-    if (['SUBSCRIBE', 'PSUBSCRIBE', 'SSUBSCRIBE', 'UNSUBSCRIBE', 'PUNSUBSCRIBE', 'SUNSUBSCRIBE'].includes(word)) return line(text, 'note', 'Not sent here: use Pub/Sub (5) to subscribe.');
-    if (word === 'MONITOR') return line(text, 'note', 'Not sent here: use the Monitor panel in Server (3).');
-    if (word === 'SELECT') return line(text, 'note', 'Not sent here: SELECT would switch the database under every view. Press b to switch it.');
+    if (['SUBSCRIBE', 'PSUBSCRIBE', 'SSUBSCRIBE', 'UNSUBSCRIBE', 'PUNSUBSCRIBE', 'SUNSUBSCRIBE'].includes(word)) return line(text, 'note', 'Not sent here: use the Pub/Sub screen to subscribe.');
+    if (word === 'MONITOR') return line(text, 'note', 'Not sent here: use Monitor on the Server screen.');
+    if (word === 'SELECT') return line(text, 'note', 'Not sent here: SELECT would switch the database under every view.');
     if (['AUTH', 'HELLO'].includes(word)) return line(`${words[0]}${' ***'.repeat(Math.max(1, words.length - 1))}`, 'note', 'Not sent: it would change the connection every view shares.');
     if (['RESET', 'QUIT', 'MULTI', 'EXEC', 'DISCARD', 'WATCH', 'UNWATCH'].includes(word)) return line(text, 'note', 'Not sent: it would change the connection every view shares.');
     if (['EVAL', 'EVAL_RO', 'EVALSHA', 'EVALSHA_RO', 'FCALL', 'FCALL_RO', 'SCRIPT', 'FUNCTION'].includes(word)) return line(text, 'note', `Not sent: ${word} runs a script, whose commands the command line can't check.`);
@@ -511,10 +526,12 @@ export function createMockServer({ entra = false } = {}) {
   async function connect(target) {
     if (!known(target, ['name', 'docker']) || (!!target.name === !!target.docker)) return [400, { error: 'give one of name and docker' }];
     let p;
+    let locked = false;
     if (target.name) p = find(target.name);
     else {
       const c = docker.find((d) => d.container === target.docker);
       if (c) p = profile(c.container, 'local', c.endpoint, { auth: 'none', read_only: false }, c.sim);
+      locked = !!c && c.auth === 'required';
     }
     if (!p) return [404, { error: 'there is no saved connection by that name' }];
     connSeq += 1;
@@ -528,6 +545,14 @@ export function createMockServer({ entra = false } = {}) {
       if (p.endpoint.endsWith(':6399')) {
         session.status = 'failed';
         session.error = 'Connection refused (os error 61)';
+        emitState();
+        return;
+      }
+      if (locked) {
+        // A connect that opens but can't authenticate is failed, never connected.
+        session.status = 'failed';
+        session.live = 'closed';
+        session.error = 'the server asks for a password, and this connection has none: add the connection again with its password';
         emitState();
         return;
       }
@@ -549,7 +574,7 @@ export function createMockServer({ entra = false } = {}) {
       const name = body.name.trim();
       if (!name) return [400, { error: 'a profile needs a name' }];
       if (/^docker:/i.test(name)) return [400, { error: 'profile names starting with docker: are reserved for discovered containers' }];
-      if (find(name) && !body.force) return [400, { error: `a profile named ${name} already exists; pass --force to replace it` }];
+      if (find(name) && !body.force) return [400, { error: `a profile named ${name} already exists: tick Replace to overwrite it` }];
       const endpoint = maskedAddress(body.url);
       if (!endpoint) return [400, { error: 'the connection string could not be read: missing host' }];
       const tokens = Array.isArray(body.token_command) ? body.token_command : [];
@@ -561,7 +586,7 @@ export function createMockServer({ entra = false } = {}) {
         return ask({ kind: 'ask', text: `This profile will run this command at every connect and send what it prints as the password: ${tokens.join(' ')}. It is run directly, not through a shell. Save it?` }, () => step(true, writesOk));
       }
       if (e === 'prod' && body.writes === true && !writesOk) {
-        return ask({ kind: 'type', expect: name, text: `${name} is a prod profile. Type its name to turn writes on: ` }, () => step(tokenOk, true));
+        return ask({ kind: 'type', expect: name, text: `${name} is a prod profile. Type its name to turn writes on.` }, () => step(tokenOk, true));
       }
       // A password is never kept: only where it would live is noted.
       const hasSecret = typeof body.password === 'string' && body.password.length > 0;
@@ -587,7 +612,7 @@ export function createMockServer({ entra = false } = {}) {
   function set(name, body) {
     if (!known(body, ['writes', 'tag', 'untag', 'standalone'])) return [400, { error: SHAPE }];
     const p = find(name);
-    if (!p) return [404, { error: `no profile named ${name}` }];
+    if (!p) return [404, { error: 'there is no saved connection by that name' }];
     const apply = () => {
       if (body.writes !== undefined) p.read_only = !body.writes;
       for (const t of body.tag || []) if (!p.tags.includes(t)) p.tags.push(t);
@@ -601,8 +626,8 @@ export function createMockServer({ entra = false } = {}) {
     };
     if (body.writes === true && p.read_only) {
       return p.env === 'prod'
-        ? ask({ kind: 'type', expect: p.name, text: `${p.name} is a prod profile. Type its name to turn writes on: ` }, apply)
-        : ask({ kind: 'ask', text: `Turn writes on for ${p.name}? Each write still asks before it is sent. [y/N] ` }, apply);
+        ? ask({ kind: 'type', expect: p.name, text: `${p.name} is a prod profile. Type its name to turn writes on.`, mismatch: [400, `writes stay off: the name given does not match ${p.name}`] }, apply)
+        : ask({ kind: 'ask', text: `Turn writes on for ${p.name}? Each write still asks before it is sent.` }, apply);
     }
     return apply();
   }
@@ -620,8 +645,14 @@ export function createMockServer({ entra = false } = {}) {
       if (parts.length === 3 && method === 'PATCH') return set(parts[2], body);
       if (parts.length === 3 && method === 'DELETE') {
         const at = saved.findIndex((p) => p.name === parts[2]);
-        if (at < 0) return [400, { error: `no profile named ${parts[2]}` }];
-        saved.splice(at, 1);
+        if (at < 0) return [404, { error: 'there is no saved connection by that name' }];
+        const [gone] = saved.splice(at, 1);
+        if (session && session.profile === gone) {
+          connSeq += 1;
+          session = null;
+          confirms.clear();
+          emitState();
+        }
         return [200, { message: `Removed ${parts[2]}.` }];
       }
       if (parts.length === 4 && parts[3] === 'test' && method === 'POST') {
@@ -648,7 +679,10 @@ export function createMockServer({ entra = false } = {}) {
       confirms.delete(parts[2]);
       if (!held) return [410, { error: GONE }];
       if (method === 'DELETE') return [200, { cancelled: true, text: CANCELLED }];
-      if (held.question.kind === 'type' && body.typed !== held.question.expect) return [400, { error: `not sent: the name given does not match ${held.question.expect}` }];
+      if (held.question.kind === 'type' && body.typed !== held.question.expect) {
+        const [status, error] = held.question.mismatch || [422, 'Not sent: the name typed did not match.'];
+        return [status, { error }];
+      }
       return held.run();
     }
     if (key === 'POST /api/node') {
@@ -660,6 +694,27 @@ export function createMockServer({ entra = false } = {}) {
       return [200, state()];
     }
     if (key === 'GET /api/overview') return session ? [200, overview()] : [409, { error: NOT_LIVE }];
+    if (key === 'POST /api/polling') {
+      if (!known(body, ['paused', 'interval_secs'])) return [400, { error: SHAPE }];
+      if (body.interval_secs !== undefined && !polling.intervals.includes(body.interval_secs)) return [422, { error: 'the interval must be one of 1, 2, 3, 5, 10, 15, 30 or 60 seconds' }];
+      if (body.paused !== undefined) polling.paused = body.paused === true;
+      if (body.interval_secs !== undefined) polling.interval_secs = body.interval_secs;
+      emitState();
+      return [200, polling];
+    }
+    if (path === '/api/session/writes' && method === 'POST') {
+      if (!known(body, ['on']) || typeof body.on !== 'boolean') return [400, { error: SHAPE }];
+      if (!session) return [409, { error: NOT_LIVE }];
+      const sp = session.profile;
+      if (!session.docker) return set(sp.name, { writes: body.on });
+      const apply = () => {
+        sp.read_only = !body.on;
+        emitState();
+        return [200, { message: `Writes are ${body.on ? 'on' : 'off'} for ${sp.name} in this session only (a container has no saved profile).`, state: state() }];
+      };
+      if (body.on && sp.read_only) return ask({ kind: 'ask', text: `Turn writes on for ${sp.name} in this session? Each write still asks as the write table says.` }, apply);
+      return apply();
+    }
 
     // Everything below reads the live connection.
     if (!live()) return [409, { error: NOT_LIVE }];
@@ -667,67 +722,19 @@ export function createMockServer({ entra = false } = {}) {
     if (key === 'GET /api/server/clients') return [200, p.sim.denied['CLIENT LIST'] ? { off: 'the server refused CLIENT LIST for this user' } : clients()];
     if (key === 'GET /api/server/slowlog') return [200, p.sim.denied.SLOWLOG ? { off: 'the server refused SLOWLOG for this user' } : slowlog()];
     if (key === 'POST /api/server/monitor') {
-      idSeq += 1;
-      const run = idSeq;
-      session.monitor = { run, startedAt: null };
-      emitState();
-      later(250).then(() => {
-        if (!session || !session.monitor || session.monitor.run !== run) return;
-        if (p.sim.denied['CLIENT LIST']) {
-          closeMonitor('failed', 'the server refused MONITOR for this user');
-          return;
-        }
-        session.monitor.startedAt = Date.now();
-        emitState();
-        emit('monitor', { at_unix_ms: session.monitor.startedAt, kind: 'ready', max_lines: 10000, max_secs: 30, run });
-      });
-      return [202, { max_lines: 10000, max_secs: 30, run }];
+      if (session.monitor) return [422, { error: 'MONITOR is already running: stop it first.' }];
+      // Monitor always asks first, read-only connections too; production types the name.
+      const about = 'MONITOR shows every command the server runs, other users\' values included, and slows the server. It stops after 30 s or 10,000 lines.';
+      const question = p.env === 'prod'
+        ? { kind: 'type', expect: p.name, text: `${about} Type ${p.name} to start it on ${p.name}.`, mismatch: [422, 'MONITOR not started: the name typed did not match.'] }
+        : { kind: 'ask', text: `${about} Start it on ${p.name}?` };
+      return ask(question, () => startMonitor(p));
     }
     if (key === 'DELETE /api/server/monitor') return [200, { stopped: closeMonitor('stopped') }];
     if (key === 'GET /api/pubsub/channels') return [200, p.sim.denied.PUBSUB ? { off: 'the server refused PUBSUB CHANNELS for this user' } : channels()];
-    if (key === 'POST /api/pubsub/subscribe') {
-      if (!known(body, ['name', 'kind']) || typeof body.name !== 'string') return [400, { error: SHAPE }];
-      const name = body.name;
-      const pattern = /[*?[]/.test(name);
-      const wanted = body.kind || 'auto';
-      if (!['auto', 'channel', 'pattern', 'shard'].includes(wanted)) return [400, { error: 'kind is auto, channel, pattern or shard' }];
-      if (!name) return [422, { error: 'Type the channel or pattern to subscribe to.' }];
-      if (wanted === 'shard' && pattern) return [422, { error: "A pattern can't be shard-subscribed: type one shard channel's name." }];
-      const kind = wanted === 'auto' ? (pattern ? 'pattern' : 'channel') : wanted;
-      if (session.tail) emit('tail', { error: null, kind: 'closed', tail: session.tail.id });
-      idSeq += 1;
-      const id = idSeq;
-      session.tail = { id, kind, name, ready: false, matches: kind === 'pattern' ? globMatches(name) : [name] };
-      emitState();
-      later(200).then(() => {
-        if (!session || !session.tail || session.tail.id !== id) return;
-        if (p.sim.denied.PUBSUB) {
-          closeTail(kind === 'pattern' ? 'the server refused PSUBSCRIBE on that pattern for this user' : 'the server refused SUBSCRIBE on that channel for this user');
-          return;
-        }
-        session.tail.ready = true;
-        emitState();
-        emit('tail', { kind: 'ready', tail: id });
-      });
-      return [202, { kind, node: session.picked, tail: id }];
-    }
+    if (key === 'POST /api/pubsub/subscribe') return subscribe(p, body);
     if (key === 'DELETE /api/pubsub/subscribe') return [200, { stopped: closeTail() }];
-    if (key === 'POST /api/pubsub/publish') {
-      if (!known(body, ['channel', 'message', 'shard']) || typeof body.channel !== 'string' || typeof body.message !== 'string') return [400, { error: SHAPE }];
-      if (!body.channel) return [422, { error: 'Type the channel to publish to.' }];
-      if (p.read_only) return [422, { error: readOnly(p) }];
-      const send = () => {
-        const found = CHANNELS.find((c) => c[0] === body.channel);
-        let receivers = found ? found[1] : 0;
-        if (session && session.tail && session.tail.ready && session.tail.matches.includes(body.channel)) {
-          receivers += 1;
-          emit('tail', { dropped: 0, kind: 'messages', messages: [{ at_unix_ms: Date.now(), bytes: body.message.length, channel: body.channel, pattern: session.tail.kind === 'pattern' ? session.tail.name : null, preview: body.message }], tail: session.tail.id });
-        }
-        return [200, { reply: { kind: 'int', value: receivers }, sent: true }];
-      };
-      if (p.env === 'prod') return ask({ kind: 'ask', text: `Send PUBLISH ${body.channel} ${JSON.stringify(body.message)} to ${p.name}?` }, send);
-      return send();
-    }
+    if (key === 'POST /api/pubsub/publish') return publish(p, body);
     if (key === 'POST /api/cmdline') {
       if (typeof body.line !== 'string') return [400, { error: SHAPE }];
       return command(body.line.trim());
@@ -741,6 +748,69 @@ export function createMockServer({ entra = false } = {}) {
       return found ? [200, found] : [404, { error: 'the server has no docs for that name' }];
     }
     return [404, { error: 'not found' }];
+  }
+
+  function startMonitor(p) {
+    if (!live() || session.profile !== p) return [422, { error: NOT_LIVE }];
+    idSeq += 1;
+    const run = idSeq;
+    session.monitor = { run, startedAt: null };
+    emitState();
+    later(250).then(() => {
+      if (!session || !session.monitor || session.monitor.run !== run) return;
+      if (p.sim.denied['CLIENT LIST']) {
+        closeMonitor('failed', 'the server refused MONITOR for this user');
+        return;
+      }
+      session.monitor.startedAt = Date.now();
+      emitState();
+      emit('monitor', { at_unix_ms: session.monitor.startedAt, kind: 'ready', max_lines: 10000, max_secs: 30, run });
+    });
+    return [202, { max_lines: 10000, max_secs: 30, run }];
+  }
+
+  function subscribe(p, body) {
+    if (!known(body, ['name', 'kind']) || typeof body.name !== 'string') return [400, { error: SHAPE }];
+    const name = body.name;
+    const pattern = /[*?[]/.test(name);
+    const wanted = body.kind || 'auto';
+    if (!['auto', 'channel', 'pattern', 'shard'].includes(wanted)) return [400, { error: 'kind is auto, channel, pattern or shard' }];
+    if (!name) return [422, { error: 'Type the channel or pattern to subscribe to.' }];
+    if (wanted === 'shard' && pattern) return [422, { error: "A pattern can't be shard-subscribed: type one shard channel's name." }];
+    const kind = wanted === 'auto' ? (pattern ? 'pattern' : 'channel') : wanted;
+    if (session.tail) emit('tail', { error: null, kind: 'closed', tail: session.tail.id });
+    idSeq += 1;
+    const id = idSeq;
+    session.tail = { id, kind, name, ready: false, matches: kind === 'pattern' ? globMatches(name) : [name] };
+    emitState();
+    later(200).then(() => {
+      if (!session || !session.tail || session.tail.id !== id) return;
+      if (p.sim.denied.PUBSUB) {
+        closeTail(kind === 'pattern' ? 'the server refused PSUBSCRIBE on that pattern for this user' : 'the server refused SUBSCRIBE on that channel for this user');
+        return;
+      }
+      session.tail.ready = true;
+      emitState();
+      emit('tail', { kind: 'ready', tail: id });
+    });
+    return [202, { kind, node: session.picked, tail: id }];
+  }
+
+  function publish(p, body) {
+    if (!known(body, ['channel', 'message', 'shard']) || typeof body.channel !== 'string' || typeof body.message !== 'string') return [400, { error: SHAPE }];
+    if (!body.channel) return [422, { error: 'Type the channel to publish to.' }];
+    if (p.read_only) return [422, { error: readOnly(p) }];
+    const send = () => {
+      const found = CHANNELS.find((c) => c[0] === body.channel);
+      let receivers = found ? found[1] : 0;
+      if (session && session.tail && session.tail.ready && session.tail.matches.includes(body.channel)) {
+        receivers += 1;
+        emit('tail', { dropped: 0, kind: 'messages', messages: [{ at_unix_ms: Date.now(), bytes: body.message.length, channel: body.channel, pattern: session.tail.kind === 'pattern' ? session.tail.name : null, preview: body.message }], tail: session.tail.id });
+      }
+      return [200, { reply: { kind: 'int', value: receivers }, sent: true }];
+    };
+    if (p.env === 'prod') return ask({ kind: 'ask', text: `Send PUBLISH ${body.channel} ${JSON.stringify(body.message)} to ${p.name}?` }, send);
+    return send();
   }
 
   async function fetchFn(path, init = {}) {
