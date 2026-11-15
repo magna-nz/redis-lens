@@ -67,7 +67,7 @@ pub fn parse_connection_string(s: &str) -> Result<ParsedConnection, ConnError> {
         parse_uri(&format!("redis://{}", &s["valkey://".len()..]))?
     } else if lower.starts_with("valkeys://") {
         parse_uri(&format!("rediss://{}", &s["valkeys://".len()..]))?
-    } else if lower.contains("://") {
+    } else if has_scheme(s) {
         return Err(err(UNSUPPORTED_SCHEME));
     } else {
         parse_stackexchange(s)?
@@ -76,6 +76,17 @@ pub fn parse_connection_string(s: &str) -> Result<ParsedConnection, ConnError> {
         return Err(err(HOST_WITH_USERINFO));
     }
     Ok(parsed)
+}
+
+/// `s` starts with a URL scheme (`name://`): letters, digits, `+`, `-` and `.`, a letter
+/// first. A `://` later on, such as inside a StackExchange-style password, is not one.
+fn has_scheme(s: &str) -> bool {
+    s.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    })
 }
 
 /// A host name or an address and nothing else: no userinfo (`@`), path, query,
@@ -659,6 +670,16 @@ mod tests {
         assert!(p.endpoint.tls);
         assert_eq!(p.endpoint.host, "cache.example");
         assert_eq!(pw(&p), Some("pw-x"));
+    }
+
+    /// Found by `mask_hides_stackexchange_password`: a `://` inside a StackExchange-style
+    /// password is not a URL scheme.
+    #[test]
+    fn a_stackexchange_password_may_hold_a_scheme_separator() {
+        let p = parse_connection_string("h.example:6380,password=PW-a://b,ssl=True").unwrap();
+        assert_eq!(p.endpoint.host, "h.example");
+        assert_eq!(pw(&p), Some("PW-a://b"));
+        assert!(!mask("h.example:6380,password=PW-a://b").contains("PW-a"));
     }
 
     #[test]
