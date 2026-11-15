@@ -34,6 +34,7 @@ use crate::live::values::{
 };
 use crate::live::write::{Reply as WriteReply, list_marker};
 use crate::live::{CANCELLED, Dest, LiveError, LiveReply, LiveRequest, ReqId};
+use crate::model::ServerInfo;
 use crate::tui::app::Screen;
 use crate::tui::clipboard::CopyText;
 use crate::tui::editor::EditorJob;
@@ -254,14 +255,27 @@ impl ValueState {
 
     /// Sends the next page (the first when none came). False when nothing was sent.
     fn load(&mut self, act: &mut Act<'_>) -> bool {
-        let Some(row) = &self.row else {
+        let Some((dest, req)) = self.next_request(act.server()) else {
             return false;
         };
+        match act.send_to(dest, LiveRequest::Value(req)) {
+            Some(id) => {
+                self.loading = Some(id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The next page's request and where it goes (the first page when none came), as
+    /// [`Self::load`] sends it; `None` with no key. `server`: the session's server, for
+    /// field TTLs. The web dashboard sends it itself and gives the answer to
+    /// [`Self::answer`].
+    pub(crate) fn next_request(&mut self, server: Option<&ServerInfo>) -> Option<(Dest, Request)> {
+        let row = self.row.as_ref()?;
         let first = self.pages == 0;
         if first {
-            let supported = act
-                .server()
-                .is_some_and(|s| field_ttls_supported(s.flavor, &s.version));
+            let supported = server.is_some_and(|s| field_ttls_supported(s.flavor, &s.version));
             self.field_ttls = supported && self.httl_off.is_none();
         }
         let req = Request {
@@ -273,13 +287,30 @@ impl ValueState {
         };
         // On a cluster, to the owner of the key's slot.
         let dest = Dest::key(row.key.as_bytes().to_vec());
-        match act.send_to(dest, LiveRequest::Value(req)) {
-            Some(id) => {
-                self.loading = Some(id);
-                true
+        Some((dest, req))
+    }
+
+    /// The answer to a page [`Self::next_request`] built, as the screen takes it.
+    pub(crate) fn answer(&mut self, result: Result<LiveReply, LiveError>) {
+        match result {
+            Ok(LiveReply::Value(Reply::Gone)) => {
+                self.gone = true;
+                self.items = None;
+                self.next = None;
+                self.error = None;
             }
-            None => false,
+            Ok(LiveReply::Value(Reply::Page(page))) => self.take(page),
+            Ok(_) => {}
+            Err(e) => {
+                self.denied = matches!(e, LiveError::Denied(_));
+                self.error = Some(read_error(&e));
+            }
         }
+    }
+
+    /// The last read was refused: reading more asks again for nothing.
+    pub(crate) fn refused_read(&self) -> bool {
+        self.denied
     }
 
     /// Forgets a request that will never be answered (a rescan replaced the live
@@ -1705,20 +1736,7 @@ impl ViewState for ValueState {
             return;
         }
         self.loading = None;
-        match result {
-            Ok(LiveReply::Value(Reply::Gone)) => {
-                self.gone = true;
-                self.items = None;
-                self.next = None;
-                self.error = None;
-            }
-            Ok(LiveReply::Value(Reply::Page(page))) => self.take(page),
-            Ok(_) => {}
-            Err(e) => {
-                self.denied = matches!(e, LiveError::Denied(_));
-                self.error = Some(read_error(&e));
-            }
-        }
+        self.answer(result);
     }
 
     fn input(&self) -> Option<Input> {

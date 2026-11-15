@@ -140,8 +140,17 @@ pub fn estimate_for(depth: Depth, app: &App) -> Estimate {
     let Some(s) = app.session.as_ref() else {
         return estimate(depth, &empty_profile());
     };
+    estimate_of(depth, s, app.entry(s.id).and_then(|e| e.perms.as_ref()))
+}
+
+/// [`estimate_for`] of session `s` and its permission check alone (the web dashboard
+/// keeps both of its own session).
+pub(crate) fn estimate_of(
+    depth: Depth,
+    s: &Session,
+    perms: Option<&crate::model::PermissionReport>,
+) -> Estimate {
     let per_sec = ScanOptions::for_profile(&s.profile).max_commands_per_sec;
-    let perms = app.entry(s.id).and_then(|e| e.perms.as_ref());
     let server = s
         .figures
         .as_ref()
@@ -405,8 +414,23 @@ pub fn analysis_findings(app: &App, report: &ScanReport) -> Vec<Finding> {
     let Some(s) = app.session.as_ref() else {
         return Vec::new();
     };
-    let diff = s.diff();
-    let mut out: Vec<Finding> = recommendations(report, diff, &app.views.analysis.facts)
+    analysis_findings_of(
+        report,
+        s.diff(),
+        &app.views.analysis.facts,
+        &app.views.server.slow.entries,
+    )
+}
+
+/// [`analysis_findings`] from the report, its diff, the Big keys facts and the slow
+/// log alone (the web dashboard keeps these of its own session).
+pub(crate) fn analysis_findings_of(
+    report: &ScanReport,
+    diff: Option<&crate::diff::ReportDiff>,
+    facts: &std::collections::HashMap<String, crate::analysis::KeyFacts>,
+    slow: &[SlowEntry],
+) -> Vec<Finding> {
+    let mut out: Vec<Finding> = recommendations(report, diff, facts)
         .into_iter()
         .map(|rec| Finding {
             severity: rec.severity,
@@ -414,7 +438,7 @@ pub fn analysis_findings(app: &App, report: &ScanReport) -> Vec<Finding> {
             text: rec.text,
         })
         .collect();
-    out.extend(slow_finding(&app.views.server.slow.entries));
+    out.extend(slow_finding(slow));
     out
 }
 

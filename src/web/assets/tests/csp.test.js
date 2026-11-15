@@ -158,6 +158,7 @@ test('the pages say what they must', () => {
   const index = read('index.html');
   assert.match(index, /<script type="module" src="assets\/app\.js"><\/script>/);
   assert.match(index, /<html lang="en" data-theme="dark">/);
-  for (const area of ['overview', 'server', 'pubsub', 'connections']) assert.match(index, new RegExp(`href="#/${area}" data-nav="${area}"`));
-  assert.equal(/browse|analyze|streams|search/i.test(index), false, 'only the areas built in this phase are in the nav');
+  for (const area of ['overview', 'browse', 'analyze', 'server', 'pubsub', 'connections']) assert.match(index, new RegExp(`href="#/${area}" data-nav="${area}"`));
+  assert.equal(/#\/(streams|search)|data-nav="(streams|search)"/i.test(index), false, 'Streams and Search are not in the nav yet');
+  assert.match(index, /<form class="find" id="find-form" role="search"/, 'Find a key sits in the top bar');
 });

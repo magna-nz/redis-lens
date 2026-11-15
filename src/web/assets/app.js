@@ -3,20 +3,22 @@
 // The views live in views/*.js. Each exports `mount(root, ctx, route)` and returns a
 // function that unmounts it. They read data only through `ctx.api` (api.js).
 
-import { api, TEXT, initApi, acceptSignIn } from './api.js';
+import { api, TEXT, initApi, acceptSignIn, adaptAnalysis } from './api.js';
 import {
   h, fill, setIcon, envBadge, createThemeStore, createToasts, confirmDialog,
-  parseRoute, pushSeries, errorText,
+  parseRoute, pushSeries, errorText, analyzing,
 } from './ui.js';
 import * as connections from './views/connections.js';
 import * as overview from './views/overview.js';
+import * as browse from './views/browse.js';
+import * as analyze from './views/analyze.js';
 import * as server from './views/server.js';
 import * as pubsub from './views/pubsub.js';
 import * as cmdline from './views/cmdline.js';
 
-const VIEWS = { overview, server, pubsub, connections };
+const VIEWS = { overview, browse, analyze, server, pubsub, connections };
 const NAMES = Object.keys(VIEWS);
-const TITLES = { overview: 'Overview', server: 'Server', pubsub: 'Pub/Sub', connections: 'Connections' };
+const TITLES = { overview: 'Overview', browse: 'Browse', analyze: 'Analyze', server: 'Server', pubsub: 'Pub/Sub', connections: 'Connections' };
 
 const $ = (id) => document.getElementById(id);
 
@@ -24,7 +26,7 @@ const IDLE = {
   status: 'idle', connected: false, connecting: null, failed: null, conn: null, liveState: 'waiting', lost: null,
   tail: null, monitor: null, features: { entraId: false, version: null },
   polling: { paused: false, intervalSecs: 2, intervals: [1, 2, 3, 5, 10, 15, 30, 60] }, live: true,
-  monitorLimits: { maxLines: 10000, maxSecs: 30 },
+  monitorLimits: { maxLines: 10000, maxSecs: 30 }, analysis: adaptAnalysis(null),
 };
 
 const store = {
@@ -104,6 +106,28 @@ const ctx = {
     }
   },
   openCommandLine: () => setCommandLine(true),
+  /** Find keys by name (the search field in the top bar): the results show on Browse. */
+  findKey(text) {
+    const q = String(text ?? '').trim();
+    if (!q) return;
+    browse.requestFind(q);
+    ctx.navigate('#/browse');
+  },
+  /** Open a key's value (`Name`), or a pattern's keys, on Browse. */
+  openKey(name) {
+    browse.requestKey(name);
+    ctx.navigate('#/browse');
+  },
+  openPattern(name, node = null) {
+    browse.requestPattern(name, node);
+    ctx.navigate('#/browse');
+  },
+  /** Start an analysis from another area (Overview's buttons): Analyze asks first, with
+   *  its estimate, as the TUI does. */
+  analyze(depth) {
+    analyze.requestStart(depth);
+    ctx.navigate('#/analyze');
+  },
 };
 
 // ---------- Router ----------
@@ -113,11 +137,19 @@ function currentRoute() {
   return parseRoute(window.location.hash, NAMES, fallback);
 }
 
+/** The connection's status and live state as the areas see them: while an analysis runs it
+ *  connects again, and the areas stay as they are meanwhile (they follow the analysis). */
+function steady(s) {
+  if (!analyzing(s)) return { status: s.status, live: s.liveState };
+  return { status: 'connected', live: s.liveState === 'closed' ? 'closed' : 'ready' };
+}
+
 /** What makes a mounted view stale: who is connected, how, and to which node. */
 function viewKey() {
   const s = store.state;
   const c = s.conn;
-  return [s.status, s.failed, s.liveState, c && c.name, c && c.docker, c && c.env, c && c.readOnly, c && c.pickedNode].join('|');
+  const now = steady(s);
+  return [now.status, s.failed, now.live, c && c.name, c && c.docker, c && c.env, c && c.readOnly, c && c.pickedNode].join('|');
 }
 
 function render() {
@@ -149,14 +181,16 @@ function render() {
 function renderChrome() {
   const s = store.state;
   const pill = $('conn-pill');
-  if (s.connected && s.conn) {
-    const access = s.conn.readOnly ? 'read-only' : 'writes on';
+  const db = s.analysis && s.analysis.db ? `db ${s.analysis.db}` : null;
+  if ((s.connected || analyzing(s)) && s.conn) {
+    const access = analyzing(s) ? 'analyzing…' : s.conn.readOnly ? 'read-only' : 'writes on';
     fill(pill,
-      h('span', { class: s.lost ? 'dot busy' : 'dot ok', 'aria-hidden': 'true' }),
+      h('span', { class: s.lost || analyzing(s) ? 'dot busy' : 'dot ok', 'aria-hidden': 'true' }),
       h('span', { class: 'mono name clip', text: s.conn.name }),
       envBadge(s.conn.env),
+      db ? h('span', { class: 'badge mono', text: db }) : null,
       h('span', { class: 'muted access', text: access }));
-    pill.setAttribute('aria-label', `Connected to ${s.conn.name}, ${s.conn.env}, ${access}. Open Connections.`);
+    pill.setAttribute('aria-label', `Connected to ${s.conn.name}, ${s.conn.env}${db ? `, ${db}` : ''}, ${access}. Open Connections.`);
   } else if (s.connecting) {
     fill(pill,
       h('span', { class: 'dot busy', 'aria-hidden': 'true' }),
@@ -233,6 +267,7 @@ function showLocked() {
   $('conn-pill').hidden = true;
   $('live-toggle').hidden = true;
   $('poll-interval').hidden = true;
+  $('find-form').hidden = true;
 }
 
 /** `?mock` in a build without the sample servers: say so, and show nothing made up. */
@@ -246,6 +281,7 @@ function showNoMock(text) {
   $('conn-pill').hidden = true;
   $('live-toggle').hidden = true;
   $('poll-interval').hidden = true;
+  $('find-form').hidden = true;
 }
 
 // ---------- The command line panel ----------
@@ -277,7 +313,7 @@ function applyState(next) {
   if (now && (next.connected || next.connecting)) store.lastTarget = targetOf(now);
   // The bars are one reading apart: start them again when what they show changes (another
   // connection or node) or when the readings get another spacing.
-  const moved = (was && was.name) !== (now && now.name) || (was && was.pickedNode) !== (now && now.pickedNode) || prev.status !== next.status;
+  const moved = (was && was.name) !== (now && now.name) || (was && was.pickedNode) !== (now && now.pickedNode) || steady(prev).status !== steady(next).status;
   if (moved || prev.polling.intervalSecs !== next.polling.intervalSecs) {
     store.series = { ops: [], clients: [], everySecs: next.polling.intervalSecs };
     if (moved) {
@@ -363,10 +399,32 @@ async function boot() {
   $('poll-interval').addEventListener('change', (e) => setPolling({ intervalSecs: Number(e.target.value) }));
   $('cmd-toggle').addEventListener('click', () => setCommandLine($('cmdline').hidden));
 
+  // Find a key, from anywhere: the results show on Browse. `/` comes here from any area
+  // when no text box has the focus.
+  $('find-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = $('find-input').value.trim();
+    if (!text) return;
+    if (!store.state.connected && !analyzing(store.state)) {
+      notify('Connect first: open Connections and pick a connection. Then keys can be found.', 'info');
+      return;
+    }
+    ctx.findKey(text);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey || store.locked) return;
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.closest('dialog'))) return;
+    e.preventDefault();
+    $('find-input').focus();
+    $('find-input').select();
+  });
+
   // The stores that keep running whatever view is shown (the tail, Monitor) hear about a
   // new state first, so a view drawn for it finds them up to date.
   pubsub.init(api);
   server.init(api);
+  analyze.init(api);
 
   api.setConfirmHandler((confirm) => confirmDialog(confirm));
   api.on('state', applyState);

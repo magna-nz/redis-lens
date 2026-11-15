@@ -3,6 +3,9 @@
 // `node --test "src/web/assets/tests/*.test.js"` runs them one process each instead; both
 // run the same tests. csp.test.js checks that this list has every *.test.js file.
 import './api.test.js';
+import './browse-api.test.js';
+import './browse-mock.test.js';
+import './browse.test.js';
 import './confirm.test.js';
 import './csp.test.js';
 import './format.test.js';

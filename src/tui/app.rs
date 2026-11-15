@@ -1316,7 +1316,7 @@ fn pattern_data_of<'a>(
 
 /// The key count Browse's name estimates scale to: `DBSIZE` from the connect's figures
 /// (summed over a cluster's nodes), or the server line's.
-fn names_dbsize(s: &Session) -> u64 {
+pub(crate) fn names_dbsize(s: &Session) -> u64 {
     s.figures
         .as_ref()
         .and_then(|f| f.server.as_ref())

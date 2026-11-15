@@ -10,13 +10,13 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 use super::writes::{self, Action};
-use super::{App, Body, Question, SHAPE, error, ok};
+use super::{App, Body, Q, Question, SHAPE, error, ok};
 use crate::live::cmdline::{self, Args, CommandInfo, Gate, Reply as CmdReply, Request};
 use crate::live::command;
 use crate::live::{CANCELLED, Dest, LiveError, LiveReply, LiveRequest};
@@ -42,6 +42,8 @@ pub struct Meta {
 /// A readonly `@dangerous` command waiting for its confirmation.
 pub struct Asked {
     conn: ConnId,
+    /// The run of the session it was asked in: a new run refuses the answer.
+    run: u64,
     args: Args,
     info: CommandInfo,
     dest: Dest,
@@ -233,7 +235,11 @@ pub async fn run(State(app): State<App>, Body(l): Body<Line>) -> Response {
     if let Some(why) = command::refused(&args) {
         return ok(Ran::note(line, why));
     }
-    let Some(conn) = app.hub.with(|c| c.live_ready().then_some(c.id)).flatten() else {
+    let Some((conn, run)) = app
+        .hub
+        .with(|c| c.live_ready().then(|| writes::run_of(c)))
+        .flatten()
+    else {
         return ok(Ran::note(line, NOT_OPEN).with("failed", NOT_OPEN));
     };
     let Some(name) = name_of(&args[0]) else {
@@ -287,10 +293,10 @@ pub async fn run(State(app): State<App>, Body(l): Body<Line>) -> Response {
                 if !repeatable(&op, &decision) {
                     return ok(Ran::note(meta.line, REPEAT_ASKS));
                 }
-                return ok(repeat_writes(&app, conn, op, dest, &meta).await);
+                return ok(repeat_writes(&app, (conn, run), op, dest, &meta).await);
             }
             match &decision {
-                Decision::Run => match writes::grant(&app, conn, op, &Answer::None) {
+                Decision::Run => match writes::grant(&app, (conn, run), op, &Answer::None) {
                     Ok(permit) => send_write(&app, conn, dest, permit, meta).await,
                     Err(r) => r.into_response(),
                 },
@@ -301,6 +307,7 @@ pub async fn run(State(app): State<App>, Body(l): Body<Line>) -> Response {
                     app.ask(
                         Action::Write {
                             conn,
+                            run,
                             op,
                             dest,
                             decision,
@@ -364,6 +371,7 @@ pub async fn run(State(app): State<App>, Body(l): Body<Line>) -> Response {
             app.ask(
                 Action::Command(Asked {
                     conn,
+                    run,
                     args,
                     info,
                     dest,
@@ -477,12 +485,18 @@ async fn reads(
 
 /// A write repeated: each one decided and granted by the write gate right before it is
 /// sent, one at a time.
-async fn repeat_writes(app: &App, conn: ConnId, op: WriteOp, dest: Dest, meta: &Meta) -> Ran {
+async fn repeat_writes(
+    app: &App,
+    (conn, run): (ConnId, u64),
+    op: WriteOp,
+    dest: Dest,
+    meta: &Meta,
+) -> Ran {
     let mut out = Ran::new(meta);
     while out.sent < meta.times {
         app.hub.follow_saved_profile().await;
         let decision = app.hub.with(|c| {
-            (c.id == conn).then(|| {
+            (writes::run_of(c) == (conn, run)).then(|| {
                 crate::write::decide_op(&op, c.profile(), &c.settings, &c.session.refusals)
             })
         });
@@ -495,7 +509,7 @@ async fn repeat_writes(app: &App, conn: ConnId, op: WriteOp, dest: Dest, meta: &
         if !repeatable(&op, &decision) {
             return out.with("failed", REPEAT_ASKS);
         }
-        let permit = match writes::grant(app, conn, op.clone(), &Answer::None) {
+        let permit = match writes::grant(app, (conn, run), op.clone(), &Answer::None) {
             Ok(p) => p,
             Err(_) => return out.with("failed", cmdline::NOT_SENT),
         };
@@ -535,6 +549,10 @@ pub async fn send_write(
 /// The answer to a `@dangerous` readonly command's question: on `prod` the profile's
 /// name must be typed, as in the TUI.
 pub async fn confirmed(app: &App, a: Asked, typed: Option<String>) -> Response {
+    // Asked about another run of the session (another database): not sent there.
+    if app.hub.with(writes::run_of) != Some((a.conn, a.run)) {
+        return error(StatusCode::CONFLICT, writes::CHANGED);
+    }
     if let Some(want) = &a.expect
         && typed.as_deref() != Some(want.as_str())
     {
@@ -612,7 +630,7 @@ impl Help {
 
 /// `GET /api/cmdline/help?name=<command>`: what `COMMAND DOCS` says (Redis 7.0 and
 /// later, and Valkey); `{"off": ...}` on an older server.
-pub async fn help(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Response {
+pub async fn help(State(app): State<App>, Q(q): Q<HashMap<String, String>>) -> Response {
     let Some(name) = q.get("name").and_then(|n| name_of(n.as_bytes())) else {
         return error(
             StatusCode::BAD_REQUEST,

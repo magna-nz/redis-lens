@@ -157,7 +157,40 @@ pub struct Current {
     pub live: LiveFigures,
     /// The last `overview` event's data ([`Hub::emit_overview_if_changed`]).
     pub last_overview: Option<serde_json::Value>,
+    /// The analysis of this session: how the last one went ([`Hub::new_run`]).
+    pub analysis: AnalysisRun,
+    /// Browse and Analyze: the key names, the key lists, the values open, the
+    /// database list, Big keys' facts and Slots.
+    pub browse: crate::web::api::browse::Browse,
+    /// The hub has a snapshot directory of its own (tests): the runner's lookup of the
+    /// last snapshot, in the default directory, is ignored.
+    own_snapshots: bool,
+    /// The tail to subscribe again once a database switch's live connection is ready,
+    /// as the TUI does.
+    resub: Option<(Subscription, usize)>,
 }
+
+/// How this session's analyses went, beside what the TUI's [`Session`] keeps (the
+/// phase, the progress, the partial results, the report, its history and trend).
+#[derive(Debug, Default)]
+pub struct AnalysisRun {
+    /// When the running (or last) analysis started, in Unix seconds.
+    pub started_unix: Option<i64>,
+    pub started: Option<Instant>,
+    /// Why the last analysis failed, in redis-lens's own words.
+    pub error: Option<String>,
+    /// What the last stop did when it kept nothing.
+    pub note: Option<&'static str>,
+    /// When the last `progress` event of kind `sampling` went out.
+    last_event: Option<Instant>,
+    /// A report just finished, whose comparison with the last snapshot is to be loaded.
+    history_due: Option<Box<crate::model::ScanReport>>,
+}
+
+/// Why an analysis that kept nothing changed nothing, as the TUI says it.
+pub const STOPPED_EMPTY: &str = "Analysis stopped before it sampled any key. Nothing changed.";
+/// `progress` events of kind `sampling` go out at most this often.
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 
 impl Current {
     fn new(id: ConnId, profile: Profile, source: SecretSource, docker: bool) -> Self {
@@ -207,7 +240,31 @@ impl Current {
             client_conns: Vec::new(),
             live: LiveFigures::default(),
             last_overview: None,
+            analysis: AnalysisRun::default(),
+            browse: Default::default(),
+            own_snapshots: false,
+            resub: None,
         }
+    }
+
+    /// The name this session's reports and snapshots are saved under: the profile's
+    /// name, or `docker:<container>` for a container, as the TUI names them.
+    pub fn report_name(&self) -> String {
+        if self.docker {
+            format!(
+                "{}{}",
+                crate::cli::conn::DOCKER_PREFIX,
+                self.session.profile.name
+            )
+        } else {
+            self.session.profile.name.clone()
+        }
+    }
+
+    /// An analysis connects or samples now.
+    pub fn analysis_running(&self) -> bool {
+        self.session.analysis.is_some()
+            && matches!(self.session.phase, Phase::Connecting | Phase::Scanning)
     }
 
     pub fn profile(&self) -> &Profile {
@@ -283,6 +340,15 @@ pub struct Hub {
     clients: AtomicUsize,
     /// A command line is running ([`Hub::line_slot`]).
     line_running: std::sync::atomic::AtomicBool,
+    /// Where snapshots are saved and read: `None` for the TUI's own directory
+    /// ([`crate::snapshot::default_dir`]); the integration tests give their own.
+    snapshots: Option<PathBuf>,
+    /// Tests: requests sent through [`Hub::send`], and whether they are held (kept
+    /// waiting for [`Hub::answer_oldest`]) instead of going to the runtime.
+    #[cfg(test)]
+    test_sent: AtomicUsize,
+    #[cfg(test)]
+    test_hold: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Hub {
@@ -352,6 +418,16 @@ impl Hub {
     /// A hub with no connection, for the config file at `config`, reading saved
     /// profiles' credentials from `store`. Must be called inside a tokio runtime.
     pub fn new(config: PathBuf, store: Arc<dyn SecretStore>) -> Arc<Self> {
+        Self::with_snapshots(config, store, None)
+    }
+
+    /// [`Self::new`] saving and reading snapshots in `snapshots` instead of the TUI's
+    /// directory, when given: for the integration tests.
+    pub fn with_snapshots(
+        config: PathBuf,
+        store: Arc<dyn SecretStore>,
+        snapshots: Option<PathBuf>,
+    ) -> Arc<Self> {
         let (runner, msgs) = Headless::new(config.clone(), Arc::new(MemoryStore::default()));
         let (events, _) = broadcast::channel(EVENTS_KEPT);
         let hub = Arc::new(Self {
@@ -368,6 +444,11 @@ impl Hub {
             events,
             clients: AtomicUsize::new(0),
             line_running: std::sync::atomic::AtomicBool::new(false),
+            snapshots,
+            #[cfg(test)]
+            test_sent: AtomicUsize::new(0),
+            #[cfg(test)]
+            test_hold: std::sync::atomic::AtomicBool::new(false),
         });
         tokio::spawn(pump(Arc::downgrade(&hub), msgs));
         hub
@@ -566,6 +647,7 @@ impl Hub {
             g.next_conn += 1;
             let mut cur = Current::new(id, profile.clone(), source.clone(), docker);
             cur.settings = settings;
+            cur.own_snapshots = self.snapshots.is_some();
             // The old session goes first: its requests are answered as closed.
             g.cur = Some(cur);
             // The store and the connect it is for go in under one lock: two connects at
@@ -583,7 +665,237 @@ impl Hub {
             });
         }
         self.emit_state();
+        if self.snapshots.is_some() {
+            self.find_last_snapshot();
+        }
         Ok(())
+    }
+
+    /// The snapshot directory: the hub's own, or the TUI's.
+    pub fn snapshot_dir(&self) -> Result<PathBuf, crate::snapshot::SnapshotError> {
+        match &self.snapshots {
+            Some(d) => Ok(d.clone()),
+            None => crate::snapshot::default_dir(),
+        }
+    }
+
+    /// Overview's "Last analysis" from the hub's own snapshot directory, as the runner
+    /// reads it from the TUI's on connect.
+    fn find_last_snapshot(self: &Arc<Self>) {
+        let Some((id, name)) = self.with(|c| (c.id, c.report_name())) else {
+            return;
+        };
+        let Ok(dir) = self.snapshot_dir() else {
+            return;
+        };
+        let hub = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let last = tokio::task::spawn_blocking(move || crate::tui::last_snapshot(&dir, &name))
+                .await
+                .ok()
+                .flatten();
+            let Some(hub) = hub.upgrade() else { return };
+            hub.with_mut(|c| {
+                if c.id == id && c.session.last_snapshot.is_none() {
+                    c.session.last_snapshot = last;
+                }
+            });
+            hub.emit_overview_if_changed();
+        });
+    }
+
+    /// Starts a new run of the session on its profile, as the TUI's `r` and database
+    /// switch do: with `analysis`, an analysis of that depth (the TUI's
+    /// [`Effect::Connect`] with its sample, so the same `ScanOptions`, budget and, on a
+    /// cluster, shard by shard); with `db`, a switch to that database, which reads no
+    /// key. The live connection is opened again by the run: requests in flight are
+    /// answered as closed, the tail and Monitor end (a switch subscribes the tail again
+    /// once the new connection is ready). Until an analysis's first results, the last
+    /// report stays. Returns the run's number.
+    pub fn new_run(
+        self: &Arc<Self>,
+        analysis: Option<crate::tui::app::views::overview::Depth>,
+        db: Option<u32>,
+    ) -> Result<u64, crate::web::api::Refused> {
+        use crate::web::api::Refused;
+        use axum::http::StatusCode;
+        let mut events = Vec::new();
+        let scan = {
+            let mut g = lock(&self.inner);
+            let Inner { runner, cur, .. } = &mut *g;
+            let Some(c) = cur.as_mut() else {
+                return Err(Refused::new(StatusCode::CONFLICT, NOT_CONNECTED));
+            };
+            match c.session.phase {
+                Phase::Failed(_) => return Err(Refused::new(StatusCode::CONFLICT, CONNECT_FAILED)),
+                Phase::Connecting if c.session.analysis.is_none() => {
+                    return Err(Refused::new(StatusCode::CONFLICT, STILL_CONNECTING));
+                }
+                Phase::Connecting | Phase::Scanning => {
+                    return Err(Refused::new(StatusCode::CONFLICT, ANALYSIS_RUNS));
+                }
+                Phase::Connected | Phase::Done => {}
+            }
+            let tail = c.tail.take();
+            if let Some(t) = &tail {
+                events.push(Event::new(
+                    "tail",
+                    serde_json::json!({ "tail": t.id, "kind": "closed", "error": null }),
+                ));
+            }
+            if let Some(m) = c.monitor.take() {
+                runner.run(Effect::StopMonitor {
+                    id: c.id,
+                    run: m.run,
+                });
+                events.push(Event::new(
+                    "monitor",
+                    serde_json::json!({ "run": m.run, "kind": "closed", "end": "stopped", "error": null }),
+                ));
+            }
+            c.resub = db.and(tail.map(|t| (t.to, t.node)));
+            c.drain();
+            let s = &mut c.session;
+            // The report on screen: an earlier run's kept one, or this run's own.
+            s.previous = s.report.as_ref().and(s.previous.or(Some(s.scan)));
+            s.scan += 1;
+            if let Some(db) = db {
+                s.profile.db = db;
+            }
+            s.target = None;
+            s.progress = None;
+            s.phase = Phase::Connecting;
+            s.partial = None;
+            s.rescan = true;
+            s.live = LiveState::Waiting;
+            s.analysis = analysis;
+            s.stopped = false;
+            if analysis.is_none() {
+                // Nothing replaces the earlier results: they were of another database.
+                s.previous = None;
+                s.report = None;
+                s.history = History::Pending;
+                s.trend = None;
+            }
+            let scan = s.scan;
+            c.analysis = AnalysisRun {
+                started_unix: analysis.map(|_| unix_secs()),
+                started: analysis.map(|_| Instant::now()),
+                ..AnalysisRun::default()
+            };
+            c.browse.new_run(db.is_some());
+            runner.run(Effect::Connect {
+                id: c.id,
+                scan,
+                profile: c.session.profile.clone(),
+                secrets: c.source.clone(),
+                sample: analysis.map(crate::tui::app::views::overview::Depth::sample_limit),
+            });
+            if let Some(d) = analysis {
+                events.push(Event::new(
+                    "progress",
+                    serde_json::json!({
+                        "run": scan,
+                        "kind": "started",
+                        "depth": crate::web::api::analyze::depth_name(d),
+                        "sample_limit": d.sample_limit(),
+                    }),
+                ));
+            }
+            scan
+        };
+        self.emit_state();
+        self.emit_all(events);
+        Ok(scan)
+    }
+
+    /// Asks the running analysis to stop, as `esc` does in the TUI: it stops within one
+    /// batch and what it sampled becomes the report, marked stopped. `Ok(false)` when it
+    /// was asked already.
+    pub fn stop_analysis(&self) -> Result<bool, crate::web::api::Refused> {
+        let stopped = {
+            let mut g = lock(&self.inner);
+            let Inner { runner, cur, .. } = &mut *g;
+            let Some(c) = cur.as_mut().filter(|c| c.analysis_running()) else {
+                return Err(crate::web::api::Refused::new(
+                    axum::http::StatusCode::CONFLICT,
+                    NO_ANALYSIS,
+                ));
+            };
+            if c.session.stopped {
+                return Ok(false);
+            }
+            c.session.stopped = true;
+            runner.run(Effect::StopAnalysis {
+                id: c.id,
+                scan: c.session.scan,
+            });
+            c.session.scan
+        };
+        self.emit(Event::new(
+            "progress",
+            serde_json::json!({ "run": stopped, "kind": "stopping" }),
+        ));
+        self.emit_state();
+        Ok(true)
+    }
+
+    /// Loads the comparison of a report just finished with the newest snapshot before
+    /// it, and the trend over the snapshots before that, from the hub's snapshot
+    /// directory, as the TUI's runner does after an analysis.
+    fn load_history(
+        self: &Arc<Self>,
+        id: ConnId,
+        scan: u64,
+        report: Box<crate::model::ScanReport>,
+    ) {
+        let dir = self.snapshot_dir();
+        let hub = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let taken = report.taken_at_unix;
+            let loaded = tokio::task::spawn_blocking(move || {
+                let dir = dir?;
+                let prev = crate::snapshot::latest_before(
+                    &dir,
+                    &report.profile,
+                    report.taken_at_unix,
+                    report.match_glob.as_deref(),
+                )?;
+                let diff = prev.map(|p| crate::diff::diff(&p, &report));
+                let trend = crate::tui::load_trend(&dir, &report).ok();
+                Ok::<_, crate::snapshot::SnapshotError>((diff, trend))
+            })
+            .await;
+            let Some(hub) = hub.upgrade() else { return };
+            let applied = hub.with_mut(|c| {
+                let s = &mut c.session;
+                if c.id != id
+                    || s.scan != scan
+                    || s.report.as_ref().is_none_or(|r| r.taken_at_unix != taken)
+                {
+                    return false;
+                }
+                match loaded {
+                    Ok(Ok((Some(d), trend))) => {
+                        s.history = History::Diff(d);
+                        s.trend = trend;
+                    }
+                    Ok(Ok((None, trend))) => {
+                        s.history = History::NoSnapshot;
+                        s.trend = trend;
+                    }
+                    _ => s.history = History::Failed(SNAPSHOTS_UNREAD.to_string()),
+                }
+                true
+            });
+            if applied == Some(true) {
+                hub.emit(Event::new(
+                    "progress",
+                    serde_json::json!({ "run": scan, "kind": "compared" }),
+                ));
+                hub.emit_overview_if_changed();
+            }
+        });
     }
 
     /// A session on `profile` as if its connect had finished, the live connection
@@ -678,6 +990,35 @@ impl Hub {
         self.with(|c| c.pending.len()).unwrap_or(0)
     }
 
+    /// Tests: from now on requests wait until [`Self::answer_oldest`] answers them
+    /// (`true`), or go to the runtime as usual (`false`).
+    #[cfg(test)]
+    pub(crate) fn hold_requests(&self, hold: bool) {
+        self.test_hold.store(hold, Ordering::SeqCst);
+    }
+
+    /// Tests: how many requests (reads and writes) were sent so far.
+    #[cfg(test)]
+    pub(crate) fn sent_count(&self) -> usize {
+        self.test_sent.load(Ordering::SeqCst)
+    }
+
+    /// Tests: answers the oldest request still waiting with `result`. False when none
+    /// waits.
+    #[cfg(test)]
+    pub(crate) fn answer_oldest(&self, result: LiveResult) -> bool {
+        self.with_mut(|c| {
+            let Some(id) = c.pending.keys().min_by_key(|r| r.0).copied() else {
+                return false;
+            };
+            c.writes.remove(&id);
+            c.pending
+                .remove(&id)
+                .is_some_and(|tx| tx.send(result).is_ok())
+        })
+        .unwrap_or(false)
+    }
+
     fn send(
         &self,
         conn: Option<ConnId>,
@@ -701,6 +1042,13 @@ impl Hub {
             c.writes.insert(req_id, name);
         }
         let id = c.id;
+        #[cfg(test)]
+        {
+            self.test_sent.fetch_add(1, Ordering::SeqCst);
+            if self.test_hold.load(Ordering::SeqCst) {
+                return Ok((id, req_id, rx));
+            }
+        }
         runner.run(Effect::Live {
             id,
             req_id,
@@ -853,15 +1201,22 @@ impl Hub {
     }
 
     /// One message from the runtime.
-    fn apply(&self, msg: Msg) {
+    fn apply(self: &Arc<Self>, msg: Msg) {
         let mut events = Vec::new();
         let mut state = false;
+        let history;
         {
             let mut g = lock(&self.inner);
-            let Inner { runner, cur, .. } = &mut *g;
+            let Inner {
+                runner,
+                cur,
+                next_tail,
+                ..
+            } = &mut *g;
             let Some(c) = cur.as_mut() else {
                 return;
             };
+            let ready = matches!(&msg, Msg::LiveReady { id, scan } if this(c, *id, *scan));
             let live_closed =
                 matches!(&msg, Msg::LiveClosed { id, scan, .. } if this(c, *id, *scan));
             let was_failed = c.failed();
@@ -889,6 +1244,43 @@ impl Hub {
                     }),
                 ));
             }
+            history = c
+                .analysis
+                .history_due
+                .take()
+                .map(|r| (c.id, c.session.scan, r));
+            // After a database switch, the tail that ran subscribes again on the new
+            // live connection, as in the TUI.
+            let resub = if ready && c.live_ready() {
+                c.resub.take()
+            } else {
+                None
+            };
+            if let Some((to, node)) = resub
+                && c.session.own_connection_refused(node).is_none()
+            {
+                let tail = *next_tail;
+                *next_tail += 1;
+                c.tail = Some(Tail {
+                    id: tail,
+                    to: to.clone(),
+                    node,
+                    ready: false,
+                });
+                runner.run(Effect::Subscribe {
+                    id: c.id,
+                    scan: c.session.scan,
+                    tail,
+                    profile: c.session.profile.clone(),
+                    secrets: c.source.clone(),
+                    to,
+                    node,
+                });
+                state = true;
+            }
+        }
+        if let Some((id, scan, report)) = history {
+            self.load_history(id, scan, report);
         }
         if state {
             self.emit_state();
@@ -982,7 +1374,12 @@ fn apply_to(c: &mut Current, msg: Msg, events: &mut Vec<Event>, state: &mut bool
             c.session.refusals = crate::tui::app::confirm::refusals_of(&perms);
             c.session.server = server;
             c.session.target = Some(target);
-            c.session.phase = Phase::Connected;
+            // An analysis's run samples next, as in the TUI.
+            c.session.phase = if c.session.analysis.is_some() {
+                Phase::Scanning
+            } else {
+                Phase::Connected
+            };
             c.session.connected_at_unix = Some(unix_secs());
             c.perms = Some(perms);
         }
@@ -1009,7 +1406,7 @@ fn apply_to(c: &mut Current, msg: Msg, events: &mut Vec<Event>, state: &mut bool
             c.session.phase = Phase::Failed(error);
             *state = true;
         }
-        Msg::LastSnapshot { id, scan, last } if this(c, id, scan) => {
+        Msg::LastSnapshot { id, scan, last } if this(c, id, scan) && !c.own_snapshots => {
             c.session.last_snapshot = last;
         }
         Msg::LiveReady { id, scan } if this(c, id, scan) && !c.failed() => {
@@ -1159,10 +1556,128 @@ fn apply_to(c: &mut Current, msg: Msg, events: &mut Vec<Event>, state: &mut bool
                 c.client_conns = list;
             }
         }
-        // The scan's progress and the rest are for the TUI's views.
+        Msg::ScanProgress { id, scan, progress } if this(c, id, scan) => {
+            if c.session.phase == Phase::Done {
+                return;
+            }
+            c.session.progress = Some(progress);
+            let due = progress.done
+                || c.analysis
+                    .last_event
+                    .is_none_or(|t| t.elapsed() >= PROGRESS_EVERY);
+            if due {
+                c.analysis.last_event = Some(Instant::now());
+                events.push(Event::new(
+                    "progress",
+                    serde_json::json!({
+                        "run": scan,
+                        "kind": "sampling",
+                        "sampled": progress.sampled,
+                        "target": progress.target,
+                        "patterns": c.session.partial.as_ref().map(|p| p.patterns.len()),
+                        "stopping": c.session.stopped,
+                    }),
+                ));
+            }
+        }
+        Msg::ScanPartial { id, scan, partial } if this(c, id, scan) => {
+            // As the TUI takes them: only while this run samples, and not over a report
+            // of its own; the first one replaces the previous run's report.
+            let s = &mut c.session;
+            let sampling =
+                s.phase == Phase::Scanning || (s.phase == Phase::Connected && s.previous.is_none());
+            if !sampling || (s.report.is_some() && s.previous.is_none()) {
+                return;
+            }
+            s.phase = Phase::Scanning;
+            if s.previous.take().is_some() {
+                s.report = None;
+                s.history = History::Pending;
+                s.trend = None;
+                *state = true;
+            }
+            s.partial = Some(partial);
+        }
+        Msg::ScanDone { id, scan, report } if this(c, id, scan) => {
+            *state = true;
+            let s = &mut c.session;
+            if s.stopped {
+                // Stopped before its first batch: the results on screen stay.
+                if report.sampled_keys == 0 {
+                    s.stopped = false;
+                    s.progress = None;
+                    s.previous = None;
+                    s.partial = None;
+                    s.phase = if s.report.is_some() {
+                        Phase::Done
+                    } else {
+                        Phase::Connected
+                    };
+                    c.analysis.note = Some(STOPPED_EMPTY);
+                    events.push(Event::new(
+                        "progress",
+                        serde_json::json!({ "run": scan, "kind": "stopped", "kept": false, "text": STOPPED_EMPTY }),
+                    ));
+                    return;
+                }
+                // It may have sampled its whole target before it saw the stop.
+                let target = s.progress.map_or(u64::MAX, |p| p.target);
+                s.stopped = report.sampled_keys < target;
+            }
+            s.server = Some(report.server.clone());
+            s.phase = Phase::Done;
+            s.partial = None;
+            s.history = History::Pending;
+            s.trend = None;
+            s.previous = None;
+            let summary = serde_json::json!({
+                "run": scan,
+                "kind": "done",
+                "sampled_keys": report.sampled_keys,
+                "patterns": report.patterns.len(),
+                "complete": report.complete,
+                "stopped": s.stopped,
+                "taken_at_unix": report.taken_at_unix,
+            });
+            c.analysis.history_due = Some(report.clone());
+            s.report = Some(*report);
+            events.push(Event::new("progress", summary));
+        }
+        Msg::ScanFailed { id, scan, error } if this(c, id, scan) => {
+            // The live connection stays: the dashboard keeps the session usable and says
+            // why (the TUI shows the failure on its own line). Partial results do not
+            // stay as if final; a report kept from before stays, still marked.
+            *state = true;
+            let s = &mut c.session;
+            s.stopped = false;
+            s.partial = None;
+            s.progress = None;
+            s.phase = if s.report.is_some() {
+                Phase::Done
+            } else {
+                Phase::Connected
+            };
+            let why = crate::value::escape(&crate::web::wording::analysis_failed(&error));
+            c.analysis.error = Some(why.clone());
+            events.push(Event::new(
+                "progress",
+                serde_json::json!({ "run": scan, "kind": "failed", "error": why }),
+            ));
+        }
+        // The rest is for the TUI's views.
         _ => {}
     }
 }
+
+/// Why phase 2's routes can't start a run.
+pub const NOT_CONNECTED: &str = "Not connected: connect first.";
+pub const CONNECT_FAILED: &str = "The connect failed: connect again first.";
+pub const STILL_CONNECTING: &str = "Still connecting: wait until the connection is ready.";
+pub const ANALYSIS_RUNS: &str = "An analysis is already running.";
+pub const NO_ANALYSIS: &str = "No analysis is running.";
+/// Why the comparison with the last snapshot is missing (never the file system's text,
+/// which names paths).
+pub const SNAPSHOTS_UNREAD: &str = "the snapshot directory could not be read";
 
 fn unix_secs() -> i64 {
     std::time::SystemTime::now()
@@ -1204,6 +1719,105 @@ pub struct State {
     pub monitor_limits: MonitorLimits,
     /// What this build can do.
     pub features: Features,
+    /// The analysis: running, done (and how old its report is) or none.
+    pub analysis: AnalysisDto,
+}
+
+/// The analysis part of the state.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AnalysisDto {
+    /// `none`, `connecting`, `sampling`, `stopping` or `done`.
+    pub status: &'static str,
+    /// The session's run: a new analysis or database switch is a new run.
+    pub run: u64,
+    /// `quick` or `deep`, while one runs or for the one that made the report.
+    pub depth: Option<&'static str>,
+    pub sampled: Option<u64>,
+    pub target: Option<u64>,
+    pub started_unix: Option<i64>,
+    /// Why the last analysis failed.
+    pub error: Option<String>,
+    /// What the last stop did when it kept nothing.
+    pub note: Option<&'static str>,
+    /// The report the panels show, if any.
+    pub report: Option<ReportSummary>,
+    /// The report is an earlier run's, kept while a new analysis has no results yet.
+    pub previous: bool,
+    /// The database the session reads.
+    pub db: u32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReportSummary {
+    pub taken_at_unix: i64,
+    pub age_secs: i64,
+    pub sampled_keys: u64,
+    pub patterns: usize,
+    /// Every key was looked at.
+    pub complete: bool,
+    /// The analysis was stopped early: its results are partial and are not saved.
+    pub stopped: bool,
+    /// `MEMORY USAGE` was allowed, so the figures have sizes.
+    pub sizes_available: bool,
+    /// The report has per-shard results (a cluster).
+    pub cluster: bool,
+}
+
+impl AnalysisDto {
+    fn of(c: Option<&Current>) -> Self {
+        let Some(c) = c else {
+            return Self {
+                status: "none",
+                run: 0,
+                depth: None,
+                sampled: None,
+                target: None,
+                started_unix: None,
+                error: None,
+                note: None,
+                report: None,
+                previous: false,
+                db: 0,
+            };
+        };
+        let s = &c.session;
+        let status = if c.analysis_running() {
+            if s.stopped {
+                "stopping"
+            } else if s.phase == Phase::Connecting {
+                "connecting"
+            } else {
+                "sampling"
+            }
+        } else if s.report.is_some() {
+            "done"
+        } else {
+            "none"
+        };
+        let now = unix_secs();
+        Self {
+            status,
+            run: s.scan,
+            depth: s.analysis.map(crate::web::api::analyze::depth_name),
+            sampled: s.progress.map(|p| p.sampled),
+            target: s.progress.map(|p| p.target),
+            started_unix: c.analysis.started_unix,
+            error: c.analysis.error.clone(),
+            note: c.analysis.note,
+            report: s.report.as_ref().map(|r| ReportSummary {
+                taken_at_unix: r.taken_at_unix,
+                age_secs: now.saturating_sub(r.taken_at_unix).max(0),
+                sampled_keys: r.sampled_keys,
+                patterns: r.patterns.len(),
+                complete: r.complete,
+                stopped: crate::tui::app::views::overview::stopped_early(s),
+                sizes_available: r.sizes_available,
+                cluster: r.nodes.is_some(),
+            }),
+            previous: s.previous.is_some() && s.report.is_some(),
+            db: s.profile.db,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -1309,6 +1923,7 @@ impl State {
                 polling,
                 monitor_limits,
                 features,
+                analysis: AnalysisDto::of(None),
             };
         };
         let s = &c.session;
@@ -1375,6 +1990,7 @@ impl State {
             polling,
             monitor_limits,
             features,
+            analysis: AnalysisDto::of(Some(c)),
         }
     }
 }
@@ -1595,5 +2211,154 @@ mod tests {
         let st = State::of(Some(&c), Polling::default());
         assert_eq!(st.live, "closed");
         assert_eq!(st.live_error.as_deref(), Some(crate::live::CONNECTION_LOST));
+    }
+
+    fn run(c: &mut Current, msg: Msg) -> (Vec<Event>, bool) {
+        let (mut events, mut state) = (Vec::new(), false);
+        apply_to(c, msg, &mut events, &mut state);
+        (events, state)
+    }
+
+    fn analysing() -> Current {
+        let mut c = Current::new(1, profile(Auth::None), SecretSource::Keychain, false);
+        c.session.scan = 2;
+        c.session.analysis = Some(crate::tui::app::views::overview::Depth::Quick);
+        c.session.phase = Phase::Scanning;
+        c.session.live = LiveState::Ready;
+        c
+    }
+
+    #[test]
+    fn an_analysis_reports_its_progress_results_and_end_as_events() {
+        let mut c = analysing();
+        // An earlier report stays until the first partial results.
+        c.session.report = Some(crate::tui::fixtures::previous_report(true));
+        c.session.previous = Some(1);
+        let progress = crate::scan::ScanProgress {
+            sampled: 10,
+            target: 100,
+            done: false,
+        };
+        let (events, _) = run(
+            &mut c,
+            Msg::ScanProgress {
+                id: 1,
+                scan: 2,
+                progress,
+            },
+        );
+        assert_eq!(events[0].name, "progress");
+        assert_eq!(events[0].data["kind"], "sampling");
+        assert_eq!(events[0].data["sampled"], 10);
+        // Throttled: the next one within the interval is not sent.
+        let (events, _) = run(
+            &mut c,
+            Msg::ScanProgress {
+                id: 1,
+                scan: 2,
+                progress,
+            },
+        );
+        assert!(events.is_empty());
+        // Another run's messages are not this one's.
+        let (events, _) = run(
+            &mut c,
+            Msg::ScanProgress {
+                id: 1,
+                scan: 1,
+                progress,
+            },
+        );
+        assert!(events.is_empty());
+        run(
+            &mut c,
+            Msg::ScanPartial {
+                id: 1,
+                scan: 2,
+                partial: crate::tui::fixtures::partial(true),
+            },
+        );
+        assert!(c.session.report.is_none() && c.session.previous.is_none());
+        assert!(c.session.partial.is_some());
+        let report = crate::tui::fixtures::report(true);
+        let (events, state) = run(
+            &mut c,
+            Msg::ScanDone {
+                id: 1,
+                scan: 2,
+                report: Box::new(report.clone()),
+            },
+        );
+        assert!(state);
+        assert_eq!(events[0].data["kind"], "done");
+        assert_eq!(events[0].data["sampled_keys"], report.sampled_keys);
+        assert_eq!(c.session.phase, Phase::Done);
+        assert!(c.session.partial.is_none());
+        assert!(c.analysis.history_due.is_some(), "its history loads next");
+        let st = AnalysisDto::of(Some(&c));
+        assert_eq!(st.status, "done");
+        assert_eq!(st.report.unwrap().sampled_keys, report.sampled_keys);
+    }
+
+    #[test]
+    fn a_failed_analysis_keeps_the_session_and_says_why_in_fixed_words() {
+        let mut c = analysing();
+        let (events, _) = run(
+            &mut c,
+            Msg::ScanFailed {
+                id: 1,
+                scan: 2,
+                error: "ResponseError: NOPERM this user has no permissions to run the 'scan' command (user lim)".into(),
+            },
+        );
+        assert_eq!(events[0].data["kind"], "failed");
+        let why = events[0].data["error"].as_str().unwrap();
+        assert!(!why.contains("lim") && !why.contains("NOPERM"), "{why}");
+        // The analysis failed, not the connection: it says so.
+        assert_eq!(why, crate::web::wording::ANALYSIS_REFUSED);
+        assert_eq!(c.analysis.error.as_deref(), Some(why));
+        assert_eq!(c.session.phase, Phase::Connected);
+        assert!(c.live_ready(), "the live views go on");
+        assert_eq!(AnalysisDto::of(Some(&c)).status, "none");
+    }
+
+    #[test]
+    fn a_stop_before_any_key_changes_nothing() {
+        let mut c = analysing();
+        c.session.stopped = true;
+        let mut empty = crate::tui::fixtures::report(true);
+        empty.sampled_keys = 0;
+        let (events, _) = run(
+            &mut c,
+            Msg::ScanDone {
+                id: 1,
+                scan: 2,
+                report: Box::new(empty),
+            },
+        );
+        assert_eq!(events[0].data["kind"], "stopped");
+        assert_eq!(events[0].data["text"], STOPPED_EMPTY);
+        assert!(c.session.report.is_none());
+        assert_eq!(c.session.phase, Phase::Connected);
+        assert_eq!(c.analysis.note, Some(STOPPED_EMPTY));
+    }
+
+    #[test]
+    fn an_analysis_run_samples_after_its_connect() {
+        let mut c = analysing();
+        c.session.phase = Phase::Connecting;
+        assert_eq!(AnalysisDto::of(Some(&c)).status, "connecting");
+        run(
+            &mut c,
+            Msg::Connected {
+                id: 1,
+                scan: 2,
+                server: Some(crate::tui::fixtures::server()),
+                perms: crate::tui::fixtures::perms_ok(),
+                target: crate::conn::ScanTarget::Primary,
+            },
+        );
+        assert_eq!(c.session.phase, Phase::Scanning);
+        assert_eq!(AnalysisDto::of(Some(&c)).status, "sampling");
     }
 }

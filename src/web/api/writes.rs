@@ -5,7 +5,9 @@
 //! [`write::decide_op`] (the profile, the action, the refusals), and sent only inside a
 //! [`Permit`] that [`Permit::grant`] made, with the answer given. A decision of Ask or
 //! Type is held as an [`Action::Write`] and the browser is asked; the answer is checked
-//! by `grant` again, on the same connection only.
+//! by `grant` again, on the same connection and the same run only: a database switch
+//! or an analysis started since the question refuses it ([`CHANGED`]), as the TUI drops
+//! its question on a new run.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -25,6 +27,8 @@ pub enum Action {
     /// A write the gate asked about.
     Write {
         conn: ConnId,
+        /// The run of the session the question was asked in ([`run_of`]).
+        run: u64,
         op: WriteOp,
         dest: Dest,
         decision: Decision,
@@ -110,9 +114,26 @@ pub fn question(op: &WriteOp, decision: &Decision, profile: &str) -> Option<Ques
     }
 }
 
-/// Where `op` goes and what the gate says about it on the current connection: the
-/// connection's id and both, or why it is not sent.
-pub fn decide(app: &App, op: &WriteOp) -> Result<(ConnId, Dest, Decision, String), Refused> {
+/// The connection and the run of the session a write or a question is about: a new run
+/// (a database switch, an analysis) keeps the connection's id but not the run.
+pub fn run_of(c: &crate::web::session::Current) -> (ConnId, u64) {
+    (c.id, c.session.scan)
+}
+
+/// What [`decide`] found: where the write goes and what the gate says about it.
+#[derive(Debug)]
+pub struct Decided {
+    pub conn: ConnId,
+    pub run: u64,
+    pub dest: Dest,
+    pub decision: Decision,
+    /// The profile's name, escaped, for the question.
+    pub profile: String,
+}
+
+/// Where `op` goes and what the gate says about it on the current connection, or why it
+/// is not sent.
+pub fn decide(app: &App, op: &WriteOp) -> Result<Decided, Refused> {
     app.hub
         .with(|c| {
             if !c.live_ready() {
@@ -129,21 +150,30 @@ pub fn decide(app: &App, op: &WriteOp) -> Result<(ConnId, Dest, Decision, String
                 }
                 d => d,
             };
-            Ok((
-                c.id,
+            let (conn, run) = run_of(c);
+            Ok(Decided {
+                conn,
+                run,
                 dest,
                 decision,
-                crate::value::escape(&c.profile().name),
-            ))
+                profile: crate::value::escape(&c.profile().name),
+            })
         })
         .unwrap_or_else(|| Err(Refused::new(StatusCode::CONFLICT, super::NOT_LIVE)))
 }
 
-/// The permit for `op` on connection `conn` with `answer`, from the gate itself.
-pub fn grant(app: &App, conn: ConnId, op: WriteOp, answer: &Answer) -> Result<Permit, Refused> {
+/// The permit for `op` on connection `conn` in run `run` with `answer`, from the gate
+/// itself. Another connection, or a new run of it (a database switch, an analysis), is
+/// refused with [`CHANGED`]: the write was decided for what the session was then.
+pub fn grant(
+    app: &App,
+    (conn, run): (ConnId, u64),
+    op: WriteOp,
+    answer: &Answer,
+) -> Result<Permit, Refused> {
     app.hub
         .with(|c| {
-            if c.id != conn {
+            if run_of(c) != (conn, run) {
                 return Err(Refused::new(StatusCode::CONFLICT, CHANGED));
             }
             Permit::grant(op, c.profile(), &c.settings, &c.session.refusals, answer).map_err(
@@ -161,7 +191,8 @@ pub fn profile_data(p: &crate::model::Profile) -> [&str; 2] {
     [p.name.as_str(), p.endpoint.host.as_str()]
 }
 
-/// Why an answer is not used: the connection it was about is gone.
+/// Why an answer is not used: the connection it was about is gone, or the session
+/// started a new run on it (another database, an analysis).
 pub const CHANGED: &str = "Not sent: the connection changed since the question was asked.";
 
 /// Sends a granted write and says how it went.
@@ -183,13 +214,19 @@ pub async fn send(app: &App, conn: ConnId, dest: Dest, permit: Permit) -> Respon
 /// One write, start to end: refused, sent, or asked about.
 pub async fn write_flow(app: &App, op: WriteOp) -> Response {
     app.hub.follow_saved_profile().await;
-    let (conn, dest, decision, profile) = match decide(app, &op) {
+    let Decided {
+        conn,
+        run,
+        dest,
+        decision,
+        profile,
+    } = match decide(app, &op) {
         Ok(d) => d,
         Err(r) => return r.into_response(),
     };
     match &decision {
         Decision::Refuse(why) => error(StatusCode::UNPROCESSABLE_ENTITY, why),
-        Decision::Run => match grant(app, conn, op, &Answer::None) {
+        Decision::Run => match grant(app, (conn, run), op, &Answer::None) {
             Ok(p) => send(app, conn, dest, p).await,
             Err(r) => r.into_response(),
         },
@@ -200,6 +237,7 @@ pub async fn write_flow(app: &App, op: WriteOp) -> Response {
             app.ask(
                 Action::Write {
                     conn,
+                    run,
                     op,
                     dest,
                     decision,
@@ -256,6 +294,7 @@ pub async fn answer(
     match action {
         Action::Write {
             conn,
+            run,
             op,
             dest,
             decision,
@@ -267,7 +306,7 @@ pub async fn answer(
             };
             // The profile may have gone read-only since the question was asked.
             app.hub.follow_saved_profile().await;
-            let permit = match grant(&app, conn, op, &answer) {
+            let permit = match grant(&app, (conn, run), op, &answer) {
                 Ok(p) => p,
                 Err(r) => return r.into_response(),
             };

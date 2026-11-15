@@ -6,7 +6,8 @@ The JSON API and event stream the web dashboard's page talks to (`src/web/`). Th
 Every example reply below was captured from a real run: a test that started the dashboard
 with `redis_lens::web::start_with` against a Redis 7 container, a temporary config file and
 an in-memory credential store (`MemoryStore`). Ports and times are from that run. Long lists
-are cut, and each place that is cut says so.
+are cut, and each place that is cut says so. The examples of Browse, Analyze and snapshots
+were captured by `tests/web_p2_it.rs` (see [Browse, Analyze and snapshots](#browse-analyze-and-snapshots)).
 
 ## Listening and signing in
 
@@ -95,13 +96,19 @@ Example, `GET /api/state (wrong Host)`. Reply: HTTP 403
 - Bodies are JSON. An empty body counts as `{}`. A body this route does not take
   (wrong shape, unknown field) gets 400 `{"error":"the request body is not the JSON this route takes"}`.
   The input is never echoed back.
+- A query string this route does not take (a parameter missing, or not of its type, such
+  as `GET /api/find` without `q`, `GET /api/value/item?view=abc` or
+  `GET /api/analysis/slots?refresh=true`) gets 400
+  `{"error":"the query parameters are not the ones this route takes"}`, as JSON like every
+  other refusal. The input is never echoed back.
 - Errors are `{"error": "<text>"}`.
 - Status codes:
   - 200: done.
-  - 201: a connection was added.
-  - 202: started, with the result arriving as events (connect, subscribe, Monitor).
-  - 400: a body this route does not take (also one over 2 MiB), or a change
-    `conn add`/`conn set` refuses (the reason is in `error`).
+  - 201: a connection was added, or a snapshot saved.
+  - 202: started, with the result arriving as events (connect, subscribe, Monitor, an
+    analysis, a database switch).
+  - 400: a body or a query string this route does not take (also a body over 2 MiB), or
+    a change `conn add`/`conn set` refuses (the reason is in `error`).
   - 404: no such connection or route.
   - 409: there is no live connection (`{"error":"not connected: connect first, or the live connection is closed"}`),
     a confirm is needed (see below), or a command line is still running
@@ -154,8 +161,12 @@ and so does starting Monitor (it always asks) and turning writes on:
   prod profiles), and `expect` holds that name.
 - `POST /api/confirm/<id>` with `{}` (ask) or `{"typed": "<name>"}` (type) answers yes. The
   gate checks again at that point, with the profile's `read_only` and `env` read again from
-  the config file: a different connection (409 or 410), a profile that is now read-only
-  (422), or a wrong typed name means it is not sent.
+  the config file: a different connection (409 or 410), a new run of the same connection
+  since the question (a database switch or an analysis started: 409
+  `{"error":"Not sent: the connection changed since the question was asked."}`), a profile
+  that is now read-only (422), or a wrong typed name means it is not sent. The same holds
+  for a `@dangerous` command line's question, and for a repeated write that a new run
+  interrupts.
 - `DELETE /api/confirm/<id>` cancels.
 - Each id can be used once and expires after 2 minutes. After that both routes answer 410.
   Expired questions, and what they held, are dropped every 10 s even when no request comes.
@@ -228,6 +239,7 @@ stream.
 | `tail` | pub/sub tail | `{tail, kind: "ready"}`, `{tail, kind: "messages", messages: [...], dropped}`, `{tail, kind: "closed", error}` |
 | `monitor` | Monitor run | `{run, kind: "ready", at_unix_ms, max_lines, max_secs}`, `{run, kind: "lines", lines: [...]}`, `{run, kind: "closed", end: "stopped"\|"line_cap"\|"time_up"\|"lost"\|"failed", error}` |
 | `overview` | when what the connect read for Overview changes: the connect's slow log and client list landing after the live connection is ready (they fill `findings`), another node picked (its findings go until it is read), the last analysis found, the connect's figures. Sent only when the data differs from the last `overview` event of this connection, never before the connect has read anything | the body of `GET /api/overview` without `live` and `shards` (those come with `figures`) |
+| `progress` | an analysis: started, sampling, stopping, done, stopped, failed, and compared with the last snapshot (see [The `progress` event](#the-progress-event)) | `{run, kind, ...}` |
 | `notice` | something the user should know that has no panel, such as the live connection closing or a stream that fell behind | `{"text": "..."}` |
 
 A stream that falls more than 1024 events behind skips them and gets a `notice` instead.
@@ -236,6 +248,19 @@ Example, `event: state (first on the stream, not connected)`. Event (`$.polling.
 
 ```json
 {
+  "analysis": {
+    "db": 0,
+    "depth": null,
+    "error": null,
+    "note": null,
+    "previous": false,
+    "report": null,
+    "run": 0,
+    "sampled": null,
+    "started_unix": null,
+    "status": "none",
+    "target": null
+  },
   "connected_at_unix": null,
   "connection": null,
   "docker": false,
@@ -344,6 +369,25 @@ Example, `event: figures`. Event
 | POST | `/api/cmdline` | run a typed command line under the TUI's rules |
 | GET | `/api/cmdline/commands` | command names for completion |
 | GET | `/api/cmdline/help?name=` | a command's help |
+| GET | `/api/dbs` | the databases and their key counts |
+| POST | `/api/db` | switch the session's database |
+| GET | `/api/browse` | Browse › Keys: the pattern tree, from key names or an analysis |
+| POST | `/api/browse/more` | one more page of key names |
+| GET | `/api/keys?pattern=` | a pattern's keys |
+| GET | `/api/find?q=` | Find key |
+| GET | `/api/keys/more?list=` | a key list's next page |
+| GET | `/api/value?key=` | open a key's value |
+| GET | `/api/value/more?view=` | a value's next page |
+| GET | `/api/value/item?view=&index=` | one item, whole, in a format |
+| GET, POST, DELETE | `/api/analysis` | the analysis and its estimates; start one; stop it |
+| GET | `/api/analysis/big_keys` | Big keys and "Things to look at" |
+| GET | `/api/analysis/expiry` | Expiry |
+| GET | `/api/analysis/changes` | Changes against the last snapshot |
+| GET | `/api/analysis/hot_keys` | Hot keys |
+| GET | `/api/analysis/nodes` | Nodes (a cluster) |
+| GET | `/api/analysis/slots` | Slots (a cluster) |
+| GET, POST | `/api/snapshots` | list, save snapshots |
+| GET | `/api/snapshots/compare?a=&b=` | compare two snapshots |
 | POST, DELETE | `/api/confirm/{id}` | answer or cancel a question |
 
 ### `GET /api/state`
@@ -359,7 +403,8 @@ turned off. `nodes` and `picked` describe a cluster (the first primary is picked
 nodes arrive). `polling` is how the live figures are polled (`paused`, `interval_secs`,
 and the `intervals` that can be set). `monitor_limits` is when a Monitor run stops by itself
 (`max_secs`, `max_lines`), known before one starts. `features.entra_id` says whether this
-build has Entra ID.
+build has Entra ID. `analysis` is the analysis and its report's age (see
+[`state.analysis`](#stateanalysis)).
 
 A connect that opens but can't authenticate (the server wants a password and none was sent,
 or it refused the one sent) is `failed`, with a fixed reason, never `connected`.
@@ -368,6 +413,19 @@ Example, `GET /api/state`. Reply: HTTP 200 (`$.polling.intervals` cut to the fir
 
 ```json
 {
+  "analysis": {
+    "db": 0,
+    "depth": null,
+    "error": null,
+    "note": null,
+    "previous": false,
+    "report": null,
+    "run": 0,
+    "sampled": null,
+    "started_unix": null,
+    "status": "none",
+    "target": null
+  },
   "connected_at_unix": null,
   "connection": null,
   "docker": false,
@@ -481,6 +539,19 @@ Example, `GET /api/state (a connect to a server that wants a password, without o
 
 ```json
 {
+  "analysis": {
+    "db": 0,
+    "depth": null,
+    "error": null,
+    "note": null,
+    "previous": false,
+    "report": null,
+    "run": 1,
+    "sampled": null,
+    "started_unix": null,
+    "status": "none",
+    "target": null
+  },
   "connected_at_unix": null,
   "connection": {
     "auth": "none",
@@ -896,6 +967,19 @@ Example, `GET /api/state (after removing the connected profile)`. Reply: HTTP 20
 
 ```json
 {
+  "analysis": {
+    "db": 0,
+    "depth": null,
+    "error": null,
+    "note": null,
+    "previous": false,
+    "report": null,
+    "run": 0,
+    "sampled": null,
+    "started_unix": null,
+    "status": "none",
+    "target": null
+  },
   "connected_at_unix": null,
   "connection": null,
   "docker": false,
@@ -1047,6 +1131,19 @@ Example, `POST /api/connect {"name":"cache"}`. Reply: HTTP 202 (`$.polling.inter
 
 ```json
 {
+  "analysis": {
+    "db": 0,
+    "depth": null,
+    "error": null,
+    "note": null,
+    "previous": false,
+    "report": null,
+    "run": 1,
+    "sampled": null,
+    "started_unix": null,
+    "status": "none",
+    "target": null
+  },
   "connected_at_unix": null,
   "connection": {
     "auth": "none",
@@ -1110,6 +1207,19 @@ Example, `POST /api/disconnect`. Reply: HTTP 200 (`$.polling.intervals` cut to t
 
 ```json
 {
+  "analysis": {
+    "db": 0,
+    "depth": null,
+    "error": null,
+    "note": null,
+    "previous": false,
+    "report": null,
+    "run": 0,
+    "sampled": null,
+    "started_unix": null,
+    "status": "none",
+    "target": null
+  },
   "connected_at_unix": null,
   "connection": null,
   "docker": false,
@@ -1164,7 +1274,8 @@ Example, `POST /api/node {"index":1} (not a cluster)`. Reply: HTTP 422
 `figures` holds the headline numbers for the connection's report (`figures_failed` says why
 when there are none). `perms` is the permission check, and `shards` holds every node's
 headline on a cluster. `last_analysis` is the last saved analysis for this profile, when
-there is one. `server` and `target` describe what was connected to. Live rates come as
+there is one. `analysis` is Overview's analysis part, `null` until an analysis has a report
+(see [`GET /api/overview`: `analysis`](#get-apioverview-analysis)). `server` and `target` describe what was connected to. Live rates come as
 `figures` events.
 
 `findings` is "From the server", worked out by the TUI's own code from what the connect read
@@ -1178,6 +1289,7 @@ Example, `GET /api/overview`. Reply: HTTP 200 (`$.perms` cut to the first 3 of 4
 
 ```json
 {
+  "analysis": null,
   "figures": {
     "big_keys": null,
     "dataset_bytes": 475200,
@@ -2013,3 +2125,2650 @@ Example, `GET /api/cmdline/help?name=get`. Reply: HTTP 200
 }
 ```
 
+## Browse, Analyze and snapshots
+
+These routes are the TUI's Browse, Analyze and snapshots, on the session's connection. Each
+runs the TUI's own code: the same `live` requests (paced by the same command budget the
+scan and the live views share), the same `scan` run for an analysis, the same views' state
+for key names, key lists, values and slot statistics, and the same snapshot writer. The
+dashboard sends no command of its own: `SCAN`, never `KEYS`, and nothing here writes.
+
+The examples in this part were captured by `tests/web_p2_it.rs` with
+`REDIS_LENS_P2_CAPTURE=<file>`, against a Redis 7.4 container (a Valkey 8.1 or a cluster
+one where it says so) seeded with keys of every type, `cart:{n}` with a TTL, `lock:job:{n}`
+without one, a key named `evil<ESC>[31mkey` and three keys in db 1.
+
+### Key and pattern names
+
+A key name is bytes, and it can hold control characters or bidirectional controls. Every
+key or pattern a reply names is an object of three:
+
+- `name`: for display, escaped with `value::escape` as the TUI escapes it (`\x1b` for ESC).
+- `id`: the name's bytes in lowercase hex. The page sends this back to name a key
+  (`/api/value?key=<id>`) or a pattern (`/api/keys?pattern=<id>`), never the display text.
+  An id that is not even-length hex of UTF-8 bytes, or longer than 131,072 digits, is 400
+  `{"error":"the key id is not the hex the dashboard gave for a key"}`.
+- `copy`: the name as it is, for the clipboard, when escaping changes nothing; `null`
+  otherwise (copying the escaped text would name another key).
+
+Key names that are not UTF-8 are counted as unreadable by the live layers (`unreadable`
+in a key list) and never listed, as in the TUI. Field names, members and values are shown
+the same way: valid UTF-8 escaped, other bytes as `\xNN`.
+
+### The `progress` event
+
+An analysis reports on the event stream as `progress` events, each with the session's
+`run` (the same number `POST /api/analysis` answered) and a `kind`:
+
+| `kind` | When | Data |
+|---|---|---|
+| `started` | `POST /api/analysis` was taken | `{run, kind, depth, sample_limit}` |
+| `sampling` | the first progress, then at most every 250 ms while keys are sampled | `{run, kind, sampled, target, patterns, stopping}` (`patterns` is `null` until the first partial results) |
+| `stopping` | `DELETE /api/analysis` was taken | `{run, kind}` |
+| `done` | the report is in: the panels can be read | `{run, kind, sampled_keys, patterns, complete, stopped, taken_at_unix}` (`stopped`: stopped early, so partial) |
+| `stopped` | stopped before any key was sampled: nothing changed | `{run, kind, kept: false, text}` |
+| `failed` | the scan failed; the session stays connected and keeps any earlier report | `{run, kind, error}` in fixed words |
+| `compared` | after `done`, once the newest earlier snapshot was looked up and diffed (the Changes panel and Overview's `changes`), and the trend loaded | `{run, kind}` |
+
+A `state` event comes with `started`, `done`, `stopped` and `failed` too (and an
+`overview` event after `done` and `compared`, when Overview's part changed). A database
+switch is a run as well, but it reads no key, so it sends no `progress` event.
+
+Example, `event: progress` (`started`). Event
+
+```json
+{
+  "depth": "quick",
+  "kind": "started",
+  "run": 4,
+  "sample_limit": 10000
+}
+```
+
+Example, `event: progress` (`sampling`). Event
+
+```json
+{
+  "kind": "sampling",
+  "patterns": 11,
+  "run": 4,
+  "sampled": 74,
+  "stopping": false,
+  "target": 74
+}
+```
+
+Example, `event: progress` (`done`). Event
+
+```json
+{
+  "complete": true,
+  "kind": "done",
+  "patterns": 11,
+  "run": 4,
+  "sampled_keys": 74,
+  "stopped": false,
+  "taken_at_unix": 1794745502
+}
+```
+
+Example, `event: progress` (`compared`). Event
+
+```json
+{
+  "kind": "compared",
+  "run": 4
+}
+```
+
+Example, `event: progress` (`stopping`). Event
+
+```json
+{
+  "kind": "stopping",
+  "run": 6
+}
+```
+
+Example, `event: progress` (`stopped`). Event
+
+```json
+{
+  "kept": false,
+  "kind": "stopped",
+  "run": 6,
+  "text": "Analysis stopped before it sampled any key. Nothing changed."
+}
+```
+
+A `failed` event's `error` (and `state.analysis.error`) says that the analysis failed,
+never that the connection was refused, in one of these sentences: `The analysis failed:
+the server refused a command it needs.` (a command refused or answered with an error, such
+as `SCAN` for a user without it), `The analysis failed: the connection to the server
+broke.`, the two password sentences of a refused login, or redis-lens's own sentence when
+it gave one. The server's text never reaches it.
+
+Example, `event: progress` (`failed`), a user without `SCAN`. Event
+
+```json
+{
+  "error": "The analysis failed: the server refused a command it needs.",
+  "kind": "failed",
+  "run": 2
+}
+```
+
+### `state.analysis`
+
+`GET /api/state` (and every `state` event) has `analysis`:
+
+- `status`: `none` (no report), `connecting` (an analysis's connect), `sampling`,
+  `stopping` or `done` (a report the panels show).
+- `run`: the session's run. A connect, an analysis and a database switch each start one.
+- `depth`: `quick` or `deep`, while one runs and for the one that made the report.
+- `sampled`, `target`: the progress while one runs.
+- `started_unix`: when the running or last analysis started.
+- `error`: why the last analysis failed, in fixed words.
+- `note`: what the last stop did when it kept nothing.
+- `report`: the report the panels show, or `null`: `taken_at_unix`, `age_secs` (its age now),
+  `sampled_keys`, `patterns`, `complete` (every key was looked at), `stopped` (stopped
+  early: partial, not saved), `sizes_available` (`MEMORY USAGE` was allowed), `cluster`.
+- `previous`: the report is the earlier run's, kept while a new analysis has no results.
+- `db`: the database the session reads.
+
+Example, `GET /api/state`. Reply: HTTP 200 (`$.polling.intervals` cut to the first 3 of 8)
+
+```json
+{
+  "analysis": {
+    "db": 0,
+    "depth": "quick",
+    "error": null,
+    "note": null,
+    "previous": false,
+    "report": {
+      "age_secs": 0,
+      "cluster": false,
+      "complete": true,
+      "patterns": 11,
+      "sampled_keys": 74,
+      "sizes_available": true,
+      "stopped": false,
+      "taken_at_unix": 1794745502
+    },
+    "run": 4,
+    "sampled": 74,
+    "started_unix": 1794745502,
+    "status": "done",
+    "target": 74
+  },
+  "connected_at_unix": 1794745502,
+  "connection": {
+    "auth": "none",
+    "db": 0,
+    "endpoint": "127.0.0.1:62093",
+    "env": "local",
+    "env_label": "LOCAL",
+    "name": "local",
+    "prefer_replica": false,
+    "provider": null,
+    "provider_notice": null,
+    "read_only": false,
+    "sentinel": null,
+    "sentinel_tls": false,
+    "ssh": null,
+    "standalone": false,
+    "tags": [],
+    "tls": false,
+    "token_command": false,
+    "url": "redis://127.0.0.1:62093/0",
+    "writes": true
+  },
+  "docker": false,
+  "error": null,
+  "features": {
+    "entra_id": false,
+    "version": "0.1.0"
+  },
+  "live": "ready",
+  "live_error": null,
+  "monitor": null,
+  "monitor_limits": {
+    "max_lines": 10000,
+    "max_secs": 30
+  },
+  "nodes": [],
+  "picked": 0,
+  "polling": {
+    "interval_secs": 2,
+    "intervals": [
+      1,
+      2,
+      3
+    ],
+    "paused": false
+  },
+  "refused": [],
+  "sentinel": null,
+  "server": {
+    "flavor": "redis",
+    "keys": 74,
+    "lfu": true,
+    "maxmemory": 0,
+    "mode": "standalone",
+    "policy": "allkeys-lfu",
+    "used_memory": 1944104,
+    "version": "7.4.12"
+  },
+  "status": "connected",
+  "tail": null,
+  "target": "primary",
+  "writes": true,
+  "writes_off": null
+}
+```
+
+### `GET /api/overview`: `analysis`
+
+Overview's analysis part, `null` until an analysis has a report and while one runs (the
+TUI's Overview shows "Things to look at" then): `taken_at_unix`, `sampled_keys`,
+`patterns`, `complete`, `stopped`, `sizes_available`, `findings` (the TUI's analysis
+findings, with `severity`, `text`, `screen`, `area` and `panel` as the connect's
+findings), `top_patterns` (the 5 biggest by memory: `pattern`, `est_keys`, `est_bytes`,
+`share`), `never_expires_share` (of the memory sampled), `changes` (`pending`, `none`,
+`failed` or `diff`, as the Changes panel) and `note`. The `overview` event carries it too.
+
+Example, `GET /api/overview`, its `analysis` part only. Reply: HTTP 200 (`$.analysis.findings` cut to the first 3 of 11; `$.analysis.top_patterns` cut to the first 3 of 5)
+
+```json
+{
+  "analysis": {
+    "changes": "none",
+    "complete": true,
+    "findings": [
+      {
+        "area": "Analyze",
+        "panel": "Expiry",
+        "screen": "expiry",
+        "severity": "note",
+        "text": "lock:job:{id}: 100% of its keys never expire."
+      },
+      {
+        "area": "Analyze",
+        "panel": "Expiry",
+        "screen": "expiry",
+        "severity": "info",
+        "text": "57% of memory never expires: 5.5K of 9.6K."
+      },
+      {
+        "area": "Analyze",
+        "panel": "Expiry",
+        "screen": "expiry",
+        "severity": "info",
+        "text": "events:log never expires."
+      }
+    ],
+    "never_expires_share": 0.5708502024291497,
+    "note": null,
+    "patterns": 11,
+    "sampled_keys": 74,
+    "sizes_available": true,
+    "stopped": false,
+    "taken_at_unix": 1794745502,
+    "top_patterns": [
+      {
+        "est_bytes": 4736,
+        "est_keys": 1,
+        "pattern": {
+          "copy": "events:log",
+          "id": "6576656e74733a6c6f67",
+          "name": "events:log"
+        },
+        "share": 0.47935222672064776
+      },
+      {
+        "est_bytes": 4240,
+        "est_keys": 60,
+        "pattern": {
+          "copy": "cart:{id}",
+          "id": "636172743a7b69647d",
+          "name": "cart:{id}"
+        },
+        "share": 0.4291497975708502
+      },
+      {
+        "est_bytes": 280,
+        "est_keys": 5,
+        "pattern": {
+          "copy": "lock:job:{id}",
+          "id": "6c6f636b3a6a6f623a7b69647d",
+          "name": "lock:job:{id}"
+        },
+        "share": 0.02834008097165992
+      }
+    ]
+  }
+}
+```
+
+### `GET /api/dbs`
+
+The databases and their key counts (`INFO keyspace` on the picked node), the current one
+always listed: `current`, `rows` (`db`, `keys`, `expires`, `current`), `unread` (why the
+counts could not be read, with the current database still listed), `saved_as` (the
+profile's name; `null` for a Docker container) and `note`. On a cluster it is
+`{"off": "A cluster only has database 0."}`. 409 while connecting, while an analysis runs
+or when the live connection is closed, each with its reason.
+
+Example, `GET /api/dbs`. Reply: HTTP 200
+
+```json
+{
+  "current": 0,
+  "note": "Picking a database is for this session. The saved profile is unchanged.",
+  "rows": [
+    {
+      "current": true,
+      "db": 0,
+      "expires": 60,
+      "keys": 74
+    },
+    {
+      "current": false,
+      "db": 1,
+      "expires": 0,
+      "keys": 3
+    }
+  ],
+  "saved_as": "local",
+  "unread": null
+}
+```
+
+Example, `GET /api/dbs`. Reply: HTTP 200 [cluster redis]
+
+```json
+{
+  "off": "A cluster only has database 0."
+}
+```
+
+### `POST /api/db`
+
+`{"db": n}` switches the session to database `n`, as picking one in the TUI's database
+list does. Only a database the last `GET /api/dbs` listed is taken (422 otherwise). It is a
+new run that reads no key: the earlier results go, the live connection opens again on the
+new database, a running pub/sub tail is subscribed again, a running Monitor is stopped, and
+Browse reads the new database's key names. For this session only: the saved profile is not
+changed. The reply is 202 with the run; a `state` event follows, and
+`state.analysis.db` says the database. The current database is 200
+`{"db": n, "switched": false, "run": null, "text": null}` (nothing changes). 409 on a
+cluster (`A cluster only has database 0.`), while an analysis runs, and when no run can
+start: no session (`not connected: connect first, or the live connection is closed`), the
+switch before still connecting
+(`Still connecting: wait until the connection is ready.`) or a failed connect
+(`The connect failed: connect again first.`).
+
+The switch drops Browse's key names, key lists and open values (they were of the other
+database); their `list` and `view` numbers are not given again, so an old number answers
+404. A write question asked before the switch is refused when answered after it (409, see
+"Confirms"). An analysis, a run on the same database, keeps the key lists and values
+open.
+
+Example, `POST /api/db {"db":1}`. Reply: HTTP 202
+
+```json
+{
+  "db": 1,
+  "run": 2,
+  "switched": true,
+  "text": "Switched to db 1 for this session. The saved profile is unchanged."
+}
+```
+
+Example, `POST /api/db {"db":0}` on database 0. Reply: HTTP 200
+
+```json
+{
+  "db": 0,
+  "run": null,
+  "switched": false,
+  "text": null
+}
+```
+
+Example, `POST /api/db {"db":7}`. Reply: HTTP 422
+
+```json
+{
+  "error": "Pick a database the list shows (read the list first): it shows the databases with keys."
+}
+```
+
+### `GET /api/browse`
+
+Browse › Keys: the pattern tree. `?sort=` is one of `sorts` (`memory`, `keys`, `avg_size`,
+`no_ttl`, `name`: sizes need an analysis; 400 for anything else), `?node=<i>` narrows an
+analysis of a cluster to one shard (`nodes` lists them; 422 for one not there; 400 for
+one that is not a number). `node` in the reply is the node the rows are narrowed to: only
+an analysis's rows can be, so it is `null` for rows from key names or from partial
+results, whatever `?node=` asked.
+
+`source` says where the rows come from:
+
+- `names`: before any analysis, the dashboard reads key names as the TUI does (`SCAN` in
+  pages of 1,000, the first `names.first_pages` pages at once, every shard on a cluster)
+  and groups them into patterns. Only names are known: counts, no sizes, no verdict.
+  `names` says how far it got: `pages`, `names_read`, `dbsize`, `complete`, `done`,
+  `reading`, `error`, `refused`, `skipped` and, on a cluster, `missing` (shards not read)
+  and `nodes_done` (`[read, of]`).
+- `partial`: an analysis is running and has partial results (`partial` holds
+  `{sampled, target}`).
+- `analysis`: the report. Rows have sizes, TTL histograms, the verdict and the TUI's
+  reason, and `change` when the last comparison found one.
+- `none`: nothing yet; `why` says why.
+
+`rows` are pattern rows, or `group` rows (`label`, `key`, `children` of pattern rows) when
+patterns share a prefix, as in the TUI. A pattern row: `pattern` (a name, above), `type`,
+`est_keys`, `est_bytes`, `avg_bytes`, `sampled_keys`, `sampled_bytes`, `share`, `no_ttl`,
+`no_ttl_ratio`, `ttl_hist` (counts per `ttl_labels`), `ttl_verdict`, `verdict`
+(`leak?`, `persistent`, ...), `reason`, `warning`, `size_p50`, `size_p99`, `size_max`,
+`examples` (sampled keys, as in a key list), `command` (the `redis-cli --scan` line that
+lists them), `marked`, `change` and, from names only, `names_seen` and `literal`. `total`
+is the memory (or keys, from names) the rows add up to; `previous` says the rows are the
+earlier run's.
+
+Example, `GET /api/browse?sort=keys`. Reply: HTTP 200 (`$.rows` cut to the first 2 of 9; `$.ttl_labels` cut to the first 2 of 7)
+
+```json
+{
+  "names": {
+    "complete": true,
+    "dbsize": 74,
+    "done": true,
+    "error": null,
+    "first_pages": 8,
+    "missing": [],
+    "names_read": 74,
+    "nodes_done": null,
+    "pages": 1,
+    "reading": false,
+    "refused": [],
+    "skipped": []
+  },
+  "node": null,
+  "nodes": [],
+  "partial": null,
+  "previous": false,
+  "rows": [
+    {
+      "avg_bytes": null,
+      "change": null,
+      "command": "redis-cli --scan --pattern \"cart:*\"",
+      "est_bytes": null,
+      "est_keys": 60,
+      "examples": [],
+      "kind": "pattern",
+      "literal": false,
+      "marked": false,
+      "names_seen": 60,
+      "no_ttl": null,
+      "no_ttl_ratio": null,
+      "pattern": {
+        "copy": "cart:{id}",
+        "id": "636172743a7b69647d",
+        "name": "cart:{id}"
+      },
+      "reason": null,
+      "sampled_bytes": null,
+      "sampled_keys": 60,
+      "share": 0.8108108108108109,
+      "size_max": null,
+      "size_p50": null,
+      "size_p99": null,
+      "ttl_hist": null,
+      "ttl_verdict": null,
+      "type": null,
+      "verdict": null,
+      "warning": false
+    },
+    {
+      "avg_bytes": null,
+      "change": null,
+      "command": "redis-cli --scan --pattern \"lock:job:*\"",
+      "est_bytes": null,
+      "est_keys": 5,
+      "examples": [],
+      "kind": "pattern",
+      "literal": false,
+      "marked": false,
+      "names_seen": 5,
+      "no_ttl": null,
+      "no_ttl_ratio": null,
+      "pattern": {
+        "copy": "lock:job:{id}",
+        "id": "6c6f636b3a6a6f623a7b69647d",
+        "name": "lock:job:{id}"
+      },
+      "reason": null,
+      "sampled_bytes": null,
+      "sampled_keys": 5,
+      "share": 0.06756756756756757,
+      "size_max": null,
+      "size_p50": null,
+      "size_p99": null,
+      "ttl_hist": null,
+      "ttl_verdict": null,
+      "type": null,
+      "verdict": null,
+      "warning": false
+    }
+  ],
+  "sizes": false,
+  "sort": "keys",
+  "sorts": [
+    "keys",
+    "name"
+  ],
+  "source": "names",
+  "total": 74,
+  "ttl_labels": [
+    "none",
+    "<1m"
+  ],
+  "why": null
+}
+```
+
+Example, `GET /api/browse`. Reply: HTTP 200 (`$.rows` cut to the first 2 of 9; `$.rows[*].ttl_hist` cut to the first 2 of 7; `$.rows[*].examples` cut to the first 2 of 5; `$.sorts` cut to the first 2 of 5; `$.ttl_labels` cut to the first 2 of 7)
+
+```json
+{
+  "names": null,
+  "node": null,
+  "nodes": [],
+  "partial": null,
+  "previous": false,
+  "rows": [
+    {
+      "avg_bytes": 4736,
+      "change": null,
+      "command": "redis-cli --scan --pattern \"events:log\"",
+      "est_bytes": 4736,
+      "est_keys": 1,
+      "examples": [
+        {
+          "bytes": 4736,
+          "copy": "events:log",
+          "freq": 6,
+          "id": "6576656e74733a6c6f67",
+          "name": "events:log",
+          "node": null,
+          "ttl": "never",
+          "ttl_secs": null,
+          "type": "stream"
+        }
+      ],
+      "kind": "pattern",
+      "literal": null,
+      "marked": false,
+      "names_seen": null,
+      "no_ttl": 1,
+      "no_ttl_ratio": 1.0,
+      "pattern": {
+        "copy": "events:log",
+        "id": "6576656e74733a6c6f67",
+        "name": "events:log"
+      },
+      "reason": "All 1 keys never expire and the pattern has no earlier snapshot to compare with. This looks intentional.",
+      "sampled_bytes": 4736,
+      "sampled_keys": 1,
+      "share": 0.47935222672064776,
+      "size_max": 4736,
+      "size_p50": 4736,
+      "size_p99": 4736,
+      "ttl_hist": [
+        1,
+        0
+      ],
+      "ttl_verdict": "persistent · stable",
+      "type": "stream",
+      "verdict": "persistent",
+      "warning": false
+    },
+    {
+      "avg_bytes": 70,
+      "change": null,
+      "command": "redis-cli --scan --pattern \"cart:*\"",
+      "est_bytes": 4240,
+      "est_keys": 60,
+      "examples": [
+        {
+          "bytes": 72,
+          "copy": "cart:10",
+          "freq": 6,
+          "id": "636172743a3130",
+          "name": "cart:10",
+          "node": null,
+          "ttl": "59m 59s",
+          "ttl_secs": 3599,
+          "type": "string"
+        },
+        {
+          "bytes": 72,
+          "copy": "cart:11",
+          "freq": 6,
+          "id": "636172743a3131",
+          "name": "cart:11",
+          "node": null,
+          "ttl": "59m 59s",
+          "ttl_secs": 3599,
+          "type": "string"
+        }
+      ],
+      "kind": "pattern",
+      "literal": null,
+      "marked": false,
+      "names_seen": null,
+      "no_ttl": 0,
+      "no_ttl_ratio": 0.0,
+      "pattern": {
+        "copy": "cart:{id}",
+        "id": "636172743a7b69647d",
+        "name": "cart:{id}"
+      },
+      "reason": "All 60 keys expire, typically in under an hour.",
+      "sampled_bytes": 4240,
+      "sampled_keys": 60,
+      "share": 0.4291497975708502,
+      "size_max": 72,
+      "size_p50": 72,
+      "size_p99": 72,
+      "ttl_hist": [
+        0,
+        0
+      ],
+      "ttl_verdict": "ok",
+      "type": "string",
+      "verdict": "ok",
+      "warning": false
+    }
+  ],
+  "sizes": true,
+  "sort": "memory",
+  "sorts": [
+    "memory",
+    "keys"
+  ],
+  "source": "analysis",
+  "total": 9880,
+  "ttl_labels": [
+    "none",
+    "<1m"
+  ],
+  "why": null
+}
+```
+
+Example, `GET /api/browse`. Reply: HTTP 200 (`$.rows` cut to the first 2 of 31; `$.ttl_labels` cut to the first 2 of 7) [cluster redis]
+
+```json
+{
+  "names": {
+    "complete": true,
+    "dbsize": 120,
+    "done": true,
+    "error": null,
+    "first_pages": 8,
+    "missing": [],
+    "names_read": 120,
+    "nodes_done": [
+      3,
+      3
+    ],
+    "pages": 3,
+    "reading": false,
+    "refused": [],
+    "skipped": []
+  },
+  "node": null,
+  "nodes": [],
+  "partial": null,
+  "previous": false,
+  "rows": [
+    {
+      "avg_bytes": null,
+      "change": null,
+      "command": "redis-cli --scan --pattern \"item:*\"",
+      "est_bytes": null,
+      "est_keys": 90,
+      "examples": [],
+      "kind": "pattern",
+      "literal": false,
+      "marked": false,
+      "names_seen": 90,
+      "no_ttl": null,
+      "no_ttl_ratio": null,
+      "pattern": {
+        "copy": "item:{id}",
+        "id": "6974656d3a7b69647d",
+        "name": "item:{id}"
+      },
+      "reason": null,
+      "sampled_bytes": null,
+      "sampled_keys": 90,
+      "share": 0.75,
+      "size_max": null,
+      "size_p50": null,
+      "size_p99": null,
+      "ttl_hist": null,
+      "ttl_verdict": null,
+      "type": null,
+      "verdict": null,
+      "warning": false
+    },
+    {
+      "avg_bytes": null,
+      "change": null,
+      "command": "redis-cli --scan --pattern \"*:name\"",
+      "est_bytes": null,
+      "est_keys": 1,
+      "examples": [],
+      "kind": "pattern",
+      "literal": true,
+      "marked": false,
+      "names_seen": 1,
+      "no_ttl": null,
+      "no_ttl_ratio": null,
+      "pattern": {
+        "copy": "{user0}:name",
+        "id": "7b75736572307d3a6e616d65",
+        "name": "{user0}:name"
+      },
+      "reason": null,
+      "sampled_bytes": null,
+      "sampled_keys": 1,
+      "share": 0.008333333333333333,
+      "size_max": null,
+      "size_p50": null,
+      "size_p99": null,
+      "ttl_hist": null,
+      "ttl_verdict": null,
+      "type": null,
+      "verdict": null,
+      "warning": false
+    }
+  ],
+  "sizes": false,
+  "sort": "keys",
+  "sorts": [
+    "keys",
+    "name"
+  ],
+  "source": "names",
+  "total": 120,
+  "ttl_labels": [
+    "none",
+    "<1m"
+  ],
+  "why": null
+}
+```
+
+### `POST /api/browse/more`
+
+One more page of key names (1,000 names), with `{"sort": ...}` as `GET /api/browse` takes
+it; the reply is the tree. 409 once an analysis's patterns are shown, while a page is
+being read, or when every name is read.
+
+Example, `POST /api/browse/more {}`. Reply: HTTP 409
+
+```json
+{
+  "error": "Every key name is read: 74."
+}
+```
+
+### `GET /api/keys`, `GET /api/find`, `GET /api/keys/more`
+
+A key list, as Browse › Keys lists a pattern's keys and Find key finds keys:
+
+- `GET /api/keys?pattern=<id>[&node=<i>]`: the keys of a pattern from the tree (its `id`),
+  matched with the pattern's glob. `node` narrows a cluster's list to one shard.
+- `GET /api/find?q=<text>`: the keys of the whole database whose names match: text with
+  `*`, `?` or `[` is a glob used as typed, other text means "contains" (`*text*`). Control
+  characters are dropped, the text is cut at 512 bytes and trimmed. 400 for empty text;
+  then, as the TUI checks them, 409 while connecting or once the live connection is
+  closed, and 422 for a glob the TUI refuses (too many wildcards, in its words).
+- `GET /api/keys/more?list=<n>`: the next page of list `n`. 404 for a list no longer kept
+  (the newest 16 are, and a database switch drops them all), 409 while it loads a page,
+  when it is complete, or once it holds 50,000 keys or more
+  (`{"error":"This list holds 50,000 keys or more, so no more are loaded. Find a narrower name to see others."}`).
+
+`GET /api/keys` is 422 `{"error":"That node is not one of this analysis's nodes."}` for a
+`node` the analysis does not have. Every route of the three is 400 for a parameter
+missing or not of its type ("Conventions").
+
+The first page is read before the reply. If the browser drops the request while a page is
+read, the page still lands in the list: the next `more` reads on from it. A list: `list`
+(its number), `kind` (`pattern` or `find`), `pattern` or `find` (`{text, glob}`), `glob`,
+`rows`, `loaded` (rows held), `new_from`, `pages`, `page_keys`, `done`, `capped` (it holds
+`max_rows` keys or more: no more pages are read), `max_rows` (50,000), `error`, `refused`
+(metadata the server refused, in fixed words), `other_pattern` (matched the glob but
+belong to another pattern), `unreadable`, `sizes`, `lfu`, `freq` and, on a cluster,
+`cluster` (`walk`: the shards in order, `at`, `nodes_done`, `missing`, `narrowed`).
+
+`rows` holds the rows the reply's page added, from row `new_from` on: every row for
+`GET /api/keys` and `GET /api/find` (`new_from` is 0), only the new ones for
+`GET /api/keys/more` (`new_from` is the number held before it). The page appends them to
+the rows it has. A row is a key name with
+`type`, `ttl` (`never` or the TUI's `59m 59s`), `ttl_secs`, `bytes`, `encoding`, `length`,
+`length_unit`, `freq` (the LFU counter, when the policy keeps them) and `node`.
+
+Example, `GET /api/keys?pattern=636172743a7b69647d`. Reply: HTTP 200 (`$.rows` cut to the first 2 of 60)
+
+```json
+{
+  "capped": false,
+  "cluster": null,
+  "done": true,
+  "error": null,
+  "find": null,
+  "freq": true,
+  "glob": "cart:*",
+  "kind": "pattern",
+  "lfu": true,
+  "list": 1,
+  "loaded": 60,
+  "max_rows": 50000,
+  "new_from": 0,
+  "other_pattern": 0,
+  "page_keys": 1000,
+  "pages": 1,
+  "pattern": {
+    "copy": "cart:{id}",
+    "id": "636172743a7b69647d",
+    "name": "cart:{id}"
+  },
+  "refused": [],
+  "rows": [
+    {
+      "bytes": 72,
+      "copy": "cart:57",
+      "encoding": "embstr",
+      "freq": 5,
+      "id": "636172743a3537",
+      "length": 5,
+      "length_unit": "bytes",
+      "name": "cart:57",
+      "node": null,
+      "ttl": "59m 59s",
+      "ttl_secs": 3599,
+      "type": "string"
+    },
+    {
+      "bytes": 64,
+      "copy": "cart:9",
+      "encoding": "embstr",
+      "freq": 5,
+      "id": "636172743a39",
+      "length": 5,
+      "length_unit": "bytes",
+      "name": "cart:9",
+      "node": null,
+      "ttl": "59m 59s",
+      "ttl_secs": 3599,
+      "type": "string"
+    }
+  ],
+  "sizes": true,
+  "unreadable": 0
+}
+```
+
+Example, `GET /api/find?q=user`. Reply: HTTP 200
+
+```json
+{
+  "capped": false,
+  "cluster": null,
+  "done": true,
+  "error": null,
+  "find": {
+    "glob": "*user*",
+    "text": "user"
+  },
+  "freq": true,
+  "glob": "*user*",
+  "kind": "find",
+  "lfu": true,
+  "list": 2,
+  "loaded": 1,
+  "max_rows": 50000,
+  "new_from": 0,
+  "other_pattern": 0,
+  "page_keys": 1000,
+  "pages": 1,
+  "pattern": null,
+  "refused": [],
+  "rows": [
+    {
+      "bytes": 104,
+      "copy": "user:1:profile",
+      "encoding": "listpack",
+      "freq": 5,
+      "id": "757365723a313a70726f66696c65",
+      "length": 2,
+      "length_unit": "fields",
+      "name": "user:1:profile",
+      "node": null,
+      "ttl": "never",
+      "ttl_secs": null,
+      "type": "hash"
+    }
+  ],
+  "sizes": true,
+  "unreadable": 0
+}
+```
+
+Example, `GET /api/find?q=evil%2A`. Reply: HTTP 200
+
+```json
+{
+  "capped": false,
+  "cluster": null,
+  "done": true,
+  "error": null,
+  "find": {
+    "glob": "evil*",
+    "text": "evil*"
+  },
+  "freq": true,
+  "glob": "evil*",
+  "kind": "find",
+  "lfu": true,
+  "list": 3,
+  "loaded": 1,
+  "max_rows": 50000,
+  "new_from": 0,
+  "other_pattern": 0,
+  "page_keys": 1000,
+  "pages": 1,
+  "pattern": null,
+  "refused": [],
+  "rows": [
+    {
+      "bytes": 64,
+      "copy": null,
+      "encoding": "embstr",
+      "freq": 5,
+      "id": "6576696c1b5b33316d6b6579",
+      "length": 1,
+      "length_unit": "bytes",
+      "name": "evil\\x1b[31mkey",
+      "node": null,
+      "ttl": "never",
+      "ttl_secs": null,
+      "type": "string"
+    }
+  ],
+  "sizes": true,
+  "unreadable": 0
+}
+```
+
+Example, `GET /api/find?q=%2Aa%2Ab%2Ac%2Ad%2Ae%2Af%2Ag%2Ah%2Ai%2A`. Reply: HTTP 422
+
+```json
+{
+  "error": "A pattern may have at most 8 * wildcards, so matching it stays cheap for the server. This one has 10."
+}
+```
+
+Example, `GET /api/keys/more?list=1`. Reply: HTTP 409
+
+```json
+{
+  "error": "Every key of this list is loaded."
+}
+```
+
+Example, `GET /api/keys?pattern=6974656d3a7b69647d`. Reply: HTTP 200 (`$.cluster.walk` cut to the first 2 of 3; `$.rows` cut to the first 2 of 90) [cluster valkey]
+
+```json
+{
+  "capped": false,
+  "cluster": {
+    "at": 2,
+    "missing": [],
+    "narrowed": null,
+    "nodes_done": 3,
+    "walk": [
+      0,
+      1
+    ]
+  },
+  "done": true,
+  "error": null,
+  "find": null,
+  "freq": false,
+  "glob": "item:*",
+  "kind": "pattern",
+  "lfu": false,
+  "list": 1,
+  "loaded": 90,
+  "max_rows": 50000,
+  "new_from": 0,
+  "other_pattern": 0,
+  "page_keys": 1000,
+  "pages": 3,
+  "pattern": {
+    "copy": "item:{id}",
+    "id": "6974656d3a7b69647d",
+    "name": "item:{id}"
+  },
+  "refused": [],
+  "rows": [
+    {
+      "bytes": 32,
+      "copy": "item:18",
+      "encoding": "embstr",
+      "freq": null,
+      "id": "6974656d3a3138",
+      "length": 1,
+      "length_unit": "bytes",
+      "name": "item:18",
+      "node": 0,
+      "ttl": "never",
+      "ttl_secs": null,
+      "type": "string"
+    },
+    {
+      "bytes": 32,
+      "copy": "item:6",
+      "encoding": "embstr",
+      "freq": null,
+      "id": "6974656d3a36",
+      "length": 1,
+      "length_unit": "bytes",
+      "name": "item:6",
+      "node": 0,
+      "ttl": "never",
+      "ttl_secs": null,
+      "type": "string"
+    }
+  ],
+  "sizes": true,
+  "unreadable": 0
+}
+```
+
+### `GET /api/value`, `GET /api/value/more`, `GET /api/value/item`
+
+A key's value, as the TUI's key detail reads it (the same requests, paged the same way,
+at most 10,000 items held):
+
+- `GET /api/value?key=<id>[&type=<t>]` opens it and reads the first page. The key's
+  metadata (`meta`) is its row in the newest key list that has it, else what the analysis
+  sampled of it, else only the name, with the type the first read says. The newest 8
+  values are kept open.
+- `GET /api/value/more?view=<n>` reads the next page. When there is none it reads nothing
+  and `notice` says why, in the TUI's words. 404 for a view no longer open (a database
+  switch closes them all), 409 `{"error":"Still loading the value: wait for it."}` while a
+  page of it loads: one page of a value is read at a time, so two requests at once never
+  read the same page twice. If the browser drops a request while its page is read, the
+  page still lands in the value.
+- `GET /api/value/item?view=<n>&index=<i>[&field=<j>][&format=<f>][&width=<w>]` renders one
+  item whole: a hash field's value, a list, set or vector element, a sorted set member, a
+  stream entry's field `field` (a stream entry needs one: 422), or `index=0` for a string
+  or a JSON document. `format` is one of the value's `formats` (`text`, `hex`, `JSON`,
+  `MessagePack`, `PHP`, `Pickle`, `Protobuf`, `Java`, any case; `msgpack` too); without
+  one the format is detected.
+
+Every route of the three is 400 for a parameter missing or not of its type
+("Conventions"): `key`, `view`, `index`, `field` and `width` are numbers, `index` 0 or
+more.
+
+A value: `view`, `key` (a name), `type` (the server's), `kind` (`string`, `hash`, `list`,
+`set`, `zset`, `stream`, `json`, `vector`, `array`, `module`, `other`), `command` (what
+reads it), `meta`, `pattern`, `loading`, `pages`, `loaded`, `length`, `done`, `more`,
+`capped`, `gone` (the key no longer exists), `error`, `notice`, `refused`, `field_ttls`
+(hash field TTLs are read: Redis 7.4 and later) and `field_ttls_off`, `items`, `value`,
+`cut`, `message` (a type that is not read, a document too big), `module`, `cluster` and
+`max_items`.
+
+`items` (hash, list, set, sorted set, stream, vector) are previews of at most 80
+characters: `index`, `name` (a field, member or entry id), `value`, `ttl`, `at`, and a
+stream entry's `fields`. `value` (a string or document) and an item's `shown` are rendered
+as the TUI renders them: `format`, `detected`, `picked`, `formats`, `bytes`,
+`compression`, `truncated`, `note`, `header`, `lines` and `copy`.
+
+Copy: the server gives the text to copy and the page puts it on the clipboard. `copy` is
+the value as shown when that is safe text; for a value with control characters it is
+`null` and `copy_refused` says to show it as hex, whose text copies.
+
+Example, `GET /api/value?key=7374723a706c61696e`. Reply: HTTP 200 (`$.value.formats` cut to the first 3 of 8)
+
+```json
+{
+  "capped": false,
+  "cluster": false,
+  "command": "GETRANGE",
+  "cut": null,
+  "done": true,
+  "error": null,
+  "field_ttls": true,
+  "field_ttls_off": null,
+  "gone": false,
+  "items": [],
+  "key": {
+    "copy": "str:plain",
+    "id": "7374723a706c61696e",
+    "name": "str:plain"
+  },
+  "kind": "string",
+  "length": null,
+  "loaded": 1,
+  "loading": false,
+  "max_items": 10000,
+  "message": null,
+  "meta": {
+    "bytes": null,
+    "copy": "str:plain",
+    "encoding": null,
+    "freq": null,
+    "id": "7374723a706c61696e",
+    "length": null,
+    "length_unit": "bytes",
+    "name": "str:plain",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "string"
+  },
+  "module": null,
+  "more": false,
+  "notice": "The value is loaded.",
+  "pages": 1,
+  "pattern": null,
+  "refused": [],
+  "type": "string",
+  "value": {
+    "bytes": 11,
+    "compression": null,
+    "copy": "hello world",
+    "copy_refused": null,
+    "detected": "text",
+    "format": "text",
+    "formats": [
+      "text",
+      "hex",
+      "JSON"
+    ],
+    "header": "value · text · 11 bytes · auto-detected",
+    "lines": [
+      "hello world"
+    ],
+    "note": null,
+    "picked": null,
+    "truncated": false
+  },
+  "view": 1
+}
+```
+
+Example, `GET /api/value?key=7374723a62696e`. Reply: HTTP 200 (`$.value.formats` cut to the first 3 of 8)
+
+```json
+{
+  "capped": false,
+  "cluster": false,
+  "command": "GETRANGE",
+  "cut": null,
+  "done": true,
+  "error": null,
+  "field_ttls": true,
+  "field_ttls_off": null,
+  "gone": false,
+  "items": [],
+  "key": {
+    "copy": "str:bin",
+    "id": "7374723a62696e",
+    "name": "str:bin"
+  },
+  "kind": "string",
+  "length": null,
+  "loaded": 1,
+  "loading": false,
+  "max_items": 10000,
+  "message": null,
+  "meta": {
+    "bytes": null,
+    "copy": "str:bin",
+    "encoding": null,
+    "freq": null,
+    "id": "7374723a62696e",
+    "length": null,
+    "length_unit": "bytes",
+    "name": "str:bin",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "string"
+  },
+  "module": null,
+  "more": false,
+  "notice": "The value is loaded.",
+  "pages": 1,
+  "pattern": null,
+  "refused": [],
+  "type": "string",
+  "value": {
+    "bytes": 7,
+    "compression": null,
+    "copy": "0001ff62696e1b",
+    "copy_refused": null,
+    "detected": "hex",
+    "format": "hex",
+    "formats": [
+      "text",
+      "hex",
+      "JSON"
+    ],
+    "header": "value · hex · 7 bytes · auto-detected",
+    "lines": [
+      "00000000  00 01 ff 62 69 6e 1b                              |...bin.|"
+    ],
+    "note": null,
+    "picked": null,
+    "truncated": false
+  },
+  "view": 3
+}
+```
+
+Example, `GET /api/value/item?view=3&index=0&format=text`. Reply: HTTP 200 (`$.shown.formats` cut to the first 3 of 8)
+
+```json
+{
+  "field": null,
+  "index": 0,
+  "name": null,
+  "shown": {
+    "bytes": 7,
+    "compression": null,
+    "copy": null,
+    "copy_refused": "The value has control characters, so it is not copied as text: show it as hex to copy it.",
+    "detected": "hex",
+    "format": "text",
+    "formats": [
+      "text",
+      "hex",
+      "JSON"
+    ],
+    "header": "value · 7 bytes · shown as text",
+    "lines": [
+      "\\x00\\x01\\xffbin\\x1b"
+    ],
+    "note": null,
+    "picked": "text",
+    "truncated": false
+  }
+}
+```
+
+Example, `GET /api/value?key=757365723a313a70726f66696c65`. Reply: HTTP 200
+
+```json
+{
+  "capped": false,
+  "cluster": false,
+  "command": "HSCAN",
+  "cut": null,
+  "done": true,
+  "error": null,
+  "field_ttls": true,
+  "field_ttls_off": null,
+  "gone": false,
+  "items": [
+    {
+      "at": null,
+      "fields": null,
+      "index": 0,
+      "name": "name",
+      "ttl": "never",
+      "value": "Ada"
+    },
+    {
+      "at": null,
+      "fields": null,
+      "index": 1,
+      "name": "email",
+      "ttl": "never",
+      "value": "ada@example.com"
+    }
+  ],
+  "key": {
+    "copy": "user:1:profile",
+    "id": "757365723a313a70726f66696c65",
+    "name": "user:1:profile"
+  },
+  "kind": "hash",
+  "length": 2,
+  "loaded": 2,
+  "loading": false,
+  "max_items": 10000,
+  "message": null,
+  "meta": {
+    "bytes": 104,
+    "copy": "user:1:profile",
+    "encoding": "listpack",
+    "freq": 5,
+    "id": "757365723a313a70726f66696c65",
+    "length": 2,
+    "length_unit": "fields",
+    "name": "user:1:profile",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "hash"
+  },
+  "module": null,
+  "more": false,
+  "notice": "All 2 items are loaded.",
+  "pages": 1,
+  "pattern": null,
+  "refused": [],
+  "type": "hash",
+  "value": null,
+  "view": 4
+}
+```
+
+Example, `GET /api/value/item?view=4&index=0`. Reply: HTTP 200 (`$.shown.formats` cut to the first 3 of 8)
+
+```json
+{
+  "field": null,
+  "index": 0,
+  "name": "name",
+  "shown": {
+    "bytes": 3,
+    "compression": null,
+    "copy": "Ada",
+    "copy_refused": null,
+    "detected": "text",
+    "format": "text",
+    "formats": [
+      "text",
+      "hex",
+      "JSON"
+    ],
+    "header": "value · text · 3 bytes · auto-detected",
+    "lines": [
+      "Ada"
+    ],
+    "note": null,
+    "picked": null,
+    "truncated": false
+  }
+}
+```
+
+Example, `GET /api/value?key=71756575653a6a6f6273`. Reply: HTTP 200
+
+```json
+{
+  "capped": false,
+  "cluster": false,
+  "command": "LRANGE",
+  "cut": null,
+  "done": true,
+  "error": null,
+  "field_ttls": true,
+  "field_ttls_off": null,
+  "gone": false,
+  "items": [
+    {
+      "at": null,
+      "fields": null,
+      "index": 0,
+      "name": null,
+      "ttl": null,
+      "value": "j1"
+    },
+    {
+      "at": null,
+      "fields": null,
+      "index": 1,
+      "name": null,
+      "ttl": null,
+      "value": "j2"
+    },
+    {
+      "at": null,
+      "fields": null,
+      "index": 2,
+      "name": null,
+      "ttl": null,
+      "value": "j3"
+    }
+  ],
+  "key": {
+    "copy": "queue:jobs",
+    "id": "71756575653a6a6f6273",
+    "name": "queue:jobs"
+  },
+  "kind": "list",
+  "length": null,
+  "loaded": 3,
+  "loading": false,
+  "max_items": 10000,
+  "message": null,
+  "meta": {
+    "bytes": null,
+    "copy": "queue:jobs",
+    "encoding": null,
+    "freq": null,
+    "id": "71756575653a6a6f6273",
+    "length": null,
+    "length_unit": "bytes",
+    "name": "queue:jobs",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "list"
+  },
+  "module": null,
+  "more": false,
+  "notice": "All 3 items are loaded.",
+  "pages": 1,
+  "pattern": null,
+  "refused": [],
+  "type": "list",
+  "value": null,
+  "view": 5
+}
+```
+
+Example, `GET /api/value/more?view=5`. Reply: HTTP 200
+
+```json
+{
+  "capped": false,
+  "cluster": false,
+  "command": "LRANGE",
+  "cut": null,
+  "done": true,
+  "error": null,
+  "field_ttls": true,
+  "field_ttls_off": null,
+  "gone": false,
+  "items": [
+    {
+      "at": null,
+      "fields": null,
+      "index": 0,
+      "name": null,
+      "ttl": null,
+      "value": "j1"
+    },
+    {
+      "at": null,
+      "fields": null,
+      "index": 1,
+      "name": null,
+      "ttl": null,
+      "value": "j2"
+    },
+    {
+      "at": null,
+      "fields": null,
+      "index": 2,
+      "name": null,
+      "ttl": null,
+      "value": "j3"
+    }
+  ],
+  "key": {
+    "copy": "queue:jobs",
+    "id": "71756575653a6a6f6273",
+    "name": "queue:jobs"
+  },
+  "kind": "list",
+  "length": null,
+  "loaded": 3,
+  "loading": false,
+  "max_items": 10000,
+  "message": null,
+  "meta": {
+    "bytes": null,
+    "copy": "queue:jobs",
+    "encoding": null,
+    "freq": null,
+    "id": "71756575653a6a6f6273",
+    "length": null,
+    "length_unit": "bytes",
+    "name": "queue:jobs",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "list"
+  },
+  "module": null,
+  "more": false,
+  "notice": "All 3 items are loaded.",
+  "pages": 1,
+  "pattern": null,
+  "refused": [],
+  "type": "list",
+  "value": null,
+  "view": 5
+}
+```
+
+Example, `GET /api/value?key=626f6172643a73636f726573`. Reply: HTTP 200
+
+```json
+{
+  "capped": false,
+  "cluster": false,
+  "command": "ZRANGE",
+  "cut": null,
+  "done": true,
+  "error": null,
+  "field_ttls": true,
+  "field_ttls_off": null,
+  "gone": false,
+  "items": [
+    {
+      "at": null,
+      "fields": null,
+      "index": 0,
+      "name": "ann",
+      "ttl": null,
+      "value": "10"
+    },
+    {
+      "at": null,
+      "fields": null,
+      "index": 1,
+      "name": "bob",
+      "ttl": null,
+      "value": "20"
+    }
+  ],
+  "key": {
+    "copy": "board:scores",
+    "id": "626f6172643a73636f726573",
+    "name": "board:scores"
+  },
+  "kind": "zset",
+  "length": null,
+  "loaded": 2,
+  "loading": false,
+  "max_items": 10000,
+  "message": null,
+  "meta": {
+    "bytes": null,
+    "copy": "board:scores",
+    "encoding": null,
+    "freq": null,
+    "id": "626f6172643a73636f726573",
+    "length": null,
+    "length_unit": "bytes",
+    "name": "board:scores",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "zset"
+  },
+  "module": null,
+  "more": false,
+  "notice": "All 2 items are loaded.",
+  "pages": 1,
+  "pattern": null,
+  "refused": [],
+  "type": "zset",
+  "value": null,
+  "view": 7
+}
+```
+
+Example, `GET /api/value?key=6576656e74733a6c6f67`. Reply: HTTP 200
+
+```json
+{
+  "capped": false,
+  "cluster": false,
+  "command": "XREVRANGE",
+  "cut": null,
+  "done": true,
+  "error": null,
+  "field_ttls": true,
+  "field_ttls_off": null,
+  "gone": false,
+  "items": [
+    {
+      "at": null,
+      "fields": [
+        {
+          "name": "kind",
+          "value": "logout"
+        }
+      ],
+      "index": 0,
+      "name": "1794745502183-1",
+      "ttl": null,
+      "value": null
+    },
+    {
+      "at": null,
+      "fields": [
+        {
+          "name": "kind",
+          "value": "login"
+        },
+        {
+          "name": "who",
+          "value": "ada"
+        }
+      ],
+      "index": 1,
+      "name": "1794745502183-0",
+      "ttl": null,
+      "value": null
+    }
+  ],
+  "key": {
+    "copy": "events:log",
+    "id": "6576656e74733a6c6f67",
+    "name": "events:log"
+  },
+  "kind": "stream",
+  "length": null,
+  "loaded": 2,
+  "loading": false,
+  "max_items": 10000,
+  "message": null,
+  "meta": {
+    "bytes": null,
+    "copy": "events:log",
+    "encoding": null,
+    "freq": null,
+    "id": "6576656e74733a6c6f67",
+    "length": null,
+    "length_unit": "bytes",
+    "name": "events:log",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "stream"
+  },
+  "module": null,
+  "more": false,
+  "notice": "All 2 items are loaded.",
+  "pages": 1,
+  "pattern": null,
+  "refused": [],
+  "type": "stream",
+  "value": null,
+  "view": 8
+}
+```
+
+Example, `GET /api/value/item?view=8&index=1&field=1`. Reply: HTTP 200 (`$.shown.formats` cut to the first 3 of 8)
+
+```json
+{
+  "field": 1,
+  "index": 1,
+  "name": "who",
+  "shown": {
+    "bytes": 3,
+    "compression": null,
+    "copy": "ada",
+    "copy_refused": null,
+    "detected": "text",
+    "format": "text",
+    "formats": [
+      "text",
+      "hex",
+      "JSON"
+    ],
+    "header": "value · text · 3 bytes · auto-detected",
+    "lines": [
+      "ada"
+    ],
+    "note": null,
+    "picked": null,
+    "truncated": false
+  }
+}
+```
+
+Example, `GET /api/value/item?view=8&index=1`. Reply: HTTP 422
+
+```json
+{
+  "error": "A stream entry has several fields: open one field to see or copy its value."
+}
+```
+
+Example, `GET /api/value?key=6576696c1b5b33316d6b6579`. Reply: HTTP 200 (`$.value.formats` cut to the first 3 of 8)
+
+```json
+{
+  "capped": false,
+  "cluster": false,
+  "command": "GETRANGE",
+  "cut": null,
+  "done": true,
+  "error": null,
+  "field_ttls": true,
+  "field_ttls_off": null,
+  "gone": false,
+  "items": [],
+  "key": {
+    "copy": null,
+    "id": "6576696c1b5b33316d6b6579",
+    "name": "evil\\x1b[31mkey"
+  },
+  "kind": "string",
+  "length": 1,
+  "loaded": 1,
+  "loading": false,
+  "max_items": 10000,
+  "message": null,
+  "meta": {
+    "bytes": 64,
+    "copy": null,
+    "encoding": "embstr",
+    "freq": 5,
+    "id": "6576696c1b5b33316d6b6579",
+    "length": 1,
+    "length_unit": "bytes",
+    "name": "evil\\x1b[31mkey",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "string"
+  },
+  "module": null,
+  "more": false,
+  "notice": "The value is loaded.",
+  "pages": 1,
+  "pattern": null,
+  "refused": [],
+  "type": "string",
+  "value": {
+    "bytes": 1,
+    "compression": null,
+    "copy": "v",
+    "copy_refused": null,
+    "detected": "text",
+    "format": "text",
+    "formats": [
+      "text",
+      "hex",
+      "JSON"
+    ],
+    "header": "value · text · 1 bytes · auto-detected",
+    "lines": [
+      "v"
+    ],
+    "note": null,
+    "picked": null,
+    "truncated": false
+  },
+  "view": 9
+}
+```
+
+Example, `GET /api/value?key=6e6f3a737563683a6b6579`. Reply: HTTP 200
+
+```json
+{
+  "capped": false,
+  "cluster": false,
+  "command": "GETRANGE",
+  "cut": null,
+  "done": false,
+  "error": null,
+  "field_ttls": true,
+  "field_ttls_off": null,
+  "gone": true,
+  "items": [],
+  "key": {
+    "copy": "no:such:key",
+    "id": "6e6f3a737563683a6b6579",
+    "name": "no:such:key"
+  },
+  "kind": "string",
+  "length": null,
+  "loaded": 0,
+  "loading": false,
+  "max_items": 10000,
+  "message": null,
+  "meta": {
+    "bytes": null,
+    "copy": "no:such:key",
+    "encoding": null,
+    "freq": null,
+    "id": "6e6f3a737563683a6b6579",
+    "length": null,
+    "length_unit": "bytes",
+    "name": "no:such:key",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "string"
+  },
+  "module": null,
+  "more": false,
+  "notice": "The key no longer exists.",
+  "pages": 0,
+  "pattern": null,
+  "refused": [],
+  "type": "string",
+  "value": null,
+  "view": 10
+}
+```
+
+Example, `GET /api/value?key=757365723a313a70726f66696c65`. Reply: HTTP 200 [valkey]
+
+```json
+{
+  "capped": false,
+  "cluster": false,
+  "command": "HSCAN",
+  "cut": null,
+  "done": true,
+  "error": null,
+  "field_ttls": false,
+  "field_ttls_off": null,
+  "gone": false,
+  "items": [
+    {
+      "at": null,
+      "fields": null,
+      "index": 0,
+      "name": "name",
+      "ttl": null,
+      "value": "Ada"
+    },
+    {
+      "at": null,
+      "fields": null,
+      "index": 1,
+      "name": "email",
+      "ttl": null,
+      "value": "ada@example.com"
+    }
+  ],
+  "key": {
+    "copy": "user:1:profile",
+    "id": "757365723a313a70726f66696c65",
+    "name": "user:1:profile"
+  },
+  "kind": "hash",
+  "length": 2,
+  "loaded": 2,
+  "loading": false,
+  "max_items": 10000,
+  "message": null,
+  "meta": {
+    "bytes": 88,
+    "copy": "user:1:profile",
+    "encoding": "listpack",
+    "freq": 5,
+    "id": "757365723a313a70726f66696c65",
+    "length": 2,
+    "length_unit": "fields",
+    "name": "user:1:profile",
+    "node": null,
+    "ttl": "never",
+    "ttl_secs": null,
+    "type": "hash"
+  },
+  "module": null,
+  "more": false,
+  "notice": "All 2 items are loaded.",
+  "pages": 1,
+  "pattern": null,
+  "refused": [],
+  "type": "hash",
+  "value": null,
+  "view": 4
+}
+```
+
+### `GET /api/analysis`, `POST /api/analysis`, `DELETE /api/analysis`
+
+- `GET /api/analysis`: `analysis` (as `state.analysis`), `running`, and `estimates`: what
+  a Quick and a Deep analysis would cost, as the TUI's Analyze screen says it (`depth`,
+  `sample_limit`, `keys`, `commands`, `per_sec`, `duration_secs`, `about`, `shards`,
+  `sizes`, `freq`).
+- `POST /api/analysis {"depth": "quick"|"deep"}` (Quick when left out) starts one, as the
+  TUI's Analyze does: a Quick one samples up to 10,000 keys, a Deep one up to 100,000. The
+  reply is 202 `{run, depth, sample_limit, estimate}`; progress comes as `progress`
+  events. 400 for another depth, 409 while one runs, while connecting or after a failed
+  connect.
+- `DELETE /api/analysis` stops the running one: it stops within one batch, and what it
+  sampled becomes the report, marked stopped (partial, not saved). Stopped before any key
+  is sampled, nothing changes. 200 `{stopping, text}`; 409 when none runs.
+
+Example, `GET /api/analysis`. Reply: HTTP 200
+
+```json
+{
+  "analysis": {
+    "db": 0,
+    "depth": null,
+    "error": null,
+    "note": null,
+    "previous": false,
+    "report": null,
+    "run": 3,
+    "sampled": null,
+    "started_unix": null,
+    "status": "none",
+    "target": null
+  },
+  "estimates": [
+    {
+      "about": "as fast as the server answers",
+      "commands": 303,
+      "depth": "quick",
+      "duration_secs": null,
+      "freq": true,
+      "keys": 74,
+      "per_sec": null,
+      "sample_limit": 10000,
+      "shards": 0,
+      "sizes": true
+    },
+    {
+      "about": "as fast as the server answers",
+      "commands": 303,
+      "depth": "deep",
+      "duration_secs": null,
+      "freq": true,
+      "keys": 74,
+      "per_sec": null,
+      "sample_limit": 100000,
+      "shards": 0,
+      "sizes": true
+    }
+  ],
+  "running": false
+}
+```
+
+Example, `POST /api/analysis {"depth":"quick"}`. Reply: HTTP 202
+
+```json
+{
+  "depth": "quick",
+  "estimate": {
+    "about": "as fast as the server answers",
+    "commands": 303,
+    "depth": "quick",
+    "duration_secs": null,
+    "freq": true,
+    "keys": 74,
+    "per_sec": null,
+    "sample_limit": 10000,
+    "shards": 0,
+    "sizes": true
+  },
+  "run": 4,
+  "sample_limit": 10000
+}
+```
+
+Example, `POST /api/analysis {}`. Reply: HTTP 409
+
+```json
+{
+  "error": "An analysis is already running."
+}
+```
+
+Example, `DELETE /api/analysis`. Reply: HTTP 200
+
+```json
+{
+  "stopping": true,
+  "text": "Stopping the analysis. What it sampled so far is kept."
+}
+```
+
+### The Analyze panels
+
+Each panel is the TUI's, from the session's report. Without one each is 409
+`{"error":"No analysis yet: analyze the keys first."}`. Each has `report` (the report's
+summary: `taken_at_unix`, `sampled_keys`, `complete`, `stopped`, `sizes_available`,
+`previous`) and `empty` (why
+there are no rows).
+
+- `GET /api/analysis/big_keys`: the biggest sampled keys (`rows`: `key`, `pattern`,
+  `length`, `length_unit`, `encoding`, `big`, `node`: the node's index on a cluster, else null, and `endpoint`: its `host:port`), and the recommendations ("Things to
+  look at": `severity`, `text`, `hint`). Lengths and encodings are read for the listed keys
+  (pipelined, per shard) once per report: a request that comes while they are read waits
+  for that read instead of reading them again, and an `overview` event follows once they
+  are in (Overview's findings use them). `facts_read` says they were, `notes` what was
+  refused. `big_key_bytes` is the TUI's size for a big key.
+- `GET /api/analysis/expiry`: patterns by TTL risk in the TUI's order (`status`,
+  `explain`, `ttl_hist`, `no_ttl`, ...), and `freed`: the memory freed by TTL within each
+  `within` horizon, `later`, `never` and `never_share`; `freed_off` says why it is not
+  shown.
+- `GET /api/analysis/changes`: this report against the newest snapshot before it.
+  `status` is `pending` (being compared), `none` (`text` says there is no earlier one),
+  `failed` (`text`) or `diff`: `before_*` and `after_*` times and `used_memory`, `rows` of
+  patterns that changed (`keys_before`, `keys_after`, `bytes_before`, `bytes_after`,
+  `change` with `delta_bytes`, `delta_keys`, `cause`, `cause_words`, `alarming`, and
+  `trend` from the earlier snapshots when there are enough), `trend_points` and `note`.
+- `GET /api/analysis/hot_keys`: the sampled keys with the highest LFU counters (`rows`:
+  `key`, `pattern`, `node`, `endpoint`, `hot_and_big`). Off (`{"off": ...}`, the TUI's words) when the
+  policy keeps no LFU counters (not an `*-lfu` policy) or `OBJECT FREQ` was refused.
+- `GET /api/analysis/nodes`: on a cluster, each shard and the node read for it (`index`,
+  `id`, `primary_id`, `endpoint`, `role`, `version`, `status`, `complete`, `keys`,
+  `sampled_keys`, `patterns`, `memory`, `slots`, `slot_count`, `sizes_available`, `note`).
+  Off on a standalone server.
+- `GET /api/analysis/slots[?order=keys|cpu|net_in|net_out][&refresh=1]`: on a cluster,
+  `CLUSTER SLOT-STATS` of each shard's slot ranges (at most four shards at once), read
+  once per run unless `refresh=1`: `ranges` (per shard: `status`, `error`, the figures),
+  `hottest` (the hottest slots by `order`, with the sampled keys in each), `order`,
+  `memory_column`, `cpu_and_network_zero` and `note`. Off on a standalone server, on a
+  version without the command (Redis before 8.2, Valkey before 8.0), or when it is refused.
+
+Example, `GET /api/analysis/big_keys`. Reply: HTTP 200 (`$.recommendations` cut to the first 2 of 11; `$.rows` cut to the first 2 of 50)
+
+```json
+{
+  "big_key_bytes": 67108864,
+  "empty": null,
+  "facts_read": true,
+  "notes": [],
+  "recommendations": [
+    {
+      "hint": "A lock should always carry a TTL.",
+      "severity": "note",
+      "text": "lock:job:{id}: 100% of its keys never expire."
+    },
+    {
+      "hint": "Fine for data that must stay; caches should expire.",
+      "severity": "info",
+      "text": "57% of memory never expires: 5.5K of 9.6K."
+    }
+  ],
+  "report": {
+    "complete": true,
+    "previous": false,
+    "sampled_keys": 74,
+    "sizes_available": true,
+    "stopped": false,
+    "taken_at_unix": 1794745502
+  },
+  "rows": [
+    {
+      "big": false,
+      "encoding": "stream",
+      "key": {
+        "bytes": 4736,
+        "copy": "events:log",
+        "freq": 6,
+        "id": "6576656e74733a6c6f67",
+        "name": "events:log",
+        "node": null,
+        "ttl": "never",
+        "ttl_secs": null,
+        "type": "stream"
+      },
+      "length": 2,
+      "length_unit": "entries",
+      "endpoint": null,
+      "node": null,
+      "pattern": {
+        "copy": "events:log",
+        "id": "6576656e74733a6c6f67",
+        "name": "events:log"
+      }
+    },
+    {
+      "big": false,
+      "encoding": "listpack",
+      "key": {
+        "bytes": 104,
+        "copy": "user:1:profile",
+        "freq": 6,
+        "id": "757365723a313a70726f66696c65",
+        "name": "user:1:profile",
+        "node": null,
+        "ttl": "never",
+        "ttl_secs": null,
+        "type": "hash"
+      },
+      "length": 2,
+      "length_unit": "fields",
+      "endpoint": null,
+      "node": null,
+      "pattern": {
+        "copy": "user:{id}:profile",
+        "id": "757365723a7b69647d3a70726f66696c65",
+        "name": "user:{id}:profile"
+      }
+    }
+  ]
+}
+```
+
+Example, `GET /api/analysis/expiry`. Reply: HTTP 200 (`$.freed.within` cut to the first 2 of 4; `$.rows` cut to the first 2 of 11; `$.rows[*].ttl_hist` cut to the first 2 of 7; `$.ttl_labels` cut to the first 2 of 7)
+
+```json
+{
+  "empty": null,
+  "freed": {
+    "later": 0,
+    "never": 5640,
+    "never_share": 0.5708502024291497,
+    "total": 9880,
+    "within": [
+      {
+        "bytes": 4240,
+        "label": "1 h"
+      },
+      {
+        "bytes": 4240,
+        "label": "1 d"
+      }
+    ]
+  },
+  "freed_off": null,
+  "report": {
+    "complete": true,
+    "previous": false,
+    "sampled_keys": 74,
+    "sizes_available": true,
+    "stopped": false,
+    "taken_at_unix": 1794745502
+  },
+  "rows": [
+    {
+      "command": "redis-cli --scan --pattern \"events:log\"",
+      "est_bytes": 4736,
+      "est_keys": 1,
+      "explain": [
+        "All 1 keys never expire and the pattern has no earlier snapshot to compare with.",
+        "This looks intentional."
+      ],
+      "no_ttl": 1,
+      "no_ttl_ratio": 1.0,
+      "pattern": {
+        "copy": "events:log",
+        "id": "6576656e74733a6c6f67",
+        "name": "events:log"
+      },
+      "sampled_keys": 1,
+      "status": "persistent · stable",
+      "ttl_hist": [
+        1,
+        0
+      ],
+      "warning": false
+    },
+    {
+      "command": "redis-cli --scan --pattern \"lock:job:*\"",
+      "est_bytes": 280,
+      "est_keys": 5,
+      "explain": [
+        "All 5 keys never expire and the pattern has no earlier snapshot to compare with.",
+        "This looks intentional."
+      ],
+      "no_ttl": 5,
+      "no_ttl_ratio": 1.0,
+      "pattern": {
+        "copy": "lock:job:{id}",
+        "id": "6c6f636b3a6a6f623a7b69647d",
+        "name": "lock:job:{id}"
+      },
+      "sampled_keys": 5,
+      "status": "persistent · stable",
+      "ttl_hist": [
+        5,
+        0
+      ],
+      "warning": false
+    }
+  ],
+  "ttl_labels": [
+    "none",
+    "<1m"
+  ]
+}
+```
+
+Example, `GET /api/analysis/changes`. Reply: HTTP 200
+
+```json
+{
+  "report": {
+    "complete": true,
+    "previous": false,
+    "sampled_keys": 74,
+    "sizes_available": true,
+    "stopped": false,
+    "taken_at_unix": 1794745502
+  },
+  "status": "none",
+  "text": "No earlier snapshot for local. Save one; the next analysis compares against it."
+}
+```
+
+Example, `GET /api/analysis/changes`. Reply: HTTP 200 (`$.rows` cut to the first 2 of 12)
+
+```json
+{
+  "after_taken_at_unix": 1794745503,
+  "after_utc": "2026-11-15 12:25:03 UTC",
+  "before_taken_at_unix": 1794745502,
+  "before_utc": "2026-11-15 12:25:02 UTC",
+  "empty": null,
+  "note": null,
+  "report": {
+    "complete": true,
+    "previous": false,
+    "sampled_keys": 75,
+    "sizes_available": true,
+    "stopped": false,
+    "taken_at_unix": 1794745503
+  },
+  "rows": [
+    {
+      "bytes_after": 72,
+      "bytes_before": null,
+      "change": {
+        "alarming": true,
+        "cause": "new",
+        "cause_words": "new",
+        "delta_bytes": 72,
+        "delta_keys": 1
+      },
+      "keys_after": 1,
+      "keys_before": null,
+      "partial": false,
+      "pattern": {
+        "copy": "cart:new",
+        "id": "636172743a6e6577",
+        "name": "cart:new"
+      },
+      "trend": null
+    },
+    {
+      "bytes_after": 80,
+      "bytes_before": 80,
+      "change": {
+        "alarming": false,
+        "cause": "unchanged",
+        "cause_words": "unchanged",
+        "delta_bytes": 0,
+        "delta_keys": 0
+      },
+      "keys_after": 1,
+      "keys_before": 1,
+      "partial": false,
+      "pattern": {
+        "copy": "board:scores",
+        "id": "626f6172643a73636f726573",
+        "name": "board:scores"
+      },
+      "trend": null
+    }
+  ],
+  "status": "diff",
+  "trend_points": null,
+  "used_memory_after": 2018832,
+  "used_memory_before": 1944104
+}
+```
+
+Example, `GET /api/analysis/hot_keys`. Reply: HTTP 200 (`$.rows` cut to the first 2 of 50)
+
+```json
+{
+  "empty": null,
+  "hot_big_bytes": 10485760,
+  "hot_freq": 100,
+  "report": {
+    "complete": true,
+    "previous": false,
+    "sampled_keys": 74,
+    "sizes_available": true,
+    "stopped": false,
+    "taken_at_unix": 1794745502
+  },
+  "rows": [
+    {
+      "hot_and_big": false,
+      "key": {
+        "bytes": 72,
+        "copy": "str:plain",
+        "freq": 9,
+        "id": "7374723a706c61696e",
+        "name": "str:plain",
+        "node": null,
+        "ttl": "never",
+        "ttl_secs": null,
+        "type": "string"
+      },
+      "endpoint": null,
+      "node": null,
+      "pattern": {
+        "copy": "str:plain",
+        "id": "7374723a706c61696e",
+        "name": "str:plain"
+      }
+    },
+    {
+      "hot_and_big": false,
+      "key": {
+        "bytes": 80,
+        "copy": "queue:jobs",
+        "freq": 7,
+        "id": "71756575653a6a6f6273",
+        "name": "queue:jobs",
+        "node": null,
+        "ttl": "never",
+        "ttl_secs": null,
+        "type": "list"
+      },
+      "endpoint": null,
+      "node": null,
+      "pattern": {
+        "copy": "queue:jobs",
+        "id": "71756575653a6a6f6273",
+        "name": "queue:jobs"
+      }
+    }
+  ]
+}
+```
+
+Example, `GET /api/analysis/nodes`. Reply: HTTP 200
+
+```json
+{
+  "off": "Not a cluster: this analysis read one standalone server."
+}
+```
+
+Example, `GET /api/analysis/slots`. Reply: HTTP 200
+
+```json
+{
+  "off": "Not a cluster: this is one standalone server."
+}
+```
+
+Example, `GET /api/analysis/nodes`. Reply: HTTP 200 (`$.rows` cut to the first 1 of 3; `$.rows[*].slots[*]` cut to the first 1 of 2) [cluster redis]
+
+```json
+{
+  "empty": null,
+  "report": {
+    "complete": true,
+    "previous": false,
+    "sampled_keys": 120,
+    "sizes_available": true,
+    "stopped": false,
+    "taken_at_unix": 1794745506
+  },
+  "rows": [
+    {
+      "complete": true,
+      "endpoint": "127.0.0.1:49152",
+      "id": "db60446aa32515e6de67dd00619ee413492b6997",
+      "index": 0,
+      "keys": 37,
+      "memory": 3036424,
+      "note": null,
+      "patterns": 10,
+      "primary_id": "db60446aa32515e6de67dd00619ee413492b6997",
+      "role": "primary",
+      "sampled_keys": 37,
+      "sizes_available": true,
+      "slot_count": 5461,
+      "slots": [
+        [
+          0
+        ]
+      ],
+      "status": "scanned",
+      "version": "7.4.12"
+    }
+  ]
+}
+```
+
+Example, `GET /api/analysis/slots`. Reply: HTTP 200 [cluster redis]
+
+```json
+{
+  "off": "CLUSTER SLOT-STATS needs Redis 8.2 or Valkey 8.0; 127.0.0.1:49152 runs Redis 7.4.12"
+}
+```
+
+Example, `GET /api/analysis/slots`. Reply: HTTP 200 (`$.hottest` cut to the first 2 of 20; `$.ranges` cut to the first 2 of 3) [cluster valkey]
+
+```json
+{
+  "cpu_and_network_zero": false,
+  "empty": null,
+  "hottest": [
+    {
+      "cpu_usec": null,
+      "endpoint": "127.0.0.1:49358",
+      "keys": 1,
+      "memory": null,
+      "net_in": null,
+      "net_out": null,
+      "node": 0,
+      "sampled_keys": [
+        {
+          "key": {
+            "copy": "item:18",
+            "id": "6974656d3a3138",
+            "name": "item:18"
+          },
+          "kinds": "big",
+          "pattern": {
+            "copy": "item:{id}",
+            "id": "6974656d3a7b69647d",
+            "name": "item:{id}"
+          }
+        }
+      ],
+      "slot": 687
+    },
+    {
+      "cpu_usec": null,
+      "endpoint": "127.0.0.1:49358",
+      "keys": 1,
+      "memory": null,
+      "net_in": null,
+      "net_out": null,
+      "node": 0,
+      "sampled_keys": [],
+      "slot": 796
+    }
+  ],
+  "memory_column": false,
+  "note": null,
+  "order": "keys",
+  "ranges": [
+    {
+      "cpu_usec": null,
+      "end": 5460,
+      "endpoint": "127.0.0.1:49358",
+      "error": null,
+      "keys": 37,
+      "memory": null,
+      "net_in": null,
+      "net_out": null,
+      "node": 0,
+      "start": 0,
+      "status": "done"
+    },
+    {
+      "cpu_usec": null,
+      "end": 10922,
+      "endpoint": "127.0.0.1:49359",
+      "error": null,
+      "keys": 44,
+      "memory": null,
+      "net_in": null,
+      "net_out": null,
+      "node": 1,
+      "start": 5461,
+      "status": "done"
+    }
+  ]
+}
+```
+
+No `hot_keys` off reply was captured live (the test servers use `allkeys-lfu`); with
+another policy it is `{"off": ...}` with the TUI's sentence, checked by the router test
+`hot_keys_degrade_in_the_tuis_words` in `src/web/tests.rs`.
+
+### `POST /api/snapshots`, `GET /api/snapshots`, `GET /api/snapshots/compare`
+
+Snapshots are the TUI's: the same directory (the snapshot directory of the TUI and
+`scan --save`, one subdirectory per connection), the same writer and so the same file,
+which holds no credential. They are named by their file name (`20261115T122502Z.json`,
+UTC).
+
+- `POST /api/snapshots` saves the current report, as the TUI saves one: 201 `{file,
+  taken_at_unix, taken_at_utc, sampled_keys, text}`, and Overview's `last_analysis`
+  follows. 409, in the TUI's words, for no report, a running analysis, partial results or
+  a report stopped early
+  (`{"error":"This analysis was stopped early, so its results are partial and are not saved. Analyze again to save one."}`).
+  500 `{"error":"The snapshot could not be saved: the snapshot directory could not be written."}`
+  when the file can't be written (the file system's text, which names paths, is never
+  passed on).
+- Snapshots of every database of a profile go to the same directory, as in the TUI: after
+  a database switch, Changes and `compare` set the new database's analysis against the
+  other database's snapshots.
+- `GET /api/snapshots`: the connection's snapshots, newest first (`file`, `taken_at_unix`,
+  `taken_at_utc`, `current`: the report the panels show), `profile`, `can_save`,
+  `save_off` (why not) and `saved` (the current report is saved). 500
+  `{"error":"The snapshots could not be listed: the snapshot directory could not be read."}`
+  when the directory can't be read.
+- `GET /api/snapshots/compare?a=<file|current>&b=<file|current>`: the newer of the two
+  against the older, as the Changes panel shows it (the `diff` body above without
+  `status` and `report`, with `before_sampled_keys` and `after_sampled_keys`). A name is a
+  file name exactly as `GET /api/snapshots` gives it, or `current`; anything else is 400
+  before any file is opened, a file of another connection or none is 404, the same name
+  twice is 422, a file that is not a snapshot is 422, `current` without a finished report
+  (none yet, or an analysis running) is 409
+  `{"error":"No analysis yet: analyze the keys first."}`, a directory that can't be read
+  is 500 (the listing's sentence above). A missing `a` or `b` is 400 ("Conventions").
+
+Example, `POST /api/snapshots {}`. Reply: HTTP 201
+
+```json
+{
+  "file": "20261115T122502Z.json",
+  "sampled_keys": 74,
+  "taken_at_unix": 1794745502,
+  "taken_at_utc": "2026-11-15 12:25:02 UTC",
+  "text": "Saved snapshot 20261115T122502Z.json"
+}
+```
+
+Example, `GET /api/snapshots`. Reply: HTTP 200
+
+```json
+{
+  "can_save": true,
+  "profile": "local",
+  "save_off": null,
+  "saved": true,
+  "snapshots": [
+    {
+      "current": true,
+      "file": "20261115T122503Z.json",
+      "taken_at_unix": 1794745503,
+      "taken_at_utc": "2026-11-15 12:25:03 UTC"
+    },
+    {
+      "current": false,
+      "file": "20261115T122502Z.json",
+      "taken_at_unix": 1794745502,
+      "taken_at_utc": "2026-11-15 12:25:02 UTC"
+    }
+  ]
+}
+```
+
+Example, `GET /api/snapshots/compare?a=20261115T122502Z.json&b=20261115T122503Z.json`. Reply: HTTP 200 (`$.rows` cut to the first 2 of 12)
+
+```json
+{
+  "after_sampled_keys": 75,
+  "after_taken_at_unix": 1794745503,
+  "after_utc": "2026-11-15 12:25:03 UTC",
+  "before_sampled_keys": 74,
+  "before_taken_at_unix": 1794745502,
+  "before_utc": "2026-11-15 12:25:02 UTC",
+  "empty": null,
+  "note": null,
+  "rows": [
+    {
+      "bytes_after": 72,
+      "bytes_before": null,
+      "change": {
+        "alarming": true,
+        "cause": "new",
+        "cause_words": "new",
+        "delta_bytes": 72,
+        "delta_keys": 1
+      },
+      "keys_after": 1,
+      "keys_before": null,
+      "partial": false,
+      "pattern": {
+        "copy": "cart:new",
+        "id": "636172743a6e6577",
+        "name": "cart:new"
+      },
+      "trend": null
+    },
+    {
+      "bytes_after": 80,
+      "bytes_before": 80,
+      "change": {
+        "alarming": false,
+        "cause": "unchanged",
+        "cause_words": "unchanged",
+        "delta_bytes": 0,
+        "delta_keys": 0
+      },
+      "keys_after": 1,
+      "keys_before": 1,
+      "partial": false,
+      "pattern": {
+        "copy": "board:scores",
+        "id": "626f6172643a73636f726573",
+        "name": "board:scores"
+      },
+      "trend": null
+    }
+  ],
+  "trend_points": null,
+  "used_memory_after": 2018832,
+  "used_memory_before": 1944104
+}
+```

@@ -1232,3 +1232,659 @@ async fn the_server_times_out_slow_headers_and_caps_its_connections() {
     let head = String::from_utf8_lossy(&buf);
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
 }
+
+// -- phase 2: Browse, Analyze, snapshots, databases --------------------------------
+
+/// A session with `report` as its finished analysis and the live connection closed, so
+/// no route sends anything (there is no server behind it).
+fn analysed(
+    t: &T,
+    report: Option<crate::model::ScanReport>,
+    perms: Option<crate::model::PermissionReport>,
+) {
+    t.hub.install_for_test(profile("cache", Env::Local), false);
+    t.hub.with_mut(|c| {
+        c.session.phase = crate::tui::app::Phase::Done;
+        c.session.live = crate::tui::app::views::LiveState::Closed(None);
+        c.session.server = report.as_ref().map(|r| r.server.clone());
+        c.session.report = report;
+        c.perms = perms;
+    });
+}
+
+async fn get_json(t: &T, path: &str) -> (StatusCode, serde_json::Value) {
+    let res = call(t, signed_get(path)).await;
+    let status = res.status();
+    (status, json(&text(res).await))
+}
+
+/// Every phase 2 route and method, as the router serves them.
+const PHASE_TWO: &[(&str, &str)] = &[
+    ("GET", "/api/browse"),
+    ("POST", "/api/browse/more"),
+    ("GET", "/api/dbs"),
+    ("POST", "/api/db"),
+    ("GET", "/api/keys?pattern=61"),
+    ("GET", "/api/keys/more?list=1"),
+    ("GET", "/api/find?q=a"),
+    ("GET", "/api/value?key=61"),
+    ("GET", "/api/value/more?view=1"),
+    ("GET", "/api/value/item?view=1"),
+    ("GET", "/api/analysis"),
+    ("POST", "/api/analysis"),
+    ("DELETE", "/api/analysis"),
+    ("GET", "/api/analysis/big_keys"),
+    ("GET", "/api/analysis/expiry"),
+    ("GET", "/api/analysis/changes"),
+    ("GET", "/api/analysis/hot_keys"),
+    ("GET", "/api/analysis/nodes"),
+    ("GET", "/api/analysis/slots"),
+    ("GET", "/api/snapshots"),
+    ("POST", "/api/snapshots"),
+    ("GET", "/api/snapshots/compare?a=current&b=current"),
+];
+
+/// S3: every phase 2 route and method needs the token; every one that is not a GET
+/// needs the dashboard's Origin, its header and a JSON body too, with the token given.
+#[tokio::test]
+async fn phase_two_routes_need_the_token_and_writes_the_guard() {
+    let t = setup("p2guard", Vec::new());
+    analysed(&t, Some(crate::tui::fixtures::report(true)), None);
+    for (method, path) in PHASE_TWO {
+        let req = Request::builder()
+            .method(*method)
+            .uri(*path)
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, ORIGIN)
+            .header("x-redis-lens", "1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let res = call(&t, req).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+        assert_security_headers(&res, path);
+        let wrong_host = Request::builder()
+            .method(*method)
+            .uri(*path)
+            .header(header::HOST, "evil.example:7379")
+            .header(header::AUTHORIZATION, bearer())
+            .body(Body::empty())
+            .unwrap();
+        let res = call(&t, wrong_host).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        if *method == "GET" {
+            continue;
+        }
+        let refused = [
+            ("http://evil.example", Some("1"), "application/json"),
+            ("http://localhost:7380", Some("1"), "application/json"),
+            (ORIGIN, None, "application/json"),
+            (ORIGIN, Some("1"), "text/plain"),
+        ];
+        for (origin, marker, kind) in refused {
+            let mut req = Request::builder()
+                .method(*method)
+                .uri(*path)
+                .header(header::HOST, HOST)
+                .header(header::ORIGIN, origin)
+                .header(header::CONTENT_TYPE, kind)
+                .header(header::AUTHORIZATION, bearer());
+            if let Some(m) = marker {
+                req = req.header("x-redis-lens", m);
+            }
+            let res = call(&t, req.body(Body::from("{}")).unwrap()).await;
+            assert_eq!(
+                res.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {path} from {origin} {marker:?} {kind}"
+            );
+        }
+    }
+}
+
+/// S2: a query parameter missing or not of its type is refused with 400 and the one
+/// fixed sentence, as JSON: never axum's plain-text rejection.
+#[tokio::test]
+async fn a_bad_or_missing_query_parameter_is_refused_as_json() {
+    let t = setup("p2query", Vec::new());
+    for path in [
+        // Missing.
+        "/api/find",
+        "/api/keys",
+        "/api/keys/more",
+        "/api/value",
+        "/api/value/more",
+        "/api/value/item",
+        "/api/snapshots/compare?a=current",
+        // Malformed.
+        "/api/keys/more?list=x",
+        "/api/keys?pattern=61&node=first",
+        "/api/value/more?view=abc",
+        "/api/value/item?view=abc",
+        "/api/value/item?view=1&index=-1",
+        "/api/value/item?view=1&width=wide",
+        "/api/browse?node=-1",
+        "/api/analysis/slots?refresh=true",
+    ] {
+        let res = call(&t, signed_get(path)).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(
+            res.headers()[header::CONTENT_TYPE],
+            "application/json",
+            "{path}"
+        );
+        let body = text(res).await;
+        assert!(!body.contains("deserialize"), "{path}: {body}");
+        assert_eq!(
+            json(&body)["error"],
+            super::api::BAD_QUERY,
+            "{path}: {body}"
+        );
+    }
+    assert_eq!(super::wording::banned(super::api::BAD_QUERY), None);
+    assert_eq!(
+        super::wording::server_free(super::api::BAD_QUERY),
+        super::api::BAD_QUERY
+    );
+}
+
+#[tokio::test]
+async fn without_a_report_the_panels_say_so_and_nothing_is_saved() {
+    let t = setup("p2noreport", Vec::new());
+    analysed(&t, None, None);
+    for panel in ["big_keys", "expiry", "changes", "hot_keys", "nodes"] {
+        let (status, v) = get_json(&t, &format!("/api/analysis/{panel}")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{panel}");
+        assert_eq!(v["error"], super::api::analyze::NO_REPORT, "{panel}");
+    }
+    let res = call(&t, write("POST", "/api/snapshots", "")).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(&text(res).await)["error"],
+        super::api::snapshots::NOTHING_TO_SAVE
+    );
+    let (_, s) = get_json(&t, "/api/state").await;
+    assert_eq!(s["analysis"]["status"], "none", "{s}");
+    assert_eq!(s["analysis"]["report"], serde_json::Value::Null, "{s}");
+}
+
+#[tokio::test]
+async fn hot_keys_degrade_in_the_tuis_words() {
+    let t = setup("p2hot", Vec::new());
+    analysed(&t, Some(crate::tui::fixtures::report_lru()), None);
+    let (status, v) = get_json(&t, "/api/analysis/hot_keys").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        v["off"],
+        "The eviction policy is allkeys-lru, so Redis keeps no LFU counters. Set \
+         maxmemory-policy to allkeys-lfu or volatile-lfu to see hot keys.",
+        "{v}"
+    );
+    analysed(
+        &t,
+        Some(crate::tui::fixtures::report(true)),
+        Some(crate::tui::fixtures::perms_freq_denied()),
+    );
+    let (_, v) = get_json(&t, "/api/analysis/hot_keys").await;
+    assert_eq!(v["off"], "OBJECT FREQ was denied for this user.", "{v}");
+    let mut hot = crate::tui::fixtures::report(true);
+    hot.hot_keys = crate::tui::fixtures::hot_keys();
+    analysed(&t, Some(hot), Some(crate::tui::fixtures::perms_ok()));
+    let (_, v) = get_json(&t, "/api/analysis/hot_keys").await;
+    assert_eq!(v["rows"][1]["key"]["name"], "queue:emails", "{v}");
+    assert_eq!(v["rows"][1]["hot_and_big"], true, "{v}");
+}
+
+#[tokio::test]
+async fn a_standalone_server_has_no_nodes_or_slots_and_a_cluster_no_databases() {
+    let t = setup("p2cluster", Vec::new());
+    analysed(&t, Some(crate::tui::fixtures::report(true)), None);
+    let (_, v) = get_json(&t, "/api/analysis/nodes").await;
+    assert_eq!(v["off"], super::api::analyze::NODES_NOT_CLUSTER);
+    let (_, v) = get_json(&t, "/api/analysis/slots").await;
+    assert_eq!(v["off"], crate::tui::app::views::slots::NOT_CLUSTER, "{v}");
+    t.hub.with_mut(|c| {
+        c.session.nodes = vec![crate::live::nodes::NodeInfo {
+            id: "n1".into(),
+            endpoint: Endpoint {
+                host: "10.0.0.1".into(),
+                port: 7000,
+                tls: false,
+            },
+            role: crate::model::NodeRole::Primary,
+            slots: vec![(0, 16383)],
+            connected: true,
+        }];
+    });
+    let (status, v) = get_json(&t, "/api/dbs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["off"], "A cluster only has database 0.", "{v}");
+    let res = call(&t, write("POST", "/api/db", r#"{"db":1}"#)).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn the_panels_come_from_the_report_with_names_escaped() {
+    let t = setup("p2panels", Vec::new());
+    let mut r = crate::tui::fixtures::report(true);
+    r.patterns[0].examples[0].key = "evil\x1b[2Jkey".into();
+    analysed(&t, Some(r), Some(crate::tui::fixtures::perms_ok()));
+    let (status, v) = get_json(&t, "/api/browse").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["source"], "analysis");
+    let body = v.to_string();
+    assert!(!body.contains('\u{1b}'), "an escape reached the page");
+    assert!(body.contains("evil\\\\x1b[2Jkey"), "{body}");
+    let (_, e) = get_json(&t, "/api/analysis/expiry").await;
+    assert!(e["rows"].as_array().is_some_and(|r| !r.is_empty()), "{e}");
+    let (_, b) = get_json(&t, "/api/analysis/big_keys").await;
+    assert_eq!(b["facts_read"], false, "{b}");
+    assert_eq!(
+        b["notes"][0], "Lengths and encodings are read once the live connection is open.",
+        "{b}"
+    );
+    let (_, c) = get_json(&t, "/api/analysis/changes").await;
+    assert_eq!(c["status"], "pending", "{c}");
+    let (_, s) = get_json(&t, "/api/state").await;
+    assert_eq!(s["analysis"]["status"], "done", "{s}");
+    assert!(
+        s["analysis"]["report"]["age_secs"].as_i64().unwrap() > 0,
+        "{s}"
+    );
+    let (_, o) = get_json(&t, "/api/overview").await;
+    assert!(o["analysis"]["findings"].is_array(), "{o}");
+    let (status, a) = get_json(&t, "/api/analysis").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(a["estimates"][0]["depth"], "quick", "{a}");
+    assert_eq!(a["estimates"][1]["sample_limit"], 100_000, "{a}");
+}
+
+#[tokio::test]
+async fn bad_ids_globs_and_names_are_refused_in_fixed_words() {
+    let t = setup("p2refused", Vec::new());
+    analysed(&t, None, None);
+    let (status, v) = get_json(&t, "/api/keys?pattern=zz").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"], crate::web::keyname::BAD_ID);
+    let (status, v) = get_json(&t, "/api/value?key=fffe").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    // Small 8: the live state is checked before the glob, as in the TUI.
+    let (status, v) = get_json(&t, "/api/find?q=*a*b*c*d*e*f*g*h*i*").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["error"], super::api::keys::FIND_CLOSED);
+    t.hub
+        .with_mut(|c| c.session.live = crate::tui::app::views::LiveState::Ready);
+    let (status, v) = get_json(&t, "/api/find?q=*a*b*c*d*e*f*g*h*i*").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(v["error"].as_str().unwrap().contains("at most 8"), "{v}");
+    t.hub
+        .with_mut(|c| c.session.live = crate::tui::app::views::LiveState::Closed(None));
+    let (status, v) = get_json(&t, "/api/find?q=%01%02").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"], super::api::keys::EMPTY_FIND);
+    // The live connection is closed: a find says so.
+    let (status, v) = get_json(&t, "/api/find?q=user").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(v["error"], super::api::keys::FIND_CLOSED);
+    let (status, _) = get_json(&t, "/api/snapshots/compare?a=../config.toml&b=current").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, v) = get_json(&t, "/api/browse?sort=size").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"], super::api::browse::BAD_SORT);
+    let res = call(&t, write("POST", "/api/analysis", r#"{"depth":"full"}"#)).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let res = call(&t, write("DELETE", "/api/analysis", "")).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(&text(res).await)["error"],
+        crate::web::session::NO_ANALYSIS
+    );
+}
+
+#[tokio::test]
+async fn a_saved_snapshot_is_the_tuis_file_and_compares_with_the_current_report() {
+    let dir = temp_config("p2snapdir").parent().unwrap().join("snapshots");
+    let config = temp_config("p2snap");
+    let store = Arc::new(MemoryStore::default());
+    let hub = session::Hub::with_snapshots(config, store, Some(dir.clone()));
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let router = router(app_state(
+        Arc::clone(&hub),
+        PORT,
+        Token::for_test(&token()),
+        rx,
+    ));
+    let t = T {
+        router,
+        hub,
+        store: Arc::new(MemoryStore::default()),
+        config: dir.join("unused.toml"),
+        _shutdown: _tx,
+    };
+    // An older analysis on disk, then the current one.
+    let mut old = crate::tui::fixtures::previous_report(true);
+    old.profile = "cache".into();
+    crate::snapshot::save(&dir, &old).unwrap();
+    let mut r = crate::tui::fixtures::report(true);
+    r.profile = "cache".into();
+    analysed(&t, Some(r.clone()), None);
+    let res = call(&t, write("POST", "/api/snapshots", "")).await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let saved = json(&text(res).await);
+    let file = saved["file"].as_str().unwrap().to_string();
+    assert_eq!(
+        file,
+        format!("{}.json", crate::snapshot::timestamp_name(r.taken_at_unix))
+    );
+    // The TUI's own reader reads it back as the same report.
+    let on_disk = crate::snapshot::list(&dir, "cache").unwrap();
+    assert_eq!(on_disk.len(), 2);
+    assert_eq!(crate::snapshot::load(&on_disk[0].path).unwrap(), r);
+    let (_, l) = get_json(&t, "/api/snapshots").await;
+    assert_eq!(l["snapshots"].as_array().unwrap().len(), 2, "{l}");
+    assert_eq!(l["saved"], true, "{l}");
+    let older = l["snapshots"][1]["file"].as_str().unwrap().to_string();
+    let (status, d) = get_json(&t, &format!("/api/snapshots/compare?a={older}&b={file}")).await;
+    assert_eq!(status, StatusCode::OK, "{d}");
+    assert_eq!(d["before_taken_at_unix"], old.taken_at_unix, "{d}");
+    assert!(d["rows"].as_array().is_some_and(|r| !r.is_empty()), "{d}");
+    let (status, _) = get_json(&t, &format!("/api/snapshots/compare?a=current&b={older}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, v) = get_json(
+        &t,
+        "/api/snapshots/compare?a=20200101T000000Z.json&b=current",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -- the verifier's findings: B1, S1, Small 1, 5, 6, 9 --------------------------------
+
+/// Sends `req` in a task of its own: a request that waits while the test answers it.
+fn spawn_call(t: &T, req: Request<Body>) -> tokio::task::JoinHandle<Response> {
+    let router = t.router.clone();
+    tokio::spawn(async move { router.oneshot(req).await.unwrap() })
+}
+
+/// Waits (a little) until `want` holds.
+async fn until(what: &str, want: impl Fn() -> bool) {
+    for _ in 0..500 {
+        if want() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    panic!("{what}: not in time");
+}
+
+/// The browser goes while the request waits for the server: the future is dropped.
+async fn dropped(t: &T, path: &str) {
+    let gone = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        call(t, signed_get(path)),
+    )
+    .await;
+    assert!(gone.is_err(), "{path} waits for its answer");
+}
+
+fn key_row(key: &str) -> crate::live::keys::KeyRow {
+    crate::live::keys::KeyRow {
+        key: key.into(),
+        key_type: crate::model::KeyType::String,
+        ttl: crate::model::Ttl::Persistent,
+        bytes: None,
+        encoding: None,
+        length: None,
+        freq: None,
+    }
+}
+
+fn keys_page(keys: &[&str], cursor: u64) -> session::LiveResult {
+    Ok(crate::live::LiveReply::Keys(
+        crate::live::keys::Reply::Page(crate::live::keys::Page {
+            rows: keys.iter().map(|k| key_row(k)).collect(),
+            cursor,
+            carry: Vec::new(),
+            other_pattern: 0,
+            unreadable: 0,
+            refused: Vec::new(),
+        }),
+    ))
+}
+
+fn list_page(items: &[&str], more: bool) -> session::LiveResult {
+    use crate::live::values::{At, Items, Page, Reply};
+    Ok(crate::live::LiveReply::Value(Reply::Page(Page {
+        type_name: Some("list".into()),
+        items: Items::List(items.iter().map(|i| crate::value::Raw::from(*i)).collect()),
+        next: more.then_some(At::Index(2)),
+        refused: Vec::new(),
+    })))
+}
+
+/// S1: a request the browser drops while it waits for the server leaves no name page,
+/// key list or value loading: the answer still lands, and the next request works.
+#[tokio::test]
+async fn a_request_dropped_mid_read_leaves_nothing_loading() {
+    let t = setup("p2dropped", Vec::new());
+    t.hub.install_for_test(profile("cache", Env::Local), false);
+    t.hub.hold_requests(true);
+
+    // Browse › Keys from names.
+    dropped(&t, "/api/browse").await;
+    assert_eq!(t.hub.pending_len(), 1);
+    assert!(t.hub.answer_oldest(Ok(crate::live::LiveReply::Names(
+        crate::live::names::Reply::Page(crate::live::names::Page {
+            names: vec!["user:1".into(), "user:2".into()],
+            cursor: 0,
+            unreadable: 0,
+        })
+    ))));
+    let hub = Arc::clone(&t.hub);
+    until("the page of names is taken", || {
+        hub.with(|c| !c.browse.names.is_reading() && c.browse.names.pages == 1)
+            .unwrap_or(false)
+    })
+    .await;
+    let (status, b) = get_json(&t, "/api/browse?node=0").await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["source"], "names", "{b}");
+    assert_eq!(b["names"]["reading"], false, "{b}");
+    assert_eq!(b["rows"][0]["pattern"]["name"], "user:{id}", "{b}");
+    // Small 9: names are not narrowed to a node, so the node is not echoed.
+    assert_eq!(b["node"], serde_json::Value::Null, "{b}");
+    let res = call(&t, write("POST", "/api/browse/more", "")).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let e = json(&text(res).await);
+    assert!(
+        e["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("Every key name is read"),
+        "not stuck reading: {e}"
+    );
+
+    // A pattern's keys.
+    let pattern: String = "user:{id}".bytes().map(|b| format!("{b:02x}")).collect();
+    dropped(&t, &format!("/api/keys?pattern={pattern}")).await;
+    assert!(t.hub.answer_oldest(keys_page(&["user:1"], 5)));
+    until("the key list's page is taken", || {
+        hub.with(|c| c.browse.lists.loading_of(1) == Some(false))
+            .unwrap_or(false)
+    })
+    .await;
+    let more = spawn_call(&t, signed_get("/api/keys/more?list=1"));
+    until("the next page is asked for", || hub.pending_len() == 1).await;
+    // A second "more" while it loads is refused, and sends nothing.
+    let sent = t.hub.sent_count();
+    let (status, v) = get_json(&t, "/api/keys/more?list=1").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["error"], super::api::keys::LOADING);
+    assert_eq!(t.hub.sent_count(), sent);
+    assert!(t.hub.answer_oldest(keys_page(&["user:2"], 0)));
+    let res = more.await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let l = json(&text(res).await);
+    // Small 6: a next page's reply holds only the rows it added.
+    assert_eq!(l["rows"].as_array().unwrap().len(), 1, "{l}");
+    assert_eq!(l["rows"][0]["name"], "user:2", "{l}");
+    assert_eq!(
+        (l["new_from"].clone(), l["loaded"].clone()),
+        (1.into(), 2.into())
+    );
+    assert_eq!(l["done"], true, "{l}");
+    assert_eq!(l["capped"], false, "{l}");
+
+    // A value.
+    let key: String = "queue".bytes().map(|b| format!("{b:02x}")).collect();
+    dropped(&t, &format!("/api/value?key={key}&type=list")).await;
+    assert!(t.hub.answer_oldest(list_page(&["a", "b"], true)));
+    until("the value's page is taken", || {
+        hub.with(|c| c.browse.values.loading_of(1) == Some(false))
+            .unwrap_or(false)
+    })
+    .await;
+    let more = spawn_call(&t, signed_get("/api/value/more?view=1"));
+    until("the next page is asked for", || hub.pending_len() == 1).await;
+    // Small 1: a second "more" while a page loads reads nothing twice.
+    let sent = t.hub.sent_count();
+    let (status, v) = get_json(&t, "/api/value/more?view=1").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["error"], super::api::values::STILL_LOADING);
+    assert_eq!(t.hub.sent_count(), sent);
+    assert!(t.hub.answer_oldest(list_page(&["c"], false)));
+    let res = more.await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = json(&text(res).await);
+    assert_eq!(v["loaded"], 3, "{v}");
+    assert_eq!(v["items"][2]["value"], "c", "{v}");
+    assert_eq!(v["loading"], false, "{v}");
+    assert_eq!(t.hub.pending_len(), 0);
+}
+
+/// Small 5: two Big keys requests at once read the facts once, and Overview hears of
+/// them (its findings use them).
+#[tokio::test]
+async fn big_keys_facts_are_read_once_and_overview_hears_of_them() {
+    let t = setup("p2facts", Vec::new());
+    analysed(
+        &t,
+        Some(crate::tui::fixtures::report(true)),
+        Some(crate::tui::fixtures::perms_ok()),
+    );
+    t.hub
+        .with_mut(|c| c.session.live = crate::tui::app::views::LiveState::Ready);
+    t.hub.hold_requests(true);
+    let mut l = t.hub.listen();
+    let a = spawn_call(&t, signed_get("/api/analysis/big_keys"));
+    let hub = Arc::clone(&t.hub);
+    until("the facts are asked for", || hub.pending_len() == 1).await;
+    let b = spawn_call(&t, signed_get("/api/analysis/big_keys"));
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(t.hub.sent_count(), 1, "read once");
+    assert!(!b.is_finished(), "the second waits for the first's read");
+    let facts = vec![(
+        "big:1".to_string(),
+        crate::analysis::KeyFacts {
+            length: Some(3),
+            encoding: Some("listpack".into()),
+        },
+    )];
+    assert!(t.hub.answer_oldest(Ok(crate::live::LiveReply::Keys(
+        crate::live::keys::Reply::Facts {
+            facts,
+            refused: Vec::new(),
+        }
+    ))));
+    for res in [a.await.unwrap(), b.await.unwrap()] {
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(json(&text(res).await)["facts_read"], true);
+    }
+    assert_eq!(t.hub.sent_count(), 1);
+    let mut overview = false;
+    while let Ok(e) = l.rx.try_recv() {
+        overview |= e.name == "overview";
+    }
+    assert!(
+        overview,
+        "an overview event went out once the facts were in"
+    );
+}
+
+/// A PUBLISH the gate asks about: the question's id.
+async fn ask(t: &T) -> String {
+    let req = write(
+        "POST",
+        "/api/pubsub/publish",
+        r#"{"channel":"c","message":"m"}"#,
+    );
+    let res = call(t, req).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    json(&text(res).await)["confirm"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Answers the switch's or the analysis's connect as if it finished: the live
+/// connection of the new run is ready (no server stands behind this test).
+async fn new_run_ready(t: &T) {
+    let hub = Arc::clone(&t.hub);
+    // The connect to nowhere fails first; then the run is made ready by hand.
+    until("the new run's connect ends", || {
+        hub.with(|c| c.failed()).unwrap_or(false)
+    })
+    .await;
+    t.hub.with_mut(|c| {
+        c.session.phase = crate::tui::app::Phase::Connected;
+        c.session.analysis = None;
+        c.session.live = crate::tui::app::views::LiveState::Ready;
+    });
+}
+
+/// B1 (rule 2): a write question asked before a database switch or an analysis is
+/// refused when answered after it, in the CHANGED words, and nothing is sent: the yes
+/// was for the database the question was asked on.
+#[tokio::test]
+async fn a_write_question_is_not_answered_on_a_new_run() {
+    let mut p = profile("prod1", Env::Prod);
+    p.read_only = Some(false);
+    // Nothing listens there: the new runs' connects fail at once.
+    p.endpoint = Endpoint {
+        host: "127.0.0.1".into(),
+        port: 1,
+        tls: false,
+    };
+    let t = setup("p2b1", vec![p.clone()]);
+    t.hub.install_for_test(p, false);
+    // In the same run the answer is sent (answered as closed: no server here).
+    let id = ask(&t).await;
+    let sent = t.hub.sent_count();
+    let res = answer(&t, &id, Some("prod1")).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(t.hub.sent_count(), sent + 1, "the control write is sent");
+
+    // A database switch between the question and the answer.
+    let id = ask(&t).await;
+    t.hub.with_mut(|c| c.browse.dbs = Some(vec![0, 1]));
+    let res = call(&t, write("POST", "/api/db", r#"{"db":1}"#)).await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    new_run_ready(&t).await;
+    let sent = t.hub.sent_count();
+    let res = answer(&t, &id, Some("prod1")).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(json(&text(res).await)["error"], super::api::writes::CHANGED);
+    assert_eq!(t.hub.sent_count(), sent, "nothing is sent to db 1");
+
+    // An analysis between the question and the answer.
+    let id = ask(&t).await;
+    let res = call(&t, write("POST", "/api/analysis", r#"{"depth":"quick"}"#)).await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    new_run_ready(&t).await;
+    let sent = t.hub.sent_count();
+    let res = answer(&t, &id, Some("prod1")).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(json(&text(res).await)["error"], super::api::writes::CHANGED);
+    assert_eq!(t.hub.sent_count(), sent, "nothing is sent");
+}

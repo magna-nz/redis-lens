@@ -86,6 +86,74 @@
 // Confirm       { id, kind: 'ask'|'type', text, expect, title: string|null }
 // Notice        { text, kind: 'info' }
 //
+// Browse, Analyze and snapshots (phase 2):
+// Name          { name (escaped, to show), id (hex of the bytes: what names it in a request),
+//                 copy: string|null (the name as it is, when escaping changed nothing) }
+// Analysis      { status: 'none'|'connecting'|'sampling'|'stopping'|'done', running: bool, run,
+//                 depth: 'quick'|'deep'|null, sampled, target, startedAt (unix), error, note,
+//                 previous: bool, db, report: Report|null }          (State.analysis)
+// Report        { takenAt (unix), ageSecs, sampledKeys, patterns, complete, stopped, sizes,
+//                 cluster, previous }
+// Progress      { run, kind: 'started'|'sampling'|'stopping'|'done'|'stopped'|'failed'|
+//                 'compared', depth, sampleLimit, sampled, target, patterns, stopping,
+//                 sampledKeys, complete, stopped, takenAt, kept, text, error }
+// Dbs           { off, current, rows: [{ db, keys, expires, current }], unread, savedAs, note }
+// Browse        { source: 'names'|'partial'|'analysis'|'none', why, sort, sorts, sizes, node,
+//                 nodes: [{ index, endpoint, role, status, sampledKeys }], previous, partial:
+//                 { sampled, target }|null, names: Names|null, total, ttlLabels, rows: [Row] }
+// Names         { pages, firstPages, namesRead, dbsize, complete, done, reading, error,
+//                 refused, skipped, missing: [endpoint], nodesDone: [read, of]|null }
+// Row           PatternRow | { kind: 'group', label, key, type, estKeys, estBytes, sampledKeys,
+//                 share, noTtl, noTtlRatio, verdict, marked, reason, children: [PatternRow] }
+// PatternRow    { kind: 'pattern', pattern: Name, type, estKeys, estBytes, avgBytes,
+//                 sampledKeys, sampledBytes, share, noTtl, noTtlRatio, ttlHist: [n]|null,
+//                 ttlVerdict, verdict, reason, warning, p50, p99, max, examples: [KeyRow],
+//                 command, marked, change: Change|null, namesSeen, literal }
+// Change        { deltaBytes, deltaKeys, cause, words, alarming }
+// KeyRow        Name plus { type, ttl ('never', '59m 59s'), ttlSecs, bytes, encoding, length,
+//                 lengthUnit, freq, node }
+// KeyList       { list, kind: 'pattern'|'find', pattern: Name|null, find: { text, glob }|null,
+//                 glob, rows: [KeyRow] (from newFrom on), loaded, newFrom, pages, pageKeys,
+//                 done, capped, maxRows, error,
+//                 refused: [string], otherPattern, unreadable, sizes, lfu, freq, cluster:
+//                 { walk, at, nodesDone, missing: [endpoint], narrowed }|null }
+// Value         { view, key: Name|null, type, kind, command, meta: KeyRow|null, pattern,
+//                 loading, pages, loaded, length, done, more, capped, gone, error, notice,
+//                 refused, fieldTtls, fieldTtlsOff, items: [{ index, name, value, ttl, at,
+//                 fields: [{ name, value }]|null }], value: Shown|null, cut, message,
+//                 module: Module|null, cluster, maxItems }
+// Shown         { format, detected, picked, formats, bytes, compression, truncated, note,
+//                 header, lines: [string], copy: string|null, copyRefused }
+// Item          { index, field, name, shown: Shown }
+// Module        { label, info, top, stats: [{ name, value }], samples: [{ at (ms), value }],
+//                 missing: [string], unavailable }
+// AnalysisInfo  { analysis: Analysis, estimates: [Estimate], running }
+// Estimate      { depth, sampleLimit, keys, commands, perSec, durationSecs, about, shards,
+//                 sizes, freq }
+// BigKeys       { off, report, empty, rows: [{ key: KeyRow, pattern: Name, length, lengthUnit,
+//                 encoding, big, endpoint }], recommendations: [{ severity, text, hint }],
+//                 factsRead, notes, bigKeyBytes }
+// Expiry        { off, report, empty, rows: [{ pattern, estKeys, estBytes, sampledKeys, noTtl,
+//                 noTtlRatio, ttlHist, status, warning, explain: [string], command }],
+//                 ttlLabels, freed: { within: [{ label, bytes }], later, never, total,
+//                 neverShare }|null, freedOff }
+// Diff          { off, report, status: 'pending'|'none'|'failed'|'diff', text, before, after:
+//                 { at, utc, sampledKeys, usedMemory }, rows: [{ pattern, keysBefore,
+//                 keysAfter, bytesBefore, bytesAfter, change, partial, trend: { values,
+//                 perDay, ratioPerDay }|null }], empty, note, trendPoints }
+// HotKeys       { off, report, empty, rows: [{ key: KeyRow, pattern, endpoint, hotAndBig }],
+//                 hotBigBytes, hotFreq }
+// Nodes         { off, report, empty, rows: [{ index, id, primaryId, endpoint, role, version,
+//                 status, complete, keys, sampledKeys, patterns, memory, slots (text),
+//                 slotCount, sizes, note }] }
+// Slots         { off, ranges: [{ node, endpoint, start, end, status, error, keys, cpuUsec,
+//                 netIn, netOut, memory }], hottest: [{ slot, node, endpoint, keys, cpuUsec,
+//                 netIn, netOut, memory, sampled: [{ key: Name, pattern: Name, kinds }] }],
+//                 order, memoryColumn, cpuAndNetworkZero, note, empty }
+// Snapshots     { profile, snapshots: [{ file, takenAt, utc, current }], canSave, saveOff,
+//                 saved }
+// Saved         { file, takenAt, utc, sampledKeys, text }
+//
 // =======================================================================================
 // METHODS (all async; each can reject with ApiError, whose `message` is the server's own
 // fixed wording, or a fixed line of the page's when the server sent none)
@@ -115,6 +183,24 @@
 //   runCommand(line, { pipeline })    → Reply         POST   /api/cmdline
 //   getCommandNames()                 → Names         GET    /api/cmdline/commands
 //   getCommandHelp(name)              → Help | null   GET    /api/cmdline/help?name=
+//   getDbs()                          → Dbs           GET    /api/dbs
+//   switchDb(db)                      → { switched, db, run, text }   POST /api/db (202)
+//   getBrowse({ sort, node })         → Browse        GET    /api/browse
+//   moreNames({ sort })               → Browse        POST   /api/browse/more
+//   getKeys({ pattern (id), node })   → KeyList       GET    /api/keys
+//   findKeys(text)                    → KeyList       GET    /api/find?q=
+//   moreKeys(list)                    → KeyList       GET    /api/keys/more?list=
+//   openValue({ key (id), type })     → Value         GET    /api/value
+//   moreValue(view)                   → Value         GET    /api/value/more?view=
+//   getItem({ view, index, field, format }) → Item    GET    /api/value/item
+//   getAnalysis()                     → AnalysisInfo  GET    /api/analysis
+//   startAnalysis(depth)              → { run, depth, sampleLimit, estimate }   POST (202)
+//   stopAnalysis()                    → { stopping, text }   DELETE /api/analysis
+//   getBigKeys() getExpiry() getChanges() getHotKeys() getNodes() getSlots({ order, refresh })
+//                                     → the panel     GET    /api/analysis/<panel>
+//   saveSnapshot()                    → Saved         POST   /api/snapshots (201)
+//   listSnapshots()                   → Snapshots     GET    /api/snapshots
+//   compareSnapshots(a, b)            → Diff          GET    /api/snapshots/compare
 //
 // A write the gate wants confirmed comes back as HTTP 409 `{ "confirm": … }`. The wrapper
 // here opens the confirm dialog (through the handler app.js registers), answers with
@@ -125,7 +211,7 @@
 // EVENTS: `api.on(name, fn)` returns a function that unsubscribes.
 //   state (State) · figures (Figures) · overview (Overview without `figures` and
 //   `shards`, which come with `figures`) · tail (TailEvent) · monitor (MonitorEvent) ·
-//   notice (Notice) · link ({ up: bool }, the page's own line to redis-lens) ·
+//   progress (Progress, an analysis) · notice (Notice) · link ({ up: bool }, the page's own line to redis-lens) ·
 //   locked ({}): the session is missing or wrong (HTTP 401) · live ({ live: bool }):
 //   raised by app.js when the state's `live` changes, for the views that draw figures.
 
@@ -334,6 +420,7 @@ export function adaptState(j) {
     polling,
     live: !polling.paused,
     monitorLimits: { maxLines: num(limits.max_lines) ?? 10000, maxSecs: num(limits.max_secs) ?? 30 },
+    analysis: adaptAnalysis(o.analysis),
   };
 }
 
@@ -536,11 +623,42 @@ export function adaptOverview(j) {
     figures: o.live ? adaptFigures(o.live) : null,
     shards: arr(o.shards).map(adaptShard),
     findings: arr(o.findings).map(adaptFinding).filter((f) => f.text),
+    analysis: o.analysis ? adaptOverviewAnalysis(o.analysis) : null,
   };
 }
 
+/** Overview's analysis part (`overview.analysis`): null until an analysis has a report, and
+ *  while one runs. */
+export function adaptOverviewAnalysis(j) {
+  const o = obj(j);
+  return {
+    takenAt: num(o.taken_at_unix),
+    sampledKeys: num(o.sampled_keys),
+    patterns: num(o.patterns),
+    complete: o.complete === true,
+    stopped: o.stopped === true,
+    sizes: o.sizes_available === true,
+    findings: arr(o.findings).map(adaptFinding).filter((f) => f.text),
+    topPatterns: arr(o.top_patterns).map((t) => {
+      const x = obj(t);
+      return { pattern: adaptName(x.pattern), estKeys: num(x.est_keys), estBytes: num(x.est_bytes), share: num(x.share) };
+    }),
+    neverExpiresShare: num(o.never_expires_share),
+    changes: oneOf(o.changes, ['pending', 'none', 'failed', 'diff'], null),
+    note: str(o.note),
+  };
+}
+
+/** Where a finding's `screen` is looked into on this page (a route under `#/`): the TUI's
+ *  screens the dashboard has. Streams and Search are not in it yet. */
+export const FINDING_WHERE = {
+  slow_log: 'server/slowlog', clients: 'server/clients', monitor: 'server/monitor', pubsub: 'pubsub', connections: 'connections',
+  keys: 'browse', big_keys: 'analyze/big_keys', expiry: 'analyze/expiry', changes: 'analyze/changes', hot_keys: 'analyze/hot_keys',
+  nodes: 'analyze/nodes', slots: 'analyze/slots',
+};
+
 /** One of Overview's findings "from the server": `{ severity, text, screen, area, panel }`.
- *  `where` is this page's panel for it, when this phase has one. */
+ *  `where` is this page's route for it (`server/slowlog`), when the page has the screen. */
 export function adaptFinding(j) {
   const o = obj(j);
   const screen = str(o.screen);
@@ -549,7 +667,7 @@ export function adaptFinding(j) {
     severity: oneOf(o.severity, ['warn', 'note', 'info'], 'note'),
     screen,
     label: [str(o.area), str(o.panel)].filter(Boolean).join(' › ') || null,
-    where: { slow_log: 'slowlog', clients: 'clients' }[screen] ?? null,
+    where: FINDING_WHERE[screen] ?? null,
   };
 }
 
@@ -759,6 +877,524 @@ export function adaptNotice(j) {
   return { text: str(obj(j).text) ?? '', kind: 'info' };
 }
 
+// ---------------------------------------------------------------------------------------
+// Browse, Analyze and snapshots (phase 2). The same rules: unknown stays unknown, and
+// every text from Redis arrives escaped by redis-lens and is drawn as text.
+// ---------------------------------------------------------------------------------------
+
+/** A text that may be empty (a key name, a value): only a non-string is unknown. */
+const text = (v) => (typeof v === 'string' ? v : null);
+const bool = (v) => (typeof v === 'boolean' ? v : null);
+const nums = (v) => (Array.isArray(v) ? v.map((n) => num(n)) : null);
+
+/** A key or pattern name: the escaped text to show, the hex id that names it in a request
+ *  (never the text), and the name to copy when escaping changed nothing. */
+export function adaptName(j) {
+  const o = obj(j);
+  const id = typeof o.id === 'string' && /^(?:[0-9a-f]{2})*$/.test(o.id) ? o.id : '';
+  return { name: text(o.name) ?? '', id, copy: text(o.copy) };
+}
+
+/** A key with what is known of it: a key list's row, a sampled key, a value's facts. */
+export function adaptKeyRow(j) {
+  const o = obj(j);
+  return {
+    ...adaptName(o),
+    type: str(o.type),
+    ttl: str(o.ttl),
+    ttlSecs: num(o.ttl_secs),
+    bytes: num(o.bytes),
+    encoding: str(o.encoding),
+    length: num(o.length),
+    lengthUnit: str(o.length_unit),
+    freq: num(o.freq),
+    node: num(o.node),
+  };
+}
+
+/** A report's summary (`state.analysis.report`, each panel's `report`). */
+export function adaptReport(j) {
+  const o = obj(j);
+  return {
+    takenAt: num(o.taken_at_unix),
+    ageSecs: num(o.age_secs),
+    sampledKeys: num(o.sampled_keys),
+    patterns: num(o.patterns),
+    complete: o.complete === true,
+    stopped: o.stopped === true,
+    sizes: o.sizes_available === true,
+    cluster: o.cluster === true,
+    previous: o.previous === true,
+  };
+}
+
+const RUNNING = ['connecting', 'sampling', 'stopping'];
+
+/** `state.analysis`: the analysis and its report. */
+export function adaptAnalysis(j) {
+  const o = obj(j);
+  const status = oneOf(o.status, ['none', 'connecting', 'sampling', 'stopping', 'done'], 'none');
+  return {
+    status,
+    running: RUNNING.includes(status),
+    run: num(o.run) ?? 0,
+    depth: oneOf(o.depth, ['quick', 'deep'], null),
+    sampled: num(o.sampled),
+    target: num(o.target),
+    startedAt: num(o.started_unix),
+    error: str(o.error),
+    note: str(o.note),
+    previous: o.previous === true,
+    db: num(o.db) ?? 0,
+    report: o.report ? adaptReport(o.report) : null,
+  };
+}
+
+/** The `progress` event of an analysis. */
+export function adaptProgress(j) {
+  const o = obj(j);
+  return {
+    run: num(o.run),
+    kind: oneOf(o.kind, ['started', 'sampling', 'stopping', 'done', 'stopped', 'failed', 'compared'], 'sampling'),
+    depth: oneOf(o.depth, ['quick', 'deep'], null),
+    sampleLimit: num(o.sample_limit),
+    sampled: num(o.sampled),
+    target: num(o.target),
+    patterns: num(o.patterns),
+    stopping: o.stopping === true,
+    sampledKeys: num(o.sampled_keys),
+    complete: o.complete === true,
+    stopped: o.stopped === true,
+    takenAt: num(o.taken_at_unix),
+    kept: bool(o.kept),
+    text: str(o.text),
+    error: str(o.error),
+  };
+}
+
+/** GET /api/dbs: the databases with their key counts, or `{ off }` on a cluster. */
+export function adaptDbs(j) {
+  const o = obj(j);
+  return {
+    off: str(o.off),
+    current: num(o.current) ?? 0,
+    rows: arr(o.rows).map((r) => {
+      const x = obj(r);
+      return { db: num(x.db) ?? 0, keys: num(x.keys), expires: num(x.expires), current: x.current === true };
+    }),
+    unread: str(o.unread),
+    savedAs: str(o.saved_as),
+    note: str(o.note),
+  };
+}
+
+/** POST /api/db: 202 `{ db, run, switched: true, text }`, 200 `{ switched: false }`. */
+export function adaptDbSwitch(j) {
+  const o = obj(j);
+  return { switched: o.switched === true, db: num(o.db), run: num(o.run), text: str(o.text) };
+}
+
+export function adaptChange(j) {
+  if (!j) return null;
+  const o = obj(j);
+  return { deltaBytes: num(o.delta_bytes), deltaKeys: num(o.delta_keys), cause: str(o.cause), words: str(o.cause_words) ?? str(o.cause), alarming: o.alarming === true };
+}
+
+/** A pattern row of the Browse tree. */
+export function adaptPatternRow(j) {
+  const o = obj(j);
+  return {
+    kind: 'pattern',
+    pattern: adaptName(o.pattern),
+    type: str(o.type),
+    estKeys: num(o.est_keys),
+    estBytes: num(o.est_bytes),
+    avgBytes: num(o.avg_bytes),
+    sampledKeys: num(o.sampled_keys),
+    sampledBytes: num(o.sampled_bytes),
+    share: num(o.share),
+    noTtl: num(o.no_ttl),
+    noTtlRatio: num(o.no_ttl_ratio),
+    ttlHist: nums(o.ttl_hist),
+    ttlVerdict: str(o.ttl_verdict),
+    verdict: str(o.verdict),
+    reason: str(o.reason),
+    warning: o.warning === true,
+    p50: num(o.size_p50),
+    p99: num(o.size_p99),
+    max: num(o.size_max),
+    examples: arr(o.examples).map(adaptKeyRow),
+    command: str(o.command),
+    marked: o.marked === true,
+    change: adaptChange(o.change),
+    namesSeen: num(o.names_seen),
+    literal: bool(o.literal),
+  };
+}
+
+/** A row of the tree: a pattern, or a group of patterns that share a prefix. */
+export function adaptTreeRow(j) {
+  const o = obj(j);
+  if (o.kind !== 'group') return adaptPatternRow(o);
+  return {
+    kind: 'group',
+    label: str(o.label) ?? '',
+    key: str(o.key) ?? str(o.label) ?? '',
+    type: str(o.type),
+    estKeys: num(o.est_keys),
+    estBytes: num(o.est_bytes),
+    sampledKeys: num(o.sampled_keys),
+    share: num(o.share),
+    noTtl: num(o.no_ttl),
+    noTtlRatio: num(o.no_ttl_ratio),
+    verdict: str(o.verdict),
+    marked: o.marked === true,
+    reason: str(o.reason),
+    children: arr(o.children).map(adaptPatternRow),
+  };
+}
+
+const SORTS = ['memory', 'keys', 'avg_size', 'no_ttl', 'name'];
+
+/** GET /api/browse and POST /api/browse/more: the pattern tree. */
+export function adaptBrowse(j) {
+  const o = obj(j);
+  const n = o.names ? obj(o.names) : null;
+  const partial = o.partial ? obj(o.partial) : null;
+  const done = n ? arr(n.nodes_done) : [];
+  return {
+    source: oneOf(o.source, ['names', 'partial', 'analysis', 'none'], 'none'),
+    why: str(o.why),
+    sort: oneOf(o.sort, SORTS, 'keys'),
+    sorts: arr(o.sorts).filter((s) => SORTS.includes(s)),
+    sizes: o.sizes === true,
+    node: num(o.node),
+    nodes: arr(o.nodes).map((x) => {
+      const r = obj(x);
+      return { index: num(r.index) ?? 0, endpoint: str(r.endpoint) ?? '', role: str(r.role), status: str(r.status), sampledKeys: num(r.sampled_keys) };
+    }),
+    previous: o.previous === true,
+    partial: partial ? { sampled: num(partial.sampled), target: num(partial.target) } : null,
+    names: n ? {
+      pages: num(n.pages) ?? 0,
+      firstPages: num(n.first_pages),
+      namesRead: num(n.names_read) ?? 0,
+      dbsize: num(n.dbsize),
+      complete: n.complete === true,
+      done: n.done === true,
+      reading: n.reading === true,
+      error: str(n.error),
+      refused: strings(n.refused),
+      skipped: strings(n.skipped),
+      missing: strings(n.missing),
+      nodesDone: done.length === 2 && num(done[0]) !== null && num(done[1]) !== null ? [done[0], done[1]] : null,
+    } : null,
+    total: num(o.total),
+    ttlLabels: strings(o.ttl_labels),
+    rows: arr(o.rows).map(adaptTreeRow),
+  };
+}
+
+/** GET /api/keys, GET /api/find and GET /api/keys/more: a key list. */
+export function adaptKeyList(j) {
+  const o = obj(j);
+  const find = o.find ? obj(o.find) : null;
+  const cluster = o.cluster ? obj(o.cluster) : null;
+  return {
+    list: num(o.list),
+    kind: o.kind === 'find' ? 'find' : 'pattern',
+    pattern: o.pattern ? adaptName(o.pattern) : null,
+    find: find ? { text: text(find.text) ?? '', glob: text(find.glob) ?? '' } : null,
+    glob: text(o.glob),
+    rows: arr(o.rows).map(adaptKeyRow),
+    loaded: num(o.loaded) ?? 0,
+    newFrom: num(o.new_from) ?? 0,
+    pages: num(o.pages) ?? 0,
+    pageKeys: num(o.page_keys) ?? 1000,
+    done: o.done === true,
+    capped: o.capped === true,
+    maxRows: num(o.max_rows),
+    error: str(o.error),
+    refused: strings(o.refused),
+    otherPattern: num(o.other_pattern) ?? 0,
+    unreadable: num(o.unreadable) ?? 0,
+    sizes: o.sizes === true,
+    lfu: o.lfu === true,
+    freq: o.freq === true,
+    cluster: cluster ? {
+      walk: arr(cluster.walk).filter((n) => num(n) !== null),
+      at: num(cluster.at),
+      nodesDone: num(cluster.nodes_done),
+      missing: strings(cluster.missing),
+      narrowed: num(cluster.narrowed),
+    } : null,
+  };
+}
+
+/** A value drawn in one format (`value` of a string or document, `shown` of an item). */
+export function adaptShown(j) {
+  const o = obj(j);
+  return {
+    format: str(o.format) ?? 'text',
+    detected: str(o.detected),
+    picked: str(o.picked),
+    formats: strings(o.formats),
+    bytes: num(o.bytes),
+    compression: str(o.compression),
+    truncated: o.truncated === true,
+    note: str(o.note),
+    header: str(o.header) ?? '',
+    lines: arr(o.lines).filter((l) => typeof l === 'string'),
+    copy: text(o.copy),
+    copyRefused: str(o.copy_refused),
+  };
+}
+
+const pairs = (v) => arr(v).map((p) => ({ name: text(obj(p).name) ?? '', value: text(obj(p).value) ?? '' }));
+
+/** A module type's summary (time series, Bloom, Top-K, ...). */
+export function adaptModule(j) {
+  const o = obj(j);
+  return {
+    label: str(o.label),
+    info: pairs(o.info),
+    top: pairs(o.top),
+    stats: pairs(o.stats),
+    samples: arr(o.samples).map((s) => ({ at: num(obj(s).ts_ms), value: text(obj(s).value) ?? '' })),
+    missing: strings(o.missing),
+    unavailable: str(o.unavailable),
+  };
+}
+
+const KINDS = ['string', 'hash', 'list', 'set', 'zset', 'stream', 'json', 'vector', 'array', 'module', 'other'];
+
+/** GET /api/value and GET /api/value/more: an open value. */
+export function adaptValue(j) {
+  const o = obj(j);
+  return {
+    view: num(o.view),
+    key: o.key ? adaptName(o.key) : null,
+    type: str(o.type),
+    kind: oneOf(o.kind, KINDS, 'other'),
+    command: str(o.command),
+    meta: o.meta ? adaptKeyRow(o.meta) : null,
+    pattern: o.pattern ? adaptName(o.pattern) : null,
+    loading: o.loading === true,
+    pages: num(o.pages) ?? 0,
+    loaded: num(o.loaded) ?? 0,
+    length: num(o.length),
+    done: o.done === true,
+    more: o.more === true,
+    capped: o.capped === true,
+    gone: o.gone === true,
+    error: str(o.error),
+    notice: str(o.notice),
+    refused: strings(o.refused),
+    fieldTtls: o.field_ttls === true,
+    fieldTtlsOff: str(o.field_ttls_off),
+    items: arr(o.items).map((i) => {
+      const x = obj(i);
+      return {
+        index: num(x.index) ?? 0,
+        name: text(x.name),
+        value: text(x.value),
+        ttl: str(x.ttl),
+        at: num(x.at),
+        fields: Array.isArray(x.fields) ? pairs(x.fields) : null,
+      };
+    }),
+    value: o.value ? adaptShown(o.value) : null,
+    cut: str(o.cut),
+    message: str(o.message),
+    module: o.module ? adaptModule(o.module) : null,
+    cluster: o.cluster === true,
+    maxItems: num(o.max_items) ?? 10000,
+  };
+}
+
+/** GET /api/value/item: one item, whole, in a format. */
+export function adaptItem(j) {
+  const o = obj(j);
+  return { index: num(o.index), field: num(o.field), name: text(o.name), shown: adaptShown(o.shown) };
+}
+
+export function adaptEstimate(j) {
+  const o = obj(j);
+  return {
+    depth: oneOf(o.depth, ['quick', 'deep'], 'quick'),
+    sampleLimit: num(o.sample_limit),
+    keys: num(o.keys),
+    commands: num(o.commands),
+    perSec: num(o.per_sec),
+    durationSecs: num(o.duration_secs),
+    about: str(o.about),
+    shards: num(o.shards) ?? 0,
+    sizes: o.sizes === true,
+    freq: o.freq === true,
+  };
+}
+
+/** GET /api/analysis: the analysis, whether one runs, and what each depth would cost. */
+export function adaptAnalysisInfo(j) {
+  const o = obj(j);
+  return { analysis: adaptAnalysis(o.analysis), estimates: arr(o.estimates).map(adaptEstimate), running: o.running === true };
+}
+
+/** POST /api/analysis → 202 `{ run, depth, sample_limit, estimate }`. */
+export function adaptAnalysisStart(j) {
+  const o = obj(j);
+  return { run: num(o.run), depth: oneOf(o.depth, ['quick', 'deep'], 'quick'), sampleLimit: num(o.sample_limit), estimate: o.estimate ? adaptEstimate(o.estimate) : null };
+}
+
+const panel = (o) => ({ off: str(o.off), report: o.report ? adaptReport(o.report) : null, empty: str(o.empty) });
+
+/** GET /api/analysis/big_keys. */
+export function adaptBigKeys(j) {
+  const o = obj(j);
+  return {
+    ...panel(o),
+    rows: arr(o.rows).map((r) => {
+      const x = obj(r);
+      return { key: adaptKeyRow(x.key), pattern: adaptName(x.pattern), length: num(x.length), lengthUnit: str(x.length_unit), encoding: str(x.encoding), big: x.big === true, endpoint: str(x.endpoint) ?? str(x.node) };
+    }),
+    recommendations: arr(o.recommendations).map((r) => {
+      const x = obj(r);
+      return { severity: oneOf(x.severity, ['warn', 'note', 'info'], 'note'), text: str(x.text) ?? '', hint: str(x.hint) };
+    }).filter((r) => r.text),
+    factsRead: o.facts_read === true,
+    notes: strings(o.notes),
+    bigKeyBytes: num(o.big_key_bytes),
+  };
+}
+
+/** GET /api/analysis/expiry. */
+export function adaptExpiry(j) {
+  const o = obj(j);
+  const freed = o.freed ? obj(o.freed) : null;
+  return {
+    ...panel(o),
+    rows: arr(o.rows).map((r) => {
+      const x = obj(r);
+      return {
+        pattern: adaptName(x.pattern), estKeys: num(x.est_keys), estBytes: num(x.est_bytes), sampledKeys: num(x.sampled_keys), noTtl: num(x.no_ttl),
+        noTtlRatio: num(x.no_ttl_ratio), ttlHist: nums(x.ttl_hist), status: str(x.status), warning: x.warning === true, explain: strings(x.explain), command: str(x.command),
+      };
+    }),
+    ttlLabels: strings(o.ttl_labels),
+    freed: freed ? {
+      within: arr(freed.within).map((w) => ({ label: str(obj(w).label) ?? '', bytes: num(obj(w).bytes) })),
+      later: num(freed.later),
+      never: num(freed.never),
+      total: num(freed.total),
+      neverShare: num(freed.never_share),
+    } : null,
+    freedOff: str(o.freed_off),
+  };
+}
+
+/** GET /api/analysis/changes and GET /api/snapshots/compare: one analysis against another. */
+export function adaptDiff(j) {
+  const o = obj(j);
+  const side = (p) => ({ at: num(o[`${p}_taken_at_unix`]), utc: str(o[`${p}_utc`]), sampledKeys: num(o[`${p}_sampled_keys`]), usedMemory: num(o[`used_memory_${p}`]) });
+  const status = o.status === undefined && Array.isArray(o.rows) ? 'diff' : oneOf(o.status, ['pending', 'none', 'failed', 'diff'], 'none');
+  return {
+    ...panel(o),
+    status,
+    text: str(o.text),
+    before: side('before'),
+    after: side('after'),
+    rows: arr(o.rows).map((r) => {
+      const x = obj(r);
+      const t = x.trend ? obj(x.trend) : null;
+      const g = t && t.growth ? obj(t.growth) : null;
+      return {
+        pattern: adaptName(x.pattern), keysBefore: num(x.keys_before), keysAfter: num(x.keys_after), bytesBefore: num(x.bytes_before), bytesAfter: num(x.bytes_after),
+        change: adaptChange(x.change), partial: x.partial === true,
+        trend: t ? { values: nums(t.values) || [], perDay: g ? num(g.per_day) : null, ratioPerDay: g ? num(g.ratio_per_day) : null } : null,
+      };
+    }),
+    note: str(o.note),
+    trendPoints: Array.isArray(o.trend_points) ? o.trend_points.map((p) => ({ at: num(obj(p).taken_at_unix), complete: obj(p).complete === true, sampledKeys: num(obj(p).sampled_keys) })) : null,
+  };
+}
+
+/** GET /api/analysis/hot_keys, or `{ off }` without LFU counters. */
+export function adaptHotKeys(j) {
+  const o = obj(j);
+  return {
+    ...panel(o),
+    rows: arr(o.rows).map((r) => {
+      const x = obj(r);
+      return { key: adaptKeyRow(x.key), pattern: adaptName(x.pattern), endpoint: str(x.endpoint) ?? str(x.node), hotAndBig: x.hot_and_big === true };
+    }),
+    hotBigBytes: num(o.hot_big_bytes),
+    hotFreq: num(o.hot_freq),
+  };
+}
+
+/** GET /api/analysis/nodes, or `{ off }` on a standalone server. */
+export function adaptNodes(j) {
+  const o = obj(j);
+  return {
+    ...panel(o),
+    rows: arr(o.rows).map((r) => {
+      const x = obj(r);
+      return {
+        index: num(x.index) ?? 0, id: str(x.id), primaryId: str(x.primary_id), endpoint: str(x.endpoint) ?? '', role: str(x.role), version: str(x.version),
+        status: oneOf(x.status, ['scanned', 'partial', 'failed'], 'failed'), complete: x.complete === true, keys: num(x.keys), sampledKeys: num(x.sampled_keys),
+        patterns: num(x.patterns), memory: num(x.memory), slots: fmtSlots(x.slots), slotCount: num(x.slot_count), sizes: x.sizes_available === true, note: str(x.note),
+      };
+    }),
+  };
+}
+
+const slotFigures = (x) => ({ keys: num(x.keys), cpuUsec: num(x.cpu_usec), netIn: num(x.net_in), netOut: num(x.net_out), memory: num(x.memory) });
+
+/** GET /api/analysis/slots, or `{ off }`. */
+export function adaptSlots(j) {
+  const o = obj(j);
+  return {
+    off: str(o.off),
+    empty: str(o.empty),
+    ranges: arr(o.ranges).map((r) => {
+      const x = obj(r);
+      return { node: num(x.node), endpoint: str(x.endpoint) ?? '', start: num(x.start), end: num(x.end), status: str(x.status), error: str(x.error), ...slotFigures(x) };
+    }),
+    hottest: arr(o.hottest).map((r) => {
+      const x = obj(r);
+      return {
+        slot: num(x.slot), node: num(x.node), endpoint: str(x.endpoint) ?? '', ...slotFigures(x),
+        sampled: arr(x.sampled_keys).map((k) => ({ key: adaptName(obj(k).key), pattern: adaptName(obj(k).pattern), kinds: str(obj(k).kinds) })),
+      };
+    }),
+    order: oneOf(o.order, ['keys', 'cpu', 'net_in', 'net_out'], 'keys'),
+    memoryColumn: o.memory_column === true,
+    cpuAndNetworkZero: o.cpu_and_network_zero === true,
+    note: str(o.note),
+  };
+}
+
+/** GET /api/snapshots: this connection's snapshots, newest first. */
+export function adaptSnapshots(j) {
+  const o = obj(j);
+  return {
+    profile: str(o.profile),
+    snapshots: arr(o.snapshots).map((s) => {
+      const x = obj(s);
+      return { file: str(x.file) ?? '', takenAt: num(x.taken_at_unix), utc: str(x.taken_at_utc), current: x.current === true };
+    }).filter((s) => s.file),
+    canSave: o.can_save === true,
+    saveOff: str(o.save_off),
+    saved: o.saved === true,
+  };
+}
+
+/** POST /api/snapshots → 201. */
+export function adaptSaved(j) {
+  const o = obj(j);
+  return { file: str(o.file), takenAt: num(o.taken_at_unix), utc: str(o.taken_at_utc), sampledKeys: num(o.sampled_keys), text: str(o.text) };
+}
+
 /** A failed reply → the sentence to show. Only the server's `error` field, which is
  *  redis-lens's own wording, is ever shown; any other body is replaced by a fixed line. */
 export function adaptError(status, j) {
@@ -805,6 +1441,14 @@ export async function runWithConfirm(run, backend, ask) {
 
 const seg = (s) => encodeURIComponent(String(s));
 
+/** A query string from the parts that are set: `?pattern=6b6579&node=0`, or ''. */
+export function query(parts) {
+  const out = Object.entries(parts)
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .map(([k, v]) => `${seg(k)}=${seg(v)}`);
+  return out.length ? `?${out.join('&')}` : '';
+}
+
 /** Every route in one place (docs/dashboard-api.md). */
 export const ROUTES = {
   state: () => ['GET', '/api/state'],
@@ -831,6 +1475,28 @@ export const ROUTES = {
   command: () => ['POST', '/api/cmdline'],
   commandNames: () => ['GET', '/api/cmdline/commands'],
   commandHelp: (name) => ['GET', `/api/cmdline/help?name=${seg(name)}`],
+  dbs: () => ['GET', '/api/dbs'],
+  db: () => ['POST', '/api/db'],
+  browse: (q = {}) => ['GET', `/api/browse${query({ sort: q.sort, node: q.node })}`],
+  browseMore: () => ['POST', '/api/browse/more'],
+  keys: (pattern, node = null) => ['GET', `/api/keys${query({ pattern, node })}`],
+  find: (text) => ['GET', `/api/find${query({ q: text })}`],
+  keysMore: (list) => ['GET', `/api/keys/more${query({ list })}`],
+  value: (key, type = null) => ['GET', `/api/value${query({ key, type })}`],
+  valueMore: (view) => ['GET', `/api/value/more${query({ view })}`],
+  valueItem: (q = {}) => ['GET', `/api/value/item${query({ view: q.view, index: q.index, field: q.field, format: q.format, width: q.width })}`],
+  analysis: () => ['GET', '/api/analysis'],
+  analysisStart: () => ['POST', '/api/analysis'],
+  analysisStop: () => ['DELETE', '/api/analysis'],
+  bigKeys: () => ['GET', '/api/analysis/big_keys'],
+  expiry: () => ['GET', '/api/analysis/expiry'],
+  changes: () => ['GET', '/api/analysis/changes'],
+  hotKeys: () => ['GET', '/api/analysis/hot_keys'],
+  nodes: () => ['GET', '/api/analysis/nodes'],
+  slots: (q = {}) => ['GET', `/api/analysis/slots${query({ order: q.order, refresh: q.refresh ? 1 : null })}`],
+  snapshots: () => ['GET', '/api/snapshots'],
+  snapshotSave: () => ['POST', '/api/snapshots'],
+  snapshotCompare: (a, b) => ['GET', `/api/snapshots/compare${query({ a, b })}`],
   confirm: (id) => ['POST', `/api/confirm/${seg(id)}`],
   confirmCancel: (id) => ['DELETE', `/api/confirm/${seg(id)}`],
   events: () => ['GET', '/api/events'],
@@ -842,6 +1508,7 @@ const EVENT_ADAPTERS = {
   overview: adaptOverview,
   tail: adaptTailEvent,
   monitor: adaptMonitorEvent,
+  progress: adaptProgress,
   notice: adaptNotice,
 };
 
@@ -1216,6 +1883,29 @@ export function createReal({ fetchFn = (...a) => fetch(...a), tokens = null, tok
       throw err;
     }),
 
+    getDbs: () => request(ROUTES.dbs(), null, adaptDbs),
+    switchDb: (db) => request(ROUTES.db(), { db: Number(db) }, adaptDbSwitch),
+    getBrowse: (q = {}) => request(ROUTES.browse(q), null, adaptBrowse),
+    moreNames: (q = {}) => request(ROUTES.browseMore(), q.sort ? { sort: q.sort } : {}, adaptBrowse),
+    getKeys: ({ pattern, node = null }) => request(ROUTES.keys(pattern, node), null, adaptKeyList),
+    findKeys: (text) => request(ROUTES.find(text), null, adaptKeyList),
+    moreKeys: (list) => request(ROUTES.keysMore(list), null, adaptKeyList),
+    openValue: ({ key, type = null }) => request(ROUTES.value(key, type), null, adaptValue),
+    moreValue: (view) => request(ROUTES.valueMore(view), null, adaptValue),
+    getItem: (q) => request(ROUTES.valueItem(q), null, adaptItem),
+    getAnalysis: () => request(ROUTES.analysis(), null, adaptAnalysisInfo),
+    startAnalysis: (depth) => request(ROUTES.analysisStart(), { depth: depth === 'deep' ? 'deep' : 'quick' }, adaptAnalysisStart),
+    stopAnalysis: () => request(ROUTES.analysisStop(), {}, (j) => ({ stopping: obj(j).stopping === true, text: str(obj(j).text) })),
+    getBigKeys: () => request(ROUTES.bigKeys(), null, adaptBigKeys),
+    getExpiry: () => request(ROUTES.expiry(), null, adaptExpiry),
+    getChanges: () => request(ROUTES.changes(), null, adaptDiff),
+    getHotKeys: () => request(ROUTES.hotKeys(), null, adaptHotKeys),
+    getNodes: () => request(ROUTES.nodes(), null, adaptNodes),
+    getSlots: (q = {}) => request(ROUTES.slots(q), null, adaptSlots),
+    saveSnapshot: () => request(ROUTES.snapshotSave(), {}, adaptSaved),
+    listSnapshots: () => request(ROUTES.snapshots(), null, adaptSnapshots),
+    compareSnapshots: (a, b) => request(ROUTES.snapshotCompare(a, b), null, adaptDiff),
+
     answerConfirm: (confirm, typed, adapt) => request(ROUTES.confirm(confirm.id), confirm.kind === 'type' ? { typed } : {}, adapt),
     cancelConfirm: (id) => request(ROUTES.confirmCancel(id), {}, () => ({})),
   };
@@ -1230,6 +1920,9 @@ export const METHODS = [
   'testConnection', 'connect', 'disconnect', 'pickNode', 'setPolling', 'setSessionWrites', 'getOverview', 'getClients', 'getSlowlog',
   'startMonitor', 'stopMonitor', 'getChannels', 'subscribe', 'unsubscribe', 'publish', 'runCommand',
   'getCommandNames', 'getCommandHelp',
+  'getDbs', 'switchDb', 'getBrowse', 'moreNames', 'getKeys', 'findKeys', 'moreKeys', 'openValue', 'moreValue', 'getItem',
+  'getAnalysis', 'startAnalysis', 'stopAnalysis', 'getBigKeys', 'getExpiry', 'getChanges', 'getHotKeys', 'getNodes', 'getSlots',
+  'saveSnapshot', 'listSnapshots', 'compareSnapshots',
 ];
 
 /** The methods whose reply is the new State: it is also sent to `state` subscribers, so

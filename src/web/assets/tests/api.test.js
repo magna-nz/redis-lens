@@ -347,14 +347,17 @@ test('overview: as captured from the demo Redis', () => {
   assert.equal(o.figures, null);
   assert.equal(o.lastAnalysis, null);
   assert.deepEqual(o.shards, []);
-  assert.deepEqual(o.findings, [{ text: 'EVAL took 1.3 s at 06:52 UTC.', severity: 'note', screen: 'slow_log', label: 'Server › Slow log', where: 'slowlog' }]);
+  assert.deepEqual(o.findings, [{ text: 'EVAL took 1.3 s at 06:52 UTC.', severity: 'note', screen: 'slow_log', label: 'Server › Slow log', where: 'server/slowlog' }]);
 });
 
-test('findings: the server\'s words; a link only to a panel this page has', () => {
+test('findings: the server\'s words; a link to the route of the panel, only one this page has', () => {
   assert.deepEqual(adaptFinding({ area: 'Server', panel: 'Clients', screen: 'clients', severity: 'warn', text: '212 connections from 10.0.9.17 idle for over an hour.' }),
-    { text: '212 connections from 10.0.9.17 idle for over an hour.', severity: 'warn', screen: 'clients', label: 'Server › Clients', where: 'clients' });
+    { text: '212 connections from 10.0.9.17 idle for over an hour.', severity: 'warn', screen: 'clients', label: 'Server › Clients', where: 'server/clients' });
   const big = adaptFinding({ area: 'Analyze', panel: 'Big keys', screen: 'big_keys', severity: 'warn', text: '3 big keys, counted by the server (INFO keysizes).' });
-  assert.equal(big.where, null, 'Analyze arrives later: named, not linked');
+  assert.equal(big.where, 'analyze/big_keys');
+  assert.equal(adaptFinding({ screen: 'keys', text: 'x' }).where, 'browse');
+  assert.equal(adaptFinding({ screen: 'streams', text: 'x' }).where, null, 'Streams arrive later: named, not linked');
+  assert.equal(adaptFinding({ screen: 'search', text: 'x' }).where, null);
   assert.equal(big.label, 'Analyze › Big keys');
   assert.equal(adaptFinding({ text: 'x', severity: 'loud' }).severity, 'note');
   assert.deepEqual(adaptOverview({ ...OVERVIEW, findings: [{ text: '' }, { text: 'kept', screen: 'slow_log' }] }).findings.map((f) => f.text), ['kept']);

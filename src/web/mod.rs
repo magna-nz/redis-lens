@@ -29,6 +29,7 @@ pub mod assets;
 pub mod auth;
 pub mod confirm;
 pub mod dto;
+pub mod keyname;
 pub mod session;
 pub mod wording;
 
@@ -193,6 +194,17 @@ pub fn start(opts: Options) -> Result<Dashboard, StartError> {
 /// `MemoryStore`, never the real keychain).
 #[doc(hidden)]
 pub fn start_with(opts: Options, store: Arc<dyn SecretStore>) -> Result<Dashboard, StartError> {
+    start_with_snapshots(opts, store, None)
+}
+
+/// [`start_with`] saving and reading snapshots in `snapshots` instead of the TUI's
+/// directory, for the integration tests (they never touch the user's snapshots).
+#[doc(hidden)]
+pub fn start_with_snapshots(
+    opts: Options,
+    store: Arc<dyn SecretStore>,
+    snapshots: Option<PathBuf>,
+) -> Result<Dashboard, StartError> {
     let std_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, opts.port))
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::AddrInUse => StartError::PortInUse(opts.port),
@@ -210,7 +222,7 @@ pub fn start_with(opts: Options, store: Arc<dyn SecretStore>) -> Result<Dashboar
     let listener = tokio::net::TcpListener::from_std(std_listener).map_err(bind_err)?;
     let token = auth::Token::random().map_err(|_| StartError::Random)?;
     let (shutdown, shutdown_rx) = watch::channel(false);
-    let hub = session::Hub::new(opts.config, store);
+    let hub = session::Hub::with_snapshots(opts.config, store, snapshots);
     let app = app_state(Arc::clone(&hub), port, token.clone(), shutdown_rx.clone());
     let router = router(app);
     tokio::spawn(api::overview::poll(Arc::clone(&hub), shutdown_rx.clone()));
@@ -253,7 +265,10 @@ pub(crate) fn app_state(
 
 /// Every route, behind the guard, every response with the security headers.
 pub(crate) fn router(app: api::App) -> Router {
-    use api::{cmdline, connections, overview, pubsub, server, writes};
+    use api::{
+        analyze, browse, cmdline, connections, keys, overview, pubsub, server, snapshots, values,
+        writes,
+    };
     let guard = app.page.guard.clone();
     Router::new()
         .route("/", get(assets::index))
@@ -288,6 +303,28 @@ pub(crate) fn router(app: api::App) -> Router {
             post(pubsub::subscribe).delete(pubsub::unsubscribe),
         )
         .route("/api/pubsub/publish", post(pubsub::publish))
+        .route("/api/browse", get(browse::tree))
+        .route("/api/browse/more", post(browse::more))
+        .route("/api/dbs", get(browse::dbs))
+        .route("/api/db", post(browse::switch))
+        .route("/api/keys", get(keys::open))
+        .route("/api/keys/more", get(keys::more))
+        .route("/api/find", get(keys::find))
+        .route("/api/value", get(values::open))
+        .route("/api/value/more", get(values::more))
+        .route("/api/value/item", get(values::item_route))
+        .route(
+            "/api/analysis",
+            get(analyze::get).post(analyze::start).delete(analyze::stop),
+        )
+        .route("/api/analysis/big_keys", get(analyze::big_keys))
+        .route("/api/analysis/expiry", get(analyze::expiry))
+        .route("/api/analysis/changes", get(analyze::changes))
+        .route("/api/analysis/hot_keys", get(analyze::hot_keys))
+        .route("/api/analysis/nodes", get(analyze::nodes))
+        .route("/api/analysis/slots", get(analyze::slots))
+        .route("/api/snapshots", get(snapshots::list).post(snapshots::save))
+        .route("/api/snapshots/compare", get(snapshots::compare))
         .route("/api/cmdline", post(cmdline::run))
         .route("/api/cmdline/commands", get(cmdline::commands))
         .route("/api/cmdline/help", get(cmdline::help))

@@ -115,6 +115,9 @@ pub(crate) fn body(c: &crate::web::session::Current) -> serde_json::Value {
                 .iter()
                 .map(dto::Finding::of)
                 .collect::<Vec<_>>(),
+            // Once an analysis has a report (and none runs): its findings, which the TUI
+            // shows in place of the server's own.
+            "analysis": super::analyze::overview_block(c),
         })
     }
 }

@@ -761,7 +761,7 @@ pub async fn test(State(app): State<App>, Path(name): Path<String>) -> Response 
         &profile.endpoint.to_string(),
         crate::scan::ScanOptions::for_profile(&profile).max_commands_per_sec,
     );
-    let report = crate::conn::check_permissions(&mut Budgeted {
+    let report = crate::conn::check_permissions(&mut crate::conn::cluster::Budgeted {
         conn: &mut conn,
         budget: &budget,
     })
@@ -784,44 +784,6 @@ pub async fn test(State(app): State<App>, Path(name): Path<String>) -> Response 
         "sentinel": answer.as_ref().map(|a| crate::value::escape(&cli::sentinel_line(a))),
         "checks": dto::perms(&report),
     }))
-}
-
-/// A connection that takes one command from `budget` for each command it sends (a
-/// pipeline takes its length). The same adapter as `conn::cluster`'s private one, which
-/// the per-node probes use; that one is not reachable from here.
-struct Budgeted<'a, C> {
-    conn: &'a mut C,
-    budget: &'a crate::budget::Budget,
-}
-
-impl<C: redis::aio::ConnectionLike + Send> redis::aio::ConnectionLike for Budgeted<'_, C> {
-    fn req_packed_command<'a>(
-        &'a mut self,
-        cmd: &'a redis::Cmd,
-    ) -> redis::RedisFuture<'a, redis::Value> {
-        Box::pin(async move {
-            self.budget.take(1).await;
-            self.conn.req_packed_command(cmd).await
-        })
-    }
-
-    fn req_packed_commands<'a>(
-        &'a mut self,
-        cmd: &'a redis::Pipeline,
-        offset: usize,
-        count: usize,
-    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
-        Box::pin(async move {
-            self.budget
-                .take(u32::try_from(cmd.len()).unwrap_or(u32::MAX))
-                .await;
-            self.conn.req_packed_commands(cmd, offset, count).await
-        })
-    }
-
-    fn get_db(&self) -> i64 {
-        self.conn.get_db()
-    }
 }
 
 /// Why a connection name finds nothing.

@@ -283,7 +283,9 @@ impl SlotsState {
         seen
     }
 
-    fn rank(&mut self) {
+    /// Ranks the hottest slots by [`Self::order`] from what was read. The web dashboard
+    /// fills [`Self::nodes`] itself and calls it.
+    pub(crate) fn rank(&mut self) {
         let order = self.order;
         let mut all: Vec<HotSlot> = Vec::new();
         for (node, n) in self.nodes.iter().enumerate() {
