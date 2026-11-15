@@ -36,7 +36,7 @@ use crate::model::{Auth, PermissionReport, Profile};
 use crate::secrets::{MemoryStore, SecretError, SecretStore};
 use crate::tui::Headless;
 use crate::tui::app::views::LiveState;
-use crate::tui::app::views::server::Point;
+use crate::tui::app::views::server::{DEFAULT_INTERVAL, INTERVALS, Point};
 use crate::tui::app::{ConnId, Effect, History, Msg, Phase, SecretSource, Session};
 use crate::web::dto;
 use crate::write::{Permit, Settings};
@@ -70,7 +70,8 @@ impl Event {
 
     /// A `notice` event: a sentence for the page to show.
     pub fn notice(text: impl Into<String>) -> Self {
-        Self::new("notice", serde_json::json!({ "text": text.into() }))
+        let text = crate::web::wording::server_free(&text.into());
+        Self::new("notice", serde_json::json!({ "text": text }))
     }
 }
 
@@ -135,6 +136,14 @@ pub struct Current {
     pub slow_specs: HashMap<String, CommandKeys>,
     pub slow_config: bool,
     pub slow_keys: bool,
+    /// Why the slow log's settings, and its key names, are not read any more: kept, so
+    /// every reply says it, not only the one that found out.
+    pub slow_config_off: Option<String>,
+    pub slow_keys_off: Option<String>,
+    /// The picked node's last slow log and client list (the connect's reads, then each
+    /// panel's): Overview's findings come from them, as the TUI's do.
+    pub slow_entries: Vec<crate::live::server::SlowEntry>,
+    pub client_conns: Vec<crate::live::server::ClientConn>,
     pub live: LiveFigures,
 }
 
@@ -180,6 +189,10 @@ impl Current {
             slow_specs: HashMap::new(),
             slow_config: true,
             slow_keys: true,
+            slow_config_off: None,
+            slow_keys_off: None,
+            slow_entries: Vec::new(),
+            client_conns: Vec::new(),
             live: LiveFigures::default(),
         }
     }
@@ -189,7 +202,12 @@ impl Current {
     }
 
     pub fn live_ready(&self) -> bool {
-        self.session.live == LiveState::Ready
+        self.session.live == LiveState::Ready && !self.failed()
+    }
+
+    /// The connect failed (the session stays, to say why).
+    pub fn failed(&self) -> bool {
+        matches!(self.session.phase, Phase::Failed(_))
     }
 
     /// Answers every request still waiting: the live connection is gone.
@@ -207,7 +225,35 @@ impl Drop for Current {
     }
 }
 
+/// The live figures' polling: paused or not, and how often, as the TUI's Overview
+/// (`p`, and `+` `-` through [`INTERVALS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Polling {
+    pub paused: bool,
+    /// Index into [`INTERVALS`].
+    pub interval: usize,
+}
+
+impl Default for Polling {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            interval: DEFAULT_INTERVAL,
+        }
+    }
+}
+
+impl Polling {
+    pub fn every(&self) -> Duration {
+        Duration::from_secs(INTERVALS[self.interval])
+    }
+}
+
+/// Why an interval is refused: it is not one the TUI steps through.
+pub const BAD_INTERVAL: &str = "the interval must be one of 1, 2, 3, 5, 10, 15, 30 or 60 seconds";
+
 struct Inner {
+    polling: Polling,
     runner: Headless,
     next_conn: ConnId,
     next_req: u64,
@@ -297,6 +343,7 @@ impl Hub {
             config,
             store,
             inner: Mutex::new(Inner {
+                polling: Polling::default(),
                 runner,
                 next_conn: 1,
                 next_req: 1,
@@ -348,7 +395,38 @@ impl Hub {
     /// The session as `GET /api/state` and the `state` event show it.
     pub fn state(&self) -> State {
         let g = lock(&self.inner);
-        State::of(g.cur.as_ref())
+        State::of(g.cur.as_ref(), g.polling)
+    }
+
+    /// How the live figures are polled now.
+    pub fn polling(&self) -> Polling {
+        lock(&self.inner).polling
+    }
+
+    /// Pauses or resumes the live figures and sets their interval, in seconds (one of
+    /// [`INTERVALS`]). Paused, no `INFO` is sent for them.
+    pub fn set_polling(
+        &self,
+        paused: Option<bool>,
+        every_secs: Option<u64>,
+    ) -> Result<Polling, &'static str> {
+        let p = {
+            let mut g = lock(&self.inner);
+            let mut p = g.polling;
+            if let Some(secs) = every_secs {
+                p.interval = INTERVALS
+                    .iter()
+                    .position(|s| *s == secs)
+                    .ok_or(BAD_INTERVAL)?;
+            }
+            if let Some(paused) = paused {
+                p.paused = paused;
+            }
+            g.polling = p;
+            p
+        };
+        self.emit_state();
+        Ok(p)
     }
 
     fn emit_state(&self) {
@@ -411,6 +489,21 @@ impl Hub {
         Ok(())
     }
 
+    /// A session on `profile` as if its connect had finished, the live connection
+    /// ready, without any server: for the router's unit tests.
+    #[cfg(test)]
+    pub(crate) fn install_for_test(&self, profile: Profile, docker: bool) -> ConnId {
+        let mut g = lock(&self.inner);
+        let id = g.next_conn;
+        g.next_conn += 1;
+        let source = SecretSource::Keychain;
+        let mut c = Current::new(id, profile, source, docker);
+        c.session.phase = Phase::Connected;
+        c.session.live = LiveState::Ready;
+        g.cur = Some(c);
+        id
+    }
+
     /// Ends the current connection, its tail and its Monitor run.
     pub fn disconnect(&self) {
         {
@@ -428,6 +521,10 @@ impl Hub {
             .with_mut(|c| {
                 if index >= c.session.nodes.len().max(1) {
                     return false;
+                }
+                if c.session.picked != index {
+                    c.slow_entries.clear();
+                    c.client_conns.clear();
                 }
                 c.session.picked = index;
                 c.live.node = index;
@@ -550,9 +647,20 @@ impl Hub {
         stopped.is_some()
     }
 
-    /// Starts Monitor on the picked node: time-boxed by `live::monitor::Limits` as in
-    /// the TUI. Its lines come as `monitor` events.
-    pub fn monitor(&self) -> Result<u64, String> {
+    /// Whether Monitor can start now on the picked node, as the TUI checks before it
+    /// asks: the connection's id and profile, or why not.
+    pub fn monitor_check(&self) -> Result<(ConnId, Profile), String> {
+        let g = lock(&self.inner);
+        let Some(c) = g.cur.as_ref() else {
+            return Err(LiveError::Closed.to_string());
+        };
+        monitor_refused(c).map_or_else(|| Ok((c.id, c.session.profile.clone())), Err)
+    }
+
+    /// Starts Monitor on the picked node of connection `conn`: time-boxed by
+    /// `live::monitor::Limits` as in the TUI. Its lines come as `monitor` events. Ask
+    /// first ([`Self::monitor_check`]): this starts it.
+    pub fn monitor(&self, conn: ConnId) -> Result<u64, String> {
         let run = {
             let mut g = lock(&self.inner);
             let run = g.next_tail;
@@ -561,16 +669,13 @@ impl Hub {
             let Some(c) = cur.as_mut() else {
                 return Err(LiveError::Closed.to_string());
             };
-            if !c.live_ready() {
-                return Err(LiveError::Closed.to_string());
+            if c.id != conn {
+                return Err(crate::web::api::writes::CHANGED.to_string());
             }
-            if let Some(why) = crate::conn::monitor_unsupported(&c.session.profile) {
-                return Err(why.to_string());
-            }
-            let node = c.session.picked;
-            if let Some(why) = c.session.own_connection_refused(node) {
+            if let Some(why) = monitor_refused(c) {
                 return Err(why);
             }
+            let node = c.session.picked;
             c.monitor = Some(Monitor {
                 run,
                 node,
@@ -635,7 +740,14 @@ impl Hub {
             };
             let live_closed =
                 matches!(&msg, Msg::LiveClosed { id, scan, .. } if this(c, *id, *scan));
+            let was_failed = c.failed();
             apply_to(c, msg, &mut events, &mut state);
+            // A connect that failed after it opened (no password): nothing of it runs on.
+            if !was_failed && c.failed() {
+                runner.close();
+                c.drain();
+                c.session.live = LiveState::Waiting;
+            }
             // A Monitor run stops with the live connection, as in the TUI (spec "Monitor
             // (P2)").
             if live_closed && let Some(m) = c.monitor.take() {
@@ -658,6 +770,42 @@ impl Hub {
             self.emit_state();
         }
         self.emit_all(events);
+    }
+}
+
+/// Why Monitor can't start on `c` now, as the TUI's `enter` on Monitor checks.
+fn monitor_refused(c: &Current) -> Option<String> {
+    if c.monitor.is_some() {
+        return Some(MONITOR_RUNS.to_string());
+    }
+    if !c.live_ready() {
+        return Some(LiveError::Closed.to_string());
+    }
+    if let Some(why) = crate::conn::monitor_unsupported(&c.session.profile) {
+        return Some(why.to_string());
+    }
+    c.session.own_connection_refused(c.session.picked)
+}
+
+/// Why a second Monitor run does not start.
+pub const MONITOR_RUNS: &str = "MONITOR is already running: stop it first.";
+
+/// Why a connect that opened is a failed one: every command was refused for want of a
+/// password (`NOAUTH`), or for the wrong one (`WRONGPASS`). The permission check holds
+/// the server's code at the start of a refusal it does not know.
+pub(crate) fn auth_refused(perms: &PermissionReport) -> Option<&'static str> {
+    let denied = || {
+        perms.checks.iter().filter_map(|c| match &c.status {
+            crate::model::PermStatus::Denied(m) => Some(m.as_str()),
+            _ => None,
+        })
+    };
+    if denied().any(|m| m.starts_with("NOAUTH")) {
+        Some(crate::web::wording::NEEDS_PASSWORD)
+    } else if denied().any(|m| m.starts_with("WRONGPASS")) {
+        Some(crate::web::wording::BAD_CREDENTIALS)
+    } else {
+        None
     }
 }
 
@@ -702,13 +850,21 @@ fn apply_to(c: &mut Current, msg: Msg, events: &mut Vec<Event>, state: &mut bool
             perms,
             target,
         } if this(c, id, scan) => {
+            *state = true;
+            // The server let the connection open but answers nothing without a
+            // password (or refused the one sent): that is a failed connect, said in
+            // fixed words, not a connected session with every check refused.
+            if let Some(why) = auth_refused(&perms) {
+                c.session.phase = Phase::Failed(why.to_string());
+                c.perms = None;
+                return;
+            }
             c.session.refusals = crate::tui::app::confirm::refusals_of(&perms);
             c.session.server = server;
             c.session.target = Some(target);
             c.session.phase = Phase::Connected;
             c.session.connected_at_unix = Some(unix_secs());
             c.perms = Some(perms);
-            *state = true;
         }
         Msg::Figures { id, scan, figures } if this(c, id, scan) => {
             c.session.figures = Some(figures);
@@ -736,7 +892,7 @@ fn apply_to(c: &mut Current, msg: Msg, events: &mut Vec<Event>, state: &mut bool
         Msg::LastSnapshot { id, scan, last } if this(c, id, scan) => {
             c.session.last_snapshot = last;
         }
-        Msg::LiveReady { id, scan } if this(c, id, scan) => {
+        Msg::LiveReady { id, scan } if this(c, id, scan) && !c.failed() => {
             c.session.live = LiveState::Ready;
             *state = true;
         }
@@ -801,7 +957,11 @@ fn apply_to(c: &mut Current, msg: Msg, events: &mut Vec<Event>, state: &mut bool
             c.tail = None;
             events.push(Event::new(
                 "tail",
-                serde_json::json!({ "tail": tail, "kind": "closed", "error": error }),
+                serde_json::json!({
+                    "tail": tail,
+                    "kind": "closed",
+                    "error": crate::web::wording::server_free_opt(error.as_deref()),
+                }),
             ));
             *state = true;
         }
@@ -853,12 +1013,33 @@ fn apply_to(c: &mut Current, msg: Msg, events: &mut Vec<Event>, state: &mut bool
             };
             events.push(Event::new(
                 "monitor",
-                serde_json::json!({ "run": run, "kind": "closed", "end": end, "error": error }),
+                serde_json::json!({
+                    "run": run,
+                    "kind": "closed",
+                    "end": end,
+                    "error": crate::web::wording::server_free_opt(error.as_deref()),
+                }),
             ));
             *state = true;
         }
-        // The scan's progress, the one-off server reads and the rest are for the TUI's
-        // views: the dashboard's panels ask for what they show.
+        // The slow log and client list the connect read once, on the picked node: for
+        // Overview's findings, as in the TUI.
+        Msg::ServerReads {
+            id,
+            scan,
+            node,
+            slow,
+            clients,
+        } if this(c, id, scan) && c.session.picked == node => {
+            use crate::live::server::Reply as S;
+            if let Some(Ok(LiveReply::Server(S::SlowLog(r)))) = slow {
+                c.slow_entries = r.entries;
+            }
+            if let Some(Ok(LiveReply::Server(S::Clients(list)))) = clients {
+                c.client_conns = list;
+            }
+        }
+        // The scan's progress and the rest are for the TUI's views.
         _ => {}
     }
 }
@@ -897,8 +1078,45 @@ pub struct State {
     pub refused: Vec<String>,
     pub tail: Option<TailDto>,
     pub monitor: Option<MonitorDto>,
+    /// How the live figures are polled.
+    pub polling: PollingDto,
+    /// When a Monitor run stops by itself, known before one starts.
+    pub monitor_limits: MonitorLimits,
     /// What this build can do.
     pub features: Features,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PollingDto {
+    pub paused: bool,
+    pub interval_secs: u64,
+    /// The intervals that can be set.
+    pub intervals: &'static [u64],
+}
+
+impl PollingDto {
+    pub fn of(p: Polling) -> Self {
+        Self {
+            paused: p.paused,
+            interval_secs: INTERVALS[p.interval],
+            intervals: &INTERVALS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MonitorLimits {
+    pub max_lines: usize,
+    pub max_secs: u64,
+}
+
+impl MonitorLimits {
+    pub fn now() -> Self {
+        Self {
+            max_lines: crate::live::monitor::MAX_LINES,
+            max_secs: crate::live::monitor::MAX_TIME.as_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -942,7 +1160,9 @@ pub fn sub_kind(s: &Subscription) -> &'static str {
 }
 
 impl State {
-    fn of(c: Option<&Current>) -> Self {
+    fn of(c: Option<&Current>, polling: Polling) -> Self {
+        let polling = PollingDto::of(polling);
+        let monitor_limits = MonitorLimits::now();
         let features = Features {
             entra_id: cfg!(feature = "entra-id"),
             version: env!("CARGO_PKG_VERSION"),
@@ -966,19 +1186,24 @@ impl State {
                 refused: Vec::new(),
                 tail: None,
                 monitor: None,
+                polling,
+                monitor_limits,
                 features,
             };
         };
         let s = &c.session;
         let (status, error) = match &s.phase {
             Phase::Connecting => ("connecting", None),
-            Phase::Failed(e) => ("failed", Some(crate::value::escape(e))),
+            Phase::Failed(e) => (
+                "failed",
+                Some(crate::value::escape(&crate::web::wording::server_free(e))),
+            ),
             _ => ("connected", None),
         };
         let (live, live_error) = match &s.live {
             LiveState::Waiting => ("waiting", None),
             LiveState::Ready => ("ready", None),
-            LiveState::Closed(e) => ("closed", e.clone()),
+            LiveState::Closed(e) => ("closed", crate::web::wording::server_free_opt(e.as_deref())),
         };
         Self {
             status,
@@ -1009,7 +1234,7 @@ impl State {
             writes_off: s
                 .profile
                 .is_read_only()
-                .then(|| crate::write::read_only_reason(&s.profile)),
+                .then(|| crate::web::wording::web(&crate::write::read_only_reason(&s.profile))),
             refused: s.refusals.iter().map(str::to_string).collect(),
             tail: c.tail.as_ref().map(|t| TailDto {
                 id: t.id,
@@ -1025,6 +1250,8 @@ impl State {
                 max_lines: crate::live::monitor::MAX_LINES,
                 max_secs: crate::live::monitor::MAX_TIME.as_secs(),
             }),
+            polling,
+            monitor_limits,
             features,
         }
     }
@@ -1092,7 +1319,7 @@ mod tests {
 
     #[test]
     fn the_idle_state_has_no_connection() {
-        let s = State::of(None);
+        let s = State::of(None, Polling::default());
         assert_eq!(s.status, "idle");
         assert!(s.connection.is_none());
         assert_eq!(s.features.version, env!("CARGO_PKG_VERSION"));
@@ -1151,7 +1378,7 @@ mod tests {
         assert!(state);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "notice");
-        let st = State::of(Some(&c));
+        let st = State::of(Some(&c), Polling::default());
         assert_eq!(st.live, "closed");
         assert_eq!(st.live_error.as_deref(), Some(crate::live::CONNECTION_LOST));
     }

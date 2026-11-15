@@ -29,6 +29,7 @@ pub mod auth;
 pub mod confirm;
 pub mod dto;
 pub mod session;
+pub mod wording;
 
 /// The port the dashboard listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 7379;
@@ -200,8 +201,10 @@ pub(crate) fn router(app: api::App) -> Router {
         .route("/api/docker", get(connections::docker))
         .route("/api/connect", post(connections::connect))
         .route("/api/disconnect", post(connections::disconnect))
+        .route("/api/session/writes", post(connections::session_writes))
         .route("/api/node", post(connections::pick))
         .route("/api/overview", get(overview::get))
+        .route("/api/polling", post(overview::set_polling))
         .route("/api/server/clients", get(server::clients))
         .route("/api/server/slowlog", get(server::slowlog))
         .route(

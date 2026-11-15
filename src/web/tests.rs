@@ -60,6 +60,7 @@ fn profile(name: &str, env: Env) -> Profile {
 
 struct T {
     router: axum::Router,
+    hub: Arc<session::Hub>,
     store: Arc<MemoryStore>,
     config: PathBuf,
     _shutdown: tokio::sync::watch::Sender<bool>,
@@ -75,9 +76,10 @@ fn setup(tag: &str, profiles: Vec<Profile>) -> T {
     let store = Arc::new(MemoryStore::default());
     let hub = session::Hub::new(config.clone(), store.clone());
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let app = app_state(hub, PORT, Token::for_test(&token()), rx);
+    let app = app_state(Arc::clone(&hub), PORT, Token::for_test(&token()), rx);
     T {
         router: router(app),
+        hub,
         store,
         config,
         _shutdown: tx,
@@ -605,7 +607,7 @@ async fn a_typed_line_is_refused_before_anything_is_sent() {
     for (line, says) in [
         (r#"GET "unclosed"#, "quote"),
         ("101 GET k", "100"),
-        ("MONITOR", "monitor panel"),
+        ("MONITOR", "monitor on the server screen"),
         ("MULTI", "connection every view shares"),
     ] {
         let body = serde_json::json!({ "line": line }).to_string();
@@ -666,4 +668,200 @@ fn a_port_in_use_is_its_own_error() {
         .unwrap_err();
         assert!(matches!(e, StartError::PortInUse(p) if p == port), "{e}");
     });
+}
+
+#[tokio::test]
+async fn polling_pauses_and_steps_through_the_tuis_intervals_and_state_says_so() {
+    let t = setup("polling", Vec::new());
+    let s = json(&text(call(&t, signed_get("/api/state")).await).await);
+    assert_eq!(s["polling"]["paused"], false);
+    assert_eq!(
+        s["polling"]["interval_secs"], 2,
+        "the TUI's 2 s to start with"
+    );
+    assert_eq!(
+        s["polling"]["intervals"],
+        serde_json::json!([1, 2, 3, 5, 10, 15, 30, 60])
+    );
+    // Monitor's limits are known before a run starts.
+    assert_eq!(s["monitor_limits"]["max_secs"], 30);
+    assert_eq!(s["monitor_limits"]["max_lines"], 10_000);
+    let res = call(&t, write("POST", "/api/polling", r#"{"interval_secs":7}"#)).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/polling",
+            r#"{"paused":true,"interval_secs":10}"#,
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let s = json(&text(call(&t, signed_get("/api/state")).await).await);
+    assert_eq!(s["polling"]["paused"], true);
+    assert_eq!(s["polling"]["interval_secs"], 10);
+    assert!(t.hub.polling().paused);
+    let res = call(&t, write("POST", "/api/polling", r#"{"paused":false}"#)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(!t.hub.polling().paused);
+    assert_eq!(t.hub.polling().every(), std::time::Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn removing_an_unknown_connection_is_404_and_the_current_one_clears_the_state() {
+    let mut gone = profile("gone", Env::Local);
+    // Nothing listens there: the connect fails at once.
+    gone.endpoint = Endpoint {
+        host: "127.0.0.1".into(),
+        port: 1,
+        tls: false,
+    };
+    let t = setup("remove", vec![gone]);
+    let res = call(&t, write("DELETE", "/api/connections/nope", "{}")).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let res = call(&t, write("POST", "/api/connect", r#"{"name":"gone"}"#)).await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let t0 = std::time::Instant::now();
+    loop {
+        let s = json(&text(call(&t, signed_get("/api/state")).await).await);
+        if s["status"] == "failed" {
+            break;
+        }
+        assert!(t0.elapsed().as_secs() < 20, "{s}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let res = call(&t, write("DELETE", "/api/connections/gone", "{}")).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let s = json(&text(call(&t, signed_get("/api/state")).await).await);
+    assert_eq!(s["status"], "idle", "{s}");
+    assert_eq!(s["connection"], serde_json::Value::Null, "{s}");
+}
+
+#[tokio::test]
+async fn a_containers_writes_change_for_the_session_off_at_once_and_on_after_asking() {
+    let t = setup("dockerwrites", Vec::new());
+    let mut p = profile("redis-dev", Env::Local);
+    p.read_only = Some(false);
+    t.hub.install_for_test(p, true);
+    let res = call(&t, write("POST", "/api/session/writes", r#"{"on":false}"#)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let s = json(&text(call(&t, signed_get("/api/state")).await).await);
+    assert_eq!(s["writes"], false, "{s}");
+    let res = call(&t, write("POST", "/api/session/writes", r#"{"on":true}"#)).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let v = json(&text(res).await);
+    assert_eq!(v["confirm"]["kind"], "ask");
+    let id = v["confirm"]["id"].as_str().unwrap().to_string();
+    let res = call(&t, write("POST", &format!("/api/confirm/{id}"), "{}")).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let s = json(&text(call(&t, signed_get("/api/state")).await).await);
+    assert_eq!(s["writes"], true, "{s}");
+    // The config file is not touched: a container has no saved profile.
+    let c = crate::config::Config::load(&t.config).unwrap();
+    assert!(c.profiles.is_empty());
+}
+
+#[tokio::test]
+async fn monitor_asks_first_and_never_starts_on_the_request_itself() {
+    let t = setup("monitorasks", Vec::new());
+    for (env, kind) in [(Env::Local, "ask"), (Env::Prod, "type")] {
+        let mut p = profile("cache", env);
+        // Read-only profiles ask too: MONITOR writes nothing but slows the server.
+        p.read_only = Some(true);
+        p.endpoint.tls = false;
+        t.hub.install_for_test(p, false);
+        let res = call(&t, write("POST", "/api/server/monitor", "{}")).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT, "{env:?}");
+        let v = json(&text(res).await);
+        assert_eq!(v["confirm"]["kind"], kind, "{v}");
+        let q = v["confirm"]["text"].as_str().unwrap();
+        assert!(q.contains("30 s") && q.contains("10,000 lines"), "{q}");
+        assert!(t.hub.with(|c| c.monitor.is_none()).unwrap());
+        if env == Env::Prod {
+            assert_eq!(v["confirm"]["expect"], "cache");
+            let id = v["confirm"]["id"].as_str().unwrap();
+            let res = call(
+                &t,
+                write("POST", &format!("/api/confirm/{id}"), r#"{"typed":"nope"}"#),
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(t.hub.with(|c| c.monitor.is_none()).unwrap());
+        }
+    }
+}
+
+/// Every reply these requests get, scanned for a TUI key, a screen number or a CLI flag
+/// (`wording::BANNED`): the dashboard says it in its own terms.
+#[tokio::test]
+async fn no_reply_names_a_tui_key_a_screen_number_or_a_cli_flag() {
+    let mut s = profile("sent", Env::Local);
+    s.sentinel = Some(crate::model::Sentinel {
+        master: "m".into(),
+        nodes: vec![crate::model::SentinelNode {
+            host: "127.0.0.1".into(),
+            port: 26379,
+        }],
+        tls: false,
+    });
+    let mut ro = profile("ro", Env::Local);
+    ro.read_only = Some(true);
+    ro.endpoint.tls = false;
+    let t = setup("wording", vec![profile("cache", Env::Local), s]);
+    let mut bodies = Vec::new();
+    for (m, path, body) in [
+        (
+            "POST",
+            "/api/connections",
+            r#"{"name":"cache","url":"redis://127.0.0.1:6379"}"#,
+        ),
+        (
+            "POST",
+            "/api/connections",
+            r#"{"name":"u","url":"redis://user@127.0.0.1:6379"}"#,
+        ),
+        (
+            "POST",
+            "/api/connections",
+            r#"{"name":"tp","url":"redis://127.0.0.1:6379","password":"p","token_command":["x"]}"#,
+        ),
+        (
+            "POST",
+            "/api/connections",
+            r#"{"name":"s","url":"redis://h","ssh":"u@h:99999"}"#,
+        ),
+        ("PATCH", "/api/connections/cache", "{}"),
+        ("PATCH", "/api/connections/sent", r#"{"standalone":true}"#),
+        ("PATCH", "/api/connections/cache", r#"{"writes":true}"#),
+    ] {
+        let res = call(&t, write(m, path, body)).await;
+        bodies.push(format!("{m} {path} {body}: {}", text(res).await));
+    }
+    t.hub.install_for_test(ro, false);
+    for line in ["SUBSCRIBE a", "MONITOR", "SELECT 1", "SET k v", "3 SET k v"] {
+        let body = serde_json::json!({ "line": line }).to_string();
+        let res = call(&t, write("POST", "/api/cmdline", &body)).await;
+        bodies.push(format!("{line}: {}", text(res).await));
+    }
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/pubsub/publish",
+            r#"{"channel":"c","message":"m"}"#,
+        ),
+    )
+    .await;
+    bodies.push(text(res).await);
+    bodies.push(text(call(&t, signed_get("/api/state")).await).await);
+    for b in &bodies {
+        // The JSON's own `--` never comes up; the text inside does.
+        assert_eq!(super::wording::banned(b), None, "{b}");
+    }
+    // They still say something useful.
+    let all = bodies.join("\n");
+    assert!(all.contains("Turn writes on in Connections."), "{all}");
+    assert!(all.contains("use the Pub/Sub screen"), "{all}");
+    assert!(all.contains("tick Replace to overwrite it"), "{all}");
 }

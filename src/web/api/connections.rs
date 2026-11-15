@@ -18,6 +18,7 @@ use super::{App, Body, Question, error, ok};
 use crate::cli::conn as cli;
 use crate::cli::{ConnAddArgs, EnvArg, ProviderArg, WritesArg};
 use crate::config::Config;
+use crate::tui::app::ConnId;
 use crate::web::dto;
 use crate::web::session::{ConnectError, Target, prefetch_async};
 
@@ -284,7 +285,10 @@ async fn add_step(app: &App, asked: AddAsked) -> Response {
             let connection = saved(app, &name).await;
             (
                 StatusCode::CREATED,
-                axum::Json(serde_json::json!({ "message": message, "connection": connection })),
+                axum::Json(serde_json::json!({
+                    "message": crate::web::wording::web(&message),
+                    "connection": connection,
+                })),
             )
                 .into_response()
         }
@@ -321,7 +325,7 @@ async fn add_step(app: &App, asked: AddAsked) -> Response {
                     token_ok: asked.token_ok,
                     writes_name: Some(String::new()),
                 })),
-                Question::typed(crate::value::escape(&q), expect),
+                Question::typed(crate::value::escape(&crate::web::wording::web(&q)), expect),
             )
         }
         Err((why, _)) => error(StatusCode::BAD_REQUEST, &why),
@@ -396,7 +400,8 @@ async fn set_step(
             untag: &r.untag,
             standalone: r.standalone,
         };
-        let result = cli::set(&path, &n, &changes, &ask).map_err(|e| format!("{e:#}"));
+        let result =
+            cli::set(&path, &n, &changes, &ask).map_err(|e| (not_found(&e), format!("{e:#}")));
         let profile = Config::load(&path).ok().and_then(|c| c.get(&n).cloned());
         (
             result,
@@ -427,7 +432,7 @@ async fn set_step(
                 }
             }
             ok(serde_json::json!({
-                "message": crate::value::escape(&crate::conn::parse::mask(&message)),
+                "message": crate::web::wording::web(&crate::value::escape(&crate::conn::parse::mask(&message))),
                 "connection": profile.as_ref().map(dto::Connection::of),
             }))
         }
@@ -435,10 +440,11 @@ async fn set_step(
             let prod = profile
                 .as_ref()
                 .is_some_and(|p| p.env == crate::model::Env::Prod);
+            let q = crate::value::escape(&crate::web::wording::web(&q));
             let question = if prod {
-                Question::typed(crate::value::escape(&q), name.clone())
+                Question::typed(q, name.clone())
             } else {
-                Question::ask(crate::value::escape(&q))
+                Question::ask(q)
             };
             app.ask(
                 Action::Set(SetAsked {
@@ -449,8 +455,8 @@ async fn set_step(
                 question,
             )
         }
-        (Err(why), None) => {
-            let status = if why.contains("not found") || why.contains("no profile") {
+        (Err((missing, why)), None) => {
+            let status = if missing {
                 StatusCode::NOT_FOUND
             } else {
                 StatusCode::BAD_REQUEST
@@ -489,22 +495,152 @@ pub async fn set_answered(app: &App, asked: SetAsked, typed: Option<String>) -> 
     }
 }
 
-/// `DELETE /api/connections/<name>`: removes it, and its keychain entries.
+/// Whether `e` says there is no profile by that name.
+fn not_found(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<crate::config::ConfigError>(),
+            Some(crate::config::ConfigError::NotFound(_))
+        )
+    })
+}
+
+/// `DELETE /api/connections/<name>`: removes it, and its keychain entries. When the
+/// session is on that profile (connected, connecting, or failed), it is closed and the
+/// state cleared: a removed profile is not shown as the current one. An unknown name
+/// is 404.
 pub async fn remove(State(app): State<App>, Path(name): Path<String>) -> Response {
     let path = app.hub.config.clone();
     let store = Arc::clone(&app.hub.store);
+    let n = name.clone();
     let joined = tokio::task::spawn_blocking(move || {
-        cli::remove(&path, store.as_ref(), &name).map_err(|e| format!("{e:#}"))
+        cli::remove(&path, store.as_ref(), &n).map_err(|e| (not_found(&e), format!("{e:#}")))
     })
     .await;
+    let forget = |app: &App| {
+        let current = app
+            .hub
+            .with(|c| !c.docker && c.session.profile.name == name)
+            .unwrap_or(false);
+        if current {
+            app.hub.disconnect();
+            app.confirms().clear();
+        }
+    };
     match joined {
-        Ok(Ok(message)) => ok(serde_json::json!({ "message": crate::value::escape(&message) })),
-        Ok(Err(why)) => error(
-            StatusCode::BAD_REQUEST,
-            &crate::value::escape(&crate::conn::parse::mask(&why)),
-        ),
+        Ok(Ok(message)) => {
+            forget(&app);
+            ok(
+                serde_json::json!({ "message": crate::web::wording::web(&crate::value::escape(&message)) }),
+            )
+        }
+        Ok(Err((true, _))) => error(StatusCode::NOT_FOUND, NO_SUCH),
+        Ok(Err((false, why))) => {
+            // The profile went, its keychain entry did not: the session goes all the same.
+            forget(&app);
+            error(
+                StatusCode::BAD_REQUEST,
+                &crate::value::escape(&crate::conn::parse::mask(&why)),
+            )
+        }
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "the change failed"),
     }
+}
+
+/// `POST /api/session/writes` body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionWrites {
+    pub on: bool,
+}
+
+/// `POST /api/session/writes` `{"on": bool}`: writes on or off for the connection the
+/// session is on, as `w` on the TUI's Connections. A saved profile changes as
+/// `PATCH /api/connections/<name>` changes it (saved, and turning writes on asks: its
+/// name typed on `prod`). A Docker container has no saved profile, so it changes for
+/// this session only: off at once, on after asking (yes or no, or its name typed on
+/// `prod`), as the TUI does.
+pub async fn session_writes(State(app): State<App>, Body(b): Body<SessionWrites>) -> Response {
+    let Some((conn, docker, profile)) = app
+        .hub
+        .with(|c| (c.id, c.docker, c.session.profile.clone()))
+    else {
+        return error(StatusCode::CONFLICT, super::NOT_LIVE);
+    };
+    if !docker {
+        let req = SetRequest {
+            writes: Some(b.on),
+            ..SetRequest::default()
+        };
+        return set_step(&app, profile.name, req, false, None).await;
+    }
+    if !b.on || !profile.is_read_only() {
+        return set_session_writes(&app, conn, b.on);
+    }
+    let name = crate::value::escape(&profile.name);
+    if profile.env == crate::model::Env::Prod {
+        let q = Question::typed(
+            format!(
+                "{name} is a prod container. Type its name to turn writes on for this session."
+            ),
+            profile.name.clone(),
+        );
+        app.ask(
+            Action::SessionWritesTyped {
+                conn,
+                expect: profile.name,
+            },
+            q,
+        )
+    } else {
+        let q = Question::ask(format!(
+            "Turn writes on for {name} in this session? Each write still asks as the write table says."
+        ));
+        app.ask(Action::SessionWrites { conn }, q)
+    }
+}
+
+/// The answer to the question about a container's writes.
+pub fn session_writes_on(app: &App, conn: ConnId) -> Response {
+    set_session_writes(app, conn, true)
+}
+
+/// The answer to the typed question about a prod container's writes.
+pub fn session_writes_typed(
+    app: &App,
+    conn: ConnId,
+    expect: &str,
+    typed: Option<&str>,
+) -> Response {
+    if typed != Some(expect) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "writes stay off: the name typed does not match",
+        );
+    }
+    set_session_writes(app, conn, true)
+}
+
+fn set_session_writes(app: &App, conn: ConnId, on: bool) -> Response {
+    let done = app.hub.with_mut(|c| {
+        if c.id != conn {
+            return None;
+        }
+        c.session.profile.read_only = Some(!on);
+        Some(crate::value::escape(&c.session.profile.name))
+    });
+    let Some(Some(name)) = done else {
+        return error(StatusCode::CONFLICT, super::writes::CHANGED);
+    };
+    app.hub
+        .emit(crate::web::session::Event::new("state", app.hub.state()));
+    ok(serde_json::json!({
+        "message": format!(
+            "Writes are {} for {name} in this session only (a container has no saved profile).",
+            if on { "on" } else { "off" }
+        ),
+        "state": app.hub.state(),
+    }))
 }
 
 /// `GET /api/connections`: the saved connections.
@@ -570,6 +706,11 @@ pub async fn test(State(app): State<App>, Path(name): Path<String>) -> Response 
     let report = crate::conn::check_permissions(&mut conn).await;
     let answer = conn.sentinel().cloned();
     drop(conn);
+    // Open, but every command refused for want of a password: a failed test, as a
+    // connect of the session is a failed one.
+    if let Some(why) = crate::web::session::auth_refused(&report) {
+        return error(StatusCode::BAD_GATEWAY, why);
+    }
     let at = answer
         .as_ref()
         .map_or(&profile.endpoint, |a| &a.primary)

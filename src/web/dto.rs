@@ -151,8 +151,14 @@ pub fn perms(r: &PermissionReport) -> Vec<Perm> {
         .map(|c| {
             let (status, reason) = match &c.status {
                 PermStatus::Allowed => ("allowed", None),
-                PermStatus::Denied(m) => ("denied", Some(escape(m))),
-                PermStatus::Skipped(m) => ("skipped", Some(escape(m))),
+                PermStatus::Denied(m) => (
+                    "denied",
+                    Some(escape(&crate::web::wording::perm_reason(c.label, true, m))),
+                ),
+                PermStatus::Skipped(m) => (
+                    "skipped",
+                    Some(escape(&crate::web::wording::perm_reason(c.label, false, m))),
+                ),
             };
             Perm {
                 label: c.label,
@@ -670,5 +676,55 @@ mod tests {
         let json = serde_json::to_string(&Docker::of(&d)).unwrap();
         assert!(!json.contains("container-pw"), "{json}");
         assert!(json.contains("\"auth\":\"password\""), "{json}");
+    }
+}
+
+/// One of Overview's findings before an analysis ("FROM THE SERVER"), computed by the
+/// TUI's own code (`views::overview::server_findings_of`): what was found, how much it
+/// matters, and where it is looked into.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Finding {
+    /// `warn`, `note` or `info`.
+    pub severity: &'static str,
+    pub text: String,
+    /// The screen it points to: `big_keys`, `expiry`, `changes`, `hot_keys`,
+    /// `slow_log`, `clients`, ...
+    pub screen: &'static str,
+    /// The area and panel names, as the TUI shows them (`Server`, `Slow log`).
+    pub area: &'static str,
+    pub panel: &'static str,
+}
+
+impl Finding {
+    pub fn of(f: &crate::tui::app::views::overview::Finding) -> Self {
+        use crate::analysis::Severity;
+        use crate::tui::app::Screen;
+        Self {
+            severity: match f.severity {
+                Severity::Warn => "warn",
+                Severity::Note => "note",
+                Severity::Info => "info",
+            },
+            text: escape(&f.text),
+            screen: match f.to {
+                Screen::Connections => "connections",
+                Screen::Overview => "overview",
+                Screen::Patterns | Screen::KeyList | Screen::KeyDetail => "keys",
+                Screen::Streams => "streams",
+                Screen::Search => "search",
+                Screen::BigKeys => "big_keys",
+                Screen::Ttl => "expiry",
+                Screen::Diff => "changes",
+                Screen::HotKeys => "hot_keys",
+                Screen::Nodes => "nodes",
+                Screen::Slots => "slots",
+                Screen::Clients => "clients",
+                Screen::SlowLog => "slow_log",
+                Screen::Monitor => "monitor",
+                Screen::PubSub => "pubsub",
+            },
+            area: f.to.area().title(),
+            panel: f.place(),
+        }
     }
 }

@@ -37,6 +37,15 @@ pub enum Action {
     Add(Box<super::connections::AddAsked>),
     /// `conn set` asking before turning writes on.
     Set(super::connections::SetAsked),
+    /// Monitor, which always asks before it starts; `expect` is the name to type.
+    Monitor {
+        conn: ConnId,
+        expect: Option<String>,
+    },
+    /// Writes on for a container's session (it has no saved profile).
+    SessionWrites { conn: ConnId },
+    /// The same on a prod container: its name typed.
+    SessionWritesTyped { conn: ConnId, expect: String },
 }
 
 /// Names only: the op's command, never its values.
@@ -47,6 +56,10 @@ impl std::fmt::Debug for Action {
             Action::Command(_) => f.write_str("Command"),
             Action::Add(_) => f.write_str("Add"),
             Action::Set(_) => f.write_str("Set"),
+            Action::Monitor { .. } => f.write_str("Monitor"),
+            Action::SessionWrites { .. } | Action::SessionWritesTyped { .. } => {
+                f.write_str("SessionWrites")
+            }
         }
     }
 }
@@ -232,6 +245,13 @@ pub async fn answer(
         Action::Command(asked) => super::cmdline::confirmed(&app, asked, a.typed).await,
         Action::Add(asked) => super::connections::add_answered(&app, *asked, a.typed).await,
         Action::Set(asked) => super::connections::set_answered(&app, asked, a.typed).await,
+        Action::Monitor { conn, expect } => {
+            super::server::monitor_answered(&app, conn, expect, a.typed).await
+        }
+        Action::SessionWrites { conn } => super::connections::session_writes_on(&app, conn),
+        Action::SessionWritesTyped { conn, expect } => {
+            super::connections::session_writes_typed(&app, conn, &expect, a.typed.as_deref())
+        }
     }
 }
 

@@ -451,6 +451,7 @@ async fn one_server(kind: &str, server: &common::TestServer) {
             "+@all",
             "-get",
             "-client",
+            "-config",
         ],
     )
     .await;
@@ -532,8 +533,38 @@ async fn one_server(kind: &str, server: &common::TestServer) {
     );
     assert!(sl["settings"]["threshold_micros"].is_i64(), "{kind}: {sl}");
 
-    // Monitor: lines over the stream, credentials masked; stopped on request.
+    // Overview's findings, by the TUI's own rules: the slowest slow-log entry, pointing
+    // at Server > Slow log.
+    let o = d.get("/api/overview").await.json();
+    let found = o["findings"].as_array().unwrap();
+    assert!(
+        found.iter().any(|f| f["screen"] == "slow_log"
+            && f["panel"] == "Slow log"
+            && f["area"] == "Server"),
+        "{kind}: {o}"
+    );
+    assert!(
+        found
+            .iter()
+            .all(|f| !f["text"].as_str().unwrap().contains(PASS)),
+        "{kind}"
+    );
+
+    // Monitor asks first (yes or no off prod), starts only on the answer; lines over
+    // the stream, credentials masked; stopped on request.
     let r = d.post("/api/server/monitor", serde_json::json!({})).await;
+    assert_eq!(r.status, 409, "{kind}: {}", r.body);
+    let q = r.json();
+    assert_eq!(q["confirm"]["kind"], "ask", "{kind}: {q}");
+    assert_eq!(
+        d.get("/api/state").await.json()["monitor"],
+        Value::Null,
+        "{kind}: not started by the question"
+    );
+    let id = q["confirm"]["id"].as_str().unwrap();
+    let r = d
+        .post(&format!("/api/confirm/{id}"), serde_json::json!({}))
+        .await;
     assert_eq!(r.status, 202, "{kind}: {}", r.body);
     assert_eq!(r.json()["max_secs"], 30);
     wait_for(&mut events, "monitor", |v| v["kind"] == "ready").await;
@@ -643,8 +674,23 @@ async fn one_server(kind: &str, server: &common::TestServer) {
     let h = d.get("/api/cmdline/help?name=get").await;
     assert_eq!(h.status, 200, "{kind}: {}", h.body);
 
-    // A writable prod profile: the publish asks first, then is sent once confirmed.
+    // A writable prod profile: Monitor wants the name typed; the publish asks first,
+    // then is sent once confirmed.
     d.connect("prod-rw").await;
+    let r = d.post("/api/server/monitor", serde_json::json!({})).await;
+    assert_eq!(r.status, 409, "{kind}: {}", r.body);
+    let q = r.json();
+    assert_eq!(q["confirm"]["kind"], "type", "{kind}: {q}");
+    assert_eq!(q["confirm"]["expect"], "prod-rw", "{kind}: {q}");
+    let id = q["confirm"]["id"].as_str().unwrap();
+    let r = d
+        .post(
+            &format!("/api/confirm/{id}"),
+            serde_json::json!({ "typed": "prod" }),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{kind}: {}", r.body);
+    assert_eq!(d.get("/api/state").await.json()["monitor"], Value::Null);
     let r = d
         .post(
             "/api/pubsub/publish",
@@ -692,8 +738,15 @@ async fn one_server(kind: &str, server: &common::TestServer) {
         .unwrap();
     assert_eq!(v.as_deref(), Some("v1"), "{kind}: nothing was written");
 
-    // A user refused GET and CLIENT: the feature is off, in fixed words.
+    // A user refused GET, CLIENT and CONFIG: the feature is off, in fixed words, and
+    // the slow log says why its settings are missing in every reply, not only the
+    // first.
     d.connect("limited").await;
+    for n in 0..2 {
+        let sl = d.get("/api/server/slowlog").await.json();
+        assert_eq!(sl["settings"], Value::Null, "{kind} {n}: {sl}");
+        assert!(sl["settings_off"].is_string(), "{kind} {n}: {sl}");
+    }
     let r = d.post("/api/cmdline", run("GET web:k")).await.json();
     assert_eq!(r["status"], "failed", "{kind}: {r}");
     assert_eq!(
@@ -769,5 +822,94 @@ async fn a_cluster_connects_with_its_nodes_and_routes_by_slot() {
         assert_eq!(cl["node"], 2, "{kind}: {cl}");
         let r = d.post("/api/node", serde_json::json!({ "index": 9 })).await;
         assert_eq!(r.status, 422, "{kind}");
+    }
+}
+
+/// A server that needs a password, connected without one and with a wrong one: the
+/// connect fails in redis-lens's own words, and no reply or event carries the server's
+/// text (rule 3), on Redis and Valkey.
+#[tokio::test]
+async fn a_server_that_wants_a_password_fails_the_connect_in_fixed_words() {
+    for (kind, server) in [
+        (
+            "redis",
+            common::redis_with(&["--requirepass", "probe-pw-9"]).await,
+        ),
+        (
+            "valkey",
+            common::valkey_with(&["--requirepass", "probe-pw-9"]).await,
+        ),
+    ] {
+        let none = profile("nopw", server.port, Env::Local, None);
+        let mut wrong = profile("wrongpw", server.port, Env::Local, None);
+        wrong.auth = Auth::Keychain;
+        let d = Dash::start(vec![none, wrong.clone()], &format!("auth-{kind}")).await;
+        d.store
+            .set(
+                &wrong.secret_ref(),
+                &Credentials {
+                    username: None,
+                    password: SecretString::from("bad-pw-9".to_string()),
+                },
+            )
+            .unwrap();
+        let mut events = d.events().await;
+        let mut seen = Vec::new();
+        for name in ["nopw", "wrongpw"] {
+            let r = d
+                .post("/api/connect", serde_json::json!({ "name": name }))
+                .await;
+            assert_eq!(r.status, 202, "{kind}: {}", r.body);
+            let t0 = Instant::now();
+            let s = loop {
+                let s = d.get("/api/state").await;
+                let v = s.json();
+                seen.push(s.body);
+                if v["status"] == "failed" {
+                    break v;
+                }
+                assert!(t0.elapsed() < WAIT, "{kind} {name}: {v}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            assert_ne!(s["live"], "ready", "{kind} {name}: {s}");
+            let want = if name == "nopw" {
+                web::wording::NEEDS_PASSWORD
+            } else {
+                web::wording::BAD_CREDENTIALS
+            };
+            assert_eq!(s["error"], want, "{kind} {name}: {s}");
+            seen.push(d.get("/api/overview").await.body);
+            seen.push(
+                d.post(
+                    &format!("/api/connections/{name}/test"),
+                    serde_json::json!({}),
+                )
+                .await
+                .body,
+            );
+            seen.push(d.get("/api/server/clients").await.body);
+            seen.push(
+                d.post("/api/cmdline", serde_json::json!({ "line": "GET k" }))
+                    .await
+                    .body,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        while let Ok(e) = events.try_recv() {
+            seen.push(e.1.to_string());
+        }
+        for b in &seen {
+            for word in [
+                "NOAUTH",
+                "WRONGPASS",
+                "ERR",
+                "Authentication required",
+                "AuthenticationFailed",
+                "probe-pw-9",
+                "bad-pw-9",
+            ] {
+                assert!(!b.contains(word), "{kind}: {word} in {b}");
+            }
+        }
     }
 }

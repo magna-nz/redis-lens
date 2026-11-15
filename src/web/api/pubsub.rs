@@ -82,7 +82,7 @@ pub async fn channels(State(app): State<App>) -> Response {
                     "notes": s.notes,
                 }),
                 Ok(_) => serde_json::json!({ "node": i, "off": SHAPE }),
-                Err(e) => serde_json::json!({ "node": i, "off": e.to_string() }),
+                Err(e) => serde_json::json!({ "node": i, "off": crate::web::wording::server_free(&e.to_string()) }),
             });
         }
     }

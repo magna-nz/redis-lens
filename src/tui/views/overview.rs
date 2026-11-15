@@ -345,10 +345,22 @@ pub fn server_findings(app: &App) -> Vec<Finding> {
     let Some(s) = app.session.as_ref() else {
         return Vec::new();
     };
+    server_findings_of(
+        s.figures.as_ref(),
+        &app.views.server.slow.entries,
+        &app.views.server.clients.conns,
+    )
+}
+
+/// [`server_findings`] from the connect's figures, the slow log and the client list
+/// alone (the dashboard keeps these of its own session).
+pub(crate) fn server_findings_of(
+    figures: Option<&Figures>,
+    slow: &[SlowEntry],
+    conns: &[ClientConn],
+) -> Vec<Finding> {
     let mut out = Vec::new();
-    let big = s
-        .figures
-        .as_ref()
+    let big = figures
         .and_then(|f| f.server.as_ref())
         .and_then(|f| f.headline().big_keys);
     if let Some(n) = big.filter(|n| *n > 0) {
@@ -362,8 +374,8 @@ pub fn server_findings(app: &App) -> Vec<Finding> {
             to: Screen::BigKeys,
         });
     }
-    out.extend(slow_finding(&app.views.server.slow.entries));
-    out.extend(idle_finding(&app.views.server.clients.conns));
+    out.extend(slow_finding(slow));
+    out.extend(idle_finding(conns));
     out
 }
 

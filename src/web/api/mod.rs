@@ -85,6 +85,7 @@ impl FromRef<App> for Page {
 
 /// `{"error": text}` with `status`.
 pub fn error(status: StatusCode, text: &str) -> Response {
+    let text = crate::web::wording::server_free(text);
     (status, axum::Json(serde_json::json!({ "error": text }))).into_response()
 }
 
@@ -113,6 +114,7 @@ impl IntoResponse for Refused {
 
 /// `{"off": why}`: a panel's feature is off for this server or user.
 pub fn off(why: &str) -> Response {
+    let why = crate::web::wording::server_free(why);
     axum::Json(serde_json::json!({ "off": why })).into_response()
 }
 

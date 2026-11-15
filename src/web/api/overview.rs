@@ -1,8 +1,9 @@
 //! 1 Overview before an analysis: what the connect read of the server (its figures, the
 //! permission checks, the provider notice, the per-shard rows of a cluster), and the
-//! live figures, polled about once a second only while an event stream is open
-//! ([`poll`]), as the TUI's Overview polls `INFO` on the picked node and, on a cluster,
-//! each shard every [`SHARDS_EVERY`].
+//! live figures, polled only while an event stream is open and polling is not paused
+//! ([`poll`]), at the TUI's interval (2 s to start with, `POST /api/polling` changes it),
+//! as the TUI's Overview polls `INFO` on the picked node and, on a cluster, each shard
+//! every [`SHARDS_EVERY`] or at the interval if that is longer.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,14 +17,14 @@ use tokio::sync::watch;
 use super::{App, error, ok};
 use crate::live::server::{Reply, Request};
 use crate::live::{Dest, LiveReply, LiveRequest};
-use crate::tui::app::views::server::{SHARDS_EVERY, point};
+use crate::tui::app::views::overview::server_findings_of;
+use crate::tui::app::views::server::{SHARDS_EVERY, max_gap, point};
 use crate::web::dto;
 use crate::web::session::{Event, Hub};
 
-/// How often the live figures are polled while a page listens.
-pub const EVERY: Duration = Duration::from_secs(1);
-/// Rates over a longer gap than this between two polls are not told (the page was away).
-const MAX_GAP: Duration = Duration::from_secs(10);
+/// How often the poller looks whether a poll is due. The polls themselves go at the
+/// interval set with `POST /api/polling` (the TUI's, 2 s to start with).
+const TICK: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 struct Provider {
@@ -88,6 +89,12 @@ pub async fn get(State(app): State<App>) -> Response {
             }),
             "server": s.server.as_ref().map(dto::Server::of),
             "target": s.target.as_ref().map(|t| crate::value::escape(&t.to_string())),
+            // "From the server", by the TUI's own rules: big keys counted by the
+            // server, the slowest slow-log entry, many idle clients from one address.
+            "findings": server_findings_of(figures, &c.slow_entries, &c.client_conns)
+                .iter()
+                .map(dto::Finding::of)
+                .collect::<Vec<_>>(),
         })
     });
     match body {
@@ -99,14 +106,17 @@ pub async fn get(State(app): State<App>) -> Response {
 /// Polls the live figures while at least one event stream is open, until `shutdown`.
 /// Every `INFO` goes through the node's budget, like every other live request.
 pub async fn poll(hub: Arc<Hub>, mut shutdown: watch::Receiver<bool>) {
-    let mut tick = tokio::time::interval(EVERY);
+    let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last: Option<std::time::Instant> = None;
     loop {
         tokio::select! {
             _ = tick.tick() => {}
             _ = shutdown.wait_for(|v| *v) => return,
         }
-        if hub.listeners() == 0 {
+        let polling = hub.polling();
+        let every = polling.every();
+        if hub.listeners() == 0 || polling.paused || last.is_some_and(|t| t.elapsed() < every) {
             continue;
         }
         let Some((conn, node, nodes, shards_due)) = hub
@@ -116,7 +126,7 @@ pub async fn poll(hub: Arc<Hub>, mut shutdown: watch::Receiver<bool>) {
                     let due = n > 0
                         && c.live
                             .shards_at
-                            .is_none_or(|at| at.elapsed() >= SHARDS_EVERY);
+                            .is_none_or(|at| at.elapsed() >= every.max(SHARDS_EVERY));
                     (c.id, c.session.picked, n, due)
                 })
             })
@@ -124,6 +134,7 @@ pub async fn poll(hub: Arc<Hub>, mut shutdown: watch::Receiver<bool>) {
         else {
             continue;
         };
+        last = Some(std::time::Instant::now());
         let info = LiveRequest::Server(Request::Info);
         let r = hub
             .request(Some(conn), Dest::node(node), info.clone())
@@ -135,7 +146,7 @@ pub async fn poll(hub: Arc<Hub>, mut shutdown: watch::Receiver<bool>) {
                         return None;
                     }
                     let prev = c.live.last.as_ref().map(|(t, s)| (*t, s));
-                    let p = point(prev, at, &sample, MAX_GAP);
+                    let p = point(prev, at, &sample, max_gap(every));
                     c.live.point = Some(p);
                     c.live.last = Some((at, (*sample).clone()));
                     Some(serde_json::json!({
@@ -146,7 +157,10 @@ pub async fn poll(hub: Arc<Hub>, mut shutdown: watch::Receiver<bool>) {
                 })
                 .flatten(),
             Ok(_) => None,
-            Err(e) => Some(serde_json::json!({ "node": node, "error": e.to_string() })),
+            Err(e) => Some(serde_json::json!({
+                "node": node,
+                "error": crate::web::wording::server_free(&e.to_string()),
+            })),
         };
         let mut shards = None;
         if shards_due {
@@ -198,5 +212,28 @@ pub async fn poll(hub: Arc<Hub>, mut shutdown: watch::Receiver<bool>) {
                 data,
             });
         }
+    }
+}
+
+/// `POST /api/polling` body: either or both.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetPolling {
+    #[serde(default)]
+    pub paused: Option<bool>,
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
+}
+
+/// `POST /api/polling` `{"paused": bool, "interval_secs": N}`: pauses or resumes the
+/// live figures and sets how often they are read, as `p` and `+` `-` on the TUI's
+/// Overview. Answers with the polling as `/api/state` shows it.
+pub async fn set_polling(
+    State(app): State<App>,
+    super::Body(b): super::Body<SetPolling>,
+) -> Response {
+    match app.hub.set_polling(b.paused, b.interval_secs) {
+        Ok(p) => ok(crate::web::session::PollingDto::of(p)),
+        Err(why) => error(StatusCode::UNPROCESSABLE_ENTITY, why),
     }
 }

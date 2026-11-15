@@ -56,13 +56,26 @@ pub struct Ran {
     pub line: String,
     /// `ok` (replies), `note` (not sent, and why) or `failed`.
     pub status: &'static str,
+    /// In the dashboard's terms ([`crate::web::wording::server_free`]).
+    #[serde(serialize_with = "dashboard_words")]
     pub text: Option<String>,
     /// The cluster node it went to.
     pub node: Option<String>,
+    #[serde(serialize_with = "dashboard_words")]
     pub route_note: Option<&'static str>,
     pub times: u32,
     pub sent: u32,
     pub replies: Vec<dto::Reply>,
+}
+
+fn dashboard_words<S: serde::Serializer, T: AsRef<str>>(
+    t: &Option<T>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(
+        &crate::web::wording::server_free_opt(t.as_ref().map(AsRef::as_ref)),
+        s,
+    )
 }
 
 impl Ran {
