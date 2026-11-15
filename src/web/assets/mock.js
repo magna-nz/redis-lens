@@ -83,7 +83,7 @@ function savedProfiles() {
   return [
     profile('prod-cache-01', 'prod', 'cache-01.prod.internal:6379', { tls: true, tags: ['cache', 'eu'] }, { analysed: true }),
     profile('staging-cache', 'stage', 'staging.internal:6379', { tags: ['cache'] }, {
-      version: '7.2.5', scale: 0.08, policy: 'noeviction', lfu: false, denied: { 'MEMORY STATS': noperm('MEMORY STATS') }, configDenied: true,
+      version: '7.2.5', scale: 0.08, policy: 'noeviction', lfu: false, denied: { 'MEMORY STATS': noperm('MEMORY STATS') }, configDenied: true, analysisFails: true,
     }),
     profile('demo-cluster', 'local', '127.0.0.1:7001', { auth: 'none' }, {
       flavor: 'valkey', version: '8.0.1', mode: 'cluster', scale: 0.3, policy: 'allkeys-lru', lfu: false,
@@ -124,6 +124,170 @@ export function maskedAddress(url) {
 
 const ADD_FIELDS = ['name', 'url', 'env', 'password', 'tags', 'writes', 'provider', 'ssh', 'ssh_identity', 'ssh_known_hosts', 'sentinel', 'sentinel_master',
   'sentinel_tls', 'sentinel_user', 'sentinel_password', 'token_command', 'entra', 'standalone', 'prefer_replica', 'force'];
+
+// ---------- the keyspace of the sample data (Browse and Analyze) ----------
+
+const MIB = 1024 ** 2;
+const utf8 = new TextEncoder();
+
+/** The hex id that names a key in a request: the hex of its bytes. */
+export function hexOf(raw) {
+  return Array.from(utf8.encode(raw), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function fromHex(id) {
+  if (typeof id !== 'string' || !/^(?:[0-9a-f]{2})*$/.test(id)) return null;
+  const bytes = new Uint8Array((id.match(/../g) || []).map((x) => parseInt(x, 16)));
+  return new TextDecoder().decode(bytes);
+}
+
+/** A name as redis-lens sends it: escaped for the screen, the hex id, and the name to copy
+ *  when escaping changed nothing. */
+export function nameOf(raw) {
+  const name = raw.replace(/[\x00-\x1f\x7f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
+  return { copy: name === raw ? raw : null, id: hexOf(raw), name };
+}
+
+/** A TTL in the TUI's words: `6d 10h`, `59m 59s`, `never`. */
+export function ttlText(secs) {
+  if (secs === null || secs === undefined) return 'never';
+  const d = Math.floor(secs / 86400);
+  const hh = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  if (d) return `${d}d ${hh}h`;
+  if (hh) return `${hh}h ${m}m`;
+  if (m) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+/** A Redis glob as a regular expression: `*`, `?`, `[...]` and `\` escapes. */
+export function globRe(glob) {
+  const lit = (c) => c.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+  let re = '';
+  for (let i = 0; i < glob.length; i += 1) {
+    const c = glob[i];
+    if (c === '*') re += '.*';
+    else if (c === '?') re += '.';
+    else if (c === '\\' && i + 1 < glob.length) {
+      i += 1;
+      re += lit(glob[i]);
+    } else if (c === '[') {
+      const end = glob.indexOf(']', i + 2);
+      if (end < 0) re += '\\[';
+      else {
+        const body = glob.slice(i + 1, end);
+        const neg = body.startsWith('^');
+        re += `[${neg ? '^' : ''}${(neg ? body.slice(1) : body).replace(/[\\\]]/g, '\\$&')}]`;
+        i = end;
+      }
+    } else re += lit(c);
+  }
+  return new RegExp(`^${re}$`, 's');
+}
+
+// Each pattern of the sample keyspace: its keys at scale 1, their mean size, TTL (seconds,
+// or null for none) and the share without a TTL, and how to name its i-th key.
+const SPACE = [
+  { name: 'user:{id}:cart', glob: 'user:*:cart', type: 'hash', keys: 2410000, avg: 1290, ttl: 554400, noTtl: 0.01, enc: 'listpack', unit: 'fields', len: 4, hot: 20, key: (i) => `user:${10293 + i * 7}:cart`, value: 'cart', group: 'user:' },
+  { name: 'session:{id}', glob: 'session:*', type: 'string', keys: 1980000, avg: 820, ttl: 1790, noTtl: 0, enc: 'raw', unit: 'bytes', len: 612, hot: 60, key: (i) => `session:${((0x5f3a91c + i * 40503) >>> 0).toString(16)}`, value: 'session', grows: true },
+  { name: 'cache:product:{id}', glob: 'cache:product:*', type: 'hash', keys: 1210000, avg: 2100, ttl: 3540, noTtl: 0.04, enc: 'listpack', unit: 'fields', len: 6, hot: 30, key: (i) => `cache:product:${51007 + i}`, value: 'product' },
+  { name: 'rl:{ip}:login', glob: 'rl:*:login', type: 'string', keys: 880000, avg: 64, ttl: 52, noTtl: 0, enc: 'int', unit: 'bytes', len: 2, hot: 180, key: (i) => `rl:203.0.${(i >> 8) & 255}.${(7 + i) & 255}:login`, value: 'counter' },
+  { name: 'user:{id}:feed', glob: 'user:*:feed', type: 'zset', keys: 640000, avg: 3400, ttl: null, noTtl: 1, enc: 'listpack', unit: 'members', len: 40, hot: 10, key: (i) => `user:${88120 + i * 3}:feed`, value: 'feed', group: 'user:' },
+  { name: 'tmp:import:{id}', glob: 'tmp:import:*', type: 'string', keys: 420000, avg: 5200, ttl: null, noTtl: 1, enc: 'raw', unit: 'bytes', len: 5120, hot: 0, key: (i) => `tmp:import:${20260901 + i}`, value: 'blob', grows: true, warn: 'Every key never expires, and the pattern grows: temporary data should carry a TTL.' },
+  { name: 'tags:{id}', glob: 'tags:*', type: 'set', keys: 380000, avg: 310, ttl: null, noTtl: 1, enc: 'listpack', unit: 'members', len: 5, hot: 4, key: (i) => `tags:${1000 + i}`, value: 'tags' },
+  { name: 'queue:emails', glob: 'queue:emails', literal: true, type: 'list', keys: 1, avg: 92 * MIB, ttl: null, noTtl: 1, enc: 'quicklist', unit: 'elements', len: 412000, hot: 140, key: () => 'queue:emails', value: 'queue' },
+  { name: 'events:orders', glob: 'events:orders', literal: true, type: 'stream', keys: 1, avg: 18 * MIB, ttl: null, noTtl: 1, enc: 'stream', unit: 'entries', len: 96000, hot: 90, key: () => 'events:orders', value: 'stream' },
+  { name: 'bf:signups', glob: 'bf:signups', literal: true, type: 'MBbloom--', keys: 1, avg: Math.round(2.4 * MIB), ttl: null, noTtl: 1, enc: null, unit: null, len: null, hot: 70, key: () => 'bf:signups', value: 'bloom' },
+  { name: 'cfg:flags', glob: 'cfg:flags', literal: true, type: 'string', keys: 1, avg: 410, ttl: null, noTtl: 1, enc: 'raw', unit: 'bytes', len: 342, hot: 120, key: () => 'cfg:flags', value: 'json' },
+  // A key whose name holds an escape sequence: shown escaped, asked for by its hex id, and
+  // never copied (a pasted copy would name another key).
+  { name: 'evil\x1b[31mkey', glob: null, literal: true, type: 'string', keys: 1, avg: 56, ttl: null, noTtl: 1, enc: 'embstr', unit: 'bytes', len: 1, hot: 2, key: () => 'evil\x1b[31mkey', value: 'v' },
+];
+// The other databases of a standalone server.
+const OTHER_DBS = {
+  1: [{ name: 'job:{id}', glob: 'job:*', type: 'hash', keys: 41, fixed: true, avg: 240, ttl: null, noTtl: 1, enc: 'listpack', unit: 'fields', len: 3, hot: 3, key: (i) => `job:${700 + i}`, value: 'product' }],
+  3: [{ name: 'lock:{id}', glob: 'lock:*', type: 'string', keys: 3, fixed: true, avg: 72, ttl: 30, noTtl: 0, enc: 'embstr', unit: 'bytes', len: 8, hot: 1, key: (i) => `lock:order:${9 + i}`, value: 'counter' }],
+};
+const TTL_LABELS = ['none', '<1m', '<1h', '<1d', '<7d', '<30d', '≥30d'];
+const FORMATS = ['text', 'hex', 'JSON', 'MessagePack', 'PHP', 'Pickle', 'Protobuf', 'Java'];
+const COPY_REFUSED = 'The value has control characters, so it is not copied as text: show it as hex to copy it.';
+const BAD_FORMAT = 'the format must be one of text, hex, json, msgpack, php, pickle, protobuf or java';
+const NO_REPORT = 'No analysis yet: analyze the keys first.';
+const NO_VIEW = 'That value is no longer open (a newer one replaced it, or the session changed): open it again.';
+const NO_LIST = 'That key list is gone (a newer one replaced it, or the session changed): open it again.';
+const NOT_CONNECTED = 'Not connected: connect first.';
+const BIG_KEY = 64 * MIB;
+const HOT_BIG = 10 * MIB;
+const HOT_FREQ = 100;
+const scanCommand = (glob) => (glob ? `redis-cli --scan --pattern "${glob}"` : null);
+const snapFile = (at) => `${new Date(at * 1000).toISOString().replace(/[-:]/g, '').slice(0, 15)}Z.json`;
+const snapUtc = (at) => `${new Date(at * 1000).toISOString().replace('T', ' ').slice(0, 19)} UTC`;
+const short = (n) => (n >= GIB ? `${(n / GIB).toFixed(1)}G` : n >= MIB ? `${(n / MIB).toFixed(1)}M` : n >= 1024 ? `${(n / 1024).toFixed(1)}K` : `${n}B`);
+const pct = (r) => `${Math.round(r * 100)}%`;
+
+/** A value in a format, as redis-lens draws it: header, lines, what to copy. */
+function render(raw, want = null) {
+  const binary = /[\x00-\x08\x0e-\x1f\x7f-\xff]/.test(raw);
+  let json = null;
+  try {
+    const v = JSON.parse(raw);
+    if (v && typeof v === 'object') json = v;
+  } catch {
+    // Not JSON.
+  }
+  const detected = binary ? 'hex' : json ? 'JSON' : 'text';
+  const label = want ? FORMATS.find((f) => f.toLowerCase() === want.toLowerCase() || (want.toLowerCase() === 'msgpack' && f === 'MessagePack')) : detected;
+  const bytes = raw.length;
+  const escaped = raw.replace(/[\x00-\x08\x0b-\x1f\x7f-\xff]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
+  const hexLines = () => {
+    const out = [];
+    for (let at = 0; at < Math.min(bytes, 512); at += 16) {
+      const chunk = raw.slice(at, at + 16);
+      const hx = Array.from(chunk, (c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join(' ');
+      out.push(`${at.toString(16).padStart(8, '0')}  ${hx.padEnd(47)}  ${chunk.replace(/[^\x20-\x7e]/g, '.')}`);
+    }
+    return out;
+  };
+  let lines;
+  let copy = raw;
+  let copyRefused = null;
+  let note = null;
+  if (label === 'hex') {
+    lines = hexLines();
+    copy = Array.from(raw, (c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+    if (bytes > 512) note = 'Shown: the first 512 bytes in hex. Copy takes them all.';
+  } else if (label === 'JSON' && json) lines = JSON.stringify(json, null, 2).split('\n');
+  else {
+    if (label !== 'text') note = `This value is not ${label}: it is shown as text.`;
+    lines = escaped.split('\n');
+    if (binary) {
+      copy = null;
+      copyRefused = COPY_REFUSED;
+    }
+  }
+  const header = want ? `value · ${bytes.toLocaleString('en-US')} bytes · shown as ${label}` : `value · ${detected} · ${bytes.toLocaleString('en-US')} bytes · auto-detected`;
+  return { bytes, compression: null, copy, copy_refused: copyRefused, detected, format: label, formats: FORMATS, header, lines, note, picked: want ? label.toLowerCase() : null, truncated: false };
+}
+
+/** The value of key `i` of a pattern: items, or the string. */
+function valueOf(spec, i, raw) {
+  const seed = (i * 2654435761) >>> 0;
+  switch (spec.value) {
+    case 'cart': return { kind: 'hash', length: 3 + (i % 3), item: (n) => (n < 2 + (i % 3) ? [`sku:${44812 + n * 31 + (i % 50)}`, JSON.stringify({ qty: 1 + ((seed >> n) % 3), price: [19.99, 4.5, 129, 7.25][n % 4] })] : ['coupon', 'WINTER10']) };
+    case 'product': return { kind: 'hash', length: 6, item: (n) => [['name', 'price', 'stock', 'currency', 'updated_at', 'image'][n], [`Trail shoe ${i % 90}`, String(49 + (i % 70)), String(seed % 400), 'EUR', '2026-11-14T08:12:40Z', `/img/p/${51007 + i}.jpg`][n]] };
+    case 'session': return { kind: 'string', raw: JSON.stringify({ user_id: 10293 + i * 7, roles: ['buyer'], csrf: seed.toString(36), cart: `user:${10293 + i * 7}:cart`, expires: '2026-11-16T10:00:00Z', ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6)' }) };
+    case 'counter': return { kind: 'string', raw: String(1 + (seed % 30)) };
+    case 'feed': return { kind: 'zset', length: 40, item: (n) => [`post:${900100 + ((seed + n * 977) % 90000)}`, String(1794745502 - n * 3600)] };
+    case 'blob': return { kind: 'string', raw: `\x1f\x8b\x08\x00${Array.from({ length: 1020 }, (_, n) => String.fromCharCode((seed + n * 131) % 256)).join('')}` };
+    case 'tags': return { kind: 'set', length: 5, item: (n) => [null, ['red', 'blue', 'sale', 'new', 'eu'][n]] };
+    case 'queue': return { kind: 'list', length: spec.len, page: 500, item: (n) => [null, JSON.stringify({ to: `user${10293 + n * 7}@example.com`, template: n % 3 ? 'receipt' : 'welcome' })] };
+    case 'stream': return { kind: 'stream', length: spec.len, page: 200, entry: (n) => [`1794745${String(502183 - n * 61).padStart(6, '0')}-0`, [['kind', n % 4 ? 'paid' : 'created'], ['order', String(770100 - n)], ['amount', `${(12 + (n % 80)).toFixed(2)}`]]] };
+    case 'bloom': return { kind: 'module', module: { label: 'Bloom filter', info: [{ name: 'Capacity', value: '1000000' }, { name: 'Size', value: '2516288' }, { name: 'Number of filters', value: '1' }, { name: 'Number of items inserted', value: '412880' }, { name: 'Expansion rate', value: '2' }], top: [], stats: [], samples: [], missing: [], unavailable: null } };
+    case 'json': return { kind: 'string', raw: JSON.stringify({ checkout_v2: true, search_beta: false, regions: ['eu', 'us'], max_cart_items: 50, banner: { text: 'Winter sale', until: '2026-12-01' } }) };
+    default: return { kind: 'string', raw: raw === 'evil\x1b[31mkey' ? 'v' : 'ok' };
+  }
+}
 
 export function createMockServer({ entra = false } = {}) {
   const saved = savedProfiles();
@@ -169,14 +333,14 @@ export function createMockServer({ entra = false } = {}) {
     if (!s) {
       return {
         connected_at_unix: null, connection: null, docker: false, error: null, features, live: 'waiting', live_error: null, monitor: null,
-        monitor_limits: limits, nodes: [], picked: 0, polling,
+        analysis: analysisState(), monitor_limits: limits, nodes: [], picked: 0, polling,
         refused: [], sentinel: null, server: null, status: 'idle', tail: null, target: null, writes: false, writes_off: null,
       };
     }
     const p = s.profile;
     const up = s.status === 'connected';
     return {
-      connected_at_unix: s.connectedAt, connection: connection(p), docker: s.docker, error: s.error, features, live: s.live, live_error: s.liveError,
+      analysis: analysisState(), connected_at_unix: s.connectedAt, connection: { ...connection(p), db: s.db }, docker: s.docker, error: s.error, features, live: s.live, live_error: s.liveError,
       monitor: s.monitor ? { run: s.monitor.run, node: s.picked, started_at_unix_ms: s.monitor.startedAt, max_lines: 10000, max_secs: 30 } : null,
       monitor_limits: limits, nodes: up ? nodesOf(p) : [], picked: s.picked, polling, refused: s.refused, sentinel: null, server: up ? server(p) : null, status: s.status,
       tail: s.tail ? { id: s.tail.id, kind: s.tail.kind, name: s.tail.name, node: s.picked, ready: s.tail.ready } : null,
@@ -384,7 +548,7 @@ export function createMockServer({ entra = false } = {}) {
       );
     }
     return {
-      figures: up ? figures(p) : null, figures_failed: null, findings,
+      analysis: up ? overviewAnalysis() : null, figures: up ? figures(p) : null, figures_failed: null, findings,
       last_analysis: up && p.sim.analysed ? { taken_at_unix: unix() - 3 * 3600, sampled_keys: 100000 } : null,
       live: null, perms: up ? perms(p) : [], provider: null, server: up ? server(p) : null,
       shards: nodes.map((node) => ({ node, figures: figures(p, 1 / nodes.length), note: null, live: null, failed: false })),
@@ -567,6 +731,837 @@ export function createMockServer({ entra = false } = {}) {
     return line(text, 'note', `Not sent: the server has no command ${word}.`);
   }
 
+  // ---------- Browse, Analyze and snapshots ----------
+
+  const PAGE = 1000;
+  const SORTS = ['memory', 'keys', 'avg_size', 'no_ttl', 'name'];
+  const STILL_CONNECTING = 'Still connecting: wait until the connection is ready.';
+  const STOPPED_TEXT = 'This analysis was stopped early, so its results are partial and are not saved. Analyze again to save one.';
+  const ANALYSIS_RUNS = 'An analysis is running: its patterns replace the key names.';
+  let runSeq = 0;
+
+  // Saved snapshots by profile. prod-cache-01 has three from the last two days, so its
+  // Changes show a trend.
+  const snaps = new Map();
+  {
+    const now = unix();
+    const at = [now - 2 * 86400 - 1800, now - 86400 - 600, now - 3 * 3600];
+    const grew = [0.9, 0.95, 0.985];
+    snaps.set('prod-cache-01', at.map((t, n) => ({
+      at: t, file: snapFile(t), sampled: 100000, complete: false, usedMemory: Math.round(15.02 * GIB * (0.955 + n * 0.015)),
+      rows: SPACE.filter((spec) => n === 2 || spec.glob).map((spec) => {
+        const keys = Math.round((spec.literal ? 1 : spec.keys) * (spec.grows ? grew[n] : 1));
+        return { name: spec.name, keys, bytes: Math.round(keys * spec.avg) };
+      }),
+    })));
+  }
+
+  const snapName = () => session.profile.name;
+  const snapsOf = () => snaps.get(snapName()) || [];
+  const isCluster = (p) => p.sim.nodes.length > 0;
+  const sizesOn = (p) => !p.sim.denied['MEMORY USAGE'];
+  const freqOn = (p) => p.sim.lfu && !p.sim.denied['OBJECT FREQ'];
+  const running = () => !!session && ['connecting', 'sampling', 'stopping'].includes(session.an.status);
+  const keep = (map, id, value, cap) => {
+    map.set(id, value);
+    while (map.size > cap) map.delete(map.keys().next().value);
+  };
+
+  function freshAnalysis() {
+    runSeq += 1;
+    return { status: 'none', run: runSeq, depth: null, sampled: null, target: null, startedAt: null, error: null, note: null, report: null, stop: false };
+  }
+
+  /** The patterns of the database shown, with their key counts. */
+  function space() {
+    const p = session.profile;
+    const specs = session.db === 0 ? SPACE : OTHER_DBS[session.db] || [];
+    return specs.map((spec) => ({ spec, count: spec.literal ? 1 : spec.fixed ? spec.keys : Math.max(1, Math.round(spec.keys * p.sim.scale)) }));
+  }
+  const dbsize = () => space().reduce((n, x) => n + x.count, 0);
+
+  function keyRow(spec, i, node = null) {
+    const p = session.profile;
+    const never = spec.ttl === null || i % 100 < spec.noTtl * 100;
+    const ttl = never ? null : spec.ttl - ((i * 97) % Math.max(1, Math.floor(spec.ttl / 2)));
+    const bytes = spec.literal ? spec.avg : Math.round(spec.avg * (0.55 + ((i * 37) % 90) / 100));
+    const nodes = p.sim.nodes.length;
+    return {
+      ...nameOf(spec.key(i)), bytes: sizesOn(p) ? bytes : null, encoding: spec.enc, freq: freqOn(p) ? Math.min(255, spec.hot + ((i * 13) % 9)) : null,
+      length: spec.len === null ? null : spec.literal ? spec.len : Math.max(1, Math.round(spec.len * (0.6 + ((i * 7) % 80) / 100))), length_unit: spec.unit,
+      node: nodes ? node ?? (spec.literal ? spec.name.length % nodes : i % nodes) : null, ttl: ttlText(ttl), ttl_secs: ttl, type: spec.type,
+    };
+  }
+
+  const refusals = (p) => [
+    p.sim.denied['MEMORY USAGE'] ? 'MEMORY USAGE is refused for this user, so the keys have no sizes.' : null,
+    p.sim.lfu && p.sim.denied['OBJECT FREQ'] ? 'OBJECT FREQ is refused for this user, so the keys have no LFU counters.' : null,
+  ].filter(Boolean);
+
+  // ---------- the pattern tree ----------
+
+  function names() {
+    if (!session.names) {
+      const n = { pages: 0, read: 0, reading: true };
+      session.names = n;
+      const mine = connSeq;
+      const step = () => {
+        if (!session || connSeq !== mine || session.names !== n) return;
+        const total = dbsize();
+        n.pages += 1;
+        n.read = Math.min(total, n.pages * PAGE);
+        if (n.read >= total || n.pages >= 8) n.reading = false;
+        else later(180).then(step);
+      };
+      later(180).then(step);
+    }
+    return session.names;
+  }
+
+  const bucket = (ttl) => (ttl < 60 ? 1 : ttl < 3600 ? 2 : ttl < 86400 ? 3 : ttl < 7 * 86400 ? 4 : ttl < 30 * 86400 ? 5 : 6);
+
+  /** A pattern's row from an analysis (`r`), narrowed to a node when given. */
+  function patternStats(r, spec, count, node = null) {
+    const p = session.profile;
+    const nodes = p.sim.nodes.length;
+    let k = count;
+    if (node !== null && nodes) k = spec.literal ? (spec.name.length % nodes === node ? 1 : 0) : Math.round(count / nodes);
+    const est = Math.round(k * (spec.grows ? r.growth : 1));
+    const sampled = r.complete ? est : Math.min(est, Math.max(est ? 1 : 0, Math.round(est * r.fraction)));
+    const bytes = r.sizes ? Math.round(est * spec.avg) : null;
+    const noTtl = Math.round(sampled * spec.noTtl);
+    const hist = TTL_LABELS.map(() => 0);
+    hist[0] = noTtl;
+    if (spec.ttl !== null) hist[bucket(spec.ttl)] += sampled - noTtl;
+    const big = r.sizes && spec.avg >= BIG_KEY;
+    const base = r.base ? r.base.rows.find((x) => x.name === spec.name) : undefined;
+    return {
+      avg_bytes: r.sizes ? spec.avg : null, change: r.base ? changeOf(base, { keys: est, bytes }) : null, command: scanCommand(spec.glob), est_bytes: bytes, est_keys: est,
+      examples: (spec.literal ? [0] : [0, 1, 2]).map((i) => keyRow(spec, i)), kind: 'pattern', literal: !!spec.literal, marked: !!spec.warn || big, names_seen: null,
+      no_ttl: noTtl, no_ttl_ratio: sampled ? noTtl / sampled : null, pattern: nameOf(spec.name),
+      reason: spec.warn || (big ? `${short(spec.avg)} in one key: a key this big blocks the server while it is read or deleted whole.` : null),
+      sampled_bytes: r.sizes ? Math.round(sampled * spec.avg) : null, sampled_keys: sampled, share: null,
+      size_max: r.sizes ? Math.round(spec.avg * (spec.literal ? 1 : 1.45)) : null, size_p50: r.sizes ? Math.round(spec.avg * (spec.literal ? 1 : 0.95)) : null, size_p99: r.sizes ? Math.round(spec.avg * (spec.literal ? 1 : 1.4)) : null,
+      ttl_hist: hist, ttl_verdict: spec.noTtl >= 1 ? 'never expires' : spec.noTtl > 0 ? 'mostly expires' : 'every key expires', type: spec.type,
+      verdict: spec.warn ? 'look' : big ? 'big' : null, warning: !!spec.warn,
+    };
+  }
+
+  function changeOf(b, a) {
+    if (!b) return { alarming: (a.bytes ?? 0) >= MIB, cause: 'new', cause_words: 'new', delta_bytes: a.bytes, delta_keys: a.keys };
+    const dk = a.keys - b.keys;
+    const dbytes = a.bytes === null || b.bytes === null ? null : a.bytes - b.bytes;
+    const cause = dk === 0 && !dbytes ? 'unchanged' : dk > 0 ? 'more_keys' : dk < 0 ? 'fewer_keys' : dbytes > 0 ? 'bigger_keys' : 'smaller_keys';
+    const words = { unchanged: 'unchanged', more_keys: 'more keys', fewer_keys: 'fewer keys', bigger_keys: 'bigger keys', smaller_keys: 'smaller keys' }[cause];
+    return { alarming: (dbytes ?? 0) > 0 && b.bytes > 0 && dbytes / b.bytes >= 0.03, cause, cause_words: words, delta_bytes: dbytes, delta_keys: dk };
+  }
+
+  /** Sort pattern rows and put the patterns that share a prefix in one group. */
+  function tree(items, sort) {
+    const by = { memory: (r) => -(r.est_bytes ?? -1), keys: (r) => -r.est_keys, avg_size: (r) => -(r.avg_bytes ?? -1), no_ttl: (r) => -(r.no_ttl_ratio ?? -1), name: null }[sort];
+    items.sort((x, y) => (by ? by(x.row) - by(y.row) : 0) || x.row.pattern.name.localeCompare(y.row.pattern.name));
+    const out = [];
+    const done = new Set();
+    for (const { row, spec } of items) {
+      const members = spec.group ? items.filter((x) => x.spec.group === spec.group) : [];
+      if (members.length < 2) {
+        out.push(row);
+        continue;
+      }
+      if (done.has(spec.group)) continue;
+      done.add(spec.group);
+      const kids = members.map((x) => x.row);
+      const sum = (f) => (kids.every((c) => typeof c[f] === 'number') ? kids.reduce((n, c) => n + c[f], 0) : null);
+      const noTtl = sum('no_ttl');
+      const sampled = sum('sampled_keys');
+      out.push({
+        children: kids, est_bytes: sum('est_bytes'), est_keys: sum('est_keys'), key: spec.group, kind: 'group', label: spec.group, marked: kids.some((c) => c.marked),
+        no_ttl: noTtl, no_ttl_ratio: noTtl !== null && sampled ? noTtl / sampled : null, reason: null, sampled_keys: sampled, share: sum('share'), type: null, verdict: null,
+      });
+    }
+    return out;
+  }
+
+  function analysisRows(r, node) {
+    const items = space().map(({ spec, count }) => ({ spec, row: patternStats(r, spec, count, node) })).filter((x) => x.row.est_keys > 0);
+    const total = items.reduce((n, x) => n + (r.sizes ? x.row.est_bytes : x.row.est_keys), 0) || 1;
+    for (const x of items) x.row.share = (r.sizes ? x.row.est_bytes : x.row.est_keys) / total;
+    return items;
+  }
+
+  function browse(q) {
+    const p = session.profile;
+    const a = session.an;
+    const sort = q.get('sort');
+    if (sort !== null && !SORTS.includes(sort)) return [400, { error: 'the sort must be one of memory, keys, avg_size, no_ttl or name' }];
+    let node = null;
+    if (q.has('node')) {
+      node = /^\d+$/.test(q.get('node')) ? Number(q.get('node')) : -1;
+      if (!a.report || !isCluster(p) || node < 0 || node >= p.sim.nodes.length) return [400, { error: "That node is not one of this analysis's nodes." }];
+    }
+    const total = dbsize();
+    const base = { names: null, node: null, nodes: [], partial: null, previous: false, rows: [], sizes: false, sort: 'keys', sorts: ['keys', 'name'], source: 'none', total, ttl_labels: TTL_LABELS, why: null };
+    const sorted = (r) => {
+      const s = sort && (r.sizes || !['memory', 'avg_size'].includes(sort)) ? sort : r.sizes ? 'memory' : 'keys';
+      return { sizes: r.sizes, sort: s, sorts: r.sizes ? SORTS : ['keys', 'no_ttl', 'name'] };
+    };
+    if (a.report) {
+      const r = a.report;
+      return [200, {
+        ...base, ...sorted(r), node, nodes: isCluster(p) ? p.sim.nodes.map(([endpoint], index) => ({ endpoint, index, role: 'primary', sampled_keys: Math.round(r.sampled / p.sim.nodes.length), status: index === 2 ? 'partial' : 'scanned' })) : [],
+        previous: running(), rows: tree(analysisRows(r, node), sorted(r).sort), source: 'analysis',
+        why: running() ? 'An analysis is running: these are the last one\'s patterns until it is done.' : 'These patterns come from the analysis: analyze again to read them anew.',
+      }];
+    }
+    if (running()) {
+      if (!a.sampled) return [200, { ...base, why: 'An analysis is starting: its patterns come once it samples keys.' }];
+      const r = { sizes: sizesOn(p), complete: false, fraction: a.sampled / Math.max(1, total), growth: 1, base: null };
+      return [200, { ...base, ...sorted(r), partial: { sampled: a.sampled, target: a.target }, rows: tree(analysisRows(r, null), sorted(r).sort), source: 'partial', why: ANALYSIS_RUNS }];
+    }
+    if (!live()) return [200, { ...base, why: 'Key names are read once the live connection is open.' }];
+    const n = names();
+    const items = [];
+    for (const { spec, count } of space()) {
+      const seen = spec.literal ? (n.read >= total || n.pages >= 2 ? 1 : 0) : Math.round(count * (n.read / Math.max(1, total)));
+      if (!seen) continue;
+      items.push({
+        spec,
+        row: {
+          avg_bytes: null, change: null, command: scanCommand(spec.glob), est_bytes: null, est_keys: n.read >= total || spec.literal ? seen : count, examples: [], kind: 'pattern', literal: !!spec.literal,
+          marked: false, names_seen: seen, no_ttl: null, no_ttl_ratio: null, pattern: nameOf(spec.name), reason: null, sampled_bytes: null, sampled_keys: seen, share: seen / Math.max(1, n.read),
+          size_max: null, size_p50: null, size_p99: null, ttl_hist: null, ttl_verdict: null, type: null, verdict: null, warning: false,
+        },
+      });
+    }
+    return [200, {
+      ...base, sort: sort === 'name' ? 'name' : 'keys', source: 'names', rows: tree(items, sort === 'name' ? 'name' : 'keys'),
+      names: {
+        complete: n.read >= total, dbsize: total, done: !n.reading, error: null, first_pages: 8, missing: [], names_read: n.read,
+        nodes_done: isCluster(p) ? [Math.min(p.sim.nodes.length, Math.ceil((n.read / Math.max(1, total)) * p.sim.nodes.length)), p.sim.nodes.length] : null,
+        pages: n.pages, reading: n.reading, refused: [], skipped: [],
+      },
+    }];
+  }
+
+  async function moreNames(body) {
+    if (!known(body, ['sort'])) return [400, { error: SHAPE }];
+    if (session.an.report || running()) return [409, { error: 'The patterns come from the analysis: there are no more names to read.' }];
+    const n = names();
+    if (n.reading) return [409, { error: 'Still reading key names: wait for it.' }];
+    const total = dbsize();
+    if (n.read >= total) return [409, { error: `Every key name is read: ${total.toLocaleString('en-US')}.` }];
+    await later(250);
+    n.pages += 1;
+    n.read = Math.min(total, n.read + PAGE);
+    return browse(new URLSearchParams(body.sort ? { sort: body.sort } : {}));
+  }
+
+  // ---------- key lists ----------
+
+  function listReply(l, from) {
+    const p = session.profile;
+    const rows = [];
+    for (let j = from; j < l.loaded; j += 1) rows.push(l.row(j));
+    const done = l.loaded >= l.total;
+    const nodes = p.sim.nodes.length;
+    return {
+      cluster: nodes ? { at: done ? nodes - 1 : Math.min(nodes - 1, l.pages - 1), missing: [], narrowed: l.node, nodes_done: done ? nodes : Math.min(l.pages, nodes - 1), walk: p.sim.nodes.map((_, n) => n) } : null,
+      capped: false, done, error: null, find: l.find, freq: freqOn(p), glob: l.glob, kind: l.kind, lfu: p.sim.lfu, list: l.id, loaded: l.loaded, max_rows: 50000, new_from: from, other_pattern: 0, page_keys: PAGE, pages: l.pages,
+      pattern: l.pattern, refused: l.refused, rows, sizes: sizesOn(p), unreadable: 0,
+    };
+  }
+
+  function newList(fields) {
+    session.listSeq += 1;
+    const l = { id: session.listSeq, pages: 1, refused: refusals(session.profile), find: null, pattern: null, glob: null, node: null, ...fields };
+    l.loaded = Math.min(PAGE, l.total);
+    keep(session.lists, l.id, l, 16);
+    return l;
+  }
+
+  function patternList(q) {
+    const id = q.get('pattern');
+    if (!id || fromHex(id) === null) return [400, { error: 'a pattern is named by its hex id: ?pattern=757365723a2a' }];
+    const p = session.profile;
+    let node = null;
+    if (q.has('node')) {
+      node = /^\d+$/.test(q.get('node')) ? Number(q.get('node')) : -1;
+      if (!isCluster(p) || node < 0 || node >= p.sim.nodes.length) return [400, { error: "That node is not one of this analysis's nodes." }];
+    }
+    const x = space().find(({ spec }) => hexOf(spec.name) === id);
+    if (!x) return [404, { error: 'There is no such pattern in the patterns shown: read them again.' }];
+    const nodes = p.sim.nodes.length;
+    const narrowed = node !== null && nodes;
+    const total = Math.min(50000, narrowed ? (x.spec.literal ? Number(x.spec.name.length % nodes === node) : Math.ceil(x.count / nodes)) : x.count);
+    const l = newList({ kind: 'pattern', pattern: nameOf(x.spec.name), glob: x.spec.glob ? nameOf(x.spec.glob).name : nameOf(x.spec.name).name, node, total, row: (j) => keyRow(x.spec, narrowed && !x.spec.literal ? node + j * nodes : j, narrowed ? node : null) });
+    return [200, listReply(l, 0)];
+  }
+
+  function findList(q) {
+    if (!q.has('q')) return [400, { error: 'give the name or pattern to find: ?q=user' }];
+    const text = q.get('q').trim();
+    if (!text) return [422, { error: 'Type a name or a pattern to find.' }];
+    if (text.length > 512) return [422, { error: 'A name to find has at most 512 characters.' }];
+    const glob = /[*?[]/.test(text) ? text : `*${text.replace(/\\/g, '\\\\')}*`;
+    if ((glob.match(/\*/g) || []).length > 8) return [422, { error: 'A pattern may have at most 8 * wildcards, so matching it stays cheap for the server.' }];
+    const re = globRe(glob);
+    const hits = [];
+    for (const { spec, count } of space()) {
+      for (let i = 0; i < Math.min(count, 4000) && hits.length < 50000; i += 1) if (re.test(spec.key(i))) hits.push([spec, i]);
+    }
+    const l = newList({ kind: 'find', find: { glob: nameOf(glob).name, text: nameOf(text).name }, glob: nameOf(glob).name, total: hits.length, row: (j) => keyRow(hits[j][0], hits[j][1]) });
+    return [200, listReply(l, 0)];
+  }
+
+  function moreList(q) {
+    if (!/^\d+$/.test(q.get('list') || '')) return [400, { error: 'give the key list: ?list=1' }];
+    const l = session.lists.get(Number(q.get('list')));
+    if (!l) return [404, { error: NO_LIST }];
+    if (l.loaded >= l.total) return [409, { error: 'Every key of this list is loaded.' }];
+    const from = l.loaded;
+    l.loaded = Math.min(l.total, l.loaded + PAGE);
+    l.pages += 1;
+    // Like the real server: only the rows that are new, from `new_from` on.
+    return [200, listReply(l, from)];
+  }
+
+  // ---------- values ----------
+
+  function findKey(raw) {
+    for (const { spec, count } of space()) {
+      if (spec.literal) {
+        if (spec.key(0) === raw) return [spec, 0];
+        continue;
+      }
+      if (!globRe(spec.glob).test(raw)) continue;
+      for (let i = 0; i < Math.min(count, 50000); i += 1) if (spec.key(i) === raw) return [spec, i];
+    }
+    return null;
+  }
+
+  function viewReply(v) {
+    const p = session.profile;
+    const base = {
+      capped: false, cluster: isCluster(p), command: null, cut: null, done: true, error: null, field_ttls: false, field_ttls_off: null, gone: false, items: [], key: nameOf(v.raw), kind: 'other',
+      length: null, loaded: 0, loading: false, max_items: 10000, message: null, meta: null, module: null, more: false, notice: null, pages: v.pages, pattern: null, refused: [], type: null, value: null, view: v.id,
+    };
+    if (!v.spec) return { ...base, gone: true, notice: 'The key no longer exists: it expired or was deleted.' };
+    const val = v.value;
+    const out = { ...base, kind: val.kind, type: v.spec.type, meta: keyRow(v.spec, v.i), pattern: nameOf(v.spec.name), refused: refusals(p) };
+    const fieldTtls = p.sim.flavor === 'redis' && p.sim.version >= '7.4';
+    if (val.kind === 'string') return { ...out, command: 'GETRANGE', loaded: 1, value: render(val.raw), notice: 'The value is loaded.' };
+    if (val.kind === 'module') return { ...out, command: 'BF.INFO', loaded: 1, module: val.module, notice: 'The summary is loaded.' };
+    const done = v.loaded >= val.length;
+    const capped = !done && v.loaded >= 10000;
+    const items = [];
+    for (let n = 0; n < v.loaded; n += 1) {
+      if (val.kind === 'stream') {
+        const [id, fields] = val.entry(n);
+        items.push({ at: null, fields: fields.map(([name, value]) => ({ name, value })), index: n, name: id, ttl: null, value: null });
+      } else {
+        const [name, value] = val.item(n);
+        items.push({ at: null, fields: null, index: n, name, ttl: val.kind === 'hash' && fieldTtls ? 'never' : null, value });
+      }
+    }
+    const n = (x) => x.toLocaleString('en-US');
+    return {
+      ...out, capped, command: { hash: 'HSCAN', list: 'LRANGE', set: 'SSCAN', zset: 'ZRANGE', stream: 'XREVRANGE' }[val.kind], done: done || capped, items, length: val.length, loaded: v.loaded, more: !done && !capped,
+      field_ttls: val.kind === 'hash' && fieldTtls,
+      field_ttls_off: val.kind === 'hash' && !fieldTtls ? `Field TTLs need Redis 7.4 or later: ${p.sim.flavor === 'valkey' ? 'Valkey' : 'Redis'} ${p.sim.version} has none.` : null,
+      notice: done ? `All ${n(val.length)} items are loaded.` : capped ? `The first ${n(v.loaded)} of ${n(val.length)} items are loaded: at most 10,000 are held.` : `${n(v.loaded)} of ${n(val.length)} items are loaded.`,
+    };
+  }
+
+  function openView(q) {
+    const raw = fromHex(q.get('key'));
+    if (!q.get('key') || raw === null) return [400, { error: 'a key is named by the hex of its bytes: ?key=6b6579' }];
+    const found = findKey(raw);
+    session.viewSeq += 1;
+    const v = { id: session.viewSeq, raw, spec: found ? found[0] : null, i: found ? found[1] : 0, loaded: 0, pages: 1, value: null };
+    if (found) {
+      v.value = valueOf(v.spec, v.i, raw);
+      v.loaded = v.value.length ? Math.min(v.value.length, v.value.page || v.value.length) : 1;
+    }
+    keep(session.views, v.id, v, 8);
+    return [200, viewReply(v)];
+  }
+
+  function moreView(q) {
+    if (!/^\d+$/.test(q.get('view') || '')) return [400, { error: 'give the open value: ?view=1' }];
+    const v = session.views.get(Number(q.get('view')));
+    if (!v) return [404, { error: NO_VIEW }];
+    const val = v.value;
+    if (!val || !val.length || v.loaded >= Math.min(val.length, 10000)) return [409, { error: 'Every item of this value is loaded.' }];
+    v.loaded = Math.min(val.length, 10000, v.loaded + (val.page || val.length));
+    v.pages += 1;
+    return [200, viewReply(v)];
+  }
+
+  function itemOf(q) {
+    if (!/^\d+$/.test(q.get('view') || '') || (q.has('index') && !/^\d+$/.test(q.get('index')))) return [400, { error: 'give the open value and the item: ?view=1&index=0' }];
+    const format = q.get('format');
+    if (format !== null && format.toLowerCase() !== 'msgpack' && !FORMATS.some((f) => f.toLowerCase() === format.toLowerCase())) return [400, { error: BAD_FORMAT }];
+    const v = session.views.get(Number(q.get('view')));
+    if (!v) return [404, { error: NO_VIEW }];
+    const val = v.value;
+    const index = Number(q.get('index') || 0);
+    const noItem = [422, { error: 'There is no such item in what is loaded.' }];
+    if (!val || val.kind === 'module') return noItem;
+    let raw;
+    let name = null;
+    let field = null;
+    if (val.kind === 'string') {
+      if (index) return noItem;
+      raw = val.raw;
+    } else {
+      if (index >= v.loaded) return noItem;
+      if (val.kind === 'stream') {
+        if (!q.has('field')) return [422, { error: 'A stream entry has several fields: open one field to see or copy its value.' }];
+        field = Number(q.get('field'));
+        const fields = val.entry(index)[1];
+        if (!fields[field]) return noItem;
+        [name, raw] = fields[field];
+      } else [name, raw] = val.item(index);
+    }
+    return [200, { field, index, name, shown: render(raw, format) }];
+  }
+
+  // ---------- the analysis ----------
+
+  function analysisState() {
+    if (!session) return { db: 0, depth: null, error: null, note: null, previous: false, report: null, run: 0, sampled: null, started_unix: null, status: 'none', target: null };
+    const a = session.an;
+    return {
+      db: session.db, depth: a.depth, error: a.error, note: a.note, previous: running() && !!a.report, report: a.report ? reportJson(a.report) : null,
+      run: a.run, sampled: a.sampled, started_unix: a.startedAt, status: a.status, target: a.target,
+    };
+  }
+
+  const reportJson = (r) => ({
+    age_secs: Math.max(0, unix() - r.takenAt), cluster: r.cluster, complete: r.complete, patterns: space().length, previous: running(), sampled_keys: r.sampled,
+    sizes_available: r.sizes, stopped: r.stopped, taken_at_unix: r.takenAt,
+  });
+
+  function estimates() {
+    const p = session.profile;
+    const total = dbsize();
+    // A production profile's budget: the analysis keeps under it.
+    const budget = p.env === 'prod' ? 4000 : null;
+    return ['quick', 'deep'].map((depth) => {
+      const limit = depth === 'quick' ? 10000 : 100000;
+      const keys = Math.min(limit, total);
+      const commands = keys * (2 + Number(sizesOn(p)) + Number(freqOn(p))) + Math.ceil(total / PAGE) + 3;
+      return {
+        about: budget ? `at most ${budget.toLocaleString('en-US')} commands a second` : 'as fast as the server answers', commands, depth, duration_secs: budget ? Math.ceil(commands / budget) : null,
+        freq: freqOn(p), keys, per_sec: budget, sample_limit: limit, shards: p.sim.nodes.length, sizes: sizesOn(p),
+      };
+    });
+  }
+
+  function startAnalysis(body) {
+    if (!known(body, ['depth'])) return [400, { error: SHAPE }];
+    const depth = body.depth ?? 'quick';
+    if (!['quick', 'deep'].includes(depth)) return [400, { error: 'the depth must be quick or deep' }];
+    if (running()) return [409, { error: 'An analysis is already running.' }];
+    if (!live()) return [409, { error: STILL_CONNECTING }];
+    const p = session.profile;
+    const a = session.an;
+    const est = estimates().find((e) => e.depth === depth);
+    runSeq += 1;
+    Object.assign(a, { run: runSeq, status: 'connecting', depth, sampled: null, target: null, startedAt: unix(), error: null, note: null, stop: false });
+    // A new run: the key lists, open values and pending questions go.
+    confirms.clear();
+    session.lists.clear();
+    session.views.clear();
+    session.names = null;
+    const run = a.run;
+    const mine = connSeq;
+    const alive = () => !!session && connSeq === mine && session.an === a && a.run === run;
+    // As on the real server, an analysis opens its connection again: the state goes
+    // through connecting and waiting for a moment.
+    session.status = 'connecting';
+    session.live = 'waiting';
+    emitState();
+    emit('progress', { depth, kind: 'started', run, sample_limit: est.sample_limit });
+
+    const stopped = () => {
+      const kept = a.sampled > 0;
+      if (kept) {
+        const total = dbsize();
+        a.report = { takenAt: unix(), sampled: a.sampled, complete: false, stopped: true, sizes: sizesOn(p), cluster: isCluster(p), fraction: a.sampled / Math.max(1, total), growth: 1 + 0.01 * (run % 7), base: null };
+      }
+      Object.assign(a, { status: a.report ? 'done' : 'none', sampled: null, target: null, stop: false });
+      const n = kept ? a.report.sampled.toLocaleString('en-US') : '0';
+      emit('progress', { kept, kind: 'stopped', run, text: kept ? `Analysis stopped: the ${n} keys it sampled are shown. They are partial, so they are not saved.` : 'Analysis stopped before it sampled any key. Nothing changed.' });
+      emitState();
+      emitOverview();
+    };
+    const done = () => {
+      const total = dbsize();
+      a.report = { takenAt: unix(), sampled: a.sampled, complete: a.sampled >= total, stopped: false, sizes: sizesOn(p), cluster: isCluster(p), fraction: a.sampled / Math.max(1, total), growth: 1 + 0.01 * (run % 7), base: undefined };
+      Object.assign(a, { status: 'done', sampled: null, target: null });
+      emit('progress', { complete: a.report.complete, kind: 'done', patterns: space().length, run, sampled_keys: a.report.sampled, stopped: false, taken_at_unix: a.report.takenAt });
+      emitState();
+      later(300).then(() => {
+        if (!alive()) return;
+        const r = a.report;
+        const older = snapsOf().filter((x) => x.at < r.takenAt).sort((x, y) => y.at - x.at);
+        r.base = older[0] || null;
+        emit('progress', { kind: 'compared', run });
+        emitOverview();
+      });
+    };
+    const failed = () => {
+      Object.assign(a, { status: a.report ? 'done' : 'none', sampled: null, target: null, stop: false });
+      a.error = 'The analysis failed: the connection to the server broke.';
+      emit('progress', { error: a.error, kind: 'failed', run });
+      emitState();
+    };
+
+    later(350).then(() => {
+      if (!alive()) return;
+      session.status = 'connected';
+      later(150).then(() => {
+        if (!alive()) return;
+        session.live = 'ready';
+        emitState();
+      });
+      if (a.stop) {
+        stopped();
+        return;
+      }
+      Object.assign(a, { status: 'sampling', sampled: 0, target: est.keys });
+      emitState();
+      const steps = depth === 'deep' ? 24 : 12;
+      let step = 0;
+      const next = () => {
+        if (!alive()) return;
+        if (a.stop) {
+          stopped();
+          return;
+        }
+        step += 1;
+        a.sampled = Math.min(a.target, Math.round((a.target * step) / steps));
+        if (p.sim.analysisFails && step === Math.round(steps * 0.4)) {
+          failed();
+          return;
+        }
+        emit('progress', { kind: 'sampling', patterns: Math.min(space().length, step), run, sampled: a.sampled, stopping: false, target: a.target });
+        emitState();
+        if (step >= steps) done();
+        else later(250).then(next);
+      };
+      later(250).then(next);
+    });
+    return [202, { depth, estimate: est, run, sample_limit: est.sample_limit }];
+  }
+
+  function stopAnalysis(body) {
+    if (!known(body, [])) return [400, { error: SHAPE }];
+    if (!running()) return [409, { error: 'No analysis is running.' }];
+    const a = session.an;
+    const first = !a.stop;
+    a.stop = true;
+    a.status = 'stopping';
+    emit('progress', { kind: 'stopping', run: a.run });
+    emitState();
+    return [200, { stopping: true, text: first ? 'Stopping the analysis. What it sampled so far is kept.' : 'Stopping: the analysis ends after its current batch.' }];
+  }
+
+  /** The sampled keys the panels rank: a few of each pattern, the big ones whole. */
+  function sampledKeys() {
+    const out = [];
+    for (const { spec, count } of space()) for (let i = 0; i < Math.min(count, spec.literal ? 1 : 8); i += 1) out.push({ spec, key: keyRow(spec, i) });
+    return out;
+  }
+  const endpointOf = (k) => (k.node === null ? null : session.profile.sim.nodes[k.node][0]);
+
+  function bigKeys() {
+    const r = session.an.report;
+    if (!r.sizes) return { off: 'MEMORY USAGE is refused for this user, so no key has a size to rank.' };
+    const rows = sampledKeys().sort((x, y) => y.key.bytes - x.key.bytes).slice(0, 50).map(({ spec, key }) => ({
+      big: key.bytes >= BIG_KEY, encoding: spec.enc, key, length: key.length, length_unit: spec.unit, node: endpointOf(key), pattern: nameOf(spec.name),
+    }));
+    const stats = analysisRows(r, null);
+    const total = stats.reduce((n, x) => n + x.row.est_bytes, 0);
+    const never = stats.reduce((n, x) => n + x.row.est_bytes * x.spec.noTtl, 0);
+    const recommendations = rows.filter((x) => x.big).map((x) => ({ hint: 'Read it in ranges, delete it with UNLINK, or split it.', severity: 'warn', text: `${x.key.name} is ${short(x.key.bytes)}: a key this big blocks the server while it is read or deleted whole.` }));
+    for (const x of stats) if (x.spec.warn) recommendations.push({ hint: 'Temporary data should carry a TTL.', severity: 'note', text: `${x.row.pattern.name}: 100% of its keys never expire.` });
+    if (total) recommendations.push({ hint: 'Fine for data that must stay; caches should expire.', severity: 'info', text: `${pct(never / total)} of memory never expires: ${short(Math.round(never))} of ${short(total)}.` });
+    return { big_key_bytes: BIG_KEY, empty: rows.length ? null : 'No keys were sampled.', facts_read: true, notes: [], recommendations, report: reportJson(r), rows };
+  }
+
+  function expiryPanel() {
+    const r = session.an.report;
+    const stats = analysisRows(r, null);
+    const status = (spec) => `${spec.noTtl >= 1 ? 'persistent' : spec.noTtl > 0 ? 'mostly expiring' : 'expiring'} · ${spec.grows ? 'growing' : 'stable'}`;
+    const explain = (spec, row) => {
+      const lines = [];
+      if (spec.noTtl >= 1) lines.push(`All ${row.est_keys.toLocaleString('en-US')} keys never expire${spec.grows ? ', and the pattern grew since the last snapshot' : ''}.`);
+      else if (spec.noTtl > 0) lines.push(`${pct(spec.noTtl)} of its keys never expire; the others expire within ${ttlText(spec.ttl)}.`);
+      else lines.push(`Every key expires, within ${ttlText(spec.ttl)}.`);
+      if (spec.warn) lines.push(spec.warn);
+      return lines;
+    };
+    const rows = stats.map(({ spec, row }) => ({
+      command: row.command, est_bytes: row.est_bytes, est_keys: row.est_keys, explain: explain(spec, row), no_ttl: row.no_ttl, no_ttl_ratio: row.no_ttl_ratio, pattern: row.pattern,
+      sampled_keys: row.sampled_keys, status: status(spec), ttl_hist: row.ttl_hist, warning: row.warning,
+    })).sort((x, y) => (y.warning - x.warning) || ((y.est_bytes ?? 0) - (x.est_bytes ?? 0)));
+    let freed = null;
+    if (r.sizes) {
+      const total = stats.reduce((n, x) => n + x.row.est_bytes, 0);
+      const within = [['1 h', 3600], ['1 d', 86400], ['7 d', 7 * 86400], ['30 d', 30 * 86400]].map(([label, secs]) => ({
+        bytes: Math.round(stats.reduce((n, x) => n + (x.spec.ttl !== null && x.spec.ttl <= secs ? x.row.est_bytes * (1 - x.spec.noTtl) : 0), 0)), label,
+      }));
+      const never = Math.round(stats.reduce((n, x) => n + x.row.est_bytes * (x.spec.ttl === null ? 1 : x.spec.noTtl), 0));
+      freed = { later: Math.max(0, total - never - within[within.length - 1].bytes), never, never_share: total ? never / total : 0, total, within };
+    }
+    return { empty: rows.length ? null : 'No keys were sampled.', freed, freed_off: r.sizes ? null : 'MEMORY USAGE is refused for this user, so there are no memory figures.', report: reportJson(r), rows, ttl_labels: TTL_LABELS };
+  }
+
+  /** The current analysis as a snapshot's figures. */
+  function current(r) {
+    return {
+      at: r.takenAt, sampled: r.sampled, complete: r.complete, usedMemory: server(session.profile).used_memory,
+      rows: analysisRows(r, null).map(({ spec, row }) => ({ name: spec.name, keys: row.est_keys, bytes: row.est_bytes })),
+    };
+  }
+
+  function diff(b, a, history = null) {
+    const all = Array.from(new Set(b.rows.map((x) => x.name).concat(a.rows.map((x) => x.name))));
+    const days = history && history.length ? Math.max(1 / 24, (a.at - history[0].at) / 86400) : null;
+    const rows = all.map((name) => {
+      const x = b.rows.find((r) => r.name === name);
+      const y = a.rows.find((r) => r.name === name);
+      const change = !y ? { alarming: false, cause: 'gone', cause_words: 'gone', delta_bytes: x.bytes === null ? null : -x.bytes, delta_keys: -x.keys } : changeOf(x, y);
+      let trend = null;
+      if (history && history.length >= 2) {
+        const values = history.map((h0) => {
+          const at = h0.rows.find((r) => r.name === name);
+          return at ? at.bytes ?? at.keys : null;
+        }).concat([y ? y.bytes ?? y.keys : null]);
+        const first = values.find((v) => v !== null);
+        const last = values[values.length - 1];
+        trend = { growth: first !== null && last !== null && first !== undefined ? { per_day: (last - first) / days, ratio_per_day: first ? (last - first) / first / days : null } : null, values };
+      }
+      return { bytes_after: y ? y.bytes : null, bytes_before: x ? x.bytes : null, change, keys_after: y ? y.keys : null, keys_before: x ? x.keys : null, partial: false, pattern: nameOf(name), trend };
+    }).sort((p, q) => Math.abs(q.change.delta_bytes ?? q.change.delta_keys) - Math.abs(p.change.delta_bytes ?? p.change.delta_keys));
+    return {
+      after_sampled_keys: a.sampled, after_taken_at_unix: a.at, after_utc: snapUtc(a.at), before_sampled_keys: b.sampled, before_taken_at_unix: b.at, before_utc: snapUtc(b.at),
+      empty: rows.length ? null : 'Neither analysis sampled any keys.', note: b.complete === false || a.complete === false ? 'Both are samples: the figures are estimates scaled from the keys sampled.' : null, rows,
+      trend_points: history && history.length >= 2 ? history.map((h0) => ({ complete: !!h0.complete, sampled_keys: h0.sampled, taken_at_unix: h0.at })) : null,
+      used_memory_after: a.usedMemory, used_memory_before: b.usedMemory,
+    };
+  }
+
+  function changesPanel() {
+    const r = session.an.report;
+    const report = reportJson(r);
+    if (r.base === undefined) return { report, status: 'pending', text: 'Looking for an earlier snapshot…' };
+    if (r.stopped) return { report, status: 'none', text: 'This analysis was stopped early, so it is not compared with a snapshot.' };
+    if (!r.base) return { report, status: 'none', text: `No earlier snapshot for ${snapName()}. Save one; the next analysis compares against it.` };
+    const history = snapsOf().filter((x) => x.at < r.takenAt).sort((x, y) => x.at - y.at);
+    return { ...diff(r.base, current(r), history), report, status: 'diff' };
+  }
+
+  function hotKeys() {
+    const p = session.profile;
+    const r = session.an.report;
+    if (p.sim.denied['OBJECT FREQ']) return { off: 'OBJECT FREQ is refused for this user, so there are no hot keys.' };
+    if (!p.sim.lfu) return { off: `The maxmemory policy is ${p.sim.policy}: without an LFU policy the server keeps no access counters, so there are no hot keys.` };
+    const rows = sampledKeys().sort((x, y) => y.key.freq - x.key.freq).slice(0, 50).map(({ spec, key }) => ({
+      hot_and_big: (key.bytes ?? 0) >= HOT_BIG && key.freq >= HOT_FREQ, key, node: endpointOf(key), pattern: nameOf(spec.name),
+    }));
+    return { empty: rows.length ? null : 'No sampled key has an LFU counter above 0 yet.', hot_big_bytes: HOT_BIG, hot_freq: HOT_FREQ, report: reportJson(r), rows };
+  }
+
+  function nodesPanel() {
+    const p = session.profile;
+    const r = session.an.report;
+    if (!isCluster(p)) return { off: 'Not a cluster: this analysis read one standalone server.' };
+    const total = dbsize();
+    const count = p.sim.nodes.length;
+    const rows = nodesOf(p).map((n, i) => ({
+      complete: i !== 2, endpoint: n.endpoint, id: n.id, index: i, keys: Math.round((total / count) * (0.96 + i * 0.04)), memory: Math.round((server(p).used_memory / count) * (0.97 + i * 0.03)),
+      note: i === 2 ? 'Its sample stopped at the command budget, so its figures are partial.' : null, patterns: space().length - (i === 2 ? 1 : 0), primary_id: n.id, role: 'primary',
+      sampled_keys: Math.round((r.sampled / count) * (i === 2 ? 0.8 : 1.1)), sizes_available: r.sizes, slot_count: n.slot_count, slots: n.slots, status: i === 2 ? 'partial' : 'scanned', version: p.sim.version,
+    }));
+    return { empty: null, report: reportJson(r), rows };
+  }
+
+  function slotsPanel(q) {
+    const p = session.profile;
+    const order = q.get('order') ?? 'keys';
+    if (!['keys', 'cpu', 'net_in', 'net_out'].includes(order)) return [400, { error: 'the order must be one of keys, cpu, net_in or net_out' }];
+    if (!isCluster(p)) return [200, { off: 'Not a cluster: this is one standalone server.' }];
+    if (!session.slots || q.get('refresh')) session.slots = { seed: tick };
+    const seed = session.slots.seed;
+    const nodes = nodesOf(p);
+    const fig = (slot) => ({ keys: 120 + ((slot * 7919 + seed) % 260), cpu_usec: 5000 + ((slot * 104729 + seed * 13) % 90000), net_in: 20000 + ((slot * 15485863) % 400000), net_out: 90000 + ((slot * 32452843 + seed) % 2000000), memory: null });
+    const nodeOf = (slot) => nodes.findIndex((n) => slot >= n.slots[0][0] && slot <= n.slots[0][1]);
+    const by = { keys: 'keys', cpu: 'cpu_usec', net_in: 'net_in', net_out: 'net_out' }[order];
+    const hottest = [8412, 1203, 15011, 5462, 3300, 12800, 9001, 61, 14000, 7777, 2200, 10500]
+      .map((slot) => ({ slot, node: nodeOf(slot), ...fig(slot) }))
+      .sort((x, y) => y[by] - x[by]).slice(0, 10)
+      .map((x) => ({ ...x, endpoint: nodes[x.node].endpoint, sampled_keys: x.slot === 8412 && session.an.report ? [{ key: nameOf('user:10293:cart'), kinds: 'hash', pattern: nameOf('user:{id}:cart') }] : [] }));
+    const ranges = nodes.map((n, i) => ({
+      cpu_usec: 1200000 + i * 90000 + seed, end: n.slots[0][1], endpoint: n.endpoint, error: null, keys: Math.round(dbsize() / nodes.length), memory: null,
+      net_in: 41000000 + i * 1200000, net_out: 380000000 + i * 9000000, node: i, start: n.slots[0][0], status: 'done',
+    }));
+    return [200, { cpu_and_network_zero: false, empty: null, hottest, memory_column: p.sim.flavor === 'redis', note: null, order, ranges }];
+  }
+
+  /** Overview's analysis part: null until there is a report, and while one runs. */
+  function overviewAnalysis() {
+    const r = session.an.report;
+    if (!r || running()) return null;
+    const stats = analysisRows(r, null);
+    const by = (x) => (r.sizes ? x.row.est_bytes : x.row.est_keys);
+    const total = stats.reduce((n, x) => n + by(x), 0);
+    const findings = [];
+    if (r.sizes) {
+      for (const { spec, key } of sampledKeys()) {
+        if (key.bytes >= BIG_KEY) findings.push({ area: 'Analyze', panel: 'Big keys', screen: 'big_keys', severity: 'warn', text: `${key.name} is ${short(key.bytes)}: a big key.` });
+      }
+    }
+    for (const x of stats) if (x.spec.warn) findings.push({ area: 'Analyze', panel: 'Expiry', screen: 'expiry', severity: 'note', text: `${x.row.pattern.name}: 100% of its keys never expire.` });
+    if (r.base) {
+      for (const row of diff(r.base, current(r)).rows) {
+        if (row.change.alarming && row.change.cause !== 'new') findings.push({ area: 'Analyze', panel: 'Changes', screen: 'changes', severity: 'warn', text: `${row.pattern.name} grew ${pct((row.change.delta_bytes ?? 0) / (row.bytes_before || 1))} since the last snapshot.` });
+      }
+    }
+    if (freqOn(session.profile)) {
+      const hot = sampledKeys().sort((x, y) => y.key.freq - x.key.freq)[0];
+      if (hot) findings.push({ area: 'Analyze', panel: 'Hot keys', screen: 'hot_keys', severity: 'info', text: `${hot.key.name} is the most-read sampled key: LFU counter ${hot.key.freq}.` });
+    }
+    const never = r.sizes && total ? stats.reduce((n, x) => n + x.row.est_bytes * (x.spec.ttl === null ? 1 : x.spec.noTtl), 0) / total : null;
+    return {
+      changes: r.base === undefined ? 'pending' : r.base ? 'diff' : 'none', complete: r.complete, findings, never_expires_share: never,
+      note: r.stopped ? 'Stopped early: these figures come from part of the sample.' : null, patterns: stats.length, sampled_keys: r.sampled, sizes_available: r.sizes, stopped: r.stopped,
+      taken_at_unix: r.takenAt,
+      top_patterns: stats.slice().sort((x, y) => by(y) - by(x)).slice(0, 5).map((x) => ({ est_bytes: x.row.est_bytes, est_keys: x.row.est_keys, pattern: x.row.pattern, share: total ? by(x) / total : null })),
+    };
+  }
+
+  // ---------- snapshots and databases ----------
+
+  function snapshotList() {
+    const r = session.an.report;
+    const list = snapsOf().slice().sort((x, y) => y.at - x.at);
+    const saveOff = !r ? 'Nothing to save yet: analyze the keys first.' : running() ? 'An analysis is running: save it when it finishes.' : r.stopped ? STOPPED_TEXT : null;
+    return {
+      can_save: !saveOff, profile: snapName(), save_off: saveOff, saved: !!r && list.some((s) => s.at === r.takenAt),
+      snapshots: list.map((s) => ({ current: !!r && s.at === r.takenAt, file: s.file, taken_at_unix: s.at, taken_at_utc: snapUtc(s.at) })),
+    };
+  }
+
+  function saveSnapshot(body) {
+    if (!known(body, [])) return [400, { error: SHAPE }];
+    const r = session.an.report;
+    if (running()) return [409, { error: 'An analysis is running: save it when it finishes.' }];
+    if (!r) return [409, { error: 'Nothing to save yet: analyze the keys first.' }];
+    if (r.stopped) return [409, { error: STOPPED_TEXT }];
+    const list = snaps.get(snapName()) || [];
+    let s = list.find((x) => x.at === r.takenAt);
+    if (!s) {
+      s = { ...current(r), file: snapFile(r.takenAt) };
+      list.push(s);
+      snaps.set(snapName(), list);
+    }
+    return [201, { file: s.file, sampled_keys: r.sampled, taken_at_unix: r.takenAt, taken_at_utc: snapUtc(r.takenAt), text: `Saved snapshot ${s.file}` }];
+  }
+
+  function compareSnapshots(q) {
+    const names = [q.get('a'), q.get('b')];
+    if (names.some((n) => !n || !(n === 'current' || /^\d{8}T\d{6}Z\.json$/.test(n)))) return [400, { error: 'a snapshot is named by its file name, such as 20261115T091500Z.json, or current' }];
+    if (names[0] === names[1]) return [422, { error: 'Pick two different snapshots to compare.' }];
+    const r = session.an.report;
+    const sides = [];
+    for (const n of names) {
+      if (n === 'current') {
+        if (!r) return [409, { error: NO_REPORT }];
+        sides.push(current(r));
+      } else {
+        const s = snapsOf().find((x) => x.file === n);
+        if (!s) return [404, { error: 'There is no such snapshot of this connection.' }];
+        sides.push(s);
+      }
+    }
+    return [200, diff(sides[0], sides[1])];
+  }
+
+  function dbs() {
+    const p = session.profile;
+    if (isCluster(p)) return { off: 'A cluster only has database 0.' };
+    const db0 = SPACE.reduce((n, spec) => n + (spec.literal ? 1 : Math.max(1, Math.round(spec.keys * p.sim.scale))), 0);
+    const rows = [{ db: 0, keys: db0, expires: Math.round(db0 * 0.31) }, { db: 1, keys: 41, expires: 0 }, { db: 3, keys: 3, expires: 3 }];
+    return {
+      current: session.db, note: 'Picking a database is for this session. The saved profile is unchanged.', rows: rows.map((r) => ({ ...r, current: r.db === session.db })),
+      saved_as: p.name, unread: p.sim.denied['MEMORY USAGE'] ? 'CONFIG GET databases is refused for this user, so only the databases with keys are listed.' : null,
+    };
+  }
+
+  function switchDb(body) {
+    if (!known(body, ['db']) || !Number.isInteger(body.db)) return [400, { error: SHAPE }];
+    if (isCluster(session.profile)) return [422, { error: 'A cluster only has database 0.' }];
+    if (running()) return [409, { error: 'An analysis is running: wait for it to finish, then pick a database.' }];
+    if (!live()) return [409, { error: 'The connection is not ready yet: wait for it, then pick a database.' }];
+    if (![0, 1, 3].includes(body.db)) return [422, { error: 'Pick a database the list shows (read the list first): it shows the databases with keys.' }];
+    if (body.db === session.db) return [200, { db: body.db, run: null, switched: false, text: null }];
+    // A new run: what was read of the other database goes, pending questions too.
+    Object.assign(session, { db: body.db, an: freshAnalysis(), names: null, slots: null });
+    session.lists.clear();
+    session.views.clear();
+    confirms.clear();
+    emitState();
+    later(200).then(() => emitOverview());
+    return [202, { db: body.db, run: session.an.run, switched: true, text: `Switched to db ${body.db} for this session. The saved profile is unchanged.` }];
+  }
+
+  const P2 = ['/api/dbs', '/api/db', '/api/browse', '/api/browse/more', '/api/keys', '/api/keys/more', '/api/find', '/api/value', '/api/value/more', '/api/value/item',
+    '/api/analysis', '/api/analysis/big_keys', '/api/analysis/expiry', '/api/analysis/changes', '/api/analysis/hot_keys', '/api/analysis/nodes', '/api/analysis/slots',
+    '/api/snapshots', '/api/snapshots/compare'];
+
+  /** Phase 2's routes, or null for another route. */
+  async function phase2(method, path, query, body) {
+    if (!P2.includes(path)) return null;
+    if (!session) return [409, { error: NOT_CONNECTED }];
+    if (session.status === 'failed') return [409, { error: 'The connect failed: connect again first.' }];
+    const q = new URLSearchParams(query);
+    const k = `${method} ${path}`;
+    const reading = !live() ? [409, { error: STILL_CONNECTING }] : null;
+    const panel = (fn) => {
+      if (!session.an.report) return [409, { error: NO_REPORT }];
+      const out = fn();
+      return [200, out];
+    };
+    switch (k) {
+      case 'GET /api/dbs': return [200, dbs()];
+      case 'POST /api/db': return switchDb(body);
+      case 'GET /api/browse': return browse(q);
+      case 'POST /api/browse/more': return reading || moreNames(body);
+      case 'GET /api/keys': return reading || patternList(q);
+      case 'GET /api/find': return live() ? findList(q) : [409, { error: 'Still connecting: find a key once connected.' }];
+      case 'GET /api/keys/more': return reading || moreList(q);
+      case 'GET /api/value': return reading || openView(q);
+      case 'GET /api/value/more': return reading || moreView(q);
+      case 'GET /api/value/item': return reading || itemOf(q);
+      case 'GET /api/analysis': return [200, { analysis: analysisState(), estimates: session.status === 'connected' || running() ? estimates() : [], running: running() }];
+      case 'POST /api/analysis': return startAnalysis(body);
+      case 'DELETE /api/analysis': return stopAnalysis(body);
+      case 'GET /api/analysis/big_keys': return panel(bigKeys);
+      case 'GET /api/analysis/expiry': return panel(expiryPanel);
+      case 'GET /api/analysis/changes': return panel(changesPanel);
+      case 'GET /api/analysis/hot_keys': return panel(hotKeys);
+      case 'GET /api/analysis/nodes': return panel(nodesPanel);
+      case 'GET /api/analysis/slots': return slotsPanel(q);
+      case 'GET /api/snapshots': return [200, snapshotList()];
+      case 'POST /api/snapshots': return saveSnapshot(body);
+      case 'GET /api/snapshots/compare': return compareSnapshots(q);
+      default: return [405, { error: 'method not allowed' }];
+    }
+  }
+
   // ---------- the router ----------
 
   async function connect(target) {
@@ -584,7 +1579,10 @@ export function createMockServer({ entra = false } = {}) {
     const mine = connSeq;
     confirms.clear();
     lastOps = null;
-    session = { profile: p, docker: !!target.docker, status: 'connecting', error: null, live: 'waiting', liveError: null, connectedAt: null, picked: 0, refused: [], tail: null, monitor: null };
+    session = {
+      profile: p, docker: !!target.docker, status: 'connecting', error: null, live: 'waiting', liveError: null, connectedAt: null, picked: 0, refused: [], tail: null, monitor: null,
+      db: p.db, an: freshAnalysis(), names: null, lists: new Map(), views: new Map(), listSeq: 0, viewSeq: 0, slots: null,
+    };
     emitState();
     later(600).then(() => {
       if (!session || connSeq !== mine) return;
@@ -767,6 +1765,9 @@ export function createMockServer({ entra = false } = {}) {
       if (body.on && sp.read_only) return ask({ kind: 'ask', text: `Turn writes on for ${sp.name} in this session? Each write still asks as the write table says.` }, apply);
       return apply();
     }
+
+    const p2 = await phase2(method, path, query, body);
+    if (p2) return p2;
 
     // Everything below reads the live connection.
     if (!live()) return [409, { error: NOT_LIVE }];

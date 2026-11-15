@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** the web dashboard, phase 1 of 4, on `claude/dashboard-p1` ([Web dashboard](#web-dashboard-2026-11-15)). On main: Redis Insight parity phases 1 to 5 (#15 to #23), the TUI redesign (#21), the shorter README (#24), Find key (#25) and the release pipeline with the switch to MIT (#27).
-**Last updated:** 2026-11-15 (web dashboard phase 1 in progress on `claude/dashboard-p1`; release pipeline merged as #27)
+**Current milestone:** the web dashboard, phase 2 of 4, on `claude/dashboard-p2`; phase 1 merged as #26 ([Web dashboard](#web-dashboard-2026-11-15)). On main: Redis Insight parity phases 1 to 5 (#15 to #23), the TUI redesign (#21), the shorter README (#24), Find key (#25) and the release pipeline with the switch to MIT (#27).
+**Last updated:** 2026-11-16 (web dashboard phase 1 merged as #26; phase 2 on `claude/dashboard-p2`)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -670,8 +670,8 @@ A web UI served by redis-lens on `127.0.0.1`, an alternative to the TUI with the
 
 | Phase | Content | State |
 |---|---|---|
-| 1 | The server (`src/web/`, axum), sign-in token and request checks, the dashboard's own session through the TUI's runner, the shared command budget, `--dashboard` / `--terminal` / `--port` / `--no-open`, `ctrl-o`, and the screens Connections (add, edit, remove, test, writes), Overview, Server, Pub/Sub and Command line | in progress on `claude/dashboard-p1` |
-| 2 | Browse (patterns, keys, values, Find key) and Analyze (Big keys, Expiry, Changes, Hot keys, Nodes, Slots), snapshots, database switch | next |
+| 1 | The server (`src/web/`, axum), sign-in token and request checks, the dashboard's own session through the TUI's runner, the shared command budget, `--dashboard` / `--terminal` / `--port` / `--no-open`, `ctrl-o`, and the screens Connections (add, edit, remove, test, writes), Overview, Server, Pub/Sub and Command line | **done**, merged as #26 |
+| 2 | Browse (patterns, keys, values, Find key) and Analyze (Big keys, Expiry, Changes, Hot keys, Nodes, Slots), snapshots, database switch | **done** on `claude/dashboard-p2` |
 | 3 | Writes: field edits, add key, expiry, rename, delete, bulk actions | next |
 | 4 | Streams and Search | next |
 
@@ -686,6 +686,17 @@ A web UI served by redis-lens on `127.0.0.1`, an alternative to the TUI with the
 | verifier | One blocking finding, eight should-fix and ten small ones, all fixed with tests. Blocking: an address like `valkey://user:password@host` was taken as a host, so its password was shown and written to the config file (on main too, for `conn add` and the TUI's add flow): `valkey://` is now a `redis://` URL and other schemes or userinfo in a host are refused. Also: server error codes the wording filter missed; a profile made read-only elsewhere still writing; no caps on the command line; `conn test` outside the shared budget; the sign-in URL as a program argument | `6459f35` | **done** |
 | sign-in | The cookie is gone: the token travels in the URL fragment and an `Authorization` header, so no other local port ever receives it; the browser is opened through a private redirect file | `6459f35`, page in a later commit | **done** |
 | docs | `docs/dashboard.gif` (`make dashboard-gif`, `demo/record-dashboard.mjs`) in the README beside the terminal GIF; the site has a Terminal / Dashboard switch (`?ui=`, remembered in the browser) and dashboard pages with a screenshot per screen; the generator moved to `docs/site-src/` (`make site`) | **done**. Next: a light theme for the site, and fonts and mermaid served locally |
+
+### How phase 2 was built
+
+| Part | Content | Commits | State |
+|---|---|---|---|
+| server | `src/web/api/{browse,keys,values,analyze,snapshots}.rs`, `src/web/keyname.rs` (key names travel as the hex of their bytes); the database switch, names, key lists, values, Find, the analysis with `progress` events, the six panels, snapshots | `36b04a3` | **done**; unit tests and `tests/web_p2_it.rs` on Redis 7.4, Redis 6.2, Valkey and a cluster |
+| verifier | One blocking finding: a write question asked before a database switch, answered yes after it, wrote to the new database. Questions now belong to their run and are refused on a new one. Also: a dropped request left a list loading for good; bad query strings were plain text; key list pages resent every row; tests that could not fail (a credential check on a profile without credentials) | `99fe50c` | **done** |
+| page | `views/browse.js`, `views/analyze.js`, the top bar's Find, the database picker, Overview's analysis part, the mock server for every new route; 248 page tests | this PR | **done**; checked in headless Chrome against the demo servers and the mock, and by the lead on the rebuilt server |
+| parser | A `://` inside a StackExchange-style password was taken for a URL scheme (a proptest found it) | `aed7429` | **done** |
+
+Open from phase 2: Hot keys from Monitor (the TUI's second ranking) is not in the dashboard yet; snapshots of two databases of one connection share a directory (as in the TUI), so Changes after a database switch compares across databases; the page polls `GET /api/browse` while names are read (no event for it); ReJSON, binary key names and clusters are checked against the mock and in tests, not on the demo servers.
 
 ### Decisions taken alone (dashboard)
 

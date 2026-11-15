@@ -1222,7 +1222,7 @@ Redis 6.2 stays tested: it runs everything else.
 
 ## Web dashboard
 
-An alternative to the TUI in a web browser, served by the same redis-lens process, with the same features and the same rules. It is being built in phases; phase 1 is Connections, Overview, Server, Pub/Sub and the command line. Browse and Analyze, the edits and bulk actions, and Streams and Search follow, and until then the dashboard does not show those screens. The routes and their replies are in [docs/dashboard-api.md](docs/dashboard-api.md).
+An alternative to the TUI in a web browser, served by the same redis-lens process, with the same features and the same rules. It is being built in phases: phase 1 is Connections, Overview, Server, Pub/Sub and the command line; phase 2 adds Browse, Analyze, snapshots and the database switch. The edits and bulk actions, and Streams and Search, follow; until then the dashboard does not offer them. The routes and their replies are in [docs/dashboard-api.md](docs/dashboard-api.md).
 
 ### Starting it
 
@@ -1264,6 +1264,16 @@ One connection at a time, shared by every tab. Dark by default, with a light the
 - **Server:** the live charts, Clients (grouped as the TUI groups them, a group opens to its connections), Slow log (arguments masked) and Monitor. Monitor always asks first, with the profile name typed on `prod`, and its limits (30 s, 10,000 lines) are said before it starts.
 - **Pub/Sub:** channels with their subscribers, subscribing to a channel, a pattern or a shard channel, the live tail (pause, clear, filter, rate; "Messages are shown, never saved"), and Publish through the write gate.
 - **Command line:** the TUI's panel with its rules: what is sent and refused, writes through the gate, repeats of at most 100, pipeline mode, the reply as text, a table, JSON or raw, completion and the command's help. A line holds at most 8,192 characters, a reply at most 4 MiB (the rest is dropped and said so), and one line runs at a time.
+
+### Screens (phase 2)
+
+- **Browse:** the pattern tree, from key names before an analysis (pages of 1,000, more on request) and from the analysis after one, narrowed to a shard on a cluster; a pattern's keys; Find key (text means "contains", a glob is taken as typed, with the TUI's limits: at most 8 `*`); a key's value of every type, paged as in the TUI (at most 10,000 items), each item whole in any of the TUI's formats. Key names are shown escaped, and the page names a key back to the server by the hex of its bytes, never by the shown text. Copy takes a name or a value to the browser's clipboard; text with control characters is copied only as hex. A key list stops reading pages once it holds 50,000 keys. A request the browser drops while a page is read still adds that page, so nothing stays loading.
+- **Database switch:** for the dashboard's session only; the saved profile is unchanged. Off on a cluster. A switch drops the key names, key lists and open values; an analysis keeps the lists and values open.
+- **Analyze:** Quick or Deep with the TUI's estimate first, progress on the event stream, Stop (what was sampled is kept, marked stopped and not saved; a stop before any key changes nothing) and Analyze again; then Big keys, Expiry, Changes, Hot keys (off without an LFU policy) and, on a cluster only, Nodes and Slots. Overview's "Things to look at" include the analysis. Big keys reads its lengths and encodings once per report. An analysis that fails says so in redis-lens's words, never as a refused connection ("The analysis failed: the server refused a command it needs.", "The analysis failed: the connection to the server broke.", the password sentences for a refused login), and the session stays connected with any earlier report.
+- **Snapshots:** save with the TUI's rules (not partial, not stopped, not while running), list, and compare two, or one with the current analysis, in the TUI's snapshot directory and file format. Snapshots of two databases of one connection share that directory, as in the TUI.
+- **Questions and new runs:** a question belongs to the run it was asked in. When the session starts a new run before it is answered (a database switch or an analysis), the answer is refused with "Not sent: the connection changed since the question was asked." and nothing is sent, as the TUI drops its question on a new run. This holds for write questions, a `@dangerous` command line's question, and a repeated write that a new run interrupts.
+- **Requests:** a query string that lacks a parameter, or has one of the wrong type, is answered 400 with `{"error": "the query parameters are not the ones this route takes"}`, as a body that does not fit is; the input is never echoed.
+- Not yet: Hot keys from Monitor (the TUI's second Hot keys ranking).
 
 ## Quality bar
 

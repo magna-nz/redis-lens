@@ -1004,6 +1004,15 @@ async fn a_cluster_browses_and_analyzes_shard_by_shard() {
         }
         let big = d.get("/api/analysis/big_keys").await.json();
         assert_eq!(big["facts_read"], true, "{kind}: {big}");
+        // On a cluster each row names its node by index, as every other route does, and
+        // gives its address apart.
+        for row in big["rows"].as_array().unwrap() {
+            assert!(row["node"].is_u64(), "{kind}: {row}");
+            assert!(
+                row["endpoint"].as_str().is_some_and(|e| e.contains(':')),
+                "{kind}: {row}"
+            );
+        }
         let r = d.post("/api/snapshots", json!({})).await;
         assert_eq!(r.status, 201, "{kind}: {}", r.body);
     }

@@ -378,7 +378,8 @@ fn big_keys_body(c: &Current, r: &ScanReport) -> serde_json::Value {
                 "length": kf.and_then(|x| x.length),
                 "length_unit": length_unit(k.key_type),
                 "encoding": kf.and_then(|x| x.encoding.as_deref()).map(crate::value::escape),
-                "node": k.node.and_then(|n| node_endpoint(r, n)),
+                "node": k.node,
+                "endpoint": k.node.and_then(|n| node_endpoint(r, n)),
             })
         })
         .collect();
@@ -626,7 +627,8 @@ pub async fn hot_keys(State(app): State<App>) -> Response {
                 "key": Sample::of(k),
                 "hot_and_big": k.bytes.is_some_and(|b| b >= HOT_BIG) && k.lfu_freq.is_some_and(|f| f >= HOT_FREQ),
                 "pattern": Name::of(&pattern_of(r, &k.key)),
-                "node": k.node.and_then(|n| node_endpoint(r, n)),
+                "node": k.node,
+                "endpoint": k.node.and_then(|n| node_endpoint(r, n)),
             })).collect::<Vec<_>>(),
             "empty": null,
         })),

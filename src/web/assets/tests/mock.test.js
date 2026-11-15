@@ -63,7 +63,7 @@ test('connect goes through connecting to connected, then the live connection is 
   assert.equal(overview.keys.total, 7920114);
   assert.equal(overview.shards.length, 0, 'no shard rows on a standalone server');
   assert.ok(overview.lastAnalysis, 'this profile has a saved analysis');
-  assert.deepEqual(overview.findings.map((f) => [f.severity, f.where, f.label]), [['note', 'slowlog', 'Server › Slow log'], ['warn', 'clients', 'Server › Clients']]);
+  assert.deepEqual(overview.findings.map((f) => [f.severity, f.where, f.label]), [['note', 'server/slowlog', 'Server › Slow log'], ['warn', 'server/clients', 'Server › Clients']]);
   assert.equal((await api.listConnections()).connected, 'prod-cache-01');
 });
 
@@ -436,7 +436,7 @@ test('the overview event: the findings arrive after the live connection is ready
   await connected(api, { name: 'prod-cache-01' });
   for (let i = 0; i < 20 && !events.length; i += 1) await wait(50);
   assert.equal(events.length, 1);
-  assert.deepEqual(events[0].findings.map((f) => f.where), ['slowlog', 'clients']);
+  assert.deepEqual(events[0].findings.map((f) => f.where), ['server/slowlog', 'server/clients']);
   assert.equal(events[0].figures, null, 'no live figures in the event: they come with figures');
   assert.deepEqual(events[0].shards, [], 'no shard rows in the event');
   await api.connect({ name: 'demo-cluster' });

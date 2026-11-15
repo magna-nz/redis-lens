@@ -1,16 +1,15 @@
 // Overview: the first screen after a connect. Live figures on top, then what the server
 // says about itself. A connect reads no key, and neither does anything here.
 //
-// "Things to look at" lists the server's own findings (`overview.findings`); what a sample
-// of the keys would add, and "Memory by key pattern", say that analysis arrives with Browse.
+// "Things to look at" lists the server's own findings (`overview.findings`), then those of
+// the last analysis (`overview.analysis.findings`); "Memory by key pattern" is the last
+// analysis's biggest patterns. Analyze starts one, after its estimate.
 // Nothing is made up: a figure the server did not give shows as "—".
 
 import {
   h, fill, DASH, fmtBytes, fmtCount, fmtDuration, fmtPercent, fmtRate, fmtClock, fmtGrouped, plural, barPercent,
   barChart, meter, setVar, table, notice, emptyState, connectFirst, nodePicker, errorText,
 } from '../ui.js';
-
-const NEXT = 'Analysis arrives with Browse in the next update.';
 
 /** The line under a live tile: how far back the bars go, or that they are paused. */
 export function spanText(points, everySecs, live) {
@@ -52,6 +51,24 @@ export function analysisWhen(at, now = Date.now()) {
 
 /** The lines of "Turned off, and why": the figures that could not be read, the gaps, each
  *  refused check, the provider's notice. No line twice. */
+/** The line under "Memory by key pattern": what the analysis was, in words. */
+export function analysisLine(a, now = Date.now()) {
+  if (!a) return null;
+  const parts = [`From the analysis of ${analysisWhen(a.takenAt * 1000, now)}`, `${plural(a.sampledKeys, 'key', 'keys')} sampled`];
+  if (a.stopped) parts.push('stopped early');
+  else if (a.complete) parts.push('every key looked at');
+  if (typeof a.neverExpiresShare === 'number') parts.push(`${fmtPercent(a.neverExpiresShare)} of the memory never expires`);
+  return `${parts.join(' · ')}.`;
+}
+
+/** What Changes found, for Overview: null when there is nothing to say. */
+export const CHANGES_TEXT = {
+  diff: 'Changes since the last snapshot are on Analyze › Changes.',
+  none: 'No earlier snapshot to compare with: Analyze › Snapshots saves one.',
+  pending: 'Comparing with the last snapshot…',
+  failed: 'Could not compare with the last snapshot: Analyze › Changes says why.',
+};
+
 export function offLines(data, conn) {
   const lines = [];
   const add = (text) => {
@@ -86,13 +103,20 @@ export function mount(root, ctx) {
   let shardLive = new Map();
 
   const subtitle = h('p', { class: 'mono subtitle' });
+  const quick = h('button', { type: 'button', class: 'btn', text: 'Analyze 10,000 keys', onclick: () => ctx.analyze('quick') });
+  const deep = h('button', { type: 'button', class: 'btn primary', text: 'Analyze 100,000 keys', onclick: () => ctx.analyze('deep') });
+  const drawButtons = () => {
+    const a = ctx.state().analysis;
+    quick.disabled = a.running;
+    deep.disabled = a.running;
+    deep.textContent = a.running ? 'Analyzing…' : 'Analyze 100,000 keys';
+  };
+  drawButtons();
   const head = h('div', { class: 'view-head' },
     h('div', null, h('h1', { class: 'title', id: 'overview-title', text: 'Overview' }), subtitle),
     h('div', { class: 'actions' },
       nodePicker(conn, (index) => ctx.pickNode(index)),
-      h('span', { class: 'muted', text: NEXT }),
-      h('button', { type: 'button', class: 'btn', text: 'Analyze 10,000 keys', disabled: true }),
-      h('button', { type: 'button', class: 'btn primary', text: 'Analyze 100,000 keys', disabled: true })));
+      quick, deep));
 
   const tile = (label) => {
     const value = h('span', { class: 'tile-value', text: DASH });
@@ -219,30 +243,57 @@ export function mount(root, ctx) {
   }
 
   function drawFindings() {
-    // "From the server": what the server reports on its own, worked out by redis-lens. A
-    // finding links to its panel when this page has it; the others arrive with Browse.
-    const href = { slowlog: '#/server/slowlog', clients: '#/server/clients' };
-    const rows = (data ? data.findings : []).map((f) => {
-      const to = href[f.where] || null;
+    // "From the server": what the server reports on its own, worked out by redis-lens; then
+    // what the last analysis found. A finding links to the panel it is looked into on.
+    const a = data ? data.analysis : null;
+    const row = (f) => {
+      const to = f.where ? `#/${f.where}` : null;
       const inner = [
         h('span', { class: f.severity === 'warn' ? 'glyph' : 'muted', 'aria-hidden': 'true', text: f.severity === 'warn' ? '▲' : '•' }),
         h('span', null, h('span', { text: f.text }), f.label ? h('span', { class: 'sub', text: f.label }) : null),
         h('span', { class: 'chev', 'aria-hidden': 'true', text: to ? '›' : '' }),
       ];
       return h('li', null, to ? h('a', { class: 'row row-finding', href: to }, inner) : h('div', { class: 'row row-finding' }, inner));
-    });
+    };
+    const server = (data ? data.findings : []).map(row);
+    // The analysis's findings repeat the server's own: each is listed once, under the server.
+    const said = new Set((data ? data.findings : []).map((f) => f.text));
+    const sampled = a ? a.findings.filter((f) => !said.has(f.text)).map(row) : [];
     fill(findings,
       h('h2', { class: 'lbl', text: 'Things to look at' }),
-      rows.length ? h('ul', { class: 'list' }, rows) : h('p', { text: 'Nothing stands out in what the server reports.' }),
-      h('p', { class: 'muted small', text: `From what the server reports: no keys were read. What a sample of the keys finds comes later. ${NEXT}` }));
+      server.length ? h('ul', { class: 'list' }, server) : h('p', { text: 'Nothing stands out in what the server reports.' }),
+      a ? h('h3', { class: 'lbl sub-lbl', text: `From the analysis · ${plural(a.sampledKeys, 'key', 'keys')}` }) : null,
+      sampled.length ? h('ul', { class: 'list' }, sampled) : a ? h('p', { text: 'Nothing stands out in the sampled keys.' }) : null,
+      h('p', { class: 'muted small', text: a ? 'From what the server reports, and the keys the last analysis sampled.' : 'From what the server reports: no keys were read. An analysis samples keys and adds what it finds here.' }));
   }
 
   function drawPatterns() {
     const last = data && data.lastAnalysis;
+    const a = data ? data.analysis : null;
+    const running = ctx.state().analysis.running;
+    if (!a || !a.topPatterns.length) {
+      fill(patterns,
+        h('h2', { class: 'lbl', text: 'Memory by key pattern' }),
+        emptyState(running ? 'Analyzing: the biggest patterns show here when it is done.' : a ? 'The analysis found no pattern.' : 'This needs a sample of the keys: Analyze 10,000 keys reads one, after showing what it costs.'),
+        !a && last ? h('p', { class: 'muted small', text: `Last analysis: ${analysisWhen(last.at)}, ${fmtGrouped(last.sampledKeys)} keys (a saved snapshot).` }) : null);
+      return;
+    }
+    const byBytes = a.sizes && a.topPatterns.some((t) => typeof t.estBytes === 'number');
+    const max = Math.max(1, ...a.topPatterns.map((t) => (byBytes ? t.estBytes : t.estKeys) || 0));
     fill(patterns,
-      h('h2', { class: 'lbl', text: 'Memory by key pattern' }),
-      emptyState(`This needs a sample of the keys. ${NEXT}`),
-      last ? h('p', { class: 'muted small', text: `Last analysis: ${analysisWhen(last.at)}, ${fmtGrouped(last.sampledKeys)} keys (a saved snapshot).` }) : null);
+      h('h2', { class: 'lbl', text: byBytes ? 'Memory by key pattern' : 'Keys by key pattern' }),
+      h('ul', { class: 'list' }, a.topPatterns.map((t) => h('li', null, h('button', {
+        type: 'button', class: 'row row-pattern', title: `List the keys of ${t.pattern.name} on Browse`,
+        onclick: () => ctx.openPattern(t.pattern),
+      },
+      h('span', { class: 'mono clip name', text: t.pattern.name }),
+      meter(barPercent(byBytes ? t.estBytes : t.estKeys, max)),
+      h('span', { class: 'mono right', text: byBytes ? fmtBytes(t.estBytes) : `~${fmtCount(t.estKeys)}` }),
+      h('span', { class: 'mono right muted', text: typeof t.share === 'number' ? fmtPercent(t.share) : DASH }))))),
+      a.note ? notice(a.note, 'info') : null,
+      h('p', { class: 'muted small', text: analysisLine(a) }),
+      a.changes && CHANGES_TEXT[a.changes] ? h('p', { class: 'muted small' }, h('a', { href: a.changes === 'none' ? '#/analyze/snapshots' : '#/analyze/changes', text: CHANGES_TEXT[a.changes] })) : null,
+      h('p', { class: 'muted small' }, h('a', { href: '#/analyze', text: 'Every panel of the analysis is on Analyze.' })));
   }
 
   function drawOff() {
@@ -284,7 +335,7 @@ export function mount(root, ctx) {
     drawPatterns();
     drawLive();
     if (changed('shards', data.shards)) drawShards();
-    if (changed('findings', data.findings)) drawFindings();
+    if (changed('findings', [data.findings, data.analysis && data.analysis.findings])) drawFindings();
     if (changed('off', [data.figuresFailed, data.gaps, data.checks, data.provider])) drawOff();
   }
 
@@ -313,7 +364,17 @@ export function mount(root, ctx) {
     if (!alive) return;
     take({ ...next, figures: data ? data.figures : null, shards: data ? data.shards : [] });
   };
-  const offs = [ctx.api.on('figures', redraw), ctx.api.on('live', () => drawLive()), ctx.api.on('overview', fromEvent)];
+  let wasRunning = ctx.state().analysis.running;
+  const onState = (s) => {
+    if (!alive) return;
+    drawButtons();
+    if (s.analysis.running !== wasRunning) {
+      wasRunning = s.analysis.running;
+      drawPatterns();
+      if (!wasRunning) load();
+    }
+  };
+  const offs = [ctx.api.on('figures', redraw), ctx.api.on('live', () => drawLive()), ctx.api.on('overview', fromEvent), ctx.api.on('state', onState)];
   drawSubtitle();
   drawLive();
   drawPatterns();

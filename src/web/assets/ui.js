@@ -136,6 +136,43 @@ export function barPercent(value, max) {
   return Math.min(100, Math.max(1, Math.round((value / max) * 100)));
 }
 
+/** A change in bytes with its sign: `+72B`, `−1.2M`, `0B`. */
+export function fmtSignedBytes(n) {
+  if (!isNum(n)) return DASH;
+  if (n === 0) return '0B';
+  return `${n > 0 ? '+' : '−'}${fmtBytes(Math.abs(n))}`;
+}
+
+/** A change in a count with its sign: `+12`, `−1.5K`. */
+export function fmtSignedCount(n) {
+  if (!isNum(n)) return DASH;
+  if (n === 0) return '0';
+  return `${n > 0 ? '+' : '−'}${fmtCount(Math.abs(n))}`;
+}
+
+const SPARKS = '▁▂▃▄▅▆▇█';
+
+/** A row of values as a sparkline in text, oldest first: `▁▃▅█`, `·` where a value is
+ *  missing (a snapshot without the pattern: a gap, not a zero). */
+export function sparkline(values) {
+  const known = values.filter(isNum);
+  if (!known.length) return '';
+  const lo = Math.min(...known);
+  const hi = Math.max(...known);
+  const span = hi - lo;
+  return values.map((v) => {
+    if (!isNum(v)) return '·';
+    if (!span) return SPARKS[3];
+    return SPARKS[Math.min(SPARKS.length - 1, Math.round(((v - lo) / span) * (SPARKS.length - 1)))];
+  }).join('');
+}
+
+/** A key's expiry in words, from the TUI's `ttl` text: `never expires`, `expires in 6d 10h`. */
+export function expiryText(ttl) {
+  if (!ttl) return null;
+  return ttl === 'never' ? 'never expires' : `expires in ${ttl}`;
+}
+
 /** Append to a rolling series, keeping the last `cap` points. Returns a new array. */
 export function pushSeries(series, value, cap = 40) {
   const out = series.concat([isNum(value) ? value : null]);
@@ -636,6 +673,9 @@ export const ICONS = {
   lock: 'M6 11h12v9H6zM8 11V8a4 4 0 0 1 8 0v3',
   close: 'M6 6l12 12M18 6L6 18',
   plus: 'M12 5v14M5 12h14',
+  browse: 'M4 6h16M4 12h16M4 18h10',
+  analyze: 'M5 20V10M12 20V4M19 20v-7',
+  search: 'M11 4a7 7 0 1 0 0 14a7 7 0 0 0 0-14zM20 20l-3.5-3.5',
 };
 
 /** A decorative icon (hidden from screen readers; the control beside it has the words). */
@@ -892,10 +932,30 @@ export function nodePicker(conn, onPick) {
   return h('div', { class: 'picker' }, h('label', { htmlFor: id, text: 'Node' }), select);
 }
 
+/** Put text on the clipboard, at the user's click. The browser may refuse (no permission,
+ *  not focused): that is said, never hidden. Resolves to null when copied, or the sentence
+ *  to show. Nothing copied is kept anywhere by the page. */
+export async function copyText(text) {
+  const clip = typeof navigator !== 'undefined' && navigator.clipboard;
+  if (!clip || typeof clip.writeText !== 'function') return 'This browser does not let the page use the clipboard here: select the text and copy it yourself.';
+  try {
+    await clip.writeText(String(text));
+    return null;
+  } catch {
+    return 'The browser did not allow the copy: select the text and copy it yourself.';
+  }
+}
+
 /** What to say for an error thrown by the data layer. */
 export function errorText(err) {
   if (err && err.cancelled) return 'Cancelled: nothing was sent.';
   return (err && err.message) || 'Something went wrong.';
+}
+
+/** Whether an analysis is running on the connection (it connects again while it runs, so
+ *  the state says "connecting" for a moment: the areas stay as they are meanwhile). */
+export function analyzing(state) {
+  return !!(state && state.conn && state.analysis && state.analysis.running && !state.failed);
 }
 
 /** What an area shows instead of its panels: before there is a connection ("Connect
@@ -905,6 +965,8 @@ export function errorText(err) {
 export function connectFirst(state, { needsLive = false } = {}) {
   const card = (text, action = null) => h('div', { class: 'card' }, emptyState(text, action));
   const open = () => h('a', { class: 'btn primary', href: '#/connections', text: 'Open Connections' });
+  // An analysis connects again (as the TUI's does): the area stays, and says what it waits for.
+  if (analyzing(state)) return state.liveState === 'closed' ? card(state.lost || 'The live connection is closed.') : null;
   if (state.connecting) return card(state.connecting.text || `Connecting to ${state.connecting.name} and checking permissions…`);
   if (state.failed) return card(`The connect${state.conn ? ` to ${state.conn.name}` : ''} failed: ${state.failed}`, open());
   if (!state.connected) return card('Connect first: open Connections and pick a connection.', open());

@@ -4155,7 +4155,7 @@ summary: `taken_at_unix`, `sampled_keys`, `complete`, `stopped`, `sizes_availabl
 there are no rows).
 
 - `GET /api/analysis/big_keys`: the biggest sampled keys (`rows`: `key`, `pattern`,
-  `length`, `length_unit`, `encoding`, `big`, `node`), and the recommendations ("Things to
+  `length`, `length_unit`, `encoding`, `big`, `node`: the node's index on a cluster, else null, and `endpoint`: its `host:port`), and the recommendations ("Things to
   look at": `severity`, `text`, `hint`). Lengths and encodings are read for the listed keys
   (pipelined, per shard) once per report: a request that comes while they are read waits
   for that read instead of reading them again, and an `overview` event follows once they
@@ -4172,7 +4172,7 @@ there are no rows).
   `change` with `delta_bytes`, `delta_keys`, `cause`, `cause_words`, `alarming`, and
   `trend` from the earlier snapshots when there are enough), `trend_points` and `note`.
 - `GET /api/analysis/hot_keys`: the sampled keys with the highest LFU counters (`rows`:
-  `key`, `pattern`, `node`, `hot_and_big`). Off (`{"off": ...}`, the TUI's words) when the
+  `key`, `pattern`, `node`, `endpoint`, `hot_and_big`). Off (`{"off": ...}`, the TUI's words) when the
   policy keeps no LFU counters (not an `*-lfu` policy) or `OBJECT FREQ` was refused.
 - `GET /api/analysis/nodes`: on a cluster, each shard and the node read for it (`index`,
   `id`, `primary_id`, `endpoint`, `role`, `version`, `status`, `complete`, `keys`,
@@ -4230,6 +4230,7 @@ Example, `GET /api/analysis/big_keys`. Reply: HTTP 200 (`$.recommendations` cut 
       },
       "length": 2,
       "length_unit": "entries",
+      "endpoint": null,
       "node": null,
       "pattern": {
         "copy": "events:log",
@@ -4253,6 +4254,7 @@ Example, `GET /api/analysis/big_keys`. Reply: HTTP 200 (`$.recommendations` cut 
       },
       "length": 2,
       "length_unit": "fields",
+      "endpoint": null,
       "node": null,
       "pattern": {
         "copy": "user:{id}:profile",
@@ -4462,6 +4464,7 @@ Example, `GET /api/analysis/hot_keys`. Reply: HTTP 200 (`$.rows` cut to the firs
         "ttl_secs": null,
         "type": "string"
       },
+      "endpoint": null,
       "node": null,
       "pattern": {
         "copy": "str:plain",
@@ -4482,6 +4485,7 @@ Example, `GET /api/analysis/hot_keys`. Reply: HTTP 200 (`$.rows` cut to the firs
         "ttl_secs": null,
         "type": "list"
       },
+      "endpoint": null,
       "node": null,
       "pattern": {
         "copy": "queue:jobs",
