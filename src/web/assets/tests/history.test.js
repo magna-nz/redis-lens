@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CommandHistory, maskCommand } from '../ui.js';
-import { replyBody, capEntries } from '../views/cmdline.js';
+import { replyBody, capEntries, completeLine, helpTarget, helpLines } from '../views/cmdline.js';
 
 test('up and down step through the commands and come back to the line being typed', () => {
   const h = new CommandHistory();
@@ -68,17 +68,63 @@ test('ordinary commands are left as typed', () => {
 });
 
 test('a reply shows the view asked for, or its text with a note', () => {
-  const views = { text: '1) "a"\n2) "1"', table: { columns: ['#', 'field', 'value'], rows: [['1', 'a', '1']] }, json: '{\n  "a": "1"\n}', raw: null };
-  assert.deepEqual(replyBody(views, 'text'), { kind: 'text', text: views.text, note: null });
-  assert.equal(replyBody(views, 'table').kind, 'table');
+  const views = { text: '1) "a"\n2) "1"', table: '#  field  value\n1  a      1', json: '{\n  "a": "1"\n}', raw: null };
+  assert.deepEqual(replyBody(views, 'text'), { text: views.text, note: null });
+  assert.deepEqual(replyBody(views, 'table'), { text: views.table, note: null });
   assert.equal(replyBody(views, 'json').text, views.json);
   const raw = replyBody(views, 'raw');
   assert.equal(raw.text, views.text);
   assert.match(raw.note, /no raw view/);
-  const noTable = replyBody({ text: 'PONG', table: null, json: '"PONG"', raw: '+PONG' }, 'table');
-  assert.equal(noTable.kind, 'text');
-  assert.match(noTable.note, /no table view/);
-  assert.deepEqual(replyBody({ text: 'x', table: '#  value\n1  a' }, 'table'), { kind: 'text', text: '#  value\n1  a', note: null }, 'a table the server drew is shown as it is');
+  assert.match(replyBody({ text: 'PONG', table: null, json: null, raw: null }, 'json').note, /no JSON view/);
+});
+
+const NAMES = ['acl', 'acl|cat', 'config', 'config|get', 'config|help', 'config|set', 'get', 'getdel', 'getex', 'hget', 'hgetall', 'ping'];
+
+test('tab completes command names, in the case that was typed', () => {
+  assert.deepEqual(completeLine('ge', NAMES), ['get', 'getdel', 'getex']);
+  assert.deepEqual(completeLine('GE', NAMES), ['GET', 'GETDEL', 'GETEX']);
+  assert.deepEqual(completeLine('Hge', NAMES), ['HGET', 'HGETALL']);
+  assert.deepEqual(completeLine('p', NAMES), ['ping']);
+  assert.deepEqual(completeLine('con', NAMES), ['config'], 'subcommands are not offered as command names');
+  assert.deepEqual(completeLine('zz', NAMES), []);
+  assert.deepEqual(completeLine('', NAMES), [], 'nothing typed, nothing to complete');
+});
+
+test('tab completes the subcommands of a container command', () => {
+  assert.deepEqual(completeLine('CONFIG ', NAMES), ['CONFIG GET', 'CONFIG HELP', 'CONFIG SET']);
+  assert.deepEqual(completeLine('config s', NAMES), ['config set']);
+  assert.deepEqual(completeLine('CONFIG g', NAMES), ['CONFIG get'], 'the second word keeps its own case');
+  assert.deepEqual(completeLine('GET ', NAMES), [], 'a plain command has none');
+  assert.deepEqual(completeLine('CONFIG GET max', NAMES), [], 'arguments are not completed');
+});
+
+test('tab keeps a repeat count in front, and needs the command list', () => {
+  assert.deepEqual(completeLine('3 ge', NAMES), ['3 get', '3 getdel', '3 getex']);
+  assert.deepEqual(completeLine('3 config s', NAMES), ['3 config set']);
+  assert.deepEqual(completeLine('ge', []), []);
+  assert.deepEqual(completeLine('ge', null), []);
+});
+
+test('the helper looks up the command once its name is typed out', () => {
+  assert.equal(helpTarget('GET'), null, 'still being typed');
+  assert.equal(helpTarget('GET '), 'get');
+  assert.equal(helpTarget('  get user:1'), 'get');
+  assert.equal(helpTarget('3 GET user:1'), 'get', 'a count in front is not the command');
+  assert.equal(helpTarget(''), null);
+  assert.equal(helpTarget('3 '), null);
+});
+
+test('the helper shows the arguments and complexity, then the summary; a subcommand shows its own', () => {
+  const get = { name: 'get', summary: 'Returns the string value of a key.', complexity: 'O(1)', arguments: 'key', subcommands: [] };
+  assert.deepEqual(helpLines(get, 'GET '), { title: 'GET key · O(1)', summary: 'Returns the string value of a key.' });
+  const config = {
+    name: 'config', summary: 'A container for server configuration commands.', complexity: 'Depends on subcommand.', arguments: null,
+    subcommands: [{ name: 'config|get', summary: 'Returns the effective values of configuration parameters.', complexity: 'O(N)', arguments: 'parameter [parameter ...]', subcommands: [] }],
+  };
+  assert.deepEqual(helpLines(config, 'CONFIG '), { title: 'CONFIG · Depends on subcommand.', summary: 'A container for server configuration commands.' });
+  assert.deepEqual(helpLines(config, 'config get maxmemory'), { title: 'CONFIG GET parameter [parameter ...] · O(N)', summary: 'Returns the effective values of configuration parameters.' });
+  assert.deepEqual(helpLines(config, '2 CONFIG GET x').title, 'CONFIG GET parameter [parameter ...] · O(N)');
+  assert.equal(helpLines(null, 'NOPE '), null);
 });
 
 test('the output keeps the last 100 commands', () => {

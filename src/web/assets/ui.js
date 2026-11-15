@@ -442,14 +442,6 @@ export function urlHasSecret(text) {
   return colon >= 0 && colon < userinfo.length - 1;
 }
 
-/** Whether a connection string asks for TLS: `rediss://` or `ssl=True`. */
-export function urlWantsTls(text) {
-  const s = String(text ?? '').trim();
-  if (/^rediss:\/\//i.test(s)) return true;
-  if (/^redis:\/\//i.test(s)) return false;
-  return s.split(',').some((t) => /^\s*ssl\s*=\s*true\s*$/i.test(t));
-}
-
 /** Obvious mistakes in the add form, by field name. The server stays the judge of
  *  everything else. `form` holds plain strings and booleans; the password is only checked
  *  for being there together with a token command, never read otherwise. */
@@ -477,10 +469,13 @@ export function checkAddForm(form) {
   for (const [field, value] of [['sshIdentity', form.sshIdentity], ['sshKnownHosts', form.sshKnownHosts]]) {
     if (/[%"]|\$\{/.test(String(value ?? ''))) errors[field] = 'The path may not contain %, " or ${.';
   }
+  if (form.entra && (token || form.hasPassword)) errors.entra = 'Entra ID replaces the password and the token command: use one of them.';
   const sentinels = String(form.sentinelAddresses ?? '').trim();
   const master = String(form.sentinelMaster ?? '').trim();
   if (sentinels && !master) errors.sentinelMaster = 'Sentinel needs the master name.';
-  if (!sentinels && (master || form.hasSentinelPassword)) errors.sentinelAddresses = 'List the Sentinel addresses as host:port, separated by commas.';
+  if (!sentinels && (master || form.hasSentinelPassword || String(form.sentinelUser ?? '').trim() || form.sentinelTls)) {
+    errors.sentinelAddresses = 'List the Sentinel addresses as host:port, separated by commas.';
+  }
   if (sentinels && sentinels.split(',').some((a) => !/^\s*\S+:\d{1,5}\s*$/.test(a))) {
     errors.sentinelAddresses = 'Each Sentinel address is host:port.';
   }
@@ -856,7 +851,7 @@ export function nodePicker(conn, onPick) {
   const nodes = conn && Array.isArray(conn.nodes) ? conn.nodes : [];
   if (nodes.length < 2) return null;
   const id = `node-pick-${(dialogSeq += 1)}`;
-  const select = h('select', { class: 'field', id, onchange: () => onPick(select.value) },
+  const select = h('select', { class: 'field', id, onchange: () => onPick(Number(select.value)) },
     nodes.map((n, i) => h('option', { value: n.id, selected: n.id === conn.pickedNode, text: `${n.address} · ${i + 1} of ${nodes.length}` })));
   return h('div', { class: 'picker' }, h('label', { htmlFor: id, text: 'Node' }), select);
 }
@@ -867,14 +862,17 @@ export function errorText(err) {
   return (err && err.message) || 'Something went wrong.';
 }
 
-/** What an area shows before there is a connection: the TUI's "Connect first" line, or the
- *  connecting line while a connect runs. Returns null once connected. */
-export function connectFirst(state) {
-  if (state.connected) return null;
-  if (state.connecting) {
-    return h('div', { class: 'card' }, emptyState(state.connecting.text || `Connecting to ${state.connecting.name} and checking permissions…`));
-  }
-  return h('div', { class: 'card' },
-    emptyState('Connect first: open Connections and pick a connection.',
-      h('a', { class: 'btn primary', href: '#/connections', text: 'Open Connections' })));
+/** What an area shows instead of its panels: before there is a connection ("Connect
+ *  first"), while a connect runs, after one failed, and (with `needsLive`, for the areas
+ *  that read the live connection) while it is not ready. Returns null when the area can
+ *  draw. */
+export function connectFirst(state, { needsLive = false } = {}) {
+  const card = (text, action = null) => h('div', { class: 'card' }, emptyState(text, action));
+  const open = () => h('a', { class: 'btn primary', href: '#/connections', text: 'Open Connections' });
+  if (state.connecting) return card(state.connecting.text || `Connecting to ${state.connecting.name} and checking permissions…`);
+  if (state.failed) return card(`The connect${state.conn ? ` to ${state.conn.name}` : ''} failed: ${state.failed}`, open());
+  if (!state.connected) return card('Connect first: open Connections and pick a connection.', open());
+  if (needsLive && state.liveState === 'waiting') return card('Waiting for the live connection…');
+  if (needsLive && state.liveState === 'closed') return card(state.lost || 'The live connection is closed.');
+  return null;
 }

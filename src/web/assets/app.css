@@ -170,6 +170,7 @@ input::placeholder { color: var(--muted); opacity: 1; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; min-width: 0; }
 .card.tight { padding: 12px; }
 .card.stack { display: flex; flex-direction: column; gap: 12px; }
+.card.stack > :empty { display: none; }
 
 .lbl { font-size: 12px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
 h2.lbl { margin: 0 0 8px; }
@@ -329,6 +330,7 @@ button.row:hover, a.row:hover { background: var(--panel2); }
 .tbl .right { text-align: right; }
 .tbl .nowrap { white-space: nowrap; }
 .tbl.slow { min-width: 520px; }
+.tbl.conns { min-width: 760px; }
 .tbl.shards { min-width: 620px; }
 .tbl.reply { width: auto; min-width: 240px; }
 .tbl.reply td { height: auto; padding: 3px 12px 3px 0; font-family: var(--mono); vertical-align: top; overflow-wrap: anywhere; }
@@ -416,6 +418,7 @@ button.row:hover, a.row:hover { background: var(--panel2); }
 details.advanced { border: 1px solid var(--line); border-radius: 10px; }
 details.advanced > summary { min-height: 44px; padding: 11px 12px; cursor: pointer; font-weight: 500; border-radius: 10px; }
 details.advanced > .form { padding: 4px 12px 14px; }
+details.advanced > .list { padding: 0 6px 10px; }
 fieldset.group { margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 fieldset.group > legend { padding: 0 6px; font-size: 12px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
 
@@ -508,6 +511,7 @@ fieldset.group > legend { padding: 0 6px; font-size: 12px; font-weight: 600; let
 .cmd-in { display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 12px; }
 .cmd-in:focus-within { outline: 2px solid var(--blue); outline-offset: 2px; }
 .cmd-in .prompt { color: var(--accent); font-family: var(--mono); }
+.cmd-help { min-height: 20px; overflow-wrap: anywhere; }
 .cmd-in input { flex: 1; min-width: 0; height: 40px; border: 0; background: transparent; font-family: var(--mono); font-size: 13px; outline: none; }
 
 /* ---------- Locked page ---------- */

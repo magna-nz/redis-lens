@@ -1,8 +1,9 @@
-// The Pub/Sub tail: the filter, the buffer (cap, pause, clear, rate) and its status line.
+// The Pub/Sub tail: the filter, the buffer (cap, pause, clear, rate), its status line,
+// and how it follows the server's events and state.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { TailBuffer, tailFilter, tailMatches } from '../ui.js';
-import { isPattern, tailStatus } from '../views/pubsub.js';
+import { isPattern, tailStatus, tailNew, tailBegin, tailApply, tailFollow } from '../views/pubsub.js';
 
 const msg = (body, channel = 'orders.created', at = 0) => ({ at, channel, body });
 
@@ -93,4 +94,53 @@ test('text with * ? or [ is a pattern', () => {
   assert.equal(isPattern('h[ae]llo'), true);
   assert.equal(isPattern('orders.created'), false);
   assert.equal(isPattern('__keyevent@0__:expired'), false);
+});
+
+// ---- Following the server ----
+
+const event = (id, kind, extra = {}) => ({ id, kind, messages: [], skipped: 0, error: null, ...extra });
+
+test('a tail: ready, messages, and a close that says why', () => {
+  const t = tailNew();
+  tailBegin(t, { id: 5, name: 'orders.*', kind: 'pattern', node: 0 });
+  assert.equal(t.ready, false);
+  tailApply(t, event(5, 'ready'));
+  assert.equal(t.ready, true);
+  tailApply(t, event(5, 'messages', { messages: [msg('one'), msg('two')], skipped: 4 }), 1000);
+  assert.deepEqual(t.buffer.kept.map((m) => m.body), ['one', 'two']);
+  assert.equal(t.buffer.skipped, 4);
+  tailApply(t, event(5, 'closed', { error: 'the connection to the server was lost' }));
+  assert.equal(t.stopped, 'the connection to the server was lost');
+  assert.equal(t.buffer.kept.length, 2, 'what was shown stays on screen');
+});
+
+test('messages of a tail that was replaced are ignored', () => {
+  const t = tailNew();
+  tailBegin(t, { id: 5, name: 'a', kind: 'channel', node: 0 });
+  tailBegin(t, { id: 6, name: 'b', kind: 'channel', node: 0 });
+  tailApply(t, event(5, 'messages', { messages: [msg('late')] }));
+  tailApply(t, event(5, 'closed'));
+  assert.equal(t.buffer.kept.length, 0);
+  assert.equal(t.stopped, null, 'the close of the old tail does not stop the new one');
+  tailApply(t, event(6, 'messages', { messages: [msg('mine')] }));
+  assert.equal(t.buffer.kept.length, 1);
+  const none = tailNew();
+  tailApply(none, event(1, 'messages', { messages: [msg('x')] }));
+  assert.equal(none.sub, null, 'no tail, nothing kept');
+});
+
+test('the state names a tail this page did not start, ends one that is gone, and resets on another connection', () => {
+  const t = tailNew();
+  const state = (name, tail) => ({ conn: name ? { name, docker: false } : null, tail });
+  tailFollow(t, state('demo', { id: 7, kind: 'pattern', name: 'orders.*', node: 0, ready: true }));
+  assert.deepEqual(t.sub, { id: 7, name: 'orders.*', kind: 'pattern', node: 0 });
+  assert.equal(t.ready, true);
+  tailApply(t, event(7, 'messages', { messages: [msg('kept')] }));
+  tailFollow(t, state('demo', { id: 7, kind: 'pattern', name: 'orders.*', node: 0, ready: true }));
+  assert.equal(t.buffer.kept.length, 1, 'the same tail again changes nothing');
+  tailFollow(t, state('demo', null));
+  assert.ok(t.stopped);
+  tailFollow(t, state('other', null));
+  assert.equal(t.sub, null);
+  assert.equal(t.buffer.kept.length, 0);
 });

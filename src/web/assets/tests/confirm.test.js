@@ -53,8 +53,8 @@ function fakeBackend() {
   const calls = [];
   return {
     calls,
-    async answerConfirm(id, typed, adapt) {
-      calls.push(['answer', id, typed]);
+    async answerConfirm(confirm, typed, adapt) {
+      calls.push(['answer', confirm.id, typed]);
       return adapt({ done: true });
     },
     async cancelConfirm(id) {
@@ -109,8 +109,8 @@ test('other errors pass through untouched, and nothing is asked', async () => {
 test('a second question after the first is asked too, and endless questions stop', async () => {
   const backend = fakeBackend();
   let asked = 0;
-  backend.answerConfirm = async (id) => {
-    if (id === 'q1') throw new ConfirmRequired({ id: 'q2', kind: 'ask', text: 'Sure?' });
+  backend.answerConfirm = async (confirm) => {
+    if (confirm.id === 'q1') throw new ConfirmRequired({ id: 'q2', kind: 'ask', text: 'Sure?' });
     return 'sent';
   };
   const result = await runWithConfirm(async () => { throw new ConfirmRequired({ id: 'q1', kind: 'ask', text: '?' }); }, backend, async () => { asked += 1; return { typed: '' }; });
@@ -137,30 +137,81 @@ function fakeFetch(script) {
   return fn;
 }
 
-test('409 with a confirm opens the question, then POSTs the answer to /api/confirm/<id>', async () => {
+test('409 with a confirm opens the question, then POSTs the typed name to /api/confirm/<id>', async () => {
   const fetchFn = fakeFetch((path) => {
-    if (path === '/api/command') return [409, { confirm: { id: 'abc 1', kind: 'type', text: 'Send DEL?', expect: 'user:1' } }];
-    if (path === '/api/confirm/abc%201') return [200, { kind: 'reply', views: { text: '(integer) 1' } }];
+    if (path === '/api/cmdline') return [409, { confirm: { expect: 'demo-prod', id: 'abc 1', kind: 'type', text: 'KEYS is @dangerous: it can slow the server down. Type the profile name demo-prod to send it: KEYS user:*' } }];
+    if (path === '/api/confirm/abc%201') return [200, { line: 'KEYS user:*', node: null, replies: [{ cut: false, error: false, json: ['[]'], raw: ['[array] *0'], table: ['(empty array)'], text: ['(empty array)'], took_ms: 0.5 }], route_note: null, sent: 1, status: 'ok', text: null, times: 1 }];
     return [500, {}];
   });
   const api = createApi(createReal({ fetchFn }));
   const questions = [];
-  api.setConfirmHandler(async (c) => { questions.push(c); return { typed: 'user:1' }; });
-  const reply = await api.runCommand('DEL user:1');
-  assert.equal(reply.views.text, '(integer) 1', 'the confirmed reply goes through the same adapter');
-  assert.deepEqual(questions, [{ id: 'abc 1', kind: 'type', text: 'Send DEL?', expect: 'user:1', title: null }]);
+  api.setConfirmHandler(async (c) => { questions.push(c); return { typed: 'demo-prod' }; });
+  const reply = await api.runCommand('KEYS user:*');
+  assert.equal(reply.replies[0].views.text, '(empty array)', 'the confirmed reply goes through the same adapter');
+  assert.equal(questions.length, 1);
+  assert.equal(questions[0].kind, 'type');
+  assert.equal(questions[0].expect, 'demo-prod');
   assert.deepEqual(fetchFn.seen.map((c) => [c.method, c.path, c.body]), [
-    ['POST', '/api/command', { line: 'DEL user:1' }],
-    ['POST', '/api/confirm/abc%201', { typed: 'user:1' }],
+    ['POST', '/api/cmdline', { line: 'KEYS user:*', pipeline: false }],
+    ['POST', '/api/confirm/abc%201', { typed: 'demo-prod' }],
+  ]);
+});
+
+test('a yes/no question is answered with an empty body', async () => {
+  const fetchFn = fakeFetch((path) => (path === '/api/pubsub/publish'
+    ? [409, { confirm: { expect: null, id: 'y1', kind: 'ask', text: 'Send PUBLISH orders "x" to demo-prod?' } }]
+    : [200, { reply: { kind: 'int', value: 3 }, sent: true }]));
+  const api = createApi(createReal({ fetchFn }));
+  api.setConfirmHandler(async () => ({ typed: '' }));
+  assert.deepEqual(await api.publish({ channel: 'orders', message: 'x' }), { receivers: 3 });
+  assert.deepEqual(fetchFn.seen.map((c) => [c.method, c.path, c.body]), [
+    ['POST', '/api/pubsub/publish', { channel: 'orders', message: 'x', shard: false }],
+    ['POST', '/api/confirm/y1', {}],
   ]);
 });
 
 test('Cancel sends DELETE /api/confirm/<id> and nothing else', async () => {
-  const fetchFn = fakeFetch((path, init) => (init.method === 'DELETE' ? [200, {}] : [409, { confirm: { id: 'x9', kind: 'ask', text: 'Publish?' } }]));
+  const fetchFn = fakeFetch((path, init) => (init.method === 'DELETE' ? [200, { cancelled: true, text: 'Cancelled: nothing was sent.' }] : [409, { confirm: { id: 'x9', kind: 'ask', text: 'Publish?' } }]));
   const api = createApi(createReal({ fetchFn }));
   api.setConfirmHandler(async () => null);
   await assert.rejects(api.publish({ channel: 'c', message: 'm' }), (err) => err.cancelled === true);
   assert.deepEqual(fetchFn.seen.map((c) => [c.method, c.path]), [['POST', '/api/pubsub/publish'], ['DELETE', '/api/confirm/x9']]);
+});
+
+test('a 409 without a confirm is "not connected", in the server\'s words, and asks nothing', async () => {
+  const api = createApi(createReal({ fetchFn: fakeFetch(() => [409, { error: 'not connected: connect first, or the live connection is closed' }]) }));
+  api.setConfirmHandler(async () => assert.fail('nothing to ask'));
+  await assert.rejects(api.getClients(), (err) => err.notLive === true && err.message === 'not connected: connect first, or the live connection is closed');
+});
+
+test('a question that expired (410) and a wrong name (400) show the server\'s words', async () => {
+  const gone = createApi(createReal({ fetchFn: fakeFetch((path) => (path === '/api/cmdline' ? [409, { confirm: { id: 'g1', kind: 'ask', text: '?' } }] : [410, { error: 'that question is no longer open: it was answered, cancelled or expired' }])) }));
+  gone.setConfirmHandler(async () => ({ typed: '' }));
+  await assert.rejects(gone.runCommand('DEL a'), (err) => err.status === 410 && /no longer open/.test(err.message));
+});
+
+test('an accepted connect (202) is a success, and the request names a profile or a container', async () => {
+  const fetchFn = fakeFetch(() => [202, { status: 'connecting', connection: { name: 'demo', env: 'local', env_label: 'LOCAL', endpoint: 'h:1' }, live: 'waiting', writes: true }]);
+  const api = createApi(createReal({ fetchFn }));
+  const state = await api.connect({ name: 'demo' });
+  assert.equal(state.connecting.name, 'demo');
+  await api.connect({ docker: 'demo-valkey-1' });
+  await api.pickNode(2);
+  await api.subscribe({ name: 'orders.*' });
+  await api.subscribe({ name: 'shard.x', kind: 'shard' });
+  assert.deepEqual(fetchFn.seen.map((c) => [c.path, c.body]), [
+    ['/api/connect', { name: 'demo' }],
+    ['/api/connect', { docker: 'demo-valkey-1' }],
+    ['/api/node', { index: 2 }],
+    ['/api/pubsub/subscribe', { name: 'orders.*', kind: 'auto' }],
+    ['/api/pubsub/subscribe', { name: 'shard.x', kind: 'shard' }],
+  ]);
+});
+
+test('help that the server has no docs for (404) is no help, not an error', async () => {
+  const api = createApi(createReal({ fetchFn: fakeFetch((path) => (path.endsWith('name=nosuch') ? [404, { error: 'the server has no docs for that name' }] : [502, { error: 'the server did not answer' }])) }));
+  assert.equal(await api.getCommandHelp('nosuch'), null);
+  await assert.rejects(api.getCommandHelp('get'), (err) => err.status === 502);
 });
 
 test('every request carries the session cookie and the header; every non-GET a JSON body', async () => {
@@ -206,14 +257,43 @@ test('a network failure says redis-lens may have been closed', async () => {
 });
 
 test('replies that are the new State also reach state subscribers', async () => {
-  const api = createApi(createReal({ fetchFn: fakeFetch(() => [200, { connected: true, connection: { name: 'demo', env: 'local', read_only: false } }]) }));
+  const api = createApi(createReal({ fetchFn: fakeFetch(() => [200, { status: 'connected', connection: { name: 'demo', env: 'local', read_only: false, writes: true }, live: 'ready', writes: true }]) }));
   const states = [];
   api.on('state', (s) => states.push(s));
-  await api.connect('demo');
+  await api.connect({ name: 'demo' });
   assert.equal(states.length, 1);
   assert.equal(states[0].conn.name, 'demo');
   const off = api.on('figures', () => assert.fail('unsubscribed'));
   off();
+});
+
+test('a reply\'s state is dropped when the stream delivered a newer one while the request ran', async () => {
+  // A connect to a closed port: the stream says "connecting" then "failed" before the
+  // request's own reply ("connecting") arrives. The page must end on "failed".
+  const sources = [];
+  class FakeSource {
+    constructor() { this.listeners = {}; this.readyState = 1; sources.push(this); }
+    addEventListener(name, fn) { this.listeners[name] = fn; }
+    close() { this.readyState = 2; }
+  }
+  const state = (status, error = null) => ({ status, error, connection: { name: 'zz', env: 'other', env_label: 'OTHER', endpoint: '127.0.0.1:6399' }, live: 'waiting', writes: true });
+  let release;
+  const fetchFn = async () => {
+    await new Promise((resolve) => { release = resolve; });
+    return { status: 202, ok: true, json: async () => state('connecting') };
+  };
+  const api = createApi(createReal({ fetchFn, EventSourceFn: FakeSource }));
+  const seen = [];
+  api.on('state', (s) => seen.push(s.status));
+  api.start();
+  const pending = api.connect({ name: 'zz' });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  sources[0].listeners.state({ data: JSON.stringify(state('connecting')) });
+  sources[0].listeners.state({ data: JSON.stringify(state('failed', 'Connection refused (os error 61)')) });
+  release();
+  await pending;
+  api.stop();
+  assert.deepEqual(seen, ['connecting', 'failed']);
 });
 
 test('events from the stream are adapted and delivered; a broken handler does not stop the others', async () => {
@@ -234,7 +314,7 @@ test('events from the stream are adapted and delivered; a broken handler does no
     api.start();
     assert.equal(sources[0].url, '/api/events');
     sources[0].onopen();
-    sources[0].listeners.figures({ data: JSON.stringify({ ops_per_sec: 1200, clients: 14 }) });
+    sources[0].listeners.figures({ data: JSON.stringify({ node: 0, info: { clients: 14 }, rates: { ops: 1200, clients: 14 } }) });
     sources[0].listeners.figures({ data: 'not json' });
   } finally {
     console.error = realError;

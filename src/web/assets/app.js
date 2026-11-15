@@ -20,15 +20,25 @@ const TITLES = { overview: 'Overview', server: 'Server', pubsub: 'Pub/Sub', conn
 
 const $ = (id) => document.getElementById(id);
 
+const IDLE = {
+  status: 'idle', connected: false, connecting: null, failed: null, conn: null, liveState: 'waiting', lost: null,
+  tail: null, monitor: null, features: { entraId: false, version: null },
+};
+
 const store = {
-  state: { connected: false, connecting: null, conn: null, live: true, lost: null },
+  /** The server's state, plus `live`: this page's own Live / Paused switch. */
+  state: { ...IDLE, live: true },
   series: { ops: [], clients: [], everySecs: null },
   figures: null,
+  /** Why the live figures are off (the server refused INFO), in its words. */
+  figuresOff: null,
   linkUp: true,
   locked: false,
-  lastConn: null,
-  // Paused on this page only: set when the server has no way to pause its polling.
-  pausedHere: false,
+  paused: false,
+  /** What Reconnect connects to again: `{ name }` or `{ docker }`. */
+  lastTarget: null,
+  /** The connect this tab started, until it is connected or has failed. */
+  intent: null,
 };
 
 let mounted = null;
@@ -65,21 +75,26 @@ const ctx = {
   state: () => store.state,
   series: () => store.series,
   figures: () => store.figures,
-  /** Overview hands over the readings the server already has, so the charts don't start empty. */
-  seedSeries(history) {
-    if (!history) return;
-    if (history.everySecs) store.series.everySecs = history.everySecs;
-    if (history.ops.length > store.series.ops.length) store.series.ops = history.ops.slice(-40);
-    if (history.clients.length > store.series.clients.length) store.series.clients = history.clients.slice(-40);
-  },
+  figuresOff: () => store.figuresOff,
   navigate(hash) {
     if (window.location.hash === hash) render();
     else window.location.hash = hash;
   },
-  /** Pick a cluster node; the views that read one node follow it. */
-  async pickNode(id) {
+  /** Connect to `{ name }` or `{ docker }`. The outcome arrives as state: this tab then
+   *  lands on Overview, or says why the connect failed. */
+  async connect(target) {
+    store.intent = target.docker || target.name;
     try {
-      await api.pickNode(id);
+      await api.connect(target);
+    } catch (err) {
+      store.intent = null;
+      notify(errorText(err), err.cancelled ? 'info' : 'error');
+    }
+  },
+  /** Pick a cluster node; the views that read one node follow it. */
+  async pickNode(index) {
+    try {
+      await api.pickNode(index);
     } catch (err) {
       notify(errorText(err), 'error');
     }
@@ -98,7 +113,7 @@ function currentRoute() {
 function viewKey() {
   const s = store.state;
   const c = s.conn;
-  return [s.connected, s.connecting && s.connecting.name, c && c.name, c && c.env, c && c.readOnly, c && c.pickedNode, c && c.checksOff.length].join('|');
+  return [s.status, s.failed, s.liveState, c && c.name, c && c.docker, c && c.env, c && c.readOnly, c && c.pickedNode].join('|');
 }
 
 function render() {
@@ -133,7 +148,7 @@ function renderChrome() {
   if (s.connected && s.conn) {
     const access = s.conn.readOnly ? 'read-only' : 'writes on';
     fill(pill,
-      h('span', { class: 'dot ok', 'aria-hidden': 'true' }),
+      h('span', { class: s.lost ? 'dot busy' : 'dot ok', 'aria-hidden': 'true' }),
       h('span', { class: 'mono name clip', text: s.conn.name }),
       envBadge(s.conn.env),
       h('span', { class: 'muted access', text: access }));
@@ -153,7 +168,7 @@ function renderChrome() {
   live.disabled = !s.connected;
   live.querySelector('.dot').classList.toggle('ok', s.connected && s.live);
   $('live-label').textContent = s.live ? 'Live' : 'Paused';
-  live.setAttribute('aria-label', s.live ? 'Live: pause the live figures' : 'Paused: resume the live figures');
+  live.setAttribute('aria-label', s.live ? 'Live: pause the live figures on this page' : 'Paused: resume the live figures');
 
   renderBanner();
 }
@@ -167,14 +182,7 @@ function renderBanner() {
       await loadState();
     }));
   } else if (s.lost) {
-    const name = (s.conn && s.conn.name) || store.lastConn;
-    fill(box, banner(s.lost, name ? 'Reconnect' : null, async () => {
-      try {
-        await api.connect(name);
-      } catch (err) {
-        notify(errorText(err), 'error');
-      }
-    }));
+    fill(box, banner(s.lost, store.lastTarget ? 'Reconnect' : null, () => ctx.connect(store.lastTarget)));
   } else {
     fill(box);
   }
@@ -233,19 +241,51 @@ function setCommandLine(open) {
 
 // ---------- State ----------
 
+const targetOf = (conn) => (conn.docker ? { docker: conn.name } : { name: conn.name });
+
 function applyState(next) {
   const prev = store.state;
-  const prevNode = prev.conn && prev.conn.pickedNode;
-  const prevName = prev.conn && prev.conn.name;
-  store.state = store.pausedHere ? { ...next, live: false } : next;
-  if (next.conn) store.lastConn = next.conn.name;
-  if (prevName !== (next.conn && next.conn.name) || prevNode !== (next.conn && next.conn.pickedNode)) {
+  const was = prev.conn;
+  const now = next.conn;
+  store.state = { ...next, live: !store.paused };
+  if (now && (next.connected || next.connecting)) store.lastTarget = targetOf(now);
+  const moved = (was && was.name) !== (now && now.name) || (was && was.pickedNode) !== (now && now.pickedNode) || prev.status !== next.status;
+  if (moved) {
     store.series = { ops: [], clients: [], everySecs: null };
     store.figures = null;
+    store.figuresOff = null;
   }
   renderChrome();
   render();
   if (commandLine) commandLine.refresh();
+
+  // The outcome of a connect this tab started.
+  if (store.intent && now && now.name === store.intent) {
+    if (next.connected) {
+      store.intent = null;
+      notify(`Connected to ${now.name}. No key was read.`, 'ok');
+      if (currentRoute().name === 'connections') ctx.navigate('#/overview');
+    } else if (next.failed) {
+      store.intent = null;
+      notify(`The connect to ${now.name} failed: ${next.failed}`, 'error');
+    }
+  } else if (store.intent && next.status === 'idle') {
+    store.intent = null;
+  }
+}
+
+function applyFigures(f) {
+  if (!store.state.live || !store.state.connected) return;
+  if (f.error) {
+    store.figuresOff = f.error;
+    return;
+  }
+  const last = store.figures;
+  if (last && f.at > last.at && !store.series.everySecs) store.series.everySecs = Math.max(1, Math.round((f.at - last.at) / 1000));
+  store.figuresOff = null;
+  store.figures = f;
+  store.series.ops = pushSeries(store.series.ops, f.opsPerSec);
+  store.series.clients = pushSeries(store.series.clients, f.clients);
 }
 
 async function loadState() {
@@ -272,34 +312,24 @@ function boot() {
     themes.save(theme);
     applyTheme();
   });
-  $('live-toggle').addEventListener('click', async () => {
-    const want = !store.state.live;
-    if (store.pausedHere) {
-      store.pausedHere = false;
-      applyState({ ...store.state, live: true });
-      return;
-    }
-    try {
-      await api.setLive(want);
-    } catch (err) {
-      if (err.locked || err.network) return;
-      // The server could not pause its polling: stop drawing the figures here instead.
-      store.pausedHere = !want;
-      applyState({ ...store.state, live: want });
-    }
+  // Live / Paused is this page's own: paused, it stops drawing the figures and stops its
+  // own reads of the panels. The server has no route to pause its poll.
+  $('live-toggle').addEventListener('click', () => {
+    store.paused = !store.paused;
+    store.state = { ...store.state, live: !store.paused };
+    renderChrome();
+    api.emit('live', { live: store.state.live });
   });
   $('cmd-toggle').addEventListener('click', () => setCommandLine($('cmdline').hidden));
 
+  // The stores that keep running whatever view is shown (the tail, Monitor) hear about a
+  // new state first, so a view drawn for it finds them up to date.
+  pubsub.init(api);
+  server.init(api);
+
   api.setConfirmHandler((confirm) => confirmDialog(confirm));
   api.on('state', applyState);
-  api.on('figures', (f) => {
-    if (!store.state.live || !store.state.connected) return;
-    const last = store.figures;
-    if (last && f.at > last.at && !store.series.everySecs) store.series.everySecs = Math.max(1, Math.round((f.at - last.at) / 1000));
-    store.figures = f;
-    store.series.ops = pushSeries(store.series.ops, f.opsPerSec);
-    store.series.clients = pushSeries(store.series.clients, f.clients);
-  });
+  api.on('figures', applyFigures);
   api.on('notice', (n) => notify(n.text, n.kind));
   api.on('locked', showLocked);
   api.on('link', ({ up }) => {
@@ -309,9 +339,6 @@ function boot() {
     if (up) loadState();
   });
 
-  // The stores that keep running whatever view is shown: the tail, Monitor, the command line.
-  pubsub.init(api);
-  server.init(api);
   commandLine = cmdline.mount($('cmdline'), ctx, () => setCommandLine(false));
 
   window.addEventListener('hashchange', render);

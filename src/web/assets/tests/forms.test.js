@@ -2,7 +2,7 @@
 // splitting a token command into arguments, tags, the obvious-mistake checks, the router.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { splitArgs, parseTags, splitUrlSecret, urlHasSecret, urlWantsTls, checkAddForm, parseRoute } from '../ui.js';
+import { splitArgs, parseTags, splitUrlSecret, urlHasSecret, checkAddForm, parseRoute } from '../ui.js';
 import { guessName } from '../views/connections.js';
 
 test('a password pasted in a URL moves out of the address', () => {
@@ -45,15 +45,6 @@ test('an address that still holds a password is known, so the form can empty it 
   }
 });
 
-test('TLS is read off the address', () => {
-  assert.equal(urlWantsTls('rediss://h'), true);
-  assert.equal(urlWantsTls('redis://h'), false);
-  assert.equal(urlWantsTls('h:6380,ssl=True'), true);
-  assert.equal(urlWantsTls('h:6380, SSL = true ,x=y'), true);
-  assert.equal(urlWantsTls('h:6380,ssl=False'), false);
-  assert.equal(urlWantsTls(''), false);
-});
-
 test('a token command is split into arguments like a shell', () => {
   assert.deepEqual(splitArgs('aws elasticache generate-iam-auth-token --cache "my cache"').args, ['aws', 'elasticache', 'generate-iam-auth-token', '--cache', 'my cache']);
   assert.deepEqual(splitArgs("  sh -c 'echo  $TOKEN'  ").args, ['sh', '-c', 'echo  $TOKEN']);
@@ -92,6 +83,11 @@ test('the add form: obvious mistakes, by field', () => {
   assert.ok(checkAddForm({ url: 'redis://h', name: 'x', sentinelMaster: 'mymaster' }).sentinelAddresses);
   assert.ok(checkAddForm({ url: 'redis://h', name: 'x', sentinelAddresses: 's1', sentinelMaster: 'm' }).sentinelAddresses);
   assert.ok(checkAddForm({ url: 'redis://h', name: 'x', hasSentinelPassword: true }).sentinelAddresses);
+  assert.ok(checkAddForm({ url: 'redis://h', name: 'x', sentinelUser: 'sen' }).sentinelAddresses, 'a Sentinel username needs the Sentinels');
+  assert.ok(checkAddForm({ url: 'redis://h', name: 'x', sentinelTls: true }).sentinelAddresses);
+  assert.match(checkAddForm({ url: 'redis://h', name: 'x', entra: true, hasPassword: true }).entra, /Entra ID replaces/);
+  assert.match(checkAddForm({ url: 'redis://h', name: 'x', entra: true, tokenCommand: 'get-token' }).entra, /Entra ID replaces/);
+  assert.deepEqual(checkAddForm({ url: 'rediss://x.redis.azure.net:10000', name: 'az', entra: true }), {});
 });
 
 test('the checks never see a password, only whether there is one', () => {

@@ -12,8 +12,12 @@ import {
 
 const SHOWN = 300;
 
-/** The tail, kept while other views are shown. */
-const tail = { sub: null, buffer: new TailBuffer(2000), filter: '', stopped: null, conn: null };
+/** A tail's memory, kept while other views are shown. */
+export function tailNew() {
+  return { sub: null, buffer: new TailBuffer(2000), filter: '', ready: false, stopped: null, conn: null };
+}
+
+const tail = tailNew();
 
 /** Whether text is a pattern (`*`, `?` or `[`): sent with PSUBSCRIBE, not SUBSCRIBE. */
 export function isPattern(text) {
@@ -28,30 +32,55 @@ export function tailStatus(buffer, now = Date.now()) {
   return `${fmtRate(Math.round(buffer.rate(now) * 10) / 10)} msg/s · ${kept}${skipped}`;
 }
 
-function tailReset(connName) {
-  tail.sub = null;
-  tail.buffer = new TailBuffer(2000);
-  tail.filter = '';
-  tail.stopped = null;
-  tail.conn = connName;
+/** A subscription started (the reply to Subscribe): an empty list for it. */
+export function tailBegin(t, sub) {
+  t.sub = sub;
+  t.buffer = new TailBuffer(2000);
+  t.filter = '';
+  t.ready = false;
+  t.stopped = null;
+  return t;
+}
+
+/** Take in a `tail` event. Events of another tail than the one on screen are ignored:
+ *  a new subscription replaces the last one. */
+export function tailApply(t, e, now = Date.now()) {
+  if (!t.sub || e.id !== t.sub.id) return t;
+  if (e.kind === 'ready') t.ready = true;
+  else if (e.kind === 'messages') {
+    t.ready = true;
+    t.buffer.push(e.messages, e.skipped, now);
+  } else if (e.kind === 'closed') {
+    t.ready = false;
+    t.stopped = e.error || 'it was stopped';
+  }
+  return t;
+}
+
+/** Follow the server's state: a tail this page did not start (another tab, or a reload)
+ *  is picked up; a tail that is gone is marked stopped. */
+export function tailFollow(t, state) {
+  const name = state.conn ? `${state.conn.name}|${state.conn.docker}` : null;
+  if (name !== t.conn) Object.assign(t, tailNew(), { conn: name });
+  const live = state.tail;
+  if (live && (!t.sub || t.sub.id !== live.id)) tailBegin(t, { id: live.id, name: live.name, kind: live.kind, node: live.node });
+  if (live && t.sub && t.sub.id === live.id) {
+    t.ready = live.ready || t.ready;
+    if (!t.sub.name) t.sub.name = live.name;
+  }
+  if (!live && t.sub && !t.stopped) t.stopped = 'it was stopped';
+  return t;
 }
 
 /** Called once at boot: keep the tail's messages whatever view is on screen. */
 export function init(api) {
-  api.on('tail', (batch) => {
-    if (!tail.sub) return;
-    tail.buffer.push(batch.messages, batch.skipped);
-    if (batch.stopped) tail.stopped = batch.stopped;
-  });
-  api.on('state', (s) => {
-    const name = s.conn ? s.conn.name : null;
-    if (name !== tail.conn) tailReset(name);
-  });
+  api.on('tail', (e) => tailApply(tail, e));
+  api.on('state', (s) => tailFollow(tail, s));
 }
 
 export function mount(root, ctx) {
   const state = ctx.state();
-  const gate = connectFirst(state);
+  const gate = connectFirst(state, { needsLive: true });
   const view = h('section', { class: 'view', 'aria-labelledby': 'pubsub-title' });
   root.append(view);
   if (gate) {
@@ -60,9 +89,13 @@ export function mount(root, ctx) {
   }
 
   const conn = state.conn;
-  const cluster = conn.nodes.length >= 2 || conn.topology === 'cluster';
+  const nodeName = (index) => {
+    const node = conn.nodes.find((n) => n.index === index);
+    return node ? node.address : null;
+  };
   let alive = true;
   let frame = 0;
+  let shardsOn = false;
   const timers = [];
   const offs = [];
 
@@ -71,12 +104,13 @@ export function mount(root, ctx) {
   view.append(
     h('div', { class: 'view-head' },
       h('h1', { class: 'title', id: 'pubsub-title', text: 'Pub/Sub' }),
-      h('div', { class: 'actions' }, nodePicker(conn, (id) => ctx.pickNode(id)))),
+      h('div', { class: 'actions' }, nodePicker(conn, (index) => ctx.pickNode(index)))),
     h('div', { class: 'cols' }, left, right));
 
   // ---------- Channels ----------
   const target = h('input', { class: 'field mono', type: 'text', id: 'sub-target', placeholder: 'orders.* or a channel', autocomplete: 'off', spellcheck: false });
   const shard = h('input', { type: 'checkbox', id: 'sub-shard' });
+  const shardRow = h('div', { class: 'check', hidden: true }, shard, h('label', { htmlFor: 'sub-shard' }, 'Shard channel', h('span', { class: 'hint', text: 'SSUBSCRIBE, on the node that owns the channel’s slot.' })));
   const subError = h('p', { class: 'field-error', role: 'alert' });
   const listBox = h('div', null, h('p', { class: 'muted', text: 'Reading the channels…' }));
   const count = h('span', { class: 'muted small' });
@@ -93,11 +127,10 @@ export function mount(root, ctx) {
       return;
     }
     try {
-      const sub = await ctx.api.subscribe({ target: text, shard: isShard });
-      tail.sub = sub;
-      tail.buffer = new TailBuffer(2000);
-      tail.filter = '';
-      tail.stopped = null;
+      const sub = await ctx.api.subscribe({ name: text, kind: isShard ? 'shard' : 'auto' });
+      // The state event may have shown this tail already; either way it is this one now.
+      if (!tail.sub || tail.sub.id !== sub.id) tailBegin(tail, sub);
+      else tail.sub.name = sub.name;
       target.value = '';
       if (alive) {
         drawTail();
@@ -115,38 +148,43 @@ export function mount(root, ctx) {
     if (!data) return;
     // The counts are read again every few seconds. Redraw only when something changed, and
     // keep the keyboard focus on the channel it was on.
-    const signature = JSON.stringify([data, tail.sub]);
+    const signature = JSON.stringify([data, tail.sub && tail.sub.id, tail.stopped]);
     if (signature === drawn) return;
     drawn = signature;
-    const active = document.activeElement;
-    const focused = active && listBox.contains(active) ? active.getAttribute('data-channel') : null;
+    shardsOn = !data.off && !data.shardOff;
+    shardRow.hidden = !shardsOn;
     if (data.off) {
       count.textContent = '';
-      fill(listBox, notice(data.off));
+      fill(listBox, notice(`The channel list is off: ${data.off}.`), h('p', { class: 'muted small', text: 'You can still type a channel or a pattern to subscribe to.' }));
       return;
     }
+    const active = document.activeElement;
+    const focused = active && listBox.contains(active) ? active.getAttribute('data-channel') : null;
     const parts = [plural(data.total ?? data.channels.length, 'channel', 'channels')];
     if (data.patterns !== null) parts.push(plural(data.patterns, 'pattern', 'patterns'));
     count.textContent = parts.join(' · ');
     const row = (c) => {
-      const on = tail.sub && tail.sub.name === c.name && (tail.sub.kind === 'shard') === c.shard;
+      const on = tail.sub && !tail.stopped && tail.sub.name === c.name && (tail.sub.kind === 'shard') === c.shard;
       const subs = c.subscribers === null ? DASH : plural(c.subscribers, 'subscriber', 'subscribers');
+      const node = c.shard && c.node !== null ? nodeName(c.node) : null;
       return h('li', null, h('button', {
         type: 'button', class: on ? 'row row-channel on' : 'row row-channel', 'aria-pressed': on ? 'true' : 'false',
         'data-channel': `${c.shard ? 's' : 'c'}:${c.name}`,
         onclick: () => subscribe(c.name, c.shard),
       },
       h('span', { class: 'mono name clip', text: c.name }),
-      h('span', { class: 'small muted right', text: c.node ? `${subs} · ${c.node}` : subs })));
+      h('span', { class: 'small muted right', text: node ? `${subs} · ${node}` : subs })));
     };
     const classic = data.channels.filter((c) => !c.shard);
     const shards = data.channels.filter((c) => c.shard);
+    const here = conn.nodes.length >= 2 && data.node !== null ? nodeName(data.node) : null;
     fill(listBox,
-      data.node ? h('p', { class: 'muted small', text: `Subscribers on ${data.node}` }) : null,
+      here ? h('p', { class: 'muted small', text: `Subscribers on ${here}` }) : null,
       classic.length
         ? h('ul', { class: 'list' }, classic.map(row))
         : h('p', { class: 'muted', text: 'No active channels. A channel exists only while a client subscribes to it.' }),
       shards.length ? [h('h3', { class: 'lbl', text: 'Shard channels' }), h('ul', { class: 'list' }, shards.map(row))] : null,
+      data.shardOff ? h('p', { class: 'muted small', text: `Shard channels are off: ${data.shardOff}.` }) : null,
       data.notes.map((n) => notice(n)),
       h('p', { class: 'muted small', text: 'Counts read no payloads.' }));
     if (focused !== null) {
@@ -162,14 +200,12 @@ export function mount(root, ctx) {
       class: 'subscribe',
       onsubmit: (e) => {
         e.preventDefault();
-        subscribe(target.value, cluster && shard.checked);
+        subscribe(target.value, shardsOn && shard.checked);
       },
     },
     h('label', { class: 'sr-only', htmlFor: 'sub-target', text: 'Channel or pattern to subscribe to' }),
     h('div', { class: 'line' }, target, h('button', { type: 'submit', class: 'btn', text: 'Subscribe' })),
-    cluster && conn.shardChannels
-      ? h('div', { class: 'check' }, shard, h('label', { htmlFor: 'sub-shard' }, 'Shard channel', h('span', { class: 'hint', text: 'SSUBSCRIBE, on the node that owns the channel’s slot.' })))
-      : null,
+    shardRow,
     subError),
     listBox);
 
@@ -178,6 +214,7 @@ export function mount(root, ctx) {
       const data = await ctx.api.getChannels();
       if (alive) drawChannels(data);
     } catch (err) {
+      drawn = '';
       if (alive) fill(listBox, notice(errorText(err)));
     }
   }
@@ -190,12 +227,16 @@ export function mount(root, ctx) {
   let log = null;
   let status = null;
   let pauseButton = null;
+  let shownSub = null;
 
   function drawMessages() {
     if (!log || !tail.sub) return;
     const { rows, matching, total } = tail.buffer.visible(tail.filter, SHOWN);
     if (!rows.length) {
-      const text = total && tail.filter.trim() ? 'No message matches the filter.' : tail.stopped ? 'The tail is stopped.' : 'Waiting for messages.';
+      let text = 'Waiting for messages.';
+      if (total && tail.filter.trim()) text = 'No message matches the filter.';
+      else if (tail.stopped) text = 'The tail is stopped. Pick a channel, or type one, to subscribe again.';
+      else if (!tail.ready) text = 'Subscribing on a connection of its own…';
       fillLog(log, h('p', { class: 'muted', text }));
     } else {
       const showChannel = tail.sub.kind === 'pattern';
@@ -211,7 +252,7 @@ export function mount(root, ctx) {
 
   function drawStatus() {
     if (!status || !tail.sub) return;
-    status.textContent = tail.stopped ? `The tail stopped: ${tail.stopped}` : tailStatus(tail.buffer);
+    status.textContent = tail.stopped ? `The tail stopped: ${tail.stopped}.` : tailStatus(tail.buffer);
     if (pauseButton) pauseButton.textContent = tail.buffer.paused ? 'Resume' : 'Pause';
   }
 
@@ -219,8 +260,11 @@ export function mount(root, ctx) {
     if (frame) return;
     frame = requestAnimationFrame(() => {
       frame = 0;
-      if (alive && !tail.buffer.paused) drawMessages();
-      else if (alive) drawStatus();
+      if (!alive) return;
+      // The tail on screen may have been replaced (from another tab) or have just begun.
+      if ((tail.sub && tail.sub.id) !== shownSub) drawTail();
+      else if (!tail.buffer.paused || tail.stopped) drawMessages();
+      else drawStatus();
     });
   }
 
@@ -244,7 +288,7 @@ export function mount(root, ctx) {
         send.disabled = true;
         try {
           const done = await ctx.api.publish({ channel: channel.value.trim(), message: message.value, shard: !!sub && sub.kind === 'shard' && sub.name === channel.value.trim() });
-          ctx.notify(done.text || (done.receivers === null ? 'Published.' : `Published: ${plural(done.receivers, 'subscriber', 'subscribers')} got it.`), 'ok');
+          ctx.notify(done.receivers === null ? 'Published.' : `Published: ${plural(done.receivers, 'subscriber', 'subscribers')} got it.`, 'ok');
           message.value = '';
         } catch (err) {
           ctx.notify(errorText(err), err.cancelled ? 'info' : 'error');
@@ -262,6 +306,7 @@ export function mount(root, ctx) {
     status = null;
     pauseButton = null;
     const sub = tail.sub;
+    shownSub = sub ? sub.id : null;
     if (!sub) {
       fill(right,
         h('p', { class: 'muted', text: 'Pick a channel to watch its messages live, or type a channel or a pattern. Messages are shown here and never saved.' }),
@@ -300,10 +345,10 @@ export function mount(root, ctx) {
           },
         }),
         h('button', {
-          type: 'button', class: 'btn quiet', text: 'Stop',
+          type: 'button', class: 'btn quiet', text: tail.stopped ? 'Close' : 'Stop',
           onclick: async () => {
             try {
-              await ctx.api.unsubscribe();
+              if (!tail.stopped) await ctx.api.unsubscribe();
             } catch (err) {
               ctx.notify(errorText(err), 'error');
             }
@@ -322,7 +367,7 @@ export function mount(root, ctx) {
     drawMessages();
   }
 
-  offs.push(ctx.api.on('tail', schedule));
+  offs.push(ctx.api.on('tail', schedule), ctx.api.on('state', schedule));
   timers.push(setInterval(drawStatus, 1000));
   drawTail();
 
