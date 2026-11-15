@@ -80,10 +80,10 @@ impl CopyText {
         }
     }
 
-    /// A command line of the Slow log or Monitor, as the masker wrote it
-    /// ([`crate::live::command::masked_line`]): credentials already masked, never the
-    /// raw arguments. Only `y` on those panels builds one.
-    pub fn masked_line(masked: &str) -> Self {
+    /// A command line of the Slow log or Monitor. It masks nothing itself: callers
+    /// must pass text already masked by [`crate::live::command::masked_line`], never
+    /// the raw arguments or any other text. Only `y` on those panels builds one.
+    pub(crate) fn masked_line(masked: &str) -> Self {
         Self {
             kind: CopyKind::CommandLine,
             text: masked.to_string(),
