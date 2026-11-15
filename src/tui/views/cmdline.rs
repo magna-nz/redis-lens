@@ -3270,10 +3270,42 @@ mod tests {
     }
 
     #[test]
+    fn three_one_mib_replies_fit_under_the_output_cap() {
+        // The cap counts the largest view of each reply, not all four together: three
+        // replies of about 1 MiB (each about that size in every view) are all kept.
+        let big = || Value::BulkString(vec![b'a'; 1_000_000]);
+        let mut app = opened();
+        let run = enter_with(&mut app, "GET a", Some(get_info()));
+        reply(&mut app, run[0].0, ran(big()));
+        for k in ["GET b", "GET c"] {
+            let run = reqs(&enter_cached(&mut app, k));
+            reply(&mut app, run[0].0, ran(big()));
+        }
+        let lines: Vec<_> = app
+            .views
+            .cmdline
+            .entries
+            .iter()
+            .filter_map(|e| e.line.clone())
+            .collect();
+        assert_eq!(lines, ["GET a", "GET b", "GET c"]);
+
+        // A repeat keeps all three too, and drops none.
+        let mut next = reqs(&enter_cached(&mut app, "3 GET k"));
+        while let [(id, _)] = &next[..] {
+            next = reqs(&reply(&mut app, *id, ran(big())));
+        }
+        let Body::Runs(r) = last_body(&app) else {
+            panic!()
+        };
+        assert_eq!((r.answered(), r.outs.len(), r.dropped), (3, 3, 0));
+    }
+
+    #[test]
     fn a_long_repeat_keeps_the_output_under_its_cap() {
         let mut app = opened();
         let mut next = enter_with(&mut app, "8 GET k", Some(get_info()));
-        // 8 replies of about 1 MiB in each of 4 views: the oldest go first.
+        // 8 replies of about 0.7 MiB in each view: the oldest go first.
         let big = Value::BulkString(vec![b'a'; MAX_OUTPUT_BYTES / 6]);
         while let [(id, _)] = &next[..] {
             next = reqs(&reply(&mut app, *id, ran(big.clone())));
