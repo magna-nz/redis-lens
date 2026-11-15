@@ -48,6 +48,9 @@ already runs the same checks) and nothing is built or published.
 
 - **Before host** (plan, the gate or a build): nothing was published. Fix it on `main`, delete the tag
   (`git push --delete origin vX.Y.Z` and `git tag -d vX.Y.Z`), tag the fixed commit and push again.
+- **A build cancelled before it starts** with "The configuration '…' is not supported": GitHub retired the
+  runner image dist picked for that target. Name a current one under `[dist.github-custom-runners]` in
+  `dist-workspace.toml` (v0.1.0 needed `aarch64-apple-darwin = "macos-15"`), then re-tag as above.
 - **The Homebrew or crates.io step** (after the GitHub Release exists): re-run the failed jobs from the
   Actions page. A crates.io version can never be changed or uploaded twice, so the publish job first asks
   crates.io whether this version is already there and skips the upload if it is. Re-running is safe. You can
