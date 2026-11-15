@@ -21,6 +21,7 @@
 <span class="sub">Redis and Valkey in the terminal</span>
 <span class="spacer"></span>
 <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="nav">Sections</button>
+<a class="toplink crate" href="https://crates.io/crates/redis-lens" target="_blank" rel="noopener">crates.io</a>
 <a class="toplink" href="https://github.com/magna-nz/redis-lens" target="_blank" rel="noopener">GitHub</a>
 </header>
 <div class="layout">
@@ -119,7 +120,7 @@
 <div class="eyebrow">Overview</div>
 <h1>redis-lens</h1>
 <p class="lede">redis-lens lists your keys and shows their values, finds the keys and key patterns that use the most memory, and shows live server stats, connected clients, the slow log and Pub/Sub messages. You can also run commands and edit keys from it.</p>
-<div class="badges"><span>Redis 6.2 and later</span><span>Valkey 8</span><span>standalone, cluster, Sentinel</span><span>macOS · Linux · Windows</span><span>MIT or Apache-2.0</span></div>
+<div class="badges"><span>Redis 6.2 and later</span><span>Valkey 8</span><span>standalone, cluster, Sentinel</span><span>macOS · Linux · Windows</span><span>MIT</span></div>
 <p>To see what uses the memory, press <kbd>r</kbd>. redis-lens samples the keys with <code>SCAN</code>, groups them into patterns such as <code>user:{id}:cart</code>, and lists each pattern's key count, memory, average size and how many keys have no TTL. A pattern that looks wrong, such as keys that never expire or one very large list, is marked <code>▲</code> with the reason.</p>
 <p>To find a key, press <kbd>ctrl-f</kbd> on any screen and type part of its name or a pattern. Other screens show the server (stats, clients, the slow log, <code>MONITOR</code>), streams and consumer groups, Pub/Sub, Search indexes, and a <code>:</code> command line. Snapshots, diffs, trends and <code>--check</code> rules run the same analysis from cron or CI.</p>
 <h3>Why it is safe on production</h3>
@@ -133,8 +134,8 @@
 <figure><img class="gif" src="demo.gif" alt="redis-lens opening the demo Redis, analyzing the keys, browsing the key patterns and their verdicts, opening a pattern's keys and a value, then the Analyze and Server panels" loading="lazy"><figcaption>The demo keyspace from <code>make demo</code>. Every screen below is drawn from the app's own snapshot tests.</figcaption></figure>
 </div>
 <div class="rail">
-<div class="codeblock"><div class="cb-head"><span class="cb-title">install</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">cargo install --git https://github.com/magna-nz/redis-lens</code></pre></div>
-<p class="rail-note">Or build from a clone. See <a href="#install">Install</a>.</p>
+<div class="codeblock"><div class="cb-head"><span class="cb-title">install</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">brew install magna-nz/tap/redis-lens</code></pre></div>
+<p class="rail-note">Or <code>cargo install redis-lens</code>, an installer script, or a binary from <a href="https://github.com/magna-nz/redis-lens/releases" target="_blank" rel="noopener">GitHub Releases</a>. See <a href="#install">Install</a>.</p>
 <div class="codeblock"><div class="cb-head"><span class="cb-title">first run</span><span class="cb-lang">bash</span></div><pre><code class="language-bash"># save a connection; the password goes to the OS keychain
 redis-lens conn add staging \
   --url redis://lens-ro@staging.internal:6379 \
@@ -159,15 +160,19 @@ queue:emails             1    612M    100% ▲</code></pre></div>
 <div class="eyebrow">Get started</div>
 <h2>Install <a class="anchor" href="#install" aria-label="Link to this section">#</a></h2>
 <p class="lede">One binary. No server-side component, no daemon, no telemetry.</p>
+<h3>Homebrew</h3>
+<p>On macOS and Linux: <code>brew install magna-nz/tap/redis-lens</code>. Run <code>brew update</code> before <code>brew upgrade redis-lens</code> to pick up a release that just came out.</p>
+<h3>Installer scripts</h3>
+<p>The shell installer (macOS, Linux) and the PowerShell installer (Windows) download the binary for your platform from the latest release and put it in <code>$CARGO_HOME/bin</code> (<code>~/.cargo/bin</code> by default).</p>
 <h3>With cargo</h3>
-<p><code>cargo install --git https://github.com/magna-nz/redis-lens</code> builds the latest <code>main</code>. It needs Rust 1.89 or newer. redis-lens is not on crates.io yet. Microsoft Entra ID sign-in is behind a cargo feature, so install with <code>--features entra-id</code> if you use Azure Cache for Redis or Azure Managed Redis with Entra ID.</p>
+<p><code>cargo install redis-lens --locked</code> builds it from crates.io. It needs Rust 1.89 or newer. Microsoft Entra ID sign-in is behind a cargo feature, so install with <code>--features entra-id</code> if you use Azure Cache for Redis or Azure Managed Redis with Entra ID.</p>
 <h3>Release binaries</h3>
-<p>There are no releases yet. Once a <code>vX.Y.Z</code> tag is pushed, the release workflow builds binaries for five targets and attaches them to a <a href="https://github.com/magna-nz/redis-lens/releases" target="_blank" rel="noopener">GitHub Release</a>, with a SHA-256 checksum next to each archive:</p>
+<p>Each <code>vX.Y.Z</code> tag builds binaries for five targets and attaches them to a <a href="https://github.com/magna-nz/redis-lens/releases" target="_blank" rel="noopener">GitHub Release</a>, with a SHA-256 checksum next to each archive:</p>
 <div class="table-wrap"><table><thead><tr><th>Platform</th><th>Target</th><th>Archive</th></tr></thead><tbody>
-<tr><td>Linux x86_64</td><td><code>x86_64-unknown-linux-gnu</code></td><td><code>.tar.gz</code></td></tr>
-<tr><td>Linux aarch64</td><td><code>aarch64-unknown-linux-gnu</code></td><td><code>.tar.gz</code></td></tr>
-<tr><td>macOS Intel</td><td><code>x86_64-apple-darwin</code></td><td><code>.tar.gz</code></td></tr>
-<tr><td>macOS Apple silicon</td><td><code>aarch64-apple-darwin</code></td><td><code>.tar.gz</code></td></tr>
+<tr><td>Linux x86_64</td><td><code>x86_64-unknown-linux-gnu</code></td><td><code>.tar.xz</code></td></tr>
+<tr><td>Linux aarch64</td><td><code>aarch64-unknown-linux-gnu</code></td><td><code>.tar.xz</code></td></tr>
+<tr><td>macOS Intel</td><td><code>x86_64-apple-darwin</code></td><td><code>.tar.xz</code></td></tr>
+<tr><td>macOS Apple silicon</td><td><code>aarch64-apple-darwin</code></td><td><code>.tar.xz</code></td></tr>
 <tr><td>Windows x86_64</td><td><code>x86_64-pc-windows-msvc</code></td><td><code>.zip</code></td></tr>
 </tbody></table></div>
 <h3>From source</h3>
@@ -175,10 +180,13 @@ queue:emails             1    612M    100% ▲</code></pre></div>
 <div class="note"><p><strong>On macOS</strong>, a keychain entry is tied to the binary that wrote it. After an upgrade or a rebuild, macOS asks once whether redis-lens may use it. Choose <strong>Always Allow</strong>. Until you answer, connecting waits; after two seconds the TUI tells you it is waiting on the keychain.</p></div>
 </div>
 <div class="rail">
-<div class="codeblock"><div class="cb-head"><span class="cb-title">cargo</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">cargo install --git https://github.com/magna-nz/redis-lens
+<div class="codeblock"><div class="cb-head"><span class="cb-title">homebrew</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">brew install magna-nz/tap/redis-lens</code></pre></div>
+<div class="codeblock"><div class="cb-head"><span class="cb-title">shell installer</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">curl --proto '=https' --tlsv1.2 -LsSf https://github.com/magna-nz/redis-lens/releases/latest/download/redis-lens-installer.sh | sh</code></pre></div>
+<div class="codeblock"><div class="cb-head"><span class="cb-title">powershell installer</span><span class="cb-lang">powershell</span></div><pre><code class="language-powershell">powershell -ExecutionPolicy Bypass -c "irm https://github.com/magna-nz/redis-lens/releases/latest/download/redis-lens-installer.ps1 | iex"</code></pre></div>
+<div class="codeblock"><div class="cb-head"><span class="cb-title">crates.io</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">cargo install redis-lens --locked
 
 # with Microsoft Entra ID sign-in
-cargo install --git https://github.com/magna-nz/redis-lens --features entra-id</code></pre></div>
+cargo install redis-lens --locked --features entra-id</code></pre></div>
 <div class="codeblock"><div class="cb-head"><span class="cb-title">from source</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">git clone https://github.com/magna-nz/redis-lens
 cd redis-lens
 make build        # cargo build --release --locked
@@ -1255,7 +1263,7 @@ redis-lens conn add aws-prod \
 <p>For Azure Cache for Redis and Azure Managed Redis, install with the <code>entra-id</code> feature and pass <code>--entra</code>. It uses the developer-tools credential chain, so run <code>az login</code> first. Managed identity and workload identity are not covered yet; a token command works meanwhile. Azure hosts (<code>*.redis.cache.windows.net</code>, <code>*.redis.azure.net</code>) are recognised and the environment is guessed from the host name.</p>
 </div>
 <div class="rail">
-<div class="codeblock"><div class="cb-head"><span class="cb-title">entra</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">cargo install --git https://github.com/magna-nz/redis-lens --features entra-id
+<div class="codeblock"><div class="cb-head"><span class="cb-title">entra</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">cargo install redis-lens --features entra-id
 az login
 redis-lens conn add azure-cache \
   --url rediss://my-cache.redis.azure.net:10000 --env prod --entra</code></pre></div>
@@ -1830,7 +1838,7 @@ min_keys = 100</code></pre></div>
     runs-on: ubuntu-latest
     steps:
       - name: Install redis-lens
-        run: cargo install --git https://github.com/magna-nz/redis-lens --locked
+        run: cargo install redis-lens --locked
       - name: Gate the deploy
         # 0 pass, 1 a rule failed, 2 the scan itself broke
         run: |
@@ -2017,7 +2025,7 @@ make help       # the full list</code></pre></div></div>
 </section>
 
 <footer class="site-foot">
-<p>redis-lens is licensed under either of the Apache License 2.0 or the MIT license, at your option. Source, issues and the README live at
+<p>redis-lens is licensed under the MIT license. Source, issues and the README live at
 <a href="https://github.com/magna-nz/redis-lens" target="_blank" rel="noopener">github.com/magna-nz/redis-lens</a>.</p>
 </footer>
 </div>

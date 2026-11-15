@@ -23,6 +23,8 @@ redis-lens writes to a server only through the one write gate ([Write permission
 - **Servers:** Redis 7.x and Valkey 8.x, standalone and cluster, are tested in CI. Redis 6.2 is tested in CI too (a separate integration job), standalone and cluster. A cluster is found from its seed node and scanned shard by shard (see [Cluster](#cluster)); redis-rs's cluster client is not used. Sentinel is planned for P4 ([Sentinel](#sentinel-p4)).
 - **Platforms:** macOS, Linux and Windows on x86_64, plus aarch64 for macOS and Linux.
 - **Minimum Rust version:** 1.89.
+- **Install:** Homebrew (`brew install magna-nz/tap/redis-lens`), the shell and PowerShell installers attached to each GitHub Release (they install into `$CARGO_HOME/bin`), `cargo install redis-lens` from crates.io (`--features entra-id` for Entra ID), or a binary archive from GitHub Releases.
+- **Licence:** MIT ([LICENSE](LICENSE)).
 
 ## Views
 
@@ -1222,7 +1224,7 @@ Redis 6.2 stays tested: it runs everything else.
 - **TUI screens** get insta snapshots rendered with ratatui's `TestBackend`.
 - **Integration tests** run against real Redis and Valkey containers via testcontainers, behind the `integration-tests` feature.
 - **CI** runs on every PR: fmt, clippy with `-D warnings`, unit tests on three operating systems, integration tests, the MSRV build, `cargo package`, and a demo seeding check. All are required on `main`.
-- **Releases:** a `vX.Y.Z` tag checks the tag matches the version, builds binaries for five targets, creates a GitHub Release and publishes to crates.io.
+- **Releases:** built by [dist](https://axodotdev.github.io/cargo-dist/) 0.32.0 (`dist-workspace.toml`, `.github/workflows/release.yml`). A `vX.Y.Z` tag must match the version in `Cargo.toml`. The release gate (`release-gate.yml`: fmt, clippy with `-D warnings`, unit tests on three operating systems, integration tests on Redis 7.4, Redis 6.2 and Valkey) must pass before anything is built or published. Then dist builds archives for the five targets, the shell and PowerShell installers and a Homebrew formula, creates the GitHub Release with the matching `CHANGELOG.md` section as its notes, pushes the formula to `magna-nz/homebrew-tap` and publishes the crate to crates.io (skipped if that version is already there). Prereleases skip Homebrew and crates.io. Pull requests run `dist plan` only. How to cut one: [docs/releasing.md](docs/releasing.md).
 
 ## Demo
 
