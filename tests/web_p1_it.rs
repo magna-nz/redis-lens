@@ -690,17 +690,27 @@ async fn one_server(kind: &str, server: &common::TestServer) {
         .json();
     assert_eq!(r["replies"][0]["text"][0], "1) \"web:k\"", "{kind}: {r}");
     // Help and completion.
+    // `COMMAND LIST` and `COMMAND DOCS` are Redis 7.0 and later: on 6.2 both turn off
+    // and say why, as in the TUI.
+    let old = kind == "redis" && common::redis_image().1.starts_with("6.");
     let names = d.get("/api/cmdline/commands").await.json();
-    assert!(
-        names["names"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|n| n == "get"),
-        "{kind}"
-    );
+    if old {
+        assert!(names["off"].is_string(), "{kind}: {names}");
+    } else {
+        assert!(
+            names["names"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n == "get"),
+            "{kind}: {names}"
+        );
+    }
     let h = d.get("/api/cmdline/help?name=get").await;
     assert_eq!(h.status, 200, "{kind}: {}", h.body);
+    if old {
+        assert!(h.json()["off"].is_string(), "{kind}: {}", h.body);
+    }
 
     // A writable prod profile: Monitor wants the name typed; the publish asks first,
     // then is sent once confirmed.
