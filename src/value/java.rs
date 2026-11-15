@@ -6,9 +6,12 @@
 //!
 //! Bounded for untrusted bytes: at most [`MAX_HANDLES`] handles, nesting at most
 //! [`MAX_DEPTH`] deep, no array or string allocated by a length before its bytes are
-//! there.
+//! there. Cheap where nothing is shown: a line is only formatted when it will be kept,
+//! a class's fields are shared by every object of it, and reading stops once the tree
+//! is full (a preview reads only what it shows).
 
 use std::fmt::Write as _;
+use std::rc::Rc;
 
 use super::tree::{MAX_DEPTH, Tree, bytes_text, hex_head, hex_tail};
 
@@ -50,8 +53,21 @@ pub(super) fn detect(b: &[u8]) -> bool {
 
 /// Writes what can be read of the stream into `out`. False when `b` lacks the header.
 pub(super) fn render(b: &[u8], out: &mut Tree) -> bool {
+    read(b, out).is_some()
+}
+
+/// What a [`read`] cost: how far into the stream it got, and how many lines it
+/// formatted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Work {
+    read: usize,
+    built: usize,
+}
+
+/// [`render`], and what it cost. `None` when `b` lacks the header.
+fn read(b: &[u8], out: &mut Tree) -> Option<Work> {
     if !detect(b) {
-        return false;
+        return None;
     }
     let mut r = Reader {
         b,
@@ -60,6 +76,7 @@ pub(super) fn render(b: &[u8], out: &mut Tree) -> bool {
         spare: Handle::Pending,
         quiet: 0,
         at: MAGIC.len(),
+        built: 0,
         out,
     };
     if b.len() == MAGIC.len() {
@@ -67,12 +84,17 @@ pub(super) fn render(b: &[u8], out: &mut Tree) -> bool {
     }
     while r.i < b.len() && !r.out.full() {
         if r.content(0, String::new()).is_err() {
+            // Also when the tree filled up: then nothing more is kept, the tail
+            // included, so stopping there changes nothing on screen.
             let at = r.at.min(b.len());
             hex_tail(r.out, 0, at, &b[at..]);
             break;
         }
     }
-    true
+    Some(Work {
+        read: r.i,
+        built: r.built,
+    })
 }
 
 struct Field {
@@ -83,7 +105,9 @@ struct Field {
 struct Desc {
     name: String,
     flags: u8,
-    fields: Vec<Field>,
+    /// Shared with every object of the class while its fields are read: an object
+    /// never copies them.
+    fields: Rc<[Field]>,
     sup: Option<usize>,
 }
 
@@ -107,6 +131,8 @@ struct Reader<'a, 'o> {
     quiet: usize,
     /// Where the item being read started: a hex tail starts there.
     at: usize,
+    /// Lines formatted so far ([`Self::emit`]).
+    built: usize,
     out: &'o mut Tree,
 }
 
@@ -133,9 +159,19 @@ struct Stop;
 type R<T> = Result<T, Stop>;
 
 impl<'a> Reader<'a, '_> {
-    fn emit(&mut self, depth: usize, text: String) {
-        if self.quiet == 0 {
-            self.out.push(depth, text);
+    /// Nothing written now would be kept: inside a class annotation or past the
+    /// [`ARRAY_SHOWN`] elements (quiet), or the tree is full. Neither ends inside the
+    /// item being read, so an item silent when it starts writes no line of its own.
+    fn silent(&self) -> bool {
+        self.quiet > 0 || self.out.full()
+    }
+
+    /// Adds the line `text` makes, formatting it only when it will be kept.
+    fn emit(&mut self, depth: usize, text: impl FnOnce(&Self) -> String) {
+        if !self.silent() {
+            let t = text(self);
+            self.built += 1;
+            self.out.push(depth, t);
         }
     }
 
@@ -199,29 +235,29 @@ impl<'a> Reader<'a, '_> {
     /// block data, as a line `prefix` and what it is, its parts below.
     fn content(&mut self, depth: usize, prefix: String) -> R<()> {
         self.at = self.i;
-        if depth > MAX_DEPTH {
+        // A full tree keeps nothing more: stop reading (`render` adds nothing after).
+        if depth > MAX_DEPTH || self.out.full() {
             return Err(Stop);
         }
         let tc = self.peek()?;
         match tc {
             TC_NULL => {
                 self.i += 1;
-                self.emit(depth, format!("{prefix}null"));
+                self.emit(depth, |_| format!("{prefix}null"));
             }
             TC_REFERENCE => {
                 self.i += 1;
                 let k = self.handle_ref()?;
-                let text = match self.handle(k) {
-                    Handle::Str(s) => format!("\"{s}\""),
-                    Handle::Named(n) => format!("{n} (again)"),
-                    Handle::Desc(d) => format!("class {}", d.name),
-                    Handle::Pending => "itself".to_string(),
-                };
-                self.emit(depth, format!("{prefix}{text}"));
+                self.emit(depth, |r| match r.handle(k) {
+                    Handle::Str(s) => format!("{prefix}\"{s}\""),
+                    Handle::Named(n) => format!("{prefix}{n} (again)"),
+                    Handle::Desc(d) => format!("{prefix}class {}", d.name),
+                    Handle::Pending => format!("{prefix}itself"),
+                });
             }
             TC_STRING | TC_LONGSTRING => {
                 let s = self.string()?;
-                self.emit(depth, format!("{prefix}\"{s}\""));
+                self.emit(depth, |_| format!("{prefix}\"{s}\""));
             }
             TC_OBJECT => {
                 self.i += 1;
@@ -238,20 +274,21 @@ impl<'a> Reader<'a, '_> {
                 let name = self.string()?;
                 let class = self.desc_name(d);
                 let text = format!("enum {class}.{name}");
-                *self.handle_mut(h) = Handle::Named(text.clone());
-                self.emit(depth, format!("{prefix}{text}"));
+                self.emit(depth, |_| format!("{prefix}{text}"));
+                *self.handle_mut(h) = Handle::Named(text);
             }
             TC_CLASS => {
                 self.i += 1;
                 let d = self.class_desc(depth)?.ok_or(Stop)?;
                 let text = format!("class {}", self.desc_name(d));
                 self.new_handle(Handle::Named(text.clone()))?;
-                self.emit(depth, format!("{prefix}{text}"));
+                self.emit(depth, |_| format!("{prefix}{text}"));
             }
             TC_CLASSDESC | TC_PROXYCLASSDESC => {
                 let d = self.class_desc(depth)?.ok_or(Stop)?;
-                let text = format!("class description {}", self.desc_name(d));
-                self.emit(depth, format!("{prefix}{text}"));
+                self.emit(depth, |r| {
+                    format!("{prefix}class description {}", r.desc_name(d))
+                });
             }
             TC_BLOCKDATA | TC_BLOCKDATALONG => {
                 self.i += 1;
@@ -261,10 +298,9 @@ impl<'a> Reader<'a, '_> {
                     usize::try_from(self.i32()?).map_err(|_| Stop)?
                 };
                 let data = self.take(n)?;
-                self.emit(
-                    depth,
-                    format!("{prefix}block data ({n} bytes) {}", hex_head(data, 32)),
-                );
+                self.emit(depth, |_| {
+                    format!("{prefix}block data ({n} bytes) {}", hex_head(data, 32))
+                });
             }
             TC_RESET => {
                 self.i += 1;
@@ -273,7 +309,7 @@ impl<'a> Reader<'a, '_> {
             TC_EXCEPTION => {
                 self.i += 1;
                 self.handles.clear();
-                self.emit(depth, format!("{prefix}exception"));
+                self.emit(depth, |_| format!("{prefix}exception"));
                 self.content(depth + 1, String::new())?;
                 self.handles.clear();
             }
@@ -347,7 +383,7 @@ impl<'a> Reader<'a, '_> {
                 *self.handle_mut(h) = Handle::Desc(Desc {
                     name,
                     flags,
-                    fields,
+                    fields: fields.into(),
                     sup,
                 });
                 Ok(Some(h))
@@ -367,7 +403,7 @@ impl<'a> Reader<'a, '_> {
                 *self.handle_mut(h) = Handle::Desc(Desc {
                     name: format!("proxy({})", names.join(", ")),
                     flags: SC_SERIALIZABLE,
-                    fields: Vec::new(),
+                    fields: Rc::new([]),
                     sup,
                 });
                 Ok(Some(h))
@@ -399,7 +435,7 @@ impl<'a> Reader<'a, '_> {
         let d = self.class_desc(depth)?.ok_or(Stop)?;
         let name = self.desc_name(d);
         let h = self.new_handle(Handle::Pending)?;
-        self.emit(depth, format!("{prefix}object {name}"));
+        self.emit(depth, |_| format!("{prefix}object {name}"));
         // Class data, from the topmost superclass down.
         let mut chain = Vec::new();
         let mut at = Some(d);
@@ -414,14 +450,10 @@ impl<'a> Reader<'a, '_> {
             };
         }
         for &k in chain.iter().rev() {
-            let (flags, fields): (u8, Vec<(u8, String)>) = match self.handle(k) {
-                Handle::Desc(desc) => (
-                    desc.flags,
-                    desc.fields
-                        .iter()
-                        .map(|f| (f.code, f.name.clone()))
-                        .collect(),
-                ),
+            // The class's own field list, shared: what a `TC_RESET` among the values
+            // clears is the table, not this.
+            let (flags, fields) = match self.handle(k) {
+                Handle::Desc(desc) => (desc.flags, Rc::clone(&desc.fields)),
                 _ => return Err(Stop),
             };
             if flags & SC_EXTERNALIZABLE != 0 {
@@ -434,15 +466,27 @@ impl<'a> Reader<'a, '_> {
             if flags & SC_SERIALIZABLE == 0 || flags & SC_ENUM != 0 {
                 continue;
             }
-            for (code, fname) in fields {
+            for f in fields.iter() {
                 self.at = self.i;
-                match code {
+                if self.out.full() {
+                    return Err(Stop);
+                }
+                match f.code {
                     b'L' | b'[' => {
-                        self.content(depth + 1, format!("{fname}: "))?;
+                        let prefix = if self.silent() {
+                            String::new()
+                        } else {
+                            format!("{}: ", f.name)
+                        };
+                        self.content(depth + 1, prefix)?;
                     }
-                    _ => {
-                        let v = self.primitive(code)?;
-                        self.emit(depth + 1, format!("{fname}: {v}"));
+                    code => {
+                        // `data` is exactly `prim_size` bytes, so it always has a value.
+                        let data = self.take(prim_size(code).ok_or(Stop)?)?;
+                        self.emit(depth + 1, |_| {
+                            let v = primitive_value(code, data).unwrap_or_default();
+                            format!("{}: {} {v}", f.name, prim_name(code))
+                        });
                     }
                 }
             }
@@ -452,13 +496,6 @@ impl<'a> Reader<'a, '_> {
         }
         *self.handle_mut(h) = Handle::Named(format!("object {name}"));
         Ok(())
-    }
-
-    /// A primitive field's value with its type: `int 3`.
-    fn primitive(&mut self, code: u8) -> R<String> {
-        let size = prim_size(code).ok_or(Stop)?;
-        let v = primitive_value(code, self.take(size)?).ok_or(Stop)?;
-        Ok(format!("{} {v}", prim_name(code)))
     }
 
     fn array_item(&mut self, depth: usize, prefix: String) -> R<()> {
@@ -475,25 +512,31 @@ impl<'a> Reader<'a, '_> {
         if size > 0 {
             // All the bytes must be there before any is read.
             let data = self.take(n.checked_mul(size).ok_or(Stop)?)?;
-            let text = if code == b'B' {
-                hex_head(data, 32)
-            } else {
-                let mut s = String::new();
-                for (k, e) in data.chunks(size).take(ARRAY_SHOWN).enumerate() {
-                    if k > 0 {
-                        s.push_str(", ");
+            self.emit(depth, |_| {
+                let text = if code == b'B' {
+                    hex_head(data, 32)
+                } else {
+                    // Each element is exactly `size` bytes, so each has a value.
+                    let mut s = String::new();
+                    for (k, e) in data.chunks(size).take(ARRAY_SHOWN).enumerate() {
+                        if k > 0 {
+                            s.push_str(", ");
+                        }
+                        s.push_str(&primitive_value(code, e).unwrap_or_default());
                     }
-                    s.push_str(&primitive_value(code, e).ok_or(Stop)?);
-                }
-                if n > ARRAY_SHOWN {
-                    let _ = write!(s, ", … ({} more)", n - ARRAY_SHOWN);
-                }
-                s
-            };
-            self.emit(depth, format!("{prefix}{shown} ({n}) {text}"));
+                    if n > ARRAY_SHOWN {
+                        let _ = write!(s, ", … ({} more)", n - ARRAY_SHOWN);
+                    }
+                    s
+                };
+                format!("{prefix}{shown} ({n}) {text}")
+            });
         } else {
-            self.emit(depth, format!("{prefix}{shown} ({n})"));
+            self.emit(depth, |_| format!("{prefix}{shown} ({n})"));
             for k in 0..n {
+                if self.out.full() {
+                    return Err(Stop);
+                }
                 let q = k >= ARRAY_SHOWN;
                 if q {
                     self.quiet += 1;
@@ -505,7 +548,7 @@ impl<'a> Reader<'a, '_> {
                 r?;
             }
             if n > ARRAY_SHOWN {
-                self.emit(depth + 1, format!("… {} more", n - ARRAY_SHOWN));
+                self.emit(depth + 1, |_| format!("… {} more", n - ARRAY_SHOWN));
             }
         }
         *self.handle_mut(h) = Handle::Named(shown);
@@ -666,6 +709,105 @@ mod tests {
         let l = lines(&b);
         assert!(l.len() < MAX_DEPTH + 40, "{}", l.len());
         assert!(l.iter().any(|x| x.starts_with("not read:")));
+    }
+
+    /// An array of `n` objects of one class with `fields` int fields, each named
+    /// `name_len` bytes of `0xff` (drawn 4 bytes each, `\xff`): the class is written
+    /// once, every other object refers back to it.
+    fn many_objects(n: i32, fields: u16, name_len: u16) -> Vec<u8> {
+        let mut b = MAGIC.to_vec();
+        // `Big[]`, handle 0; the array itself is handle 1.
+        b.extend([TC_ARRAY, TC_CLASSDESC, 0, 6]);
+        b.extend(b"[LBig;");
+        b.extend([0; 8]);
+        b.extend([SC_SERIALIZABLE, 0, 0, TC_ENDBLOCKDATA, TC_NULL]);
+        b.extend(n.to_be_bytes());
+        for k in 0..n {
+            b.push(TC_OBJECT);
+            if k == 0 {
+                // `Big`, handle 2.
+                b.extend([TC_CLASSDESC, 0, 3]);
+                b.extend(b"Big");
+                b.extend([0; 8]);
+                b.push(SC_SERIALIZABLE);
+                b.extend(fields.to_be_bytes());
+                for _ in 0..fields {
+                    b.push(b'I');
+                    b.extend(name_len.to_be_bytes());
+                    b.extend(vec![0xff; usize::from(name_len)]);
+                }
+                b.extend([TC_ENDBLOCKDATA, TC_NULL]);
+            } else {
+                b.extend([TC_REFERENCE, 0x00, 0x7e, 0x00, 0x02]);
+            }
+            for f in 0..fields {
+                b.extend(i32::from(f).to_be_bytes());
+            }
+        }
+        b
+    }
+
+    /// Found by the phase 5 verifier: a 1 MiB stream of objects with 64 fields of
+    /// 1 KiB names took 310 ms to preview in a release build, because the reader read
+    /// to the end. Once the tree is full it stops, so a preview (and the full tree)
+    /// reads only the start, and formats only the lines it keeps.
+    #[test]
+    fn a_full_tree_stops_the_reader() {
+        let b = many_objects(3_800, 64, 1024);
+        assert!(b.len() > 1_000_000, "{}", b.len());
+        // The preview `compact_tree` makes, and the full tree.
+        for mut t in [Tree::with_limit(401), Tree::new()] {
+            let w = read(&b, &mut t).unwrap();
+            assert!(t.is_cut());
+            assert_eq!(t.lines()[0].1, "Big[] (3800)");
+            assert_eq!(t.lines()[1].1, "object Big");
+            // The class (64 KiB) and at most a few objects, not the 1 MiB stream.
+            assert!(w.read < 150_000, "read {} of {}", w.read, b.len());
+            // Every line formatted is kept, but the one that did not fit.
+            assert!(w.built <= t.lines().len() + 1, "{w:?}");
+        }
+        // Generous for a debug build: well under a millisecond in release.
+        let start = std::time::Instant::now();
+        let preview = crate::value::preview(&b, 100);
+        let shown = crate::value::render(&crate::value::decode(&b), crate::value::Format::Java, 80);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            preview.starts_with("Big[] (3800) {object Big {"),
+            "{preview}"
+        );
+        assert_eq!(shown.format, crate::value::Format::Java);
+    }
+
+    /// Past the first [`ARRAY_SHOWN`] elements nothing is drawn, and nothing is
+    /// formatted either: the elements are only read.
+    #[test]
+    fn quiet_elements_are_not_formatted() {
+        let b = many_objects(3_800, 2, 1);
+        let mut t = Tree::new();
+        let w = read(&b, &mut t).unwrap();
+        assert!(!t.is_cut());
+        assert_eq!(w.read, b.len());
+        // The array, 64 objects of 3 lines, and "… 3736 more".
+        assert_eq!(t.lines().len(), 1 + 64 * 3 + 1);
+        assert_eq!(t.lines().last().unwrap().1, "… 3736 more");
+        assert_eq!(w.built, t.lines().len());
+    }
+
+    /// An object reads its class's fields from the list it shares with the class:
+    /// a `TC_RESET` among the values (which clears the handle table) does not change
+    /// which fields follow.
+    #[test]
+    fn a_reset_among_the_fields_keeps_the_class_fields() {
+        let mut b = MAGIC.to_vec();
+        b.extend([TC_OBJECT, TC_CLASSDESC, 0, 1, b'P']);
+        b.extend([0; 8]);
+        b.extend([SC_SERIALIZABLE, 0, 2]);
+        b.extend([b'L', 0, 1, b'a', TC_STRING, 0, 1, b'X']);
+        b.extend([b'I', 0, 1, b'b']);
+        b.extend([TC_ENDBLOCKDATA, TC_NULL]);
+        b.push(TC_RESET);
+        b.extend([0, 0, 0, 7]);
+        assert_eq!(lines(&b), ["object P", "  b: int 7"]);
     }
 
     #[test]
