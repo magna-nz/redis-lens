@@ -644,7 +644,7 @@ Tests: the keymap test `tui::keymap::tests::spec_lists_every_key` checks the key
 
 ### Open questions (phase 5)
 
-- Install: the README now says `cargo install --git https://github.com/magna-nz/redis-lens`. The site still says `cargo install redis-lens` and GitHub Releases, and neither exists yet (not on crates.io, no releases). Publish first, or reword the site too?
+- Install: the README and the site now say `cargo install --git https://github.com/magna-nz/redis-lens`, and the site says there are no releases yet. When the crate is published or the first `vX.Y.Z` tag is pushed, switch them back to `cargo install redis-lens` and the release binaries.
 - GitHub Pages has to be enabled by the owner, served from `main` `/docs`.
 - Carried over: an allow-list for `INFO` and `PING` on the command line, and a reply-size check before whole-key reads.
 - Carried over: Dependabot PRs #2 to #5.

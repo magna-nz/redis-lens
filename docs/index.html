@@ -21,7 +21,6 @@
 <span class="sub">Redis and Valkey in the terminal</span>
 <span class="spacer"></span>
 <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="nav">Sections</button>
-<a class="toplink crate" href="https://crates.io/crates/redis-lens" target="_blank" rel="noopener">crates.io</a>
 <a class="toplink" href="https://github.com/magna-nz/redis-lens" target="_blank" rel="noopener">GitHub</a>
 </header>
 <div class="layout">
@@ -134,8 +133,8 @@
 <figure><img class="gif" src="demo.gif" alt="redis-lens opening the demo Redis, analyzing the keys, browsing the key patterns and their verdicts, opening a pattern's keys and a value, then the Analyze and Server panels" loading="lazy"><figcaption>The demo keyspace from <code>make demo</code>. Every screen below is drawn from the app's own snapshot tests.</figcaption></figure>
 </div>
 <div class="rail">
-<div class="codeblock"><div class="cb-head"><span class="cb-title">install</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">cargo install redis-lens</code></pre></div>
-<p class="rail-note">Or a binary from <a href="https://github.com/magna-nz/redis-lens/releases" target="_blank" rel="noopener">GitHub Releases</a>. See <a href="#install">Install</a>.</p>
+<div class="codeblock"><div class="cb-head"><span class="cb-title">install</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">cargo install --git https://github.com/magna-nz/redis-lens</code></pre></div>
+<p class="rail-note">Or build from a clone. See <a href="#install">Install</a>.</p>
 <div class="codeblock"><div class="cb-head"><span class="cb-title">first run</span><span class="cb-lang">bash</span></div><pre><code class="language-bash"># save a connection; the password goes to the OS keychain
 redis-lens conn add staging \
   --url redis://lens-ro@staging.internal:6379 \
@@ -161,9 +160,9 @@ queue:emails             1    612M    100% ▲</code></pre></div>
 <h2>Install <a class="anchor" href="#install" aria-label="Link to this section">#</a></h2>
 <p class="lede">One binary. No server-side component, no daemon, no telemetry.</p>
 <h3>With cargo</h3>
-<p><code>cargo install redis-lens</code> builds it from crates.io. It needs Rust 1.89 or newer. Microsoft Entra ID sign-in is behind a cargo feature, so install with <code>--features entra-id</code> if you use Azure Cache for Redis or Azure Managed Redis with Entra ID.</p>
-<h3>From a release</h3>
-<p>Each <code>vX.Y.Z</code> tag builds binaries for five targets and attaches them to a <a href="https://github.com/magna-nz/redis-lens/releases" target="_blank" rel="noopener">GitHub Release</a>, with a SHA-256 checksum next to each archive:</p>
+<p><code>cargo install --git https://github.com/magna-nz/redis-lens</code> builds the latest <code>main</code>. It needs Rust 1.89 or newer. redis-lens is not on crates.io yet. Microsoft Entra ID sign-in is behind a cargo feature, so install with <code>--features entra-id</code> if you use Azure Cache for Redis or Azure Managed Redis with Entra ID.</p>
+<h3>Release binaries</h3>
+<p>There are no releases yet. Once a <code>vX.Y.Z</code> tag is pushed, the release workflow builds binaries for five targets and attaches them to a <a href="https://github.com/magna-nz/redis-lens/releases" target="_blank" rel="noopener">GitHub Release</a>, with a SHA-256 checksum next to each archive:</p>
 <div class="table-wrap"><table><thead><tr><th>Platform</th><th>Target</th><th>Archive</th></tr></thead><tbody>
 <tr><td>Linux x86_64</td><td><code>x86_64-unknown-linux-gnu</code></td><td><code>.tar.gz</code></td></tr>
 <tr><td>Linux aarch64</td><td><code>aarch64-unknown-linux-gnu</code></td><td><code>.tar.gz</code></td></tr>
@@ -176,10 +175,10 @@ queue:emails             1    612M    100% ▲</code></pre></div>
 <div class="note"><p><strong>On macOS</strong>, a keychain entry is tied to the binary that wrote it. After an upgrade or a rebuild, macOS asks once whether redis-lens may use it. Choose <strong>Always Allow</strong>. Until you answer, connecting waits; after two seconds the TUI tells you it is waiting on the keychain.</p></div>
 </div>
 <div class="rail">
-<div class="codeblock"><div class="cb-head"><span class="cb-title">crates.io</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">cargo install redis-lens
+<div class="codeblock"><div class="cb-head"><span class="cb-title">cargo</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">cargo install --git https://github.com/magna-nz/redis-lens
 
 # with Microsoft Entra ID sign-in
-cargo install redis-lens --features entra-id</code></pre></div>
+cargo install --git https://github.com/magna-nz/redis-lens --features entra-id</code></pre></div>
 <div class="codeblock"><div class="cb-head"><span class="cb-title">from source</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">git clone https://github.com/magna-nz/redis-lens
 cd redis-lens
 make build        # cargo build --release --locked
@@ -1207,7 +1206,7 @@ redis-lens conn add aws-prod \
 <p>For Azure Cache for Redis and Azure Managed Redis, install with the <code>entra-id</code> feature and pass <code>--entra</code>. It uses the developer-tools credential chain, so run <code>az login</code> first. Managed identity and workload identity are not covered yet; a token command works meanwhile. Azure hosts (<code>*.redis.cache.windows.net</code>, <code>*.redis.azure.net</code>) are recognised and the environment is guessed from the host name.</p>
 </div>
 <div class="rail">
-<div class="codeblock"><div class="cb-head"><span class="cb-title">entra</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">cargo install redis-lens --features entra-id
+<div class="codeblock"><div class="cb-head"><span class="cb-title">entra</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">cargo install --git https://github.com/magna-nz/redis-lens --features entra-id
 az login
 redis-lens conn add azure-cache \
   --url rediss://my-cache.redis.azure.net:10000 --env prod --entra</code></pre></div>
@@ -1782,7 +1781,7 @@ min_keys = 100</code></pre></div>
     runs-on: ubuntu-latest
     steps:
       - name: Install redis-lens
-        run: cargo install redis-lens --locked
+        run: cargo install --git https://github.com/magna-nz/redis-lens --locked
       - name: Gate the deploy
         # 0 pass, 1 a rule failed, 2 the scan itself broke
         run: |

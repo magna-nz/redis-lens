@@ -524,7 +524,7 @@ pre.term .badge-w { background: var(--t-warn); color: #1a1205; font-weight: 600;
 @media (max-width: 900px) {
   :root { --nav-col: 0px; --code-col: 0px; }
   .layout { display: block; }
-  .topbar .sub, .topbar .toplink.crate { display: none; }
+  .topbar .sub { display: none; }
   .sidebar {
     position: static;
     max-height: none;
