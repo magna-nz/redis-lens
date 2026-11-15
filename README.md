@@ -20,6 +20,7 @@ safe to point at production: read-only by default, and it never runs `KEYS`.
 
 ## What you can do
 
+- **Find any key:** `ctrl-f` from any screen searches the whole server by name or pattern.
 - **Browse keys and values:** every Redis type, plus JSON, streams and module types, decoded as JSON, MessagePack, hex and more.
 - **See what uses memory:** keys grouped into patterns like `user:{id}:cart`, with big keys, hot keys and keys that never expire.
 - **Watch the server:** live stats, clients, the slow log, `MONITOR` and Pub/Sub.
