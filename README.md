@@ -11,8 +11,7 @@
   <p><a href="https://magna-nz.github.io/redis-lens/"><strong>Documentation</strong></a></p>
 </div>
 
-redis-lens is a terminal UI for Redis and Valkey. It lists your keys and shows their values, finds the keys and key
-patterns that use the most memory, and shows live server stats, connected clients, the slow log and Pub/Sub messages.
+redis-lens lists your keys and shows their values, finds the keys and key patterns that use the most memory, and shows live server stats, connected clients, the slow log and Pub/Sub messages.
 You can also run commands and edit keys from it.
 
 Connections marked as production are read-only unless you turn writes on.
