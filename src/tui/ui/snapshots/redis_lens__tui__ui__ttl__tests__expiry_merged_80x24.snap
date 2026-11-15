@@ -26,4 +26,4 @@ expression: small
 "│                                             │ 7 d   █▋░░░░░░░     2.4G   18% │"
 "│                                             │ 30 d  █▋░░░░░░░     2.4G   18% │"
 "└─────────────────────────────────────────────┴────────────────────────────────┘"
-" ↑↓ Move   tab Next panel   y Copy   r Analyze   s Snapshot    : Command  ? Help"
+" ↑↓ Move   tab Next panel   y Copy   r Analyze           ctrl-f Find key  ? Help"

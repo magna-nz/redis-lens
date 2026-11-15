@@ -6,6 +6,9 @@
 //! `ZCARD`, `XLEN`). Never `KEYS` and never a command that reads a value. Every command
 //! goes through the shared budget ([`query`], [`query_pipe`]); per-key commands are
 //! pipelined in batches of [`BATCH`] keys, like a scan.
+//!
+//! A find (`ctrl-f`, [`Request::Find`]) walks the same way with a glob the user typed
+//! ([`find_glob`]) and keeps every key it returns.
 
 use std::collections::HashSet;
 
@@ -44,9 +47,64 @@ pub enum Request {
         /// Send `OBJECT FREQ` (LFU policy, and the scan was allowed it).
         freq: bool,
     },
+    /// The next page of a find (`ctrl-f`): as [`Request::Page`], but with `glob` as the
+    /// user's own `SCAN MATCH` glob ([`find_glob`]) and every key it returns kept, since
+    /// there is no pattern to infer to (`other_pattern` stays 0).
+    Find {
+        glob: String,
+        /// Where the walk continues; 0 to start.
+        cursor: u64,
+        /// Keys found by the previous page but not loaded yet, loaded first.
+        carry: Vec<String>,
+        /// Send `MEMORY USAGE`.
+        sizes: bool,
+        /// Send `OBJECT FREQ`.
+        freq: bool,
+    },
     /// The encoding of known keys, and the length of those with `length` set: for Big
     /// keys and Recommendations.
     Facts { keys: Vec<FactKey> },
+}
+
+/// The `SCAN MATCH` glob of a find's text: text with `*`, `?` or `[` is a glob the user
+/// wrote and is used as typed (`\` escapes as in Redis). Any other text means "the name
+/// contains it": `*`, the text with each `\` doubled (the only other character a glob
+/// treats specially), `*`.
+pub fn find_glob(text: &str) -> String {
+    if text.contains(['*', '?', '[']) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('*');
+    for c in text.chars() {
+        if c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('*');
+    out
+}
+
+/// The most `*` wildcards a typed glob may hold (a run of `*` counts once). A glob with
+/// many is slow to match on every key `SCAN` looks at, and on servers without the
+/// CVE-2022-36021 fix (Redis before 6.0.18, 6.2.11 and 7.0.9) it can take exponential
+/// time, so a find never sends one.
+pub const MAX_FIND_STARS: usize = 8;
+
+/// Why typed text can't be searched, or `None`. Plain text always can: its glob has
+/// two `*`.
+pub fn find_refusal(text: &str) -> Option<String> {
+    let stars = text
+        .split(|c| c != '*')
+        .filter(|run| !run.is_empty())
+        .count();
+    (stars > MAX_FIND_STARS).then(|| {
+        format!(
+            "A pattern may have at most {MAX_FIND_STARS} * wildcards, so matching it stays \
+             cheap for the server. This one has {stars}."
+        )
+    })
 }
 
 /// A key for [`Request::Facts`].
@@ -130,7 +188,28 @@ pub async fn run(
             carry,
             sizes,
             freq,
-        } => page(conn, budget, &pattern, cursor, carry, sizes, freq)
+        } => {
+            let glob = match_glob(&pattern);
+            page(
+                conn,
+                budget,
+                &glob,
+                Some(&pattern),
+                cursor,
+                carry,
+                sizes,
+                freq,
+            )
+            .await
+            .map(Reply::Page)
+        }
+        Request::Find {
+            glob,
+            cursor,
+            carry,
+            sizes,
+            freq,
+        } => page(conn, budget, &glob, None, cursor, carry, sizes, freq)
             .await
             .map(Reply::Page),
         Request::Facts { keys } => facts(conn, budget, &keys).await,
@@ -158,17 +237,19 @@ impl Refused {
     }
 }
 
+/// One page of `SCAN cursor MATCH glob`: with `pattern`, only the keys that infer to it
+/// are kept (a pattern's keys); without, every key (a find).
 #[allow(clippy::too_many_arguments)]
 async fn page(
     conn: &mut impl LiveConn,
     budget: &Budget,
-    pattern: &str,
+    glob: &str,
+    pattern: Option<&str>,
     mut cursor: u64,
     carry: Vec<String>,
     sizes: bool,
     freq: bool,
 ) -> Result<Page, LiveError> {
-    let glob = match_glob(pattern);
     let mut seen: HashSet<String> = carry.iter().cloned().collect();
     let mut found: Vec<String> = carry;
     let (mut other_pattern, mut unreadable) = (0u64, 0u64);
@@ -180,7 +261,7 @@ async fn page(
         let mut cmd = redis::cmd("SCAN");
         cmd.arg(cursor)
             .arg("MATCH")
-            .arg(&glob)
+            .arg(glob)
             .arg("COUNT")
             .arg(SCAN_COUNT);
         let (next, keys): (u64, Vec<Vec<u8>>) = query(conn, budget, "SCAN", &cmd).await?;
@@ -188,7 +269,7 @@ async fn page(
         cursor = next;
         for raw in keys {
             match String::from_utf8(raw) {
-                Ok(k) if !key_in_pattern(&k, pattern) => other_pattern += 1,
+                Ok(k) if pattern.is_some_and(|p| !key_in_pattern(&k, p)) => other_pattern += 1,
                 Ok(k) => {
                     if seen.insert(k.clone()) {
                         found.push(k);
@@ -443,5 +524,186 @@ mod tests {
         );
         let text = r.0[0].to_string();
         assert!(!text.contains("lens-limited"), "{text}");
+    }
+
+    // -----------------------------------------------------------------------
+    // find_glob
+    // -----------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Redis's own glob matcher (`stringmatchlen` in `util.c`, case-sensitive), byte by
+    /// byte: `*`, `?`, `[...]` with `^`, ranges and `\` escapes, and `\` escaping the
+    /// next character outside brackets (a `\` at the very end is literal). The crate has
+    /// no glob matcher of its own (`analysis::match_glob` builds a glob from a pattern),
+    /// so the find's glob is checked against this one.
+    fn redis_match(p: &[u8], s: &[u8]) -> bool {
+        let (mut pi, mut si) = (0, 0);
+        while pi < p.len() && si < s.len() {
+            match p[pi] {
+                b'*' => {
+                    while pi + 1 < p.len() && p[pi + 1] == b'*' {
+                        pi += 1;
+                    }
+                    if pi + 1 == p.len() {
+                        return true;
+                    }
+                    return (si..s.len()).any(|at| redis_match(&p[pi + 1..], &s[at..]));
+                }
+                b'?' => si += 1,
+                b'[' => {
+                    pi += 1;
+                    let not = p.get(pi) == Some(&b'^');
+                    if not {
+                        pi += 1;
+                    }
+                    let mut hit = false;
+                    loop {
+                        if pi >= p.len() {
+                            // Unterminated: the pattern ends here.
+                            pi -= 1;
+                            break;
+                        } else if p[pi] == b'\\' && p.len() - pi >= 2 {
+                            pi += 1;
+                            hit |= p[pi] == s[si];
+                        } else if p[pi] == b']' {
+                            break;
+                        } else if p.len() - pi >= 3 && p[pi + 1] == b'-' {
+                            let (a, b) = (p[pi].min(p[pi + 2]), p[pi].max(p[pi + 2]));
+                            hit |= (a..=b).contains(&s[si]);
+                            pi += 2;
+                        } else {
+                            hit |= p[pi] == s[si];
+                        }
+                        pi += 1;
+                    }
+                    if hit == not {
+                        return false;
+                    }
+                    si += 1;
+                }
+                c => {
+                    let c = if c == b'\\' && p.len() - pi >= 2 {
+                        pi += 1;
+                        p[pi]
+                    } else {
+                        c
+                    };
+                    if c != s[si] {
+                        return false;
+                    }
+                    si += 1;
+                }
+            }
+            pi += 1;
+            if si == s.len() {
+                while pi < p.len() && p[pi] == b'*' {
+                    pi += 1;
+                }
+                break;
+            }
+        }
+        pi == p.len() && si == s.len()
+    }
+
+    fn matches(glob: &str, key: &str) -> bool {
+        redis_match(glob.as_bytes(), key.as_bytes())
+    }
+
+    #[test]
+    fn the_matcher_follows_redis() {
+        assert!(matches("user:*:cart", "user:1:cart"));
+        assert!(!matches("user:*:cart", "user:1:cart:x"));
+        assert!(matches("h?llo", "hello") && !matches("h?llo", "hllo"));
+        assert!(matches("h[ae]llo", "hallo") && !matches("h[ae]llo", "hillo"));
+        assert!(matches("h[^e]llo", "hallo") && !matches("h[^e]llo", "hello"));
+        assert!(matches("h[a-b]llo", "hbllo") && matches("h[b-a]llo", "hallo"));
+        assert!(matches("a\\*b", "a*b") && !matches("a\\*b", "axb"));
+        assert!(matches("a\\\\b", "a\\b"));
+        // A `\` at the end matches itself.
+        assert!(matches("a\\", "a\\"));
+        assert!(matches("**", "x") && !matches("", "x") && matches("", ""));
+        // As in Redis, a glob with a `*` matches no empty name (`SCAN MATCH *` skips
+        // matching altogether). An empty find is never sent.
+        assert!(!matches("*", ""));
+    }
+
+    #[test]
+    fn plain_text_finds_names_that_contain_it() {
+        assert_eq!(find_glob("cart"), "*cart*");
+        assert_eq!(find_glob("user:1"), "*user:1*");
+        // `]` and `^` are only special inside brackets.
+        assert_eq!(find_glob("a]b^"), "*a]b^*");
+        // `\` is the one character that needs escaping.
+        assert_eq!(find_glob("a\\b"), "*a\\\\b*");
+        assert_eq!(find_glob("\\"), "*\\\\*");
+        assert!(matches(&find_glob("a\\b"), "xa\\by"));
+        assert!(!matches(&find_glob("a\\b"), "ab"));
+    }
+
+    #[test]
+    fn a_glob_with_too_many_wildcards_is_refused() {
+        assert_eq!(find_refusal("cart"), None);
+        assert_eq!(find_refusal("user:*:cart"), None);
+        // Runs of `*` count once.
+        assert_eq!(find_refusal("a**b***c"), None);
+        let eight = "a*".repeat(8);
+        assert_eq!(find_refusal(&eight), None);
+        let nine = format!("{eight}b*");
+        assert_eq!(
+            find_refusal(&nine).as_deref(),
+            Some(
+                "A pattern may have at most 8 * wildcards, so matching it stays cheap for the \
+             server. This one has 9."
+            )
+        );
+        // `?` and brackets do not backtrack.
+        assert_eq!(find_refusal(&"?".repeat(100)), None);
+    }
+
+    #[test]
+    fn text_with_a_glob_character_is_used_as_typed() {
+        for t in ["user:*:cart", "user:?", "user:[12]", "a\\*b", "[", "*"] {
+            assert_eq!(find_glob(t), t);
+        }
+        assert!(matches(&find_glob("user:*:cart"), "user:42:cart"));
+        assert!(!matches(&find_glob("user:*:cart"), "xuser:42:cart"));
+        assert!(matches(&find_glob("a\\*b"), "a*b"));
+    }
+
+    /// Text without `*`, `?` or `[`, with the characters that could trip the escaping.
+    /// Never empty: `enter` on an empty find does nothing.
+    fn plain_text() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[^*?\\[]{1,12}",
+            "[a-c:\\\\\\]^{}-]{1,8}",
+            Just("\\".to_string()),
+        ]
+    }
+
+    fn any_key() -> impl Strategy<Value = String> {
+        prop_oneof!["\\PC{0,24}", "[a-c:\\\\\\]^*?\\[{}-]{0,16}",]
+    }
+
+    proptest! {
+        /// Plain text finds exactly the names that contain it.
+        #[test]
+        fn plain_text_matches_exactly_the_names_containing_it(
+            t in plain_text(),
+            key in any_key(),
+        ) {
+            prop_assert_eq!(matches(&find_glob(&t), &key), key.contains(&t));
+        }
+
+        /// A name built around the text is always found.
+        #[test]
+        fn a_name_around_the_text_is_found(
+            t in plain_text(),
+            before in any_key(),
+            after in any_key(),
+        ) {
+            let key = format!("{before}{t}{after}");
+            prop_assert!(matches(&find_glob(&t), &key), "{} {}", find_glob(&t), key);
+        }
     }
 }

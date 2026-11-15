@@ -11,8 +11,10 @@
   <p><a href="https://magna-nz.github.io/redis-lens/"><strong>Documentation</strong></a></p>
 </div>
 
-Browse keys, watch the server, run commands, and find out what is using your memory, all from a terminal. It is
-safe to point at production: read-only by default, and it never runs `KEYS`.
+redis-lens lists your keys and shows their values, finds the keys and key patterns that use the most memory, and shows live server stats, connected clients, the slow log and Pub/Sub messages.
+You can also run commands and edit keys from it.
+
+Connections marked as production are read-only unless you turn writes on.
 
 <div align="center">
   <img src="docs/demo.gif" alt="redis-lens browsing key patterns and a value, then the Server panel and the command line" width="900">
@@ -20,6 +22,7 @@ safe to point at production: read-only by default, and it never runs `KEYS`.
 
 ## What you can do
 
+- **Find any key:** `ctrl-f` from any screen searches the whole server by name or pattern.
 - **Browse keys and values:** every Redis type, plus JSON, streams and module types, decoded as JSON, MessagePack, hex and more.
 - **See what uses memory:** keys grouped into patterns like `user:{id}:cart`, with big keys, hot keys and keys that never expire.
 - **Watch the server:** live stats, clients, the slow log, `MONITOR` and Pub/Sub.

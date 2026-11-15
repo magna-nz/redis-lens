@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** Redis Insight parity phase 5, merged as #22, with the verifier's fixes in the follow-up branch `claude/insight-phase5-followups` ([Phase 5](#phase-5-2026-11-15-the-rest-of-redis-insight-parity)). On main: parity phases 1 to 4 (#15, #16, #17, #18, #19), the phase 4 follow-up PR #20 (merged 2026-11-14, merge commit `9e031cb`) and the TUI redesign (#21, merged 2026-11-15, merge commit `dec974e`).
-**Last updated:** 2026-11-15 (phase 5 and its follow-ups merged as #22 and #23; README cut to a short overview)
+**Current milestone:** Find key (`ctrl-f`) on `claude/find-key` ([Find key](#find-key-2026-11-15)). Redis Insight parity phase 5 is merged as #22 and its follow-ups as #23, and the shorter README as #24. On main: parity phases 1 to 4 (#15, #16, #17, #18, #19), the phase 4 follow-up PR #20 (merged 2026-11-14, merge commit `9e031cb`) and the TUI redesign (#21, merged 2026-11-15, merge commit `dec974e`).
+**Last updated:** 2026-11-15 (Find key in progress on `claude/find-key`; phase 5, its follow-ups and the README merged as #22, #23 and #24)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -649,3 +649,17 @@ Tests: the keymap test `tui::keymap::tests::spec_lists_every_key` checks the key
 - Carried over: an allow-list for `INFO` and `PING` on the command line, and a reply-size check before whole-key reads.
 - Carried over: Dependabot PRs #2 to #5.
 - Carried over: the port-collision flake in the integration tests. The owner said to ignore it.
+
+## Find key (2026-11-15)
+
+Searching the whole server for a key by name, from any screen, was the gap left after phase 5: `/` only filters the names already read. Built on `claude/find-key`, cut from main at `5b9e527`. Spec: [Find key (`ctrl-f`)](spec.md#find-key-ctrl-f).
+
+| Part | Content | State |
+|---|---|---|
+| key and prompt | `ctrl-f` on every screen once connected opens `Find key:` in place of the footer; list filters close keeping their text; dialogs, the command line, the add flow and help keep every key (`src/tui/find.rs`) | **done** |
+| search | `find_glob`: text with `*` `?` `[` is used as typed, other text becomes "name contains"; `Request::Find` walks like a pattern's keys (same pages, budget and facts, no value) and keeps every key; every connected cluster node in slot order | **done** |
+| results | Browse › Keys lists them as `Find: <glob>`; `→` opens a value; `esc`/`←` goes back to where `ctrl-f` was pressed | **done** |
+| footer | `ctrl-f Find key  : Command  ? Help` on the right; `keymap::footer_fit`: `: Command` gives way first, then the screen's last key (at most one at 80 columns, none from 100) | **done**; 173 snapshots changed in the footer line only, 5 help overlays gained the row |
+| tests | 33 unit tests (prompt, glob with a proptest against a port of Redis's matcher, routing, footer fit), 6 insta snapshots, `tests/find_key_it.rs` (8 tests on Redis and Valkey, a cluster case) | **done** |
+| verifier | Nothing blocking. Fixed: a find before the live connection is open (on a cluster it could read one node and call itself done) now waits; typed globs hold at most 8 `*`; a find drops a form open on a key's value; the help row for `esc` on the key list; spaces around the text; tests for each, and for a late page of a replaced find | **done** |
+

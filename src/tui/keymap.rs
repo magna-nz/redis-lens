@@ -67,6 +67,14 @@ const QUIT: KeyHelp = k("q ctrl-c", "q", "Quit", "Quit", false);
 
 const COMMAND_LINE_KEY: KeyHelp = k(":", ":", "Command", "Open the command line", true);
 
+const FIND_KEY: KeyHelp = k(
+    "ctrl-f",
+    "ctrl-f",
+    "Find key",
+    "Find keys by name or pattern on the whole server",
+    true,
+);
+
 const DATABASES_KEY: KeyHelp = k(
     "b",
     "b",
@@ -75,12 +83,13 @@ const DATABASES_KEY: KeyHelp = k(
     false,
 );
 
-static GLOBAL: [KeyHelp; 7] = [
+static GLOBAL: [KeyHelp; 8] = [
     CONNECTIONS_KEY,
     AREAS,
     MORE,
     HELP,
     COMMAND_LINE_KEY,
+    FIND_KEY,
     DATABASES_KEY,
     QUIT,
 ];
@@ -353,7 +362,7 @@ static KEY_LIST: [KeyHelp; 12] = [
         "← h esc",
         "esc",
         "Back",
-        "Clear the filters first, then back to the patterns",
+        "Clear the filters first, then go back",
         true,
     ),
     k("/", "/", "Filter", "Filter the loaded keys by name", true),
@@ -853,13 +862,44 @@ pub fn footer(screen: Screen, c: FooterCtx) -> Vec<(&'static str, &'static str)>
         .collect()
 }
 
-/// The keys at the right of the footer: `: Command  ? Help`, or only `? Help` before
-/// connecting.
+/// The keys at the right of the footer: `ctrl-f Find key  : Command  ? Help`, or only
+/// `? Help` before connecting.
 pub fn footer_right(connected: bool) -> Vec<(&'static str, &'static str)> {
-    let keys: &[&str] = if connected { &[":", "?"] } else { &["?"] };
+    let keys: &[&str] = if connected {
+        &["ctrl-f", ":", "?"]
+    } else {
+        &["?"]
+    };
     keys.iter()
         .map(|k| find_key(Screen::Connections, k))
         .collect()
+}
+
+/// A footer key as drawn: `(key, label)`.
+pub type Hint = (&'static str, &'static str);
+
+/// The footer as drawn `w` columns wide: [`footer`] and [`footer_right`], four columns
+/// apart at least. When they do not all fit, `: Command` goes first (`?` finds it), then
+/// the screen's keys from the end, so its first, most important ones stay; `ctrl-f` and
+/// `?` stay while anything fits. At 80 columns that leaves out at most one key of a
+/// screen; from 100 columns on nothing is left out.
+pub fn footer_fit(screen: Screen, c: FooterCtx, w: usize) -> (Vec<Hint>, Vec<Hint>) {
+    let mut left = footer(screen, c);
+    let mut right = footer_right(c.ready);
+    let fits = |l: &[(&str, &str)], r: &[(&str, &str)]| {
+        let rw = footer_right_width(r);
+        footer_width(l) + if rw == 0 { 0 } else { 4 + rw } <= w
+    };
+    if !fits(&left, &right) {
+        right.retain(|(k, _)| *k != ":");
+    }
+    while !left.is_empty() && !fits(&left, &right) {
+        left.pop();
+    }
+    if !fits(&left, &right) {
+        right.clear();
+    }
+    (left, right)
 }
 
 /// Columns the footer's keys take as drawn: a space, then each key and ` {label}`,
@@ -1165,7 +1205,10 @@ mod tests {
             ["Next panel", "Connections"]
         );
         assert_eq!(names(Screen::PubSub, FooterCtx::default()), ["Connections"]);
-        assert_eq!(footer_right(true), [(":", "Command"), ("?", "Help")]);
+        assert_eq!(
+            footer_right(true),
+            [("ctrl-f", "Find key"), (":", "Command"), ("?", "Help")]
+        );
         assert_eq!(footer_right(false), [("?", "Help")]);
     }
 
@@ -1179,15 +1222,60 @@ mod tests {
         }
     }
 
+    /// At 80 columns every footer fits as [`footer_fit`] trims it: `ctrl-f` and `?`
+    /// always show once connected, `:` gives way first, and at most one of the
+    /// screen's keys is left out (the last). From 100 columns nothing is left out.
     #[test]
     fn footer_fits_80_columns() {
         for v in Screen::ALL {
             for c in contexts() {
-                let w =
-                    footer_width(&footer(v, c)) + 4 + footer_right_width(&footer_right(c.ready));
+                let all = footer(v, c);
+                let (left, right) = footer_fit(v, c, 80);
+                let w = footer_width(&left) + 4 + footer_right_width(&right);
                 assert!(w <= 80, "{} footer is {w} columns", v.title());
+                assert!(
+                    left.len() + 1 >= all.len() && all.starts_with(&left),
+                    "{}: {left:?} of {all:?}",
+                    v.title()
+                );
+                let keys: Vec<&str> = right.iter().map(|h| h.0).collect();
+                if c.ready {
+                    assert!(
+                        keys.contains(&"ctrl-f") && keys.contains(&"?"),
+                        "{}: {keys:?}",
+                        v.title()
+                    );
+                } else {
+                    assert_eq!(keys, ["?"], "{}", v.title());
+                }
+                assert_eq!(
+                    footer_fit(v, c, 100),
+                    (all, footer_right(c.ready)),
+                    "{} at 100 columns",
+                    v.title()
+                );
             }
         }
+    }
+
+    #[test]
+    fn the_command_key_gives_way_before_the_screens_keys() {
+        let c = FooterCtx {
+            ready: true,
+            analyzed: true,
+            ..FooterCtx::default()
+        };
+        // The key list's five keys fit beside `ctrl-f` and `?` at 81 columns...
+        let (left, right) = footer_fit(Screen::KeyList, c, 81);
+        assert_eq!(left, footer(Screen::KeyList, c));
+        assert_eq!(right, [("ctrl-f", "Find key"), ("?", "Help")]);
+        // ...at 80 the last one goes too; with room, `:` is back.
+        let (left, _) = footer_fit(Screen::KeyList, c, 80);
+        assert_eq!(left.len(), 4);
+        assert_eq!(footer_fit(Screen::KeyList, c, 100).1, footer_right(true));
+        // Before connecting the right side is `? Help` alone.
+        let (_, right) = footer_fit(Screen::Connections, FooterCtx::default(), 80);
+        assert_eq!(right, [("?", "Help")]);
     }
 
     #[test]

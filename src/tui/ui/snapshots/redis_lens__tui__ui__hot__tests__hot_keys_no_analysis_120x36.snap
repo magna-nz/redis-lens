@@ -37,4 +37,4 @@ expression: s
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" r Analyze   tab Next panel                                                                            : Command  ? Help"
+" r Analyze   tab Next panel                                                           ctrl-f Find key  : Command  ? Help"
