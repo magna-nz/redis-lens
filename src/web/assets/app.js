@@ -3,7 +3,7 @@
 // The views live in views/*.js. Each exports `mount(root, ctx, route)` and returns a
 // function that unmounts it. They read data only through `ctx.api` (api.js).
 
-import { api, TEXT } from './api.js';
+import { api, TEXT, initApi, acceptSignIn } from './api.js';
 import {
   h, fill, setIcon, envBadge, createThemeStore, createToasts, confirmDialog,
   parseRoute, pushSeries, errorText,
@@ -71,7 +71,10 @@ function applyTheme() {
 
 const ctx = {
   api,
-  mock: api.mock,
+  /** Whether the data is the sample servers' (`?mock`). */
+  get mock() {
+    return api.mock;
+  },
   notify,
   state: () => store.state,
   series: () => store.series,
@@ -232,6 +235,19 @@ function showLocked() {
   $('poll-interval').hidden = true;
 }
 
+/** `?mock` in a build without the sample servers: say so, and show nothing made up. */
+function showNoMock(text) {
+  store.locked = true;
+  fill(document.querySelector('.shell'),
+    h('main', { class: 'locked', id: 'main' },
+      h('div', { class: 'card locked-card' },
+        h('h1', { text: 'No sample data here' }),
+        h('p', { text }))));
+  $('conn-pill').hidden = true;
+  $('live-toggle').hidden = true;
+  $('poll-interval').hidden = true;
+}
+
 // ---------- The command line panel ----------
 
 function setCommandLine(open) {
@@ -317,7 +333,14 @@ async function loadState() {
 
 // ---------- Boot ----------
 
-function boot() {
+async function boot() {
+  // First of all: the sign-in token leaves the address bar (initApi takes it at once).
+  const ready = initApi(window);
+  // The sign-in address opened again in this tab (a locked one, say) only changes the hash:
+  // take the token and start the page over with it.
+  window.addEventListener('hashchange', () => {
+    if (acceptSignIn(window)) window.location.reload();
+  });
   applyTheme();
   $('served-at').textContent = window.location.host || '127.0.0.1';
   $('theme-toggle').addEventListener('click', () => {
@@ -357,9 +380,25 @@ function boot() {
     if (up) loadState();
   });
 
+  const mode = await ready;
+  if (mode.error) {
+    showNoMock(mode.error);
+    return;
+  }
+  // Made-up data must never pass for a server's: the badge stays while it is shown.
+  $('sample-badge').hidden = !mode.mock;
+
   commandLine = cmdline.mount($('cmdline'), ctx, () => setCommandLine(false));
 
   window.addEventListener('hashchange', render);
+  // The event stream is closed when the page goes away (or into the back-forward cache),
+  // and opened again if it comes back from there.
+  window.addEventListener('pagehide', () => api.stop());
+  window.addEventListener('pageshow', (e) => {
+    if (!e.persisted || store.locked) return;
+    api.restart();
+    loadState();
+  });
   renderChrome();
   loadState().then(() => {
     if (store.locked) return;

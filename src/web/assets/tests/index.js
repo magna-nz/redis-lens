@@ -9,6 +9,7 @@ import './format.test.js';
 import './forms.test.js';
 import './history.test.js';
 import './mock.test.js';
+import './signin.test.js';
 import './tail.test.js';
 import './theme.test.js';
 import './views.test.js';

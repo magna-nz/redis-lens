@@ -349,7 +349,7 @@ function editDialog(ctx, p, reload) {
 
 /** A guess at a name from the address, as the TUI's add flow does: the host's first label. */
 export function guessName(url) {
-  const s = String(url ?? '').trim().replace(/^rediss?:\/\//i, '');
+  const s = String(url ?? '').trim().replace(/^(?:rediss?|valkeys?):\/\//i, '');
   const authority = s.split(/[/?#,]/)[0];
   const hostPort = authority.slice(authority.lastIndexOf('@') + 1);
   const m = /^\[?([^\]]*?)\]?(?::(\d+))?$/.exec(hostPort);
@@ -396,7 +396,7 @@ function addDialog(ctx, reload) {
       };
 
       const url = input('url', 'Address', { class: 'field mono', placeholder: 'rediss://host:6379', 'data-autofocus': true },
-        'A redis:// URL (rediss:// for TLS), or a host:port,ssl=True string. A password pasted here moves to the password box.');
+        'A redis:// or valkey:// URL (rediss:// or valkeys:// for TLS), or a host:port,ssl=True string. A password pasted here moves to the password box.');
       const name = input('name', 'Name', { class: 'field mono' });
       const env = select('env', 'Environment', [['', 'Guess from the address']].concat(ENVS.map((e) => [e, e])));
       const pass = input('password', 'Password', { type: 'password' }, 'Goes to the OS keychain, never to a file. Leave it empty for a server without one.');

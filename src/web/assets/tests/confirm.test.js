@@ -214,16 +214,19 @@ test('help that the server has no docs for (404) is no help, not an error', asyn
   await assert.rejects(api.getCommandHelp('get'), (err) => err.status === 502);
 });
 
-test('every request carries the session cookie and the header; every non-GET a JSON body', async () => {
+test('every request carries the token as a Bearer header, no cookie, and the header; every non-GET a JSON body', async () => {
   const fetchFn = fakeFetch(() => [200, {}]);
-  const api = createApi(createReal({ fetchFn }));
+  const token = 'c'.repeat(64);
+  const api = createApi(createReal({ fetchFn, token }));
   await api.getClients();
   await api.disconnect();
   await api.stopMonitor();
   const [get, post, del] = fetchFn.seen;
   for (const call of fetchFn.seen) {
-    assert.equal(call.credentials, 'same-origin');
+    assert.equal(call.credentials, 'omit', 'no cookie goes with a request');
     assert.equal(call.headers['X-Redis-Lens'], '1');
+    assert.equal(call.headers.Authorization, `Bearer ${token}`);
+    assert.equal(call.path.includes(token), false, 'the token is never in an address');
   }
   assert.equal(get.method, 'GET');
   assert.equal(get.body, undefined);
@@ -231,6 +234,26 @@ test('every request carries the session cookie and the header; every non-GET a J
   assert.deepEqual(post.body, {});
   assert.equal(del.method, 'DELETE');
   assert.deepEqual(del.body, {}, 'a DELETE has a JSON body too, as the server requires');
+});
+
+test('without a token no Authorization header is sent', async () => {
+  const fetchFn = fakeFetch(() => [200, {}]);
+  await createApi(createReal({ fetchFn })).getState();
+  assert.equal('Authorization' in fetchFn.seen[0].headers, false);
+});
+
+test('a 422 the dashboard cannot ask about is shown like any refusal, in its words', async () => {
+  const text = 'That needs a question the dashboard cannot ask, so nothing was changed.';
+  const api = createApi(createReal({ fetchFn: fakeFetch(() => [422, { error: text }]) }));
+  await assert.rejects(api.runCommand('CONFIG SET x y'), (err) => err.status === 422 && err.message === text && !err.cancelled);
+});
+
+test('the command line\'s own refusals: a line too long (413), one still running (409)', async () => {
+  const long = 'Not sent: a line holds at most 8,192 characters.';
+  const busy = 'Not sent: the line before it is still running. Wait for its reply, then send it again.';
+  const api = createApi(createReal({ fetchFn: fakeFetch((path, init) => (JSON.parse(init.body).line.length > 8192 ? [413, { error: long }] : [409, { error: busy }])) }));
+  await assert.rejects(api.runCommand('x'.repeat(8193)), (err) => err.status === 413 && err.message === long);
+  await assert.rejects(api.runCommand('GET a'), (err) => err.status === 409 && err.message === busy && err.notLive === true);
 });
 
 test('401 raises the locked event and a locked error', async () => {
@@ -267,29 +290,46 @@ test('replies that are the new State also reach state subscribers', async () => 
   off();
 });
 
+/** A fetch whose /api/events is a stream the test writes to; other routes answer `route`. */
+function streamingFetch(route) {
+  const streams = [];
+  const fetchFn = async (path, init = {}) => {
+    if (path === '/api/events') {
+      let controller;
+      const body = new ReadableStream({ start(c) { controller = c; } });
+      const encoder = new TextEncoder();
+      const s = {
+        init,
+        send: (event, data) => controller.enqueue(encoder.encode(`event: ${event}\ndata: ${typeof data === 'string' ? data : JSON.stringify(data)}\n\n`)),
+      };
+      streams.push(s);
+      if (init.signal) init.signal.addEventListener('abort', () => { s.aborted = true; try { controller.error(new Error('aborted')); } catch { /* closed */ } });
+      return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }
+    return route(path, init);
+  };
+  return { fetchFn, streams };
+}
+const tick = (ms = 5) => new Promise((resolve) => setTimeout(resolve, ms));
+
 test('a reply\'s state is dropped when the stream delivered a newer one while the request ran', async () => {
   // A connect to a closed port: the stream says "connecting" then "failed" before the
   // request's own reply ("connecting") arrives. The page must end on "failed".
-  const sources = [];
-  class FakeSource {
-    constructor() { this.listeners = {}; this.readyState = 1; sources.push(this); }
-    addEventListener(name, fn) { this.listeners[name] = fn; }
-    close() { this.readyState = 2; }
-  }
   const state = (status, error = null) => ({ status, error, connection: { name: 'zz', env: 'other', env_label: 'OTHER', endpoint: '127.0.0.1:6399' }, live: 'waiting', writes: true });
   let release;
-  const fetchFn = async () => {
+  const { fetchFn, streams } = streamingFetch(async () => {
     await new Promise((resolve) => { release = resolve; });
     return { status: 202, ok: true, json: async () => state('connecting') };
-  };
-  const api = createApi(createReal({ fetchFn, EventSourceFn: FakeSource }));
+  });
+  const api = createApi(createReal({ fetchFn, token: 'b'.repeat(64) }));
   const seen = [];
   api.on('state', (s) => seen.push(s.status));
   api.start();
   const pending = api.connect({ name: 'zz' });
-  await new Promise((resolve) => setTimeout(resolve, 5));
-  sources[0].listeners.state({ data: JSON.stringify(state('connecting')) });
-  sources[0].listeners.state({ data: JSON.stringify(state('failed', 'Connection refused (os error 61)')) });
+  await tick();
+  streams[0].send('state', state('connecting'));
+  streams[0].send('state', state('failed', 'Connection refused (os error 61)'));
+  await tick();
   release();
   await pending;
   api.stop();
@@ -297,13 +337,8 @@ test('a reply\'s state is dropped when the stream delivered a newer one while th
 });
 
 test('events from the stream are adapted and delivered; a broken handler does not stop the others', async () => {
-  const sources = [];
-  class FakeSource {
-    constructor(url) { this.url = url; this.listeners = {}; this.readyState = 1; sources.push(this); }
-    addEventListener(name, fn) { this.listeners[name] = fn; }
-    close() { this.readyState = 2; }
-  }
-  const api = createApi(createReal({ fetchFn: fakeFetch(() => [200, {}]), EventSourceFn: FakeSource }));
+  const { fetchFn, streams } = streamingFetch(fakeFetch(() => [200, {}]));
+  const api = createApi(createReal({ fetchFn, token: 'b'.repeat(64) }));
   const got = [];
   const realError = console.error;
   console.error = () => {};
@@ -312,17 +347,23 @@ test('events from the stream are adapted and delivered; a broken handler does no
     api.on('figures', (f) => got.push(f));
     api.on('link', (l) => got.push(l));
     api.start();
-    assert.equal(sources[0].url, '/api/events');
-    sources[0].onopen();
-    sources[0].listeners.figures({ data: JSON.stringify({ node: 0, info: { clients: 14 }, rates: { ops: 1200, clients: 14 } }) });
-    sources[0].listeners.figures({ data: 'not json' });
+    await tick();
+    assert.equal(streams.length, 1);
+    assert.equal(streams[0].init.headers.Authorization, `Bearer ${'b'.repeat(64)}`, 'the stream sends the token');
+    assert.equal(streams[0].init.headers.Accept, 'text/event-stream');
+    assert.equal(streams[0].init.credentials, 'omit');
+    streams[0].send('figures', { node: 0, info: { clients: 14 }, rates: { ops: 1200, clients: 14 } });
+    streams[0].send('figures', 'not json');
+    streams[0].send('nonsense', { a: 1 });
+    await tick();
   } finally {
     console.error = realError;
   }
   assert.deepEqual(got[0], { up: true });
   assert.equal(got[1].opsPerSec, 1200);
   assert.equal(got[1].clients, 14);
-  assert.equal(got.length, 2, 'a malformed event is dropped');
+  assert.equal(got.length, 2, 'a malformed or unknown event is dropped');
   api.stop();
-  assert.equal(sources[0].readyState, 2);
+  await tick();
+  assert.equal(streams[0].aborted, true, 'stop aborts the request');
 });

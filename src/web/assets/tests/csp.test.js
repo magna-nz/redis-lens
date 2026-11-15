@@ -91,10 +91,16 @@ test('every request goes through api.js: the views and the shell never fetch', (
   }
 });
 
-test('nothing but the theme goes to localStorage, and nothing to sessionStorage or cookies', () => {
+test('nothing but the theme goes to localStorage, only the session token to sessionStorage, nothing to cookies', () => {
+  const code = (file) => read(file).split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+  for (const file of scripts) {
+    assert.equal(/document\.cookie|indexedDB/.test(read(file)), false, `${file}: storage`);
+    if (file !== 'api.js') assert.equal(/sessionStorage/.test(code(file)), false, `${file}: sessionStorage`);
+  }
+  assert.equal((code('api.js').match(/sessionStorage/g) || []).length, 1, 'api.js reaches sessionStorage in one place, for the token');
+  assert.equal(/localStorage/.test(code('api.js')), false, 'the token never goes to localStorage');
   for (const file of scripts) {
     const code = read(file);
-    assert.equal(/sessionStorage|document\.cookie|indexedDB/.test(code), false, `${file}: storage`);
     if (file !== 'app.js') assert.equal(/localStorage/.test(code.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')), false, `${file}: localStorage`);
   }
   assert.equal((read('app.js').match(/localStorage/g) || []).length, 1, 'app.js touches localStorage in one place, for the theme');
@@ -110,6 +116,18 @@ test('password boxes are type=password with autocomplete off, and nothing logs',
     const logs = read(file).match(/console\.[a-z]+\(/g) || [];
     if (file === 'api.js') assert.deepEqual(logs, ['console.error('], 'api.js logs one thing: that a handler failed, by event name');
     else assert.deepEqual(logs, [], `${file} logs`);
+  }
+});
+
+test('the token is never logged, never in an address the page builds, never in an error text', () => {
+  const api = read('api.js');
+  for (const call of api.match(/console\.[a-z]+\([^)]*\)/g) || []) assert.equal(/token/i.test(call), false, call);
+  // The only places a token is written: the Authorization header and the tab's storage.
+  const uses = api.split('\n').filter((l) => /\$\{t\}|\$\{token\}/.test(l));
+  assert.deepEqual(uses.map((l) => l.trim()), ['if (t) out.Authorization = `Bearer ${t}`;']);
+  assert.equal(/fetch\w*\([^)]*token/i.test(api), false, 'no request address holds the token');
+  for (const file of scripts.filter((f) => f !== 'api.js' && f !== 'mock.js')) {
+    assert.equal(/Authorization|#token=|TOKEN_KEY|createTokenStore/.test(read(file)), false, `${file} handles the session token`);
   }
 });
 

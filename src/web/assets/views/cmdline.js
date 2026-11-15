@@ -19,6 +19,9 @@ const VIEWS = [
 ];
 
 const MAX_ENTRIES = 100;
+/** The TUI's input cap: redis-lens refuses a longer line (413) in these words. */
+export const MAX_LINE = 8192;
+const TOO_LONG = 'Not sent: a line holds at most 8,192 characters.';
 
 /** What survives closing and opening the panel. */
 const session = { entries: [], history: new CommandHistory(100), view: 'text', pipeline: false, running: false };
@@ -90,11 +93,17 @@ export function mount(root, ctx, onClose) {
   const out = h('div', { class: 'box cmd-out', tabindex: '0', role: 'log', 'aria-live': 'polite', 'aria-label': 'Command output' });
   const helper = h('p', { class: 'cmd-help small', id: 'cmd-help' });
   const input = h('input', {
-    class: 'mono', type: 'text', id: 'cmd-input', placeholder: 'PING', autocomplete: 'off', spellcheck: false,
+    class: 'mono', type: 'text', id: 'cmd-input', placeholder: 'PING', autocomplete: 'off', spellcheck: false, maxlength: MAX_LINE,
     'aria-describedby': 'cmd-help cmd-keys', autocapitalize: 'off', autocorrect: 'off',
   });
   let cycle = null;
   let helpFor = null;
+  // One line at a time, as redis-lens runs them: Run is off while one is running.
+  const runButton = h('button', { type: 'button', class: 'btn primary cmd-run', text: 'Run', onclick: () => run() });
+  const busy = (on) => {
+    runButton.disabled = on;
+    input.setAttribute('aria-busy', on ? 'true' : 'false');
+  };
 
   function drawViews() {
     const pipeline = h('button', {
@@ -124,6 +133,8 @@ export function mount(root, ctx, onClose) {
     else if (e.kind === 'note') lines.push(h('div', { class: 'line muted', text: e.text }));
     else {
       if (e.text) lines.push(h('div', { class: 'line muted', text: e.text }));
+      // The first replies went past the 4 MiB the output keeps: redis-lens says how many.
+      if (e.droppedNote) lines.push(h('div', { class: 'line muted', text: e.droppedNote }));
       const many = e.replies.length > 1;
       let total = 0;
       e.replies.forEach((r, i) => {
@@ -163,9 +174,14 @@ export function mount(root, ctx, onClose) {
     }
     const shown = maskCommand(line);
     session.history.add(shown);
-    const entry = { input: shown, kind: 'running', text: '', replies: [], node: null, routeNote: null };
+    if (line.length > MAX_LINE) {
+      ctx.notify(TOO_LONG, 'error');
+      return;
+    }
+    const entry = { input: shown, kind: 'running', text: '', replies: [], node: null, routeNote: null, droppedNote: null };
     session.entries = capEntries(session.entries.concat([entry]));
     session.running = true;
+    busy(true);
     input.value = '';
     cycle = null;
     drawHelp();
@@ -178,11 +194,15 @@ export function mount(root, ctx, onClose) {
       entry.replies = reply.replies;
       entry.kind = reply.kind;
       entry.text = reply.text || '';
+      entry.droppedNote = reply.droppedNote;
     } catch (err) {
+      // A refusal of redis-lens's own (a line too long, one still running, a question the
+      // dashboard cannot ask) is shown like any other, in its words.
       entry.kind = err.cancelled ? 'note' : 'refused';
       entry.text = errorText(err);
     }
     session.running = false;
+    busy(false);
     drawOutput();
   }
 
@@ -270,7 +290,7 @@ export function mount(root, ctx, onClose) {
       h('span', { class: 'prompt', 'aria-hidden': 'true', text: '>' }),
       h('span', { class: 'sr-only', text: 'Redis command' }),
       input,
-      h('span', { class: 'badge mono', 'aria-hidden': 'true', text: 'enter' })),
+      runButton),
     helper,
     h('p', { class: 'muted small', id: 'cmd-keys', text: 'enter runs it · tab completes a command or subcommand · ↑ ↓ step through this session’s commands · esc closes · ctrl-l clears the output · ctrl-u clears the line' }));
 
@@ -310,5 +330,6 @@ export function mount(root, ctx, onClose) {
   drawViews();
   drawOutput();
   refresh();
+  busy(session.running);
   return { focus: () => input.focus(), refresh };
 }

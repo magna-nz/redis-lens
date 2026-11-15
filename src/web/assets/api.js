@@ -4,7 +4,16 @@
 // subscribe to its events. `api` talks to the redis-lens process that served this page
 // (the routes and replies are in docs/dashboard-api.md). With `?mock` in the address it
 // talks to mock.js instead, which answers the same routes with the same JSON, so the
-// adapters below are the one path for both.
+// adapters below are the one path for both. mock.js is loaded only then, and only debug
+// builds serve it: a release build says so and shows nothing made up.
+//
+// SIGN-IN: redis-lens opens `/#token=<64 hex>`. `initApi` takes the token out of the
+// address at once (history.replaceState), keeps it in memory and in sessionStorage (this
+// tab only, so a reload stays signed in), and every /api/* request sends it as
+// `Authorization: Bearer <token>`, the event stream included: that stream is read with
+// fetch and parsed here (`createSseParser`), because EventSource cannot send a header. A
+// 401 forgets the token and locks the page. The token is never logged, put in a URL the
+// page builds, put in an error text or in localStorage.
 //
 // =======================================================================================
 // VIEW-MODEL SHAPES (what the views consume; `null` always means "unknown", drawn as "—")
@@ -69,6 +78,7 @@
 // Published     { receivers: number|null }
 // Reply         { input (masked line), node: string|null, routeNote: string|null,
 //                 kind: 'reply'|'refused'|'error', text: string|null, times, sent,
+//                 dropped: number, droppedNote: string|null (the 4 MiB output cap),
 //                 replies: [{ views: { text, table, json, raw } (each a string or null),
 //                 micros, error: bool, cut: bool }] }
 // Names         { off: string|null, names: [string] }   ('config', 'config|get', ...)
@@ -113,12 +123,11 @@
 // A panel whose feature is off answers 200 `{ "off": why }`: its view-model carries `off`.
 //
 // EVENTS: `api.on(name, fn)` returns a function that unsubscribes.
-//   state (State) · figures (Figures) · tail (TailEvent) · monitor (MonitorEvent) ·
+//   state (State) · figures (Figures) · overview (Overview without `figures` and
+//   `shards`, which come with `figures`) · tail (TailEvent) · monitor (MonitorEvent) ·
 //   notice (Notice) · link ({ up: bool }, the page's own line to redis-lens) ·
 //   locked ({}): the session is missing or wrong (HTTP 401) · live ({ live: bool }):
 //   raised by app.js when the state's `live` changes, for the views that draw figures.
-
-import { createMockServer } from './mock.js';
 
 // ---------------------------------------------------------------------------------------
 // Errors
@@ -157,6 +166,7 @@ export const TEXT = {
   tooMany: 'Too many questions in a row, so nothing was sent.',
   liveClosed: 'The live connection is closed.',
   connectFailed: 'The connect failed.',
+  noMock: 'The sample data (?mock) comes only with development builds of redis-lens, so there is none here. Open the dashboard without ?mock to see your servers.',
 };
 
 /** Where the credentials of a saved connection live, by the server's `auth` word. */
@@ -700,6 +710,8 @@ export function adaptReply(j) {
     text: str(o.text),
     times: num(o.times) ?? 1,
     sent: num(o.sent) ?? 0,
+    dropped: num(o.dropped) ?? 0,
+    droppedNote: str(o.dropped_note),
     replies: arr(o.replies).map((r) => {
       const x = obj(r);
       const took = num(x.took_ms);
@@ -827,21 +839,293 @@ export const ROUTES = {
 const EVENT_ADAPTERS = {
   state: adaptState,
   figures: adaptFigures,
+  overview: adaptOverview,
   tail: adaptTailEvent,
   monitor: adaptMonitorEvent,
   notice: adaptNotice,
 };
 
-/** The implementation that talks to the redis-lens process. `fetchFn` and `EventSourceFn`
- *  are passed in by the tests, and by `?mock` (mock.js answers them in the browser). */
-export function createReal({ fetchFn = (...a) => fetch(...a), EventSourceFn = null, mock = false } = {}) {
+// ---------------------------------------------------------------------------------------
+// The session token
+// ---------------------------------------------------------------------------------------
+
+const TOKEN = /^[0-9a-f]{64}$/i;
+export const TOKEN_KEY = 'redis-lens.session';
+
+/** The token in a sign-in address: `#token=<64 hex>`. `present` says whether the hash
+ *  tried to carry one at all (then it is taken out of the address even when it is not a
+ *  token's shape, and `token` is null). */
+export function tokenFromHash(hash) {
+  const h = String(hash ?? '');
+  if (!/^#token=/i.test(h)) return { present: false, token: null };
+  const value = h.slice('#token='.length);
+  return { present: true, token: TOKEN.test(value) ? value.toLowerCase() : null };
+}
+
+/** Where the token is kept: in memory, and in `storage` (the tab's sessionStorage) so a
+ *  reload stays signed in. Any storage error is ignored: memory is enough for this page.
+ *  Nothing here ever logs the token or puts it anywhere else. */
+export function createTokenStore(storage = null) {
+  let memory = null;
+  let loaded = false;
+  return {
+    get() {
+      if (!loaded) {
+        loaded = true;
+        try {
+          const kept = storage ? storage.getItem(TOKEN_KEY) : null;
+          if (typeof kept === 'string' && TOKEN.test(kept)) memory = kept;
+        } catch {
+          // No storage (a private window, a policy): memory only.
+        }
+      }
+      return memory;
+    },
+    set(token) {
+      loaded = true;
+      memory = token;
+      try {
+        if (storage) storage.setItem(TOKEN_KEY, token);
+      } catch {
+        // Memory only.
+      }
+    },
+    clear() {
+      loaded = true;
+      memory = null;
+      try {
+        if (storage) storage.removeItem(TOKEN_KEY);
+      } catch {
+        // Nothing kept there, or nothing to do.
+      }
+    },
+  };
+}
+
+/** Take a sign-in token out of the address bar: a token there replaces a kept one (a
+ *  malformed one clears it, so the page locks rather than use an old session), and the
+ *  hash goes from the address and from history at once. */
+export function takeTokenFromAddress(win, tokens) {
+  const found = tokenFromHash(win.location.hash);
+  if (!found.present) return false;
+  if (found.token) tokens.set(found.token);
+  else tokens.clear();
+  try {
+    win.history.replaceState(win.history.state, '', `${win.location.pathname}${win.location.search}`);
+  } catch {
+    // Cannot happen on this origin; the token is kept either way.
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------------------
+// The event stream: Server-Sent Events read with fetch
+// ---------------------------------------------------------------------------------------
+
+/** A parser for the text of an SSE stream, as the HTML standard reads it: lines end with
+ *  CRLF, LF or CR (a CR at the end of a chunk waits for the next one, which may start with
+ *  its LF); `event:` names the event, each `data:` adds a line, `:` starts a comment (the
+ *  keep-alives); an empty line sends the event, when it has data. One leading space after
+ *  the colon is dropped; a leading BOM is dropped. `push` takes text (decode the bytes with
+ *  a streaming TextDecoder first, so a character split between chunks stays whole); `end`
+ *  drops an event left unfinished, as a browser does. */
+export function createSseParser(onEvent, onComment = () => {}) {
+  let buffer = '';
+  let first = true;
+  let name = '';
+  let data = [];
+
+  function line(text) {
+    if (text === '') {
+      if (data.length) onEvent({ event: name || 'message', data: data.join('\n') });
+      name = '';
+      data = [];
+      return;
+    }
+    if (text[0] === ':') {
+      onComment(text.slice(1));
+      return;
+    }
+    const colon = text.indexOf(':');
+    const field = colon < 0 ? text : text.slice(0, colon);
+    let value = colon < 0 ? '' : text.slice(colon + 1);
+    if (value[0] === ' ') value = value.slice(1);
+    if (field === 'event') name = value;
+    else if (field === 'data') data.push(value);
+    // `id` and `retry` are not used by redis-lens; other fields are ignored, as the standard says.
+  }
+
+  function scan(final) {
+    let at = 0;
+    for (;;) {
+      let end = -1;
+      for (let i = at; i < buffer.length; i += 1) {
+        const c = buffer.charCodeAt(i);
+        if (c === 10 || c === 13) {
+          end = i;
+          break;
+        }
+      }
+      if (end < 0) break;
+      // A CR as the last thing seen may be the first half of a CRLF split over two chunks.
+      if (buffer.charCodeAt(end) === 13 && end === buffer.length - 1 && !final) break;
+      line(buffer.slice(at, end));
+      at = end + 1;
+      if (buffer.charCodeAt(end) === 13 && buffer.charCodeAt(at) === 10) at += 1;
+    }
+    buffer = buffer.slice(at);
+  }
+
+  return {
+    push(text) {
+      let t = String(text);
+      if (first && t.length) {
+        first = false;
+        if (t.charCodeAt(0) === 0xfeff) t = t.slice(1);
+      }
+      buffer += t;
+      scan(false);
+    },
+    end() {
+      scan(true);
+      buffer = '';
+      name = '';
+      data = [];
+    },
+  };
+}
+
+/** Bytes in, events out: a streaming UTF-8 decoder in front of the parser. */
+export function createSseDecoder(onEvent, onComment) {
+  const decoder = new TextDecoder('utf-8');
+  const parser = createSseParser(onEvent, onComment);
+  return {
+    push(bytes) {
+      parser.push(decoder.decode(bytes, { stream: true }));
+    },
+    end() {
+      parser.push(decoder.decode());
+      parser.end();
+    },
+  };
+}
+
+/** How long to wait before the next try, after `attempt` failed ones in a row. */
+export const STREAM_BACKOFF = [1000, 2000, 4000, 8000, 15000];
+
+/** The one event stream: `fetch` with the token, read as it arrives. It tries again with
+ *  backoff when the stream ends or fails, stops for good on 401 (`onLocked`), and stops
+ *  at once (aborting the request) on `stop()`. */
+export function createEventStream({
+  fetchFn, url, headers, onEvent, onOpen = () => {}, onDown = () => {}, onLocked = () => {},
+  setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = (t) => clearTimeout(t), backoff = STREAM_BACKOFF,
+}) {
+  let controller = null;
+  let timer = null;
+  let failures = 0;
+  let running = false;
+
+  function again() {
+    if (!running) return;
+    onDown();
+    const wait = backoff[Math.min(failures, backoff.length - 1)];
+    failures += 1;
+    timer = setTimer(() => {
+      timer = null;
+      connect();
+    }, wait);
+  }
+
+  async function connect() {
+    if (!running) return;
+    const mine = new AbortController();
+    controller = mine;
+    let res;
+    try {
+      res = await fetchFn(url, { method: 'GET', headers: headers(), credentials: 'omit', cache: 'no-store', signal: mine.signal });
+    } catch {
+      if (!mine.signal.aborted) again();
+      return;
+    }
+    if (mine.signal.aborted) return;
+    if (res.status === 401) {
+      running = false;
+      onLocked();
+      return;
+    }
+    if (!res.ok || !res.body || typeof res.body.getReader !== 'function') {
+      again();
+      return;
+    }
+    failures = 0;
+    onOpen();
+    const decoder = createSseDecoder(onEvent);
+    const reader = res.body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) decoder.push(value);
+      }
+      decoder.end();
+    } catch {
+      // Aborted (stop), or the connection broke: told below.
+    }
+    if (mine.signal.aborted || controller !== mine) return;
+    again();
+  }
+
+  function stop() {
+    running = false;
+    if (timer !== null) clearTimer(timer);
+    timer = null;
+    if (controller) controller.abort();
+    controller = null;
+  }
+
+  return {
+    start() {
+      stop();
+      running = true;
+      failures = 0;
+      connect();
+    },
+    stop,
+    get running() {
+      return running;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------------------
+// The implementation
+// ---------------------------------------------------------------------------------------
+
+/** The implementation that talks to the redis-lens process. `fetchFn` is passed in by the
+ *  tests and by `?mock` (mock.js answers it in the browser). `tokens` is where the session
+ *  token is kept (`token` gives one for a store of its own, as the mock does). */
+export function createReal({ fetchFn = (...a) => fetch(...a), tokens = null, token = null, mock = false, timers = undefined } = {}) {
+  const keep = tokens || createTokenStore(null);
+  if (token) keep.set(token);
   let emit = () => {};
-  let source = null;
-  let retry = null;
   let locked = false;
 
+  function headers(extra = {}) {
+    const out = { Accept: 'application/json', 'X-Redis-Lens': '1', ...extra };
+    const t = keep.get();
+    if (t) out.Authorization = `Bearer ${t}`;
+    return out;
+  }
+
+  function lock() {
+    keep.clear();
+    if (locked) return;
+    locked = true;
+    emit('locked', {});
+  }
+
   async function request([method, path], body, adapt = (x) => x) {
-    const init = { method, credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json', 'X-Redis-Lens': '1' } };
+    const init = { method, credentials: 'omit', cache: 'no-store', headers: headers() };
     if (method !== 'GET') {
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body ?? {});
@@ -859,8 +1143,7 @@ export function createReal({ fetchFn = (...a) => fetch(...a), EventSourceFn = nu
       json = null;
     }
     if (res.status === 401) {
-      locked = true;
-      emit('locked', {});
+      lock();
       throw adaptError(401, json);
     }
     if (res.status === 409 && json && json.confirm) throw new ConfirmRequired(adaptConfirm(json), adapt);
@@ -868,56 +1151,41 @@ export function createReal({ fetchFn = (...a) => fetch(...a), EventSourceFn = nu
     return adapt(json ?? {});
   }
 
-  function openEvents() {
-    const Source = EventSourceFn || (typeof EventSource === 'function' ? EventSource : null);
-    if (!Source || locked) return;
-    closeEvents();
-    const es = new Source(ROUTES.events()[1]);
-    source = es;
-    for (const [name, adapt] of Object.entries(EVENT_ADAPTERS)) {
-      es.addEventListener(name, (e) => {
-        let data;
-        try {
-          data = JSON.parse(e.data);
-        } catch {
-          return;
-        }
-        emit(name, adapt(data));
-      });
-    }
-    es.onopen = () => emit('link', { up: true });
-    es.onerror = () => {
-      emit('link', { up: false });
-      // The browser retries by itself unless the stream was closed for good (an HTTP
-      // error such as 401). Then find out which, and try again a little later.
-      if (es.readyState === 2 && source === es) {
-        request(ROUTES.state(), null, adaptState).then(
-          () => {
-            retry = setTimeout(openEvents, 2000);
-          },
-          (err) => {
-            if (!err.locked) retry = setTimeout(openEvents, 4000);
-          },
-        );
+  const stream = createEventStream({
+    fetchFn,
+    url: ROUTES.events()[1],
+    headers: () => headers({ Accept: 'text/event-stream' }),
+    onEvent: ({ event, data }) => {
+      const adapt = EVENT_ADAPTERS[event];
+      if (!adapt) return;
+      let parsed;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        return;
       }
-    };
-  }
-
-  function closeEvents() {
-    if (retry) clearTimeout(retry);
-    retry = null;
-    if (source) source.close();
-    source = null;
-  }
+      emit(event, adapt(parsed));
+    },
+    onOpen: () => emit('link', { up: true }),
+    onDown: () => emit('link', { up: false }),
+    onLocked: lock,
+    ...(timers || {}),
+  });
 
   return {
     mock,
+    /** Where events go (the api's bus), stream or not: a 401 on any request locks. */
+    bind(emitFn) {
+      emit = emitFn;
+    },
     open(emitFn) {
       emit = emitFn;
-      openEvents();
+      if (!locked) stream.start();
     },
-    close: closeEvents,
-    reopen: openEvents,
+    close: () => stream.stop(),
+    reopen: () => {
+      if (!locked) stream.start();
+    },
 
     getState: () => request(ROUTES.state(), null, adaptState),
     listConnections: () => request(ROUTES.connections(), null, adaptConnections),
@@ -968,8 +1236,10 @@ export const METHODS = [
  *  the page has one path for it whether it came as a reply or as an event. */
 const STATE_METHODS = new Set(['getState', 'connect', 'disconnect', 'pickNode']);
 
-/** Wrap the implementation with the event bus and the confirm flow. */
-export function createApi(backend) {
+/** Wrap the implementation with the event bus and the confirm flow. `useBackend` swaps
+ *  the implementation (initApi does, once it knows whether `?mock` is wanted). */
+export function createApi(initial) {
+  let backend = initial;
   const listeners = new Map();
   let ask = async () => null;
   /** How many states the event stream has delivered. A reply that carries a state is
@@ -990,8 +1260,21 @@ export function createApi(backend) {
     }
   }
 
+  const relay = (name, data) => {
+    if (name === 'state') streamed += 1;
+    emit(name, data);
+  };
+  if (typeof backend.bind === 'function') backend.bind(relay);
+
   const api = {
-    mock: backend.mock === true,
+    get mock() {
+      return backend.mock === true;
+    },
+    useBackend(next) {
+      backend.close();
+      backend = next;
+      if (typeof backend.bind === 'function') backend.bind(relay);
+    },
     on(name, fn) {
       if (!listeners.has(name)) listeners.set(name, new Set());
       listeners.get(name).add(fn);
@@ -1003,10 +1286,7 @@ export function createApi(backend) {
     },
     /** Open the event stream. */
     start() {
-      backend.open((name, data) => {
-        if (name === 'state') streamed += 1;
-        emit(name, data);
-      });
+      backend.open(relay);
     },
     /** Open the event stream again now (the Reconnect button). */
     restart() {
@@ -1038,12 +1318,40 @@ export function wantsMock(search) {
   }
 }
 
-const inBrowser = typeof window !== 'undefined' && typeof window.location !== 'undefined';
+function tabStorage(win) {
+  try {
+    return win.sessionStorage;
+  } catch {
+    return null;
+  }
+}
 
-/** The one data layer the views use. */
-export const api = createApi(createReal(
-  inBrowser && wantsMock(window.location.search)
-    // `?mock&entra` shows the page as a build with Entra ID sign-in would.
-    ? { ...createMockServer({ entra: new URLSearchParams(window.location.search).has('entra') }), mock: true }
-    : {},
-));
+/** A sign-in address opened in a tab that already shows the page changes only the hash,
+ *  so the page is not loaded again: take the token out of the address now (kept for this
+ *  tab, as at boot). Returns whether there was one, so the page can start over with it. */
+export function acceptSignIn(win) {
+  return takeTokenFromAddress(win, createTokenStore(tabStorage(win)));
+}
+
+/** The one data layer the views use. It has no implementation of use until `initApi`. */
+export const api = createApi(createReal());
+
+/** Boot: take the sign-in token out of the address, then talk to redis-lens, or to the
+ *  sample servers with `?mock` (loaded only then; a release build does not serve them, and
+ *  then the page says so instead of showing anything). Returns `{ mock, error }`. */
+export async function initApi(win, { importMock = () => import('./mock.js') } = {}) {
+  const tokens = createTokenStore(tabStorage(win));
+  takeTokenFromAddress(win, tokens);
+  if (!wantsMock(win.location.search)) {
+    api.useBackend(createReal({ tokens }));
+    return { mock: false, error: null };
+  }
+  try {
+    const { createMockServer } = await importMock();
+    const server = createMockServer({ entra: new URLSearchParams(win.location.search).has('entra') });
+    api.useBackend(createReal({ fetchFn: server.fetchFn, token: server.token, mock: true }));
+    return { mock: true, error: null };
+  } catch {
+    return { mock: true, error: TEXT.noMock };
+  }
+}

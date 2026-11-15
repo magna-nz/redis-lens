@@ -386,31 +386,70 @@ export function parseTags(text) {
   return out;
 }
 
+/** The schemes redis-lens reads (valkey:// and valkeys:// are the same as redis:// and
+ *  rediss://), as the server's `parse_connection_string`. */
+const SCHEME = /^\s*(?:rediss?|valkeys?):\/\//i;
+
+/** redis-lens's own words for an address it will not read (`src/conn/parse.rs`). */
+export const ADDRESS_TEXT = {
+  scheme: 'Could not parse the connection string: only redis, rediss, valkey and valkeys URLs are supported.',
+  userinfo: 'Could not parse the connection string: the host holds a user name, a password or other URL parts; give the user name and password in a redis:// URL instead.',
+};
+
+/** The parts of a supported URL: the scheme as typed, the user info (null without an
+ *  `@`), the host and port, and what follows (path, query, fragment). The user info ends at
+ *  the last `@` before the path, as the server's URL parser reads it. */
+function urlParts(s) {
+  const scheme = SCHEME.exec(s);
+  if (!scheme) return null;
+  const rest = s.slice(scheme[0].length);
+  const cut = rest.search(/[/?#]/);
+  const authority = cut < 0 ? rest : rest.slice(0, cut);
+  const at = authority.lastIndexOf('@');
+  return {
+    head: scheme[0],
+    userinfo: at < 0 ? null : authority.slice(0, at),
+    host: authority.slice(at + 1),
+    after: cut < 0 ? '' : rest.slice(cut),
+  };
+}
+
+/** Why redis-lens will refuse an address, before it is sent (null when it may be sent):
+ *  another scheme, or an `@` anywhere but in a supported URL's user info (in the host, the
+ *  path or query, or the host of a host:port string). The server stays the judge of the
+ *  rest; this keeps a password in an address it cannot read from leaving the page. */
+export function addressProblem(text) {
+  const s = String(text ?? '').trim();
+  if (!s) return null;
+  const url = urlParts(s);
+  if (url) return url.after.includes('@') ? ADDRESS_TEXT.userinfo : null;
+  if (s.includes('://')) return ADDRESS_TEXT.scheme;
+  // host:port[,option=value...]: an option's value (a password) may hold anything.
+  const endpoints = s.split(',').filter((token) => !token.includes('='));
+  if (endpoints.some((token) => token.includes('@'))) return ADDRESS_TEXT.userinfo;
+  return null;
+}
+
 /** Take a password out of a pasted connection string, so it can go into the password box
  *  instead of sitting readable in the address box. Returns `{ url, password }`; `password`
  *  is null when there was none, or when taking it out is not clear-cut (a percent-escape,
- *  a `?password=` parameter): then the string is left alone and the server reads it.
- *  It follows the server's parser: for a URL the user info ends at the last `@` before the
- *  path; for the StackExchange.Redis form the `password=` option goes. */
+ *  a `?password=` parameter, an address redis-lens will not read): then the string is left
+ *  alone. It follows the server's parser: for a redis, rediss, valkey or valkeys URL the
+ *  user info ends at the last `@` before the path; for the StackExchange.Redis form the
+ *  `password=` option goes. */
 export function splitUrlSecret(text) {
   const s = String(text ?? '');
   const none = { url: s, password: null };
-  const scheme = /^\s*rediss?:\/\//i.exec(s);
-  if (scheme) {
-    const head = scheme[0];
-    const rest = s.slice(head.length);
-    const cut = rest.search(/[/?#]/);
-    const authority = cut < 0 ? rest : rest.slice(0, cut);
-    const after = cut < 0 ? '' : rest.slice(cut);
-    const at = authority.lastIndexOf('@');
-    if (at < 0) return none;
-    const userinfo = authority.slice(0, at);
-    const colon = userinfo.indexOf(':');
+  if (addressProblem(s)) return none;
+  const url = urlParts(s);
+  if (url) {
+    if (url.userinfo === null) return none;
+    const colon = url.userinfo.indexOf(':');
     if (colon < 0) return none;
-    const user = userinfo.slice(0, colon);
-    const password = userinfo.slice(colon + 1);
+    const user = url.userinfo.slice(0, colon);
+    const password = url.userinfo.slice(colon + 1);
     if (!password || password.includes('%')) return none;
-    return { url: `${head}${user ? `${user}@` : ''}${authority.slice(at + 1)}${after}`, password };
+    return { url: `${url.head}${user ? `${user}@` : ''}${url.host}${url.after}`, password };
   }
   if (s.includes('://')) return none;
   const tokens = s.split(',');
@@ -432,14 +471,10 @@ export function splitUrlSecret(text) {
 export function urlHasSecret(text) {
   const s = String(text ?? '');
   if (/password\s*=\s*[^,&\s]/i.test(s)) return true;
-  const scheme = /^\s*rediss?:\/\//i.exec(s);
-  if (!scheme) return false;
-  const authority = s.slice(scheme[0].length).split(/[/?#]/)[0];
-  const at = authority.lastIndexOf('@');
-  if (at < 0) return false;
-  const userinfo = authority.slice(0, at);
-  const colon = userinfo.indexOf(':');
-  return colon >= 0 && colon < userinfo.length - 1;
+  const url = urlParts(s);
+  if (!url || url.userinfo === null) return false;
+  const colon = url.userinfo.indexOf(':');
+  return colon >= 0 && colon < url.userinfo.length - 1;
 }
 
 /** Obvious mistakes in the add form, by field name. The server stays the judge of
@@ -449,8 +484,9 @@ export function checkAddForm(form) {
   const errors = {};
   const name = String(form.name ?? '').trim();
   const url = String(form.url ?? '').trim();
-  if (!url) errors.url = 'Paste a redis:// or rediss:// URL, or a host:port string.';
+  if (!url) errors.url = 'Paste a redis://, rediss://, valkey:// or valkeys:// URL, or a host:port string.';
   else if (/\s/.test(url)) errors.url = 'A connection string has no spaces.';
+  else if (addressProblem(url)) errors.url = addressProblem(url);
   if (!name) errors.name = 'Give the connection a name.';
   else if (/^docker:/i.test(name)) errors.name = 'Names starting with docker: are kept for containers found in Docker.';
   else if (/[\s/\\]/.test(name)) errors.name = 'A name has no spaces or slashes.';

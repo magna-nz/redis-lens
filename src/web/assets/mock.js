@@ -1,9 +1,14 @@
 // redis-lens dashboard: sample data, used when the address has `?mock`.
 //
 // It stands in for the redis-lens process at the HTTP level: `createMockServer()` returns
-// a `fetch` and an `EventSource` that answer the routes of docs/dashboard-api.md with the
-// same JSON, status codes and events the real server sends. So `?mock` runs the very same
-// adapters and views as the real thing. The data is the approved mockup's.
+// a `fetch` that answers the routes of docs/dashboard-api.md with the same JSON, status
+// codes and event stream the real server sends, and the `token` it signs in with. Like the
+// real server, every /api/* route answers 401 without `Authorization: Bearer <token>`, and
+// /api/events is a byte stream of Server-Sent Events (each event split in two at a varying
+// place, so the page's stream parser is exercised as a network would). So `?mock` runs the
+// very same code as the real thing. The data is the approved mockup's.
+//
+// Release builds of redis-lens do not serve this file (debug builds only).
 //
 // Nothing here talks to a network, and nothing a form sends is kept: a password least of
 // all (the mock only notes whether one was given). Like the real server it refuses a body
@@ -16,6 +21,8 @@ const GONE = 'that question is no longer open: it was answered, cancelled or exp
 const CANCELLED = 'Cancelled: nothing was sent.';
 const PERMS = ['SCAN', 'TYPE · TTL', 'MEMORY USAGE', 'OBJECT FREQ', 'INFO', 'MEMORY STATS', 'SLOWLOG', 'CLIENT LIST', 'XINFO', 'PUBSUB', 'FT._LIST', 'ACL DRYRUN'];
 const noperm = (cmd) => `NOPERM ${cmd} is not allowed for this user`;
+/** The sample servers' session token. It signs in to nothing real. */
+export const MOCK_TOKEN = 'a'.repeat(64);
 
 /** A sample Pub/Sub message for a channel, from the mockup. */
 export function sampleMessage(channel, n) {
@@ -187,6 +194,12 @@ export function createMockServer({ entra = false } = {}) {
     for (const s of Array.from(sources)) s.deliver(name, data);
   }
   const emitState = () => emit('state', state());
+  /** The `overview` event: GET /api/overview's body without `live` and `shards`. */
+  const emitOverview = () => {
+    if (!session || session.status !== 'connected') return;
+    const { live: _live, shards: _shards, ...rest } = overview();
+    emit('overview', rest);
+  };
 
   function info(p, node) {
     const s = p.sim;
@@ -202,6 +215,7 @@ export function createMockServer({ entra = false } = {}) {
 
   function onTick() {
     tick += 1;
+    if (tick % 15 === 0) for (const sub of Array.from(sources)) sub.send(': keep-alive\n\n');
     const s = session;
     // The live figures: at the polling interval, and not at all while paused.
     if (live() && !polling.paused && tick % polling.interval_secs === 0) {
@@ -261,38 +275,65 @@ export function createMockServer({ entra = false } = {}) {
     return true;
   }
 
-  class MockEventSource {
-    constructor() {
-      this.readyState = 0;
-      this.listeners = {};
-      this.onopen = null;
-      this.onerror = null;
-      sources.add(this);
-      if (!timer) timer = setInterval(onTick, 1000);
-      setTimeout(() => {
-        if (this.readyState === 2) return;
-        this.readyState = 1;
-        if (this.onopen) this.onopen();
-        this.deliver('state', state());
-      }, 0);
-    }
-
-    addEventListener(name, fn) {
-      this.listeners[name] = fn;
-    }
-
-    deliver(name, data) {
-      if (this.readyState === 1 && this.listeners[name]) this.listeners[name]({ data: JSON.stringify(data) });
-    }
-
-    close() {
-      this.readyState = 2;
-      sources.delete(this);
+  /** One open `/api/events` stream: SSE text as bytes. The first event is the state,
+   *  as on the real server; a keep-alive comment goes out now and then. */
+  let splitSeq = 0;
+  function openStream(signal) {
+    const encoder = new TextEncoder();
+    let controller = null;
+    let closed = false;
+    const sub = {
+      deliver(name, data) {
+        sub.send(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`);
+      },
+      send(text) {
+        if (closed) return;
+        const bytes = encoder.encode(text);
+        splitSeq += 1;
+        const cut = (splitSeq * 7) % bytes.length;
+        if (cut) {
+          controller.enqueue(bytes.slice(0, cut));
+          controller.enqueue(bytes.slice(cut));
+        } else controller.enqueue(bytes);
+      },
+      /** The stream ends (redis-lens went away for a moment): the page tries again. */
+      end() {
+        if (closed) return;
+        drop();
+        controller.close();
+      },
+    };
+    function drop() {
+      closed = true;
+      sources.delete(sub);
       if (!sources.size && timer) {
         clearInterval(timer);
         timer = null;
       }
     }
+    const body = new ReadableStream({
+      start(c) {
+        controller = c;
+        sources.add(sub);
+        if (!timer) timer = setInterval(onTick, 1000);
+        setTimeout(() => sub.deliver('state', state()), 0);
+      },
+      cancel() {
+        drop();
+      },
+    });
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        if (closed) return;
+        drop();
+        try {
+          controller.error(new Error('aborted'));
+        } catch {
+          // Already closed.
+        }
+      });
+    }
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
   }
 
   // ---------- confirms ----------
@@ -434,7 +475,10 @@ export function createMockServer({ entra = false } = {}) {
   // ---------- the command line ----------
 
   const one = (text, table = text, json = text, raw = text) => ({ cut: false, error: false, json, raw, table, text, took_ms: 0.18 + ((tick * 37) % 400) / 1000 });
-  const line = (shown, status, text, replies = [], times = 1) => [200, { line: shown, node: null, replies, route_note: null, sent: replies.length, status, text, times }];
+  const line = (shown, status, text, replies = [], times = 1, dropped = 0) => [200, {
+    dropped, dropped_note: dropped ? `(the first ${dropped} replies were dropped: the output keeps at most 4 MiB)` : null,
+    line: shown, node: null, replies, route_note: null, sent: replies.length + dropped, status, text, times,
+  }];
   const WRITES = ['SET', 'DEL', 'UNLINK', 'EXPIRE', 'HSET', 'LPUSH', 'FLUSHALL', 'FLUSHDB', 'INCR', 'PUBLISH'];
   const DESTRUCTIVE = ['DEL', 'UNLINK', 'FLUSHALL', 'FLUSHDB'];
 
@@ -456,12 +500,14 @@ export function createMockServer({ entra = false } = {}) {
       }, 200);
       return line(text, 'note', 'The sample data now loses its connection to the server.');
     }
+    if (upper === 'MOCK DROPPED') {
+      // A repeat whose replies went past the 4 MiB the output keeps.
+      const kept = [0, 1].map(() => one(['"…"'], ['"…"'], ['"…"'], ['[bulk string] …']));
+      return line(text, 'ok', null, kept, 5, 3);
+    }
     if (upper === 'MOCK LINK DOWN') {
       setTimeout(() => {
-        for (const s of Array.from(sources)) {
-          s.readyState = 0;
-          if (s.onerror) s.onerror();
-        }
+        for (const s of Array.from(sources)) s.end();
       }, 200);
       return line(text, 'note', 'The sample data now loses its line to redis-lens.');
     }
@@ -563,6 +609,11 @@ export function createMockServer({ entra = false } = {}) {
         if (!session || connSeq !== mine) return;
         session.live = 'ready';
         emitState();
+        // What the connect read for Overview (its findings) lands after the live
+        // connection is ready, as on the real server.
+        later(300).then(() => {
+          if (session && connSeq === mine) emitOverview();
+        });
       });
     });
     return [202, state()];
@@ -691,6 +742,7 @@ export function createMockServer({ entra = false } = {}) {
       session.picked = body.index;
       lastOps = null;
       emitState();
+      emitOverview();
       return [200, state()];
     }
     if (key === 'GET /api/overview') return session ? [200, overview()] : [409, { error: NOT_LIVE }];
@@ -737,6 +789,7 @@ export function createMockServer({ entra = false } = {}) {
     if (key === 'POST /api/pubsub/publish') return publish(p, body);
     if (key === 'POST /api/cmdline') {
       if (typeof body.line !== 'string') return [400, { error: SHAPE }];
+      if (body.line.length > 8192) return [413, { error: 'Not sent: a line holds at most 8,192 characters.' }];
       return command(body.line.trim());
     }
     if (path === '/api/cmdline/commands' && method === 'GET') return [200, p.sim.denied.SLOWLOG ? { off: 'the server refused COMMAND LIST for this user' } : { names: COMMAND_NAMES }];
@@ -813,7 +866,19 @@ export function createMockServer({ entra = false } = {}) {
     return send();
   }
 
+  /** Like the real server: one `Authorization: Bearer <token>` header, any case of the scheme. */
+  function signedIn(init) {
+    const headers = init.headers || {};
+    const values = Object.keys(headers).filter((k) => k.toLowerCase() === 'authorization').map((k) => headers[k]);
+    return values.length === 1 && /^bearer /i.test(values[0]) && values[0].slice(7) === MOCK_TOKEN;
+  }
+
   async function fetchFn(path, init = {}) {
+    if (String(path).startsWith('/api/') && !signedIn(init)) {
+      await later(20);
+      return { status: 401, ok: false, body: null, json: async () => ({ error: 'not signed in' }) };
+    }
+    if (path === '/api/events' && (init.method || 'GET') === 'GET') return openStream(init.signal);
     let body = {};
     try {
       body = init.body ? JSON.parse(init.body) : {};
@@ -826,5 +891,5 @@ export function createMockServer({ entra = false } = {}) {
     return { status, ok: status >= 200 && status < 300, json: async () => copy };
   }
 
-  return { fetchFn, EventSourceFn: MockEventSource };
+  return { fetchFn, token: MOCK_TOKEN };
 }

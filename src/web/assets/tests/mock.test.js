@@ -429,16 +429,46 @@ test('Entra ID is offered only by a build that has it', async () => {
   await assert.rejects(mockApi().api.addConnection({ name: 'az', url: 'rediss://x:1', tags: [], entra: true }), /Entra ID/);
 });
 
+test('the overview event: the findings arrive after the live connection is ready, and with another node', async () => {
+  const { api } = mockApi();
+  const events = [];
+  api.on('overview', (o) => events.push(o));
+  await connected(api, { name: 'prod-cache-01' });
+  for (let i = 0; i < 20 && !events.length; i += 1) await wait(50);
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0].findings.map((f) => f.where), ['slowlog', 'clients']);
+  assert.equal(events[0].figures, null, 'no live figures in the event: they come with figures');
+  assert.deepEqual(events[0].shards, [], 'no shard rows in the event');
+  await api.connect({ name: 'demo-cluster' });
+  for (let i = 0; i < 40 && events.length < 2; i += 1) await wait(50);
+  await api.pickNode(1);
+  for (let i = 0; i < 20 && events.length < 3; i += 1) await wait(50);
+  assert.ok(events.length >= 3, 'picking a node sends it again');
+  api.stop();
+});
+
+test('the command line: the 4 MiB notice, and a line too long', async () => {
+  const { api } = mockApi();
+  await connected(api, { name: 'demo-cluster' });
+  api.stop();
+  const big = await api.runCommand('MOCK DROPPED');
+  assert.equal(big.dropped, 3);
+  assert.equal(big.droppedNote, '(the first 3 replies were dropped: the output keeps at most 4 MiB)');
+  assert.equal((await api.runCommand('PING')).droppedNote, null);
+  await assert.rejects(api.runCommand(`GET ${'k'.repeat(8200)}`), (err) => err.status === 413 && err.message === 'Not sent: a line holds at most 8,192 characters.');
+});
+
 test('like the real server, the mock refuses a body with a field it does not know', async () => {
   const { server } = mockApi();
-  const post = async (path, body) => (await server.fetchFn(path, { method: 'POST', body: JSON.stringify(body) })).status;
+  const headers = { Authorization: `Bearer ${server.token}` };
+  const post = async (path, body) => (await server.fetchFn(path, { method: 'POST', headers, body: JSON.stringify(body) })).status;
   assert.equal(await post('/api/connections', { name: 'a', url: 'redis://h', tls: true }), 400);
   assert.equal(await post('/api/connections', { name: 'a', url: 'redis://h', token_command_confirmed: true }), 400);
   assert.equal(await post('/api/connect', { name: 'prod-cache-01', extra: 1 }), 400);
   assert.equal(await post('/api/connect', { name: 'prod-cache-01', docker: 'demo-redis' }), 400);
   assert.equal(await post('/api/polling', { live: false }), 400);
   assert.equal(await post('/api/session/writes', { writes: true }), 400);
-  assert.equal((await server.fetchFn('/api/connections/prod-cache-01', { method: 'PATCH', body: JSON.stringify({ env: 'stage' }) })).status, 400);
+  assert.equal((await server.fetchFn('/api/connections/prod-cache-01', { method: 'PATCH', headers, body: JSON.stringify({ env: 'stage' }) })).status, 400);
 });
 
 test('removing a connection; a Docker container connects by its name', async () => {

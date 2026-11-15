@@ -586,3 +586,12 @@ test('?mock picks the sample data', () => {
   assert.equal(wantsMock(''), false);
   assert.equal(wantsMock(undefined), false);
 });
+
+test('a command line reply: the replies dropped past 4 MiB, and the TUI\'s notice for them', () => {
+  const r = adaptReply({ line: '500 GET k', status: 'ok', replies: [], times: 500, sent: 500, dropped: 120, dropped_note: '(the first 120 replies were dropped: the output keeps at most 4 MiB)' });
+  assert.equal(r.dropped, 120);
+  assert.equal(r.droppedNote, '(the first 120 replies were dropped: the output keeps at most 4 MiB)');
+  const plain = adaptReply({ line: 'PING', status: 'ok', replies: [] });
+  assert.equal(plain.dropped, 0);
+  assert.equal(plain.droppedNote, null);
+});

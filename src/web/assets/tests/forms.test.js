@@ -2,7 +2,7 @@
 // splitting a token command into arguments, tags, the obvious-mistake checks, the router.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { splitArgs, parseTags, splitUrlSecret, urlHasSecret, checkAddForm, parseRoute } from '../ui.js';
+import { splitArgs, parseTags, splitUrlSecret, urlHasSecret, checkAddForm, parseRoute, addressProblem, ADDRESS_TEXT } from '../ui.js';
 import { guessName } from '../views/connections.js';
 
 test('a password pasted in a URL moves out of the address', () => {
@@ -43,6 +43,33 @@ test('an address that still holds a password is known, so the form can empty it 
   for (const s of ['rediss://app:s3cret@h:6380/0', 'h:6380,password=s3cret,ssl=True']) {
     assert.equal(urlHasSecret(splitUrlSecret(s).url), false, 'nothing is left once the password moved out');
   }
+});
+
+test('valkey:// and valkeys:// are read like redis:// and rediss://: the password moves out', () => {
+  assert.deepEqual(splitUrlSecret('valkey://app:s3cret@cache:6379/0'), { url: 'valkey://app@cache:6379/0', password: 's3cret' });
+  assert.deepEqual(splitUrlSecret('valkeys://:s3cret@cache:6380'), { url: 'valkeys://cache:6380', password: 's3cret' });
+  assert.deepEqual(splitUrlSecret('VALKEYS://u:a@b@host/1'), { url: 'VALKEYS://u@host/1', password: 'a@b' });
+  assert.equal(urlHasSecret('valkey://u:p@h'), true);
+  assert.equal(urlHasSecret('valkeys://u@h'), false);
+  assert.equal(addressProblem('valkeys://u:p@h:6380/0'), null);
+  assert.equal(guessName('valkey://cache-07.internal:6379'), 'cache-07');
+});
+
+test('an address redis-lens will not read is refused before sending, in its words, and never split', () => {
+  for (const bad of ['http://u:pw@host:6379', 'https://host', 'ftp://h', 'redis+sentinel://h:26379', 'unix:///tmp/redis.sock', 'host:6379,ssl=true,x=http://u:p@evil']) {
+    assert.equal(addressProblem(bad), ADDRESS_TEXT.scheme, bad);
+    assert.deepEqual(splitUrlSecret(bad), { url: bad, password: null }, `${bad} is not split`);
+    assert.equal(checkAddForm({ url: bad, name: 'n' }).url, ADDRESS_TEXT.scheme, bad);
+  }
+  for (const bad of ['u:pw@host:6379', 'user@host', 'h1:6379,u:p@h2:6379', 'redis://host:6379/0?x=a@b', 'redis://host/u:p@x']) {
+    assert.equal(addressProblem(bad), ADDRESS_TEXT.userinfo, bad);
+    assert.equal(splitUrlSecret(bad).password, null, `${bad} is not split`);
+  }
+  assert.match(ADDRESS_TEXT.scheme, /only redis, rediss, valkey and valkeys URLs are supported/);
+  for (const good of ['redis://u:p@h:1/0', 'rediss://h', 'valkey://h', 'host:6379', 'host:6379,password=p@ss,ssl=True', '[::1]:6379', '']) {
+    assert.equal(addressProblem(good), null, good);
+  }
+  assert.deepEqual(splitUrlSecret('host:6379,password=p@ss'), { url: 'host:6379', password: 'p@ss' }, 'an @ in the password option is the password\'s');
 });
 
 test('a token command is split into arguments like a shell', () => {

@@ -277,20 +277,21 @@ export function mount(root, ctx) {
     return true;
   };
 
+  /** Draw a reading: the reply to GET /api/overview, or an `overview` event. */
+  function take(next) {
+    data = next;
+    drawSubtitle();
+    drawPatterns();
+    drawLive();
+    if (changed('shards', data.shards)) drawShards();
+    if (changed('findings', data.findings)) drawFindings();
+    if (changed('off', [data.figuresFailed, data.gaps, data.checks, data.provider])) drawOff();
+  }
+
   async function load() {
     try {
       const next = await ctx.api.getOverview();
-      if (!alive) return;
-      const first = data === null;
-      data = next;
-      if (first) {
-        drawSubtitle();
-        drawPatterns();
-      }
-      drawLive();
-      if (changed('shards', data.shards)) drawShards();
-      if (changed('findings', data.findings)) drawFindings();
-      if (changed('off', [data.figuresFailed, data.gaps, data.checks, data.provider])) drawOff();
+      if (alive) take(next);
     } catch (err) {
       if (!alive) return;
       drawnFrom.findings = null;
@@ -305,22 +306,21 @@ export function mount(root, ctx) {
     }
     drawLive();
   };
-  const offs = [ctx.api.on('figures', redraw), ctx.api.on('live', () => drawLive())];
+  // redis-lens sends `overview` when what the connect read changes (its findings land
+  // after the live connection is open, another node is picked, ...). The event has no live
+  // figures and no shard rows: those come with `figures`, so the ones drawn are kept.
+  const fromEvent = (next) => {
+    if (!alive) return;
+    take({ ...next, figures: data ? data.figures : null, shards: data ? data.shards : [] });
+  };
+  const offs = [ctx.api.on('figures', redraw), ctx.api.on('live', () => drawLive()), ctx.api.on('overview', fromEvent)];
   drawSubtitle();
   drawLive();
   drawPatterns();
   load();
-  // The findings come from the slow log and client list the connect reads once its live
-  // connection is open, and from the Server panels read since; no event says they moved.
-  // GET /api/overview answers from what redis-lens already holds (nothing goes to the
-  // server), so it is read again now and then while the figures are live.
-  const again = setInterval(() => {
-    if (ctx.state().live && !document.hidden) load();
-  }, 5000);
 
   return () => {
     alive = false;
-    clearInterval(again);
     offs.forEach((off) => off());
   };
 }

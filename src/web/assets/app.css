@@ -226,6 +226,7 @@ h2.lbl { margin: 0 0 8px; }
   white-space: nowrap;
 }
 .badge.env-prod { border-color: var(--accent); color: var(--text); }
+.badge.sample { border-color: var(--blue); color: var(--text); font-weight: 600; }
 
 .field {
   min-height: 44px;
@@ -517,6 +518,7 @@ fieldset.group > legend { padding: 0 6px; font-size: 12px; font-weight: 600; let
 .cmd-in .prompt { color: var(--accent); font-family: var(--mono); }
 .cmd-help { min-height: 20px; overflow-wrap: anywhere; }
 .cmd-in input { flex: 1; min-width: 0; height: 40px; border: 0; background: transparent; font-family: var(--mono); font-size: 13px; outline: none; }
+.cmd-in .cmd-run { min-height: 32px; padding: 0 12px; font-size: 13px; }
 
 /* ---------- Locked page ---------- */
 
