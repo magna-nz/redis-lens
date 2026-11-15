@@ -1359,7 +1359,7 @@ impl SlowLog {
 
 /// How many `COMMAND INFO` rounds a ranking asks at most (names, then containers'
 /// subcommands, 64 names a round).
-const MAX_LOOKUPS: u8 = 8;
+pub const MAX_LOOKUPS: u8 = 8;
 /// The longest profile name the prompt takes.
 const MAX_TYPED: usize = 256;
 

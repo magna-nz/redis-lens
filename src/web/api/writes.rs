@@ -7,7 +7,10 @@
 //! Type is held as an [`Action::Write`] and the browser is asked; the answer is checked
 //! by `grant` again, on the same connection and the same run only: a database switch
 //! or an analysis started since the question refuses it ([`CHANGED`]), as the TUI drops
-//! its question on a new run.
+//! its question on a new run. A write sent to the picked node (a keyless one on a
+//! cluster: `FT.CREATE`, `FT.DROPINDEX`) is for that node only: another node picked since
+//! refuses it the same way. Every write but a typed command's is refused while a bulk
+//! action counts or runs, checked under the lock that decides and the one that grants.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -15,7 +18,7 @@ use axum::response::Response;
 use serde::{Deserialize, Serialize};
 
 use super::{App, Body, Question, Refused, SHAPE, error, ok};
-use crate::live::{CANCELLED, Dest, LiveError, LiveReply};
+use crate::live::{CANCELLED, Dest, LiveError, LiveReply, To};
 use crate::tui::app::ConnId;
 use crate::tui::app::views::write_dest;
 use crate::web::dto;
@@ -29,6 +32,8 @@ pub enum Action {
         conn: ConnId,
         /// The run of the session the question was asked in ([`run_of`]).
         run: u64,
+        /// For a write sent to the picked node: that node ([`MadeFor::node`]).
+        node: Option<usize>,
         op: WriteOp,
         dest: Dest,
         decision: Decision,
@@ -144,11 +149,55 @@ pub fn run_of(c: &crate::web::session::Current) -> (ConnId, u64) {
     (c.id, c.session.scan)
 }
 
+/// What a write was made for: the connection and run of the session ([`run_of`]), and
+/// for a write that goes to the picked node, that node. Anything else since (a new run,
+/// another connection, another node picked) refuses it with [`CHANGED`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MadeFor {
+    pub conn: ConnId,
+    pub run: u64,
+    /// The picked node the write was made for (the node its list was read on, or the one
+    /// it is sent to), when it goes to the picked node.
+    pub node: Option<usize>,
+}
+
+impl MadeFor {
+    /// The connection and run of `c` now.
+    pub fn of(c: &crate::web::session::Current) -> Self {
+        let (conn, run) = run_of(c);
+        Self {
+            conn,
+            run,
+            node: None,
+        }
+    }
+
+    /// The same, on the node picked now: for a write made from what that node listed.
+    pub fn on_picked(c: &crate::web::session::Current) -> Self {
+        Self {
+            node: Some(c.session.picked),
+            ..Self::of(c)
+        }
+    }
+
+    /// The session is still what the write was made for.
+    pub fn holds(&self, c: &crate::web::session::Current) -> bool {
+        run_of(c) == (self.conn, self.run) && self.node.is_none_or(|n| n == c.session.picked)
+    }
+}
+
+/// A bulk action counts or runs on `c`: no write but a typed command's is sent meanwhile
+/// (spec "Screens (phase 3)": the TUI's bulk dialog takes every key until it ends).
+fn bulk_busy(c: &crate::web::session::Current) -> bool {
+    c.bulk.as_ref().is_some_and(super::bulk::Bulk::busy)
+}
+
 /// What [`decide`] found: where the write goes and what the gate says about it.
 #[derive(Debug)]
 pub struct Decided {
-    pub conn: ConnId,
-    pub run: u64,
+    /// What the write is for: the connection, the run and, when it goes to the picked
+    /// node, that node. The grant checks it again ([`grant_write`]).
+    pub made: MadeFor,
     pub dest: Dest,
     pub decision: Decision,
     /// The profile's name, escaped, for the question.
@@ -156,18 +205,19 @@ pub struct Decided {
 }
 
 /// Where `op` goes and what the gate says about it on the current connection, or why it
-/// is not sent. `made_for` is the connection and run `op` was built from (a key edit
-/// reads the open value): another one since is refused with [`CHANGED`], so an edit
-/// never lands on another database or server than the one it was made for.
-pub fn decide(
-    app: &App,
-    op: &WriteOp,
-    made_for: Option<(ConnId, u64)>,
-) -> Result<Decided, Refused> {
+/// is not sent. `made_for` is the connection and run (and node) `op` was built from (a key
+/// edit reads the open value, a Search write the picked node's list): another one since
+/// is refused with [`CHANGED`], so an edit never lands on another database, server or
+/// node than the one it was made for. While a bulk action counts or runs it is refused
+/// with [`super::bulk::BUSY`], under the same lock as the decision.
+pub fn decide(app: &App, op: &WriteOp, made_for: Option<MadeFor>) -> Result<Decided, Refused> {
     app.hub
         .with(|c| {
-            if made_for.is_some_and(|m| m != run_of(c)) {
+            if made_for.is_some_and(|m| !m.holds(c)) {
                 return Err(Refused::new(StatusCode::CONFLICT, CHANGED));
+            }
+            if bulk_busy(c) {
+                return Err(Refused::new(StatusCode::CONFLICT, super::bulk::BUSY));
             }
             if !c.live_ready() {
                 return Err(Refused::new(StatusCode::CONFLICT, super::NOT_LIVE));
@@ -183,10 +233,13 @@ pub fn decide(
                 }
                 d => d,
             };
-            let (conn, run) = run_of(c);
+            let mut made = made_for.unwrap_or_else(|| MadeFor::of(c));
+            // Sent to the picked node (a keyless write on a cluster): for that node only.
+            if c.session.is_cluster() && dest.to == To::Node(c.session.picked) {
+                made.node = Some(c.session.picked);
+            }
             Ok(Decided {
-                conn,
-                run,
+                made,
                 dest,
                 decision,
                 profile: crate::value::escape(&c.profile().name),
@@ -204,17 +257,50 @@ pub fn decide(
 
 /// The permit for `op` on connection `conn` in run `run` with `answer`, from the gate
 /// itself. Another connection, or a new run of it (a database switch, an analysis), is
-/// refused with [`CHANGED`]: the write was decided for what the session was then.
+/// refused with [`CHANGED`]: the write was decided for what the session was then. For a
+/// typed command's write and a bulk action's own run, which a bulk action does not stop;
+/// every other write takes [`grant_write`].
 pub fn grant(
     app: &App,
     (conn, run): (ConnId, u64),
     op: WriteOp,
     answer: &Answer,
 ) -> Result<Permit, Refused> {
+    let made = MadeFor {
+        conn,
+        run,
+        node: None,
+    };
+    granted(app, made, false, op, answer)
+}
+
+/// [`grant`] for a write made for `made` ([`decide`]): refused with [`CHANGED`] when the
+/// session is another since (a new run, another connection, another node picked), and
+/// with [`super::bulk::BUSY`] while a bulk action counts or runs, under the lock that
+/// grants it.
+pub fn grant_write(
+    app: &App,
+    made: MadeFor,
+    op: WriteOp,
+    answer: &Answer,
+) -> Result<Permit, Refused> {
+    granted(app, made, true, op, answer)
+}
+
+fn granted(
+    app: &App,
+    made: MadeFor,
+    bulk_stops: bool,
+    op: WriteOp,
+    answer: &Answer,
+) -> Result<Permit, Refused> {
     app.hub
         .with(|c| {
-            if run_of(c) != (conn, run) {
+            if !made.holds(c) {
                 return Err(Refused::new(StatusCode::CONFLICT, CHANGED));
+            }
+            if bulk_stops && bulk_busy(c) {
+                return Err(Refused::new(StatusCode::CONFLICT, super::bulk::BUSY));
             }
             Permit::grant(op, c.profile(), &c.settings, &c.session.refusals, answer).map_err(
                 |why| {
@@ -231,8 +317,9 @@ pub fn profile_data(p: &crate::model::Profile) -> [&str; 2] {
     [p.name.as_str(), p.endpoint.host.as_str()]
 }
 
-/// Why an answer is not used: the connection it was about is gone, or the session
-/// started a new run on it (another database, an analysis).
+/// Why an answer is not used: the connection it was about is gone, the session
+/// started a new run on it (another database, an analysis), or another node was picked
+/// for a write sent to the picked node.
 pub const CHANGED: &str = "Not sent: the connection changed since the question was asked.";
 
 /// Sends a granted write and says how it went.
@@ -258,18 +345,17 @@ pub async fn write_flow(app: &App, op: WriteOp) -> Response {
 
 /// [`write_flow`] for a key edit: once sent (now, or when its question is answered),
 /// what `edit` names is read again and the reply says how it went
-/// ([`super::edits::send`]). `made_for` is the connection and run the op was built
-/// from: refused with [`CHANGED`] when the session is another since ([`decide`]).
+/// ([`super::edits::send`]). `made_for` is the connection and run (and node) the op was
+/// built from: refused with [`CHANGED`] when the session is another since ([`decide`]).
 pub async fn write_flow_then(
     app: &App,
     op: WriteOp,
     edit: Option<super::edits::After>,
-    made_for: Option<(ConnId, u64)>,
+    made_for: Option<MadeFor>,
 ) -> Response {
     app.hub.follow_saved_profile().await;
     let Decided {
-        conn,
-        run,
+        made,
         dest,
         decision,
         profile,
@@ -279,10 +365,10 @@ pub async fn write_flow_then(
     };
     match &decision {
         Decision::Refuse(why) => error(StatusCode::UNPROCESSABLE_ENTITY, why),
-        Decision::Run => match grant(app, (conn, run), op, &Answer::None) {
+        Decision::Run => match grant_write(app, made, op, &Answer::None) {
             Ok(p) => match edit {
-                Some(after) => super::edits::send(app, conn, dest, p, after).await,
-                None => send(app, conn, dest, p).await,
+                Some(after) => super::edits::send(app, made.conn, dest, p, after).await,
+                None => send(app, made.conn, dest, p).await,
             },
             Err(r) => r.into_response(),
         },
@@ -292,8 +378,9 @@ pub async fn write_flow_then(
             };
             app.ask(
                 Action::Write {
-                    conn,
-                    run,
+                    conn: made.conn,
+                    run: made.run,
+                    node: made.node,
                     op,
                     dest,
                     decision,
@@ -352,6 +439,7 @@ pub async fn answer(
         Action::Write {
             conn,
             run,
+            node,
             op,
             dest,
             decision,
@@ -364,7 +452,15 @@ pub async fn answer(
             };
             // The profile may have gone read-only since the question was asked.
             app.hub.follow_saved_profile().await;
-            let permit = match grant(&app, (conn, run), op, &answer) {
+            // A typed command's write goes during a bulk action (spec "Screens (phase
+            // 3)"); every other one asked before a bulk action started is refused while
+            // it counts or runs, checked by the grant itself.
+            let granted = if cmd.is_some() {
+                grant(&app, (conn, run), op, &answer)
+            } else {
+                grant_write(&app, MadeFor { conn, run, node }, op, &answer)
+            };
+            let permit = match granted {
                 Ok(p) => p,
                 Err(r) => return r.into_response(),
             };

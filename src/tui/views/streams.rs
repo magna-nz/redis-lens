@@ -144,7 +144,7 @@ pub fn claim_op(key: &str, group: &str, form: &Form) -> Result<WriteOp, String> 
 }
 
 /// A stream ID as `XTRIM MINID` takes it: `ms` or `ms-seq`.
-fn is_stream_id(s: &str) -> bool {
+pub(crate) fn is_stream_id(s: &str) -> bool {
     let mut parts = s.splitn(2, '-');
     let ms = parts.next().unwrap_or("");
     let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
@@ -1017,7 +1017,7 @@ pub(crate) fn streams_by_node(
 
 /// Why a view is off, in redis-lens's own words ([`LiveError`]'s texts never hold the
 /// server's).
-pub(super) fn off_text(e: &LiveError) -> String {
+pub(crate) fn off_text(e: &LiveError) -> String {
     let why = e.to_string();
     let mut c = why.chars();
     let first = c.next().map(|f| f.to_uppercase().to_string());

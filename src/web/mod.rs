@@ -266,8 +266,8 @@ pub(crate) fn app_state(
 /// Every route, behind the guard, every response with the security headers.
 pub(crate) fn router(app: api::App) -> Router {
     use api::{
-        analyze, browse, bulk, cmdline, connections, edits, keys, overview, pubsub, server,
-        snapshots, values, writes,
+        analyze, browse, bulk, cmdline, connections, edits, hot, keys, overview, pubsub, search,
+        server, snapshots, streams, values, writes,
     };
     let guard = app.page.guard.clone();
     Router::new()
@@ -325,6 +325,17 @@ pub(crate) fn router(app: api::App) -> Router {
             get(bulk::get).post(bulk::start).delete(bulk::stop),
         )
         .route("/api/bulk/run", post(bulk::run))
+        .route("/api/streams", get(streams::list))
+        .route("/api/streams/pending", get(streams::pending))
+        .route("/api/streams/ack", post(streams::ack))
+        .route("/api/streams/claim", post(streams::claim))
+        .route("/api/streams/trim", post(streams::trim))
+        .route("/api/search", get(search::list))
+        .route("/api/search/query", post(search::query))
+        .route("/api/search/results", get(search::results))
+        .route("/api/search/field", get(search::field))
+        .route("/api/search/create", post(search::create))
+        .route("/api/search/drop", post(search::drop_index))
         .route(
             "/api/analysis",
             get(analyze::get).post(analyze::start).delete(analyze::stop),
@@ -333,6 +344,7 @@ pub(crate) fn router(app: api::App) -> Router {
         .route("/api/analysis/expiry", get(analyze::expiry))
         .route("/api/analysis/changes", get(analyze::changes))
         .route("/api/analysis/hot_keys", get(analyze::hot_keys))
+        .route("/api/analysis/hot_keys/monitor", get(hot::monitor_ranking))
         .route("/api/analysis/nodes", get(analyze::nodes))
         .route("/api/analysis/slots", get(analyze::slots))
         .route("/api/snapshots", get(snapshots::list).post(snapshots::save))

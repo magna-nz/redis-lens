@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** the web dashboard, phase 3 of 4, on `claude/dashboard-p3`; phases 1 and 2 merged as #26 and #28 ([Web dashboard](#web-dashboard-2026-11-15)). On main: Redis Insight parity phases 1 to 5 (#15 to #23), the TUI redesign (#21), the shorter README (#24), Find key (#25) and the release pipeline with the switch to MIT (#27).
-**Last updated:** 2026-11-16 (web dashboard phase 2 merged as #28; phase 3 on `claude/dashboard-p3`)
+**Current milestone:** the web dashboard, phase 4 of 4, on `claude/dashboard-p4`; phases 1 to 3 merged as #26, #28 and #29 ([Web dashboard](#web-dashboard-2026-11-15)). On main: Redis Insight parity phases 1 to 5 (#15 to #23), the TUI redesign (#21), the shorter README (#24), Find key (#25) and the release pipeline with the switch to MIT (#27).
+**Last updated:** 2026-11-16 (web dashboard phase 3 merged as #29; phase 4 on `claude/dashboard-p4`)
 
 ## Overnight run (2026-11-10): approvals and plan
 
@@ -672,8 +672,8 @@ A web UI served by redis-lens on `127.0.0.1`, an alternative to the TUI with the
 |---|---|---|
 | 1 | The server (`src/web/`, axum), sign-in token and request checks, the dashboard's own session through the TUI's runner, the shared command budget, `--dashboard` / `--terminal` / `--port` / `--no-open`, `ctrl-o`, and the screens Connections (add, edit, remove, test, writes), Overview, Server, Pub/Sub and Command line | **done**, merged as #26 |
 | 2 | Browse (patterns, keys, values, Find key) and Analyze (Big keys, Expiry, Changes, Hot keys, Nodes, Slots), snapshots, database switch | **done**, merged as #28 |
-| 3 | Writes: field edits, add key, expiry, rename, delete, bulk actions | **done** on `claude/dashboard-p3` |
-| 4 | Streams and Search | next |
+| 3 | Writes: field edits, add key, expiry, rename, delete, bulk actions | **done**, merged as #29 |
+| 4 | Browse › Streams, Browse › Search, Hot keys from Monitor | **done** on `claude/dashboard-p4` |
 
 ### How phase 1 was built
 
@@ -696,7 +696,7 @@ A web UI served by redis-lens on `127.0.0.1`, an alternative to the TUI with the
 | page | `views/browse.js`, `views/analyze.js`, the top bar's Find, the database picker, Overview's analysis part, the mock server for every new route; 248 page tests | this PR | **done**; checked in headless Chrome against the demo servers and the mock, and by the lead on the rebuilt server |
 | parser | A `://` inside a StackExchange-style password was taken for a URL scheme (a proptest found it) | `aed7429` | **done** |
 
-Open from phase 2: Hot keys from Monitor (the TUI's second ranking) is not in the dashboard yet; snapshots of two databases of one connection share a directory (as in the TUI), so Changes after a database switch compares across databases; the page polls `GET /api/browse` while names are read (no event for it); ReJSON, binary key names and clusters are checked against the mock and in tests, not on the demo servers.
+Open from phase 2: snapshots of two databases of one connection share a directory (as in the TUI), so Changes after a database switch compares across databases; the page polls `GET /api/browse` while names are read (no event for it); ReJSON, binary key names and clusters are checked against the mock and in tests, not on the demo servers.
 
 ### How phase 3 was built
 
@@ -709,6 +709,19 @@ Open from phase 2: Hot keys from Monitor (the TUI's second ranking) is not in th
 Also fixed from the page's real-server walk: a refused write now sends a `state` event; a new string's length is its bytes (in the TUI too); a value's pattern is its own, never the Find text; a value's length unit follows its type; `examples/dashboard_dev.rs` keeps its snapshots and bulk key files in its temp directory. Left as in the TUI: a refused string edit names `WATCH` in its error while the refused list says `SET`.
 
 Decided alone (phase 3): bulk actions run over a pattern's keys only, as in the TUI (none over a Find result); disconnect is refused while a bulk action runs (stop it first); a typed command on the command line is not refused during a bulk run.
+
+### How phase 4 was built
+
+| Part | Content | Commits | State |
+|---|---|---|---|
+| server | `src/web/api/{streams,search,hot}.rs`: 12 routes, the TUI's own write ops (`XACK`, `XAUTOCLAIM`, `XTRIM`, `FT.CREATE`, `FT.DROPINDEX`) through the gate, refused during a bulk action; Hot keys ranked when a Monitor run ends | this PR | **done**; unit tests and `tests/web_p4_it.rs` on Redis 7.4, Redis 6.2, Valkey, a cluster, and for a real Search case Redis 8.10.1 and valkey-bundle 9.1.3 |
+| page | `views/streams.js`, `views/search.js`, Browse's Keys · Streams · Search panels, Analyze › Hot keys' Monitor ranking, the mock for every new route; 309 page tests | this PR | **done**; checked in headless Chrome against the real server (demo servers and a Redis 8 container) and the mock |
+| verifier | Nothing blocking. Fixed, each with a test that fails on the old code: a node pick is part of a keyless write's run, so an answer after a pick is refused and a pick during the decision can't redirect `FT.CREATE`/`FT.DROPINDEX`; the bulk-busy refusal is checked under the locks that decide and grant, for every write but a typed command (this also refuses key edits and publish asked before a bulk action, a phase 3 gap); stream and Search replies from an old run are dropped; after a write Streams re-reads without forgetting refusals; the list poll stops while entries are open; claim opens from a consumer or pending row; the query box starts from the last query; 405 checks for every phase 2–4 route | this PR | **done** |
+| docs | The site's dashboard part covers every screen (Browse, edits and bulk actions, Streams, Search, Analyze, Snapshots) with three new screenshots; "Not in the dashboard yet" became "What stays on the command line" | this PR | **done** |
+
+Decided alone (phase 4): stream entries reuse the value route (`/api/value?type=stream`) rather than a second path to the same read; a stream or Search write asked before a bulk action started is refused when answered during it; the Monitor ranking shows on Analyze › Hot keys only when the analysis has no hot keys, as in the TUI.
+
+Open from phase 4: a bulk action that starts between a write's grant and its send does not stop it (closing that needs a check in `Hub::send`); Search on a real cluster with the module is checked only against the mock and in unit tests; the site has no Streams or Search screenshot (the demo seed has no streams and no Search module); the phase 2 Hot keys off text says "Redis" on Valkey too; the stream groups and consumers tables scroll sideways inside their own box at 390 px.
 
 ### Decisions taken alone (dashboard)
 

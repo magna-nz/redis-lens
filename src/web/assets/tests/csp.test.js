@@ -119,6 +119,19 @@ test('password boxes are type=password with autocomplete off, and nothing logs',
   }
 });
 
+test('Streams and Search: every box they draw has autocomplete off, and nothing they hold goes to storage or an address', () => {
+  for (const file of ['views/streams.js', 'views/search.js']) {
+    const src = read(file);
+    const inputs = src.match(/h\('input', \{[^}]*\}/g) || [];
+    assert.ok(inputs.length > 0, `${file} has inputs`);
+    for (const i of inputs) assert.match(i, /autocomplete: 'off'/, `${file}: ${i}`);
+    for (const form of src.match(/h\('form', \{[^}]*/g) || []) assert.match(form, /autocomplete: 'off'/, `${file}: a form`);
+    assert.equal(/sessionStorage|localStorage|document\.cookie|location\.hash\s*=|history\.(push|replace)State/.test(src), false, `${file}: storage or the address`);
+    assert.equal(/\.innerHTML|insertAdjacentHTML/.test(src), false, `${file}: HTML from strings`);
+  }
+  assert.match(read('views/search.js'), /maxlength: String\(MAX_QUERY\)/, 'the query box takes at most 1,000 characters, as the TUI\'s');
+});
+
 test('the token is never logged, never in an address the page builds, never in an error text', () => {
   const api = read('api.js');
   for (const call of api.match(/console\.[a-z]+\([^)]*\)/g) || []) assert.equal(/token/i.test(call), false, call);
@@ -159,6 +172,8 @@ test('the pages say what they must', () => {
   assert.match(index, /<script type="module" src="assets\/app\.js"><\/script>/);
   assert.match(index, /<html lang="en" data-theme="dark">/);
   for (const area of ['overview', 'browse', 'analyze', 'server', 'pubsub', 'connections']) assert.match(index, new RegExp(`href="#/${area}" data-nav="${area}"`));
-  assert.equal(/#\/(streams|search)|data-nav="(streams|search)"/i.test(index), false, 'Streams and Search are not in the nav yet');
+  assert.equal(/#\/(streams|search)|data-nav="(streams|search)"/i.test(index), false, 'Streams and Search are panels of Browse, not areas of the nav');
+  const browse = read('views/browse.js');
+  for (const sub of ['streams', 'search']) assert.match(browse, new RegExp(`href: '#/browse/${sub}'`), `Browse links its ${sub} panel`);
   assert.match(index, /<form class="find" id="find-form" role="search"/, 'Find a key sits in the top bar');
 });

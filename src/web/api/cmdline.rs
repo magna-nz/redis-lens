@@ -308,6 +308,7 @@ pub async fn run(State(app): State<App>, Body(l): Body<Line>) -> Response {
                         Action::Write {
                             conn,
                             run,
+                            node: None,
                             op,
                             dest,
                             decision,

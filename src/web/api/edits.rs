@@ -135,7 +135,7 @@ fn words(text: &str) -> String {
 /// every edit with the same words, whatever the edit. Then, while a bulk action counts
 /// or runs, no edit (the TUI's bulk dialog takes every key until it ends: a key added
 /// or written behind the walk would survive "every key of the pattern").
-fn writable(c: &Current) -> Result<(), Refused> {
+pub(crate) fn writable(c: &Current) -> Result<(), Refused> {
     let p = c.profile();
     if p.is_read_only() {
         return Err(no(crate::write::read_only_reason(p)).holding(&super::writes::profile_data(p)));
@@ -215,7 +215,7 @@ async fn flow(
     app.hub.follow_saved_profile().await;
     let made = app
         .hub
-        .with_mut(|c| prepare(c).map(|p| (p, super::writes::run_of(c))));
+        .with_mut(|c| prepare(c).map(|p| (p, super::writes::MadeFor::of(c))));
     match made {
         None => error(StatusCode::CONFLICT, super::NOT_LIVE),
         Some(Err(r)) => r.into_response(),
@@ -537,7 +537,7 @@ pub async fn add_key(State(app): State<App>, Body(b): Body<AddKey>) -> Response 
         {
             return Err(Refused::new(StatusCode::NOT_FOUND, super::keys::NO_LIST));
         }
-        Ok(super::writes::run_of(c))
+        Ok(super::writes::MadeFor::of(c))
     });
     let made_for = match checked {
         None => return error(StatusCode::CONFLICT, super::NOT_LIVE),

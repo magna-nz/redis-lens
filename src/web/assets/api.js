@@ -673,11 +673,11 @@ export function adaptOverviewAnalysis(j) {
 }
 
 /** Where a finding's `screen` is looked into on this page (a route under `#/`): the TUI's
- *  screens the dashboard has. Streams and Search are not in it yet. */
+ *  screens the dashboard has (all of them). */
 export const FINDING_WHERE = {
   slow_log: 'server/slowlog', clients: 'server/clients', monitor: 'server/monitor', pubsub: 'pubsub', connections: 'connections',
   keys: 'browse', big_keys: 'analyze/big_keys', expiry: 'analyze/expiry', changes: 'analyze/changes', hot_keys: 'analyze/hot_keys',
-  nodes: 'analyze/nodes', slots: 'analyze/slots',
+  nodes: 'analyze/nodes', slots: 'analyze/slots', streams: 'browse/streams', search: 'browse/search',
 };
 
 /** One of Overview's findings "from the server": `{ severity, text, screen, area, panel }`.
@@ -1421,6 +1421,270 @@ export function adaptSaved(j) {
 }
 
 // ---------------------------------------------------------------------------------------
+// Streams, Search and Hot keys from Monitor (phase 4)
+// ---------------------------------------------------------------------------------------
+
+const STREAM_STATUSES = ['no_report', 'none', 'ready'];
+
+function adaptConsumer(j) {
+  const o = obj(j);
+  return {
+    name: adaptName(o.name), pending: num(o.pending) ?? 0, idleMs: num(o.idle_ms), idle: str(o.idle),
+    inactiveMs: num(o.inactive_ms), inactive: str(o.inactive), stuck: o.stuck === true,
+  };
+}
+
+function adaptGroup(j) {
+  const o = obj(j);
+  const c = obj(o.claim);
+  return {
+    name: adaptName(o.name),
+    consumers: num(o.consumers) ?? 0,
+    pending: num(o.pending) ?? 0,
+    lastDeliveredId: text(o.last_delivered_id) ?? '',
+    lag: num(o.lag),
+    lagging: o.lagging === true,
+    readers: Array.isArray(o.readers) ? o.readers.map(adaptConsumer) : null,
+    claim: { to: c.to ? adaptName(c.to) : null, minIdleMs: num(c.min_idle_ms) ?? 0, count: num(c.count) ?? 0 },
+  };
+}
+
+/** One stream of Browse › Streams (a row of the list, and its details). */
+export function adaptStreamRow(j) {
+  const o = obj(j);
+  return {
+    key: adaptName(o.key),
+    node: num(o.node),
+    endpoint: str(o.endpoint),
+    gone: o.gone === true,
+    text: str(o.text),
+    length: num(o.length),
+    bytes: num(o.bytes),
+    firstId: str(o.first_id),
+    lastId: str(o.last_id),
+    oldestAgeMs: num(o.oldest_age_ms),
+    oldest: str(o.oldest),
+    entriesAdded: num(o.entries_added),
+    groupCount: num(o.group_count),
+    lag: num(o.lag),
+    pending: num(o.pending),
+    verdict: str(o.verdict) ?? 'ok',
+    verdicts: arr(o.verdicts).map((v) => ({ label: str(obj(v).label) ?? '', text: str(obj(v).text) ?? '' })),
+    leftOut: str(o.left_out),
+    groups: Array.isArray(o.groups) ? o.groups.map(adaptGroup) : null,
+    groupsText: str(o.groups_text),
+  };
+}
+
+/** GET /api/streams: `{ status, rows, ... }`, or `{ off }`. */
+export function adaptStreams(j) {
+  const o = obj(j);
+  if (str(o.off)) return { off: str(o.off), status: 'off', rows: [] };
+  return {
+    off: null,
+    status: oneOf(o.status, STREAM_STATUSES, 'ready'),
+    text: str(o.text),
+    hint: str(o.hint),
+    analysisRunning: o.analysis_running === true,
+    cluster: o.cluster === true,
+    rows: arr(o.rows).map(adaptStreamRow),
+    found: num(o.found) ?? 0,
+    shown: num(o.shown) ?? 0,
+    note: str(o.note),
+    error: str(o.error),
+    writes: str(o.writes),
+  };
+}
+
+/** GET /api/streams/pending: a group's pending entries (XPENDING), and the stream's row;
+ *  `{ off }` when the view is off. */
+export function adaptPending(j) {
+  const o = obj(j);
+  const p = o.pending ? obj(o.pending) : null;
+  return {
+    off: str(o.off),
+    pending: p ? {
+      key: adaptName(p.key),
+      group: adaptName(p.group),
+      consumer: p.consumer ? adaptName(p.consumer) : null,
+      entries: arr(p.entries).map((e) => {
+        const x = obj(e);
+        return { id: text(x.id) ?? '', consumer: adaptName(x.consumer), idleMs: num(x.idle_ms), idle: str(x.idle), deliveries: num(x.deliveries) ?? 0 };
+      }),
+      max: num(p.max),
+      error: str(p.error),
+    } : null,
+    row: o.row ? adaptStreamRow(o.row) : null,
+    text: str(o.text),
+  };
+}
+
+/** The XACK, XAUTOCLAIM and XTRIM forms as typed. */
+export function claimRequest({ key, group, to, minIdleMs, count }) {
+  return { key: String(key ?? ''), group: String(group ?? ''), to: String(to ?? ''), min_idle_ms: String(minIdleMs ?? ''), count: String(count ?? '') };
+}
+
+export function trimRequest({ key, by, value }) {
+  return { key: String(key ?? ''), by: by === 'MINID' ? 'MINID' : 'MAXLEN', value: String(value ?? '') };
+}
+
+/** What a stream write did, in the TUI's words (its `write_reply`). */
+export function streamWriteText(what, w, extra = {}) {
+  const reply = w && w.reply ? w.reply : null;
+  const count = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+  if (what === 'claim' && reply && reply.kind === 'claimed') {
+    const v = obj(reply.value);
+    const ids = Array.isArray(reply.ids) ? reply.ids : arr(v.ids);
+    const deleted = num(reply.deleted) ?? num(v.deleted) ?? 0;
+    let t = `Claimed ${count(ids.length, 'entry', 'entries')} for ${extra.to ?? ''}.`;
+    if (deleted > 0) t += ` ${count(deleted, 'entry', 'entries')} no longer in the stream left the pending list.`;
+    return t;
+  }
+  const n = reply && reply.kind === 'int' ? num(reply.value) : null;
+  if (what === 'ack' && n !== null) return n > 0 ? `Acknowledged ${extra.id ?? ''}.` : `${extra.id ?? ''} was not pending any more.`;
+  if (what === 'trim' && n !== null) return n > 0 ? `Trimmed ${count(n, 'entry', 'entries')}.` : 'Trimmed 0 entries: with ~ the server removes whole blocks only.';
+  return 'Done.';
+}
+
+/** A stream write's reply: the edit reply, with a claim's ids and deleted count. */
+export function adaptStreamWrite(j) {
+  const w = adaptWrite(j);
+  const r = obj(obj(j).reply);
+  if (w.reply && w.reply.kind === 'claimed') {
+    w.reply = { kind: 'claimed', value: null, ids: strings(r.ids), deleted: num(r.deleted) ?? 0 };
+  }
+  return w;
+}
+
+function adaptSearchIndex(j) {
+  const o = obj(j);
+  return {
+    name: adaptName(o.name),
+    info: o.info === true,
+    infoText: str(o.info_text),
+    on: str(o.on),
+    prefixes: strings(o.prefixes),
+    docs: num(o.docs),
+    bytes: num(o.bytes),
+    indexing: o.indexing === true,
+    progress: num(o.progress),
+    progressText: str(o.progress_text),
+    building: o.building === true,
+    failures: num(o.failures),
+    leftOut: str(o.left_out),
+    schema: arr(o.schema).map((f) => {
+      const x = obj(f);
+      return { name: text(x.name) ?? '', path: str(x.path), type: str(x.type) ?? '', flags: strings(x.flags) };
+    }),
+    fieldsText: str(o.fields_text),
+  };
+}
+
+/** A page of a query's results (`results` of the query reply, GET /api/search/results). */
+export function adaptSearchResults(j) {
+  if (!j || typeof j !== 'object') return null;
+  const o = obj(j);
+  return {
+    run: num(o.run),
+    cmd: oneOf(o.cmd, ['search', 'explain', 'profile'], 'search'),
+    index: adaptName(o.index),
+    query: text(o.query) ?? '',
+    total: num(o.total) ?? 0,
+    count: str(o.count),
+    took: str(o.took),
+    kept: num(o.kept) ?? 0,
+    max: num(o.max),
+    from: num(o.from) ?? 0,
+    page: num(o.page) ?? 10,
+    docs: arr(o.docs).map((d) => {
+      const x = obj(d);
+      return { index: num(x.index) ?? 0, key: adaptName(x.key), fieldCount: num(x.field_count) ?? 0, fields: pairs(x.fields) };
+    }),
+    empty: str(o.empty),
+  };
+}
+
+/** GET /api/search: the indexes of the picked node, or `{ off, noModule, detail }`. */
+export function adaptSearch(j) {
+  const o = obj(j);
+  if (str(o.off)) return { off: str(o.off), noModule: o.no_module === true, detail: str(o.detail), indexes: [] };
+  const cmd = obj(o.cmd_off);
+  const e = o.empty ? obj(o.empty) : null;
+  return {
+    off: null,
+    noModule: false,
+    detail: null,
+    module: str(o.module),
+    node: num(o.node),
+    nodeTitle: str(o.node_title),
+    indexes: arr(o.indexes).map(adaptSearchIndex),
+    total: num(o.total) ?? 0,
+    firstOf: str(o.first_of),
+    notes: strings(o.notes),
+    empty: e ? { title: str(e.title), text: str(e.text) } : null,
+    error: str(o.error),
+    cmdOff: { search: str(cmd.search), explain: str(cmd.explain), profile: str(cmd.profile) },
+    busy: str(o.busy),
+    lastQuery: text(o.last_query),
+    lastQueryCopy: text(o.last_query_copy),
+    results: adaptSearchResults(o.results),
+    writes: str(o.writes),
+  };
+}
+
+/** POST /api/search/query: the results, the text of FT.EXPLAIN or FT.PROFILE, or `{ off }`. */
+export function adaptQuery(j) {
+  const o = obj(j);
+  if (str(o.off)) return { off: str(o.off), cmd: null, results: null, text: null };
+  const t = o.text ? obj(o.text) : null;
+  return {
+    off: null,
+    cmd: oneOf(o.cmd, ['search', 'explain', 'profile'], 'search'),
+    index: o.index ? adaptName(o.index) : null,
+    query: text(o.query),
+    results: adaptSearchResults(o.results),
+    text: t ? { lines: arr(t.lines).filter((l) => typeof l === 'string'), empty: str(t.empty) } : null,
+  };
+}
+
+/** GET /api/search/field: one field of a result, whole, in a format. */
+export function adaptSearchField(j) {
+  const o = obj(j);
+  return { run: num(o.run), doc: num(o.doc), field: num(o.field), key: adaptName(o.key), name: text(o.name) ?? '', shown: adaptShown(o.shown) };
+}
+
+/** The create form as typed. */
+export function createIndexRequest({ name, on, prefixes, fields }) {
+  return { name: String(name ?? ''), on: on === 'JSON' ? 'JSON' : 'HASH', prefixes: String(prefixes ?? ''), fields: String(fields ?? '') };
+}
+
+/** GET /api/analysis/hot_keys/monitor: the ranking of the last Monitor run. */
+export function adaptMonitorHot(j) {
+  const o = obj(j);
+  const r = o.ranking ? obj(o.ranking) : null;
+  return {
+    status: oneOf(o.status, ['lfu', 'none', 'pending', 'ready'], 'none'),
+    text: str(o.text),
+    ranking: r ? {
+      title: str(r.title) ?? '',
+      secs: num(r.secs),
+      lines: num(r.lines) ?? 0,
+      at: num(r.at_unix),
+      unknown: num(r.unknown) ?? 0,
+      unknownText: str(r.unknown_text),
+      keysNote: str(r.keys_note),
+      node: num(r.node),
+      endpoint: str(r.endpoint),
+      rows: arr(r.rows).map((x) => {
+        const y = obj(x);
+        return { key: adaptName(y.key), count: num(y.count) ?? 0, share: num(y.share) ?? 0, named: str(y.named), pattern: adaptName(y.pattern) };
+      }),
+      empty: str(r.empty),
+    } : null,
+  };
+}
+
+// ---------------------------------------------------------------------------------------
 // Edits and bulk actions (phase 3). A value the page sends is text as typed, or bytes as
 // hex (`{ hex }`); nothing a request carries is kept anywhere by the page.
 // ---------------------------------------------------------------------------------------
@@ -1645,6 +1909,18 @@ export const ROUTES = {
   bulkStart: () => ['POST', '/api/bulk'],
   bulkRun: () => ['POST', '/api/bulk/run'],
   bulkStop: () => ['DELETE', '/api/bulk'],
+  streams: (q = {}) => ['GET', `/api/streams${query({ refresh: q.refresh ? 1 : null, now: q.now && !q.refresh ? 1 : null })}`],
+  streamPending: (q = {}) => ['GET', `/api/streams/pending${query({ key: q.key, group: q.group, consumer: q.consumer })}`],
+  streamAck: () => ['POST', '/api/streams/ack'],
+  streamClaim: () => ['POST', '/api/streams/claim'],
+  streamTrim: () => ['POST', '/api/streams/trim'],
+  search: (q = {}) => ['GET', `/api/search${query({ refresh: q.refresh ? 1 : null })}`],
+  searchQuery: () => ['POST', '/api/search/query'],
+  searchResults: (q = {}) => ['GET', `/api/search/results${query({ run: q.run, from: q.from })}`],
+  searchField: (q = {}) => ['GET', `/api/search/field${query({ run: q.run, doc: q.doc, field: q.field, format: q.format, width: q.width })}`],
+  searchCreate: () => ['POST', '/api/search/create'],
+  searchDrop: () => ['POST', '/api/search/drop'],
+  hotKeysMonitor: () => ['GET', '/api/analysis/hot_keys/monitor'],
   confirm: (id) => ['POST', `/api/confirm/${seg(id)}`],
   confirmCancel: (id) => ['DELETE', `/api/confirm/${seg(id)}`],
   events: () => ['GET', '/api/events'],
@@ -2067,6 +2343,19 @@ export function createReal({ fetchFn = (...a) => fetch(...a), tokens = null, tok
     runBulk: (id) => request(ROUTES.bulkRun(), { bulk: Number(id) }, adaptBulkReply),
     stopBulk: () => request(ROUTES.bulkStop(), {}, adaptBulkReply),
 
+    getStreams: (q = {}) => request(ROUTES.streams(q), null, adaptStreams),
+    getPending: (q) => request(ROUTES.streamPending(q), null, adaptPending),
+    ackEntry: ({ key, group, id }) => request(ROUTES.streamAck(), { key: String(key ?? ''), group: String(group ?? ''), id: String(id ?? '') }, adaptStreamWrite),
+    claimEntries: (q) => request(ROUTES.streamClaim(), claimRequest(q), adaptStreamWrite),
+    trimStream: (q) => request(ROUTES.streamTrim(), trimRequest(q), adaptStreamWrite),
+    getSearch: (q = {}) => request(ROUTES.search(q), null, adaptSearch),
+    runQuery: ({ index, cmd, query: typed }) => request(ROUTES.searchQuery(), cmd === 'search' ? { index, cmd, query: String(typed ?? '') } : { index, cmd }, adaptQuery),
+    getResults: (q) => request(ROUTES.searchResults(q), null, adaptSearchResults),
+    getResultField: (q) => request(ROUTES.searchField(q), null, adaptSearchField),
+    createIndex: (q) => request(ROUTES.searchCreate(), createIndexRequest(q), adaptWrite),
+    dropIndex: ({ index }) => request(ROUTES.searchDrop(), { index: String(index ?? '') }, adaptWrite),
+    getHotKeysMonitor: () => request(ROUTES.hotKeysMonitor(), null, adaptMonitorHot),
+
     answerConfirm: (confirm, typed, adapt) => request(ROUTES.confirm(confirm.id), confirm.kind === 'type' ? { typed } : {}, adapt),
     cancelConfirm: (id) => request(ROUTES.confirmCancel(id), {}, () => ({})),
   };
@@ -2085,6 +2374,8 @@ export const METHODS = [
   'getAnalysis', 'startAnalysis', 'stopAnalysis', 'getBigKeys', 'getExpiry', 'getChanges', 'getHotKeys', 'getNodes', 'getSlots',
   'saveSnapshot', 'listSnapshots', 'compareSnapshots',
   'editValue', 'addItem', 'setTtl', 'renameKey', 'removeItem', 'deleteKey', 'addKey', 'getBulk', 'startBulk', 'runBulk', 'stopBulk',
+  'getStreams', 'getPending', 'ackEntry', 'claimEntries', 'trimStream',
+  'getSearch', 'runQuery', 'getResults', 'getResultField', 'createIndex', 'dropIndex', 'getHotKeysMonitor',
 ];
 
 /** The methods whose reply is the new State: it is also sent to `state` subscribers, so

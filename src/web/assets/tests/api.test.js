@@ -356,8 +356,9 @@ test('findings: the server\'s words; a link to the route of the panel, only one 
   const big = adaptFinding({ area: 'Analyze', panel: 'Big keys', screen: 'big_keys', severity: 'warn', text: '3 big keys, counted by the server (INFO keysizes).' });
   assert.equal(big.where, 'analyze/big_keys');
   assert.equal(adaptFinding({ screen: 'keys', text: 'x' }).where, 'browse');
-  assert.equal(adaptFinding({ screen: 'streams', text: 'x' }).where, null, 'Streams arrive later: named, not linked');
-  assert.equal(adaptFinding({ screen: 'search', text: 'x' }).where, null);
+  assert.equal(adaptFinding({ screen: 'streams', text: 'x' }).where, 'browse/streams', 'Streams is a panel of Browse');
+  assert.equal(adaptFinding({ screen: 'search', text: 'x' }).where, 'browse/search');
+  assert.equal(adaptFinding({ screen: 'nowhere', text: 'x' }).where, null, 'a screen the page has not: named, not linked');
   assert.equal(big.label, 'Analyze › Big keys');
   assert.equal(adaptFinding({ text: 'x', severity: 'loud' }).severity, 'note');
   assert.deepEqual(adaptOverview({ ...OVERVIEW, findings: [{ text: '' }, { text: 'kept', screen: 'slow_log' }] }).findings.map((f) => f.text), ['kept']);

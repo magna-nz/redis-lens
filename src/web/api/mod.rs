@@ -36,11 +36,14 @@ pub mod bulk;
 pub mod cmdline;
 pub mod connections;
 pub mod edits;
+pub mod hot;
 pub mod keys;
 pub mod overview;
 pub mod pubsub;
+pub mod search;
 pub mod server;
 pub mod snapshots;
+pub mod streams;
 pub mod values;
 pub mod writes;
 

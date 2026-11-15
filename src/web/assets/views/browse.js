@@ -1,5 +1,7 @@
 // Browse: the key tree (from key names before an analysis, from the analysis after one), a
-// pattern's keys, Find a key, and a key's value in each of its renderings.
+// pattern's keys, Find a key, and a key's value in each of its renderings. Its other panels,
+// Streams and Search (phase 4), are views/streams.js and views/search.js, as the TUI's
+// Browse has Keys · Streams · Search.
 //
 // Everything a key holds is drawn with textContent, as redis-lens escaped it. A key is
 // named in a request by the hex id redis-lens gave for it, never by the text shown. Values
@@ -16,8 +18,10 @@
 import {
   h, fill, refill, DASH, fmtBytes, fmtCount, fmtGrouped, fmtPercent, plural, barPercent, meter,
   notice, emptyState, connectFirst, analyzing, errorText, copyText, expiryText, fmtSignedBytes,
-  openDialog, readOnlyNote,
+  openDialog, readOnlyNote, pills,
 } from '../ui.js';
+import * as streams from './streams.js';
+import * as search from './search.js';
 
 // ---------------------------------------------------------------------------------------
 // Pure helpers (tested in tests/browse.test.js)
@@ -448,16 +452,51 @@ export function requestPattern(name, node = null) {
 }
 
 // ---------------------------------------------------------------------------------------
-// The view
+// The view: Keys, Streams and Search, as the TUI's Browse has them
 // ---------------------------------------------------------------------------------------
 
-export function mount(root, ctx) {
+/** Browse's panels, as the TUI's Keys · Streams · Search. */
+export const PANELS = [
+  { id: 'keys', label: 'Keys', href: '#/browse' },
+  { id: 'streams', label: 'Streams', href: '#/browse/streams' },
+  { id: 'search', label: 'Search', href: '#/browse/search' },
+];
+
+/** The panel a route names (`#/browse/streams`); Keys for anything else. */
+export function panelOf(sub) {
+  return sub === 'streams' || sub === 'search' ? sub : 'keys';
+}
+
+const panelTabs = (panel) => pills(PANELS, panel, null, 'Browse panels');
+
+export function mount(root, ctx, route = null) {
+  const panel = panelOf(route && route.sub);
+  if (panel === 'keys') return mountKeys(root, ctx);
+  const state = ctx.state();
+  const gate = connectFirst(state, { needsLive: true });
+  const view = h('section', { class: 'view', 'aria-labelledby': 'browse-title' });
+  root.append(view);
+  const subtitle = h('p', { class: 'subtitle' });
+  const actions = h('div', { class: 'actions' });
+  view.append(
+    h('div', { class: 'view-head' }, h('div', null, h('h1', { class: 'title', id: 'browse-title', text: 'Browse' }), subtitle), actions),
+    panelTabs(panel));
+  if (gate) {
+    view.append(gate);
+    return () => {};
+  }
+  const body = h('div', { class: 'stack-lg' });
+  view.append(body);
+  return (panel === 'streams' ? streams : search).mount(view, ctx, { head: { subtitle, actions }, body });
+}
+
+function mountKeys(root, ctx) {
   const state = ctx.state();
   const gate = connectFirst(state, { needsLive: true });
   const view = h('section', { class: 'view', 'aria-labelledby': 'browse-title' });
   root.append(view);
   if (gate) {
-    view.append(h('h1', { class: 'title', id: 'browse-title', text: 'Browse' }), gate);
+    view.append(h('h1', { class: 'title', id: 'browse-title', text: 'Browse' }), panelTabs('keys'), gate);
     return () => {};
   }
   follow(store, state);
@@ -478,7 +517,8 @@ export function mount(root, ctx) {
   const nodeBox = h('div', { class: 'picker' });
   view.append(h('div', { class: 'view-head' },
     h('div', null, h('h1', { class: 'title', id: 'browse-title', text: 'Browse' }), subtitle),
-    h('div', { class: 'actions' }, nodeBox, dbBox)));
+    h('div', { class: 'actions' }, nodeBox, dbBox)),
+  panelTabs('keys'));
 
   // ---------- the three cards ----------
   const patFilter = h('input', {

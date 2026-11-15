@@ -2569,7 +2569,7 @@ async fn an_edit_is_decided_only_for_the_run_it_was_made_on() {
     let op = crate::write::WriteOp::Unlink {
         key: "user:1".into(),
     };
-    let made_for = t.hub.with(super::api::writes::run_of).unwrap();
+    let made_for = t.hub.with(super::api::writes::MadeFor::of).unwrap();
     assert!(super::api::writes::decide(&app, &op, Some(made_for)).is_ok());
     t.hub.with_mut(|c| c.browse.dbs = Some(vec![0, 1]));
     let res = call(&t, write("POST", "/api/db", r#"{"db":1}"#)).await;
@@ -2645,6 +2645,25 @@ async fn while_a_bulk_action_counts_or_runs_the_session_and_its_keys_stay_put() 
                     "/api/keys/add",
                     r#"{"name":"user:9","type":"string","value":"v"}"#.to_string(),
                 ),
+                // Phase 4: the stream and Search writes wait for it too.
+                (
+                    "/api/streams/ack",
+                    r#"{"key":"73","group":"67","id":"1-0"}"#.to_string(),
+                ),
+                (
+                    "/api/streams/claim",
+                    r#"{"key":"73","group":"67","to":"c","min_idle_ms":"0","count":"1"}"#
+                        .to_string(),
+                ),
+                (
+                    "/api/streams/trim",
+                    r#"{"key":"73","by":"MAXLEN","value":"1"}"#.to_string(),
+                ),
+                (
+                    "/api/search/create",
+                    r#"{"name":"i","on":"HASH","fields":"t TEXT"}"#.to_string(),
+                ),
+                ("/api/search/drop", r#"{"index":"69"}"#.to_string()),
             ];
             let sent = t.hub.sent_count();
             for (path, body) in session.iter().chain(&edits) {
@@ -2829,4 +2848,1244 @@ async fn a_write_answered_while_a_page_loads_still_reads_the_value_again() {
     let v = json(&text(edit.await.unwrap()).await);
     assert_eq!(v["value"]["rev"], 1, "read again: {v}");
     assert_eq!(v["value"]["items"][1]["value"], "new", "{v}");
+}
+
+// -- phase 4: Streams, Search, Hot keys from Monitor ---------------------------------
+
+/// Every phase 4 route and method, as the router serves them.
+const PHASE_FOUR: &[(&str, &str)] = &[
+    ("GET", "/api/streams"),
+    ("GET", "/api/streams/pending?key=61&group=67"),
+    ("POST", "/api/streams/ack"),
+    ("POST", "/api/streams/claim"),
+    ("POST", "/api/streams/trim"),
+    ("GET", "/api/search"),
+    ("POST", "/api/search/query"),
+    ("GET", "/api/search/results?run=1"),
+    ("GET", "/api/search/field?run=1&doc=0&field=0"),
+    ("POST", "/api/search/create"),
+    ("POST", "/api/search/drop"),
+    ("GET", "/api/analysis/hot_keys/monitor"),
+];
+
+/// S3: every phase 4 route needs the token; every write route the guard's Origin,
+/// header and JSON body.
+#[tokio::test]
+async fn phase_four_routes_need_the_token_and_writes_the_guard() {
+    let t = setup("p4guard", Vec::new());
+    let mut p = profile("cache", Env::Local);
+    p.read_only = Some(false);
+    t.hub.install_for_test(p, false);
+    guarded(&t, PHASE_FOUR).await;
+}
+
+/// The fixture report with the streams `events:orders` and `events:audit`.
+fn stream_report() -> crate::model::ScanReport {
+    use crate::model::{KeySample, KeyType, Ttl};
+    let mut r = crate::tui::fixtures::report(true);
+    let mut p = r.patterns[0].clone();
+    p.pattern = "events:{name}".into();
+    p.key_type = Some(KeyType::Stream);
+    p.examples = ["events:orders", "events:audit"]
+        .iter()
+        .map(|k| KeySample {
+            key: (*k).into(),
+            key_type: KeyType::Stream,
+            bytes: Some(1024),
+            ttl: Ttl::Persistent,
+            lfu_freq: None,
+            node: None,
+        })
+        .collect();
+    r.patterns.push(p);
+    r
+}
+
+fn a_stream(key: &str) -> crate::live::streams::StreamInfo {
+    use crate::live::streams::{ConsumerInfo, GroupInfo, Lag, StreamInfo};
+    StreamInfo {
+        key: key.into(),
+        length: 3,
+        bytes: Some(900),
+        first_id: Some("1700000000000-0".into()),
+        last_id: "1700000000002-0".into(),
+        oldest_age_ms: Some(5_000),
+        entries_added: Some(3),
+        groups: Some(vec![GroupInfo {
+            name: "billing".into(),
+            consumers: 1,
+            pending: 2,
+            last_delivered_id: "1700000000001-0".into(),
+            lag: Lag::Known(1),
+            readers: Some(vec![ConsumerInfo {
+                name: "worker-1".into(),
+                pending: 2,
+                idle_ms: 1_000,
+                inactive_ms: Some(1_000),
+            }]),
+        }]),
+        notes: Vec::new(),
+        pending: None,
+    }
+}
+
+fn streams_reply(keys: &[&str]) -> session::LiveResult {
+    use crate::live::streams::{Fetched, Refused, Reply};
+    Ok(crate::live::LiveReply::Streams(Reply::Info {
+        streams: keys
+            .iter()
+            .map(|k| Fetched {
+                key: (*k).into(),
+                info: (*k != "events:audit").then(|| a_stream(k)),
+            })
+            .collect(),
+        refused: Refused::default(),
+    }))
+}
+
+/// A session with a report of two streams, the live connection ready, on `p`.
+fn streams_session(t: &T, p: Profile) {
+    t.hub.install_for_test(p, false);
+    t.hub.with_mut(|c| {
+        let r = stream_report();
+        c.session.server = Some(r.server.clone());
+        c.session.report = Some(r);
+    });
+}
+
+/// Before an analysis the panel says so in the TUI's words; then the streams of the
+/// report are read in one request (standalone), a gone key said as gone, and a list
+/// read a moment ago is answered without asking again.
+#[tokio::test]
+async fn streams_come_from_the_analysis_and_are_read_once_a_poll() {
+    let t = setup("p4streams", Vec::new());
+    t.hub.install_for_test(profile("cache", Env::Local), false);
+    let (status, v) = get_json(&t, "/api/streams").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["status"], "no_report");
+    assert_eq!(v["text"], super::api::streams::NO_ANALYSIS);
+
+    let t = setup("p4streams2", Vec::new());
+    streams_session(&t, profile("cache", Env::Local));
+    t.hub.hold_requests(true);
+    let list = spawn_call(&t, signed_get("/api/streams"));
+    answer_next(&t, streams_reply(&["events:orders", "events:audit"])).await;
+    let v = json(&text(list.await.unwrap()).await);
+    assert_eq!(v["status"], "ready", "{v}");
+    assert_eq!(v["rows"][0]["key"]["name"], "events:orders");
+    assert_eq!(
+        v["rows"][0]["groups"][0]["readers"][0]["name"]["name"],
+        "worker-1"
+    );
+    assert_eq!(v["rows"][1]["gone"], true);
+    assert_eq!(v["writes"], serde_json::Value::Null);
+    let sent = t.hub.sent_count();
+    let (_, again) = get_json(&t, "/api/streams").await;
+    assert_eq!(again["rows"], v["rows"]);
+    assert_eq!(t.hub.sent_count(), sent, "fresh: nothing sent");
+}
+
+/// Rule 3: a refused XINFO (the permission check) turns the panel off in the TUI's
+/// words, and so does a refused XINFO STREAM, until a refresh asks again.
+#[tokio::test]
+async fn a_refused_xinfo_turns_streams_off_in_fixed_words() {
+    use crate::model::{PermCheck, PermStatus, PermissionReport};
+    let t = setup("p4xinfo", Vec::new());
+    streams_session(&t, profile("cache", Env::Local));
+    t.hub.with_mut(|c| {
+        c.perms = Some(PermissionReport {
+            checks: vec![PermCheck {
+                label: crate::conn::PERM_XINFO,
+                status: PermStatus::Denied("NOPERM user alice has no permissions".into()),
+            }],
+        })
+    });
+    let (_, v) = get_json(&t, "/api/streams").await;
+    assert_eq!(
+        v["off"],
+        "The server refused XINFO for this user, so this view is off."
+    );
+    assert!(!v.to_string().contains("alice"));
+    t.hub.with_mut(|c| c.perms = None);
+    t.hub.hold_requests(true);
+    let list = spawn_call(&t, signed_get("/api/streams"));
+    answer_next(
+        &t,
+        Err(crate::live::LiveError::Denied("XINFO STREAM".into())),
+    )
+    .await;
+    let v = json(&text(list.await.unwrap()).await);
+    assert!(v["off"].as_str().unwrap().contains("XINFO STREAM"), "{v}");
+    let sent = t.hub.sent_count();
+    let (_, v) = get_json(&t, "/api/streams").await;
+    assert!(v["off"].is_string());
+    assert_eq!(t.hub.sent_count(), sent, "not asked again until a refresh");
+}
+
+/// Rule 2: on a read-only profile every stream write is refused with the gate's words
+/// and nothing is sent; listing the pending entries still reads.
+#[tokio::test]
+async fn stream_writes_on_a_read_only_profile_send_nothing() {
+    let t = setup("p4ro", Vec::new());
+    streams_session(&t, profile("prod1", Env::Prod));
+    t.hub.hold_requests(true);
+    let list = spawn_call(&t, signed_get("/api/streams"));
+    answer_next(&t, streams_reply(&["events:orders", "events:audit"])).await;
+    let v = json(&text(list.await.unwrap()).await);
+    assert!(v["writes"].is_string(), "{v}");
+    let key = hexed("events:orders");
+    let group = hexed("billing");
+    let sent = t.hub.sent_count();
+    for (path, body) in [
+        (
+            "/api/streams/ack",
+            format!(r#"{{"key":"{key}","group":"{group}","id":"1700000000000-0"}}"#),
+        ),
+        (
+            "/api/streams/claim",
+            format!(
+                r#"{{"key":"{key}","group":"{group}","to":"w2","min_idle_ms":"0","count":"10"}}"#
+            ),
+        ),
+        (
+            "/api/streams/trim",
+            format!(r#"{{"key":"{key}","by":"MAXLEN","value":"1"}}"#),
+        ),
+    ] {
+        let res = call(&t, write("POST", path, &body)).await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+        let v = json(&text(res).await);
+        assert!(
+            v["error"].as_str().unwrap().contains("read-only"),
+            "{path}: {v}"
+        );
+    }
+    assert_eq!(t.hub.sent_count(), sent, "no write sent");
+    // XPENDING is a read.
+    let pending = spawn_call(
+        &t,
+        signed_get(&format!("/api/streams/pending?key={key}&group={group}")),
+    );
+    let mut info = a_stream("events:orders");
+    info.pending = Some(crate::live::streams::Pending {
+        group: "billing".into(),
+        consumer: None,
+        entries: vec![crate::live::streams::PendingEntry {
+            id: "1700000000000-0".into(),
+            consumer: "worker-1".into(),
+            idle_ms: 1_000,
+            deliveries: 1,
+        }],
+        error: None,
+    });
+    answer_next(
+        &t,
+        Ok(crate::live::LiveReply::Streams(
+            crate::live::streams::Reply::Info {
+                streams: vec![crate::live::streams::Fetched {
+                    key: "events:orders".into(),
+                    info: Some(info),
+                }],
+                refused: Default::default(),
+            },
+        )),
+    )
+    .await;
+    let v = json(&text(pending.await.unwrap()).await);
+    assert_eq!(v["pending"]["entries"][0]["id"], "1700000000000-0", "{v}");
+}
+
+/// Rule 2: on a writable profile a stream write goes through the gate: the ack of an
+/// entry not in the pending list shown is refused before anything is asked; a trim is
+/// destructive, so the gate asks first and sends only once answered.
+#[tokio::test]
+async fn stream_writes_are_checked_then_asked_then_sent() {
+    let p = writable_cache();
+    let t = setup("p4write", vec![p.clone()]);
+    streams_session(&t, p);
+    t.hub.hold_requests(true);
+    let list = spawn_call(&t, signed_get("/api/streams"));
+    answer_next(&t, streams_reply(&["events:orders", "events:audit"])).await;
+    list.await.unwrap();
+    let key = hexed("events:orders");
+    let group = hexed("billing");
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/streams/ack",
+            &format!(r#"{{"key":"{key}","group":"{group}","id":"1700000000000-0"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        json(&text(res).await)["error"],
+        super::api::streams::NOT_PENDING_LISTED
+    );
+    // A gone stream can't be trimmed; a bad MINID is the TUI's words.
+    let audit = hexed("events:audit");
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/streams/trim",
+            &format!(r#"{{"key":"{audit}","by":"MAXLEN","value":"1"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(json(&text(res).await)["error"], super::api::streams::GONE);
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/streams/trim",
+            &format!(r#"{{"key":"{key}","by":"MINID","value":"x"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(
+        json(&text(res).await)["error"],
+        "MINID takes an entry ID, such as 1700000000000-0."
+    );
+    let sent = t.hub.sent_count();
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/streams/trim",
+            &format!(r#"{{"key":"{key}","by":"MAXLEN","value":"1"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let q = json(&text(res).await);
+    assert!(
+        q["confirm"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("XTRIM events:orders MAXLEN ~ 1"),
+        "{q}"
+    );
+    assert_eq!(t.hub.sent_count(), sent, "asked, not sent");
+    let id = q["confirm"]["id"].as_str().unwrap().to_string();
+    let answered = {
+        let t2 = t.router.clone();
+        let req = write("POST", &format!("/api/confirm/{id}"), "{}");
+        tokio::spawn(async move { t2.oneshot(req).await.unwrap() })
+    };
+    answer_next(&t, wrote(crate::live::write::Reply::Int(2))).await;
+    let v = json(&text(answered.await.unwrap()).await);
+    assert_eq!(v["reply"]["kind"], "int", "{v}");
+    assert_eq!(v["reply"]["value"], 2);
+}
+
+/// Rule 3: without the module, Search is off in the TUI's words and its writes are
+/// refused; a refused FT._LIST is off without the user's name; the panel is not asked
+/// again until a refresh.
+#[tokio::test]
+async fn search_without_the_module_or_refused_is_off() {
+    let p = writable_cache();
+    let t = setup("p4search", vec![p.clone()]);
+    t.hub.install_for_test(p, false);
+    t.hub.hold_requests(true);
+    let list = spawn_call(&t, signed_get("/api/search"));
+    answer_next(
+        &t,
+        Err(crate::live::LiveError::Unsupported("FT._LIST".into())),
+    )
+    .await;
+    let v = json(&text(list.await.unwrap()).await);
+    assert_eq!(v["off"], super::api::search::NOT_LOADED, "{v}");
+    assert_eq!(v["no_module"], true);
+    assert_eq!(v["detail"], super::api::search::NOT_LOADED_WHY);
+    let sent = t.hub.sent_count();
+    let (_, again) = get_json(&t, "/api/search").await;
+    assert_eq!(again, v);
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/search/create",
+            r#"{"name":"i","on":"HASH","prefixes":"","fields":"t TEXT"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(
+        json(&text(res).await)["error"],
+        crate::tui::app::views::search::NO_MODULE
+    );
+    assert_eq!(t.hub.sent_count(), sent, "nothing sent");
+    // Refreshed: asked again, and refused this time.
+    let list = spawn_call(&t, signed_get("/api/search?refresh=1"));
+    answer_next(&t, Err(crate::live::LiveError::Denied("FT._LIST".into()))).await;
+    let v = json(&text(list.await.unwrap()).await);
+    assert_eq!(v["no_module"], false);
+    assert!(v["off"].as_str().unwrap().contains("FT._LIST"), "{v}");
+}
+
+fn index_list() -> session::LiveResult {
+    use crate::live::search::{IndexInfo, IndexList, Reply};
+    Ok(crate::live::LiveReply::Search(Reply::Indexes(IndexList {
+        indexes: vec![IndexInfo {
+            name: "idx:p".into(),
+            on: Some("HASH".into()),
+            prefixes: vec!["p:".into()],
+            docs: Some(2),
+            bytes: Some(100),
+            indexing: Some(false),
+            progress: Some(1.0),
+            failures: Some(0),
+            schema: Vec::new(),
+        }],
+        total: 1,
+        notes: Vec::new(),
+    })))
+}
+
+/// One query at a time; explain uses the query last run; a command the server lacks is
+/// off until a refresh and not sent again; the results come a page at a time.
+#[tokio::test]
+async fn search_queries_run_one_at_a_time_and_remember_what_is_off() {
+    use crate::live::search::{Doc, Reply, Results};
+    let p = writable_cache();
+    let t = setup("p4query", vec![p.clone()]);
+    t.hub.install_for_test(p, false);
+    t.hub.hold_requests(true);
+    let list = spawn_call(&t, signed_get("/api/search"));
+    answer_next(&t, index_list()).await;
+    let v = json(&text(list.await.unwrap()).await);
+    assert_eq!(v["indexes"][0]["name"]["name"], "idx:p", "{v}");
+    let idx = hexed("idx:p");
+    // Explain before any query.
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/search/query",
+            &format!(r#"{{"index":"{idx}","cmd":"explain"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(
+        json(&text(res).await)["error"],
+        "Run a query first: FT.EXPLAIN uses the query last run."
+    );
+    let first = spawn_call(
+        &t,
+        write(
+            "POST",
+            "/api/search/query",
+            &format!(r#"{{"index":"{idx}","cmd":"search","query":""}}"#),
+        ),
+    );
+    let hub = Arc::clone(&t.hub);
+    until("the query waits", || hub.pending_len() == 1).await;
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/search/query",
+            &format!(r#"{{"index":"{idx}","cmd":"search","query":"x"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(&text(res).await)["error"],
+        "FT.SEARCH is still running: wait for its answer."
+    );
+    let docs = (0..12)
+        .map(|i| Doc {
+            key: format!("p:{i}"),
+            fields: vec![(
+                crate::value::Raw::from("title"),
+                crate::value::Raw::from("red shoe"),
+            )],
+        })
+        .collect();
+    assert!(
+        t.hub
+            .answer_oldest(Ok(crate::live::LiveReply::Search(Reply::Results(
+                Results {
+                    total: 12,
+                    docs,
+                    took: std::time::Duration::from_millis(2),
+                }
+            ))))
+    );
+    let v = json(&text(first.await.unwrap()).await);
+    assert_eq!(v["results"]["query"], "*", "an empty query is *: {v}");
+    assert_eq!(v["results"]["docs"].as_array().unwrap().len(), 10);
+    let run = v["results"]["run"].as_u64().unwrap();
+    let (_, page) = get_json(&t, &format!("/api/search/results?run={run}&from=10")).await;
+    assert_eq!(page["docs"].as_array().unwrap().len(), 2);
+    let (_, field) = get_json(&t, &format!("/api/search/field?run={run}&doc=11&field=0")).await;
+    assert_eq!(field["shown"]["lines"][0], "red shoe", "{field}");
+    // Explain: the module lacks it; then it is not sent again.
+    let explain = spawn_call(
+        &t,
+        write(
+            "POST",
+            "/api/search/query",
+            &format!(r#"{{"index":"{idx}","cmd":"explain"}}"#),
+        ),
+    );
+    answer_next(
+        &t,
+        Err(crate::live::LiveError::Unsupported("FT.EXPLAIN".into())),
+    )
+    .await;
+    let v = json(&text(explain.await.unwrap()).await);
+    assert!(v["off"].as_str().unwrap().contains("FT.EXPLAIN"), "{v}");
+    let sent = t.hub.sent_count();
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/search/query",
+            &format!(r#"{{"index":"{idx}","cmd":"explain"}}"#),
+        ),
+    )
+    .await;
+    assert!(json(&text(res).await)["off"].is_string());
+    assert_eq!(t.hub.sent_count(), sent);
+    // A query the server can't run keeps its words about the query.
+    let bad = spawn_call(
+        &t,
+        write(
+            "POST",
+            "/api/search/query",
+            &format!(r#"{{"index":"{idx}","cmd":"search","query":"(("}}"#),
+        ),
+    );
+    answer_next(
+        &t,
+        Err(crate::live::LiveError::Failed(
+            "FT.SEARCH failed: Syntax error at offset 1 near ((".into(),
+        )),
+    )
+    .await;
+    let res = bad.await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        json(&text(res).await)["error"],
+        "FT.SEARCH failed: Syntax error at offset 1 near ((."
+    );
+    // The drop of a listed index asks first (destructive).
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/search/drop",
+            &format!(r#"{{"index":"{idx}"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let q = json(&text(res).await);
+    assert!(
+        q["confirm"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("FT.DROPINDEX idx:p"),
+        "{q}"
+    );
+}
+
+/// Hot keys from Monitor: a run's lines are kept while it runs, and once it is
+/// stopped its commands' key positions are asked with COMMAND INFO through the budget,
+/// then its keys ranked as the TUI ranks them, while the analysis has no hot keys.
+#[tokio::test]
+async fn a_stopped_monitor_run_ranks_its_keys_for_hot_keys() {
+    use crate::live::server::{Begin, CommandKeys, Find, KeySpec, Reply};
+    use crate::tui::app::Msg;
+    let t = setup("p4hot", Vec::new());
+    let conn = t.hub.install_for_test(profile("cache", Env::Local), false);
+    t.hub.with_mut(|c| {
+        let r = crate::tui::fixtures::report(true);
+        c.session.server = Some(r.server.clone());
+        c.session.report = Some(r);
+    });
+    let (_, v) = get_json(&t, "/api/analysis/hot_keys/monitor").await;
+    assert_eq!(v["status"], "none");
+    assert_eq!(v["text"], super::api::hot::NO_RUN);
+    // A run, as `Hub::monitor` starts one.
+    t.hub.with_mut(|c| {
+        c.monitor = Some(session::Monitor {
+            run: 7,
+            node: 0,
+            started_at_unix_ms: None,
+        });
+        c.hot.begin(7, 0);
+    });
+    t.hub.apply_for_test(Msg::MonitorReady {
+        id: conn,
+        scan: 1,
+        run: 7,
+        at_unix_ms: 1_700_000_000_000,
+    });
+    let line = |s: &str| crate::live::monitor::read_line(s).unwrap();
+    t.hub.apply_for_test(Msg::MonitorLines {
+        id: conn,
+        scan: 1,
+        run: 7,
+        lines: vec![
+            line(r#"1.0 [0 127.0.0.1:1] "GET" "user:1""#),
+            line(r#"1.0 [0 127.0.0.1:1] "GET" "user:1""#),
+            line(r#"1.0 [0 127.0.0.1:1] "GET" "user:2""#),
+        ],
+    });
+    t.hub.hold_requests(true);
+    assert!(t.hub.stop_monitor());
+    let (_, v) = get_json(&t, "/api/analysis/hot_keys/monitor").await;
+    assert_eq!(v["status"], "pending", "{v}");
+    let mut learned = std::collections::HashMap::new();
+    learned.insert(
+        "get".to_string(),
+        CommandKeys::Specs(vec![KeySpec {
+            begin: Begin::Index(1),
+            find: Find::Range {
+                last: 0,
+                step: 1,
+                limit: 0,
+            },
+        }]),
+    );
+    answer_next(
+        &t,
+        Ok(crate::live::LiveReply::Server(Reply::CommandKeys(learned))),
+    )
+    .await;
+    let hub = Arc::clone(&t.hub);
+    until("ranked", || {
+        hub.with(|c| matches!(c.hot.rank, super::api::hot::Rank::Done(_)))
+            .unwrap_or(false)
+    })
+    .await;
+    let (_, v) = get_json(&t, "/api/analysis/hot_keys/monitor").await;
+    assert_eq!(v["status"], "ready", "{v}");
+    assert_eq!(v["ranking"]["rows"][0]["key"]["name"], "user:1");
+    assert_eq!(v["ranking"]["rows"][0]["count"], 2);
+    assert_eq!(v["ranking"]["lines"], 3);
+    assert_eq!(v["ranking"]["unknown"], 0);
+    assert!(
+        v["ranking"]["title"]
+            .as_str()
+            .unwrap()
+            .ends_with("3 lines, at 22:13 UTC"),
+        "{v}"
+    );
+}
+
+// -- phase 4: the verifier's findings (S1-S4, Small 1, 2, 4, 8) ------------------------
+
+fn primary(i: u8, slots: (u16, u16)) -> crate::live::nodes::NodeInfo {
+    crate::live::nodes::NodeInfo {
+        id: format!("n{i}"),
+        endpoint: Endpoint {
+            host: format!("10.0.0.{i}"),
+            port: 7000,
+            tls: false,
+        },
+        role: crate::model::NodeRole::Primary,
+        slots: vec![slots],
+        connected: true,
+    }
+}
+
+/// A session on `p` on a cluster of two primaries, the live connection ready.
+fn cluster_session(t: &T, p: Profile) {
+    t.hub.install_for_test(p, false);
+    t.hub.with_mut(|c| {
+        c.session.nodes = vec![primary(1, (0, 8191)), primary(2, (8192, 16383))];
+    });
+}
+
+/// The picked node's Search list read, answered with [`index_list`].
+async fn search_listed(t: &T) -> serde_json::Value {
+    let list = spawn_call(t, signed_get("/api/search"));
+    answer_next(t, index_list()).await;
+    let res = list.await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    json(&text(res).await)
+}
+
+/// The streams of the report read, answered with [`streams_reply`].
+async fn streams_listed(t: &T) {
+    let list = spawn_call(t, signed_get("/api/streams"));
+    answer_next(t, streams_reply(&["events:orders", "events:audit"])).await;
+    let res = list.await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+/// A write the gate asks about: the question's id.
+async fn asked(t: &T, path: &str, body: &str) -> String {
+    let res = call(t, write("POST", path, body)).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT, "{path}");
+    let v = json(&text(res).await);
+    v["confirm"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{path}: {v}"))
+        .to_string()
+}
+
+/// An answer that must not wait for a send: a write sent while requests are held
+/// would wait for ever.
+async fn answer_now(t: &T, id: &str, typed: Option<&str>) -> Response {
+    tokio::time::timeout(std::time::Duration::from_secs(5), answer(t, id, typed))
+        .await
+        .expect("the answer was refused at once, not sent")
+}
+
+fn no_results() -> session::LiveResult {
+    use crate::live::search::{Reply, Results};
+    Ok(crate::live::LiveReply::Search(Reply::Results(Results {
+        total: 0,
+        docs: Vec::new(),
+        took: std::time::Duration::from_millis(1),
+    })))
+}
+
+fn query_body(cmd: &str, query: &str) -> String {
+    let idx = hexed("idx:p");
+    format!(r#"{{"index":"{idx}","cmd":"{cmd}","query":"{query}"}}"#)
+}
+
+/// S1 (rule 2): a node pick is part of a Search write's run. A drop asked on node 1 and
+/// answered after node 2 was picked is refused with CHANGED and sent to neither; a write
+/// made from node 1's list and decided after another pick (the window of the profile's
+/// read) is refused the same way, and so is its grant.
+#[tokio::test]
+async fn a_search_write_is_for_the_node_it_was_made_on() {
+    use super::api::writes::{CHANGED, MadeFor, decide, grant_write};
+    let p = writable_cache();
+    let t = setup("p4s1", vec![p.clone()]);
+    cluster_session(&t, p);
+    t.hub.hold_requests(true);
+    search_listed(&t).await;
+    let idx = hexed("idx:p");
+    let id = asked(&t, "/api/search/drop", &format!(r#"{{"index":"{idx}"}}"#)).await;
+    let res = call(&t, write("POST", "/api/node", r#"{"index":1}"#)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    // A send would be answered as closed (no server here), not held.
+    t.hub.hold_requests(false);
+    let sent = t.hub.sent_count();
+    let res = answer_now(&t, &id, None).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(json(&text(res).await)["error"], CHANGED);
+    assert_eq!(t.hub.sent_count(), sent, "sent to neither node");
+
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let app = app_state(Arc::clone(&t.hub), PORT, Token::for_test(&token()), rx);
+    let op = crate::write::WriteOp::FtDropIndex {
+        index: "idx:p".into(),
+    };
+    let made = t.hub.with(MadeFor::on_picked).unwrap();
+    assert_eq!(made.node, Some(1));
+    let d = decide(&app, &op, Some(made)).unwrap();
+    assert_eq!(d.dest, crate::live::Dest::node(1));
+    assert!(t.hub.pick(0));
+    let r = decide(&app, &op, Some(made)).unwrap_err();
+    assert_eq!((r.status, r.text.as_str()), (StatusCode::CONFLICT, CHANGED));
+    let r = grant_write(&app, d.made, op.clone(), &crate::write::Answer::Yes).unwrap_err();
+    assert_eq!(r.text, CHANGED);
+    // Decided without one, a write sent to the picked node is still for that node only.
+    let d = decide(&app, &op, None).unwrap();
+    assert_eq!(d.made.node, Some(0));
+    assert!(t.hub.pick(1));
+    let r = grant_write(&app, d.made, op, &crate::write::Answer::Yes).unwrap_err();
+    assert_eq!(r.text, CHANGED);
+    // A key's write goes to its owner whatever is picked: not bound to the node.
+    let op = crate::write::WriteOp::Unlink {
+        key: "user:1".into(),
+    };
+    let d = decide(&app, &op, Some(t.hub.with(MadeFor::of).unwrap())).unwrap();
+    assert_eq!(d.made.node, None);
+    assert!(t.hub.pick(0));
+    assert!(grant_write(&app, d.made, op, &crate::write::Answer::Yes).is_ok());
+    assert_eq!(t.hub.sent_count(), sent);
+}
+
+/// S2 (the TUI's bulk dialog takes every key until it ends): a stream write, a Search
+/// write and a key edit asked before a bulk action started are refused when answered
+/// while it counts, and while it runs, with BUSY, and nothing is sent.
+#[tokio::test]
+async fn a_write_asked_before_a_bulk_action_is_refused_while_it_counts_or_runs() {
+    use super::api::bulk::{BUSY, hold};
+    let p = writable_cache();
+    let t = setup("p4s2", vec![p.clone()]);
+    streams_session(&t, p);
+    let view = open_hash(&t);
+    t.hub.hold_requests(true);
+    streams_listed(&t).await;
+    search_listed(&t).await;
+    let key = hexed("events:orders");
+    let idx = hexed("idx:p");
+    let mut questions = Vec::new();
+    for _ in 0..2 {
+        questions.push(vec![
+            asked(
+                &t,
+                "/api/streams/trim",
+                &format!(r#"{{"key":"{key}","by":"MAXLEN","value":"1"}}"#),
+            )
+            .await,
+            asked(&t, "/api/search/drop", &format!(r#"{{"index":"{idx}"}}"#)).await,
+            asked(&t, "/api/value/delete", &format!(r#"{{"view":{view}}}"#)).await,
+        ]);
+    }
+    let pattern = hexed("user:{id}");
+    let res = call(
+        &t,
+        write(
+            "POST",
+            "/api/bulk",
+            &format!(r#"{{"pattern":"{pattern}","action":"delete"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let bulk = json(&text(res).await)["bulk"]["id"].as_u64().unwrap();
+    let hub = Arc::clone(&t.hub);
+    until("the count step waits", || hub.pending_len() == 1).await;
+    let refused = |what: &'static str, ids: Vec<String>| {
+        let t = &t;
+        async move {
+            let sent = t.hub.sent_count();
+            for id in ids {
+                let res = answer_now(t, &id, None).await;
+                assert_eq!(res.status(), StatusCode::CONFLICT, "{what}");
+                assert_eq!(json(&text(res).await)["error"], BUSY, "{what}");
+            }
+            assert_eq!(t.hub.sent_count(), sent, "{what}: nothing sent");
+        }
+    };
+    let running = questions.pop().unwrap();
+    refused("counting", questions.pop().unwrap()).await;
+
+    assert!(
+        t.hub
+            .answer_oldest(count_reply(crate::live::bulk::Walk::Done, 5))
+    );
+    until("counted", || {
+        hub.with(|c| {
+            c.bulk
+                .as_ref()
+                .is_some_and(|b| matches!(b.stage, super::api::bulk::Stage::Counted))
+        })
+        .unwrap_or(false)
+    })
+    .await;
+    let qid = asked(&t, "/api/bulk/run", &format!(r#"{{"bulk":{bulk}}}"#)).await;
+    hold::hold(&t.config);
+    let res = answer(&t, &qid, None).await;
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    until("held", || hold::arrived(&t.config) == 1).await;
+    refused("running", running).await;
+}
+
+/// S3: a reply that came back just before a new run is not kept after it: the stream
+/// list, a pending list, the Search list and a query's results each answer CHANGED and
+/// leave the panel as the new run reset it.
+#[tokio::test]
+async fn a_reply_that_comes_back_on_a_new_run_is_not_kept() {
+    use super::api::writes::CHANGED;
+    let p = writable_cache();
+    let t = setup("p4s3", vec![p.clone()]);
+    streams_session(&t, p);
+    t.hub.hold_requests(true);
+    let hub = Arc::clone(&t.hub);
+    let changed = |res: Response| async move {
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(json(&text(res).await)["error"], CHANGED);
+    };
+    let report = || {
+        t.hub.with_mut(|c| c.session.report = Some(stream_report()));
+    };
+
+    // The list: answered, then the new run, then the handler takes the lock.
+    let list = spawn_call(&t, signed_get("/api/streams"));
+    until("the read waits", || hub.pending_len() == 1).await;
+    assert!(t.hub.answer_oldest(streams_reply(&["events:orders"])));
+    t.hub.new_run(None, Some(1)).unwrap();
+    changed(list.await.unwrap()).await;
+    assert_eq!(t.hub.with(|c| c.streams.is_empty()), Some(true));
+    new_run_ready(&t).await;
+
+    // A pending list.
+    report();
+    streams_listed(&t).await;
+    let (key, group) = (hexed("events:orders"), hexed("billing"));
+    let pending = spawn_call(
+        &t,
+        signed_get(&format!("/api/streams/pending?key={key}&group={group}")),
+    );
+    until("the read waits", || hub.pending_len() == 1).await;
+    assert!(t.hub.answer_oldest(streams_reply(&["events:orders"])));
+    t.hub.new_run(None, Some(0)).unwrap();
+    changed(pending.await.unwrap()).await;
+    assert_eq!(t.hub.with(|c| c.streams.is_empty()), Some(true));
+    new_run_ready(&t).await;
+
+    // The Search list.
+    let list = spawn_call(&t, signed_get("/api/search"));
+    until("the read waits", || hub.pending_len() == 1).await;
+    assert!(t.hub.answer_oldest(index_list()));
+    t.hub.new_run(None, Some(1)).unwrap();
+    changed(list.await.unwrap()).await;
+    assert_eq!(t.hub.with(|c| c.search.is_empty()), Some(true));
+    new_run_ready(&t).await;
+
+    // A query's results.
+    search_listed(&t).await;
+    let query = spawn_call(
+        &t,
+        write("POST", "/api/search/query", &query_body("search", "x")),
+    );
+    until("the query waits", || hub.pending_len() == 1).await;
+    assert!(t.hub.answer_oldest(no_results()));
+    t.hub.new_run(None, Some(0)).unwrap();
+    changed(query.await.unwrap()).await;
+    assert_eq!(t.hub.with(|c| c.search.is_empty()), Some(true));
+}
+
+/// S4: picking another node drops what Search found (its list, last query and
+/// results); a new run drops what Streams and Search found.
+#[tokio::test]
+async fn a_pick_drops_what_search_found_and_a_new_run_what_both_panels_found() {
+    let p = writable_cache();
+    let t = setup("p4s4pick", vec![p.clone()]);
+    cluster_session(&t, p);
+    t.hub.with_mut(|c| c.session.report = Some(stream_report()));
+    t.hub.hold_requests(true);
+    search_listed(&t).await;
+    let query = spawn_call(
+        &t,
+        write("POST", "/api/search/query", &query_body("search", "x")),
+    );
+    answer_next(&t, no_results()).await;
+    assert_eq!(query.await.unwrap().status(), StatusCode::OK);
+    assert_eq!(t.hub.with(|c| c.search.is_empty()), Some(false));
+    assert!(t.hub.pick(1));
+    assert_eq!(t.hub.with(|c| c.search.is_empty()), Some(true));
+    let (_, v) = get_json(&t, "/api/search/results?run=1").await;
+    assert_eq!(v["error"], super::api::search::STALE, "{v}");
+
+    // Both panels hold what they read; an analysis starts a new run.
+    let streams = spawn_call(&t, signed_get("/api/streams"));
+    let hub = Arc::clone(&t.hub);
+    until("the streams read waits", || hub.pending_len() >= 1).await;
+    while t.hub.pending_len() > 0 {
+        assert!(
+            t.hub
+                .answer_oldest(streams_reply(&["events:orders", "events:audit"]))
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(streams.await.unwrap().status(), StatusCode::OK);
+    search_listed(&t).await;
+    assert_eq!(t.hub.with(|c| c.streams.is_empty()), Some(false));
+    assert_eq!(t.hub.with(|c| c.search.is_empty()), Some(false));
+    t.hub
+        .new_run(Some(crate::tui::app::views::overview::Depth::Quick), None)
+        .unwrap();
+    assert_eq!(t.hub.with(|c| c.streams.is_empty()), Some(true));
+    assert_eq!(t.hub.with(|c| c.search.is_empty()), Some(true));
+}
+
+/// S4 (rule 2): on a read-only profile FT.CREATE and FT.DROPINDEX are refused with the
+/// gate's words and nothing is sent; the list still reads and says why writes are off.
+#[tokio::test]
+async fn search_writes_on_a_read_only_profile_send_nothing() {
+    let t = setup("p4s4ro", Vec::new());
+    t.hub.install_for_test(profile("prod1", Env::Prod), false);
+    t.hub.hold_requests(true);
+    let v = search_listed(&t).await;
+    assert!(v["writes"].as_str().unwrap().contains("read-only"), "{v}");
+    let sent = t.hub.sent_count();
+    let idx = hexed("idx:p");
+    for (path, body) in [
+        (
+            "/api/search/create",
+            r#"{"name":"i","on":"HASH","prefixes":"","fields":"t TEXT"}"#.to_string(),
+        ),
+        ("/api/search/drop", format!(r#"{{"index":"{idx}"}}"#)),
+    ] {
+        let res = call(&t, write("POST", path, &body)).await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+        let v = json(&text(res).await);
+        assert!(
+            v["error"].as_str().unwrap().contains("read-only"),
+            "{path}: {v}"
+        );
+    }
+    assert_eq!(t.hub.sent_count(), sent, "no write sent");
+}
+
+/// S4 (rule 2): a stream write's and a Search write's question answered after the
+/// profile was made read-only in the config file is refused with the gate's words; one
+/// answered after a new run is refused with CHANGED. Nothing is sent.
+#[tokio::test]
+async fn a_stream_or_search_answer_after_read_only_or_a_new_run_sends_nothing() {
+    let p = writable_cache();
+    let t = setup("p4s4late", vec![p.clone()]);
+    streams_session(&t, p);
+    t.hub.hold_requests(true);
+    streams_listed(&t).await;
+    search_listed(&t).await;
+    let key = hexed("events:orders");
+    let idx = hexed("idx:p");
+    let trim = format!(r#"{{"key":"{key}","by":"MAXLEN","value":"1"}}"#);
+    let drop = format!(r#"{{"index":"{idx}"}}"#);
+    let ids = [
+        asked(&t, "/api/streams/trim", &trim).await,
+        asked(&t, "/api/search/drop", &drop).await,
+    ];
+    flip_writes(&t, "cache", false);
+    let sent = t.hub.sent_count();
+    for id in &ids {
+        let res = answer_now(&t, id, None).await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let v = json(&text(res).await);
+        assert!(v["error"].as_str().unwrap().contains("read-only"), "{v}");
+    }
+    assert_eq!(t.hub.sent_count(), sent, "read-only: nothing sent");
+
+    flip_writes(&t, "cache", true);
+    let ids = [
+        asked(&t, "/api/streams/trim", &trim).await,
+        asked(&t, "/api/search/drop", &drop).await,
+    ];
+    t.hub.new_run(None, Some(1)).unwrap();
+    new_run_ready(&t).await;
+    let sent = t.hub.sent_count();
+    for id in &ids {
+        let res = answer_now(&t, id, None).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(json(&text(res).await)["error"], super::api::writes::CHANGED);
+    }
+    assert_eq!(t.hub.sent_count(), sent, "a new run: nothing sent");
+}
+
+/// A Monitor run as `Hub::monitor` starts one, ready, with `lines`.
+fn monitor_run(t: &T, conn: crate::tui::app::ConnId, run: u64, lines: &[&str]) {
+    use crate::tui::app::Msg;
+    t.hub.with_mut(|c| {
+        c.monitor = Some(session::Monitor {
+            run,
+            node: 0,
+            started_at_unix_ms: None,
+        });
+        c.hot.begin(run, 0);
+    });
+    t.hub.apply_for_test(Msg::MonitorReady {
+        id: conn,
+        scan: 1,
+        run,
+        at_unix_ms: 1_700_000_000_000,
+    });
+    t.hub.apply_for_test(Msg::MonitorLines {
+        id: conn,
+        scan: 1,
+        run,
+        lines: lines
+            .iter()
+            .map(|s| crate::live::monitor::read_line(s).unwrap())
+            .collect(),
+    });
+}
+
+/// S4, Hot keys: commands the server never says anything about are asked with
+/// COMMAND INFO at most MAX_LOOKUPS times, then the run is ranked with what is known;
+/// a run that a new run ends is ranked at once, without asking.
+#[tokio::test]
+async fn hot_keys_ask_at_most_max_lookups_and_a_new_run_ranks_at_once() {
+    use crate::live::server::Reply;
+    use crate::tui::app::views::server::MAX_LOOKUPS;
+    let t = setup("p4s4hot", Vec::new());
+    let conn = t.hub.install_for_test(profile("cache", Env::Local), false);
+    t.hub.with_mut(|c| {
+        let r = crate::tui::fixtures::report(true);
+        c.session.server = Some(r.server.clone());
+        c.session.report = Some(r);
+    });
+    monitor_run(
+        &t,
+        conn,
+        7,
+        &[
+            r#"1.0 [0 127.0.0.1:1] "FOO" "user:1""#,
+            r#"1.0 [0 127.0.0.1:1] "FOO" "user:2""#,
+        ],
+    );
+    t.hub.hold_requests(true);
+    let sent = t.hub.sent_count();
+    assert!(t.hub.stop_monitor());
+    for _ in 0..MAX_LOOKUPS {
+        answer_next(
+            &t,
+            Ok(crate::live::LiveReply::Server(Reply::CommandKeys(
+                Default::default(),
+            ))),
+        )
+        .await;
+    }
+    let hub = Arc::clone(&t.hub);
+    until("ranked", || {
+        hub.with(|c| matches!(c.hot.rank, super::api::hot::Rank::Done(_)))
+            .unwrap_or(false)
+    })
+    .await;
+    assert_eq!(t.hub.sent_count(), sent + MAX_LOOKUPS as usize);
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(t.hub.pending_len(), 0, "no lookup past the bound");
+    let (_, v) = get_json(&t, "/api/analysis/hot_keys/monitor").await;
+    assert_eq!(v["ranking"]["unknown"], 2, "{v}");
+
+    // A new run ends the next one: ranked at once, nothing asked.
+    monitor_run(&t, conn, 8, &[r#"1.0 [0 127.0.0.1:1] "BAR" "user:3""#]);
+    let sent = t.hub.sent_count();
+    t.hub.new_run(None, Some(1)).unwrap();
+    let ranked = t.hub.with(|c| match &c.hot.rank {
+        super::api::hot::Rank::Done(r) => r.hot.ranking.lines,
+        _ => 0,
+    });
+    assert_eq!(ranked, Some(1), "ranked at once");
+    assert_eq!(t.hub.sent_count(), sent, "no COMMAND INFO");
+    assert_eq!(t.hub.pending_len(), 0);
+}
+
+/// S4: every route of `routes` is served for its methods only: another one (with the
+/// token and the guard's headers) is 405, and `Allow` names exactly the methods listed.
+async fn only_their_methods(t: &T, routes: &[(&str, &str)]) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut by_path: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for (method, path) in routes {
+        let path = path.split('?').next().unwrap();
+        by_path.entry(path).or_default().insert(method.to_string());
+    }
+    for (path, methods) in by_path {
+        let res = call(t, write("PUT", path, "{}")).await;
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED, "PUT {path}");
+        let allow: BTreeSet<String> = res.headers()[header::ALLOW]
+            .to_str()
+            .unwrap()
+            .split(',')
+            .map(|m| m.trim().to_string())
+            .filter(|m| m != "HEAD")
+            .collect();
+        assert_eq!(allow, methods, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn every_route_is_served_for_its_registered_methods_only() {
+    let t = setup("p4methods", Vec::new());
+    let mut p = profile("cache", Env::Local);
+    p.read_only = Some(false);
+    t.hub.install_for_test(p, false);
+    only_their_methods(&t, PHASE_TWO).await;
+    only_their_methods(&t, PHASE_THREE).await;
+    only_their_methods(&t, PHASE_FOUR).await;
+}
+
+/// Small 1, 4, 8: the Search list is read each time the view asks for it; `busy` names
+/// the command as the page does; and a query of an earlier node never frees the slot of
+/// one asked after a pick, so two never run at once.
+#[tokio::test]
+async fn the_search_list_is_read_when_shown_and_one_query_runs_at_a_time_across_picks() {
+    let p = writable_cache();
+    let t = setup("p4small", vec![p.clone()]);
+    cluster_session(&t, p);
+    t.hub.hold_requests(true);
+    let hub = Arc::clone(&t.hub);
+    search_listed(&t).await;
+    let sent = t.hub.sent_count();
+    search_listed(&t).await;
+    assert_eq!(t.hub.sent_count(), sent + 1, "read again when shown");
+
+    let a = spawn_call(
+        &t,
+        write("POST", "/api/search/query", &query_body("search", "a")),
+    );
+    until("a waits", || hub.pending_len() == 1).await;
+    assert!(t.hub.pick(1));
+    let list = spawn_call(&t, signed_get("/api/search"));
+    until("the list waits", || hub.pending_len() == 2).await;
+    assert!(t.hub.answer_newest(index_list()));
+    assert_eq!(list.await.unwrap().status(), StatusCode::OK);
+    let b = spawn_call(
+        &t,
+        write("POST", "/api/search/query", &query_body("search", "b")),
+    );
+    until("b waits", || hub.pending_len() == 2).await;
+    let list = spawn_call(&t, signed_get("/api/search"));
+    until("the list waits", || hub.pending_len() == 3).await;
+    assert!(t.hub.answer_newest(index_list()));
+    let v = json(&text(list.await.unwrap()).await);
+    assert_eq!(v["busy"], "FT.SEARCH", "{v}");
+    // a, of node 1, ends: b still holds the slot.
+    assert!(t.hub.answer_oldest(no_results()));
+    assert_eq!(a.await.unwrap().status(), StatusCode::CONFLICT);
+    let sent = t.hub.sent_count();
+    let res = call(
+        &t,
+        write("POST", "/api/search/query", &query_body("search", "c")),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(&text(res).await)["error"],
+        "FT.SEARCH is still running: wait for its answer."
+    );
+    assert_eq!(t.hub.sent_count(), sent, "c is not sent");
+    assert!(t.hub.answer_oldest(no_results()));
+    assert_eq!(b.await.unwrap().status(), StatusCode::OK);
+}
+
+/// Small 2: `now=1` reads the streams at once (as the TUI's poll after a write) and
+/// still leaves out what the server refused; `refresh=1` asks for it again.
+#[tokio::test]
+async fn after_a_write_the_streams_are_read_now_without_asking_again_what_was_refused() {
+    use crate::live::streams::{Fetched, Refused, Reply};
+    let t = setup("p4now", Vec::new());
+    streams_session(&t, profile("cache", Env::Local));
+    t.hub.hold_requests(true);
+    let list = spawn_call(&t, signed_get("/api/streams"));
+    let mut info = a_stream("events:orders");
+    info.groups = None;
+    answer_next(
+        &t,
+        Ok(crate::live::LiveReply::Streams(Reply::Info {
+            streams: vec![Fetched {
+                key: "events:orders".into(),
+                info: Some(info),
+            }],
+            refused: Refused {
+                groups: true,
+                ..Refused::default()
+            },
+        })),
+    )
+    .await;
+    assert_eq!(list.await.unwrap().status(), StatusCode::OK);
+    let refused = |t: &T| t.hub.with(|c| c.streams.refused().groups).unwrap();
+    assert!(refused(&t));
+    let sent = t.hub.sent_count();
+    let (_, _) = get_json(&t, "/api/streams").await;
+    assert_eq!(t.hub.sent_count(), sent, "fresh: answered again");
+    let now = spawn_call(&t, signed_get("/api/streams?now=1"));
+    answer_next(&t, streams_reply(&["events:orders"])).await;
+    assert_eq!(now.await.unwrap().status(), StatusCode::OK);
+    assert_eq!(t.hub.sent_count(), sent + 1, "read at once");
+    assert!(refused(&t), "XINFO GROUPS still left out");
+    let again = spawn_call(&t, signed_get("/api/streams?refresh=1"));
+    let hub = Arc::clone(&t.hub);
+    until("the read waits", || hub.pending_len() == 1).await;
+    assert!(!refused(&t), "a refresh asks again");
+    assert!(t.hub.answer_oldest(streams_reply(&["events:orders"])));
+    assert_eq!(again.await.unwrap().status(), StatusCode::OK);
 }

@@ -55,11 +55,17 @@
 <li><a href="#dash-rules">The same rules</a></li>
 <li><a href="#dash-connections">Connections</a></li>
 <li><a href="#dash-overview">Overview</a></li>
+<li><a href="#dash-browse">Browse › Keys</a></li>
+<li><a href="#dash-edits">Edits and bulk actions</a></li>
+<li><a href="#dash-streams">Browse › Streams</a></li>
+<li><a href="#dash-search">Browse › Search</a></li>
+<li><a href="#dash-analyze">Analyze</a></li>
+<li><a href="#dash-snapshots">Snapshots</a></li>
 <li><a href="#dash-server">Server</a></li>
 <li><a href="#dash-pubsub">Pub/Sub</a></li>
 <li><a href="#dash-cmdline">Command line</a></li>
 <li><a href="#dash-theme">Light theme</a></li>
-<li><a href="#dash-not-yet">Not in the dashboard yet</a></li>
+<li><a href="#dash-cli-only">What stays on the command line</a></li>
 </ul></li>
 <li data-only="terminal"><a href="#keys">Key reference</a><ul class="sub-nav">
 <li><a href="#keys-everywhere">Everywhere</a></li>
@@ -136,7 +142,7 @@
 <p class="lede">redis-lens lists your keys and shows their values, finds the keys and key patterns that use the most memory, and shows live server stats, connected clients, the slow log and Pub/Sub messages. You can also run commands and edit keys from it.</p>
 <div class="badges"><span>Redis 6.2 and later</span><span>Valkey 8</span><span>standalone, cluster, Sentinel</span><span>macOS · Linux · Windows</span><span>MIT</span></div>
 <p data-only="terminal">To see what uses the memory, press <kbd>r</kbd>. redis-lens samples the keys with <code>SCAN</code>, groups them into patterns such as <code>user:{id}:cart</code>, and lists each pattern's key count, memory, average size and how many keys have no TTL. A pattern that looks wrong, such as keys that never expire or one very large list, is marked <code>▲</code> with the reason.</p>
-<p data-only="dashboard">redis-lens runs in the terminal, and the same program serves a web dashboard on <code>127.0.0.1</code>. The dashboard has five screens so far: Connections, Overview, Server (clients, the slow log, <code>MONITOR</code>), Pub/Sub and a command line. It follows the same rules as the terminal. Browsing keys, the analysis, edits, streams and Search are still terminal-only; see <a href="#dash-not-yet">Not in the dashboard yet</a>.</p>
+<p data-only="dashboard">redis-lens runs in the terminal, and the same program serves a web dashboard on <code>127.0.0.1</code>. The dashboard has every screen of the TUI: Connections, Overview, Browse (keys and their values, streams, Search), Analyze, Server (clients, the slow log, <code>MONITOR</code>), Pub/Sub and a command line, with the same edits and bulk actions. It follows the same rules as the terminal; see <a href="#dashboard">The dashboard</a>.</p>
 <p data-only="terminal">To find a key, press <kbd>ctrl-f</kbd> on any screen and type part of its name or a pattern. Other screens show the server (stats, clients, the slow log, <code>MONITOR</code>), streams and consumer groups, Pub/Sub, Search indexes, and a <code>:</code> command line. Snapshots, diffs, trends and <code>--check</code> rules run the same analysis from cron or CI.</p>
 <h3>Why it is safe on production</h3>
 <ul>
@@ -147,7 +153,7 @@
 <li><strong>A missing permission turns one feature off</strong> and says why. It never aborts a scan.</li>
 </ul>
 <figure data-only="terminal"><img class="gif" src="demo.gif" width="1175" height="784" decoding="async" alt="redis-lens opening the demo Redis, analyzing the keys, browsing the key patterns and their verdicts, opening a pattern's keys and a value, then the Analyze and Server panels" loading="lazy"><figcaption>The demo keyspace from <code>make demo</code>. Every screen below is drawn from the app's own snapshot tests.</figcaption></figure>
-<figure data-only="dashboard"><img class="gif" src="dashboard.gif" width="960" height="669" loading="lazy" decoding="async" alt="The redis-lens dashboard in a browser: connecting to a demo Redis, the Overview, the Server clients, slow log and Monitor, a Pub/Sub tail with messages arriving, the command line showing a table, and the light theme"><figcaption>The dashboard against the demo servers from <code>make demo</code>. The screenshots below are from the same run.</figcaption></figure>
+<figure data-only="dashboard"><img class="gif" src="dashboard.gif" width="960" height="669" loading="lazy" decoding="async" alt="The redis-lens dashboard in a browser: connecting to a demo Redis, the Overview, the Server clients, slow log and Monitor, a Pub/Sub tail with messages arriving, the command line showing a table, and the light theme"><figcaption>The dashboard against the demo servers from <code>make demo</code>. The screenshots below are from the same demo servers.</figcaption></figure>
 </div>
 <div class="rail">
 <div class="codeblock"><div class="cb-head"><span class="cb-title">install</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">brew install magna-nz/tap/redis-lens</code></pre></div>
@@ -259,7 +265,7 @@ redis-lens scan prod-cache --sample 20000</code></pre></div></div>
 <h3>3. Open the dashboard</h3>
 <p><code>redis-lens --dashboard</code> serves the dashboard alone. It prints <code>Dashboard:</code> and a sign-in link, opens your browser on it (not with <code>--no-open</code>), and runs until <kbd>ctrl-c</kbd>.</p>
 <p>Plain <code>redis-lens</code> starts the TUI and serves the dashboard beside it on <code>127.0.0.1:7379</code>. The Connections screen shows the address; <kbd>ctrl-o</kbd> opens it in your browser, signed in. Quitting the TUI stops the dashboard.</p>
-<p>In the page, <strong>Connections</strong> lists the saved connections and the containers found in Docker. <strong>Add a connection</strong> saves a new one, with the password going to the OS keychain. <strong>Connect</strong> reads the server's own figures, no key, and opens the Overview. Server, Pub/Sub and Command line are in the side bar.</p>
+<p>In the page, <strong>Connections</strong> lists the saved connections and the containers found in Docker. <strong>Add a connection</strong> saves a new one, with the password going to the OS keychain. <strong>Connect</strong> reads the server's own figures, no key, and opens the Overview. Browse, Analyze, Server, Pub/Sub and Command line are in the side bar; <strong>Analyze 10,000 keys</strong> on Analyze samples the keys.</p>
 </div>
 <div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">redis-lens --dashboard             # the dashboard only
 redis-lens --dashboard --no-open   # print the link, open no browser
@@ -520,9 +526,9 @@ q          quit</code></pre></div>
 <div class="prose">
 <div class="eyebrow">Use it</div>
 <h2>The dashboard <a class="anchor" href="#dashboard" aria-label="Link to this section">#</a></h2>
-<p class="lede">Connections, Overview, Server, Pub/Sub and a command line, in your browser.</p>
+<p class="lede">Every screen of the TUI, in your browser.</p>
 <p>The dashboard is served by the same redis-lens process, on <code>127.0.0.1</code> only. One connection is open at a time, shared by every tab. It sends what the TUI sends, through the same code, and keeps to the same rules. It is dark by default, with a light theme.</p>
-<p>It is being built in phases. This is phase 1; <a href="#dash-not-yet">Not in the dashboard yet</a> lists what is still terminal-only.</p>
+<p>It has Connections, Overview, Browse (Keys, Streams and Search), Analyze with snapshots, Server, Pub/Sub and the command line, with the TUI's edits and bulk actions. What runs unattended stays on the command line: see <a href="#dash-cli-only">What stays on the command line</a>.</p>
 </div>
 <div class="rail"></div>
 </div>
@@ -604,9 +610,88 @@ dashboard_port = 8080  # the port, when it starts</code></pre></div>
 <div class="sub" id="dash-overview">
 <div class="row row-wide"><div class="prose">
 <h3>Overview</h3>
-<p>What the TUI's Overview shows before an analysis: memory, keys, commands per second and clients, polled while the page is open; the server, its version, topology, persistence and figures; a row per shard and a node picker on a cluster; the provider notice; the permission checks; and Things to look at, from the server's own figures by the TUI's rules. The key analysis comes with Browse in a later phase.</p>
+<p>What the TUI's Overview shows before an analysis: memory, keys, commands per second and clients, polled while the page is open; the server, its version, topology, persistence and figures; a row per shard and a node picker on a cluster; the provider notice; the permission checks; and Things to look at, from the server's own figures by the TUI's rules. After an <a href="#dash-analyze">analysis</a>, Things to look at include its findings too.</p>
 <figure class="shot-figure"><img class="shot" src="img/dashboard-overview.png" width="1280" height="964" loading="lazy" decoding="async" alt="The dashboard's Overview for demo-admin, a local Redis 7.4.12: memory 185M of 768M, 50K keys, about 50 commands a second and 5 clients with small bar charts, the server's figures, Things to look at naming a slow EVAL, and the permission checks"><figcaption>Connected to the demo Redis. No key has been read.</figcaption></figure>
 </div></div>
+</div>
+
+<div class="sub" id="dash-browse">
+<div class="row row-wide"><div class="prose">
+<h3>Browse › Keys</h3>
+<p>Browse has the TUI's three panels, Keys, Streams and Search, each at its own address. <strong>Keys</strong> is the pattern tree beside the picked pattern's keys, with the open key's value below. Before an analysis the tree comes from key names only: <code>SCAN</code>, 1,000 names a call, more on request. After one it has memory, the <code>▲</code> mark and its reason, and can be sorted and filtered. On a cluster it can be narrowed to one shard.</p>
+<ul>
+<li><strong>A pattern</strong> lists its keys with type, size and expiry, read with <code>SCAN MATCH</code> and pipelined so no value is read. A list stops at 50,000 keys.</li>
+<li><strong>A key</strong> opens its value, of any type, in pages as in the TUI (at most 10,000 items). An item opens whole in any of the TUI's formats: text, hex, JSON, MessagePack, PHP, Pickle, Protobuf or Java. Key names are shown escaped.</li>
+<li><strong>Find a key</strong>, the box in the top bar, works from every screen. Text finds names that contain it; <code>*</code> <code>?</code> <code>[ ]</code> make a pattern, used as typed (at most 8 <code>*</code>). It reads with <code>SCAN</code>, never <code>KEYS</code>.</li>
+<li><strong>Copy name</strong> and <strong>Copy value</strong> put the text on the browser's clipboard; text with control characters is copied only as hex.</li>
+<li><strong>Database</strong> switches the database for the dashboard's session only; the saved profile is unchanged. It is off on a cluster.</li>
+</ul>
+<figure class="shot-figure"><img class="shot" src="img/dashboard-browse.png" width="1280" height="1628" loading="lazy" decoding="async" alt="Browse, Keys panel on the demo Redis: the pattern tree from an analysis with memory per pattern and warning marks on cache:search:{hash} and user:{id}:cart, a Find for user:28648:profile with one match, and below it that hash's value: fields name, bio and email, the email field selected and shown as text, with the buttons Copy name, Copy value, Add field, Set expiry, Rename, Delete key, Edit value, Field TTL and Delete field"><figcaption>A key found by name, with its value open. The format pills show the field another way.</figcaption></figure>
+</div></div>
+</div>
+
+<div class="sub" id="dash-edits">
+<div class="row row-wide"><div class="prose">
+<h3>Edits and bulk actions</h3>
+<p>With writes on, an open value has the TUI's edits for its type: a string as text or hex; hash fields added, changed, deleted and given a field TTL where the server has one; list elements pushed, changed and removed; set and sorted set members added, changed (a score) and removed; stream entries added and deleted. An edit to a value that changed since it was read is refused, and the value is read again. A value stored compressed is not edited, since saving it would store it uncompressed.</p>
+<p><strong>Add key</strong> adds a key of any of the six types with its first content, and never overwrites an existing one. <strong>Set expiry</strong>, <strong>Rename</strong> (never onto an existing name) and <strong>Delete key</strong> are on the value and beside the key in the list.</p>
+<p><strong>Set a TTL on every key…</strong> and <strong>Delete every key…</strong> on a pattern are the TUI's bulk actions. A dry run counts the keys first, with reads only. Running it asks, with the pattern typed on <code>prod</code>, then sends batches of at most 500 through the command budget, one node at a time on a cluster, with progress and a summary. <strong>Stop</strong> ends it before the next batch. While a bulk action counts or runs, the other writes, a database switch, an analysis, connect and disconnect are refused; a command typed on the command line is not.</p>
+<p>Every write goes through the <a href="#safety-gate">write gate</a>. On a read-only connection each write button is off and says why, and a command the server refuses (<code>NOPERM</code>) turns that action off for the session. Delete questions end "This can't be undone."</p>
+<figure class="shot-figure"><img class="shot" src="img/dashboard-bulk.png" width="1280" height="800" loading="lazy" decoding="async" alt="Browse, a bulk action card above the pattern tree: Set a TTL on every key of the pattern tmp:import:{ulid}, TTL 24h, counted for demo-admin. The dry run found 1,500 keys of the pattern, none with a TTL, so 1,500 would get 24h. Running it asks first. Buttons: Set the TTL on 1,500 keys… and Cancel"><figcaption>A bulk TTL after its dry run. Nothing is written until you run it and answer its question; this one was cancelled.</figcaption></figure>
+</div></div>
+</div>
+
+<div class="sub" id="dash-streams">
+<div class="row">
+<div class="prose">
+<h3>Browse › Streams</h3>
+<p>The streams the analysis found, at most 50, each read on the node that owns it, with the TUI's verdicts: a group 1,000 entries behind is <em>lagging</em>, and a consumer idle 30 minutes with entries pending is <em>stuck</em>. A stream opens to its groups (lag, pending, last delivered ID), their consumers (pending, idle), and the pending entries of a group or a consumer, at most 100. Its entries are its value: newest first, 100 at a time. Before an analysis the panel says streams are listed after one.</p>
+<p>Its writes are exactly the TUI's, through the write gate:</p>
+<ul>
+<li><strong>Ack</strong> on a pending entry sends <code>XACK</code>.</li>
+<li><strong>Claim pending entries</strong> sends <code>XAUTOCLAIM</code>, filled in as the TUI fills it: the most recently active consumer, 60,000 ms, 100 entries; from a consumer or a pending entry, that consumer's idle time, with that consumer left out of the target.</li>
+<li><strong>Trim the stream</strong> sends <code>XTRIM MAXLEN ~</code> or <code>MINID ~</code>, and asks first.</li>
+</ul>
+</div>
+<div class="rail"></div>
+</div>
+</div>
+
+<div class="sub" id="dash-search">
+<div class="row">
+<div class="prose">
+<h3>Browse › Search</h3>
+<p>The picked node's indexes (<code>FT._LIST</code>, at most 50), each with its <code>FT.INFO</code>. A query runs <code>FT.SEARCH</code>, <code>FT.EXPLAIN</code> or <code>FT.PROFILE</code> as the TUI sends them: <code>LIMIT 0 50</code>, one at a time, one line of at most 1,000 characters, and an empty query means <code>*</code>. Results show ten at a time, and a field opens whole in a format. There is no <code>FT.AGGREGATE</code>, as in the TUI.</p>
+<p><strong>Create an index</strong> sends <code>FT.CREATE</code> from the TUI's form, and <strong>Drop index</strong> sends <code>FT.DROPINDEX</code> without <code>DD</code>, so the documents stay; it asks first. Without Redis Search (built into Redis 8) or valkey-search, or when the user is refused, the panel is off and says why. The demo servers have no search module, so there it says so.</p>
+</div>
+<div class="rail"></div>
+</div>
+</div>
+
+<div class="sub" id="dash-analyze">
+<div class="row row-wide"><div class="prose">
+<h3>Analyze</h3>
+<p><strong>Analyze 10,000 keys</strong> (Quick) and <strong>Analyze 100,000 keys</strong> (Deep) first show the TUI's estimate of commands and time, then run with progress. <strong>Stop</strong> keeps what was sampled, marked stopped; a stop before any key changes nothing. The panels then show:</p>
+<ul>
+<li><strong>Big keys</strong>: Things to look at, and the 50 biggest sampled keys with type, share, size, length, encoding, expiry and pattern. A key or a pattern opens on Browse.</li>
+<li><strong>Expiry</strong>: the memory that expiry frees, and the patterns by TTL risk.</li>
+<li><strong>Changes</strong>: the analysis against a snapshot, or two snapshots against each other.</li>
+<li><strong>Hot keys</strong>: keys by LFU counter, which needs an LFU policy. When the analysis has none, it ranks the keys of the session's last Monitor run instead (Server › Monitor), kept in memory only and never saved.</li>
+<li><strong>Nodes</strong> and <strong>Slots</strong>, on a cluster only.</li>
+</ul>
+<p>Overview's Things to look at include the analysis. An analysis that fails says why in redis-lens's words, and the connection stays open with any earlier report. What each panel computes is in <a href="#analysis">Analysis</a>.</p>
+<figure class="shot-figure"><img class="shot" src="img/dashboard-analyze.png" width="1280" height="1100" loading="lazy" decoding="async" alt="Analyze, Big keys panel after a Quick analysis of 10,000 keys of the demo Redis: Things to look at, such as hashes past their compact encoding, 32% of user:{id}:cart keys never expiring and 37% of memory never expiring, then a table of the biggest sampled keys, tmp:import keys of about 20K each, with type, share, size, length, encoding, expiry and pattern"><figcaption>Big keys after a Quick analysis of the demo Redis.</figcaption></figure>
+</div></div>
+</div>
+
+<div class="sub" id="dash-snapshots">
+<div class="row">
+<div class="prose">
+<h3>Snapshots</h3>
+<p><strong>Save as snapshot</strong> on Analyze saves the analysis with the TUI's rules: not one that is partial, stopped or still running. The <strong>Snapshots</strong> panel lists them, and <strong>Compare</strong> compares two, or one with the current analysis. They are written in the TUI's snapshot directory and file format, and snapshots of two databases of one connection share that directory, as in the TUI. A snapshot holds patterns and example key names, never a value or a credential. See <a href="#snap-save">Saving snapshots</a>.</p>
+</div>
+<div class="rail"></div>
+</div>
 </div>
 
 <div class="sub" id="dash-server">
@@ -616,7 +701,7 @@ dashboard_port = 8080  # the port, when it starts</code></pre></div>
 <ul>
 <li><strong>Clients</strong> groups the connections by library and by address, as the TUI does. A group opens to its connections.</li>
 <li><strong>Slow log</strong> lists the slowest commands, with their key names, the arguments masked, and a note on commands such as <code>KEYS</code> or a slow whole-key read.</li>
-<li><strong>Monitor</strong> always asks first, with the connection's name typed on <code>prod</code>, and says its limits before it starts: 30 seconds or 10,000 lines. Lines are shown, never saved.</li>
+<li><strong>Monitor</strong> always asks first, with the connection's name typed on <code>prod</code>, and says its limits before it starts: 30 seconds or 10,000 lines. Lines are shown, never saved. When the analysis has no hot keys, <a href="#dash-analyze">Analyze › Hot keys</a> ranks the keys of the last run.</li>
 </ul>
 <div class="screens">
 <figure class="screen" data-label="Clients"><img class="shot" src="img/dashboard-clients.png" width="1280" height="846" loading="lazy" decoding="async" alt="Server, Clients panel: clients by library (ioredis 5.4.1 with 2 connections, go-redis, redis-py and redis-rs with 1 each) and by address, each with the oldest age, longest idle, most common command and memory"><figcaption>Clients grouped by library and by address.</figcaption></figure>
@@ -656,18 +741,18 @@ dashboard_port = 8080  # the port, when it starts</code></pre></div>
 </div></div>
 </div>
 
-<div class="sub" id="dash-not-yet">
+<div class="sub" id="dash-cli-only">
 <div class="row">
 <div class="prose">
-<h3>Not in the dashboard yet</h3>
-<p>These come in later phases. Until then the dashboard doesn't show them; use the terminal.</p>
+<h3>What stays on the command line</h3>
+<p>The dashboard has every screen of the TUI. What runs unattended, from cron or CI, stays on the command line:</p>
 <ul>
-<li>Browse: key patterns, key lists and values.</li>
-<li>Analyze: the key analysis, Big keys, Expiry, Changes and Hot keys.</li>
-<li>Editing values, and bulk expire and delete.</li>
-<li>Streams and Search.</li>
+<li><code>scan --save</code> with <code>--keep</code> and <code>--keep-days</code>, and <code>snapshots prune</code>;</li>
+<li><code>scan --check</code> and its rules, and the reports (<code>--report md|html|csv</code>, <code>--json</code>);</li>
+<li><code>diff</code>, <code>trend</code>, <code>compare</code> of two servers, and <code>expire</code>;</li>
+<li><code>conn export</code> and <code>conn import</code>.</li>
 </ul>
-<p>Snapshots, reports and <code>--check</code> stay command-line features: see <a href="#snapshots">Snapshots and CI</a>.</p>
+<p>See <a href="#snapshots">Snapshots and CI</a> and the <a href="#cli">command-line reference</a>.</p>
 </div>
 <div class="rail"></div>
 </div>
@@ -1081,7 +1166,7 @@ flowchart LR
 <div class="eyebrow">Understand</div>
 <h2>Analysis <a class="anchor" href="#analysis" aria-label="Link to this section">#</a></h2>
 <p class="lede">Sample the keyspace, group keys into patterns, and say which ones look like mistakes.</p>
-<div class="note" data-only="dashboard"><p>The analysis is not in the dashboard yet. Run it in the TUI (<kbd>r</kbd> on Overview) or with <code>redis-lens scan</code>.</p></div>
+<div class="note" data-only="dashboard"><p>In the dashboard, the analysis runs from <a href="#dash-analyze">Analyze</a>, and its patterns show on <a href="#dash-browse">Browse › Keys</a>.</p></div>
 </div>
 <div class="rail"></div>
 </div>
@@ -1239,6 +1324,7 @@ feature:pricing-rules├─  → feature:{var}
 <div class="prose">
 <h3>Saving snapshots</h3>
 <p><kbd>s</kbd> in the TUI, or <code>redis-lens scan --save</code>, writes the report as JSON to <code>&lt;data dir&gt;/redis-lens/snapshots/&lt;name&gt;-&lt;hash&gt;/&lt;YYYYMMDDTHHMMSSZ&gt;.json</code> (the data dir is <code>~/Library/Application Support</code> on macOS). <code>&lt;name&gt;</code> is the profile name lower-cased and made safe; <code>&lt;hash&gt;</code> is 12 hex digits of a hash of the exact name, so names that differ only in case keep separate histories.</p>
+<p data-only="dashboard">In the dashboard, <strong>Save as snapshot</strong> on Analyze writes the same file; see <a href="#dash-snapshots">Snapshots</a>.</p>
 <p>A snapshot holds patterns, the server context, the 50 biggest sampled keys (names, types, sizes, TTLs) and example key names, never values or credentials. The TUI never saves partial results or an analysis stopped early.</p>
 <p><code>--keep N</code> keeps the newest N snapshots and <code>--keep-days D</code> those from the last D days; both together keep one only while both allow it. The newest is never deleted, and retention touches only files it would have written. <code>snapshots list</code> and <code>snapshots prune</code> manage them; <code>prune</code> only lists until you add <code>--yes</code>.</p>
 </div>
@@ -1447,7 +1533,7 @@ redis-lens discover</code></pre></div>
 <tr><td>Workbench / CLI</td><td>Command line, helper, result views, pipeline mode</td><td><code>:</code> command line with helper and completion; result views, repeat and pipeline <span class="new">New</span></td></tr>
 <tr><td>Streams, Pub/Sub, Search</td><td>Consumer groups, subscribe and publish, search workspace</td><td>All three, plus stream verdicts (stuck, lagging, unbounded) and sharded Pub/Sub</td></tr>
 <tr><td>Per-slot view</td><td>None</td><td>Analyze › Slots from <code>CLUSTER SLOT-STATS</code></td></tr>
-<tr><td>Where it runs</td><td>Desktop app, or a web app in Docker</td><td>A terminal UI, plus a web dashboard on 127.0.0.1 served by the same process (so far: connections, the server, Pub/Sub and the command line)</td></tr>
+<tr><td>Where it runs</td><td>Desktop app, or a web app in Docker</td><td>A terminal UI, plus a web dashboard on 127.0.0.1 served by the same process, with the same screens</td></tr>
 <tr><td>Not in redis-lens</td><td colspan="2">Redis Copilot (AI), RDI pipeline management, tutorials, graph and geo-map plugins, cloud discovery, a public REST API or telemetry</td></tr>
 </tbody></table></div>
 <p>redis-lens reads no Redis Insight code; the comparison is from Redis Insight's documentation and release notes.</p>
@@ -1526,9 +1612,7 @@ make help       # the full list</code></pre></div></div>
 <li>Stream entries and vector sets are not edited. A JSON document over 256 KiB is not read.</li>
 <li>Docker discovery always connects directly, not through an SSH bastion. If redis-lens is killed with SIGKILL, its ssh processes are left running.</li>
 <li>On Windows the OS root store and the bundled Mozilla roots are trusted together, so a bundled root an administrator removed is still trusted.</li>
-<li>The TUI has no time zone: times are UTC.</li>
-<li data-only="dashboard">The dashboard has no Browse, Analyze, edits, Streams or Search yet. See <a href="#dash-not-yet">Not in the dashboard yet</a>.</li>
-</ul>
+<li>The TUI has no time zone: times are UTC.</li></ul>
 </div>
 <div class="rail"></div>
 </div>
