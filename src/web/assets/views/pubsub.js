@@ -6,8 +6,8 @@
 // read-only connection and goes through the confirm flow otherwise.
 
 import {
-  h, fill, DASH, TailBuffer, fmtClock, fmtGrouped, fmtRate, plural, emptyState, notice,
-  readOnlyNote, connectFirst, fillLog, errorText,
+  h, fill, DASH, TailBuffer, fmtClock, fmtGrouped, fmtRate, plural, notice,
+  connectFirst, fillLog, errorText, writesOffLine, aboutThis,
 } from '../ui.js';
 
 const SHOWN = 300;
@@ -18,6 +18,15 @@ export function tailNew() {
 }
 
 const tail = tailNew();
+
+/** Where the screen's one read-only line goes: under the tail, where Publish is (the only
+ *  write here; subscribing is not one). */
+export function readOnlyPlace() {
+  return 'tail';
+}
+
+/** The read-only line's words on Pub/Sub. */
+export const PUBLISH_OFF = 'Publishing is off: this connection is read-only.';
 
 /** Whether text is a pattern (`*`, `?` or `[`): sent with PSUBSCRIBE, not SUBSCRIBE. */
 export function isPattern(text) {
@@ -99,12 +108,12 @@ export function mount(root, ctx) {
   const timers = [];
   const offs = [];
 
-  const left = h('div', { class: 'card tight col narrow', 'data-pane': 'channels' });
-  const right = h('div', { class: 'card stack col wide', 'data-pane': 'tail' });
+  const left = h('section', { class: 'card pane lv-list pubsub-channels', 'data-pane': 'channels', 'aria-label': 'Channels' });
+  const right = h('section', { class: 'card pane lv-detail pubsub-tail', 'data-pane': 'tail', 'aria-label': 'The tail' });
   view.append(
     h('div', { class: 'view-head' },
       h('h1', { class: 'title', id: 'pubsub-title', text: 'Pub/Sub' })),
-    h('div', { class: 'cols' }, left, right));
+    h('div', { class: 'lv pubsub' }, left, right));
 
   // ---------- Channels ----------
   const target = h('input', { class: 'field mono', type: 'text', id: 'sub-target', placeholder: 'orders.* or a channel', autocomplete: 'off', spellcheck: false, 'data-act': 'sub.add' });
@@ -184,8 +193,7 @@ export function mount(root, ctx) {
         : h('p', { class: 'muted', text: 'No active channels. A channel exists only while a client subscribes to it.' }),
       shards.length ? [h('h3', { class: 'lbl', text: 'Shard channels' }), h('ul', { class: 'list' }, shards.map(row))] : null,
       data.shardOff ? h('p', { class: 'muted small', text: `Shard channels are off: ${data.shardOff}.` }) : null,
-      data.notes.map((n) => notice(n)),
-      h('p', { class: 'muted small', text: 'Counts read no payloads.' }));
+      data.notes.map((n) => notice(n)));
     if (focused !== null) {
       for (const button of listBox.querySelectorAll('button[data-channel]')) {
         if (button.getAttribute('data-channel') === focused) button.focus();
@@ -194,8 +202,8 @@ export function mount(root, ctx) {
   }
 
   fill(left,
-    h('div', { class: 'toolbar' }, h('h2', { class: 'lbl', text: 'Channels' }), count),
-    h('form', {
+    h('div', { class: 'pane-head' }, h('h2', { class: 'lbl', text: 'Channels' }), count),
+    h('div', { class: 'pane-scroll pane-body pad' }, h('form', {
       class: 'subscribe',
       onsubmit: (e) => {
         e.preventDefault();
@@ -206,7 +214,8 @@ export function mount(root, ctx) {
     h('div', { class: 'line' }, target, h('button', { type: 'submit', class: 'btn', text: 'Subscribe' })),
     shardRow,
     subError),
-    listBox);
+    listBox),
+    h('div', { class: 'pane-foot' }, aboutThis('Counts read no payloads.')));
 
   async function loadChannels() {
     try {
@@ -268,7 +277,7 @@ export function mount(root, ctx) {
   }
 
   function publishBox() {
-    if (conn.readOnly) return readOnlyNote('Publishing is a write, and this connection is read-only. Turn writes on in Connections.');
+    if (conn.readOnly && readOnlyPlace() === 'tail') return writesOffLine(ctx, PUBLISH_OFF);
     const sub = tail.sub;
     // `P` comes to the message when the channel is filled in already, else to the channel.
     const named = !!sub && sub.kind !== 'pattern';
@@ -310,8 +319,9 @@ export function mount(root, ctx) {
     shownSub = sub ? sub.id : null;
     if (!sub) {
       fill(right,
-        h('p', { class: 'muted', text: 'Pick a channel to watch its messages live, or type a channel or a pattern. Messages are shown here and never saved.' }),
-        publishBox());
+        h('div', { class: 'pane-head' }, h('h2', { class: 'lbl', text: 'Tail' })),
+        h('div', { class: 'pane-scroll pane-body pad' }, h('p', { class: 'muted', text: 'Pick a channel to watch its messages live, or type a channel or a pattern.' })),
+        h('div', { class: 'pane-foot' }, publishBox(), aboutThis('Messages are shown, never saved.')));
       return;
     }
     const filter = h('input', {
@@ -333,8 +343,9 @@ export function mount(root, ctx) {
     log = h('div', { class: 'box log tail', tabindex: '0', role: 'log', 'aria-label': `Messages on ${sub.name}` });
     const kind = sub.kind === 'pattern' ? 'pattern ' : sub.kind === 'shard' ? 'shard channel ' : '';
     fill(right,
-      h('div', { class: 'toolbar' },
+      h('div', { class: 'pane-head' },
         h('h2', { class: 'tail-name' }, kind ? h('span', { class: 'muted', text: kind }) : null, sub.name),
+        h('div', { class: 'pane-tools' },
         h('label', { class: 'sr-only', htmlFor: 'tail-filter', text: 'Filter messages' }),
         filter,
         pauseButton,
@@ -360,11 +371,9 @@ export function mount(root, ctx) {
               drawChannels(lastChannels);
             }
           },
-        })),
-      status,
-      log,
-      h('p', { class: 'muted small', text: 'Messages are shown, never saved.' }),
-      publishBox());
+        }))),
+      h('div', { class: 'pane-scroll pane-body pad' }, status, log),
+      h('div', { class: 'pane-foot' }, publishBox(), aboutThis('Messages are shown, never saved.')));
     drawMessages();
   }
 

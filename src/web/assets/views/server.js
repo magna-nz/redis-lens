@@ -1,15 +1,18 @@
-// Server: two live charts, and the panels Clients · Slow log · Monitor.
+// Server: the two live figures in a strip, and the panels Clients · Slow log · Monitor.
+// Clients and Slow log are a list with the picked row's detail beside it (under it on a
+// narrow window); Monitor's log takes the height.
 //
 // Monitor is time-boxed: the server always asks first (the confirm dialog), it counts down,
 // and stops by itself; Stop ends it early. Its lines stay in memory for the session and are never saved. Slow log and
 // Monitor lines arrive already masked by redis-lens.
 
 import {
-  h, fill, refill, DASH, fmtBytes, fmtCount, fmtDuration, fmtRate, fmtTook, fmtClock, fmtGrouped, plural,
+  h, fill, DASH, fmtBytes, fmtCount, fmtDuration, fmtRate, fmtTook, fmtClock, fmtGrouped, plural,
   barPercent, barChart, meter, table, pills, notice, emptyState, connectFirst,
-  fillLog, errorText,
+  fillLog, errorText, listPick, replyFits, paneCard, aboutThis, fillWhile,
 } from '../ui.js';
 import { spanText } from './overview.js';
+import { hexOfText } from './browse.js';
 
 export const TABS = [
   { id: 'clients', label: 'Clients', href: '#/server/clients' },
@@ -113,6 +116,70 @@ export function slowEntryFacts(e) {
   return [keys, client, cut, e.note].filter(Boolean).join(' · ');
 }
 
+// ---------------------------------------------------------------------------------------
+// The lists beside their detail (tests/server.test.js)
+// ---------------------------------------------------------------------------------------
+
+/** Slow log as a list beside its entry: each entry with its key (its id in the log, which
+ *  the server never gives two entries), whether it is flagged (redis-lens has a note on
+ *  it), and the one picked (`listPick`: kept across readings by its key). */
+export function slowModel(data, picked = null) {
+  const entries = data && !data.off && Array.isArray(data.entries) ? data.entries : [];
+  const rows = entries.map((e, i) => ({ ...e, key: typeof e.id === 'number' ? `s:${e.id}` : `t:${e.at}#${i}`, flag: !!e.note }));
+  const at = listPick(rows, picked);
+  return { rows, key: at.key, sel: at.index >= 0 ? rows[at.index] : null, gone: at.gone };
+}
+
+/** An entry's detail, label and value, from the entry only (nothing is read for it). */
+export function slowDetail(e) {
+  const client = e.client ? `${e.client}${e.clientName ? ` (${e.clientName})` : ''}` : DASH;
+  return [
+    ['When', typeof e.at === 'number' ? `${new Date(e.at).toISOString().slice(0, 10)} ${fmtClock(e.at)} UTC` : DASH],
+    ['Took', fmtTook(e.micros)],
+    ['Command', e.name || DASH],
+    ['Arguments', `${e.command || DASH}${e.argsCut ? ` … ${fmtGrouped(e.argsCut)} more arguments` : ''}`],
+    ['Client', client],
+  ];
+}
+
+/** A slow-log key that can be opened on Browse: one written as its own text (a key shown
+ *  with escapes, `\x00`, is not the text it shows, so it is not linked). */
+export function slowKeyOpens(k) {
+  return typeof k === 'string' && k.length > 0 && !k.includes('\\');
+}
+
+const GROUP_SECTIONS = [['library', 'By library'], ['address', 'By address']];
+
+/** Clients as a list beside its detail: the groups in two headed sections (by library, by
+ *  address), each row with its key `<by>:<name>`, and the picked group's connections
+ *  (`members`, from the same reading: nothing is read for a pick). A picked group that a
+ *  reading no longer has stays picked and is said to be gone; another group is never
+ *  shown in its place. */
+export function clientsModel(data, picked = null) {
+  if (!data || data.off) return { sections: [], rows: [], key: null, sel: null, gone: false, name: null, members: [] };
+  const groups = Array.isArray(data.groups) ? data.groups : [];
+  const sections = GROUP_SECTIONS.map(([by, title]) => {
+    const rows = groups.filter((g) => g.by === by).map((g) => ({ ...g, key: `${g.by}:${g.name}` }));
+    return { by, title, rows, most: Math.max(0, ...rows.map((g) => g.connections || 0)) };
+  }).filter((s) => s.rows.length);
+  const rows = sections.flatMap((s) => s.rows);
+  const at = listPick(rows, picked);
+  const sel = at.index >= 0 ? rows[at.index] : null;
+  const members = sel ? sel.members.map((i) => (data.connections || [])[i]).filter(Boolean) : [];
+  const name = sel ? sel.name : at.key ? at.key.slice(at.key.indexOf(':') + 1) : null;
+  return { sections, rows, key: at.key, sel, gone: at.gone, name, members };
+}
+
+/** The line under a group's name: oldest, longest idle, its commonest command, memory. */
+export function groupFacts(g) {
+  return [
+    g.oldestSecs !== null ? `oldest ${fmtDuration(g.oldestSecs)}` : null,
+    g.idleSecs !== null ? `longest idle ${fmtDuration(g.idleSecs)}` : null,
+    g.lastCommand ? `mostly ${g.lastCommand}` : null,
+    g.memory !== null ? fmtBytes(g.memory) : null,
+  ].filter(Boolean).join(' · ');
+}
+
 export function mount(root, ctx, route) {
   const state = ctx.state();
   const gate = connectFirst(state, { needsLive: true });
@@ -127,13 +194,16 @@ export function mount(root, ctx, route) {
   let alive = true;
   const timers = [];
   const offs = [];
+  // The panes fill the window and scroll inside themselves (app.css).
+  const unfill = fillWhile();
+  view.classList.add('lv-view');
 
-  // The two charts
+  // ---------- the strip: the two live figures, compact ----------
   const chart = (label) => {
-    const value = h('span', { class: 'chart-value', text: DASH });
-    const bars = barChart({ height: 96, tall: true });
+    const value = h('span', { class: 'strip-value mono', text: DASH });
+    const bars = barChart({ points: 30, height: 22 });
     const span = h('span', { class: 'small muted', text: 'Live' });
-    const el = h('div', { class: 'card chart' }, h('div', { class: 'chart-head' }, h('h2', { class: 'lbl', text: label }), value), bars.el, span);
+    const el = h('div', { class: 'strip-item' }, h('span', { class: 'lbl', text: label }), value, bars.el, span);
     return { el, value, bars, span };
   };
   const ops = chart('Commands / sec');
@@ -152,163 +222,270 @@ export function mount(root, ctx, route) {
   }
   offs.push(ctx.api.on('figures', drawCharts), ctx.api.on('live', drawCharts));
 
-  // The panel's list is one pane for the keys (Monitor's log has no rows).
-  const panel = h('div', { 'data-pane': tab === 'monitor' ? null : tab });
+  const sideNote = h('span', { class: 'muted small lv-note' });
+  const panel = h('div', { class: `lv ${tab}` });
   view.append(
-    h('div', { class: 'view-head' },
-      h('h1', { class: 'title', id: 'server-title', text: 'Server' })),
-    h('div', { class: 'cols stretch' }, ops.el, clients.el),
-    pills(TABS, tab, null, 'Server panels'),
+    h('div', { class: 'view-head lv-head' },
+      h('h1', { class: 'title', id: 'server-title', text: 'Server' }),
+      pills(TABS, tab, null, 'Server panels'),
+      sideNote),
+    h('div', { class: 'card tight strip' }, ops.el, clients.el),
     panel);
   drawCharts();
 
-  /** Whether a panel's reading differs from the one on screen: an unchanged list is left
-   *  alone, so the page does not jump under the reader every few seconds. */
-  let drawn = '';
-  function changed(data, extra = '') {
-    const signature = JSON.stringify(data) + extra;
-    if (signature === drawn) return false;
-    drawn = signature;
-    return true;
-  }
-
-  /** Read a panel now and again every 5 s while the figures are live and the tab is open. */
-  function poll(read) {
-    read();
+  /** Read a panel now and again every 5 s while the figures are live and the tab is open.
+   *  Only the newest reading is drawn, and only for the node it was read for. */
+  let seq = 0;
+  const who = () => {
+    const c = ctx.state().conn;
+    return c ? `${c.name}|${c.docker}|${c.pickedNode}` : null;
+  };
+  function poll(read, draw, failed) {
+    const once = async () => {
+      seq += 1;
+      const sent = { seq, who: who() };
+      try {
+        const data = await read();
+        if (alive && replyFits(sent, { seq, who: who() })) draw(data);
+      } catch (err) {
+        if (alive && replyFits(sent, { seq, who: who() })) failed(err);
+      }
+    };
+    once();
     timers.push(setInterval(() => {
-      if (ctx.state().live && !document.hidden) read();
+      if (ctx.state().live && !document.hidden) once();
     }, 5000));
   }
 
+  /** A list pane and its detail pane. Moving in the list (or a click) picks the row: the
+   *  detail is drawn from the reading in hand, and nothing is read for it. */
+  function listAndDetail({ id, label, detailId, detailLabel }) {
+    const list = paneCard({ id, label, cls: 'lv-list' });
+    const detail = paneCard({ id: detailId, label: detailLabel, cls: 'lv-detail' });
+    fill(panel, list, detail);
+    return {
+      list,
+      detail,
+      listHead: list.querySelector('.pane-head'),
+      listBody: list.querySelector('.pane-body'),
+      listFoot: list.querySelector('.pane-foot'),
+      head: detail.querySelector('.pane-head'),
+      body: detail.querySelector('.pane-body'),
+      foot: detail.querySelector('.pane-foot'),
+      /** Calls `pick(key)` for the row the focus moves to, or that is clicked. */
+      follow(pick) {
+        const on = (e) => {
+          const row = e.target && e.target.closest ? e.target.closest('[data-row]') : null;
+          if (row && list.contains(row)) pick(row.dataset.row);
+        };
+        list.addEventListener('focusin', on);
+        list.addEventListener('click', on);
+      },
+    };
+  }
+  /** Mark the picked row open (the one the detail shows), without drawing the list again. */
+  const markOpen = (box, key) => {
+    for (const r of box.querySelectorAll('[data-row]')) {
+      const on = r.dataset.row === key;
+      r.classList.toggle('on', on);
+      if (r.tagName !== 'TR') r.setAttribute('aria-current', on ? 'true' : 'false');
+    }
+  };
+
   // ---------- Clients ----------
   function clientsPanel() {
-    let open = null;
+    const ui = listAndDetail({ id: 'clients', label: 'Client groups', detailId: 'conns', detailLabel: 'Connections of the group' });
     let last = null;
-    const draw = () => {
-      // Ages and idle times move on every reading: keep the keyboard focus where it was.
-      if (last && changed(last, JSON.stringify(open))) refill(panel, drawClients(last));
-    };
-    const pick = (group) => {
-      open = group ? { by: group.by, name: group.name } : null;
-      draw();
-      const target = panel.querySelector(group ? '[data-back]' : '[data-group]');
-      if (target) target.focus();
-    };
+    let picked = null;
+    let drawnList = '';
+    let drawnDetail = '';
+    fill(ui.listHead, h('h2', { class: 'lbl', text: 'Clients' }));
+    fill(ui.listBody, h('p', { class: 'muted pad', text: 'Reading the client list…' }));
 
-    function drawClients(data) {
-      if (data.off) return h('div', { class: 'card' }, notice(`Clients are off: ${data.off}.`));
-      const shown = open && data.groups.find((g) => g.by === open.by && g.name === open.name);
-      if (open && shown) return drawGroup(data, shown);
-      const section = (by, title) => {
-        const groups = data.groups.filter((g) => g.by === by);
-        if (!groups.length) return null;
-        const most = Math.max(...groups.map((g) => g.connections || 0));
-        return [
-          h('h2', { class: 'lbl', text: title }),
-          h('ul', { class: 'list' }, groups.map((g) => {
-            const facts = [
-              g.oldestSecs !== null ? `oldest ${fmtDuration(g.oldestSecs)}` : null,
-              g.idleSecs !== null ? `longest idle ${fmtDuration(g.idleSecs)}` : null,
-              g.lastCommand ? `mostly ${g.lastCommand}` : null,
-              g.memory !== null ? fmtBytes(g.memory) : null,
-            ].filter(Boolean).join(' · ');
-            const idle = g.flagged ? `▲ ${g.idleConns ? `${fmtGrouped(g.idleConns)} ` : ''}idle for an hour or more · ` : '';
-            return h('li', null, h('button', { type: 'button', class: 'row row-group', 'data-group': '', 'data-row': `${g.by}:${g.name}`, 'aria-label': `${g.name}: ${plural(g.connections, 'connection', 'connections')}. List them.`, onclick: () => pick(g) },
-              h('span', null,
-                h('span', { class: 'mono name', text: g.name }),
-                h('span', { class: 'sub small' }, idle ? h('span', { class: 'glyph', text: idle }) : null, facts)),
-              h('span', { class: 'mono right', text: g.connections !== null ? fmtGrouped(g.connections) : DASH }),
-              meter(barPercent(g.connections, most))));
-          })),
-        ];
-      };
-      const lib = section('library', 'Clients by library');
-      const addr = section('address', 'Clients by address');
-      const idle = data.groups.filter((g) => g.by === 'address').reduce((sum, g) => sum + (g.idleConns || 0), 0);
-      return h('div', { class: 'card stack' },
-        lib || addr ? [lib, addr] : emptyState('No client connections were listed.'),
-        h('p', { class: 'muted small', text: `${plural(data.total, 'connection', 'connections')}. Pick a group to list its connections.` }),
-        idle ? notice(`${fmtGrouped(idle)} of them ${idle === 1 ? 'has' : 'have'} been idle for an hour or more. Idle clients hold memory and a connection each.`) : null);
+    function drawList(m) {
+      // Ages and idle times move on every reading: an unchanged list is left alone.
+      const signature = JSON.stringify(m.sections);
+      if (signature === drawnList) return;
+      drawnList = signature;
+      fill(ui.listHead, h('h2', { class: 'lbl', text: `Clients · ${plural(last.total, 'connection', 'connections')}` }));
+      if (!m.sections.length) {
+        fill(ui.listBody, emptyState('No client connections were listed.'));
+        fill(ui.listFoot);
+        return;
+      }
+      fill(ui.listBody, h('ul', { class: 'list' }, m.sections.map((s) => [
+        h('li', { class: 'list-head' }, h('h3', { class: 'lbl', text: s.title })),
+        s.rows.map((g) => h('li', null, h('button', {
+          type: 'button', class: 'row row-group', 'data-row': g.key,
+          'aria-label': `${g.name}: ${plural(g.connections, 'connection', 'connections')}${g.flagged ? ', some idle for an hour or more' : ''}. Show them.`,
+        },
+        h('span', { class: 'glyph', 'aria-hidden': 'true', text: g.flagged ? '▲' : '' }),
+        h('span', { class: 'mono name clip', text: g.name, title: g.name }),
+        h('span', { class: 'mono right', text: g.connections !== null ? fmtGrouped(g.connections) : DASH }),
+        meter(barPercent(g.connections, s.most))))),
+      ])));
+      const idle = last.groups.filter((g) => g.by === 'address').reduce((sum, g) => sum + (g.idleConns || 0), 0);
+      fill(ui.listFoot, idle ? notice(`${fmtGrouped(idle)} of them ${idle === 1 ? 'has' : 'have'} been idle for an hour or more. Idle clients hold memory and a connection each.`) : null);
     }
 
-    function drawGroup(data, group) {
-      const rows = group.members.map((i) => data.connections[i]).filter(Boolean);
-      return h('div', { class: 'card stack' },
-        h('div', { class: 'toolbar' },
-          h('h2', { class: 'lbl', text: `${group.by === 'address' ? 'Address' : 'Library'} ${group.name} · ${plural(rows.length, 'connection', 'connections')}` }),
-          h('button', { type: 'button', class: 'btn', text: 'Back to the groups', 'data-back': '', onclick: () => pick(null) })),
-        rows.length
+    function drawDetail(m) {
+      const signature = JSON.stringify([m.key, m.gone, m.sel, m.members]);
+      if (signature === drawnDetail) return;
+      drawnDetail = signature;
+      const g = m.sel;
+      if (!g) {
+        fill(ui.head, h('h2', { class: 'lbl', text: 'Connections' }));
+        fill(ui.body, h('p', { class: 'muted pad', text: m.gone ? `No connections in ${m.name} any more: it is not in this reading.` : 'Pick a group to list its connections.' }));
+        fill(ui.foot);
+        return;
+      }
+      const facts = groupFacts(g);
+      fill(ui.head, h('h2', { class: 'pane-title' },
+        h('span', { class: 'lbl', text: g.by === 'address' ? 'Address' : 'Library' }),
+        h('span', { class: 'mono key-title clip', text: g.name, title: g.name }),
+        h('span', { class: 'muted small fig', text: plural(m.members.length, 'connection', 'connections') })));
+      fill(ui.body,
+        facts || g.flagged ? h('p', { class: 'muted small pad-x' }, g.flagged ? h('span', { class: 'glyph', text: `▲ ${g.idleConns ? `${fmtGrouped(g.idleConns)} ` : ''}idle for an hour or more · ` }) : null, facts) : null,
+        m.members.length
           ? table([
             { label: 'Address', cls: 'mono nowrap', cell: (c) => c.addr || DASH },
             { label: 'Name', cls: 'mono', cell: (c) => (c.own ? 'redis-lens' : c.name || DASH) },
             { label: 'Library', cls: 'mono', cell: (c) => c.lib || DASH },
             { label: 'Age', cls: 'mono right nowrap', cell: (c) => fmtDuration(c.ageSecs) },
-            { label: 'Idle', cls: 'mono right nowrap', cell: (c) => `${c.idleSecs !== null && c.idleSecs >= 3600 ? '▲ ' : ''}${fmtDuration(c.idleSecs)}` },
+            { label: 'Idle', cls: 'mono right nowrap', cell: (c) => (c.idleSecs !== null && c.idleSecs >= 3600 ? [h('span', { class: 'glyph', 'aria-hidden': 'true', text: '▲ ' }), fmtDuration(c.idleSecs)] : fmtDuration(c.idleSecs)) },
             { label: 'Last command', cls: 'mono', cell: (c) => c.cmd || DASH },
             { label: 'DB', cls: 'mono right', cell: (c) => (c.db === null ? DASH : String(c.db)) },
             { label: 'Memory', cls: 'mono right', cell: (c) => fmtBytes(c.memory) },
-          ], rows, { caption: `Connections of ${group.name}`, cls: 'conns', rowKey: (c, i) => `${c.addr || ''}#${i}` })
-          : emptyState('No connections in this group any more.'),
-        h('p', { class: 'muted small', text: 'The connection redis-lens itself reads with is named redis-lens. User names are never shown.' }));
+          ], m.members, { caption: `Connections of ${g.name}`, cls: 'conns' })
+          : emptyState('No connections in this group any more.'));
+      fill(ui.foot, aboutThis('The connection redis-lens itself reads with is named redis-lens. User names are never shown.'));
     }
 
-    fill(panel, h('div', { class: 'card' }, emptyState('Reading the client list…')));
-    poll(async () => {
-      try {
-        last = await ctx.api.getClients();
-        if (alive) draw();
-      } catch (err) {
-        drawn = '';
-        if (alive) fill(panel, h('div', { class: 'card' }, notice(errorText(err))));
+    function draw() {
+      if (!last) return;
+      if (last.off) {
+        drawnList = '';
+        drawnDetail = '';
+        fill(panel, h('div', { class: 'card' }, notice(`Clients are off: ${last.off}.`)));
+        return;
       }
+      if (!panel.contains(ui.list)) fill(panel, ui.list, ui.detail);
+      const m = clientsModel(last, picked);
+      picked = m.key;
+      drawList(m);
+      markOpen(ui.list, m.gone ? null : m.key);
+      drawDetail(m);
+    }
+    ui.follow((key) => {
+      if (key === picked) return;
+      picked = key;
+      draw();
+    });
+
+    poll(() => ctx.api.getClients(), (data) => {
+      last = data;
+      draw();
+    }, (err) => {
+      drawnList = '';
+      drawnDetail = '';
+      last = null;
+      fill(panel, h('div', { class: 'card' }, notice(errorText(err))));
     });
   }
 
   // ---------- Slow log ----------
   function slowPanel() {
-    fill(panel, h('div', { class: 'card' }, emptyState('Reading the slow log…')));
-    poll(async () => {
-      try {
-        const data = await ctx.api.getSlowlog();
-        if (alive && changed(data)) fill(panel, drawSlow(data));
-      } catch (err) {
-        drawn = '';
-        if (alive) fill(panel, h('div', { class: 'card' }, notice(errorText(err))));
+    const ui = listAndDetail({ id: 'slowlog', label: 'Slow log', detailId: 'entry', detailLabel: 'The entry' });
+    let last = null;
+    let picked = null;
+    let drawnList = '';
+    let drawnDetail = '';
+    fill(ui.listHead, h('h2', { class: 'lbl', text: 'Slowest commands' }));
+    fill(ui.listBody, h('p', { class: 'muted pad', text: 'Reading the slow log…' }));
+
+    function drawList(m) {
+      const signature = JSON.stringify([m.rows, last.keysOff]);
+      if (signature === drawnList) return;
+      drawnList = signature;
+      fill(ui.listHead, h('h2', { class: 'lbl', text: `Slowest commands · ${fmtGrouped(m.rows.length)}` }));
+      fill(ui.listBody, m.rows.length
+        ? table([
+          { label: '', cls: 'flagcell', cell: (e) => (e.flag ? [h('span', { class: 'glyph', 'aria-hidden': 'true', text: '▲' }), h('span', { class: 'sr-only', text: 'flagged' })] : '') },
+          { label: 'Time (UTC)', cls: 'mono muted nowrap', cell: (e) => fmtClock(e.at) },
+          { label: 'Took', cls: 'mono right nowrap', cell: (e) => fmtTook(e.micros) },
+          { label: 'Command', cls: 'mono nowrap', cell: (e) => e.name || DASH },
+          { label: 'Keys', cls: 'mono muted clipcell', cell: (e) => h('span', { class: 'clip block', text: e.keys.length ? `${e.keys.join(' ')}${e.moreKeys ? ` +${e.moreKeys}` : ''}` : '' }) },
+          { label: 'Client', cls: 'mono muted clipcell', cell: (e) => h('span', { class: 'clip block', text: e.client || DASH }) },
+        ], m.rows, { caption: 'Slow log entries, newest first', cls: 'slow', rowKey: (e) => e.key })
+        : emptyState('The slow log is empty.'));
+      fill(ui.listFoot,
+        last.keysOff ? notice(`Key names are missing: ${last.keysOff}.`) : null,
+        aboutThis('Arguments are shown with credentials masked, on screen only.'));
+    }
+
+    function drawDetail(m) {
+      const signature = JSON.stringify([m.key, m.gone, m.sel]);
+      if (signature === drawnDetail) return;
+      drawnDetail = signature;
+      const e = m.sel;
+      if (!e) {
+        fill(ui.head, h('h2', { class: 'lbl', text: 'Entry' }));
+        fill(ui.body, h('p', { class: 'muted pad', text: m.gone ? 'That entry is not in the slow log any more.' : 'Pick an entry to see it whole.' }));
+        return;
       }
+      fill(ui.head, h('h2', { class: 'lbl', text: 'Entry' }), h('span', { class: 'mono strong', text: fmtTook(e.micros) }));
+      fill(ui.body, h('div', { class: 'stack pad' },
+        h('dl', { class: 'facts single' }, slowDetail(e).map(([k, v]) => h('div', null, h('dt', { text: k }), h('dd', { class: 'mono wrap-any', text: v }))),
+          h('div', null, h('dt', { text: 'Keys' }), h('dd', null, e.keys.length
+            ? [e.keys.map((k) => (slowKeyOpens(k)
+              ? h('button', { type: 'button', class: 'linkish mono wrap-any', text: k, title: `Open ${k} on Browse`, onclick: () => ctx.openKey({ id: hexOfText(k), name: k }) })
+              : h('span', { class: 'mono wrap-any block', text: k }))),
+            e.moreKeys ? h('span', { class: 'muted small', text: `+${e.moreKeys} more` }) : null]
+            : h('span', { class: 'muted', text: last.keysOff ? `missing: ${last.keysOff}` : 'none' })))),
+        e.note ? notice(e.note) : null));
+    }
+
+    function draw() {
+      if (!last) return;
+      if (last.off) {
+        drawnList = '';
+        drawnDetail = '';
+        sideNote.textContent = '';
+        fill(panel, h('div', { class: 'card' }, notice(`Slow log is off: ${last.off}.`)));
+        return;
+      }
+      if (!panel.contains(ui.list)) fill(panel, ui.list, ui.detail);
+      sideNote.textContent = slowlogSettingsText(last.settings, last.settingsOff);
+      const m = slowModel(last, picked);
+      picked = m.key;
+      drawList(m);
+      markOpen(ui.list, m.gone ? null : m.key);
+      drawDetail(m);
+    }
+    ui.follow((key) => {
+      if (key === picked) return;
+      picked = key;
+      draw();
+    });
+
+    poll(() => ctx.api.getSlowlog(), (data) => {
+      last = data;
+      draw();
+    }, (err) => {
+      drawnList = '';
+      drawnDetail = '';
+      last = null;
+      fill(panel, h('div', { class: 'card' }, notice(errorText(err))));
     });
   }
 
-  function drawSlow(data) {
-    if (data.off) return h('div', { class: 'card' }, notice(`Slow log is off: ${data.off}.`));
-    return h('div', { class: 'card stack' },
-      h('div', null,
-        h('h2', { class: 'lbl', text: `Slowest commands · ${fmtGrouped(data.entries.length)}` }),
-        h('p', { class: 'muted small', text: slowlogSettingsText(data.settings, data.settingsOff) })),
-      data.entries.length
-        ? table([
-          { label: 'Time (UTC)', cls: 'mono muted nowrap', cell: (e) => fmtClock(e.at) },
-          { label: 'Took', cls: 'mono right nowrap', cell: (e) => fmtTook(e.micros) },
-          {
-            label: 'Command',
-            cell: (e) => {
-              const facts = slowEntryFacts(e);
-              return [
-                h('span', { class: 'mono wrap-any', text: e.command || DASH }),
-                facts ? h('span', { class: 'sub small muted wrap-any', text: facts }) : null,
-              ];
-            },
-          },
-        ], data.entries, { caption: 'Slow log entries, newest first', cls: 'slow', rowKey: (e, i) => (e.id ?? `${e.at}#${i}`) })
-        : emptyState('The slow log is empty.'),
-      data.keysOff ? notice(`Key names are missing: ${data.keysOff}.`) : null,
-      h('p', { class: 'muted small', text: 'Arguments are shown with credentials masked, on screen only.' }));
-  }
-
   // ---------- Monitor ----------
+  // The log takes the height. Each line is drawn whole (it wraps), so no line has more than
+  // fits: Monitor keeps one pane.
   function monitorPanel() {
     const button = h('button', { type: 'button', class: 'btn primary' });
     const status = h('p', { class: 'muted small', role: 'status' });
-    const log = h('div', { class: 'box log', tabindex: '0', role: 'log', 'aria-label': 'Commands seen by MONITOR' });
+    const log = h('div', { class: 'box log fill', tabindex: '0', role: 'log', 'aria-label': 'Commands seen by MONITOR' });
     let busy = false;
     let shown = '';
 
@@ -351,13 +528,14 @@ export function mount(root, ctx, route) {
       if (alive) draw(true);
     });
 
-    fill(panel, h('div', { class: 'card stack' },
-      h('div', { class: 'toolbar' },
-        button,
-        h('span', { class: 'muted grow', text: 'MONITOR shows every command the server runs. It slows the server, so it stops by itself.' })),
-      status,
-      log,
-      h('p', { class: 'muted small', text: `Lines are shown, never saved. The last ${fmtGrouped(MONITOR_SHOWN)} are on screen.` })));
+    fill(panel, h('section', { class: 'card pane lv-one', 'aria-label': 'Monitor' },
+      h('div', { class: 'pane-head' },
+        h('div', { class: 'toolbar' }, button, status),
+        h('span', { class: 'muted small', text: 'MONITOR slows the server, so it stops by itself.' })),
+      h('div', { class: 'pane-body log-wrap' }, log),
+      h('div', { class: 'pane-foot' }, aboutThis(
+        'MONITOR shows every command the server runs. The server asks before it starts.',
+        `Lines are shown, never saved. The last ${fmtGrouped(MONITOR_SHOWN)} are on screen.`))));
     offs.push(ctx.api.on('monitor', () => draw()), ctx.api.on('state', () => draw()));
     timers.push(setInterval(() => {
       if (mon.running) draw();
@@ -371,6 +549,7 @@ export function mount(root, ctx, route) {
 
   return () => {
     alive = false;
+    unfill();
     offs.forEach((off) => off());
     timers.forEach((t) => clearInterval(t));
   };

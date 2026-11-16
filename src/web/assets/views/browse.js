@@ -452,6 +452,14 @@ export function canonicalHref(route) {
   return route.query ? `#/browse?${route.query}` : '#/browse';
 }
 
+/** The reasons under the selected item's buttons, less those the value's notes above them
+ *  show already ("Field TTLs need Redis 7.4…"): a reason is said once in a pane. `offs`:
+ *  each button's reason or null; `said`: the notes' texts. */
+export function itemReasons(offs, said = []) {
+  const shown = new Set(said.filter(Boolean));
+  return offs.map((o) => (o && shown.has(o) ? null : o));
+}
+
 /** Where the one read-only line goes: under the value's action bar when a key is open and
  *  its pane shows, else in the key list's pane. Never two at once. */
 export function readOnlyPlace({ valueOpen = false, shown = PANES } = {}) {
@@ -1962,7 +1970,7 @@ function mountKeys(root, ctx, route) {
     return h('div', { class: 'item-actions', role: 'group', 'aria-label': `Write to the selected ${label}` },
       h('p', { class: 'small muted wrap-any' }, 'Selected: ', h('span', { class: 'mono', text: label })),
       h('div', { class: 'row-actions' }, buttons),
-      whyLines(buttons.map((b) => (b.disabled ? b.title : null))),
+      whyLines(itemReasons(buttons.map((b) => (b.disabled ? b.title : null)), [v.fieldTtlsOff, ...v.refused])),
       e.noEdit ? h('p', { class: 'muted small', text: e.noEdit }) : null);
   }
 

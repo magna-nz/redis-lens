@@ -497,7 +497,7 @@ test('a read-only connection shows one line under a bar of writes, with the key 
   // and the bulk actions, as text (not only in titles).
   const browse = read('views/browse.js');
   assert.equal((browse.match(/whyLines\(/g) || []).length, 5);
-  assert.match(browse, /whyLines\(buttons\.map\(\(b\) => \(b\.disabled \? b\.title : null\)\)\)/);
+  assert.match(browse, /whyLines\(itemReasons\(buttons\.map\(\(b\) => \(b\.disabled \? b\.title : null\)\), \[v\.fieldTtlsOff, \.\.\.v\.refused\]\)\)/);
 });
 
 // ---- What the page does with a key (the decisions app.js acts on) ----

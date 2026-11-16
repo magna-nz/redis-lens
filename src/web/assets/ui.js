@@ -783,6 +783,37 @@ export function liveModel(state) {
   };
 }
 
+/** The row a list beside its detail shows (Slow log, Clients, Nodes): the one picked,
+ *  found again by its key in the rows of the newest reading, so a reading that reorders the
+ *  list keeps it. `rows`: `{ key }` in order; `picked`: the key picked, or null for none
+ *  yet (then the first row). A picked row that is gone is not swapped for another: `gone`
+ *  is true and `index` -1, so the detail says so instead of showing a row the user did not
+ *  pick. */
+export function listPick(rows, picked) {
+  const list = rows || [];
+  if (picked === null || picked === undefined) {
+    return list.length ? { key: list[0].key, index: 0, gone: false } : { key: null, index: -1, gone: false };
+  }
+  const index = list.findIndex((r) => r.key === picked);
+  return { key: picked, index, gone: index < 0 };
+}
+
+/** Whether a reply may be drawn: it answers the newest ask (`seq`), for the session or node
+ *  still shown (`who`), and, when it was asked for one row, for the row still picked
+ *  (`pick`). A late reply (a slow poll overtaken by a newer one, a read for another node or
+ *  row) is dropped, so a list or a detail never shows a reading of something else. */
+export function replyFits(sent, now) {
+  if (!sent || !now) return false;
+  if (sent.seq !== now.seq) return false;
+  if ((sent.who ?? null) !== (now.who ?? null)) return false;
+  if (sent.pick !== undefined && sent.pick !== now.pick) return false;
+  return true;
+}
+
+/** The words of the one read-only line a screen shows (drawn by `writesOffLine`). */
+export const READ_ONLY_TEXT = 'Edits are off: this connection is read-only.';
+export const WRITES_ON_TEXT = 'Turn writes on (w)';
+
 // ---------------------------------------------------------------------------------------
 // 2. DOM helpers and shared components
 // ---------------------------------------------------------------------------------------
@@ -1001,6 +1032,47 @@ export function notice(text, kind = 'warn') {
 /** The read-only line with its lock. */
 export function readOnlyNote(text) {
   return h('p', { class: 'note muted' }, icon('lock', 16), h('span', { text }));
+}
+
+/** The one read-only line of a screen, as Browse draws it: the lock, the reason, and the
+ *  button that turns writes on (the top bar's access button: the server asks first). */
+export function writesOffLine(ctx, text = READ_ONLY_TEXT) {
+  return h('div', { class: 'line read-only-line' }, readOnlyNote(text),
+    ctx && ctx.toggleWrites ? h('button', { type: 'button', class: 'linkish small', text: WRITES_ON_TEXT, onclick: () => ctx.toggleWrites() }) : null);
+}
+
+/** A small "About this" disclosure for a screen's explanation: closed by default, so the
+ *  explanation is there when wanted and out of the way otherwise. */
+export function aboutThis(...lines) {
+  const kept = lines.flat().filter(Boolean);
+  if (!kept.length) return null;
+  return h('details', { class: 'about' }, h('summary', { text: 'About this' }), kept.map((t) => (typeof t === 'string' ? h('p', { class: 'muted small', text: t }) : t)));
+}
+
+/** The width from which Overview, Server and the screens with a list beside its detail fill
+ *  the window's height, their panes side by side (below it they stack and the page scrolls). */
+export const FILL_WIDE = '(min-width: 1100px)';
+
+/** Fill the window's height (`body.fill-view`, app.css) while the window matches `query`.
+ *  Returns the function that stops it (a view's unmount). */
+export function fillWhile(query = FILL_WIDE) {
+  const mq = typeof window !== 'undefined' && typeof window.matchMedia === 'function' ? window.matchMedia(query) : null;
+  const set = () => document.body.classList.toggle('fill-view', !mq || mq.matches);
+  set();
+  if (mq) mq.addEventListener('change', set);
+  return () => {
+    if (mq) mq.removeEventListener('change', set);
+    document.body.classList.remove('fill-view');
+  };
+}
+
+/** A pane as Browse builds one: a fixed head (its title and tools), then a body that
+ *  scrolls inside itself, then a foot. `id` names it for the keys (`data-pane`). */
+export function paneCard({ id = null, label = '', title = null, tools = null, body = null, foot = null, cls = '' } = {}) {
+  return h('section', { class: `card pane ${cls}`.trim(), 'data-pane': id, 'aria-label': label || null },
+    h('div', { class: 'pane-head' }, title, tools ? h('div', { class: 'pane-tools' }, tools) : null),
+    h('div', { class: 'pane-scroll pane-body' }, body),
+    h('div', { class: 'pane-foot' }, foot));
 }
 
 /** A semantic table with the mockup's row look. `columns`: `{ label, cls, cell(row) }`,
