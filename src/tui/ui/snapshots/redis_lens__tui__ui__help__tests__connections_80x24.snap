@@ -1,6 +1,5 @@
 ---
 source: src/tui/ui/help.rs
-assertion_line: 158
 expression: "render(Screen::Connections, \"\", 80, 24).backend()"
 ---
 "    ┌─ Help · Connections ──────────────────────────────────── esc closes ─┐    "
@@ -12,7 +11,6 @@ expression: "render(Screen::Connections, \"\", 80, 24).backend()"
 "    │ Home End g G   Jump to the first or last row                         │    "
 "    │ enter          Connect: reads the server's own figures, no keys      │    "
 "    │ a              Add a connection                                      │    "
-"    │ w              Turn writes on or off for the selected profile        │    "
 "    │ /              Filter the profiles by name or tag                    │    "
 "    │ esc            Clear the filter                                      │    "
 "    │ r              Look for Docker containers again                      │    "
@@ -25,5 +23,6 @@ expression: "render(Screen::Connections, \"\", 80, 24).backend()"
 "    │ :              Open the command line                                 │    "
 "    │ ctrl-f         Find keys by name or pattern on the whole server      │    "
 "    │ b              Switch the database (once connected)                  │    "
+"    │ w              Turn writes on or off: selected or connected profile  │    "
 "    │ ctrl-o         Open the web dashboard in your browser                │    "
 "    └──────────────────────────────────────────────────────────────────────┘    "

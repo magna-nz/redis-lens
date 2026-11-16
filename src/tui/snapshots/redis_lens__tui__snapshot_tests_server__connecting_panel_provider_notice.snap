@@ -2,8 +2,8 @@
 source: src/tui/snapshot_tests_server.rs
 expression: t.backend()
 ---
-" prod-cache-01   PROD   read-only   prod-cache-01-x1y2z3.serverless.use1.ca…                              ⠋ connecting… "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
+" prod-cache-01  PROD   w  read-only    b  db 0   prod-cache-01-x1y2z3.serverless.use1.ca…                 ⠋ connecting… "
+"  1  Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                               0 Connections "
 "┌─ Now ──────────────────────────────────────────────────────────────────────────────────── INFO every 2 s · p pauses ─┐"
 "│ Waiting for the live connection…                                                                                     │"
 "├─ Keys ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤"

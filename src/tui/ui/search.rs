@@ -26,7 +26,8 @@ use crate::value::{self, escape};
 use super::streams::browse_notice;
 use super::streams::live_wait;
 use super::widgets::{
-    Pane, Title, fit, pad_l, pad_r, rows, scroll_offset, split_frame, trunc, width,
+    self, GUTTER, Pane, Title, fit, gutter_area, list_below, pad_l, pad_r, rows, scroll_offset,
+    split_frame, trunc, width,
 };
 use super::{spinner, style};
 
@@ -226,8 +227,9 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) 
 /// while a result or a text is open on the right.
 fn index_list(frame: &mut Frame, inner: Rect, state: &SearchState, more: bool, dimmed: bool) {
     let list = &state.list;
-    let w = usize::from(inner.width);
-    let all = w >= WIDE_LIST || more;
+    let all = usize::from(inner.width) >= WIDE_LIST || more;
+    // The columns start after the marker gutter.
+    let w = usize::from(gutter_area(inner).width);
     let any = |f: fn(&IndexInfo) -> bool| list.indexes.iter().any(f);
     let show_size = all && any(|i| i.bytes.is_some());
     // Beside results or a result, the list is narrow: INDEXED goes when the name
@@ -276,7 +278,7 @@ fn index_list(frame: &mut Frame, inner: Rect, state: &SearchState, more: bool, d
             style::hd(),
         ));
     }
-    rows(frame, inner, vec![Line::from(head)], None);
+    rows(frame, gutter_area(inner), vec![Line::from(head)], None);
     let body = Rect {
         y: inner.y + 1,
         height: inner.height.saturating_sub(2),
@@ -304,7 +306,7 @@ fn index_list(frame: &mut Frame, inner: Rect, state: &SearchState, more: bool, d
             }
         })
         .collect();
-    rows(frame, body, lines, Some(sel - off));
+    widgets::list(frame, body, lines, Some(sel - off));
     let bottom = Rect {
         y: inner.y + inner.height.saturating_sub(1),
         height: u16::from(inner.height >= 2),
@@ -443,8 +445,10 @@ fn results_pane(
         ],
         w,
     )));
-    let kw = (w * 35 / 100).clamp(10, 40);
-    let fw = w.saturating_sub(kw + 2);
+    // The table's columns start after the marker gutter.
+    let lw = w.saturating_sub(usize::from(GUTTER));
+    let kw = (lw * 35 / 100).clamp(10, 40);
+    let fw = lw.saturating_sub(kw + 2);
     lines.push(Line::from(vec![
         Span::styled(pad_r(" KEY", kw + 1), style::hd()),
         Span::styled(pad_r("FIELDS", fw), style::hd()),
@@ -479,7 +483,8 @@ fn results_pane(
         height: inner.height - 1,
         ..inner
     };
-    rows(frame, body, lines, selected);
+    // The query line across the pane, the table (from its head) behind the gutter.
+    list_below(frame, body, lines, first - 1, selected);
     rows(
         frame,
         keys_row,
@@ -751,13 +756,20 @@ fn detail_pane(frame: &mut Frame, inner: Rect, state: &SearchState, module: &str
             w,
         )));
     }
-    let fw = (w / 4).max(10);
-    lines.push(Line::from(vec![
-        Span::styled(pad_r(" FIELD", fw), style::hd()),
-        Span::styled(pad_r("PATH", fw), style::hd()),
-        Span::styled(pad_r("TYPE", 9), style::hd()),
-        Span::styled("OPTIONS", style::hd()),
-    ]));
+    // The table's columns start after the marker gutter.
+    let lw = w.saturating_sub(usize::from(GUTTER));
+    // Nine cells at least, so OPTIONS keeps its head at 80 columns after the gutter.
+    let fw = (lw / 4).max(9);
+    // Cut as the rows are, one cell of margin on the right.
+    lines.push(Line::from(fit(
+        vec![
+            Span::styled(pad_r(" FIELD", fw), style::hd()),
+            Span::styled(pad_r("PATH", fw), style::hd()),
+            Span::styled(pad_r("TYPE", 9), style::hd()),
+            Span::styled("OPTIONS", style::hd()),
+        ],
+        lw.saturating_sub(1),
+    )));
     let room = usize::from(inner.height).saturating_sub(lines.len());
     let first = lines.len();
     let off = if focused {
@@ -769,7 +781,7 @@ fn detail_pane(frame: &mut Frame, inner: Rect, state: &SearchState, module: &str
         // One cell of margin on the right.
         lines.push(Line::from(fit(
             field_line(f, fw).spans,
-            w.saturating_sub(1),
+            lw.saturating_sub(1),
         )));
     }
     if i.schema.is_empty() {
@@ -781,7 +793,7 @@ fn detail_pane(frame: &mut Frame, inner: Rect, state: &SearchState, module: &str
     let selected = focused
         .then(|| state.schema_sel.checked_sub(off).map(|n| n + first))
         .flatten();
-    rows(frame, inner, lines, selected);
+    list_below(frame, inner, lines, first - 1, selected);
 }
 
 fn field_line(f: &FieldInfo, fw: usize) -> Line<'static> {

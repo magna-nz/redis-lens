@@ -29,8 +29,8 @@ use crate::verdict::{PatternVerdict, explain, pattern_verdict};
 
 use super::delta::Change;
 use super::widgets::{
-    Pane, Title, bar, fit, marquee_spans, pad_l, pad_r, pattern_spans, rows, scroll_offset,
-    split_frame, trunc, ttl_hist_spans, width,
+    Pane, Title, bar, fit, gutter_area, list, marquee_spans, pad_l, pad_r, pattern_spans, rows,
+    scroll_offset, split_frame, trunc, ttl_hist_spans, width,
 };
 use super::{CONNECT_FIRST, spinner, style};
 
@@ -157,8 +157,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         names_table(frame, left, app, &summaries, sel);
         names_detail(frame, right, app, summaries.get(sel));
     } else {
+        // The columns start after the marker gutter.
         let c = cols(
-            usize::from(left.width),
+            usize::from(gutter_area(left).width),
             more,
             changes.is_some(),
             data.sizes_available,
@@ -337,7 +338,10 @@ fn names_table(
 ) {
     let names = &app.patterns.names;
     let w = usize::from(inner.width);
-    let name_w = w.saturating_sub(NAMES_KEYS_W + NAMES_TAIL).max(8);
+    // The columns start after the marker gutter.
+    let name_w = usize::from(gutter_area(inner).width)
+        .saturating_sub(NAMES_KEYS_W + NAMES_TAIL)
+        .max(8);
     let arrow = |s: SortBy| {
         (app.patterns.sort.effective(false) == s).then_some(if s.ascending() {
             " ▲"
@@ -355,7 +359,7 @@ fn names_table(
         ),
         Span::styled(pad_l("KEYS", NAMES_KEYS_W), style::hd()),
     ]);
-    rows(frame, inner, vec![head], None);
+    rows(frame, gutter_area(inner), vec![head], None);
     let body = list_area(inner);
     if summaries.is_empty() {
         let text = if !app.patterns.filter.is_empty() {
@@ -394,7 +398,7 @@ fn names_table(
                 Line::from(spans)
             })
             .collect();
-        rows(frame, body, lines, Some(sel - off));
+        list(frame, body, lines, Some(sel - off));
     }
     let (text, st) = names_bottom(app, names);
     rows(
@@ -805,13 +809,17 @@ impl Cols {
 /// compare with) with `v`. When the pattern column would get narrower than
 /// [`NAME_MIN`] the optional columns go: the share bar, Δ, AVG, TYPE, NO TTL.
 fn cols(inner: usize, more: bool, delta: bool, sizes: bool) -> Cols {
-    let wide = inner >= WIDE;
+    let wide = inner >= super::widgets::after_gutter(WIDE);
     let mut c = Cols {
         name: 0,
         ty: wide || more,
         mem: sizes,
         share: if wide || more {
-            if inner >= 90 { 14 } else { 12 }
+            if inner >= super::widgets::after_gutter(90) {
+                14
+            } else {
+                12
+            }
         } else {
             0
         },
@@ -909,7 +917,7 @@ fn table(
             style::hd(),
         ));
     }
-    rows(frame, inner, vec![Line::from(head)], None);
+    rows(frame, gutter_area(inner), vec![Line::from(head)], None);
     let total: u64 = data
         .patterns
         .iter()
@@ -954,7 +962,7 @@ fn table(
             analysed_row(s, *depth, *open, total, sizes, c, scroll, ch, v)
         })
         .collect();
-    rows(frame, body, lines, Some(sel - off));
+    list(frame, body, lines, Some(sel - off));
 }
 
 /// The pattern cell: the indent and fold mark, then the name (the selected one
@@ -1389,7 +1397,8 @@ mod tests {
 
     #[test]
     fn at_80_columns_only_pattern_keys_memory_and_the_mark_show() {
-        let c = cols(39, false, true, true);
+        // The list less the marker gutter at 80 columns.
+        let c = cols(37, false, true, true);
         assert!(c.mem && !c.ty && c.share == 0 && !c.avg && !c.no_ttl && !c.delta);
         assert!(c.name >= NAME_MIN, "{}", c.name);
         // From [`WIDE`] on, TYPE and the share bar join in.

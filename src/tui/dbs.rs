@@ -772,14 +772,18 @@ mod tests {
         out
     }
 
+    /// The context bar names the database after its ` b ` key cap: database 0 when
+    /// there is room after the address, any other always.
     #[test]
-    fn the_header_shows_db_only_when_it_is_not_0() {
+    fn the_header_shows_the_database_after_its_key() {
         let mut app = ready();
-        let header: String = text(&app, 80, 24).lines().take(3).collect();
-        assert!(!header.contains("db "), "{header}");
+        let header: String = text(&app, 140, 24).lines().take(1).collect();
+        assert!(header.contains(" b  db 0"), "{header}");
+        let header: String = text(&app, 80, 24).lines().take(1).collect();
+        assert!(!header.contains("db 0"), "{header}");
         app.session.as_mut().unwrap().profile.db = 3;
-        let header: String = text(&app, 80, 24).lines().take(3).collect();
-        assert!(header.contains("db 3"), "{header}");
+        let header: String = text(&app, 80, 24).lines().take(1).collect();
+        assert!(header.contains(" b  db 3"), "{header}");
     }
 
     #[test]

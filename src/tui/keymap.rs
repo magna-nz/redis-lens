@@ -91,7 +91,17 @@ const DASHBOARD_KEY: KeyHelp = k(
     false,
 );
 
-static GLOBAL: [KeyHelp; 9] = [
+/// `w` from every screen: on Connections for the selected profile, elsewhere for the
+/// connected one. Connections' footer shows it.
+const WRITES_KEY: KeyHelp = k(
+    "w",
+    "w",
+    "Writes",
+    "Turn writes on or off: selected or connected profile",
+    true,
+);
+
+static GLOBAL: [KeyHelp; 10] = [
     CONNECTIONS_KEY,
     AREAS,
     MORE,
@@ -99,6 +109,7 @@ static GLOBAL: [KeyHelp; 9] = [
     COMMAND_LINE_KEY,
     FIND_KEY,
     DATABASES_KEY,
+    WRITES_KEY,
     DASHBOARD_KEY,
     QUIT,
 ];
@@ -222,7 +233,7 @@ const PICK_NODE: KeyHelp = k(
     false,
 );
 
-static CONNECTIONS: [KeyHelp; 9] = [
+static CONNECTIONS: [KeyHelp; 8] = [
     MOVE,
     PAGE,
     ENDS,
@@ -234,13 +245,6 @@ static CONNECTIONS: [KeyHelp; 9] = [
         true,
     ),
     k("a", "a", "Add", "Add a connection", true),
-    k(
-        "w",
-        "w",
-        "Writes",
-        "Turn writes on or off for the selected profile",
-        true,
-    ),
     k(
         "/",
         "/",

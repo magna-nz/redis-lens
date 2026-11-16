@@ -1,21 +1,20 @@
 ---
 source: src/tui/snapshot_tests_cluster.rs
-assertion_line: 1414
 expression: t.backend()
 ---
-" prod-cache-01   PROD   read-only   cluster · 3 shards · 15G / 24G   ● analyzed "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Keys  ·  Streams  ·  Search                                                 "
+" prod-cache-01  PROD   w  read-only    b  db 0   cluster · 3 shards  ● analyzed "
+" 1    2  Browse › Keys · Streams · Search   3   4   5                         0 "
 "┌─ Streams ──────────────────────────────┬─ foo ────────────────────── stream ─┐"
-"│ KEY                       LEN    LAG   │ 100 entries · 64K · oldest 1h ago   │"
-"│ foo                       100      — ▲ │ on node 10.0.1.13:6379              │"
-"│ bar                       100      — ▲ │                                     │"
-"│ c                         100      — ▲ │ ▲ No readers: no consumer group     │"
-"│ a                         200      — ▲ │   reads this stream.                │"
+"│   KEY                     LEN    LAG   │ 100 entries · 64K · oldest 1h ago   │"
+"│ › foo                     100      — ▲ │ on node 10.0.1.13:6379              │"
+"│   bar                     100      — ▲ │                                     │"
+"│   c                       100      — ▲ │ ▲ No readers: no consumer group     │"
+"│   a                       200      — ▲ │   reads this stream.                │"
 "│                                        │                                     │"
-"│                                        │ GROUP / CONSU…   PEND   IDLE    LAG │"
-"│                                        │ No consumer groups: nothing reads   │"
-"│                                        │ this stream.                        │"
+"│                                        │   GROUP / CON…   PEND   IDLE    LAG │"
+"│                                        │   No consumer groups: nothing reads │"
+"│                                        │   this stream.                      │"
+"│                                        │                                     │"
 "│                                        │                                     │"
 "│                                        │                                     │"
 "│                                        │                                     │"

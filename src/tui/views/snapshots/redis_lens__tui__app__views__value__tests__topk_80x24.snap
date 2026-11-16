@@ -2,12 +2,11 @@
 source: src/tui/views/value.rs
 expression: t.backend()
 ---
-" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Keys  ·  Streams  ·  Search                                                 "
+" prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys   ● analyzed 14:02 "
+" 1    2  Browse › Keys · Streams · Search   3   4   5                         0 "
 "┌─ ‹ user:{id}:cart ────────┬─ mod:1 ────────────────────────────── TopK-TYPE ─┐"
-"│ KEY                       │ 4.0K · expires in 6d 04h   stored as listpack    │"
-"│ mod:1                     │                                                  │"
+"│   KEY                     │ 4.0K · expires in 6d 04h   stored as listpack    │"
+"│ › mod:1                   │                                                  │"
 "│                           │ k         3                                      │"
 "│                           │ width     8                                      │"
 "│                           │ depth     7                                      │"
@@ -17,6 +16,7 @@ expression: t.backend()
 "│                           │ page:/home                                     3 │"
 "│                           │ page:/cart                                     2 │"
 "│                           │ page:/\x1b[2J                                  1 │"
+"│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │                                                  │"

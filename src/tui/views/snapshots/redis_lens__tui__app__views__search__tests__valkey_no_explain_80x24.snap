@@ -1,17 +1,16 @@
 ---
 source: src/tui/views/search.rs
-assertion_line: 1509
 expression: "testing::render(&app, 80, 24).backend()"
 ---
-" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Keys  ·  Streams  ·  Search                                                 "
+" prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys   ● analyzed 14:02 "
+" 1    2  Browse › Keys · Streams · Search   3   4   5                         0 "
 "┌─ Search ── valkey-search ─┬─ Results · idx:products ─────────────────────────┐"
-"│ INDEX                DOCS │ query @price:[0 100] · 3 of 1,204 results · 3 ms │"
-"│ idx:products         120K │ KEY              FIELDS                          │"
-"│ idx:sessions         8.2K │ product:1        title=red shoe price=10 tags=a… │"
-"│                           │ product:2        title=blue shoe price=20 spec=… │"
-"│                           │ product:3        title=two\nlines                │"
+"│   INDEX              DOCS │ query @price:[0 100] · 3 of 1,204 results · 3 ms │"
+"│ › idx:products       120K │   KEY             FIELDS                         │"
+"│   idx:sessions       8.2K │ › product:1       title=red shoe price=10 tags=… │"
+"│                           │   product:2       title=blue shoe price=20 spec… │"
+"│                           │   product:3       title=two\nlines               │"
+"│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │                                                  │"

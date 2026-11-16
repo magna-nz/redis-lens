@@ -1,18 +1,17 @@
 ---
 source: src/tui/snapshot_tests_cluster.rs
-assertion_line: 1040
 expression: t.backend()
 ---
-" prod-cache-01   PROD   read-only   cluster · 3 shards · 15G / 24G   ● analyzed "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Keys  ·  Streams  ·  Search                                                 "
+" prod-cache-01  PROD   w  read-only    b  db 0   cluster · 3 shards  ● analyzed "
+" 1    2  Browse › Keys · Streams · Search   3   4   5                         0 "
 "┌─ ‹ session:{uuid} ── 3 of 3 nodes · … ─┬─ user:1:cart ──────────────── hash ─┐"
-"│ KEY                     SIZE▼  EXPIRES │ 4 fields · 512B                     │"
-"│ user:1:cart              512B    never │ never expires                       │"
-"│ user:2:cart              512B    never │ on node 10.0.1.11:6379              │"
-"│ user:3:cart              512B    never │                                     │"
-"│ user:4:cart              512B    never │ → shows the value                   │"
-"│ user:5:cart              512B    never │                                     │"
+"│   KEY                   SIZE▼  EXPIRES │ 4 fields · 512B                     │"
+"│ › user:1:cart            512B    never │ never expires                       │"
+"│   user:2:cart            512B    never │ on node 10.0.1.11:6379              │"
+"│   user:3:cart            512B    never │                                     │"
+"│   user:4:cart            512B    never │ → shows the value                   │"
+"│   user:5:cart            512B    never │                                     │"
+"│                                        │                                     │"
 "│                                        │                                     │"
 "│                                        │                                     │"
 "│                                        │                                     │"

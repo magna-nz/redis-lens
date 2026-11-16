@@ -1,0 +1,40 @@
+---
+source: src/tui/snapshot_tests.rs
+expression: "buffer_lines(&render(&app, 120, 36)).join(\"\\n\")"
+---
+ prod-cache-01  PROD   w  read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys         ● analyzed 14:02 UTC 
+ 1 Overview   2 Browse    3  Analyze › Big keys · Expiry · Changes · Hot keys   4 Server   5 Pub/Sub      0 Connections 
+┌─ Big keys ────────────────────────────────── top 6 of 100K sampled ─┬─ session:c41f0e9a-2d6b-47e8-b5a3-91e7d0c38f26 ─┐
+│   KEY                                          SIZE TYPE        TTL │ Size     200M                                  │
+│ › session:c41f0e9a-2d6b-47e8-b5a3-91e7d0c3…  ▲ 200M string  23h 12m │ Length   —                                     │
+│   session:7a2d9b14-6e0c-4b1f-a8d2-3c5e9f07…  ▲ 190M string  16h 40m │ TTL      23h 12m                               │
+│   session:9f1c2a7e-4b3d-4e0a-9c61-2f8d7b1e…  ▲ 180M string  11h 04m │ Pattern  session:{uuid}                        │
+│   session:03be77d1-91aa-4f52-8e3c-6a0d24c9…  ▲ 170M string   2h 51m │                                                │
+│   session:e8b03c5d-7f21-4a96-9d4e-0b6c18a2…  ▲ 160M string  47m 00s │ THINGS TO LOOK AT                              │
+│   cache:search:a17e4d9b3c02f68e1d5a7b40c9e…  ▲ 150M string    never │ ▲ session:c41f0e9a-2d6b-47e8-b5a3-91e7d0c38f26 │
+│                                                                     │   is a single 200M string. Split it, or        │
+│                                                                     │   compress it. Reading it blocks the server.   │
+│                                                                     │ ▲ session:7a2d9b14-6e0c-4b1f-a8d2-3c5e9f07b6a1 │
+│                                                                     │   is a single 190M string. Split it, or        │
+│                                                                     │   compress it. Reading it blocks the server.   │
+│                                                                     │ ▲ session:9f1c2a7e-4b3d-4e0a-9c61-2f8d7b1e5a43 │
+│                                                                     │   is a single 180M string. Split it, or        │
+│                                                                     │   compress it. Reading it blocks the server.   │
+│                                                                     │ ▲ session:03be77d1-91aa-4f52-8e3c-6a0d24c9f1b8 │
+│                                                                     │   is a single 170M string. Split it, or        │
+│                                                                     │   compress it. Reading it blocks the server.   │
+│                                                                     │ ▲ session:e8b03c5d-7f21-4a96-9d4e-0b6c18a2f7e3 │
+│                                                                     │   is a single 160M string. Split it, or        │
+│                                                                     │   compress it. Reading it blocks the server.   │
+│                                                                     │ ▲ cache:search:a17e4d9b3c02f68e1d5a7b40c9e23f… │
+│                                                                     │   is a single 150M string. Split it, or        │
+│                                                                     │   compress it. Reading it blocks the server.   │
+│                                                                     │ ▲ 12% of cache:search:{hash} keys never expire │
+│                                                                     │   while the rest do. A write path probably     │
+│                                                                     │   skips EXPIRE.                                │
+│                                                                     │ … and 5 more                                   │
+│                                                                     │ Lengths and encodings are read once the live   │
+│                                                                     │ connection is open.                            │
+│                                                                     │                                                │
+└─────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────┘
+ ↑↓ Move   tab Next panel   y Copy   r Analyze   s Snapshot                           ctrl-f Find key  : Command  ? Help

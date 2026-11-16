@@ -66,9 +66,9 @@ pub fn draw(frame: &mut Frame, area: Rect, b: &Bulk, tick: u64) {
             text(&mut lines, "TTL (90s, 10m, 24h, 7d):", style::fg(), inner);
             let shown = trunc(&crate::value::escape(input), inner.saturating_sub(3));
             lines.push(Line::from(vec![
-                Span::styled(" › ", style::amber()),
+                Span::styled(" › ", style::focus()),
                 Span::styled(shown, style::fgb()),
-                Span::styled("▏", style::amber()),
+                Span::styled("▏", style::focus()),
             ]));
             if let Some(e) = error {
                 text(&mut lines, e, style::warn(), inner);

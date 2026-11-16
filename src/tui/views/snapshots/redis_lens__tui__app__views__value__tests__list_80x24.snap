@@ -1,18 +1,16 @@
 ---
 source: src/tui/views/value.rs
-assertion_line: 1888
 expression: t.backend()
 ---
-" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Keys  ·  Streams  ·  Search                                                 "
+" prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys   ● analyzed 14:02 "
+" 1    2  Browse › Keys · Streams · Search   3   4   5                         0 "
 "┌─ ‹ user:{id}:cart ────────┬─ queue:jobs ────────────────────────────── list ─┐"
-"│ KEY                       │ 3 items · 200B · expires in 6d 04h               │"
-"│ queue:jobs                │                                                  │"
-"│                           │  INDEX ELEMENT                                   │"
-"│                           │›     0 {"job":"resize","id":1}                   │"
-"│                           │      1 plain text job                            │"
-"│                           │      2 third                                     │"
+"│   KEY                     │ 3 items · 200B · expires in 6d 04h               │"
+"│ › queue:jobs              │                                                  │"
+"│                           │   INDEX ELEMENT                                  │"
+"│                           │ ›     0 {"job":"resize","id":1}                  │"
+"│                           │       1 plain text job                           │"
+"│                           │       2 third                                    │"
 "│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │──────────────────────────────────────────────────│"
@@ -21,6 +19,7 @@ expression: t.backend()
 "│                           │   "job": "resize",                               │"
 "│                           │   "id": 1                                        │"
 "│                           │ }                                                │"
+"│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │                                                  │"

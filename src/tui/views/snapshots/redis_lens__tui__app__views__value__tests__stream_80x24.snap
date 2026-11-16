@@ -1,17 +1,15 @@
 ---
 source: src/tui/views/value.rs
-assertion_line: 1888
 expression: t.backend()
 ---
-" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Keys  ·  Streams  ·  Search                                                 "
+" prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys   ● analyzed 14:02 "
+" 1    2  Browse › Keys · Streams · Search   3   4   5                         0 "
 "┌─ ‹ user:{id}:cart ────────┬─ events:orders ───────────────────────── stream ─┐"
-"│ KEY                       │ 2 entries · 900B · expires in 6d 04h             │"
-"│ events:orders             │                                                  │"
-"│                           │  ENTRY ID        FIELDS                          │"
-"│                           │› 1700000000002-0 order=44812 state=paid          │"
-"│                           │  1700000000001-0 order=44811                     │"
+"│   KEY                     │ 2 entries · 900B · expires in 6d 04h             │"
+"│ › events:orders           │                                                  │"
+"│                           │   ENTRY ID        FIELDS                         │"
+"│                           │ › 1700000000002-0 order=44812 state=paid         │"
+"│                           │   1700000000001-0 order=44811                    │"
 "│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │                                                  │"
@@ -21,6 +19,7 @@ expression: t.backend()
 "│                           │   44812                                          │"
 "│                           │ state                                            │"
 "│                           │   paid                                           │"
+"│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │                                                  │"

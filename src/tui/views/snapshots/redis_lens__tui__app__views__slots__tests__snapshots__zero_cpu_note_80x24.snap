@@ -1,20 +1,19 @@
 ---
 source: src/tui/views/slots_tests.rs
-assertion_line: 481
 expression: render(&app)
 ---
-" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys  ·  Nodes  ·  Slots            "
+" prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys         ● analyzed "
+" 1   2    3  Analyze › Slots · 6 of 6   4   5                                 0 "
 "┌─ Slot ranges ────────── CPU and network need cluster-slot-stats-enabled yes ─┐"
 "│ RANGE         NODE                   KEYS                                    │"
 "│ 0-5460        10.0.1.11:6379           40                                    │"
 "│ 5461-10922    10.0.1.12:6379            9                                    │"
 "│ 10923-16383   10.0.1.13:6379            —                                    │"
 "├─ Hottest slots ────────────────────────────── by keys · o changes the order ─┤"
-"│ SLOT          NODE                   KEYS                                    │"
-"│ 10            10.0.1.11:6379           40                                    │"
-"│ 6000          10.0.1.12:6379            9                                    │"
+"│   SLOT          NODE                   KEYS                                  │"
+"│ › 10            10.0.1.11:6379           40                                  │"
+"│   6000          10.0.1.12:6379            9                                  │"
+"│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"

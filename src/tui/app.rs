@@ -113,8 +113,8 @@ impl Area {
         Self::ALL.into_iter().find(|a| a.digit() == c)
     }
 
-    /// The panels (sub-tabs) `tab` and `shift-tab` cycle through, in the sub-tab row's
-    /// order. Empty for an area without panels. Nodes and Slots are panels of Analyze
+    /// The panels `tab` and `shift-tab` cycle through, in the order the area row lists
+    /// them. Empty for an area without panels. Nodes and Slots are panels of Analyze
     /// only on a cluster (`cluster`).
     pub fn panels(self, cluster: bool) -> &'static [Panel] {
         match self {
@@ -138,13 +138,13 @@ impl Area {
         }
     }
 
-    /// True for the areas that have a sub-tab row.
+    /// True for the areas that have panels, listed after their name in the area row.
     pub fn has_panels(self) -> bool {
         !self.panels(false).is_empty()
     }
 }
 
-/// A panel of an area: one sub-tab. A panel shows one [`Screen`] at a time; Browse ›
+/// A panel of an area, listed after its name in the area row. A panel shows one [`Screen`] at a time; Browse ›
 /// Keys goes deeper (patterns, a pattern's keys, a key's value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Panel {
@@ -177,7 +177,7 @@ impl Panel {
         }
     }
 
-    /// The name in the sub-tab row.
+    /// The name in the area row.
     pub fn name(self) -> &'static str {
         match self {
             Self::Keys => "Keys",
@@ -2326,6 +2326,9 @@ impl App {
                 };
             }
             Some('b') => return self.open_dbs(),
+            // Writes on or off: the selected profile on Connections, the connected one
+            // everywhere else, through the same question (confirm.rs).
+            Some('w') => return self.toggle_writes(),
             Some('?') => {
                 self.help = true;
                 self.help_find = HelpFind::default();
@@ -3211,7 +3214,6 @@ impl App {
                 Some('a') => return self.start_add(),
                 Some('/') => self.conn_filtering = true,
                 Some('r') => return self.rescan_docker(),
-                Some('w') => return self.toggle_writes(),
                 _ => {}
             },
         }
@@ -9157,7 +9159,7 @@ mod tests {
     #[test]
     fn v_shows_more_columns_on_browse() {
         let mut app = views::testing::scanned();
-        let head = |app: &App, w| screen_text(app, w, 24).lines().nth(4).unwrap().to_string();
+        let head = |app: &App, w| screen_text(app, w, 24).lines().nth(3).unwrap().to_string();
         // 80: PATTERN, KEYS, MEMORY; 120: TYPE and SHARE too.
         let h = head(&app, 80);
         assert!(h.contains("KEYS") && h.contains("MEMORY"), "{h}");
@@ -9191,8 +9193,10 @@ mod tests {
             text.contains("FT._LIST is not available: no search"),
             "{text}"
         );
-        assert!(text.contains("Search is off: no search module"), "{text}");
-        // Dimmed: the reason, and Search on the sub-tab row.
+        // The area row says so too where it has room: at 120 columns, not at 80.
+        let wide = screen_text(&app, 120, 36);
+        assert!(wide.contains("Search is off: no search module"), "{wide}");
+        // Dimmed: the reason.
         let b = t.backend().buffer();
         let y = text
             .lines()

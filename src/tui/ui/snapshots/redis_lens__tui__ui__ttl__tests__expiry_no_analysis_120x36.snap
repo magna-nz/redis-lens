@@ -2,9 +2,8 @@
 source: src/tui/ui/ttl.rs
 expression: s
 ---
-" prod-cache-01   PROD   read-only   prod-cache-01.internal:6380 · Redis 7.4.2 · 15G / 24G · 7.92M keys      ● connected "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
-"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys                                                                        "
+" prod-cache-01  PROD   w  read-only    b  db 0   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys       ● connected "
+" 1 Overview   2 Browse    3  Analyze › Big keys · Expiry · Changes · Hot keys   4 Server   5 Pub/Sub      0 Connections "
 "┌─ Expiry ───────────────────────────────────────────────────────────────────────────────────── waits for an analysis ─┐"
 "│                                                                                                                      │"
 "│ No analysis yet.                                                                                                     │"
@@ -16,6 +15,7 @@ expression: s
 "│                                                                                                                      │"
 "│ What the server reports without a sample is on Overview (1): the key count, the share of keys with a TTL, and what   │"
 "│ keeps memory busy.                                                                                                   │"
+"│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"

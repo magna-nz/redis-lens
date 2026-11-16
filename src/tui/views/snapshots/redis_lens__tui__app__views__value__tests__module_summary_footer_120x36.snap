@@ -2,13 +2,13 @@
 source: src/tui/views/value.rs
 expression: t.backend()
 ---
-" prod-cache-01   PROD   read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys           ● analyzed 14:02 UTC "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
-"    Keys  ·  Streams  ·  Search                                                                                         "
+" prod-cache-01  PROD   w  read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys         ● analyzed 14:02 UTC "
+" 1 Overview    2  Browse › Keys · Streams · Search   3 Analyze   4 Server   5 Pub/Sub                     0 Connections "
 "┌─ ‹ user:{id}:cart ────────────────────┬─ ts:1 ─────────────────────────────────────────────────────────── TSDB-TYPE ─┐"
-"│ KEY                      SIZE EXPIRES │ 80B · expires in 6d 04h   stored as listpack · LFU 14                        │"
-"│ ts:1                      80B  6d 04h │                                                                              │"
+"│   KEY                    SIZE EXPIRES │ 80B · expires in 6d 04h   stored as listpack · LFU 14                        │"
+"│ › ts:1                    80B  6d 04h │                                                                              │"
 "│                                       │ redis-lens does not read values of type TSDB-TYPE.                           │"
+"│                                       │                                                                              │"
 "│                                       │                                                                              │"
 "│                                       │                                                                              │"
 "│                                       │                                                                              │"

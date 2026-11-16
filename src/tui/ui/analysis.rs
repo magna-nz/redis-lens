@@ -21,8 +21,8 @@ use crate::tui::app::{App, Phase};
 use crate::verdict::{TtlVerdict, explain};
 
 use super::widgets::{
-    Pane, Section, Title, bar, fit, marquee_spans, pad_l, pad_r, pattern_spans, rows,
-    scroll_offset, sections, split_at, split_frame, trunc, width,
+    Pane, Section, Title, after_gutter, bar, fit, gutter_area, list, marquee_spans, pad_l, pad_r,
+    pattern_spans, rows, scroll_offset, sections, split_at, split_frame, trunc, width,
 };
 use super::{spinner, style};
 
@@ -315,7 +315,7 @@ pub fn need_report(frame: &mut Frame, area: Rect, app: &App, title: &str, needs:
             // The engine's estimate, the same one the dialog and Overview show.
             let q = estimate_for(Depth::Quick, app);
             lines.push(Line::from(vec![
-                Span::styled("   r", style::amber()),
+                Span::styled("   r", style::focus()),
                 Span::styled(
                     format!(
                         "  Analyze: {} keys, about {} read-only commands, {}",
@@ -518,10 +518,12 @@ fn draw_big_keys(
         ));
         rows(frame, left, lines, None);
     } else {
-        let (keep, kw) = pick_cols(&BIG_COLS, usize::from(left.width), BIG_WIDE_AT, ctx.more);
+        // The columns start after the marker gutter.
+        let cols_w = usize::from(gutter_area(left).width);
+        let (keep, kw) = pick_cols(&BIG_COLS, cols_w, after_gutter(BIG_WIDE_AT), ctx.more);
         rows(
             frame,
-            left,
+            gutter_area(left),
             vec![head_row(&BIG_COLS, &keep, kw, &[1, 3, 5])],
             None,
         );
@@ -543,7 +545,7 @@ fn draw_big_keys(
                 big_row(&keep, kw, k, &pattern, &len, (i == sel).then_some(ticks))
             })
             .collect();
-        rows(frame, body, lines, Some(sel - off));
+        list(frame, body, lines, Some(sel - off));
     }
     let recs = recommendations(report, ctx.session.diff(), &state.facts);
     let lines = match selected {
