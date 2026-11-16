@@ -611,11 +611,19 @@ export function maskCommand(line) {
 }
 
 /** The route in a location hash: `#/server/slowlog` is `{ name: 'server', sub: 'slowlog' }`.
- *  An unknown or empty hash gives `fallback`. */
+ *  A query after `?` is kept as it is: `#/browse?p=6162` is `{ name: 'browse', sub: null,
+ *  query: 'p=6162' }` (the view reads its own; Browse › Keys keeps what it shows there).
+ *  An unknown or empty hash gives `fallback`, with no query. */
 export function parseRoute(hash, names, fallback) {
-  const parts = String(hash ?? '').replace(/^#\/?/, '').split('/').filter(Boolean);
+  const raw = String(hash ?? '').replace(/^#\/?/, '');
+  const q = raw.indexOf('?');
+  const path = q < 0 ? raw : raw.slice(0, q);
+  const parts = path.split('/').filter(Boolean);
   const name = names.includes(parts[0]) ? parts[0] : fallback;
-  return { name, sub: name === parts[0] ? parts[1] ?? null : null };
+  const known = name === parts[0];
+  const route = { name, sub: known ? parts[1] ?? null : null };
+  if (known && q >= 0 && q + 1 < raw.length) route.query = raw.slice(q + 1);
+  return route;
 }
 
 /** The placeholders redis-lens's pattern inference writes (`src/pattern/`), and no other

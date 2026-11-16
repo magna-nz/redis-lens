@@ -93,6 +93,28 @@ const ctx = {
     if (window.location.hash === hash) render();
     else window.location.hash = hash;
   },
+  /** Put `hash` in the address in place of the current one: no step in the history, and
+   *  nothing is drawn again (the view shows it already). The page's own query (`?mock`)
+   *  stays. */
+  replaceRoute(hash) {
+    if (window.location.hash === hash) return;
+    window.history.replaceState(window.history.state, '', hash);
+  },
+  /** The session a history entry's address was shown for (Browse marks its entries), so
+   *  Back to an entry of another connection or database is not applied to this one. Null
+   *  for an entry never shown (a link, a page just opened). Only this tab's history holds
+   *  it; it is never in the address. */
+  routeTag: () => {
+    const s = window.history.state;
+    return s && typeof s.view === 'string' ? s.view : null;
+  },
+  setRouteTag(tag) {
+    const s = window.history.state;
+    if (s && s.view === tag) return;
+    window.history.replaceState({ ...(s && typeof s === 'object' ? s : {}), view: tag }, '');
+  },
+  /** Move the focus into a pane, on its selected row (Browse's breadcrumb). */
+  focusPane: (pane) => focusPane(pane),
   /** Connect to `{ name }` or `{ docker }`. The outcome arrives as state: this tab then
    *  lands on Overview, or says why the connect failed. */
   async connect(target) {
@@ -122,21 +144,22 @@ const ctx = {
     const kept = dbListReply(sentKey, dbListKey(store.state), dbs, error);
     if (kept) dbCache = kept;
   },
-  /** Find keys by name (the search field in the top bar): the results show on Browse. */
+  /** Find keys by name (Go to's Find row): the results show on Browse. Each of these jumps
+   *  is an address (browse.js `hrefFor`), so it is a step in the history, and Browse reads
+   *  what the address names when it shows it. */
   findKey(text) {
     const q = String(text ?? '').trim();
     if (!q) return;
-    browse.requestFind(q);
-    ctx.navigate('#/browse');
+    ctx.navigate(browse.hrefFor({ find: q }, store.state));
   },
   /** Open a key's value (`Name`), or a pattern's keys, on Browse. */
   openKey(name) {
-    browse.requestKey(name);
-    ctx.navigate('#/browse');
+    ctx.navigate(browse.hrefFor({ k: name.id }, store.state));
   },
   openPattern(name, node = null) {
-    browse.requestPattern(name, node);
-    ctx.navigate('#/browse');
+    const change = name ? { p: name.id } : {};
+    if (node !== null) change.node = node;
+    ctx.navigate(browse.hrefFor(change, store.state));
   },
   /** Start an analysis from another area (Overview's buttons): Analyze asks first, with
    *  its estimate, as the TUI does. */
@@ -179,7 +202,12 @@ function render() {
   }
   document.title = `${TITLES[route.name]} · redis-lens`;
   const key = viewKey();
-  if (mounted && mounted.name === route.name && mounted.sub === route.sub && mounted.key === key) return;
+  if (mounted && mounted.name === route.name && mounted.sub === route.sub && mounted.key === key) {
+    // The same screen with another query (Browse's pattern, key, Find): the view shows it,
+    // reading only what changed. It is not torn down.
+    if (typeof VIEWS[route.name].onRoute === 'function') VIEWS[route.name].onRoute(route);
+    return;
+  }
   // Another screen: the row the focus was on is not looked for there.
   if (!mounted || mounted.name !== route.name || mounted.sub !== route.sub) lastRow = null;
   if (mounted) {
@@ -629,17 +657,21 @@ function listOpen(key) {
   if (!row) return;
   const panes = panesShown();
   const next = paneStep(panes.length, panes.indexOf(pane), 1);
+  // A pane hidden to the right (Browse on a narrow window): its breadcrumb part shows it.
+  const forward = next < 0 ? Array.from($('view').querySelectorAll('[data-next]')).find(visible) : null;
   const opens = Array.from(row.querySelectorAll('[data-open]')).filter(visible);
   const step = openStep(key, {
     open: isOpenRow(row),
     control: row.matches('button, a[href]'),
     controlAct: row.dataset.act || null,
     opens: opens.map((o) => ({ act: o.dataset.act || null, disabled: !!o.disabled })),
-    right: next >= 0,
+    right: next >= 0 || !!forward,
   });
   if (!step) return;
-  if (step.do === 'right') focusPane(panes[next]);
-  else if (step.do === 'row') row.click();
+  if (step.do === 'right') {
+    if (next >= 0) focusPane(panes[next]);
+    else forward.click();
+  } else if (step.do === 'row') row.click();
   else opens[step.index].click();
 }
 
@@ -658,10 +690,20 @@ function listBack() {
 
 // ----- Pressing a control -----
 
+/** A control a key may press: shown, or inside a closed popover (`details.pop`, such as
+ *  Browse's "About this pattern") whose own button is shown, as a click would reach it. */
+function reachable(el) {
+  if (visible(el)) return true;
+  const pop = el.closest('details.pop');
+  if (!pop || pop.open) return false;
+  const summary = pop.querySelector(':scope > summary');
+  return visible(summary) && !pop.parentElement.closest('details.pop:not([open])');
+}
+
 /** The controls carrying `data-act="<act>"` where the action looks: the selected row
  *  first, then the focused pane, then the screen, then the page, as far as `scope` goes. */
 function findAct(act, scope, pane, row) {
-  const pick = (root) => Array.from(root.querySelectorAll(`[data-act="${act}"]`)).filter(visible);
+  const pick = (root) => Array.from(root.querySelectorAll(`[data-act="${act}"]`)).filter(reachable);
   if (row) {
     const got = pick(row.closest('li, tr') || row);
     if (got.length) return got;

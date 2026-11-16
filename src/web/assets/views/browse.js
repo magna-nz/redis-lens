@@ -192,9 +192,9 @@ export function valueFoot(v) {
 export function blank() {
   return {
     who: null, conn: null, tree: null, treeError: null, sort: null, node: null, filter: '', closed: new Set(),
-    picked: null, list: null, listError: null, listFilter: '', listShown: CHUNK, finding: null, back: null,
+    picked: null, list: null, listError: null, listFilter: '', listShown: CHUNK, finding: null,
     value: null, valueError: null, valueId: null, item: null, shown: null, format: null, itemsShown: CHUNK,
-    dbs: null, dbsError: null, pending: null, bulk: null,
+    dbs: null, dbsError: null, bulk: null, anchor: 'patterns',
   };
 }
 
@@ -206,15 +206,191 @@ export function follow(store, state) {
   const conn = c ? `${c.name}|${c.docker}` : null;
   const who = conn ? `${conn}|${state.analysis ? state.analysis.run : 0}` : null;
   if (conn !== store.conn) {
-    const pending = store.pending;
-    Object.assign(store, blank(), { conn, who, pending });
+    Object.assign(store, blank(), { conn, who });
     return 'reset';
   }
   if (who !== store.who) {
-    Object.assign(store, { who, tree: null, treeError: null, node: null, picked: null, list: null, listError: null, finding: null, back: null, value: null, valueError: null, valueId: null, item: null, shown: null, format: null, dbs: null, dbsError: null });
+    Object.assign(store, { who, tree: null, treeError: null, node: null, picked: null, list: null, listError: null, finding: null, value: null, valueError: null, valueId: null, item: null, shown: null, format: null, dbs: null, dbsError: null, anchor: 'patterns' });
     return 'run';
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------------------
+// Browse › Keys in the address (tested in tests/browse-route.test.js)
+//
+//   #/browse?p=<pattern id>&k=<key id>&find=<text>&node=<n>&sort=<s>
+//
+// `p` and `k` are the hex ids the API names patterns and keys by (src/web/keyname.rs: the
+// name's bytes in lowercase hex), so a binary name travels whole. `find` is the Find text,
+// percent-encoded. `node` is the "Patterns of" node's index, `sort` the patterns' sort. With
+// `find`, the key list is Find's and `p` is the pattern it goes back to. Nothing else goes
+// in the address: no connection, no credential, no value.
+// ---------------------------------------------------------------------------------------
+
+/** No pattern, key, Find, node or sort. */
+export const NO_PARAMS = Object.freeze({ p: null, k: null, find: null, node: null, sort: null });
+
+/** The longest id taken, as the server's (keyname.rs `MAX_ID`). */
+export const MAX_ID_DIGITS = 128 * 1024;
+/** The longest Find text kept from an address. */
+export const MAX_FIND = 1000;
+const ID_RE = /^(?:[0-9a-f]{2})+$/;
+
+const isId = (s) => typeof s === 'string' && s.length <= MAX_ID_DIGITS && ID_RE.test(s);
+const isFind = (s) => typeof s === 'string' && s.trim() !== '' && s.length <= MAX_FIND;
+const isNode = (n) => Number.isInteger(n) && n >= 0 && n <= 9999;
+const isSort = (s) => typeof s === 'string' && Object.hasOwn(SORT_LABELS, s);
+
+/** The Browse state in a route's query (the part after `?`). Unknown names, a repeated
+ *  name, bad hex, an empty Find and anything that does not decode are left out; it never
+ *  throws. */
+export function parseBrowseQuery(query) {
+  const out = { ...NO_PARAMS };
+  const seen = new Set();
+  for (const part of String(query ?? '').replace(/^\?/, '').split('&')) {
+    if (!part) continue;
+    const eq = part.indexOf('=');
+    const name = eq < 0 ? part : part.slice(0, eq);
+    if (!Object.hasOwn(NO_PARAMS, name) || seen.has(name)) continue;
+    seen.add(name);
+    let value;
+    try {
+      value = decodeURIComponent(eq < 0 ? '' : part.slice(eq + 1));
+    } catch {
+      continue;
+    }
+    if (name === 'p' || name === 'k') {
+      const id = value.toLowerCase();
+      if (isId(id)) out[name] = id;
+    } else if (name === 'find') {
+      if (isFind(value)) out.find = value;
+    } else if (name === 'node') {
+      if (/^\d{1,4}$/.test(value)) out.node = Number(value);
+    } else if (isSort(value)) out.sort = value;
+  }
+  return out;
+}
+
+/** The query for a Browse state, `''` when it holds nothing. `parseBrowseQuery` gives the
+ *  state back. */
+export function browseQuery(params) {
+  const p = params || NO_PARAMS;
+  const parts = [];
+  if (isId(p.p)) parts.push(`p=${p.p}`);
+  if (isId(p.k)) parts.push(`k=${p.k}`);
+  if (isFind(p.find)) parts.push(`find=${encodeURIComponent(p.find)}`);
+  if (isNode(p.node)) parts.push(`node=${p.node}`);
+  if (isSort(p.sort)) parts.push(`sort=${p.sort}`);
+  return parts.join('&');
+}
+
+/** The address of Browse › Keys showing a state. */
+export function browseHref(params) {
+  const q = browseQuery(params);
+  return q ? `#/browse?${q}` : '#/browse';
+}
+
+/** A state as an address holds it (what it can't hold left out). */
+export const cleanParams = (params) => parseBrowseQuery(browseQuery(params));
+
+/** Whether two states are the same. */
+export function sameParams(a, b) {
+  return browseQuery(a) === browseQuery(b);
+}
+
+/** Whether a state opens anything (a pattern, a key, a Find or a node); the sort alone
+ *  does not count. */
+export const opensAnything = (p) => !!p && (p.p !== null || p.k !== null || p.find !== null || p.node !== null);
+
+/** The state Browse shows now, from its memory. */
+export function shownParams(s) {
+  return cleanParams({ p: s.picked ? s.picked.id : null, k: s.valueId, find: s.finding, node: s.node, sort: s.sort });
+}
+
+/** Another area's jump on top of what Browse shows: opening a pattern drops the Find and
+ *  the key; Find and opening a key keep the rest. */
+export function linkFrom(base, change) {
+  const next = { ...NO_PARAMS, ...(base || {}), ...change };
+  if (change.p !== undefined && change.p !== null) {
+    if (change.find === undefined) next.find = null;
+    if (change.k === undefined) next.k = null;
+  }
+  return browseHref(next);
+}
+
+/** The list a state shows: Find's, the pattern's, or none. */
+const listOf = (p) => (p.find !== null ? `f:${p.find}` : p.p !== null ? `p:${p.p}` : null);
+
+/** What going from one state to another reads and drops. `from` and `to` are
+ *  `{ who, params }`, `who` the session and run (`follow`'s): another one starts over, so
+ *  everything `to` names is read. Otherwise only what changed: a new key reads only the
+ *  value, a new pattern or Find only its keys, a sort or node only the tree. A `to` without
+ *  a sort keeps the one shown. Nothing is read for the same state. */
+export function routeLoads(from, to) {
+  const b = to.params;
+  const fresh = !from || from.who !== to.who;
+  const a = fresh ? NO_PARAMS : from.params;
+  const list = listOf(b);
+  return {
+    tree: fresh || (b.sort !== null && b.sort !== a.sort) || b.node !== a.node,
+    keys: list !== null && (fresh || list !== listOf(a)),
+    clearList: list === null && listOf(a) !== null,
+    value: b.k !== null && (fresh || b.k !== a.k),
+    clearValue: b.k === null && a.k !== null,
+  };
+}
+
+// ---------------------------------------------------------------------------------------
+// The three panes: which show at a width, and the breadcrumb (tests/browse-route.test.js)
+// ---------------------------------------------------------------------------------------
+
+export const PANES = ['patterns', 'keys', 'value'];
+/** The width of the panes' row from which all three fit, and from which two do (about
+ *  1,060px and 780px of the main column, less its padding). */
+export const WIDE = 1036;
+export const NARROW = 756;
+
+/** The panes shown at a width: all three when they fit; else the `anchor` pane and the
+ *  one to its right (the last two when it is the last); else the anchor pane alone. */
+export function paneLayout(width, anchor) {
+  const at = Math.max(0, PANES.indexOf(anchor));
+  if (width >= WIDE) return PANES.slice();
+  if (width >= NARROW) {
+    const from = Math.min(at, PANES.length - 2);
+    return PANES.slice(from, from + 2);
+  }
+  return [PANES[at]];
+}
+
+/** The anchor that shows `pane`: the same one when it shows already, else that pane. */
+export function revealPane(width, anchor, pane) {
+  return paneLayout(width, anchor).includes(pane) ? anchor : pane;
+}
+
+/** A name to show for an id from an address, before the server names it: its text when
+ *  that is plain, else the hex. */
+export function nameOfId(id) {
+  const text = textOfHex(id);
+  return text === null ? `0x${id}` : text;
+}
+
+/** The breadcrumb above the panes: `Patterns › user:{id}:cart › user:10293:cart`, or
+ *  `Patterns › Find: *cart* › key`. `list`: `{ kind: 'pattern', name, literal }`, `{ kind:
+ *  'find', text }` or null; `key`: the open key's name or null; `shown`: the panes shown;
+ *  `anchor`: the pane the layout is anchored on. Each part moves to its pane; `back` marks
+ *  the part just left of the panes shown (← reaches it), `next` the one just right of them
+ *  (→ on the open row reaches it). */
+export function crumbsModel({ list = null, key = null, shown = PANES, anchor = 'patterns' } = {}) {
+  const parts = [{ pane: 'patterns', kind: 'root', label: 'Patterns' }];
+  if (list) parts.push(list.kind === 'find' ? { pane: 'keys', kind: 'find', label: `Find: ${list.text}` } : { pane: 'keys', kind: 'pattern', label: list.name, literal: !!list.literal });
+  if (key !== null && key !== undefined) parts.push({ pane: 'value', kind: 'key', label: key });
+  const first = PANES.indexOf(shown[0]);
+  const last = PANES.indexOf(shown[shown.length - 1]);
+  return parts.map((p, i) => {
+    const at = PANES.indexOf(p.pane);
+    return { ...p, current: i === parts.length - 1, anchor: p.pane === anchor, off: !shown.includes(p.pane), back: at === first - 1, next: at === last + 1 };
+  });
 }
 
 // ---------------------------------------------------------------------------------------
@@ -434,30 +610,31 @@ export function bulkRunLabel(b) {
 const store = blank();
 let active = null;
 
-/** Find keys by name (from the top bar). Runs now when Browse is shown, else when it is. */
-export function requestFind(text) {
-  store.pending = { find: text };
-  if (active) active.takePending();
+const whoOf = (state) => {
+  const c = state && state.conn;
+  return c ? `${c.name}|${c.docker}|${state.analysis ? state.analysis.run : 0}` : null;
+};
+
+/** The address of Browse › Keys with a change on top of what it shows (for Overview,
+ *  Analyze, Go to and the other panels): `{ p }` opens a pattern, `{ k }` a key, `{ find }`
+ *  runs Find, `{ node }` narrows the patterns. What Browse holds for another session is
+ *  not carried over. Going there reads what a click would, and is a step in the history. */
+export function hrefFor(change, state) {
+  const who = whoOf(state);
+  return linkFrom(who && store.who === who ? shownParams(store) : NO_PARAMS, change);
 }
 
-/** Open a key's value (`Name`), from Analyze or Overview. */
-export function requestKey(name) {
-  store.pending = { key: name };
-  if (active) active.takePending();
-}
-
-/** List a pattern's keys (`Name`), narrowed to a node on a cluster when given. */
-export function requestPattern(name, node = null) {
-  store.pending = { pattern: name, node };
-  if (active) active.takePending();
+/** The address changed while Browse › Keys is shown (Back, Forward, a jump from another
+ *  area): show what it names, reading only what changed. */
+export function onRoute(route) {
+  if (active) active.applyRoute(route);
 }
 
 /** What Browse holds already for the session and run of `state`: the tree's patterns
  *  (from the analysis, or from the names read so far) and the keys of the list loaded.
  *  Go to searches these; it reads nothing from the server. Empty for another session. */
 export function held(state) {
-  const c = state && state.conn;
-  const who = c ? `${c.name}|${c.docker}|${state.analysis ? state.analysis.run : 0}` : null;
+  const who = whoOf(state);
   if (!who || store.who !== who) return { patterns: [], keys: [] };
   const patterns = [];
   for (const r of (store.tree && store.tree.rows) || []) {
@@ -487,7 +664,7 @@ const panelTabs = (panel) => pills(PANELS, panel, null, 'Browse panels');
 
 export function mount(root, ctx, route = null) {
   const panel = panelOf(route && route.sub);
-  if (panel === 'keys') return mountKeys(root, ctx);
+  if (panel === 'keys') return mountKeys(root, ctx, route);
   const state = ctx.state();
   const gate = connectFirst(state, { needsLive: true });
   const view = h('section', { class: 'view', 'aria-labelledby': 'browse-title' });
@@ -506,12 +683,13 @@ export function mount(root, ctx, route = null) {
   return (panel === 'streams' ? streams : search).mount(view, ctx, { head: { subtitle, actions }, body });
 }
 
-function mountKeys(root, ctx) {
+function mountKeys(root, ctx, route) {
   const state = ctx.state();
   const gate = connectFirst(state, { needsLive: true });
   const view = h('section', { class: 'view', 'aria-labelledby': 'browse-title' });
   root.append(view);
   if (gate) {
+    // Not connected: an address's pattern or key waits for a connection; nothing is read.
     view.append(h('h1', { class: 'title', id: 'browse-title', text: 'Browse' }), panelTabs('keys'), gate);
     return () => {};
   }
@@ -527,17 +705,22 @@ function mountKeys(root, ctx) {
     timers.add(t);
   };
 
-  // ---------- the head: title, the node the patterns are of ----------
+  // The panes fill the window: the page itself does not scroll on a wide one (app.css).
+  document.body.classList.add('fill-view');
+  view.classList.add('browse-view');
+
+  // ---------- the head: title, panels, the breadcrumb ----------
   // The database is picked in the top bar (app.js); Browse reads the list on mount, as it
   // did when the picker was here, and hands it to the top bar.
   const subtitle = h('p', { class: 'subtitle' });
-  const nodeBox = h('div', { class: 'picker' });
-  view.append(h('div', { class: 'view-head' },
-    h('div', null, h('h1', { class: 'title', id: 'browse-title', text: 'Browse' }), subtitle),
-    h('div', { class: 'actions' }, nodeBox)),
-  panelTabs('keys'));
+  const crumbsBox = h('nav', { class: 'crumbs', 'aria-label': 'Where you are in Browse' });
+  view.append(h('div', { class: 'browse-bar' },
+    h('h1', { class: 'title', id: 'browse-title', text: 'Browse' }),
+    panelTabs('keys'),
+    crumbsBox,
+    subtitle));
 
-  // ---------- the three cards ----------
+  // ---------- the three panes ----------
   const patFilter = h('input', {
     class: 'field mono', type: 'search', id: 'browse-pat-filter', placeholder: 'Filter patterns', autocomplete: 'off', spellcheck: false, value: store.filter, 'data-act': 'filter',
     oninput: () => {
@@ -546,20 +729,192 @@ function mountKeys(root, ctx) {
     },
   });
   const sortBox = h('div', { class: 'picker' });
-  const patSource = h('p', { class: 'muted small' });
+  const nodeBox = h('div', { class: 'picker' });
+  const patCols = h('div', { class: 'cols-head pat-cols', 'aria-hidden': 'true' });
   const patRows = h('ul', { class: 'list tree', 'aria-label': 'Key patterns' });
-  const patFoot = h('div', { class: 'card-foot' });
-  const patCard = h('div', { class: 'card stack browse-col pats', 'data-pane': 'patterns' },
-    h('div', { class: 'card-head' }, h('h2', { class: 'lbl', text: 'Key patterns' }), sortBox),
-    patSource,
-    h('div', null, h('label', { class: 'sr-only', htmlFor: 'browse-pat-filter', text: 'Filter the patterns' }), patFilter),
-    patRows, patFoot);
+  const patFoot = h('div', { class: 'pane-foot' });
+  const patCard = h('section', { class: 'card pane pats', 'data-pane': 'patterns', 'aria-label': 'Patterns' },
+    h('div', { class: 'pane-head' }, h('h2', { class: 'lbl', text: 'Patterns' }), h('div', { class: 'pane-tools' }, sortBox, nodeBox)),
+    h('div', { class: 'pane-filter' }, h('label', { class: 'sr-only', htmlFor: 'browse-pat-filter', text: 'Filter the patterns' }), patFilter),
+    patCols,
+    h('div', { class: 'pane-scroll' }, patRows),
+    patFoot);
 
-  const keysCard = h('div', { class: 'card stack browse-col keys', 'data-pane': 'keys' });
-  const valueCard = h('div', { class: 'card stack browse-col value', 'aria-live': 'polite', 'aria-busy': 'false', 'data-pane': 'value' });
+  const keysCard = h('section', { class: 'card pane keys', 'data-pane': 'keys', 'aria-label': 'Keys' });
+  const valueCard = h('section', { class: 'card pane value', 'aria-live': 'polite', 'aria-busy': 'false', 'data-pane': 'value', 'aria-label': 'Value' });
   // A bulk action over a pattern's keys: its dry run, question, progress and summary.
   const bulkBox = h('section', { class: 'card stack bulk', 'aria-label': 'Bulk action', hidden: true });
-  view.append(bulkBox, h('div', { class: 'browse' }, patCard, keysCard, valueCard));
+  const panesBox = h('div', { class: 'browse panes' }, patCard, keysCard, valueCard);
+  const cards = { patterns: patCard, keys: keysCard, value: valueCard };
+  view.append(bulkBox, panesBox);
+
+  // ---------- which panes show, and the breadcrumb ----------
+  // Three side by side on a wide window; below that the anchor pane and the one to its
+  // right; on a narrow one, one pane. The breadcrumb names each step and moves to it.
+  let shownPanes = PANES.slice();
+  function relayout() {
+    if (!alive) return;
+    shownPanes = paneLayout(panesBox.clientWidth, store.anchor);
+    const had = document.activeElement;
+    let lost = false;
+    for (const id of PANES) {
+      const off = !shownPanes.includes(id);
+      if (off && cards[id].contains(had)) lost = true;
+      cards[id].classList.toggle('pane-off', off);
+    }
+    panesBox.dataset.count = String(shownPanes.length);
+    drawCrumbs();
+    if (lost) toPane(shownPanes.includes(store.anchor) ? store.anchor : shownPanes[0]);
+  }
+  function toPane(id) {
+    if (ctx.focusPane) ctx.focusPane(cards[id]);
+  }
+  /** Show `pane` if it is hidden (a step down opened it, or Back went up to it). */
+  function reveal(pane) {
+    const next = revealPane(panesBox.clientWidth, store.anchor, pane);
+    if (next === store.anchor) return;
+    store.anchor = next;
+    relayout();
+  }
+  /** A breadcrumb part or ← / →: anchor on that pane and go into it. */
+  function goPane(id) {
+    store.anchor = id;
+    relayout();
+    toPane(id);
+  }
+  const sizes = typeof ResizeObserver === 'function' ? new ResizeObserver(() => relayout()) : null;
+  if (sizes) sizes.observe(panesBox);
+  // On a wide window the focus anchors the layout, so a narrower one keeps that pane.
+  panesBox.addEventListener('focusin', (e) => {
+    const pane = e.target && e.target.closest ? e.target.closest('[data-pane]') : null;
+    if (pane && panesBox.clientWidth >= WIDE && PANES.includes(pane.dataset.pane)) store.anchor = pane.dataset.pane;
+  });
+
+  function crumbList() {
+    if (store.finding !== null) return { kind: 'find', text: store.list && store.list.find ? store.list.find.glob : store.finding };
+    if (store.picked) return { kind: 'pattern', name: store.picked.name, literal: literalOf(store.picked) };
+    return null;
+  }
+  function crumbKey() {
+    if (!store.valueId) return null;
+    const v = store.value;
+    if (v && v.key && v.key.id === store.valueId) return v.key.name;
+    const row = store.list ? store.list.rows.find((r) => r.id === store.valueId) : null;
+    return row ? row.name : nameOfId(store.valueId);
+  }
+  function drawCrumbs() {
+    const parts = crumbsModel({ list: crumbList(), key: crumbKey(), shown: shownPanes, anchor: store.anchor });
+    const out = [];
+    parts.forEach((p, i) => {
+      if (i) out.push(h('span', { class: 'sep', 'aria-hidden': 'true', text: '›' }));
+      const label = p.kind === 'pattern' ? patternName(p.label, { literal: p.literal, cls: 'mono' }) : h('span', { class: p.kind === 'root' ? '' : 'mono', text: p.label });
+      out.push(h('button', {
+        type: 'button', class: `crumb${p.off ? ' off' : ''}`, 'aria-current': p.current ? 'location' : null,
+        'data-back': p.back ? '' : null, 'data-next': p.next ? '' : null, title: p.label,
+        onclick: () => goPane(p.pane),
+      }, label));
+    });
+    fill(crumbsBox, out);
+  }
+
+  // ---------- the address ----------
+  /** Put what Browse shows in the address: a new step in the history (`push`, for what
+   *  the user opened), or in place of the current one (a sort, a node, a key renamed or
+   *  deleted). The address then names what is shown, so nothing more is read. */
+  function syncUrl(push = false) {
+    if (!alive) return;
+    const href = browseHref(shownParams(store));
+    if (push) ctx.navigate(href);
+    else {
+      ctx.replaceRoute(href);
+      markEntry();
+    }
+  }
+  /** Open something (a click, Enter): a step in the history; the route change reads it. */
+  function go(change) {
+    if (!alive) return;
+    ctx.navigate(browseHref({ ...shownParams(store), ...change }));
+  }
+  // Each history entry Browse shows is marked with the session and run it was shown for
+  // (`follow`'s `who`), so Back to an entry from another connection or database is not
+  // applied to this one: its pattern and key ids may name other keys there. An entry
+  // without a mark (a link, a page just opened) is applied to the connection there is.
+  const entryMark = () => (ctx.routeTag ? ctx.routeTag() : null);
+  const markEntry = () => {
+    if (ctx.setRouteTag) ctx.setRouteTag(store.who);
+  };
+  const staleEntry = () => {
+    const mark = entryMark();
+    return mark !== null && mark !== store.who;
+  };
+  /** What a pattern id names: the tree's row, the pattern shown, or its name from the id. */
+  function patternRef(id) {
+    const r = rowOf(id);
+    if (r) return r.pattern;
+    if (store.picked && store.picked.id === id) return store.picked;
+    if (store.list && store.list.pattern && store.list.pattern.id === id) return store.list.pattern;
+    return { id, name: nameOfId(id), copy: null };
+  }
+  function keyRef(id) {
+    const row = store.list ? store.list.rows.find((r) => r.id === id) : null;
+    return row || { id, name: nameOfId(id), type: null };
+  }
+
+  /** Show the state an address names, reading only what changed (`routeLoads`). */
+  function applyParams(next, { mounting = false } = {}) {
+    const from = shownParams(store);
+    const loads = routeLoads({ who: store.who, params: from }, { who: store.who, params: next });
+    markEntry();
+    if (next.sort !== null) store.sort = next.sort;
+    store.node = next.node;
+    if (loads.tree && !mounting) loadTree();
+    if (loads.clearList) {
+      listSeq += 1;
+      Object.assign(store, { picked: null, finding: null, list: null, listError: null, listFilter: '', listShown: CHUNK });
+      drawRows();
+      drawKeys();
+    } else if (!loads.keys && next.p !== from.p) {
+      // Under a Find, the pattern it goes back to changed: nothing to read.
+      store.picked = next.p !== null ? patternRef(next.p) : null;
+    }
+    if (loads.keys) {
+      store.picked = next.p !== null ? patternRef(next.p) : null;
+      if (next.find !== null) runFind(next.find);
+      else openPattern(store.picked);
+    }
+    if (loads.clearValue) {
+      valueSeq += 1;
+      Object.assign(store, { value: null, valueId: null, valueError: null, item: null, shown: null, format: null });
+      drawValue();
+      redrawKeyRows();
+    }
+    if (loads.value) openValue(keyRef(next.k));
+    if (loads.value) reveal('value');
+    else if (loads.keys) reveal('keys');
+    else if (loads.clearValue) reveal(store.list || store.listError ? 'keys' : 'patterns');
+    else if (loads.clearList) reveal('patterns');
+    drawCrumbs();
+  }
+
+  /** A route while Browse › Keys is shown: Back, Forward, a link, another area's jump. */
+  function applyRoute(r) {
+    if (!alive || !r || r.name !== 'browse' || panelOf(r.sub) !== 'keys') return;
+    // Back to an entry of another connection or database: keep what is shown, and say so
+    // in the address in place.
+    if (staleEntry()) {
+      syncUrl();
+      return;
+    }
+    const next = parseBrowseQuery(r.query);
+    // A new entry with no state (the rail's Browse link, the digit): what Browse shows
+    // stays, as when it is opened from another area. Back to an entry that showed nothing
+    // (it is marked) does empty it.
+    if (!opensAnything(next) && next.sort === null && entryMark() === null) {
+      syncUrl();
+      return;
+    }
+    applyParams(next);
+  }
 
   // ---------- the database list, for the top bar's database control ----------
   // The key is taken before asking, so a reply that arrives after a switch or a new run is
@@ -580,18 +935,23 @@ function mountKeys(root, ctx) {
   let treeSeq = 0;
   async function loadTree() {
     const mine = (treeSeq += 1);
+    const asked = store.sort;
     try {
       const tree = await ctx.api.getBrowse({ sort: store.sort, node: store.node });
       if (!alive || mine !== treeSeq) return;
       store.tree = tree;
       store.treeError = null;
       store.sort = tree.sort;
+      // The address names the sort shown, so it is not asked for again.
+      if (asked !== null && asked !== tree.sort) syncUrl();
     } catch (err) {
       if (!alive || mine !== treeSeq) return;
-      // A sort or node no longer offered (a new run): back to the defaults.
+      // A sort or node no longer offered (a new run): back to the defaults, in the address
+      // too, so it is not asked for again.
       if ((err.status === 400 && store.sort) || (err.status === 422 && store.node !== null)) {
         store.sort = null;
         store.node = null;
+        syncUrl();
         loadTree();
         return;
       }
@@ -618,14 +978,14 @@ function mountKeys(root, ctx) {
   function drawTree() {
     const t = store.tree;
     const report = ctx.state().analysis.report;
-    patSource.textContent = store.treeError ? '' : treeSource(t);
     subtitle.textContent = t ? subtitleText(t) : ' ';
-    // The sort: from names only keys and name.
+    // The sort: from names only keys and name. It is in the address, in place (not a step).
     if (t && t.sorts.length > 1) {
       const select = h('select', {
         class: 'field', id: 'browse-sort', 'data-act': 'sort',
         onchange: () => {
           store.sort = select.value;
+          syncUrl();
           loadTree();
         },
       }, t.sorts.map((s) => h('option', { value: s, selected: s === t.sort, text: SORT_LABELS[s] || s })));
@@ -637,6 +997,7 @@ function mountKeys(root, ctx) {
         class: 'field', id: 'browse-node',
         onchange: () => {
           store.node = select.value === '' ? null : Number(select.value);
+          syncUrl();
           loadTree();
         },
       }, h('option', { value: '', selected: t.node === null, text: 'All nodes' }),
@@ -669,6 +1030,7 @@ function mountKeys(root, ctx) {
       ? h('button', { type: 'button', class: 'btn', text: 'Read 1,000 more names', 'data-act': 'more', onclick: (e) => moreNames(e.currentTarget) })
       : null;
     refill(patFoot, [
+      store.treeError ? null : h('p', { class: 'muted small', text: treeSource(t) }),
       h('p', { class: 'muted small', text: treeFoot(t, report) }),
       t && t.source === 'names' ? h('p', { class: 'muted small', text: 'Browse reads key names with SCAN, 1,000 a call, and nothing else until a key is opened. Sizes, TTLs and types come from an analysis.' }) : null,
       more,
@@ -678,6 +1040,7 @@ function mountKeys(root, ctx) {
 
   function drawRows() {
     const t = store.tree;
+    drawPatCols(t);
     if (!t) {
       refill(patRows, h('li', { class: 'muted pad', text: store.treeError ? '' : 'Reading key names…' }));
       return;
@@ -692,46 +1055,65 @@ function mountKeys(root, ctx) {
       return;
     }
     const exact = treeExact(t, ctx.state().analysis.report);
+    // The share bar is drawn against the largest share shown, so the bars can be told apart.
+    let top = 0;
+    for (const r of t.rows) top = Math.max(top, typeof r.share === 'number' ? r.share : 0);
     const out = [];
     for (const r of rows) {
       if (r.kind === 'group') {
         const closed = store.closed.has(r.key) && !store.filter;
+        const sub = `${plural(r.children.length, 'pattern', 'patterns')} · ${figureKeys(r, exact)}`;
         out.push(h('li', null, h('button', {
           type: 'button', class: 'row row-pat group', 'data-group': '', 'aria-expanded': closed ? 'false' : 'true', 'data-row': `g:${r.key}`,
-          title: r.reason || '',
+          title: [sub, r.reason].filter(Boolean).join(' · '),
           onclick: () => {
             if (store.closed.has(r.key)) store.closed.delete(r.key);
             else store.closed.add(r.key);
             drawRows();
           },
         },
-        h('span', { class: 'name' },
-          h('span', { class: 'mono clip block', text: `${closed ? '▸' : '▾'} ${r.label}` }),
-          h('span', { class: 'sub', text: `${plural(r.children.length, 'pattern', 'patterns')} · ${figureKeys(r, exact)}` })),
-        h('span', { class: 'glyph', 'aria-hidden': 'true', text: r.marked ? '▲' : '' }),
-        h('span', { class: 'mono right fig', text: figure(r, t) }))));
-        if (!closed) for (const c of r.children) out.push(patternRow(c, t, exact, true));
-      } else out.push(patternRow(r, t, exact, false));
+        h('span', { class: 'mono clip', text: `${closed ? '▸' : '▾'} ${r.label}` }),
+        h('span', { class: 'sr-only', text: sub }),
+        ...figureCells(r, t, top))));
+        if (!closed) for (const c of r.children) out.push(patternRow(c, t, exact, true, top));
+      } else out.push(patternRow(r, t, exact, false, top));
     }
     refill(patRows, out);
   }
 
   const figureKeys = (r, exact) => (r.kind === 'group' ? `${exact ? '' : '~'}${fmtCount(r.estKeys)} keys` : keysText(r, exact));
-  const figure = (r, t) => (t.sizes && typeof r.estBytes === 'number' ? fmtBytes(r.estBytes) : fmtPercent(r.share));
+  /** The memory (or, from names only, the keys), the share bar and %, and ▲. */
+  function figureCells(r, t, top) {
+    const fig = t.sizes && typeof r.estBytes === 'number' ? fmtBytes(r.estBytes) : `${r.kind === 'group' ? '' : r.literal === true ? '' : '~'}${fmtCount(r.estKeys)}`;
+    const bar = meter(barPercent(r.share, top || 1), 'thin');
+    bar.setAttribute('aria-hidden', 'true');
+    return [
+      h('span', { class: 'mono right fig', text: fig }),
+      bar,
+      h('span', { class: 'mono right fig muted share', text: fmtPercent(r.share) }),
+      h('span', { class: 'glyph', 'aria-hidden': 'true', text: r.marked ? '▲' : '' }),
+      r.marked ? h('span', { class: 'sr-only', text: 'marked: worth a look' }) : null,
+    ];
+  }
 
-  function patternRow(r, t, exact, child) {
-    const on = store.picked && store.picked.id === r.pattern.id && (!store.list || store.list.kind === 'pattern');
+  function drawPatCols(t) {
+    fill(patCols, t && t.rows.length
+      ? [h('span', { text: 'Pattern' }), h('span', { class: 'right', text: t.sizes ? 'Memory' : 'Keys' }), h('span'), h('span', { class: 'right share', text: 'Share' }), h('span')]
+      : null);
+  }
+
+  function patternRow(r, t, exact, child, top) {
+    const on = store.finding === null && store.picked && store.picked.id === r.pattern.id && (!store.list || store.list.kind === 'pattern');
     const change = r.change ? ` · ${r.change.words}${typeof r.change.deltaBytes === 'number' && r.change.deltaBytes !== 0 ? ` ${fmtSignedBytes(r.change.deltaBytes)}` : ''}` : '';
+    const sub = `${keysText(r, exact)}${r.type ? ` · ${r.type}` : ''}${change}`;
     return h('li', null, h('button', {
       type: 'button', class: `row row-pat${child ? ' child' : ''}${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null, 'data-row': `p:${r.pattern.id}`,
-      onclick: () => openPattern(r.pattern, r),
+      title: `${r.pattern.name} · ${sub}`,
+      onclick: () => go({ p: r.pattern.id, k: null, find: null }),
     },
-    h('span', { class: 'name' },
-      patternName(r.pattern.name, { literal: r.literal === true, cls: 'mono clip block' }),
-      h('span', { class: 'sub', text: `${keysText(r, exact)}${r.type ? ` · ${r.type}` : ''}${change}` })),
-    h('span', { class: 'glyph', 'aria-hidden': 'true', text: r.marked ? '▲' : '' }),
-    r.marked ? h('span', { class: 'sr-only', text: 'marked: worth a look' }) : null,
-    h('span', { class: 'mono right fig', text: figure(r, t) })));
+    patternName(r.pattern.name, { literal: r.literal === true, cls: 'mono clip' }),
+    h('span', { class: 'sr-only', text: sub }),
+    ...figureCells(r, t, top)));
   }
 
   /** The tree's row of a pattern, when it is in the tree shown. */
@@ -753,7 +1135,7 @@ function mountKeys(root, ctx) {
 
   // ---------- a pattern's keys, and Find ----------
   let listSeq = 0;
-  async function openPattern(name, row = null) {
+  async function openPattern(name) {
     const mine = (listSeq += 1);
     store.picked = name;
     store.finding = null;
@@ -767,17 +1149,18 @@ function mountKeys(root, ctx) {
       const list = await ctx.api.getKeys({ pattern: name.id, node: store.node });
       if (!alive || mine !== listSeq) return;
       store.list = list;
+      // A pattern opened from an address is named by the server once its keys come.
+      if (list.pattern && list.pattern.id === name.id && !rowOf(name.id)) store.picked = list.pattern;
     } catch (err) {
       if (!alive || mine !== listSeq) return;
       store.listError = errorText(err);
     }
     drawKeys();
-    if (row === null) drawRows();
+    drawRows();
   }
 
   async function runFind(text) {
     const mine = (listSeq += 1);
-    if (!store.finding && store.picked) store.back = store.picked;
     store.finding = text;
     store.list = null;
     store.listError = null;
@@ -816,45 +1199,61 @@ function mountKeys(root, ctx) {
     if (alive) drawKeys();
   }
 
+  /** Clear search: a step in the history, back to the pattern Find came from (its keys
+   *  read again, as before), or to no list. */
   function clearFind() {
-    store.finding = null;
-    store.list = null;
-    store.listError = null;
-    const back = store.back;
-    store.back = null;
-    if (back) openPattern(back);
-    else {
-      store.picked = null;
-      drawKeys();
-      drawRows();
-    }
+    go({ find: null });
+  }
+
+  /** The counts beside the key list's title: the pattern's keys and memory, or how many
+   *  keys Find has found. */
+  function keysCounts(l, row) {
+    if (store.finding !== null) return l ? `${fmtGrouped(l.loaded)} found${l.done ? '' : ' so far'}` : '';
+    if (!row) return '';
+    const t = store.tree;
+    const parts = [keysText(row, treeExact(t, ctx.state().analysis.report))];
+    if (t && t.sizes && typeof row.estBytes === 'number') parts.push(fmtBytes(row.estBytes));
+    return parts.join(' · ');
   }
 
   function drawKeys(busy = null) {
     const l = store.list;
-    const title = store.finding !== null
+    const finding = store.finding !== null;
+    const titleText = finding
       ? `Find: ${l && l.find ? l.find.glob : store.finding}`
       : store.picked ? store.picked.name : 'Keys';
+    const row = !finding && store.picked ? rowOf(store.picked.id) : null;
+    const counts = keysCounts(l, row);
     const addOff = keyOff(ctx.state().conn);
-    const head = h('div', { class: 'card-head' },
-      h('h2', { class: 'mono key-title clip', text: title, title }),
-      h('div', { class: 'row-actions' },
-        store.finding !== null ? h('button', { type: 'button', class: 'btn quiet', text: 'Clear search', onclick: clearFind }) : null,
-        h('button', { type: 'button', class: 'btn', text: 'Add key', disabled: !!addOff, title: addOff || 'Add a key with its first value. An existing key is never overwritten.', 'data-act': 'key.add', onclick: () => addKeyDialog() })),
-      addOff ? whyLines([addOff]) : null);
+    const title = !finding && store.picked
+      ? h('h2', { class: 'key-title clip', title: titleText }, patternName(store.picked.name, { literal: literalOf(store.picked), cls: 'mono' }))
+      : h('h2', { class: `key-title clip${finding ? ' mono' : ' lbl'}`, text: titleText, title: titleText });
+    const head = h('div', { class: 'pane-head' },
+      h('div', { class: 'pane-title' }, title, counts ? h('span', { class: 'muted small fig', text: counts }) : null),
+      h('div', { class: 'pane-tools' },
+        finding ? h('button', { type: 'button', class: 'btn quiet', text: 'Clear search', onclick: clearFind }) : null,
+        h('button', { type: 'button', class: 'btn', text: 'Add key', disabled: !!addOff, title: addOff || 'Add a key with its first value. An existing key is never overwritten.', 'data-act': 'key.add', onclick: () => addKeyDialog() }),
+        !finding && store.picked ? aboutPattern(row, store.picked) : null));
+    // Why Add key is off, and the pattern's ▲ reason: a line each, above the rows.
+    const lines = [
+      addOff ? whyLines([addOff]) : null,
+      row && row.marked && row.reason ? h('p', { class: 'pane-note warn-line' }, h('span', { class: 'glyph', 'aria-hidden': 'true', text: '▲ ' }), row.reason) : null,
+    ];
     if (busy) {
-      fill(keysCard, head, h('p', { class: 'muted', text: busy }));
+      fill(keysCard, head, lines, h('p', { class: 'muted pad', text: busy }));
+      drawCrumbs();
       return;
     }
     if (store.listError) {
-      fill(keysCard, head, notice(store.listError));
+      fill(keysCard, head, lines, h('div', { class: 'pad' }, notice(store.listError)));
+      drawCrumbs();
       return;
     }
     if (!l) {
-      fill(keysCard, head, emptyState(store.tree && store.tree.rows.length ? 'Pick a pattern to list its keys, or find a key by name in the box at the top.' : 'Find a key by name in the box at the top, or pick a pattern once there are some.'));
+      fill(keysCard, head, lines, h('div', { class: 'pad' }, emptyState(store.tree && store.tree.rows.length ? 'Open a pattern to list its keys, or find a key by name with Go to.' : 'Find a key by name with Go to, or open a pattern once there are some.')));
+      drawCrumbs();
       return;
     }
-    const row = l.kind === 'pattern' && store.picked ? rowOf(store.picked.id) : null;
     const filter = h('input', {
       class: 'field mono', type: 'search', id: 'browse-key-filter', placeholder: 'Filter the loaded keys', autocomplete: 'off', spellcheck: false, value: store.listFilter, 'data-act': 'filter',
       oninput: () => {
@@ -872,19 +1271,20 @@ function mountKeys(root, ctx) {
     const focused = keysCard.contains(document.activeElement) ? document.activeElement.id : null;
     fill(keysCard,
       head,
-      row ? patternSummary(row) : null,
-      l.kind === 'find' && l.find ? h('p', { class: 'muted small', text: /[*?[]/.test(l.find.text) ? 'A pattern, used as typed.' : `Names that contain ${l.find.text}.` }) : null,
-      h('div', null, h('label', { class: 'sr-only', htmlFor: 'browse-key-filter', text: 'Filter the loaded keys' }), filter),
-      h('div', { class: 'cols-head key-cols', 'aria-hidden': 'true' }, h('span', { text: 'Key' }), h('span', { text: 'Type' }), h('span', { class: 'right', text: 'Size' }), h('span', { class: 'right', text: 'Expires' })),
-      rowsBox,
-      showBox,
-      h('div', { class: 'card-foot' },
-        h('p', { class: 'muted small', text: [listFoot(l), l.cluster && l.cluster.nodesDone !== null && l.cluster.walk.length > 1 && !l.done ? `${l.cluster.nodesDone} of ${l.cluster.walk.length} nodes done.` : null].filter(Boolean).join(' ') }),
-        more,
+      lines,
+      l.kind === 'find' && l.find ? h('p', { class: 'pane-note muted small', text: /[*?[]/.test(l.find.text) ? 'A pattern, used as typed.' : `Names that contain ${l.find.text}.` }) : null,
+      h('div', { class: 'pane-filter' }, h('label', { class: 'sr-only', htmlFor: 'browse-key-filter', text: 'Filter the loaded keys' }), filter),
+      h('div', { class: 'cols-head key-cols', 'aria-hidden': 'true' }, h('span', { text: 'Key' }), h('span', { text: 'Type' }), h('span', { class: 'right', text: 'Size' }), h('span', { class: 'right', text: 'Length' }), h('span', { class: 'right', text: 'Expires' })),
+      h('div', { class: 'pane-scroll' }, rowsBox, showBox),
+      h('div', { class: 'pane-foot' },
+        h('div', { class: 'foot-line' },
+          h('p', { class: 'muted small', text: [listFoot(l), l.cluster && l.cluster.nodesDone !== null && l.cluster.walk.length > 1 && !l.done ? `${l.cluster.nodesDone} of ${l.cluster.walk.length} nodes done.` : null].filter(Boolean).join(' ') }),
+          more),
         listNotes(l).map((t) => notice(t))));
     if (focused === 'browse-key-filter') {
       filter.focus();
     }
+    drawCrumbs();
   }
 
   function drawKeyRows(box, showBox) {
@@ -898,12 +1298,13 @@ function mountKeys(root, ctx) {
       const open = on && store.value && store.value.key && store.value.key.id === r.id;
       return h('li', null, h('button', {
         type: 'button', class: `row row-key${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null, 'data-row': r.id,
-        onclick: () => openValue(r),
+        onclick: () => go({ k: r.id }),
       },
       h('span', { class: 'mono clip', text: r.name, title: r.name }),
       h('span', { class: 'badge mono', text: r.type || DASH }),
       h('span', { class: 'mono right', text: fmtBytes(r.bytes) }),
-      h('span', { class: 'mono right muted', text: r.ttl || DASH }),
+      h('span', { class: 'mono right muted', text: typeof r.length === 'number' ? fmtGrouped(r.length) : DASH }),
+      h('span', { class: `mono right${r.ttl === 'never' ? ' never' : ' muted'}`, text: r.ttl || DASH }),
       typeof r.node === 'number' && nodes[r.node] ? h('span', { class: 'sr-only', text: `on node ${nodes[r.node].address}` }) : null),
       // The open key's own writes, beside its row as well as above its value.
       open ? h('div', { class: 'row-tools', role: 'group', 'aria-label': `Write to ${r.name}` }, keyButtons(store.value, true)) : null);
@@ -919,8 +1320,32 @@ function mountKeys(root, ctx) {
       : null);
   }
 
-  function patternSummary(r) {
+  /** "About this pattern", a panel that opens over the panes from the key list's head, so
+   *  the rows stay where they are: its figures, copying it, every key of it at once, and
+   *  the details. `r`: its row in the tree, null when the tree shown does not hold it. */
+  let aboutOpen = null;
+  function aboutPattern(r, pattern) {
+    // It stays open while the list is drawn again, for the same pattern.
+    return h('details', {
+      class: 'pop', open: aboutOpen === pattern.id,
+      ontoggle: (e) => {
+        if (e.currentTarget.open) aboutOpen = pattern.id;
+        else if (aboutOpen === pattern.id) aboutOpen = null;
+      },
+    },
+      h('summary', { class: 'btn', text: 'About ▾', title: 'About this pattern: its figures, the scan command, every key of it at once' }),
+      h('div', { class: 'pop-body', role: 'group', 'aria-label': 'About this pattern' }, patternSummary(r, pattern)));
+  }
+
+  function patternSummary(r, pattern) {
     const t = store.tree;
+    const copyPattern = h('div', { class: 'row-actions' }, copyButton('Copy pattern', pattern.copy, 'the pattern', 'The pattern has control characters, so it is not copied: a pasted copy would name other keys.', { act: 'copy.pattern' }));
+    if (!r) {
+      return h('div', { class: 'summary' },
+        h('p', { class: 'muted small', text: 'The patterns shown do not hold this one, so there are no figures for it here.' }),
+        copyPattern,
+        bulkButtons(pattern));
+    }
     const exact = treeExact(t, ctx.state().analysis.report);
     const parts = [keysText(r, exact)];
     if (t && t.sizes && typeof r.estBytes === 'number') parts.push(`${fmtBytes(r.estBytes)}, ${fmtPercent(r.share)} of memory`);
@@ -933,7 +1358,7 @@ function mountKeys(root, ctx) {
     if (r.examples.length) {
       details.push(h('p', { class: 'lbl', text: 'Example keys' }),
         h('ul', { class: 'list' }, r.examples.map((k) => h('li', null, h('button', {
-          type: 'button', class: 'row row-example', onclick: () => openValue(k),
+          type: 'button', class: 'row row-example', onclick: () => go({ k: k.id }),
         }, h('span', { class: 'mono clip', text: k.name }), h('span', { class: 'mono right', text: fmtBytes(k.bytes) }), h('span', { class: 'mono right muted', text: k.ttl || DASH }))))));
     }
     const command = r.command
@@ -943,9 +1368,9 @@ function mountKeys(root, ctx) {
     return h('div', { class: 'summary' },
       h('p', { text: parts.join(' · ') }),
       r.marked && r.reason ? notice(r.reason) : r.reason ? h('p', { class: 'muted small', text: r.reason }) : null,
-      h('div', { class: 'row-actions' }, copyButton('Copy pattern', r.pattern.copy, 'the pattern', 'The pattern has control characters, so it is not copied: a pasted copy would name other keys.', { act: 'copy.pattern' })),
+      copyPattern,
       bulkButtons(r.pattern),
-      h('details', { class: 'advanced' }, h('summary', { text: 'About this pattern' }), h('div', { class: 'details-body' }, details)));
+      h('div', { class: 'details-body' }, details));
   }
 
   // ---------- a key's value ----------
@@ -1045,15 +1470,18 @@ function mountKeys(root, ctx) {
     const v = store.value;
     const focusedName = valueCard.contains(document.activeElement) ? (document.activeElement.getAttribute('aria-label') || document.activeElement.textContent.trim()) : null;
     if (busy) {
-      fill(valueCard, key ? h('h2', { class: 'mono key-title wrap-any', text: key.name }) : null, h('p', { class: 'muted', text: busy }));
+      fill(valueCard, key ? h('div', { class: 'pane-head' }, h('h2', { class: 'mono key-title clip', text: key.name, title: key.name })) : null, h('p', { class: 'muted pad', text: busy }));
+      drawCrumbs();
       return;
     }
     if (store.valueError) {
-      fill(valueCard, notice(store.valueError));
+      fill(valueCard, h('div', { class: 'pad' }, notice(store.valueError)));
+      drawCrumbs();
       return;
     }
     if (!v) {
-      fill(valueCard, emptyState('Pick a key to see its value.'));
+      fill(valueCard, h('div', { class: 'pad' }, emptyState(store.list ? 'Open a key to see its value.' : 'Open a pattern, then one of its keys, to see its value.')));
+      drawCrumbs();
       return;
     }
     const s = ctx.state();
@@ -1062,42 +1490,45 @@ function mountKeys(root, ctx) {
     const name = v.key ? v.key.name : v.meta ? v.meta.name : '';
     const copyName = v.key ? v.key.copy : v.meta ? v.meta.copy : null;
     const shown = store.shown;
-    const parts = [
-      h('div', { class: 'value-head' },
-        h('h2', { class: 'mono key-title wrap-any', text: name }),
+    // The head stays put (name and type, the facts, the actions and why some are off); the
+    // items and the value scroll below it, the value box taking the height left.
+    const head = h('div', { class: 'value-top' },
+      h('div', { class: 'pane-head value-head' },
+        h('h2', { class: 'mono key-title clip', text: name, title: name }),
         h('span', { class: 'badge mono', text: v.type || v.kind })),
       h('p', { class: 'muted small', text: valueFacts(v, node) || DASH }),
-      v.pattern ? h('p', { class: 'muted small' }, 'Pattern ', patternName(v.pattern.name, { literal: literalOf(v.pattern) })) : null,
+      v.pattern ? h('p', { class: 'muted small clip' }, 'Pattern ', patternName(v.pattern.name, { literal: literalOf(v.pattern) })) : null,
       h('div', { class: 'row-actions' },
         copyButton('Copy name', copyName, 'the key name', 'The name has control characters, so it is not copied: a pasted copy would name another key.', { act: 'copy.name' }),
         shown ? copyButton('Copy value', shown.copy, 'the value', shown.copyRefused || 'This value is not copied as text: show it as hex to copy it.', { act: 'copy.value' }) : null),
-      writeBar(v),
-    ];
+      writeBar(v));
     const notes = [];
     if (v.gone) notes.push(notice(v.notice || 'The key no longer exists.'));
     if (v.error) notes.push(notice(v.error));
     if (v.message) notes.push(notice(v.message, 'info'));
     v.refused.forEach((t) => notes.push(notice(t)));
     if (v.fieldTtlsOff) notes.push(notice(v.fieldTtlsOff));
-    parts.push(notes);
 
-    if (v.items.length) parts.push(itemsBox(v));
-    if (v.module) parts.push(moduleBox(v.module));
-    if (shown) parts.push(shownBox(shown, v));
-    else if (v.items.length && store.item) parts.push(h('p', { class: 'muted small', text: 'Reading the item…' }));
+    const body = [notes];
+    if (v.items.length) body.push(itemsBox(v));
+    if (v.module) body.push(moduleBox(v.module));
+    if (shown) body.push(shownBox(shown, v));
+    else if (v.items.length && store.item) body.push(h('p', { class: 'muted small', text: 'Reading the item…' }));
 
     const foot = valueFoot(v);
-    if (!v.gone && (foot || v.more)) {
-      parts.push(h('div', { class: 'card-foot' },
-        h('p', { class: 'muted small', text: v.gone ? '' : foot }),
-        v.more ? h('button', { type: 'button', class: 'btn', text: 'Load more', 'data-act': 'more', onclick: (e) => moreValue(e.currentTarget) }) : null,
-        v.capped ? h('p', { class: 'muted small', text: `At most ${fmtGrouped(v.maxItems)} items are held.` }) : null));
-    }
-    fill(valueCard, parts);
+    const footBox = !v.gone && (foot || v.more)
+      ? h('div', { class: 'pane-foot' },
+        h('div', { class: 'foot-line' },
+          h('p', { class: 'muted small', text: v.gone ? '' : foot }),
+          v.more ? h('button', { type: 'button', class: 'btn', text: 'Load more', 'data-act': 'more', onclick: (e) => moreValue(e.currentTarget) }) : null),
+        v.capped ? h('p', { class: 'muted small', text: `At most ${fmtGrouped(v.maxItems)} items are held.` }) : null)
+      : null;
+    fill(valueCard, head, h('div', { class: 'value-body' }, body), footBox);
     if (focusedName) {
       const again = Array.from(valueCard.querySelectorAll('button, a, input, select')).find((el) => (el.getAttribute('aria-label') || el.textContent.trim()) === focusedName && !el.disabled);
       if (again) again.focus();
     }
+    drawCrumbs();
   }
 
   function itemsBox(v) {
@@ -1456,6 +1887,9 @@ function mountKeys(root, ctx) {
         valueSeq += 1;
         Object.assign(store, { value: null, valueId: null, valueError: null, item: null, shown: null, format: null });
       } else if (r.value) takeValue(r.value);
+      // A deleted key leaves the address, a renamed one is there under its new name; in
+      // place, so Back does not reopen what is gone.
+      syncUrl();
     }
     drawKeys();
     drawValue();
@@ -1648,8 +2082,11 @@ function mountKeys(root, ctx) {
         store.format = null;
         store.itemsShown = CHUNK;
         takeValue(r.value);
+        // The new key is open: a step in the history, with nothing more to read.
+        syncUrl(true);
         drawKeys();
         drawValue();
+        reveal('value');
       },
     });
   }
@@ -1801,24 +2238,6 @@ function mountKeys(root, ctx) {
     }
   }
 
-  // ---------- what other areas asked for ----------
-  function takePending() {
-    const p = store.pending;
-    store.pending = null;
-    if (!p) return;
-    if (p.find) runFind(p.find);
-    else if (p.key) {
-      openValue(p.key);
-      if (!store.list) drawKeys();
-    } else if (p.pattern || typeof p.node === 'number') {
-      if (typeof p.node === 'number' && p.node !== store.node) {
-        store.node = p.node;
-        loadTree();
-      }
-      if (p.pattern) openPattern(p.pattern);
-    }
-  }
-
   // ---------- following the session ----------
   // The writes the server refused this session turn their buttons off.
   const refusedKey = (s) => (s.conn ? s.conn.refused.join(',') : '');
@@ -1827,6 +2246,10 @@ function mountKeys(root, ctx) {
     if (!alive) return;
     const what = follow(store, next);
     if (what) {
+      // What the address named belongs to the run before: it leaves the address too.
+      syncUrl();
+      relayout();
+      drawRows();
       drawKeys();
       drawValue();
       loadTree();
@@ -1856,24 +2279,42 @@ function mountKeys(root, ctx) {
     if (alive) takeBulk(r.bulk);
   })];
 
-  active = { takePending };
+  // ---------- the address on mount ----------
+  // No state in the address (the rail's link, a digit): show what Browse holds, and put it
+  // in the address in place. An entry shown for another connection or database (Back
+  // after a switch) is not applied here: what Browse holds is. Otherwise (a reload, a link
+  // in a new tab, Back from another area) the address is shown, reading only what Browse
+  // does not hold already, exactly what a click would read. Never anything else: the
+  // address carries no connection, so it never connects.
+  const fromAddress = parseBrowseQuery(route && route.query);
+  let start;
+  if (!opensAnything(fromAddress) && fromAddress.sort === null) {
+    start = shownParams(store);
+    if (opensAnything(start)) ctx.replaceRoute(browseHref(start));
+  } else if (staleEntry()) {
+    start = shownParams(store);
+    ctx.replaceRoute(browseHref(start));
+  } else start = fromAddress;
+  markEntry();
+
+  active = { applyRoute };
   // Draw what is kept at once, then read what may have changed meanwhile.
+  relayout();
   if (store.tree) drawTree();
   else drawRows();
   drawKeys();
   drawValue();
   drawBulk();
+  applyParams(start, { mounting: true });
   loadTree();
   loadDbs();
   refreshBulk();
-  if (store.pending) takePending();
-  else if (store.list && store.list.kind === 'pattern' && !store.list.done && store.picked) {
-    // Nothing to do: the list is as it was; more pages load on request.
-  }
 
   return () => {
     alive = false;
-    if (active && active.takePending === takePending) active = null;
+    if (active && active.applyRoute === applyRoute) active = null;
+    if (sizes) sizes.disconnect();
+    document.body.classList.remove('fill-view');
     timers.forEach((t) => clearTimeout(t));
     offs.forEach((off) => off());
   };

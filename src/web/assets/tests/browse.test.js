@@ -111,7 +111,6 @@ test('following the session: another connection starts afresh; a new run drops t
   store.sort = 'keys';
   store.list = { list: 1 };
   store.value = { view: 2 };
-  store.pending = { key: { id: '61' } };
   assert.equal(follow(store, state('a', 1)), null);
   assert.equal(follow(store, state('a', 2)), 'run', 'an analysis or a database switch is a new run');
   assert.equal(store.list, null);
@@ -120,7 +119,8 @@ test('following the session: another connection starts afresh; a new run drops t
   assert.equal(store.sort, 'keys');
   assert.equal(follow(store, state('b', 2)), 'reset');
   assert.equal(store.filter, '');
-  assert.deepEqual(store.pending, { key: { id: '61' } }, 'what another area asked for is kept');
+  // What another area asks for is an address now (browse-route.test.js), not kept here.
+  assert.equal('pending' in store, false);
 });
 
 test('Analyze: Nodes and Slots only on a cluster', () => {
