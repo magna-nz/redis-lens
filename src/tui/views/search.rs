@@ -27,7 +27,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::streams::form::{self, Form, Step, write_failed, write_off};
 use super::streams::{list_move, off_text, plain};
 use super::value::{Drawn, ValueState};
-use super::{Act, Input, ViewState};
+use super::{Act, Ctx, InFlight, Input, Plan, ViewState};
 use crate::live::keys::KeyRow;
 use crate::live::search::{Doc, IndexInfo, IndexList, Reply, Request, Results, Text};
 use crate::live::values::{Field, Items};
@@ -260,19 +260,16 @@ impl SearchState {
 
     /// `C`: opens the create form.
     fn open_create(&mut self, act: &mut Act<'_>) {
-        if self.no_module {
-            act.error(NO_MODULE);
-            return;
-        }
-        let sample = WriteOp::FtCreate {
-            index: "i".into(),
-            on: IndexOn::Hash,
-            prefixes: Vec::new(),
-            fields: vec![IndexField {
-                name: "f".into(),
-                alias: None,
-                kind: "TEXT".into(),
-            }],
+        let sample = match self.index_write_plan('+') {
+            Ok(op) => op,
+            Err((why, error)) => {
+                if error {
+                    act.error(why);
+                } else {
+                    act.info(why);
+                }
+                return;
+            }
         };
         if write_off(act, &sample) {
             return;
@@ -318,19 +315,55 @@ impl SearchState {
         }
     }
 
-    /// `D`: drops the selected index; its documents stay.
-    fn drop_index(&mut self, act: &mut Act<'_>) {
+    /// `+` (`c`) or `d` worked out without doing it: the op it sends (`d`) or the one
+    /// its form's gate check uses (`+`), or what it says instead, with whether that is
+    /// an error. For the keys and the Actions menu.
+    fn index_write_plan(&self, c: char) -> Result<WriteOp, (&'static str, bool)> {
+        if self.deeper.is_some() {
+            return Err((
+                if c == '+' {
+                    CREATE_FROM_DEEPER
+                } else {
+                    DROP_FROM_DEEPER
+                },
+                false,
+            ));
+        }
         if self.no_module {
-            act.error(NO_MODULE);
-            return;
+            return Err((NO_MODULE, true));
+        }
+        if c == '+' {
+            return Ok(WriteOp::FtCreate {
+                index: "i".into(),
+                on: IndexOn::Hash,
+                prefixes: Vec::new(),
+                fields: vec![IndexField {
+                    name: "f".into(),
+                    alias: None,
+                    kind: "TEXT".into(),
+                }],
+            });
         }
         let Some(index) = self.selected().map(|i| i.name.clone()) else {
-            act.info("No index selected.");
-            return;
+            return Err(("No index selected.", false));
         };
-        let op = WriteOp::FtDropIndex {
-            index: index.clone(),
+        Ok(WriteOp::FtDropIndex { index })
+    }
+
+    /// `d`: drops the selected index; its documents stay.
+    fn drop_index(&mut self, act: &mut Act<'_>) {
+        let op = match self.index_write_plan('d') {
+            Ok(op) => op,
+            Err((why, error)) => {
+                if error {
+                    act.error(why);
+                } else {
+                    act.info(why);
+                }
+                return;
+            }
         };
+        let index = op.name_to_type();
         if let Some(id) = act.write(op) {
             self.write = Some((id, index, false));
         }
@@ -483,23 +516,29 @@ impl SearchState {
     }
 
     /// `enter` on the results: open the selected one's fields.
-    fn open_result(&mut self, act: &mut Act<'_>) {
+    /// The result `enter` opens, or why there is none: the handler and the menu both
+    /// ask this.
+    fn result_to_open(&self) -> Result<&Doc, &'static str> {
         let Some(run) = self.shown_results() else {
-            act.info("Run a query with / first, then enter opens a result.");
-            return;
+            return Err("Run a query with / first, then enter opens a result.");
         };
         let Some(results) = run.results() else {
-            act.info("The query has no results to open.");
-            return;
+            return Err("The query has no results to open.");
         };
-        let Some(doc) = results
+        results
             .docs
             .get(self.result_sel.min(results.docs.len().saturating_sub(1)))
-        else {
-            act.info("No documents match the query.");
-            return;
+            .ok_or("No documents match the query.")
+    }
+
+    fn open_result(&mut self, act: &mut Act<'_>) {
+        let state = match self.result_to_open() {
+            Ok(doc) => document(doc, act.tick),
+            Err(why) => {
+                act.info(why);
+                return;
+            }
         };
-        let state = document(doc, act.tick);
         self.deeper = Some(Deeper::Document(Box::new(state)));
     }
 
@@ -723,6 +762,30 @@ impl ViewState for SearchState {
         paste_into(self.input.as_mut(), text);
     }
 
+    fn plan(&self, token: &str, ctx: &Ctx<'_>, in_flight: InFlight<'_>) -> Option<Plan> {
+        let off = |why: &str| Some(Plan::Off(why.to_string()));
+        match token {
+            "+" | "d" => Some(match self.index_write_plan(token.chars().next()?) {
+                Ok(op @ WriteOp::FtCreate { .. }) => Plan::Form(op),
+                Ok(op) => Plan::Write(op),
+                Err((why, _)) => Plan::Off(why.to_string()),
+            }),
+            "/" if self.selected().is_none() => off("No index selected."),
+            "enter" if self.deeper.is_none() => self.result_to_open().err().and_then(off),
+            "x" | "X" if self.last_query.is_none() => off(&format!(
+                "Run a query with / first: {token} uses the query last run."
+            )),
+            "f" | "y" => match &self.deeper {
+                Some(Deeper::Document(doc)) => doc.plan(token, ctx, in_flight),
+                Some(Deeper::Text { .. }) => {
+                    off("f and y work on a result's fields: press esc, then enter.")
+                }
+                None => off("Open a result with enter first: f and y work on its fields."),
+            },
+            _ => None,
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent, act: &mut Act<'_>) -> bool {
         if self.create.is_some() {
             self.create_key(key, act);
@@ -732,19 +795,9 @@ impl ViewState for SearchState {
             return self.input_key(key, act);
         }
         // The index writes act on the index list only: one level deeper (a result, an
-        // explain or a profile) they say where they live and do nothing else.
-        match (key.code, plain(&key)) {
-            (KeyCode::Char('+'), true) if self.deeper.is_some() => {
-                act.info(CREATE_FROM_DEEPER);
-                return true;
-            }
-            (KeyCode::Char('d'), true) if self.deeper.is_some() => {
-                act.info(DROP_FROM_DEEPER);
-                return true;
-            }
-            _ => {}
-        }
-        // Keys that work the same one level deeper: they go back first.
+        // explain or a profile) they say where they live and do nothing else
+        // ([`Self::index_write_plan`]). Keys that work the same one level deeper go
+        // back first.
         match (key.code, plain(&key)) {
             (KeyCode::Char('+'), true) => {
                 self.open_create(act);
@@ -1940,5 +1993,96 @@ mod tests {
                 assert!(writes(&e).is_empty(), "{k} {env:?} {ro:?}");
             }
         }
+    }
+
+    /// The Actions menu on Search without the module: create and drop are off.
+    #[test]
+    fn menu_without_the_module() {
+        let (mut app, id) = shown();
+        answer(&mut app, id, Err(LiveError::Unsupported("FT._LIST".into())));
+        set_profile(&mut app, Env::Local, None);
+        app.handle_key(ch('.'));
+        for (w, h) in [(120, 36), (80, 24)] {
+            insta::assert_snapshot!(
+                format!("menu_search_no_module_{w}x{h}"),
+                testing::render(&app, w, h).backend()
+            );
+        }
+        assert!(text(&app, 120, 36).contains("off: no Search module"));
+    }
+
+    /// The menu's labels are what its lines do: with an index, with a result open,
+    /// and without the module; writes on and off.
+    #[test]
+    fn menu_labels_match_their_outcome_on_search() {
+        use crate::tui::app::views::testing::check_menu_labels;
+        for (env, ro) in [
+            (Env::Local, None),
+            (Env::Prod, None),
+            (Env::Prod, Some(false)),
+        ] {
+            let w = format!("{env:?} {ro:?}");
+            check_menu_labels(
+                &|| {
+                    let mut app = loaded(true);
+                    set_profile(&mut app, env, ro);
+                    app
+                },
+                &format!("an index, {w}"),
+            );
+            check_menu_labels(
+                &|| {
+                    let mut app = with_results();
+                    set_profile(&mut app, env, ro);
+                    app
+                },
+                &format!("results, {w}"),
+            );
+            check_menu_labels(
+                &|| {
+                    let mut app = with_results();
+                    set_profile(&mut app, env, ro);
+                    app.handle_key(key(KeyCode::Enter));
+                    assert!(app.views.search.deeper.is_some());
+                    app
+                },
+                &format!("a result open, {w}"),
+            );
+            check_menu_labels(
+                &|| {
+                    let (mut app, id) = shown();
+                    answer(&mut app, id, Err(LiveError::Unsupported("FT._LIST".into())));
+                    set_profile(&mut app, env, ro);
+                    app
+                },
+                &format!("no module, {w}"),
+            );
+        }
+    }
+
+    /// `f` and `y` are under RESULT only while a result is open; off otherwise.
+    #[test]
+    fn f_and_y_are_the_results_while_one_is_open() {
+        use crate::tui::app::actions::Status;
+        use crate::tui::keymap::Group;
+        let mut app = with_results();
+        let f = app
+            .menu_lines()
+            .into_iter()
+            .find(|l| l.token() == "f")
+            .unwrap();
+        assert_eq!(f.group, Group::Screen);
+        assert!(matches!(f.status, Status::Off(_)));
+        app.handle_key(key(KeyCode::Enter));
+        let heads = app.menu_heads(Screen::Search);
+        assert_eq!(heads[0].0, "RESULT");
+        assert_eq!(heads[1].0, "INDEX");
+        let f = app
+            .menu_lines()
+            .into_iter()
+            .find(|l| l.token() == "f")
+            .unwrap();
+        assert_eq!(f.group, Group::Row);
+        assert!(!matches!(f.status, Status::Off(_)));
     }
 }

@@ -26,7 +26,7 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::value::{Form, FormKey, Nav};
-use super::{Act, Ctx, Input, ViewState};
+use super::{Act, Ctx, InFlight, Input, Plan, ViewState};
 use crate::live::keys::{KeyRow, Page, Reply, Request};
 use crate::live::write::Reply as WriteReply;
 use crate::live::{CANCELLED, Dest, Follow, LiveError, LiveReply, LiveRequest, ReqId};
@@ -571,6 +571,20 @@ impl KeysState {
         }
     }
 
+    /// Why `m` loads no more keys now.
+    fn more_block(&self, in_flight: InFlight<'_>) -> Option<String> {
+        if self.loading.is_some_and(in_flight) {
+            Some("Still loading keys…".into())
+        } else if self.done {
+            Some(format!(
+                "All {} matching keys are loaded.",
+                crate::format::grouped(self.rows.len() as u64)
+            ))
+        } else {
+            None
+        }
+    }
+
     /// `+`: the form for a new key, when the gate would let one through.
     fn start_new_key(&mut self, act: &mut Act<'_>) {
         if self.find.is_none() && self.pattern.is_none() {
@@ -578,27 +592,43 @@ impl KeysState {
         }
         // A find has no pattern: the name starts empty.
         let pattern = self.pattern.clone().unwrap_or_default();
+        if self.say(self.new_key_plan_of(act), act).is_none() {
+            return;
+        }
+        self.form = Some(Form::new_key(&pattern));
+    }
+
+    /// `+` worked out without doing it: the op its gate check uses, or what it says.
+    fn new_key_plan(
+        &self,
+        ctx: &Ctx<'_>,
+        in_flight: InFlight<'_>,
+    ) -> Result<WriteOp, (String, bool)> {
         let probe = WriteOp::NewKey {
             key: "k".into(),
             value: NewKey::String(crate::value::Raw::from("")),
         };
-        if let Decision::Refuse(why) = act.write_decision(&probe) {
-            act.error(why);
-            return;
+        self.write_block(&probe, ctx, in_flight)
+            .map_or(Ok(probe), Err)
+    }
+
+    fn new_key_plan_of(&self, act: &Act<'_>) -> Result<WriteOp, (String, bool)> {
+        self.new_key_plan(act, &|id| act.in_flight(id))
+    }
+
+    /// Shows the notice of a plan that was refused; the op of one that may go.
+    fn say(&self, plan: Result<WriteOp, (String, bool)>, act: &mut Act<'_>) -> Option<WriteOp> {
+        match plan {
+            Ok(op) => Some(op),
+            Err((why, true)) => {
+                act.error(why);
+                None
+            }
+            Err((why, false)) => {
+                act.info(why);
+                None
+            }
         }
-        if !act.live_ready() {
-            act.error("Not sent: the live connection is not open.");
-            return;
-        }
-        if self
-            .writing
-            .as_ref()
-            .is_some_and(|(id, _)| act.in_flight(*id))
-        {
-            act.info("The last write has not answered yet.");
-            return;
-        }
-        self.form = Some(Form::new_key(&pattern));
     }
 
     fn form_key(&mut self, key: &KeyEvent, act: &mut Act<'_>) {
@@ -660,36 +690,37 @@ impl KeysState {
         }
     }
 
-    /// True when the selected key's writes may start: the gate would not refuse
-    /// `probe`, the live connection is open and no other write of the list waits for
-    /// its answer. Otherwise says why.
-    fn may_write(&self, probe: &WriteOp, act: &mut Act<'_>) -> bool {
-        if let Decision::Refuse(why) = act.write_decision(probe) {
-            act.error(why);
-            return false;
+    /// Why the list's writes may not start, with whether it is an error notice: the
+    /// gate would refuse `probe`, the live connection is not open, or another write of
+    /// the list waits for its answer.
+    fn write_block(
+        &self,
+        probe: &WriteOp,
+        ctx: &Ctx<'_>,
+        in_flight: InFlight<'_>,
+    ) -> Option<(String, bool)> {
+        if let Decision::Refuse(why) = ctx.write_decision(probe) {
+            return Some((why, true));
         }
-        if !act.live_ready() {
-            act.error("Not sent: the live connection is not open.");
-            return false;
+        if !ctx.live_ready() {
+            return Some(("Not sent: the live connection is not open.".into(), true));
         }
-        if self
-            .writing
-            .as_ref()
-            .is_some_and(|(id, _)| act.in_flight(*id))
-        {
-            act.info("The last write has not answered yet.");
-            return false;
+        if self.writing.as_ref().is_some_and(|(id, _)| in_flight(*id)) {
+            return Some(("The last write has not answered yet.".into(), false));
         }
-        true
+        None
     }
 
-    /// `t`, `d` or `R` (`c`) on the selected key: the same writes as `T`, `D` and `R`
-    /// on its value, through the same gate and question, sent by name. Nothing of the
-    /// key is read first.
-    fn key_write(&mut self, c: char, act: &mut Act<'_>) {
+    /// `t`, `d` or `R` (`c`) worked out without doing it: the op it sends or checks
+    /// the gate with, or what it says instead.
+    fn key_write_plan(
+        &self,
+        c: char,
+        ctx: &Ctx<'_>,
+        in_flight: InFlight<'_>,
+    ) -> Result<WriteOp, (String, bool)> {
         let Some(key) = self.selected().map(|r| r.key.clone()) else {
-            act.info("No key selected.");
-            return;
+            return Err(("No key selected.".into(), false));
         };
         let probe = match c {
             't' => WriteOp::KeyTtl {
@@ -702,9 +733,22 @@ impl KeysState {
                 new: format!("{key}:"),
             },
         };
-        if !self.may_write(&probe, act) {
+        self.write_block(&probe, ctx, in_flight)
+            .map_or(Ok(probe), Err)
+    }
+
+    /// `t`, `d` or `R` (`c`) on the selected key: the same writes as `T`, `D` and `R`
+    /// on its value, through the same gate and question, sent by name. Nothing of the
+    /// key is read first.
+    fn key_write(&mut self, c: char, act: &mut Act<'_>) {
+        let plan = {
+            let a: &Act<'_> = act;
+            self.key_write_plan(c, a, &|id| a.in_flight(id))
+        };
+        let Some(probe) = self.say(plan, act) else {
             return;
-        }
+        };
+        let key = self.selected().map(|r| r.key.clone()).unwrap_or_default();
         match c {
             't' => self.form = Some(Form::key_ttl(&key)),
             'd' => {
@@ -974,13 +1018,12 @@ impl ViewState for KeysState {
                 true
             }
             (_, Some('m')) => {
-                if self.loading.is_some_and(|id| act.in_flight(id)) {
-                    act.info("Still loading keys…");
-                } else if self.done {
-                    act.info(format!(
-                        "All {} matching keys are loaded.",
-                        crate::format::grouped(self.rows.len() as u64)
-                    ));
+                let block = {
+                    let a: &Act<'_> = act;
+                    self.more_block(&|id| a.in_flight(id))
+                };
+                if let Some(why) = block {
+                    act.info(why);
                 } else {
                     self.page_rows = 0;
                     if !self.load(act) {
@@ -1053,6 +1096,31 @@ impl ViewState for KeysState {
                     load_error(&e)
                 });
             }
+        }
+    }
+
+    fn plan(&self, token: &str, ctx: &Ctx<'_>, in_flight: InFlight<'_>) -> Option<Plan> {
+        let of = |r: Result<WriteOp, (String, bool)>| match r {
+            Ok(op @ WriteOp::Unlink { .. }) => Plan::Write(op),
+            Ok(op) => Plan::Form(op),
+            Err((why, _)) => Plan::Off(why),
+        };
+        match token {
+            "y" | "Y" if self.selected().is_none() => {
+                Some(Plan::Off("Nothing selected to copy.".into()))
+            }
+            "m" => self.more_block(in_flight).map(Plan::Off),
+            "+" if ctx.screen == Screen::KeyList => {
+                if self.find.is_none() && self.pattern.is_none() {
+                    return Some(Plan::Off("No pattern is open.".into()));
+                }
+                Some(of(self.new_key_plan(ctx, in_flight)))
+            }
+            "t" | "d" | "R" if ctx.screen == Screen::KeyList => {
+                let c = token.chars().next()?;
+                Some(of(self.key_write_plan(c, ctx, in_flight)))
+            }
+            _ => None,
         }
     }
 

@@ -24,6 +24,7 @@ use super::app::views::{Ctx, Owner, PROBE_FT_LIST};
 use super::app::{App, Area, Panel, Phase, Screen, Session};
 use super::keymap;
 
+mod actions;
 mod analysis;
 mod bulk;
 mod cmdline;
@@ -41,6 +42,7 @@ mod patterns;
 mod pubsub;
 pub(crate) mod search;
 mod server;
+pub mod sheet;
 mod slots;
 pub(crate) mod streams;
 pub mod style;
@@ -160,13 +162,39 @@ pub fn browse_rows(area: Rect) -> usize {
     usize::from(body_of(area).height.saturating_sub(4))
 }
 
-/// True while a dialog is open over the screen: the screen behind it is dimmed.
+/// True while a dialog is open over the screen: the screen behind it is dimmed. A
+/// question (the confirm sheet) and the Actions menu dim nothing: the row they act on
+/// stays readable.
 pub fn dialog_open(app: &App) -> bool {
     app.help
         || app.analyze.is_some()
-        || app.confirm.is_some()
-        || app.bulk.is_some()
+        || app
+            .bulk
+            .as_ref()
+            .is_some_and(|b| !matches!(b.stage, crate::tui::app::bulk::Stage::Asking { .. }))
         || app.dbs.is_some()
+}
+
+/// The question open as a sheet, if any: the write gate's, Monitor's or the command
+/// line's.
+pub fn open_sheet(app: &App) -> Option<sheet::Sheet> {
+    let mut sh = open_sheet_of(app)?;
+    sh.wait = app.in_grace();
+    Some(sh)
+}
+
+fn open_sheet_of(app: &App) -> Option<sheet::Sheet> {
+    if let Some(c) = &app.confirm {
+        return Some(confirm::sheet(c));
+    }
+    let ctx = app.ctx()?;
+    if app.views.cmdline.open {
+        return cmdline::confirm_sheet(&app.views.cmdline, &ctx);
+    }
+    if app.monitor_asking() {
+        return server::monitor_sheet(&app.views.server.monitor, &ctx);
+    }
+    None
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -191,7 +219,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         cmdline::draw(frame, body, &app.views.cmdline, &ctx);
     }
     footer(frame, foot, app);
-    if dialog_open(app) {
+    // A dialog, or a question a reply opened a moment ago, dims the rest.
+    if dialog_open(app) || app.in_grace() {
         // Everything but the footer, which says what the dialog wants.
         widgets::dim(
             frame,
@@ -207,14 +236,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(l) = &app.dbs {
         dbs::draw(frame, body, l);
     }
-    if let Some(c) = &app.confirm {
-        confirm::draw(frame, body, c);
+    if app.menu.is_some() {
+        actions::draw(frame, body, app);
     }
     if let Some(d) = &app.analyze {
         overview::draw_analyze(frame, body, d, app);
     }
     if app.help {
         help::draw(frame, body, app);
+    }
+    // The question takes every key first, so it is drawn last: on top of everything.
+    if let Some(sh) = open_sheet(app) {
+        sheet::draw(frame, body, &sh);
     }
 }
 
@@ -987,7 +1020,7 @@ fn key_line(app: &App, w: usize) -> Line<'static> {
     let mut r = Vec::new();
     for (i, (k, l)) in right.iter().enumerate() {
         if i > 0 {
-            r.push(Span::raw("  "));
+            r.push(Span::raw("   "));
         }
         r.push(Span::styled(*k, style::key()));
         r.push(Span::styled(format!(" {l}"), style::dim()));
@@ -999,6 +1032,22 @@ fn key_line(app: &App, w: usize) -> Line<'static> {
     let rw = spans_width(&r);
     spans.push(Span::raw(" ".repeat(w.saturating_sub(lw + rw))));
     spans.extend(r);
+    Line::from(spans)
+}
+
+/// A footer of `keys` (` y Delete   n Cancel`), then `note` dim.
+fn hints_line(keys: &[(&'static str, &'static str)], note: &str) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (k, l)) in keys.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(*k, style::key()));
+        spans.push(Span::styled(format!(" {l}"), style::dim()));
+    }
+    if !note.is_empty() {
+        spans.push(Span::styled(format!("   {note}"), style::dim()));
+    }
     Line::from(spans)
 }
 
@@ -1031,10 +1080,12 @@ pub const QUESTION_OPEN: &str = " A question is open: answer it, or esc to cance
 
 fn footer(frame: &mut Frame, area: Rect, app: &App) {
     let w = usize::from(area.width);
-    let line = if app.help {
+    let line = if let Some(sh) = open_sheet(app) {
+        hints_line(&sh.keys(), if sh.wait { sheet::WAIT } else { "" })
+    } else if app.help {
         help_footer(app)
-    } else if let Some(c) = &app.confirm {
-        confirm::footer(c)
+    } else if app.menu.is_some() {
+        hints_line(&actions::footer(), actions::FOOTER_NOTE)
     } else if let Some(b) = &app.bulk {
         bulk::footer(b)
     } else if let Some(l) = &app.dbs {

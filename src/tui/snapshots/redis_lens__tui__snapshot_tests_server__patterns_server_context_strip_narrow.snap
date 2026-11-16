@@ -25,4 +25,4 @@ expression: t.backend()
 "│                                        │ → lists its keys                    │"
 "│ from 100,000 sampled keys · v more     │                                     │"
 "└─ sample explains 98% of dataset.byte…──┴─────────────────────────────────────┘"
-" ↑↓ Move   → Open   / Filter   s Sort                    ctrl-f Find key  ? Help"
+" ↑↓ Move   → Open   / Filter   s Sort   tab Next panel        . Actions   ? Keys"

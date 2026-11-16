@@ -339,6 +339,44 @@ pub struct Input {
     pub hint: &'static str,
 }
 
+/// What a key would do now, for the Actions menu (`.`): worked out from the state
+/// only, so nothing is done, sent or read. A handler and its plan share their checks
+/// (each view's handler asks the same function its plan does), so the menu, the footer
+/// and the key never disagree.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Plan {
+    /// It runs now: a read, or something on screen only. `note` goes at the right.
+    Run(Option<String>),
+    /// A write sent now: the op, as [`Act::write`] will check it (where it goes, then
+    /// the write gate's decision: it runs, asks first or is refused).
+    Write(WriteOp),
+    /// A form that ends in a write: the op its handler asks the write gate about
+    /// before opening the form ([`Ctx::write_decision`]).
+    Form(WriteOp),
+    /// It asks first, and is no write (Monitor).
+    Asks,
+    /// It does nothing now: what the key would say instead, safe to draw.
+    Off(String),
+}
+
+/// Whether request `id` may still be answered: [`Act::in_flight`] for a plan.
+pub type InFlight<'a> = &'a dyn Fn(ReqId) -> bool;
+
+/// What [`Plan::Write`] comes to on `session`: where it goes, then the gate's decision
+/// for `op` on the profile, exactly as [`Act::write`] checks them when the key is
+/// pressed. `Err`: why it is refused.
+pub(crate) fn write_plan(
+    session: &Session,
+    settings: &Settings,
+    op: &WriteOp,
+) -> Result<Decision, String> {
+    write_dest(session, op)?;
+    match crate::write::decide_op(op, &session.profile, settings, &session.refusals) {
+        Decision::Refuse(why) => Err(why),
+        d => Ok(d),
+    }
+}
+
 /// One view's state. Every method has a default that does nothing, so a view
 /// implements only what it needs. See the module documentation for when each runs.
 pub trait ViewState: fmt::Debug {
@@ -370,6 +408,14 @@ pub trait ViewState: fmt::Debug {
     /// Pasted text, only while [`ViewState::input`] is `Some`. [`Act::send`] and
     /// [`Act::copy`] work here as they do in [`ViewState::on_key`].
     fn on_paste(&mut self, _text: &str, _act: &mut Act<'_>) {}
+
+    /// What the key-table key `token` (its first key, `d` or `space`) would do on
+    /// `ctx.screen` now, for the Actions menu. `in_flight` says whether a request may
+    /// still be answered, as [`Act::in_flight`] does. `None`: it runs as far as this
+    /// view knows. Never does anything.
+    fn plan(&self, _token: &str, _ctx: &Ctx<'_>, _in_flight: InFlight<'_>) -> Option<Plan> {
+        None
+    }
 }
 
 /// Every view state. `App::views`; reset on each new connect.
@@ -939,8 +985,21 @@ pub mod testing {
             .collect()
     }
 
-    /// The answer to request `req_id`, as the runtime would send it.
+    /// The answer to request `req_id`, as the runtime would send it. A question it
+    /// opens is past its grace period at once, as if the user waited, so tests can
+    /// answer it; [`reply_now`] keeps the grace period.
     pub fn reply(
+        app: &mut App,
+        req_id: ReqId,
+        result: Result<LiveReply, LiveError>,
+    ) -> Vec<Effect> {
+        let out = reply_now(app, req_id, result);
+        app.grace_until = None;
+        out
+    }
+
+    /// [`reply`], the grace period of a question it opens kept.
+    pub fn reply_now(
         app: &mut App,
         req_id: ReqId,
         result: Result<LiveReply, LiveError>,
@@ -959,6 +1018,120 @@ pub mod testing {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| ui::draw(f, app)).unwrap();
         t
+    }
+
+    /// What the Actions menu says of each line, checked against what running it
+    /// does (spec "Actions menu"): a line showing a command sends that command and
+    /// asks nothing; `asks first` opens a question and sends nothing; a form opens and
+    /// sends nothing; a line that runs sends no write; an `off:` line sends nothing,
+    /// opens nothing and changes nothing but the notice, which is its reason. `make`
+    /// builds the state afresh for each line; `what` names it in failures.
+    pub fn check_menu_labels(make: &dyn Fn() -> App, what: &str) {
+        use crate::tui::app::actions::Status;
+        // The decode caches (`memo`) fill as lines are worked out: not state.
+        let no_memo = |s: String| {
+            let mut out = String::with_capacity(s.len());
+            let mut rest = s.as_str();
+            while let Some(i) = rest.find("Memo {") {
+                out.push_str(&rest[..i]);
+                rest = rest[i..].split_once('}').map_or("", |(_, r)| r);
+            }
+            out.push_str(rest);
+            out
+        };
+        let state = |app: &App| {
+            no_memo(format!(
+                "{:?}",
+                (
+                    app.screen(),
+                    &app.views,
+                    &app.confirm,
+                    &app.bulk,
+                    &app.dbs,
+                    app.analyze,
+                    app.help,
+                    &app.find,
+                    app.add.is_some(),
+                )
+            ))
+        };
+        let writes = |e: &[Effect]| -> Vec<String> {
+            requests(e)
+                .into_iter()
+                .filter_map(|(_, r)| match r {
+                    LiveRequest::Write(p) => Some(p.op().command()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut probe = make();
+        probe.handle_key(key(KeyCode::Char('.')));
+        let lines = probe.menu_lines();
+        assert!(!lines.is_empty(), "{what}: an empty menu");
+        for (i, line) in lines.iter().enumerate() {
+            let ctx = format!(
+                "{what}: {} {:?} ({:?})",
+                line.token(),
+                line.label,
+                line.status
+            );
+            let mut app = make();
+            let before = state(&app);
+            app.handle_key(key(KeyCode::Char('.')));
+            for _ in 0..i {
+                app.handle_key(key(KeyCode::Down));
+            }
+            let e = app.handle_key(key(KeyCode::Enter));
+            let sent = writes(&e);
+            assert!(app.menu.is_none(), "{ctx}: the menu stayed open");
+            match &line.status {
+                Status::Sends(cmd) => {
+                    assert_eq!(
+                        sent,
+                        std::slice::from_ref(cmd),
+                        "{ctx}: sent something else"
+                    );
+                    assert!(app.question().is_none(), "{ctx}: asked first");
+                }
+                Status::Asks => {
+                    assert!(sent.is_empty(), "{ctx}: sent {sent:?} without asking");
+                    assert!(
+                        app.question().is_some() || app.bulk.is_some(),
+                        "{ctx}: nothing asked"
+                    );
+                }
+                Status::Form { .. } => {
+                    assert!(sent.is_empty(), "{ctx}: a form sent {sent:?}");
+                    assert!(app.question().is_none(), "{ctx}: asked before the form");
+                    assert_ne!(state(&app), before, "{ctx}: no form opened");
+                }
+                Status::Ready(_) => {
+                    assert!(
+                        sent.is_empty(),
+                        "{ctx}: a line with no command sent {sent:?}"
+                    );
+                }
+                Status::Off(why) => {
+                    assert!(e.is_empty(), "{ctx}: an off line did {e:?}");
+                    assert!(app.question().is_none(), "{ctx}: an off line asked");
+                    let after = state(&app);
+                    if after != before {
+                        let at = after
+                            .bytes()
+                            .zip(before.bytes())
+                            .position(|(a, b)| a != b)
+                            .unwrap_or(0);
+                        let from = at.saturating_sub(120);
+                        panic!(
+                            "{ctx}: an off line changed the state:\n now  …{}\n was  …{}",
+                            after.get(from..at + 80).unwrap_or(""),
+                            before.get(from..at + 80).unwrap_or("")
+                        );
+                    }
+                    assert_eq!(app.notice.as_ref().map(|n| &n.text), Some(why), "{ctx}");
+                }
+            }
+        }
     }
 
     fn ids(app: &App) -> (crate::tui::app::ConnId, crate::tui::app::ScanId) {

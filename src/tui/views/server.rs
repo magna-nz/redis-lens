@@ -46,7 +46,7 @@ use crate::tui::clipboard::CopyText;
 use crate::write::{SlowlogSetting, WriteOp};
 
 use super::streams::form::{Field, Form, Step, write_failed, write_off};
-use super::{Act, Input, ViewState};
+use super::{Act, Ctx, InFlight, Input, Plan, ViewState};
 
 /// Polls kept for the sparklines.
 pub const HISTORY: usize = 60;
@@ -353,22 +353,45 @@ impl ServerState {
 
     /// `d`: ends the selected connection of the open group; on a group row it says how.
     fn kill(&mut self, act: &mut Act<'_>) {
+        match self.kill_plan() {
+            Ok(id) => self.send_write(WriteOp::ClientKill { id }, Sent::Kill(id), act),
+            Err((why, true)) => act.error(why),
+            Err((why, false)) => act.info(why),
+        }
+    }
+
+    /// The connection `d` ends, or what it says instead (with whether that is an
+    /// error): for `d` and the Actions menu.
+    fn kill_plan(&self) -> Result<u64, (&'static str, bool)> {
         if self.clients.drill.is_none() {
-            act.info("Press enter to list the group's connections, then d ends the selected one.");
-            return;
+            return Err((
+                "Press enter to list the group's connections, then d ends the selected one.",
+                false,
+            ));
         }
         let Some(c) = self.clients.selected_conn() else {
-            act.info("No connection selected.");
-            return;
+            return Err(("No connection selected.", false));
         };
-        let id = c.id;
         if is_own(c) {
-            act.error(
+            return Err((
                 "Not sent: this looks like redis-lens's own connection (it was running CLIENT LIST).",
-            );
-            return;
+                true,
+            ));
         }
-        self.send_write(WriteOp::ClientKill { id }, Sent::Kill(id), act);
+        Ok(c.id)
+    }
+
+    /// Why `enter` on the Monitor panel asks nothing, or `None` when it asks.
+    fn monitor_block(&self, ctx: &Ctx<'_>) -> Option<String> {
+        if self.monitor.running() {
+            Some("MONITOR is already running. esc stops it.".into())
+        } else if let Some(why) = crate::conn::monitor_unsupported(ctx.profile()) {
+            Some(why.to_string())
+        } else if !ctx.live_ready() {
+            Some("The live connection is not open, so MONITOR cannot start.".into())
+        } else {
+            None
+        }
     }
 
     /// `e` on the Slow log: opens the settings form.
@@ -641,6 +664,10 @@ impl ViewState for ServerState {
             self.form_key(key, act);
             return true;
         }
+        // Monitor's question takes every key, `ctrl-u` (clear the name) included.
+        if self.monitor.prompt.is_some() && act.screen == Screen::Monitor {
+            return self.monitor_key(key, act);
+        }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -696,6 +723,28 @@ impl ViewState for ServerState {
             (Panel::Clients, _) => self.clients.key(key, act.page),
             (Panel::SlowLog, _) => self.slow.key(key, act.page),
             _ => false,
+        }
+    }
+
+    fn plan(&self, token: &str, ctx: &Ctx<'_>, _in_flight: InFlight<'_>) -> Option<Plan> {
+        let panel = Panel::of(ctx.screen)?;
+        match (panel, token) {
+            (Panel::Clients, "d") => Some(match self.kill_plan() {
+                Ok(id) => Plan::Write(WriteOp::ClientKill { id }),
+                Err((why, _)) => Plan::Off(why.to_string()),
+            }),
+            (Panel::SlowLog, "e") => Some(Plan::Form(WriteOp::SlowlogConfig(
+                SlowlogSetting::Threshold(0),
+            ))),
+            (Panel::SlowLog, "D") => Some(Plan::Write(WriteOp::SlowlogReset)),
+            (Panel::Monitor, "enter") => Some(match self.monitor_block(ctx) {
+                Some(why) => Plan::Off(why),
+                None => Plan::Asks,
+            }),
+            (Panel::Monitor, "esc") if self.monitor.run.is_none() => {
+                Some(Plan::Off("MONITOR is not running.".into()))
+            }
+            _ => None,
         }
     }
 
@@ -1544,12 +1593,8 @@ impl ServerState {
 
     /// `enter` on the Monitor panel: opens the prompt, when a run can start.
     fn ask_monitor(&mut self, act: &mut Act<'_>) {
-        if self.monitor.running() {
-            act.info("MONITOR is already running. esc stops it.");
-        } else if let Some(why) = crate::conn::monitor_unsupported(act.profile()) {
+        if let Some(why) = self.monitor_block(act) {
             act.info(why);
-        } else if !act.live_ready() {
-            act.info("The live connection is not open, so MONITOR cannot start.");
         } else {
             self.monitor.prompt = Some(if monitor_asks_name(act.profile()) {
                 Prompt::TypeName(String::new())
@@ -1586,6 +1631,7 @@ impl ServerState {
     /// A key while the prompt is open, or on the Monitor panel.
     fn monitor_key(&mut self, key: KeyEvent, act: &mut Act<'_>) -> bool {
         if let Some(prompt) = self.monitor.prompt.as_mut() {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match (prompt, key.code) {
                 (_, KeyCode::Esc) | (Prompt::YesNo, KeyCode::Char('n' | 'N')) => {
                     self.monitor.prompt = None;
@@ -1595,7 +1641,8 @@ impl ServerState {
                     self.monitor.prompt = None;
                     self.start_monitor(act);
                 }
-                (Prompt::TypeName(t), KeyCode::Char(c)) => {
+                (Prompt::TypeName(t), KeyCode::Char('u')) if ctrl => t.clear(),
+                (Prompt::TypeName(t), KeyCode::Char(c)) if !ctrl => {
                     if t.chars().count() < MAX_TYPED {
                         t.push(c);
                     }
@@ -3195,6 +3242,99 @@ mod tests {
             }
         }
     }
+    /// The Actions menu on a Clients drill-down with writes on (`stage`).
+    #[test]
+    fn menu_on_clients_drill_down() {
+        let mut app = on_clients(Env::Stage, Some(false));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(ch('j'));
+        app.handle_key(ch('.'));
+        for (w, h) in [(120, 36), (80, 24)] {
+            insta::assert_snapshot!(
+                format!("menu_clients_drill_down_{w}x{h}"),
+                testing::render(&app, w, h).backend()
+            );
+        }
+    }
+
+    /// The Actions menu on the Slow log (`prod-cache-01`, read-only).
+    #[test]
+    fn menu_on_the_slow_log() {
+        let mut app = slow_app();
+        app.handle_key(ch('j'));
+        app.handle_key(ch('.'));
+        for (w, h) in [(120, 36), (80, 24)] {
+            insta::assert_snapshot!(
+                format!("menu_slow_log_{w}x{h}"),
+                testing::render(&app, w, h).backend()
+            );
+        }
+    }
+
+    /// While the menu is open, a poll that keeps the selected group selected (moved
+    /// in the list) leaves it open; one that removes it closes the menu with a notice,
+    /// never retargeting it to the row now selected.
+    #[test]
+    fn a_poll_that_removes_the_selected_row_closes_the_menu() {
+        let t0 = Instant::now();
+        let (mut app, out) = app_at(t0, Screen::Clients);
+        let (id, _) = last_request(&out);
+        answer(&mut app, id, Reply::Clients(fleet()));
+        set_profile(&mut app, Env::Stage, Some(false));
+        app.handle_key(ch('j'));
+        let picked = state(&app).clients.selected_group().unwrap().key.clone();
+        app.handle_key(ch('.'));
+        // Moved down by a bigger new group: still selected, the menu stays.
+        let mut more = fleet();
+        for id in 20..30 {
+            more.push(conn(id, "10.0.9.1:1", "extra", ("", ""), 0, "get"));
+        }
+        let (id, _) = last_request(&app.apply(Msg::TickAt(t0 + secs(11))));
+        answer(&mut app, id, Reply::Clients(more));
+        assert_eq!(state(&app).clients.selected_group().unwrap().key, picked);
+        assert!(app.menu.is_some(), "the same row is selected");
+        // Gone: another group would be selected; the menu closes.
+        let one = vec![conn(
+            1,
+            "10.0.1.5:50001",
+            "",
+            ("redis-py", "5.0.1"),
+            0,
+            "get",
+        )];
+        let (id, _) = last_request(&app.apply(Msg::TickAt(t0 + secs(22))));
+        answer(&mut app, id, Reply::Clients(one));
+        assert_ne!(
+            state(&app).clients.selected_group().map(|g| g.key.clone()),
+            Some(picked)
+        );
+        assert!(app.menu.is_none());
+        assert!(notice(&app).contains(crate::tui::app::actions::SCREEN_CHANGED));
+    }
+
+    /// The menu's labels are what its lines do on Clients (a group row and a
+    /// drill-down) and the Slow log; writes on and off.
+    #[test]
+    fn menu_labels_match_their_outcome_on_server() {
+        use crate::tui::app::views::testing::check_menu_labels;
+        for (env, ro) in [
+            (Env::Local, None),
+            (Env::Prod, None),
+            (Env::Prod, Some(false)),
+        ] {
+            let w = format!("{env:?} {ro:?}");
+            check_menu_labels(&|| on_clients(env, ro), &format!("Clients groups, {w}"));
+            check_menu_labels(
+                &|| {
+                    let mut app = on_clients(env, ro);
+                    app.handle_key(key(KeyCode::Enter));
+                    app
+                },
+                &format!("Clients drill-down, {w}"),
+            );
+            check_menu_labels(&|| on_slow_log(env, ro), &format!("Slow log, {w}"));
+        }
+    }
 }
 
 /// The Monitor panel, the Slow log's arguments and the Hot keys ranking from Monitor.
@@ -3826,5 +3966,19 @@ mod monitor_tests {
                 .as_ref()
                 .is_some_and(|n| n.text.contains("control characters"))
         );
+    }
+
+    /// Monitor's question is the confirm sheet: typed on `prod`.
+    #[test]
+    fn monitor_start_sheet() {
+        let mut app = on_monitor(Instant::now(), true);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.monitor_asking());
+        for (w, h) in [(120, 36), (80, 24)] {
+            insta::assert_snapshot!(
+                format!("sheet_monitor_start_{w}x{h}"),
+                testing::render(&app, w, h).backend()
+            );
+        }
     }
 }

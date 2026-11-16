@@ -25,4 +25,4 @@ expression: t.backend()
 "│                           │ 2023-11-14 22:13:58.000  23.5                    │"
 "│                           │ 2023-11-14 22:13:57.000  22.5                    │"
 "└───────────────────────────┴──────────────────────────────────────────────────┘"
-" ↑↓ Move   esc Back                           ctrl-f Find key  : Command  ? Help"
+" ↑↓ Move   esc Back                         . Actions   ctrl-f Find key   ? Keys"

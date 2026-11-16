@@ -786,6 +786,50 @@ fn monitor_state(m: &Monitor, ctx: &Ctx<'_>) -> String {
     }
 }
 
+/// Monitor's question, while it is open: the one confirm sheet ([`super::sheet`]),
+/// docked under the panel. `y`/`n`, or on a production profile its name typed.
+pub fn monitor_sheet(m: &Monitor, ctx: &Ctx<'_>) -> Option<super::sheet::Sheet> {
+    use super::sheet::{Answer, Sheet, right_of};
+    let p = m.prompt.as_ref()?;
+    let profile = ctx.profile();
+    let node = ctx
+        .session
+        .picked_node()
+        .map(|n| n.endpoint.to_string())
+        .unwrap_or_else(|| ctx.session.endpoint().to_string());
+    Some(Sheet {
+        title: "Start MONITOR?".into(),
+        right: right_of(&profile.name, profile.env),
+        lines: vec![
+            ("", format!("Server {}", crate::value::escape(&node)), style::fg()),
+            ("Sends", "MONITOR".into(), style::fgb()),
+            (
+                "",
+                "MONITOR runs on a connection of its own, and the server copies every command it runs to it. That slows a busy server.".into(),
+                style::fg(),
+            ),
+            (
+                "",
+                format!(
+                    "It stops after {} s or {} lines, or with esc. The lines stay in memory.",
+                    MAX_TIME.as_secs(),
+                    format::grouped(MAX_LINES as u64)
+                ),
+                style::dim(),
+            ),
+        ],
+        answer: match p {
+            Prompt::YesNo => Answer::YesNo("Start"),
+            Prompt::TypeName(t) => Answer::Type {
+                name: profile.name.clone(),
+                typed: t.clone(),
+                verb: "Start",
+            },
+        },
+        wait: false,
+    })
+}
+
 fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
     let inner = sections(
         frame,
@@ -803,42 +847,6 @@ fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
     );
     let w = usize::from(inner[0].width);
     let text = |t: String, st: Style| Line::from(fit(vec![Span::styled(t, st)], w));
-    if let Some(p) = &m.prompt {
-        let profile = &ctx.profile().name;
-        let mut lines = vec![
-            Line::default(),
-            text(format!(" Send MONITOR to {profile}?"), style::fgb()),
-            Line::default(),
-        ];
-        lines.extend(paragraph(
-            vec![Span::raw(" ")],
-            " ",
-            "MONITOR runs on a connection of its own, and the server copies every command it runs to it. That slows a busy server.",
-            style::fg(),
-            w,
-        ));
-        lines.extend(paragraph(
-            vec![Span::raw(" ")],
-            " ",
-            &format!(
-                "It stops after {} s or {} lines, or with esc. The lines stay in memory.",
-                MAX_TIME.as_secs(),
-                format::grouped(MAX_LINES as u64)
-            ),
-            style::dim(),
-            w,
-        ));
-        lines.push(Line::default());
-        lines.push(match p {
-            Prompt::YesNo => text(" y starts it, n cancels.".to_string(), style::amber()),
-            Prompt::TypeName(_) => text(
-                format!(" A production profile: type {profile}, then enter. esc cancels."),
-                style::amber(),
-            ),
-        });
-        rows(frame, inner[0], lines, None);
-        return;
-    }
     let status = if let Some(why) = crate::conn::monitor_unsupported(ctx.profile()) {
         text(format!(" {MARK} {why}"), style::amber())
     } else if let Some(stop) = &m.stopped {

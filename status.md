@@ -14,15 +14,15 @@ Merging: the owner asked for each PR to be merged once reviewed and green. Auto 
 | Chunk | What | State |
 |---|---|---|
 | Terminal 1 | Colour roles (focus, placeholder; amber for warnings only), the context bar and the area row in place of the header, tab row and sub-tab row, `w` from every screen, the focused pane's border, the `›` gutter on every list | **done**, #34, CI green |
-| Terminal 2 | The key grammar (every rebinding in the brief's section 5), the current area's digit again for its next panel, footers that only show keys that work and never drop the way back, and new writes on the key list (`t`, `d`, `R` on the selected key, `T`/`D` for the pattern's bulk action) through the one gate; `tests/tui_key_list_writes_it.rs` on Redis and Valkey | **done**, in its PR (stacked on Terminal 1) |
-| Terminal 3 | Actions menu (`.`), one docked confirm | not started |
+| Terminal 2 | The key grammar (every rebinding in the brief's section 5), the current area's digit again for its next panel, footers that only show keys that work and never drop the way back, and new writes on the key list (`t`, `d`, `R` on the selected key, `T`/`D` for the pattern's bulk action) through the one gate; `tests/tui_key_list_writes_it.rs` on Redis and Valkey | **done**, #36 (stacked on #34), CI green |
+| Terminal 3 | Actions menu (`.`) built from the key table, with the command a write sends, `asks first` or the reason it is off; one confirm sheet docked to the bottom for the write gate, `w`, bulk, Monitor and the command line; a question opened by a reply waits half a second before it takes an answer | **done**, in its PR (stacked on Terminal 2) |
 | Terminal 4 | Go to (`ctrl-k`) | not started |
 | Terminal 5 | Browse in three panes from 120 columns | not started |
 | Terminal 6 | Overview and Server layouts that use their height | not started |
 | Dashboard 1 | Context bar (connection menu, access, database, node), colour roles, 28px density, the command line as a drawer | **done**, #33, CI green |
 | Dashboard 2 | Key grammar, Go to, the keys sheet, list navigation | **done**, #35 (stacked on #33) |
-| Dashboard 3 | Browse in three panes, its state in the URL | built, in review |
-| Dashboard 4 | Overview and Server layouts | not started |
+| Dashboard 3 | Browse in three panes, its state in the URL | **done**, #37 (stacked on #35), CI green |
+| Dashboard 4 | Overview and Server layouts, consistency across the other screens | built, review fixes in progress |
 | Docs | README, site, screenshots, changelog | not started |
 
 For the owner to decide: the grammar puts some destructive actions on lower-case keys and changes a few old habits. `d` on the key list deletes the selected key and `D` there starts the pattern's bulk delete; `t` on a hash field in the value pane is now the field's TTL (`T` is the key's); `d` on Clients ends the selected connection. Each still goes through the gate (read-only sends nothing, production asks for the typed name, a bulk action always does its dry run), but with `skip_non_prod_confirm` a single lower-case key deletes a key on a non-production profile.

@@ -54,9 +54,49 @@ pub enum Verb {
     FindKey,
     Command,
     Dashboard,
+    /// `.`: the Actions menu.
+    Actions,
     Quit,
     /// A screen's own verb, on a key the grammar leaves free.
     Screen,
+}
+
+/// Where an action sits in the Actions menu (`.`): with the selected row's actions,
+/// with its parent's (a field's key, a key's pattern), with the screen's own (sort,
+/// filter, refresh …), or not at all: moving, going somewhere and the keys that work
+/// everywhere are no action of the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    /// Not in the menu.
+    Nav,
+    Row,
+    Parent,
+    Screen,
+}
+
+/// The menu group a row of `verb` goes in unless its row says otherwise
+/// ([`KeyHelp::group`]): the lower-case verbs act on the selected row, the upper-case
+/// ones on its parent, and `+` adds to the parent (a field to its key, a key to its
+/// pattern).
+const fn group_of(verb: Verb) -> Group {
+    match verb {
+        Verb::Copy | Verb::Edit | Verb::Ttl | Verb::Delete | Verb::Rename | Verb::Format => {
+            Group::Row
+        }
+        Verb::CopyParent | Verb::TtlParent | Verb::DeleteParent | Verb::Add => Group::Parent,
+        // A screen's `enter` acts on its selected row (connect, open, list).
+        Verb::Open => Group::Row,
+        Verb::Sort
+        | Verb::More
+        | Verb::MoreRows
+        | Verb::Analyze
+        | Verb::Refresh
+        | Verb::Pause
+        | Verb::Snapshot
+        | Verb::Filter
+        | Verb::Screen => Group::Screen,
+        _ => Group::Nav,
+    }
 }
 
 /// The letters of the key grammar and the one verb each means wherever it is bound.
@@ -82,6 +122,7 @@ pub fn grammar(key: &str) -> Option<Verb> {
         "w" => Verb::Writes,
         "b" => Verb::Databases,
         "?" => Verb::Help,
+        "." => Verb::Actions,
         "0" | "1" | "2" | "3" | "4" | "5" => Verb::Area,
         _ => return None,
     })
@@ -103,6 +144,15 @@ pub struct KeyHelp {
     pub help: &'static str,
     /// Whether the footer may show it (it still has to fit, see [`footer`]).
     pub in_footer: bool,
+    /// Its group in the Actions menu (`.`); [`Group::Nav`] keeps it out.
+    pub group: Group,
+}
+
+impl KeyHelp {
+    /// The same row in menu group `g`.
+    const fn in_group(self, g: Group) -> Self {
+        KeyHelp { group: g, ..self }
+    }
 }
 
 const fn k(
@@ -120,6 +170,7 @@ const fn k(
         label,
         help,
         in_footer,
+        group: group_of(verb),
     }
 }
 
@@ -151,11 +202,21 @@ const HELP: KeyHelp = k(
     Verb::Help,
     "?",
     "?",
-    "Help",
-    "Help here; type to find any action",
+    "Keys",
+    "Every key here; type to search for an action",
     true,
 );
 const QUIT: KeyHelp = k(Verb::Quit, "q ctrl-c", "q", "Quit", "Quit", false);
+
+/// `.` from every screen: the focused pane's actions, each with its key.
+const ACTIONS_KEY: KeyHelp = k(
+    Verb::Actions,
+    ".",
+    ".",
+    "Actions",
+    "Actions of the selected row, its parent and the screen, with their keys",
+    true,
+);
 
 const COMMAND_LINE_KEY: KeyHelp = k(
     Verb::Command,
@@ -204,11 +265,12 @@ const WRITES_KEY: KeyHelp = k(
     true,
 );
 
-static GLOBAL: [KeyHelp; 10] = [
+static GLOBAL: [KeyHelp; 11] = [
     CONNECTIONS_KEY,
     AREAS,
     MORE,
     HELP,
+    ACTIONS_KEY,
     COMMAND_LINE_KEY,
     FIND_KEY,
     DATABASES_KEY,
@@ -350,7 +412,8 @@ const COPY_CMD: KeyHelp = k(
     "Copy cmd",
     "Copy a redis-cli --scan command for the pattern",
     false,
-);
+)
+.in_group(Group::Row);
 const ANALYZE: KeyHelp = k(
     Verb::Analyze,
     "a",
@@ -410,7 +473,7 @@ static CONNECTIONS: [KeyHelp; 8] = [
         "Connect: reads the server's own figures, no keys",
         true,
     ),
-    k(Verb::Add, "+", "+", "Add", "Add a connection", true),
+    k(Verb::Add, "+", "+", "Add", "Add a connection", true).in_group(Group::Screen),
     k(
         Verb::Filter,
         "/",
@@ -457,7 +520,8 @@ static OVERVIEW: [KeyHelp; 9] = [
         "Stop",
         "Stop the analysis and keep what it has sampled",
         true,
-    ),
+    )
+    .in_group(Group::Screen),
     k(
         Verb::Pause,
         "space",
@@ -473,7 +537,8 @@ static OVERVIEW: [KeyHelp; 9] = [
         "Interval",
         "Poll the live figures less or more often, 1 to 60 s",
         true,
-    ),
+    )
+    .in_group(Group::Nav),
     PICK_NODE,
 ];
 
@@ -655,7 +720,8 @@ static KEY_DETAIL: [KeyHelp; 17] = [
         "Value",
         "Move into the value pane",
         true,
-    ),
+    )
+    .in_group(Group::Nav),
     k(
         Verb::Back,
         "← h esc",
@@ -728,6 +794,7 @@ static KEY_DETAIL: [KeyHelp; 17] = [
         "Set or remove the key's TTL (writes)",
         false,
     ),
+    // On a value it renames the key the value is of: the parent's action.
     k(
         Verb::Rename,
         "R",
@@ -735,7 +802,8 @@ static KEY_DETAIL: [KeyHelp; 17] = [
         "Rename",
         "Rename the key, never over another (writes)",
         false,
-    ),
+    )
+    .in_group(Group::Parent),
     k(
         Verb::Delete,
         "d",
@@ -824,7 +892,8 @@ static SLOW_LOG: [KeyHelp; 10] = [
         "Threshold",
         "Change the slow log threshold or length (writes)",
         false,
-    ),
+    )
+    .in_group(Group::Screen),
     k(
         Verb::DeleteParent,
         "D",
@@ -855,8 +924,9 @@ static MONITOR: [KeyHelp; 8] = [
         "Start",
         "Start MONITOR (asks; stops at 30 s or 10,000 lines)",
         true,
-    ),
-    k(Verb::Back, "esc", "esc", "Stop", "Stop MONITOR now", true),
+    )
+    .in_group(Group::Screen),
+    k(Verb::Back, "esc", "esc", "Stop", "Stop MONITOR now", true).in_group(Group::Screen),
     COPY_LINE,
     PICK_NODE,
 ];
@@ -917,7 +987,8 @@ static STREAMS: [KeyHelp; 17] = [
         "Details",
         "Into the right pane: the details or an entry's value",
         true,
-    ),
+    )
+    .in_group(Group::Nav),
     LEFT,
     k(
         Verb::Open,
@@ -969,7 +1040,8 @@ static STREAMS: [KeyHelp; 17] = [
         "Claim",
         "Claim pending entries for another consumer (writes)",
         false,
-    ),
+    )
+    .in_group(Group::Row),
     k(
         Verb::Screen,
         "A",
@@ -977,7 +1049,8 @@ static STREAMS: [KeyHelp; 17] = [
         "Ack",
         "Acknowledge the selected pending entry (writes)",
         false,
-    ),
+    )
+    .in_group(Group::Row),
     k(
         Verb::Screen,
         "-",
@@ -985,7 +1058,8 @@ static STREAMS: [KeyHelp; 17] = [
         "Trim",
         "Trim the stream (writes)",
         false,
-    ),
+    )
+    .in_group(Group::Row),
 ];
 
 static PUBSUB: [KeyHelp; 13] = [
@@ -999,7 +1073,8 @@ static PUBSUB: [KeyHelp; 13] = [
         "Subscribe",
         "Subscribe to the selected channel",
         true,
-    ),
+    )
+    .in_group(Group::Row),
     k(
         Verb::Add,
         "+",
@@ -1007,7 +1082,8 @@ static PUBSUB: [KeyHelp; 13] = [
         "Sub",
         "Subscribe to a channel or pattern",
         true,
-    ),
+    )
+    .in_group(Group::Screen),
     k(
         Verb::Screen,
         "S",
@@ -1072,7 +1148,8 @@ static SEARCH: [KeyHelp; 17] = [
         "Details",
         "Into the right pane: the details or a result's value",
         true,
-    ),
+    )
+    .in_group(Group::Nav),
     LEFT,
     k(
         Verb::Filter,
@@ -1124,7 +1201,8 @@ static SEARCH: [KeyHelp; 17] = [
         "Create",
         "Create an index (writes)",
         true,
-    ),
+    )
+    .in_group(Group::Screen),
     k(
         Verb::Delete,
         "d",
@@ -1349,13 +1427,14 @@ pub fn footer(screen: Screen, c: FooterCtx) -> Vec<(&'static str, &'static str)>
     order.iter().map(|keys| find_key(screen, keys)).collect()
 }
 
-/// The keys at the right of the footer: `ctrl-f Find key  : Command  ? Help`, or only
-/// `? Help` before connecting.
+/// The keys at the right of the footer: `. Actions   ctrl-f Find key   ? Keys`, or
+/// `. Actions   ? Keys` before connecting (Find key needs a connection). `:` is not
+/// there: it still opens the command line, and `?` lists it.
 pub fn footer_right(connected: bool) -> Vec<(&'static str, &'static str)> {
     let keys: &[&str] = if connected {
-        &["ctrl-f", ":", "?"]
+        &[".", "ctrl-f", "?"]
     } else {
-        &["?"]
+        &[".", "?"]
     };
     keys.iter()
         .map(|k| find_key(Screen::Connections, k))
@@ -1366,10 +1445,10 @@ pub fn footer_right(connected: bool) -> Vec<(&'static str, &'static str)> {
 pub type Hint = (&'static str, &'static str);
 
 /// The footer as drawn `w` columns wide: [`footer`] and [`footer_right`], four columns
-/// apart at least. When they do not all fit, `: Command` goes first (`?` finds it), then
-/// the screen's keys from the end, so its first, most important ones stay; `ctrl-f` and
-/// `?` stay while anything fits. At 80 columns that leaves out at most one key of a
-/// screen; from 100 columns on nothing is left out.
+/// apart at least. When they do not all fit, `ctrl-f Find key` goes first, then
+/// `. Actions` (`?` lists both), then the screen's keys from the end, so its first,
+/// most important ones stay, and its way back (`esc`) last of all; `?` stays while
+/// anything fits. From 100 columns on nothing is left out.
 pub fn footer_fit(screen: Screen, c: FooterCtx, w: usize) -> (Vec<Hint>, Vec<Hint>) {
     let mut left = footer(screen, c);
     let mut right = footer_right(c.ready);
@@ -1377,8 +1456,10 @@ pub fn footer_fit(screen: Screen, c: FooterCtx, w: usize) -> (Vec<Hint>, Vec<Hin
         let rw = footer_right_width(r);
         footer_width(l) + if rw == 0 { 0 } else { 4 + rw } <= w
     };
-    if !fits(&left, &right) {
-        right.retain(|(k, _)| *k != ":");
+    for drop in ["ctrl-f", "."] {
+        if !fits(&left, &right) {
+            right.retain(|(k, _)| *k != drop);
+        }
     }
     // The screen's keys go from the end, but its way back (`esc`) goes last of all.
     while !left.is_empty() && !fits(&left, &right) {
@@ -1400,10 +1481,29 @@ pub fn footer_width(hints: &[(&str, &str)]) -> usize {
     1 + w + 3 * hints.len().saturating_sub(1)
 }
 
-/// Columns [`footer_right`] takes: two spaces between its keys.
+/// Columns [`footer_right`] takes: three spaces between its keys.
 pub fn footer_right_width(hints: &[(&str, &str)]) -> usize {
     let w: usize = hints.iter().map(|(k, l)| width(k) + 1 + width(l)).sum();
-    w + 2 * hints.len().saturating_sub(1)
+    w + 3 * hints.len().saturating_sub(1)
+}
+
+/// The rows of `screen`'s Actions menu (`.`) in `group`, in table order: the screen's
+/// rows of that group, and in [`Group::Screen`] the keys that work everywhere and act
+/// on the screen (`v`). Only rows of the table, so the menu never lists a key that
+/// does not exist; each runs by pressing its first key ([`first_key`]).
+pub fn menu(screen: Screen, group: Group) -> Vec<&'static KeyHelp> {
+    let mut out: Vec<&'static KeyHelp> = for_screen(screen)
+        .iter()
+        .filter(|h| h.group == group)
+        .collect();
+    if group == Group::Screen && screen != Screen::Connections {
+        out.extend(global().iter().filter(|h| h.group == Group::Screen));
+    }
+    // On Connections `w` is the selected connection's: its writes on or off.
+    if group == Group::Row && screen == Screen::Connections {
+        out.push(&WRITES_KEY);
+    }
+    out
 }
 
 /// One line of the `?` search: an action of a screen, a screen itself, or a key that
@@ -1758,9 +1858,9 @@ mod tests {
         assert_eq!(names(Screen::PubSub, FooterCtx::default()), ["Connections"]);
         assert_eq!(
             footer_right(true),
-            [("ctrl-f", "Find key"), (":", "Command"), ("?", "Help")]
+            [(".", "Actions"), ("ctrl-f", "Find key"), ("?", "Keys")]
         );
-        assert_eq!(footer_right(false), [("?", "Help")]);
+        assert_eq!(footer_right(false), [(".", "Actions"), ("?", "Keys")]);
     }
 
     /// The footer of a view that is off names no key that needs the view.
@@ -1997,15 +2097,15 @@ mod tests {
                     "{}: {left:?} of {all:?}",
                     v.title()
                 );
+                // `?` always stays; `ctrl-f` goes before `.`; `:` is never there.
                 let keys: Vec<&str> = right.iter().map(|h| h.0).collect();
-                if c.ready {
-                    assert!(
-                        keys.contains(&"ctrl-f") && keys.contains(&"?"),
-                        "{}: {keys:?}",
-                        v.title()
-                    );
-                } else {
-                    assert_eq!(keys, ["?"], "{}", v.title());
+                assert!(keys.contains(&"?"), "{}: {keys:?}", v.title());
+                assert!(!keys.contains(&":"), "{}: {keys:?}", v.title());
+                if keys.contains(&"ctrl-f") {
+                    assert!(keys.contains(&"."), "{}: {keys:?}", v.title());
+                }
+                if !c.ready {
+                    assert!(!keys.contains(&"ctrl-f"), "{}", v.title());
                 }
                 assert_eq!(
                     footer_fit(v, c, 100),
@@ -2017,27 +2117,41 @@ mod tests {
         }
     }
 
+    /// When the footer is tight, `ctrl-f` goes first, then `.`, then the screen's
+    /// keys from the end; `?` stays.
     #[test]
-    fn the_command_key_gives_way_before_the_screens_keys() {
+    fn the_right_side_gives_way_before_the_screens_keys() {
         let c = FooterCtx {
             ready: true,
             analyzed: true,
             more: true,
             ..FooterCtx::default()
         };
-        // The key list's five keys fit beside `ctrl-f` and `?` at 81 columns...
-        let (left, right) = footer_fit(Screen::KeyList, c, 81);
-        assert_eq!(left, footer(Screen::KeyList, c));
-        assert_eq!(right, [("ctrl-f", "Find key"), ("?", "Help")]);
-        // ...at 80 one more goes too, the last but the way back; with room, `:` is back.
-        let (left, _) = footer_fit(Screen::KeyList, c, 80);
-        assert_eq!(left.len(), 4);
+        let all = footer(Screen::KeyList, c);
+        let full = footer_width(&all) + 4 + footer_right_width(&footer_right(true));
+        assert_eq!(
+            footer_fit(Screen::KeyList, c, full),
+            (all.clone(), footer_right(true))
+        );
+        // One column short: `ctrl-f` goes, the screen's keys stay.
+        let (left, right) = footer_fit(Screen::KeyList, c, full - 1);
+        assert_eq!(left, all);
+        assert_eq!(right, [(".", "Actions"), ("?", "Keys")]);
+        // Shorter than that without `ctrl-f`: `.` goes next.
+        let no_find =
+            footer_width(&all) + 4 + footer_right_width(&[(".", "Actions"), ("?", "Keys")]);
+        let (left, right) = footer_fit(Screen::KeyList, c, no_find - 1);
+        assert_eq!(left, all);
+        assert_eq!(right, [("?", "Keys")]);
+        // Then the screen's keys, the way back last.
+        let only_help = footer_width(&all) + 4 + footer_right_width(&[("?", "Keys")]);
+        let (left, right) = footer_fit(Screen::KeyList, c, only_help - 1);
+        assert_eq!(left.len(), all.len() - 1);
         assert_eq!(left.last(), Some(&("esc", "Back")));
-        assert!(!left.contains(&("m", "More rows")), "{left:?}");
-        assert_eq!(footer_fit(Screen::KeyList, c, 100).1, footer_right(true));
-        // Before connecting the right side is `? Help` alone.
-        let (_, right) = footer_fit(Screen::Connections, FooterCtx::default(), 80);
-        assert_eq!(right, [("?", "Help")]);
+        assert_eq!(right, [("?", "Keys")]);
+        // Before connecting: `.` and `?`.
+        let (_, right) = footer_fit(Screen::Connections, FooterCtx::default(), 200);
+        assert_eq!(right, [(".", "Actions"), ("?", "Keys")]);
     }
 
     #[test]

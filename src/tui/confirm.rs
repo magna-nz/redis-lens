@@ -49,8 +49,9 @@ pub struct Confirm {
     pub expect: Expect,
     /// What was typed so far, for [`Expect::Type`].
     pub typed: String,
-    /// The profile it is about, and whether it is `prod`.
+    /// The profile it is about, its environment, and whether it is `prod`.
     pub profile: String,
+    pub env: Env,
     pub prod: bool,
 }
 
@@ -244,6 +245,7 @@ impl App {
             expect,
             typed: String::new(),
             profile: s.profile.name.clone(),
+            env: s.profile.env,
             prod: s.profile.env == Env::Prod,
         });
         Vec::new()
@@ -407,7 +409,8 @@ impl App {
         if !e.profile.is_read_only() {
             return self.set_writes(id, false);
         }
-        let prod = e.profile.env == Env::Prod;
+        let env = e.profile.env;
+        let prod = env == Env::Prod;
         let name = e.profile.name.clone();
         self.confirm = Some(Confirm {
             what: ConfirmFor::WritesOn { id },
@@ -418,6 +421,7 @@ impl App {
             },
             typed: String::new(),
             profile: name,
+            env,
             prod,
         });
         Vec::new()
