@@ -25,4 +25,4 @@ expression: t.backend()
 "│                           │                                                  │"
 "│                           │                                                  │"
 "└───────────────────────────┴──────────────────────────────────────────────────┘"
-" ↑↓ Move   → Value   f Format   y Copy   esc Back             . Actions   ? Keys"
+" ↑↓ Move   → Value   f Format   y Copy   esc Back              ^K Go to   ? Keys"

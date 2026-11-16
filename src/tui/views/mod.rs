@@ -579,14 +579,27 @@ impl<'a> Ctx<'a> {
     /// or not checked (yet). Never the server's own error text, which can name the
     /// ACL user.
     pub fn off_reason(&self) -> Option<String> {
-        let label = probe_of(self.screen)?;
-        match self.check(label)? {
-            PermStatus::Allowed => None,
-            PermStatus::Denied(_) => Some(format!(
-                "The server refused {label} for this user, so this view is off."
-            )),
-            PermStatus::Skipped(why) => Some(format!("{label} is not available: {why}.")),
-        }
+        probe_off(self.perms, self.screen)
+    }
+}
+
+/// Why `screen` is off by its permission probe ([`probe_of`]) in `perms`: `None` when
+/// it is on, or not checked (yet). Never the server's own error text, which can name
+/// the ACL user. [`Ctx::off_reason`] for the screen on show; Go to asks it of every
+/// screen it lists.
+pub fn probe_off(perms: Option<&PermissionReport>, screen: Screen) -> Option<String> {
+    let label = probe_of(screen)?;
+    let status = perms?
+        .checks
+        .iter()
+        .find(|c| c.label == label)
+        .map(|c| &c.status)?;
+    match status {
+        PermStatus::Allowed => None,
+        PermStatus::Denied(_) => Some(format!(
+            "The server refused {label} for this user, so this view is off."
+        )),
+        PermStatus::Skipped(why) => Some(format!("{label} is not available: {why}.")),
     }
 }
 

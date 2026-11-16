@@ -56,6 +56,8 @@ pub enum Verb {
     Dashboard,
     /// `.`: the Actions menu.
     Actions,
+    /// `ctrl-k`: the Go to box.
+    GoTo,
     Quit,
     /// A screen's own verb, on a key the grammar leaves free.
     Screen,
@@ -218,6 +220,16 @@ const ACTIONS_KEY: KeyHelp = k(
     true,
 );
 
+/// `ctrl-k` from every screen: the Go to box.
+const GOTO_KEY: KeyHelp = k(
+    Verb::GoTo,
+    "ctrl-k",
+    "^K",
+    "Go to",
+    "Go to a pattern, a loaded key, a screen or an action; reads nothing as you type",
+    true,
+);
+
 const COMMAND_LINE_KEY: KeyHelp = k(
     Verb::Command,
     ":",
@@ -227,13 +239,14 @@ const COMMAND_LINE_KEY: KeyHelp = k(
     true,
 );
 
+/// Not in the footer: the `?` help and Go to's Find row show it.
 const FIND_KEY: KeyHelp = k(
     Verb::FindKey,
     "ctrl-f",
     "ctrl-f",
     "Find key",
     "Find keys by name or pattern on the whole server",
-    true,
+    false,
 );
 
 const DATABASES_KEY: KeyHelp = k(
@@ -265,12 +278,13 @@ const WRITES_KEY: KeyHelp = k(
     true,
 );
 
-static GLOBAL: [KeyHelp; 11] = [
+static GLOBAL: [KeyHelp; 12] = [
     CONNECTIONS_KEY,
     AREAS,
     MORE,
     HELP,
     ACTIONS_KEY,
+    GOTO_KEY,
     COMMAND_LINE_KEY,
     FIND_KEY,
     DATABASES_KEY,
@@ -1427,16 +1441,12 @@ pub fn footer(screen: Screen, c: FooterCtx) -> Vec<(&'static str, &'static str)>
     order.iter().map(|keys| find_key(screen, keys)).collect()
 }
 
-/// The keys at the right of the footer: `. Actions   ctrl-f Find key   ? Keys`, or
-/// `. Actions   ? Keys` before connecting (Find key needs a connection). `:` is not
-/// there: it still opens the command line, and `?` lists it.
-pub fn footer_right(connected: bool) -> Vec<(&'static str, &'static str)> {
-    let keys: &[&str] = if connected {
-        &[".", "ctrl-f", "?"]
-    } else {
-        &[".", "?"]
-    };
-    keys.iter()
+/// The keys at the right of the footer: `. Actions   ^K Go to   ? Keys`, before
+/// connecting too. `ctrl-f` and `:` are not there: they still work, and `?` and Go to
+/// list them.
+pub fn footer_right() -> Vec<(&'static str, &'static str)> {
+    [".", "ctrl-k", "?"]
+        .iter()
         .map(|k| find_key(Screen::Connections, k))
         .collect()
 }
@@ -1445,18 +1455,18 @@ pub fn footer_right(connected: bool) -> Vec<(&'static str, &'static str)> {
 pub type Hint = (&'static str, &'static str);
 
 /// The footer as drawn `w` columns wide: [`footer`] and [`footer_right`], four columns
-/// apart at least. When they do not all fit, `ctrl-f Find key` goes first, then
-/// `. Actions` (`?` lists both), then the screen's keys from the end, so its first,
-/// most important ones stay, and its way back (`esc`) last of all; `?` stays while
-/// anything fits. From 100 columns on nothing is left out.
+/// apart at least. When they do not all fit, `. Actions` goes first, then `^K Go to`
+/// (`?` lists both), then the screen's keys from the end, so its first, most important
+/// ones stay, and its way back (`esc`) last of all; `?` stays while anything fits.
+/// From 100 columns on nothing is left out.
 pub fn footer_fit(screen: Screen, c: FooterCtx, w: usize) -> (Vec<Hint>, Vec<Hint>) {
     let mut left = footer(screen, c);
-    let mut right = footer_right(c.ready);
+    let mut right = footer_right();
     let fits = |l: &[(&str, &str)], r: &[(&str, &str)]| {
         let rw = footer_right_width(r);
         footer_width(l) + if rw == 0 { 0 } else { 4 + rw } <= w
     };
-    for drop in ["ctrl-f", "."] {
+    for drop in [".", "^K"] {
         if !fits(&left, &right) {
             right.retain(|(k, _)| *k != drop);
         }
@@ -1692,7 +1702,7 @@ mod tests {
     fn footer_is_a_subset_of_the_table() {
         for v in Screen::ALL {
             for c in contexts() {
-                for (key, label) in footer(v, c).into_iter().chain(footer_right(c.ready)) {
+                for (key, label) in footer(v, c).into_iter().chain(footer_right()) {
                     let hit = global()
                         .iter()
                         .chain(for_screen(v))
@@ -1857,10 +1867,9 @@ mod tests {
         );
         assert_eq!(names(Screen::PubSub, FooterCtx::default()), ["Connections"]);
         assert_eq!(
-            footer_right(true),
-            [(".", "Actions"), ("ctrl-f", "Find key"), ("?", "Keys")]
+            footer_right(),
+            [(".", "Actions"), ("^K", "Go to"), ("?", "Keys")]
         );
-        assert_eq!(footer_right(false), [(".", "Actions"), ("?", "Keys")]);
     }
 
     /// The footer of a view that is off names no key that needs the view.
@@ -2078,9 +2087,9 @@ mod tests {
         }
     }
 
-    /// At 80 columns every footer fits as [`footer_fit`] trims it: `ctrl-f` and `?`
-    /// always show once connected, `:` gives way first, and at most one of the
-    /// screen's keys is left out (the last but its way back). From 100 columns
+    /// At 80 columns every footer fits as [`footer_fit`] trims it: `?` always shows,
+    /// `.` gives way before `^K`, `ctrl-f` and `:` are never there, and at most one of
+    /// the screen's keys is left out (the last but its way back). From 100 columns
     /// nothing is left out.
     #[test]
     fn footer_fits_80_columns() {
@@ -2097,19 +2106,17 @@ mod tests {
                     "{}: {left:?} of {all:?}",
                     v.title()
                 );
-                // `?` always stays; `ctrl-f` goes before `.`; `:` is never there.
+                // `?` always stays; `.` goes before `^K`; `ctrl-f` and `:` are never there.
                 let keys: Vec<&str> = right.iter().map(|h| h.0).collect();
                 assert!(keys.contains(&"?"), "{}: {keys:?}", v.title());
                 assert!(!keys.contains(&":"), "{}: {keys:?}", v.title());
-                if keys.contains(&"ctrl-f") {
-                    assert!(keys.contains(&"."), "{}: {keys:?}", v.title());
-                }
-                if !c.ready {
-                    assert!(!keys.contains(&"ctrl-f"), "{}", v.title());
+                assert!(!keys.contains(&"ctrl-f"), "{}: {keys:?}", v.title());
+                if keys.contains(&".") {
+                    assert!(keys.contains(&"^K"), "{}: {keys:?}", v.title());
                 }
                 assert_eq!(
                     footer_fit(v, c, 100),
-                    (all, footer_right(c.ready)),
+                    (all, footer_right()),
                     "{} at 100 columns",
                     v.title()
                 );
@@ -2117,8 +2124,8 @@ mod tests {
         }
     }
 
-    /// When the footer is tight, `ctrl-f` goes first, then `.`, then the screen's
-    /// keys from the end; `?` stays.
+    /// When the footer is tight, `. Actions` goes first, then `^K Go to`, then the
+    /// screen's keys from the end; `?` stays.
     #[test]
     fn the_right_side_gives_way_before_the_screens_keys() {
         let c = FooterCtx {
@@ -2128,19 +2135,19 @@ mod tests {
             ..FooterCtx::default()
         };
         let all = footer(Screen::KeyList, c);
-        let full = footer_width(&all) + 4 + footer_right_width(&footer_right(true));
+        let full = footer_width(&all) + 4 + footer_right_width(&footer_right());
         assert_eq!(
             footer_fit(Screen::KeyList, c, full),
-            (all.clone(), footer_right(true))
+            (all.clone(), footer_right())
         );
-        // One column short: `ctrl-f` goes, the screen's keys stay.
+        // One column short: `.` goes, the screen's keys stay.
         let (left, right) = footer_fit(Screen::KeyList, c, full - 1);
         assert_eq!(left, all);
-        assert_eq!(right, [(".", "Actions"), ("?", "Keys")]);
-        // Shorter than that without `ctrl-f`: `.` goes next.
-        let no_find =
-            footer_width(&all) + 4 + footer_right_width(&[(".", "Actions"), ("?", "Keys")]);
-        let (left, right) = footer_fit(Screen::KeyList, c, no_find - 1);
+        assert_eq!(right, [("^K", "Go to"), ("?", "Keys")]);
+        // Shorter than that without `.`: `^K` goes next.
+        let no_menu =
+            footer_width(&all) + 4 + footer_right_width(&[("^K", "Go to"), ("?", "Keys")]);
+        let (left, right) = footer_fit(Screen::KeyList, c, no_menu - 1);
         assert_eq!(left, all);
         assert_eq!(right, [("?", "Keys")]);
         // Then the screen's keys, the way back last.
@@ -2149,9 +2156,9 @@ mod tests {
         assert_eq!(left.len(), all.len() - 1);
         assert_eq!(left.last(), Some(&("esc", "Back")));
         assert_eq!(right, [("?", "Keys")]);
-        // Before connecting: `.` and `?`.
+        // Before connecting: the same three.
         let (_, right) = footer_fit(Screen::Connections, FooterCtx::default(), 200);
-        assert_eq!(right, [(".", "Actions"), ("?", "Keys")]);
+        assert_eq!(right, footer_right());
     }
 
     #[test]

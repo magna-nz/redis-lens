@@ -37,4 +37,4 @@ expression: t.backend()
 "│                                                                         │                                            │"
 "│ Estimated from 100,000 sampled keys of 7.92M. v shows more columns.     │                                            │"
 "└─ ▲ possible sampling bias (keysizes) · no MEMORY STATS: denied · exac…──┴────────────────────────────────────────────┘"
-" ↑↓ Move   → Open   / Filter   s Sort   tab Next panel                              . Actions   ctrl-f Find key   ? Keys"
+" ↑↓ Move   → Open   / Filter   s Sort   tab Next panel                                     . Actions   ^K Go to   ? Keys"

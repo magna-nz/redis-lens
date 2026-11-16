@@ -184,6 +184,7 @@ impl App {
                 v.keys.open_find(glob, &nodes, act);
             })
             .map_or_else(Vec::new, |(_, e)| e);
+        self.list_db = None;
         if self.screen() == Screen::KeyList {
             // Already on the key list: `switch` would tell the view nothing.
             out.extend(self.on_active("show", |v, act| v.on_show(act)));
@@ -630,7 +631,7 @@ mod tests {
         let mut app = results();
         assert_eq!(app.views.keys.rows.len(), 3);
         assert_eq!(app.views.keys.other_pattern, 0);
-        assert!(last_line(&app, 120, 36).contains("ctrl-f Find key"));
+        assert!(last_line(&app, 120, 36).contains("^K Go to"));
         let foot = text(&testing::render(&app, 120, 36));
         assert!(foot.contains("3 loaded. m loads 1,000 more."), "{foot}");
         assert!(foot.contains("‹ Find: *cart*"), "{foot}");

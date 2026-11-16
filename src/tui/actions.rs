@@ -188,10 +188,17 @@ impl App {
         h.finish()
     }
 
+    /// True when what a list of lines was built for (`target`, from
+    /// [`App::menu_target`] on `screen`) is no longer what is on screen: the menu and
+    /// Go to's ACTIONS rows then run nothing.
+    pub(super) fn target_moved(&self, screen: Screen, target: u64) -> bool {
+        self.menu_target(screen) != target
+    }
+
     /// Closes the menu when what it was opened on changed, saying so.
     pub(super) fn check_menu(&mut self) {
         if let Some(m) = self.menu
-            && self.menu_target(m.screen) != m.target
+            && self.target_moved(m.screen, m.target)
         {
             self.close_menu_changed();
         }
@@ -335,6 +342,13 @@ impl App {
             return Vec::new();
         }
         self.menu = None;
+        self.press_line(line)
+    }
+
+    /// Presses `line`'s key on the screen, through every check that key meets; a line
+    /// that is off only shows its reason. What the menu and Go to's ACTIONS rows run,
+    /// once they are closed and have checked the line is for what is on screen.
+    pub(super) fn press_line(&mut self, line: MenuLine) -> Vec<Effect> {
         if let Status::Off(why) = &line.status {
             self.set_info(why.clone());
             return Vec::new();
