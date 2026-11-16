@@ -81,7 +81,7 @@ async fn server(valkey: bool) -> common::TestServer {
     }
 }
 
-/// One page of a find for `text`, as `enter` and `n` ask for it.
+/// One page of a find for `text`, as `enter` and `m` ask for it.
 async fn find_page(
     c: &mut MultiplexedConnection,
     text: &str,
@@ -101,7 +101,7 @@ async fn find_page(
     }
 }
 
-/// Every page of a find, as `n` loads them.
+/// Every page of a find, as `m` loads them.
 async fn find_all(c: &mut MultiplexedConnection, text: &str) -> Vec<Page> {
     let mut out = Vec::new();
     let (mut cursor, mut carry) = (0, Vec::new());
@@ -264,7 +264,7 @@ async fn a_backslash_in_the_text_is_matched_as_itself() {
 }
 
 #[tokio::test]
-async fn n_loads_a_thousand_matching_keys_at_a_time_until_every_one_is_listed() {
+async fn m_loads_a_thousand_matching_keys_at_a_time_until_every_one_is_listed() {
     const KEYS: usize = 2_500;
     for valkey in [false, true] {
         let s = server(valkey).await;

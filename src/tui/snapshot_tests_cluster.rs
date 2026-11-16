@@ -125,14 +125,14 @@ fn nodes_healthy_three_shards() {
     show(&mut app, Screen::Nodes);
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    // The sub-tab row names it.
-    assert!(lines[2].contains("Nodes"), "{}", lines[2]);
-    assert!(lines[3].starts_with("┌─ Nodes "), "{}", lines[3]);
-    assert!(lines[3].contains("3 shards"), "{}", lines[3]);
+    // The area row names it.
+    assert!(lines[1].contains("Nodes"), "{}", lines[1]);
+    assert!(lines[2].starts_with("┌─ Nodes "), "{}", lines[2]);
+    assert!(lines[2].contains("3 shards"), "{}", lines[2]);
     for (row, slots, ep) in [
-        (5, "0-5460", "10.0.1.11:6379"),
-        (6, "5461-10922", "10.0.1.12:6379"),
-        (7, "10923-16383", "10.0.1.13:6379"),
+        (4, "0-5460", "10.0.1.11:6379"),
+        (5, "5461-10922", "10.0.1.12:6379"),
+        (6, "10923-16383", "10.0.1.13:6379"),
     ] {
         let l = &lines[row];
         assert!(l.contains(slots) && l.contains(ep), "{l}");
@@ -140,13 +140,13 @@ fn nodes_healthy_three_shards() {
     }
     // Columns line up with the header.
     for col in ["NODE", "ROLE", "STATE"] {
-        let at = column_of(&lines, 4, col);
+        let at = column_of(&lines, 3, col);
         let first = match col {
             "NODE" => "10.0.1.11",
             "ROLE" => "primary",
             _ => "✓ analyzed",
         };
-        assert_eq!(column_of(&lines, 5, first), at, "{col}");
+        assert_eq!(column_of(&lines, 4, first), at, "{col}");
     }
     assert_eq!(colour_of(&t, "✓ analyzed"), TEAL);
     // The detail section is the selected (first) node's, under the list in the same frame.
@@ -164,16 +164,19 @@ fn nodes_with_a_failed_and_a_partial_node() {
     press(&mut app, "G");
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[3].contains("1 failed · 1 partial"), "{}", lines[3]);
+    assert!(lines[2].contains("1 failed · 1 partial"), "{}", lines[2]);
     // Failed red, partial amber, notes in the same colours.
-    assert_eq!(colour_at(&t, "│ 10923-16383", "✗", 40), RED);
-    assert_eq!(colour_at(&t, "│ 5461-10922", "▲", 40), AMBER);
+    assert_eq!(colour_at(&t, "│ › 10923-16383", "✗", 40), RED);
+    assert_eq!(colour_at(&t, "│   5461-10922", "▲", 40), AMBER);
     assert_eq!(colour_of(&t, fixtures::NOTE_UNREACHABLE), RED);
     // The failed node has no server figures and no sample.
-    let failed = lines.iter().find(|l| l.contains("│ 10923-16383")).unwrap();
+    let failed = lines
+        .iter()
+        .find(|l| l.contains("│ › 10923-16383"))
+        .unwrap();
     assert_eq!(failed.matches('—').count(), 2, "{failed}");
     // The failed node is selected: its whole note is in the details, which may wrap it.
-    let detail = lines[8..].join(" ");
+    let detail = lines[7..].join(" ");
     for word in fixtures::NOTE_UNREACHABLE.split_whitespace() {
         assert!(detail.contains(word), "{word}: {detail}");
     }
@@ -207,11 +210,11 @@ fn nodes_with_replicas_scanned() {
     press(&mut app, "G");
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[3].contains("2 read on replicas"), "{}", lines[3]);
-    assert!(lines[5].contains("10.0.1.21:6379") && lines[5].contains("replica"));
-    assert!(lines[6].contains("10.0.1.22:6379") && lines[6].contains("replica"));
+    assert!(lines[2].contains("2 read on replicas"), "{}", lines[2]);
+    assert!(lines[4].contains("10.0.1.21:6379") && lines[4].contains("replica"));
+    assert!(lines[5].contains("10.0.1.22:6379") && lines[5].contains("replica"));
     // The shard whose replica could not be used: its primary, with the reason.
-    assert!(lines[7].contains("10.0.1.13:6379") && lines[7].contains("primary"));
+    assert!(lines[6].contains("10.0.1.13:6379") && lines[6].contains("primary"));
     assert!(text(&t).contains("▲ replica not used: 10.0.1.23:6379: timed out"));
     // Not degraded: the summary in the header is dim.
     assert_eq!(colour_of(&t, REPLICAS), DIM);
@@ -234,8 +237,8 @@ fn nodes_narrow_80x24_and_60x20() {
             assert_eq!(l.chars().count(), usize::from(w), "{l}");
         }
         // Slots and endpoints always show; the note is in the details, not the list.
-        assert!(lines[5].contains("0-5460") && lines[5].contains("10.0.1.11:6379"));
-        assert!(!lines[4].contains("NOTE"), "{}", lines[4]);
+        assert!(lines[4].contains("0-5460") && lines[4].contains("10.0.1.11:6379"));
+        assert!(!lines[3].contains("NOTE"), "{}", lines[3]);
         snap.push_str(&format!("{w}x{h}:\n{}\n\n", lines.join("\n")));
     }
     insta::assert_snapshot!(snap);
@@ -322,7 +325,7 @@ fn patterns_narrowed_to_a_node() {
     });
     // Δ is one of the `v` columns.
     app.handle_key(ch('v'));
-    assert!(buffer_lines(&render(&app, 120, 36))[4].contains('Δ'));
+    assert!(buffer_lines(&render(&app, 120, 36))[3].contains('Δ'));
     show(&mut app, Screen::Nodes);
     press(&mut app, "j");
     app.handle_key(key(KeyCode::Enter));
@@ -330,23 +333,23 @@ fn patterns_narrowed_to_a_node() {
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
     assert!(
-        lines[3].starts_with("┌─ Patterns · node 10.0.1.12:6379 "),
+        lines[2].starts_with("┌─ Patterns · node 10.0.1.12:6379 "),
         "{}",
-        lines[3]
+        lines[2]
     );
-    assert!(lines[3].contains("esc for all nodes"), "{}", lines[3]);
-    assert!(!lines[4].contains('Δ'), "{}", lines[4]);
+    assert!(lines[2].contains("esc for all nodes"), "{}", lines[2]);
+    assert!(!lines[3].contains('Δ'), "{}", lines[3]);
     // At 60 wide the title still names the node.
     let narrow = buffer_lines(&render(&app, 60, 20));
-    assert!(narrow[3].contains("node 10.0.1.12"), "{}", narrow[3]);
+    assert!(narrow[2].contains("node 10.0.1.12"), "{}", narrow[2]);
     // esc: back to Nodes, then the merged rows with their Δ column on 1.
     app.handle_key(key(KeyCode::Esc));
     assert_eq!(app.screen(), Screen::Nodes);
-    app.handle_key(ch('2'));
+    crate::tui::app::views::testing::area(&mut app, '2');
     let back = buffer_lines(&render(&app, 120, 36));
-    assert!(back[3].starts_with("┌─ Patterns "), "{}", back[3]);
-    assert!(!back[3].contains("node"), "{}", back[3]);
-    assert!(back[4].contains('Δ'), "{}", back[4]);
+    assert!(back[2].starts_with("┌─ Patterns "), "{}", back[2]);
+    assert!(!back[2].contains("node"), "{}", back[2]);
+    assert!(back[3].contains('Δ'), "{}", back[3]);
     insta::assert_snapshot!(t.backend());
 }
 
@@ -357,14 +360,14 @@ fn hot_keys_with_the_node_column() {
     press(&mut app, "j");
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[4].contains("NODE"), "{}", lines[4]);
-    let node_col = column_of(&lines, 4, "NODE");
+    assert!(lines[3].contains("NODE"), "{}", lines[3]);
+    let node_col = column_of(&lines, 3, "NODE");
     // Each key shows the node it was sampled on, under the heading.
     let report = app.report().unwrap();
     let nodes = report.nodes.as_ref().unwrap();
     for (i, k) in report.hot_keys.iter().enumerate() {
         let ep = nodes[usize::from(k.node.unwrap())].endpoint.to_string();
-        assert_eq!(column_of(&lines, 5 + i, &ep), node_col, "{}", lines[5 + i]);
+        assert_eq!(column_of(&lines, 4 + i, &ep), node_col, "{}", lines[4 + i]);
     }
     // The detail panel names the selected key's node too.
     assert!(text(&t).contains(" Node    10.0.1.12:6379"), "{}", text(&t));
@@ -374,7 +377,7 @@ fn hot_keys_with_the_node_column() {
     let (mut plain, _) = cluster_scanned(standalone, HEALTHY);
     show(&mut plain, Screen::HotKeys);
     let plain_lines = buffer_lines(&render(&plain, 120, 36));
-    assert!(!plain_lines[4].contains("NODE"), "{}", plain_lines[4]);
+    assert!(!plain_lines[3].contains("NODE"), "{}", plain_lines[3]);
     insta::assert_snapshot!(t.backend());
 }
 
@@ -385,12 +388,13 @@ fn hot_keys_node_column_cuts_a_long_address() {
     let (mut app, _) = cluster_scanned(report, HEALTHY);
     show(&mut app, Screen::HotKeys);
     let lines = buffer_lines(&render(&app, 120, 36));
-    let row = &lines[5];
+    let row = &lines[4];
     // Cut to 15 cells, and a cell stays free before the pattern.
     assert!(row.contains(" cache-node-000… "), "{row}");
 }
 
-/// The header (the header line, the tabs and the sub-tabs) of `app` drawn `w` wide.
+/// The two chrome rows (the context bar and the area row) and the body's top border
+/// of `app` drawn `w` wide.
 fn header(app: &App, w: u16) -> String {
     buffer_lines(&render(app, w, 24))[..3].join("\n")
 }
@@ -506,7 +510,7 @@ fn every_cluster_screen_at_every_size_does_not_panic() {
     let (mut app, _) = cluster_scanned(odd, HEALTHY);
     show(&mut app, Screen::HotKeys);
     let lines = buffer_lines(&render(&app, 120, 36));
-    assert!(lines[5].contains(" —  "), "{}", lines[5]);
+    assert!(lines[4].contains(" —  "), "{}", lines[4]);
 }
 
 #[test]
@@ -531,8 +535,8 @@ fn a_seed_only_scan_is_amber_everywhere_it_is_summed_up() {
     show(&mut app, Screen::Nodes);
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
-    assert!(lines[5].starts_with("│ —  "), "{}", lines[5]);
-    let detail = lines[8..36].join(" ");
+    assert!(lines[4].starts_with("│ › —  "), "{}", lines[4]);
+    let detail = lines[7..36].join(" ");
     for word in crate::conn::cluster::SHARDS_UNREADABLE.split_whitespace() {
         assert!(detail.contains(word), "{word}: {detail}");
     }
@@ -835,7 +839,7 @@ fn a_classic_tail_is_not_opened_on_a_node_discovery_did_not_use() {
     app.handle_key(ch(']'));
     app.handle_key(ch(']'));
     assert_eq!(app.session.as_ref().unwrap().picked, 2);
-    let mut effects = app.handle_key(ch('s'));
+    let mut effects = app.handle_key(ch('+'));
     effects.extend(press_all(&mut app, "news"));
     effects.extend(app.handle_key(key(KeyCode::Enter)));
     assert!(!opens_its_own_connection(&effects), "{effects:?}");
@@ -843,7 +847,7 @@ fn a_classic_tail_is_not_opened_on_a_node_discovery_did_not_use() {
     assert!(all.contains(NODE_3_NOT_CONNECTED), "{all}");
     // On a connected node the same keys do subscribe.
     app.handle_key(ch('['));
-    let mut effects = app.handle_key(ch('s'));
+    let mut effects = app.handle_key(ch('+'));
     effects.extend(press_all(&mut app, "news"));
     effects.extend(app.handle_key(key(KeyCode::Enter)));
     assert!(
@@ -897,7 +901,7 @@ fn the_pick_lasts_across_a_rescan_that_keeps_its_node() {
     assert_eq!(app.session.as_ref().unwrap().picked, 2);
     // A rescan whose list still has the node (same ID and address): kept.
     show(&mut app, Screen::Patterns);
-    app.handle_key(ch('r'));
+    app.handle_key(ch('a'));
     let scan = scan_of(&app);
     app.apply(Msg::Nodes {
         id,
@@ -1119,14 +1123,14 @@ fn the_key_list_walks_every_primary_in_slot_order_one_node_at_a_time() {
     let p = pages(&effects);
     assert_eq!((p[0].1.clone(), p[0].2), (never(1), 0));
     assert_eq!(app.views.keys.nodes_done, 1);
-    // Node 1 has more: its cursor is kept, and nothing is sent until `n`.
+    // Node 1 has more: its cursor is kept, and nothing is sent until `m`.
     let effects = answer(
         &mut app,
         p[0].0,
         page_reply(vec![key_row("user:2:cart")], 77),
     );
     assert!(pages(&effects).is_empty(), "{effects:?}");
-    let effects = app.handle_key(ch('n'));
+    let effects = app.handle_key(ch('m'));
     let p = pages(&effects);
     assert_eq!(
         p.iter()
@@ -1146,9 +1150,9 @@ fn the_key_list_walks_every_primary_in_slot_order_one_node_at_a_time() {
         p[0].0,
         page_reply(vec![key_row("user:4:cart"), key_row("user:5:cart")], 0),
     );
-    // Every node is done: nothing more is sent, `n` included.
+    // Every node is done: nothing more is sent, `m` included.
     assert!(pages(&effects).is_empty(), "{effects:?}");
-    assert!(pages(&app.handle_key(ch('n'))).is_empty());
+    assert!(pages(&app.handle_key(ch('m'))).is_empty());
     let k = &app.views.keys;
     assert_eq!(k.nodes_done, 3);
     for (key, node) in [

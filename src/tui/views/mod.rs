@@ -70,7 +70,7 @@
 //! # Drawing
 //!
 //! `ui/<view>.rs` has `pub fn draw(frame: &mut Frame, area: Rect, state: &State,
-//! ctx: &Ctx<'_>)`. `area` is the body between the header (with the tab bar) and the
+//! ctx: &Ctx<'_>)`. `area` is the body between the area row and the
 //! key bar. `ctx.screen` says which panel to draw. Big keys is drawn only once an
 //! analysis has finished (`ctx.report()` is `Some`).
 //!
@@ -856,8 +856,8 @@ pub mod testing {
         }
     }
 
-    /// Goes to `screen` with keys, as a user would: its area's digit, then `tab` to the
-    /// panel; for the key list, `enter` on the first pattern row of Browse › Keys. For
+    /// Goes to `screen` with keys, as a user would: its area's digit (unless the area is
+    /// on screen already), then `tab` to the panel; for the key list, `enter` on the first pattern row of Browse › Keys. For
     /// the key detail, `enter` on the key list's selected key; when no key is loaded,
     /// [`key_row`] is put into the list first.
     pub fn show(app: &mut App, screen: Screen) -> Vec<Effect> {
@@ -873,10 +873,16 @@ pub mod testing {
             assert_eq!(app.screen(), screen);
             return out;
         }
-        let mut out = app.handle_key(KeyEvent::new(
-            KeyCode::Char(screen.area().digit()),
-            KeyModifiers::NONE,
-        ));
+        // The current area's digit again would move to its next panel: pressed only to
+        // come from another area.
+        let mut out = if app.screen().area() == screen.area() {
+            Vec::new()
+        } else {
+            app.handle_key(KeyEvent::new(
+                KeyCode::Char(screen.area().digit()),
+                KeyModifiers::NONE,
+            ))
+        };
         if screen == Screen::KeyList && app.screen() == Screen::KeyDetail {
             out.extend(app.handle_key(key(KeyCode::Esc)));
         } else if screen == Screen::KeyList && app.screen() == Screen::Patterns {
@@ -902,6 +908,15 @@ pub mod testing {
         }
         assert_eq!(app.screen(), screen);
         out
+    }
+
+    /// The area of digit `c`, as a test that goes "to Browse" means it: the digit is
+    /// pressed only from another area (on its own area it moves to the next panel).
+    pub fn area(app: &mut App, c: char) -> Vec<Effect> {
+        if crate::tui::app::Area::of_digit(c) == Some(app.screen().area()) {
+            return Vec::new();
+        }
+        app.handle_key(key(KeyCode::Char(c)))
     }
 
     /// A scanned app with the live connection ready, on `screen`. Returns the effects

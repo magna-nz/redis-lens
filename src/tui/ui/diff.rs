@@ -17,7 +17,8 @@ use super::analysis::{
 };
 use super::delta::{Change, cause_words, ratio_change, signed_bytes, signed_percent};
 use super::widgets::{
-    Pane, Title, fit, marquee_spans, pad_l, pad_r, pattern_spans, rows, scroll_offset, split_frame,
+    Pane, Title, fit, gutter_area, list, marquee_spans, pad_l, pad_r, pattern_spans, rows,
+    scroll_offset, split_frame,
 };
 use super::{mark_previous, spinner, style};
 
@@ -103,7 +104,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                     style::fgb(),
                 ),
                 line(
-                    " Press s to save one; the next analysis compares against it.".to_string(),
+                    " Press ctrl-s to save one; the next analysis compares against it.".to_string(),
                     style::dim(),
                 ),
             ],
@@ -171,7 +172,13 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, d: &ReportDiff) {
     let trend = app.trend();
     let trend_w = trend_width(trend);
     let cols = columns(trend_w);
-    let (keep, name) = pick_cols(&cols, usize::from(left.width), WIDE_AT, more);
+    // The columns start after the marker gutter.
+    let (keep, name) = pick_cols(
+        &cols,
+        usize::from(gutter_area(left).width),
+        super::widgets::after_gutter(WIDE_AT),
+        more,
+    );
     // A pattern's bar and trend are for `v`; without a trend there is no such column.
     let keep: Vec<usize> = keep
         .into_iter()
@@ -179,7 +186,7 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, d: &ReportDiff) {
         .collect();
     rows(
         frame,
-        left,
+        gutter_area(left),
         vec![head_row(&cols, &keep, name, &[DELTA, PCT, NOW, BEFORE])],
         None,
     );
@@ -207,7 +214,7 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, d: &ReportDiff) {
             diff_row(&keep, &cols, p, max, name, spark, scroll)
         })
         .collect();
-    rows(frame, body, lines, Some(sel - off));
+    list(frame, body, lines, Some(sel - off));
     detail_lines(frame, detail, p, trend, more.then(|| header(d)));
 }
 
@@ -554,7 +561,7 @@ mod tests {
                 s.contains("Changes compares this analysis with the last snapshot."),
                 "{s}"
             );
-            assert!(s.contains("r  Analyze: "), "{s}");
+            assert!(s.contains("a  Analyze: "), "{s}");
             insta::assert_snapshot!(format!("changes_no_analysis_{w}x{h}"), s);
         }
     }

@@ -1,10 +1,13 @@
 //! Pure rendering: `draw(frame, &app)` paints the whole screen from the state.
 //!
-//! The chrome, from the mockups: a one-line header (the connection and its status), the
-//! tab row of the areas (`0 Connections │ 1 Overview 2 Browse 3 Analyze 4 Server
-//! 5 Pub/Sub`), a sub-tab row on the areas with panels, the body, and a one-line footer
-//! with the 3 to 5 keys of the screen and `ctrl-f Find key  : Command  ? Help` on the
-//! right (the `ctrl-f` prompt takes its place while it is open). Dialogs
+//! The chrome, from the mockups: two rows on top, the body, and a one-line footer. Row 1
+//! is the context bar (the connection, its environment, ` w ` and its access, ` b ` and
+//! its database, the picked node on a cluster, the server's figures, the status on the
+//! right). Row 2 is the areas with the current area's panels inline (`1 Overview
+//! 2 Browse › Keys · Streams · Search 3 Analyze 4 Server 5 Pub/Sub`, `0 Connections` at
+//! the right). The footer has the 3 to 5 keys of the screen and `ctrl-f Find key
+//! : Command  ? Help` on the right (the `ctrl-f` prompt takes its place while it is
+//! open). Dialogs
 //! (the write gate's question, a bulk action, the database list, "Analyze the keys?",
 //! `?`) draw over the screen dimmed.
 
@@ -53,22 +56,20 @@ pub fn spinner(tick: u64) -> &'static str {
     SPINNER[(tick % SPINNER.len() as u64) as usize]
 }
 
-/// The header, the tab row, the sub-tab row (empty without panels), the body and the
-/// footer.
-fn layout(area: Rect, sub_tabs: bool) -> [Rect; 5] {
+/// The context bar, the area row, the body and the footer.
+fn layout(area: Rect) -> [Rect; 4] {
     Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(u16::from(sub_tabs)),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
     .areas(area)
 }
 
-/// The body of a screen of `area`'s size on an area with panels or without.
-pub fn body_of(area: Rect, sub_tabs: bool) -> Rect {
-    layout(area, sub_tabs)[3]
+/// The body of a screen of `area`'s size: under the two chrome rows, above the footer.
+pub fn body_of(area: Rect) -> Rect {
+    layout(area)[2]
 }
 
 /// Rows of details under the Connections list (`ui/connections.rs`).
@@ -101,7 +102,7 @@ const SLOTS_RANGES: usize = 5;
 ///   column header (and the status line above it where there is one).
 pub fn list_rows(area: Rect, app: &App) -> usize {
     let screen = app.screen();
-    let mut body = body_of(area, screen.area().has_panels());
+    let mut body = body_of(area);
     if screen == Screen::Connections {
         // Less the dashboard line, while there is one.
         body = connections::split_dashboard(body, app).0;
@@ -153,10 +154,10 @@ fn value_item_rows(h: usize) -> usize {
 }
 
 /// List rows a Browse list (Patterns, a pattern's keys, Streams, Search) shows on a
-/// screen of `area`: the body under the sub-tab row less the frame's two borders, the
-/// header row and the bottom line.
+/// screen of `area`: the body less the frame's two borders, the header row and the
+/// bottom line.
 pub fn browse_rows(area: Rect) -> usize {
-    usize::from(body_of(area, true).height.saturating_sub(4))
+    usize::from(body_of(area).height.saturating_sub(4))
 }
 
 /// True while a dialog is open over the screen: the screen behind it is dimmed.
@@ -170,12 +171,9 @@ pub fn dialog_open(app: &App) -> bool {
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let full = frame.area();
-    let [head, tab_row, sub_row, body, foot] = layout(full, app.area.has_panels());
+    let [head, area_row, body, foot] = layout(full);
     header(frame, head, app);
-    tabs(frame, tab_row, app);
-    if app.area.has_panels() {
-        sub_tabs(frame, sub_row, app);
-    }
+    areas(frame, area_row, app);
     let screen = app.screen();
     match screen {
         Screen::Connections => connections::draw(frame, body, app),
@@ -469,8 +467,9 @@ pub fn hh_mm(unix: i64) -> String {
     format!("{:02}:{:02}", s / 3600, (s % 3600) / 60)
 }
 
-/// The one header line: the connection's name, environment, write state, then as much
-/// of address, server version, memory and keys as fits, and the status on the right.
+/// The context bar: the connection's name, environment, ` w ` and the write state,
+/// ` b ` and the database, the picked node on a cluster, then as much of the address,
+/// server version, memory and keys as fits, and the status on the right.
 fn header(frame: &mut Frame, area: Rect, app: &App) {
     let w = usize::from(area.width);
     let line = match &app.session {
@@ -494,22 +493,113 @@ fn connected_header(app: &App, s: &Session, w: usize) -> Line<'static> {
     let p = &s.profile;
     let mut left = vec![
         Span::styled(format!(" {}", trunc(&p.name, 24)), style::fgb()),
-        Span::raw("  "),
+        // The badge and the key cap carry their own padding: one space between.
+        Span::raw(" "),
         Span::styled(format!(" {} ", p.env.label()), style::env_badge(p.env)),
-        Span::raw("  "),
+        Span::raw(" "),
+        Span::styled(" w ", style::key()),
+        Span::raw(" "),
         write_state(p),
     ];
-    // The optional parts, in the order they show, each with the rank it keeps its place
-    // by when the line is short (lowest first).
+    let parts = header_parts(app, s);
+    // The status's time gives way first: it is cut to `14:02`, then left out, before
+    // any part but the address and the version (shown only when they fit) is dropped
+    // or cut.
+    for clock in [Clock::Utc, Clock::Short, Clock::Off] {
+        let right = status(app, s, clock);
+        let (keep, whole) = fit_parts(&mut parts.clone(), spans_width(&left), &right, w);
+        if whole || clock == Clock::Off {
+            let mut after_fact = false;
+            for part in keep {
+                let sep = if part.chip || !after_fact {
+                    "   "
+                } else {
+                    " · "
+                };
+                after_fact = !part.chip;
+                left.push(Span::styled(sep, style::dim()));
+                left.extend(part.spans);
+            }
+            return justify(left, right, w);
+        }
+    }
+    unreachable!("the last clock always returns")
+}
+
+/// One optional part of the context bar, after the name, the badge and the access.
+#[derive(Debug, Clone)]
+struct Part {
+    /// The rank it keeps its place by when the line is short (lowest first).
+    rank: u8,
+    spans: Vec<Span<'static>>,
+    /// A control with its key cap (` b ` db, `[ ]` node): three spaces before it, and
+    /// before the first fact after it. Facts are joined by ` · `.
+    chip: bool,
+    /// Cut rather than dropped when it does not fit whole (the keychain hint, a
+    /// cluster's summary): at most one part is.
+    cut: bool,
+}
+
+impl Part {
+    fn chip(rank: u8, spans: Vec<Span<'static>>) -> Self {
+        Self {
+            rank,
+            spans,
+            chip: true,
+            cut: false,
+        }
+    }
+
+    fn fact(rank: u8, span: Span<'static>) -> Self {
+        Self {
+            rank,
+            spans: vec![span],
+            chip: false,
+            cut: false,
+        }
+    }
+
+    fn cut(mut self) -> Self {
+        self.cut = true;
+        self
+    }
+
+    fn width(&self) -> usize {
+        spans_width(&self.spans)
+    }
+}
+
+/// The context bar's optional parts in the order they show: ` b ` and the database,
+/// the picked node on a cluster, then the facts.
+fn header_parts(app: &App, s: &Session) -> Vec<Part> {
+    let p = &s.profile;
+    // Database 0, the default, shows when it fits, as the address does; any other is
+    // kept before the figures.
+    let db_rank = if p.db == 0 { DB0_RANK } else { 0 };
+    let mut parts = vec![Part::chip(
+        db_rank,
+        vec![
+            Span::styled(" b ", style::key()),
+            Span::styled(format!(" db {}", p.db), style::fg()),
+        ],
+    )];
+    if let Some(node) = s.node_title() {
+        parts.push(Part::chip(
+            2,
+            vec![
+                Span::styled(" [ ] ", style::key()),
+                Span::styled(format!(" {node}"), style::fg()),
+            ],
+        ));
+    }
     let cluster = match &s.target {
         Some(ScanTarget::Cluster(summary)) => Some(summary.clone()),
         _ => None,
     };
-    let mut parts: Vec<(u8, Span<'static>)> = Vec::new();
     // A connect waiting on the OS keychain says so first: during an analysis the old
     // results stay in the body, where the hint would otherwise go.
     if let Some(hint) = app.keychain_hint() {
-        parts.push((0, Span::styled(hint, style::amber())));
+        parts.push(Part::fact(0, Span::styled(hint, style::amber())).cut());
     }
     match &cluster {
         Some(summary) => {
@@ -521,37 +611,36 @@ fn connected_header(app: &App, s: &Session, w: usize) -> Line<'static> {
             };
             // On a cluster the summary says the most: it comes first, and is cut
             // rather than dropped.
-            parts.push((0, Span::styled(summary.clone(), st)));
+            parts.push(Part::fact(0, Span::styled(summary.clone(), st)).cut());
         }
-        None => parts.push((
-            5,
+        None => parts.push(Part::fact(
+            ADDRESS_RANK,
             Span::styled(trunc(&s.endpoint().to_string(), 40), style::dim()),
         )),
     }
     if s.read_alone() {
         // A cluster node read alone on purpose: only its keys are seen.
-        parts.push((1, Span::styled("standalone", style::amber())));
+        parts.push(Part::fact(1, Span::styled("standalone", style::amber())));
     }
     match &s.target {
-        Some(ScanTarget::Replica(ep)) => parts.push((
+        Some(ScanTarget::Replica(ep)) => parts.push(Part::fact(
             3,
             Span::styled(
                 format!("replica {}", trunc(&ep.to_string(), 24)),
                 style::dim(),
             ),
         )),
-        Some(ScanTarget::PrimaryFallback(_)) => parts.push((
+        Some(ScanTarget::PrimaryFallback(_)) => parts.push(Part::fact(
             3,
             Span::styled("primary (replica unreachable)", style::amber()),
         )),
         _ => {}
     }
-    if p.db != 0 {
-        // Not database 0: kept before the figures.
-        parts.push((0, Span::styled(format!("db {}", p.db), style::amber())));
-    }
     if let Some(srv) = &s.server {
-        parts.push((6, Span::styled(server_label(srv), style::dim())));
+        parts.push(Part::fact(
+            VERSION_RANK,
+            Span::styled(server_label(srv), style::dim()),
+        ));
         let mem = if srv.maxmemory > 0 {
             format!(
                 "{} / {}",
@@ -561,76 +650,74 @@ fn connected_header(app: &App, s: &Session, w: usize) -> Line<'static> {
         } else {
             format!("{} used", format::bytes(srv.used_memory))
         };
-        parts.push((0, Span::styled(mem, style::fg())));
-        parts.push((
+        parts.push(Part::fact(0, Span::styled(mem, style::dim())));
+        parts.push(Part::fact(
             0,
             Span::styled(
                 format!("{} keys", format::count(srv.total_keys)),
-                style::fg(),
+                style::dim(),
             ),
         ));
     }
     if sizes_unavailable(app, s) {
-        parts.push((4, Span::styled("▲ no sizes", style::warn())));
+        parts.push(Part::fact(4, Span::styled("▲ no sizes", style::warn())));
     }
-    // The status's time gives way first: it is cut to `14:02`, then left out, before
-    // any part but the address and the version (shown only when they fit) is dropped
-    // or cut.
-    for clock in [Clock::Utc, Clock::Short, Clock::Off] {
-        let right = status(app, s, clock);
-        let (keep, whole) = fit_parts(&mut parts.clone(), spans_width(&left), &right, w);
-        if whole || clock == Clock::Off {
-            let mut first = true;
-            for span in keep {
-                let sep = if first { "   " } else { " · " };
-                first = false;
-                left.push(Span::styled(sep, style::dim()));
-                left.push(span);
-            }
-            return justify(left, right, w);
-        }
-    }
-    unreachable!("the last clock always returns")
+    parts
 }
 
-/// Parts of the header ranked at or above this are shown only when they fit (the
-/// address and the server version); the status's time gives way before the others.
+/// Parts of the context bar ranked at or above this are shown only when they fit, in
+/// rank order and only while each one before them did: the address, then database 0,
+/// then the server version. The status's time gives way before the others.
 const WHEN_IT_FITS: u8 = 5;
+/// The ranks of the parts shown only when they fit: see [`WHEN_IT_FITS`].
+const ADDRESS_RANK: u8 = WHEN_IT_FITS;
+const DB0_RANK: u8 = WHEN_IT_FITS + 1;
+const VERSION_RANK: u8 = WHEN_IT_FITS + 2;
 
-/// The header's `parts` (by rank, see [`connected_header`]) that fit on a line `w` wide
-/// after `left_w` cells and before `right`, in their order. True when every part ranked
-/// below [`WHEN_IT_FITS`] is there whole.
+/// The context bar's `parts` (by rank, see [`header_parts`]) that fit on a line `w`
+/// wide after `left_w` cells and before `right`, in their order. True when every part
+/// ranked below [`WHEN_IT_FITS`] is there whole.
 fn fit_parts(
-    parts: &mut [(u8, Span<'static>)],
+    parts: &mut [Part],
     left_w: usize,
     right: &[Span<'static>],
     w: usize,
-) -> (Vec<Span<'static>>, bool) {
+) -> (Vec<Part>, bool) {
     // Keep the parts by rank while the whole line, the status, a gap of two and
     // [`justify`]'s margin fit.
     let fixed = left_w + spans_width(right) + 3;
     let mut keep = vec![false; parts.len()];
     let mut whole = true;
     let mut used = 0;
+    let mut cut_one = false;
+    // Once one part shown only when it fits does not, none ranked after it shows: the
+    // version never stands in for a missing address.
+    let mut optional_full = false;
     let mut order: Vec<usize> = (0..parts.len()).collect();
-    order.sort_by_key(|&i| parts[i].0);
+    order.sort_by_key(|&i| parts[i].rank);
     for i in order {
         // Each part comes after a three-cell separator.
-        let add = width(&parts[i].1.content) + 3;
+        let add = parts[i].width() + 3;
+        let optional = parts[i].rank >= WHEN_IT_FITS;
+        if optional && optional_full {
+            continue;
+        }
         if fixed + used + add <= w {
             keep[i] = true;
             used += add;
             continue;
         }
-        if parts[i].0 < WHEN_IT_FITS {
+        if optional {
+            optional_full = true;
+        } else {
             whole = false;
         }
-        // The keychain hint and a cluster's summary (rank 0, first) are cut rather
-        // than dropped.
+        // The keychain hint or a cluster's summary is cut rather than dropped, once.
         let room = w.saturating_sub(fixed + used + 3);
-        if parts[i].0 == 0 && used == 0 && room >= 12 {
-            let cut = trunc(&parts[i].1.content, room);
-            parts[i].1 = Span::styled(cut, parts[i].1.style);
+        if parts[i].cut && !cut_one && room >= 12 {
+            cut_one = true;
+            let span = &parts[i].spans[0];
+            parts[i].spans = vec![Span::styled(trunc(&span.content, room), span.style)];
             keep[i] = true;
             used += room + 3;
         }
@@ -639,7 +726,7 @@ fn fit_parts(
         .iter()
         .zip(keep)
         .filter(|(_, k)| *k)
-        .map(|((_, span), _)| span.clone())
+        .map(|(part, _)| part.clone())
         .collect();
     (kept, whole)
 }
@@ -656,45 +743,7 @@ fn write_state(p: &crate::model::Profile) -> Span<'static> {
     }
 }
 
-/// The tab row: `0 Connections │ 1 Overview 2 Browse 3 Analyze 4 Server 5 Pub/Sub`, the
-/// area on screen highlighted. Before connecting, areas 1 to 5 are faint. When the row
-/// does not fit, the other areas show only their digit.
-fn tabs(frame: &mut Frame, area: Rect, app: &App) {
-    let w = usize::from(area.width);
-    let connected = app.session.is_some();
-    let build = |names: bool| {
-        let mut spans = vec![Span::raw(" ")];
-        for a in Area::ALL {
-            let on = a == app.area;
-            let text = if on || names {
-                format!(" {} {} ", a.digit(), a.title())
-            } else {
-                format!(" {} ", a.digit())
-            };
-            let st = if on {
-                style::tab_on()
-            } else if connected || a == Area::Connections {
-                style::tab()
-            } else {
-                style::track()
-            };
-            spans.push(Span::styled(text, st));
-            spans.push(Span::styled(
-                if a == Area::Connections { " │ " } else { " " },
-                style::border(),
-            ));
-        }
-        spans.pop();
-        spans
-    };
-    let mut spans = build(true);
-    if spans_width(&spans) > w {
-        spans = build(false);
-    }
-    rows(frame, area, vec![Line::from(spans)], None);
-}
-
-/// Why Browse › Search is dimmed in the sub-tab row: its probe (`FT._LIST`) was refused
+/// Why Browse › Search is dimmed in the area row: its probe (`FT._LIST`) was refused
 /// or skipped, so there is no search module to use.
 fn search_off(app: &App) -> bool {
     app.session
@@ -705,11 +754,79 @@ fn search_off(app: &App) -> bool {
         .is_some_and(|c| !matches!(c.status, PermStatus::Allowed))
 }
 
-/// The sub-tab row on an area with panels: `Keys · Streams · Search`, the current one
-/// highlighted, and a short note on the right.
-fn sub_tabs(frame: &mut Frame, area: Rect, app: &App) {
-    let w = usize::from(area.width);
+/// How much of the area row is spelled out: `0 Connections` or only `0`, the other
+/// areas' names or only their digits, the current area's panels all named or only the
+/// current one with where it is (`Keys · 1 of 3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AreaFit {
+    connections: bool,
+    names: bool,
+    panels: bool,
+}
+
+/// The fits [`area_line`] tries, widest first.
+const AREA_FITS: [AreaFit; 4] = [
+    AreaFit {
+        connections: true,
+        names: true,
+        panels: true,
+    },
+    AreaFit {
+        connections: false,
+        names: true,
+        panels: true,
+    },
+    AreaFit {
+        connections: false,
+        names: false,
+        panels: true,
+    },
+    AreaFit {
+        connections: false,
+        names: false,
+        panels: false,
+    },
+];
+
+/// The left of the area row: `1 Overview   2 Browse › Keys · Streams · Search
+/// 3 Analyze …`. The current area is bold with its digit as a key cap, its current
+/// panel bold in the focus colour, the rest dim; before connecting areas 1 to 5 are
+/// faint.
+fn area_spans(app: &App, fit: AreaFit) -> Vec<Span<'static>> {
+    let connected = app.session.is_some();
+    let other = if connected {
+        style::tab()
+    } else {
+        style::track()
+    };
+    let mut out = vec![Span::raw(" ")];
+    for a in Area::ALL.into_iter().filter(|a| *a != Area::Connections) {
+        if out.len() > 1 {
+            out.push(Span::raw("   "));
+        }
+        if a != app.area {
+            let text = if fit.names {
+                format!("{} {}", a.digit(), a.title())
+            } else {
+                a.digit().to_string()
+            };
+            out.push(Span::styled(text, other));
+            continue;
+        }
+        out.push(Span::styled(format!(" {} ", a.digit()), style::key()));
+        out.push(Span::styled(format!(" {}", a.title()), style::fgb()));
+        out.extend(panel_spans(app, fit.panels));
+    }
+    out
+}
+
+/// The current area's panels after its name: ` › Keys · Streams · Search`, or
+/// ` › Keys · 1 of 3`. Nothing on an area without panels.
+fn panel_spans(app: &App, all: bool) -> Vec<Span<'static>> {
     let panels = app.panels_of(app.area);
+    if panels.is_empty() {
+        return Vec::new();
+    }
     let current = app.screen().panel();
     let style_of = |p: Panel| {
         if Some(p) == current {
@@ -720,53 +837,112 @@ fn sub_tabs(frame: &mut Frame, area: Rect, app: &App) {
             style::dim()
         }
     };
-    // Spaced out when it fits, closer together when not; when even that is too wide,
-    // only the current panel and where it is in the cycle.
-    let names = |indent: &'static str, sep: &'static str| {
-        let mut out = vec![Span::raw(indent)];
+    let mut out = vec![Span::styled(" › ", style::dim())];
+    if all {
         for (i, p) in panels.iter().enumerate() {
             if i > 0 {
-                out.push(Span::styled(sep, style::border()));
+                out.push(Span::styled(" · ", style::dim()));
             }
             out.push(Span::styled(p.name(), style_of(*p)));
         }
-        out
-    };
-    let mut left = names("    ", "  ·  ");
-    if spans_width(&left) > w {
-        left = names("  ", " · ");
-    }
-    if spans_width(&left) > w {
+    } else {
         let at = current
             .and_then(|c| panels.iter().position(|p| *p == c))
             .unwrap_or(0);
         let name = current.map_or("", Panel::name);
-        left = vec![
-            Span::raw("  "),
-            Span::styled(name, style::title()),
-            Span::styled(format!(" · {} of {}", at + 1, panels.len()), style::dim()),
-        ];
+        out.push(Span::styled(name, style::title()));
+        out.push(Span::styled(
+            format!(" · {} of {}", at + 1, panels.len()),
+            style::dim(),
+        ));
     }
+    out
+}
+
+/// `0 Connections` at the right of the area row (only `0` when the row is short), a key
+/// cap and bold, and always named, while it is the area on screen.
+fn connections_spans(app: &App, names: bool) -> Vec<Span<'static>> {
+    if app.area == Area::Connections {
+        vec![
+            Span::styled(" 0 ", style::key()),
+            Span::styled(" Connections", style::fgb()),
+        ]
+    } else {
+        let title = if names { " Connections" } else { "" };
+        vec![Span::styled(format!("0{title}"), style::tab())]
+    }
+}
+
+/// The note the area row carries on Browse, at its right before `0 Connections`:
+/// names only, or Search off.
+fn browse_note(app: &App) -> Option<&'static str> {
+    if app.area != Area::Browse {
+        return None;
+    }
+    let current = app.screen().panel();
     // Old results kept during an analysis are marked in the panels' own titles
     // ([`mark_previous`]), not here.
     let names = current == Some(Panel::Keys) && app.pattern_data().is_some_and(|d| d.names);
-    let note = if app.area != Area::Browse {
-        String::new()
-    } else if names && app.analyzing() {
-        "names only until the analysis has results".to_string()
+    if names && app.analyzing() {
+        Some("names only until the analysis has results")
     } else if names {
-        "names only, no analysis yet".to_string()
+        Some("names only, no analysis yet")
     } else if search_off(app) {
-        "Search is off: no search module".to_string()
+        Some("Search is off: no search module")
     } else {
-        String::new()
+        None
+    }
+}
+
+/// The area row: the areas with the current area's panels inline, `0 Connections` at
+/// the right, and on Browse a short note before it. When it does not fit, `0
+/// Connections` becomes `0`, then the other areas show only their digits, then the
+/// panels only the current one (`Keys · 1 of 3`); the note is kept while any of these
+/// fits with it, and dropped only when none does.
+fn area_line(app: &App, w: usize) -> Line<'static> {
+    let note = browse_note(app);
+    let build = |fit: AreaFit, with_note: bool| {
+        let left = area_spans(app, fit);
+        let mut right = Vec::new();
+        if let Some(n) = note.filter(|_| with_note) {
+            right.push(Span::styled(n, style::dim()));
+            right.push(Span::raw("   "));
+        }
+        right.extend(connections_spans(app, fit.connections));
+        right.push(Span::raw(" "));
+        let fits = spans_width(&left) + spans_width(&right) + 2 <= w;
+        (left, right, fits)
     };
-    let right = if note.is_empty() {
-        Vec::new()
-    } else {
-        vec![Span::styled(note, style::dim())]
-    };
-    rows(frame, area, vec![justify(left, right, w)], None);
+    let mut tries: Vec<(AreaFit, bool)> = Vec::new();
+    if note.is_some() {
+        tries.extend(AREA_FITS.iter().map(|f| (*f, true)));
+    }
+    tries.extend(AREA_FITS.iter().map(|f| (*f, false)));
+    for (fit, with_note) in tries {
+        let (left, right, fits) = build(fit, with_note);
+        if fits {
+            return justify_flush(left, right, w);
+        }
+    }
+    // Not even the shortest fits: its left part, cut by the frame.
+    Line::from(area_spans(app, AREA_FITS[3]))
+}
+
+/// `left`, then `right` flush against the right edge.
+fn justify_flush(
+    mut left: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+    w: usize,
+) -> Line<'static> {
+    let gap = w.saturating_sub(spans_width(&left) + spans_width(&right));
+    left.push(Span::raw(" ".repeat(gap)));
+    left.extend(right);
+    Line::from(left)
+}
+
+fn areas(frame: &mut Frame, area: Rect, app: &App) {
+    let line = area_line(app, usize::from(area.width));
+    rows(frame, area, vec![line], None);
 }
 
 /// The last `w` cells of `s`, starting with `…` when cut.
@@ -788,7 +964,7 @@ fn input_line(label: &str, text: String, hint: &str, w: usize) -> Line<'static> 
     Line::from(vec![
         Span::styled(label, style::key()),
         Span::styled(format!(" {}", tail(&text, room)), style::fgb()),
-        Span::styled("▏", style::amber()),
+        Span::styled("▏", style::focus()),
         Span::styled(hint.to_string(), style::dim()),
     ])
 }
@@ -798,20 +974,7 @@ fn input_line(label: &str, text: String, hint: &str, w: usize) -> Line<'static> 
 /// not fit are left out from the end.
 fn key_line(app: &App, w: usize) -> Line<'static> {
     let screen = app.screen();
-    let c = keymap::FooterCtx {
-        ready: app.session.is_some(),
-        analyzed: app.report().is_some(),
-        analyzing: app.analyzing(),
-        writes: app
-            .session
-            .as_ref()
-            .is_some_and(|s| !s.profile.is_read_only()),
-        not_read: screen == Screen::KeyDetail
-            && matches!(
-                app.views.value.items,
-                Some(crate::live::values::Items::NotRead | crate::live::values::Items::Module(_))
-            ),
-    };
+    let c = app.footer_ctx();
     let (left, right) = keymap::footer_fit(screen, c, w);
     let mut spans = vec![Span::raw(" ")];
     for (i, (k, l)) in left.iter().enumerate() {
@@ -929,4 +1092,211 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
         key_line(app, w)
     };
     rows(frame, area, vec![line], None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::Msg;
+    use crate::tui::app::views::testing::{render, scanned, show};
+    use crate::tui::fixtures;
+
+    fn lines(app: &App, w: u16, h: u16) -> Vec<String> {
+        let t = render(app, w, h);
+        let b = t.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| b[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// Two chrome rows on every width: the context bar, the area row, then the body's
+    /// frame on the third row, the footer on the last.
+    #[test]
+    fn two_chrome_rows_at_120_80_and_60_columns() {
+        let mut app = scanned();
+        for (w, h) in [(120, 36), (80, 24), (60, 20)] {
+            assert_eq!(body_of(Rect::new(0, 0, w, h)), Rect::new(0, 2, w, h - 3));
+            for screen in [
+                Screen::Connections,
+                Screen::Overview,
+                Screen::Patterns,
+                Screen::Ttl,
+                Screen::Clients,
+                Screen::PubSub,
+            ] {
+                show(&mut app, screen);
+                let l = lines(&app, w, h);
+                assert!(l[0].starts_with(" prod-cache-01 "), "{w}: {}", l[0]);
+                assert!(l[0].contains("read-only"), "{w}: {}", l[0]);
+                assert!(l[1].contains(screen.area().title()), "{w}: {}", l[1]);
+                assert!(l[2].starts_with('┌'), "{screen:?} at {w}: {}", l[2]);
+                for line in &l {
+                    assert_eq!(line.chars().count(), usize::from(w), "{line}");
+                }
+            }
+        }
+    }
+
+    /// The area row: the current area's panels inline, the others by name where there
+    /// is room, only by digit where there is not, and the panels as `Name · n of N`
+    /// last; `0 Connections` at the right.
+    #[test]
+    fn the_area_row_at_120_80_and_60_columns() {
+        let mut app = scanned();
+        show(&mut app, Screen::Ttl);
+        let row = |app: &App, w| lines(app, w, 24)[1].clone();
+        let r = row(&app, 120);
+        assert!(
+            r.starts_with(
+                " 1 Overview   2 Browse    3  Analyze › Big keys · Expiry · Changes · Hot keys   4 Server   5 Pub/Sub"
+            ),
+            "{r}"
+        );
+        assert!(r.ends_with("0 Connections "), "{r}");
+        let r = row(&app, 80);
+        assert!(
+            r.starts_with(" 1   2    3  Analyze › Big keys · Expiry · Changes · Hot keys   4   5"),
+            "{r}"
+        );
+        assert!(r.ends_with(" 0 "), "{r}");
+        let r = row(&app, 60);
+        assert!(
+            r.starts_with(" 1   2    3  Analyze › Expiry · 2 of 4   4   5"),
+            "{r}"
+        );
+        // The current area's digit is a key cap, its panel in the focus colour.
+        let t = render(&app, 120, 24);
+        let b = t.backend().buffer();
+        let at = |s: &str| r_find(&row(&app, 120), s);
+        assert_eq!(b[(at(" 3 ") as u16, 1)].style().bg, style::key().bg);
+        assert_eq!(b[(at("Expiry") as u16, 1)].fg, style::FOCUS);
+        assert_eq!(b[(at("Changes") as u16, 1)].fg, style::DIM);
+    }
+
+    /// The column (in cells) where `s` starts in `line`.
+    fn r_find(line: &str, s: &str) -> usize {
+        let byte = line.find(s).unwrap_or_else(|| panic!("{s:?} in {line}"));
+        widgets::width(&line[..byte])
+    }
+
+    /// The context bar, in order: the name, the badge, ` w ` and the access, ` b ` and
+    /// the database, then the figures; the status at the right. Narrower, the parts go
+    /// in this order: the version, database 0, the address (each shown only while the
+    /// ones before it fit), the status's time, the key count, the memory.
+    #[test]
+    fn the_context_bar_parts_and_their_drop_order() {
+        let mut app = scanned();
+        app.set_wall_clock(50_520);
+        let bar = |app: &App, w| lines(app, w, 24)[0].clone();
+        let wide = bar(&app, 160);
+        let order = [
+            " prod-cache-01 ",
+            " PROD ",
+            " w  read-only",
+            " b  db 0",
+            "prod-cache-01.internal:6380",
+            "Redis 7.4.2",
+            "15G / 24G",
+            "7.92M keys",
+            "● analyzed",
+        ];
+        let at: Vec<usize> = order.iter().map(|s| r_find(&wide, s)).collect();
+        assert!(at.windows(2).all(|p| p[0] < p[1]), "{wide}");
+        assert!(wide.ends_with("UTC "), "{wide}");
+        // The exact parts at each width.
+        const DB: &str = "db 0";
+        const ADDR: &str = "prod-cache-01.internal:6380";
+        const VER: &str = "Redis 7.4.2";
+        const MEM: &str = "15G / 24G";
+        const KEYS: &str = "7.92M keys";
+        const UTC: &str = "14:02 UTC";
+        const TIME: &str = "14:02";
+        let all = [DB, ADDR, VER, MEM, KEYS, UTC, TIME];
+        let cases: [(u16, &[&str]); 9] = [
+            (160, &[DB, ADDR, VER, MEM, KEYS, UTC, TIME]),
+            (130, &[DB, ADDR, MEM, KEYS, UTC, TIME]),
+            // The address without database 0: the version does not stand in for it.
+            (120, &[ADDR, MEM, KEYS, UTC, TIME]),
+            (110, &[MEM, KEYS, UTC, TIME]),
+            (83, &[MEM, KEYS, UTC, TIME]),
+            (80, &[MEM, KEYS, TIME]),
+            (75, &[MEM, KEYS]),
+            (70, &[MEM]),
+            (50, &[]),
+        ];
+        for (w, want) in cases {
+            let b = bar(&app, w);
+            for part in all {
+                assert_eq!(
+                    b.contains(part),
+                    want.contains(&part),
+                    "{part:?} at {w}: {b}"
+                );
+            }
+        }
+        // As the bar narrows a part, once gone, stays gone; and the version or database 0
+        // never shows without the address.
+        let drops = [VER, DB, ADDR, "UTC", TIME, KEYS, MEM];
+        let mut gone_at = Vec::new();
+        for (i, part) in drops.iter().enumerate() {
+            let w = (40..=160u16)
+                .rev()
+                .find(|&w| !bar(&app, w).contains(part))
+                .unwrap_or(0);
+            gone_at.push(w);
+            if i > 0 {
+                assert!(
+                    w <= gone_at[i - 1],
+                    "{part} goes at {w}, before {} at {}",
+                    drops[i - 1],
+                    gone_at[i - 1]
+                );
+            }
+        }
+        for w in 40..=160u16 {
+            let b = bar(&app, w);
+            if b.contains(VER) || b.contains(DB) {
+                assert!(b.contains(ADDR), "at {w}: {b}");
+            }
+        }
+        // The name, the badge and the access stay at every width that holds them.
+        for w in [40, 50, 60, 80] {
+            let b = bar(&app, w);
+            assert!(b.contains("prod-cache-01") && b.contains("PROD"), "{b}");
+            assert!(b.contains("read-only"), "{b}");
+        }
+        // Another database is kept before the figures.
+        let id = app.session.as_ref().unwrap().id;
+        app.session.as_mut().unwrap().profile.db = 3;
+        let b = bar(&app, 80);
+        assert!(b.contains(" b  db 3   15G / 24G"), "{b}");
+        // On a cluster with its nodes read, the picked node after the database.
+        let scan = app.session.as_ref().unwrap().scan;
+        app.apply(Msg::Nodes {
+            id,
+            scan,
+            nodes: fixtures::live_nodes(),
+        });
+        let b = bar(&app, 160);
+        assert!(
+            b.contains(" b  db 3    [ ]  node 10.0.1.11:6379 · 1 of 3   "),
+            "{b}"
+        );
+        // The profile's name only: no user name, never a password.
+        for w in [40, 80, 120, 160] {
+            let b = bar(&app, w);
+            assert!(!b.contains("lens") && !b.contains('@'), "{b}");
+        }
+    }
+
+    /// Before connecting the bar reads as it always has.
+    #[test]
+    fn the_context_bar_before_connecting() {
+        let app = App::new(fixtures::profiles());
+        let l = lines(&app, 80, 24);
+        assert!(l[0].starts_with(" redis-lens "), "{}", l[0]);
+        assert!(l[0].contains("not connected"), "{}", l[0]);
+        assert!(l[0].ends_with("pick a connection, then enter "), "{}", l[0]);
+        assert!(l[1].ends_with(" 0  Connections "), "{}", l[1]);
+    }
 }

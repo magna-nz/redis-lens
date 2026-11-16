@@ -22,8 +22,8 @@ use super::analysis::{
 use super::mark_previous;
 use super::style;
 use super::widgets::{
-    Pane, Title, fit, level, marquee_spans, pad_l, pad_r, pattern_spans, rows, scroll_offset,
-    split_frame, trunc, ttl_hist_spans,
+    Pane, Title, fit, gutter_area, level, list, marquee_spans, pad_l, pad_r, pattern_spans, rows,
+    scroll_offset, split_frame, trunc, ttl_hist_spans,
 };
 
 const COLS: [Col; 5] = [
@@ -93,10 +93,16 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Title::new(&p.pattern, kind),
         Pane::Left,
     );
-    let (keep, name) = pick_cols(&COLS, usize::from(left.width), WIDE_AT, more);
+    // The columns start after the marker gutter.
+    let (keep, name) = pick_cols(
+        &COLS,
+        usize::from(gutter_area(left).width),
+        super::widgets::after_gutter(WIDE_AT),
+        more,
+    );
     rows(
         frame,
-        left,
+        gutter_area(left),
         vec![head_row(&COLS, &keep, name, &[KEYS, NO_TTL, MEMORY])],
         None,
     );
@@ -116,7 +122,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             ttl_row(&keep, name, p, *v, scroll)
         })
         .collect();
-    rows(frame, body, lines, Some(sel - off));
+    list(frame, body, lines, Some(sel - off));
 
     detail_lines(frame, detail, p, v, change(diff, p), expiry(report), more);
 }
@@ -439,7 +445,7 @@ mod tests {
                 s.contains("Expiry ranks patterns by TTL risk. It needs a sample of the keys:"),
                 "{s}"
             );
-            assert!(s.contains("r  Analyze: "), "{s}");
+            assert!(s.contains("a  Analyze: "), "{s}");
             assert!(s.contains("is on Overview (1)"), "{s}");
             insta::assert_snapshot!(format!("expiry_no_analysis_{w}x{h}"), s);
         }

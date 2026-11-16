@@ -1,8 +1,8 @@
-//! `x` and `D` on Patterns: bulk expire and bulk delete by pattern (spec "Bulk
+//! `t` and `d` on Patterns (`T` and `D` on its key list): bulk expire and bulk delete by pattern (spec "Bulk
 //! actions"). The flow is a dialog of its own, over Patterns, that takes every key while
 //! it is open:
 //!
-//! 1. `x` asks for the TTL first (24 h to start with); `D` goes straight on.
+//! 1. `t` asks for the TTL first (24 h to start with); `d` goes straight on.
 //! 2. **The dry run**: [`crate::live::bulk::count`] steps over the live connection,
 //!    counting the keys that infer to the pattern and those with a TTL. `esc` stops it.
 //! 3. **The question**: the app's one confirm dialog ([`super::confirm`]), with the
@@ -17,7 +17,7 @@
 //! Before anything is sent, the action must be possible: a pattern (not a group) is
 //! selected, the server is not a replica (nor a cluster read on replicas), the gate does
 //! not refuse the op (a read-only profile, a command the server refused), the server
-//! has `EXPIRE … NX` for `x`, and the live connection is open.
+//! has `EXPIRE … NX` for bulk expire, and the live connection is open.
 //!
 //! **On a cluster** (P4) the dry run and the run walk the primaries one at a time, in
 //! slot order, each with its own `SCAN` and its node's budget; a step never follows a
@@ -44,7 +44,7 @@ const MAX_TTL_INPUT: usize = 32;
 pub struct Bulk {
     pub pattern: String,
     pub glob: String,
-    /// `D`: delete; otherwise `x`: expire.
+    /// `true`: delete; otherwise expire.
     pub delete: bool,
     /// The profile it runs on, and whether it is `prod`, for the dialog's title.
     pub profile: String,
@@ -58,13 +58,16 @@ pub struct Bulk {
     pub nodes: Vec<(usize, String)>,
     /// Where the walk is in `nodes`.
     pub at: usize,
+    /// The node Browse › Keys is narrowed to, when it is: the action still runs on
+    /// every primary, and the question says so.
+    pub narrowed: Option<String>,
     /// The dry run's counts per primary, in the order of `nodes`.
     pub per_node: Vec<Count>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stage {
-    /// `x`: the TTL being typed, and why the last one was not accepted.
+    /// Expire: the TTL being typed, and why the last one was not accepted.
     Ttl {
         input: String,
         error: Option<String>,
@@ -276,16 +279,43 @@ pub(crate) fn bulk_nodes(
 }
 
 impl App {
-    /// `x` (expire) or `D` (`delete`) on Patterns. Checks that the action can run, then
-    /// opens the TTL input (`x`) or starts the dry run (`D`). Nothing is sent when it
-    /// can't: a read-only profile is refused with its reason before any `SCAN`.
+    /// `t` (expire) or `d` (`delete`) on Patterns: the bulk action of the selected
+    /// pattern ([`Self::bulk_for`]).
     pub(super) fn bulk_start(&mut self, delete: bool) -> Vec<Effect> {
-        let Some(s) = self.session.as_ref() else {
+        if self.session.is_none() {
             self.set_info("Nothing to change: connect first (0 Connections, then enter).");
             return Vec::new();
-        };
+        }
         let Some(pattern) = self.selected_single_pattern() else {
-            self.set_info("Select a pattern first: x and D work on one pattern, not a group.");
+            self.set_info("Select a pattern first: t and d work on one pattern, not a group.");
+            return Vec::new();
+        };
+        self.bulk_for(pattern, delete)
+    }
+
+    /// `T` (expire) or `D` (`delete`) on a pattern's keys: the bulk action of the
+    /// pattern the list belongs to, the same as `t` or `d` on its Patterns row. Not on
+    /// a Find's results: they are of no pattern.
+    pub(super) fn key_list_bulk(&mut self, delete: bool) -> Vec<Effect> {
+        let keys = &self.views.keys;
+        let pattern = match (&keys.find, &keys.pattern) {
+            (None, Some(p)) => p.clone(),
+            _ => {
+                self.set_info(
+                    "T and D work on every key of a pattern: Find results are of no pattern.",
+                );
+                return Vec::new();
+            }
+        };
+        self.bulk_for(pattern, delete)
+    }
+
+    /// Checks that the bulk action on `pattern` can run, then opens the TTL input (not
+    /// `delete`) or starts the dry run (`delete`). Nothing is sent when it can't: a
+    /// read-only profile is refused with its reason before any `SCAN`.
+    fn bulk_for(&mut self, pattern: String, delete: bool) -> Vec<Effect> {
+        let Some(s) = self.session.as_ref() else {
+            self.set_info("Nothing to change: connect first (0 Connections, then enter).");
             return Vec::new();
         };
         let report_nodes = self.report().is_some_and(|r| r.nodes.is_some());
@@ -326,6 +356,9 @@ impl App {
         let files_as = self
             .report()
             .map_or_else(|| s.profile.name.clone(), |r| r.profile.clone());
+        let narrowed = self
+            .narrowed_node()
+            .map(|(_, n)| crate::value::escape(&n.endpoint.to_string()));
         self.bulk = Some(Bulk {
             pattern,
             glob,
@@ -340,6 +373,7 @@ impl App {
             nodes,
             at: 0,
             per_node: Vec::new(),
+            narrowed,
         });
         if delete {
             return self.bulk_count(BulkAction::Delete);
@@ -626,7 +660,13 @@ impl App {
             Decision::Type(name) => Expect::Type(name),
         };
         b.stage = Stage::Asking { action, count };
-        let mut lines = summary(&count, &action);
+        let mut lines = Vec::new();
+        if let Some(node) = &b.narrowed {
+            lines.push(format!(
+                "On every node, not only {node}: the pattern's keys on every primary."
+            ));
+        }
+        lines.extend(summary(&count, &action));
         lines.extend(per_node_lines(b));
         self.confirm = Some(Confirm {
             what: ConfirmFor::Bulk { summary: lines, op },
@@ -1016,10 +1056,10 @@ mod tests {
         })))
     }
 
-    /// `x` then enter on the TTL, and the dry run answered in two steps: 1,200 keys,
+    /// `t` then enter on the TTL, and the dry run answered in two steps: 1,200 keys,
     /// 200 with a TTL. Returns the effects of the last step.
     fn dry_run_expire(app: &mut App) -> Vec<Effect> {
-        assert!(app.handle_key(ch('x')).is_empty());
+        assert!(app.handle_key(ch('t')).is_empty());
         let e = app.handle_key(key(KeyCode::Enter));
         let s = steps(&e);
         assert_eq!(s.len(), 1);
@@ -1047,15 +1087,103 @@ mod tests {
         testing::reply(app, s[0].0, counted(Walk::Done, 500, 100))
     }
 
+    /// `app_with`, on the selected pattern's key list.
+    fn on_key_list(env: Env, read_only: Option<bool>) -> App {
+        let mut app = app_with(env, read_only);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen(), Screen::KeyList);
+        assert_eq!(app.views.keys.pattern.as_deref(), Some("user:{id}:cart"));
+        app
+    }
+
+    /// `T` and `D` on a pattern's key list are the pattern's bulk actions: the same
+    /// dialog and the same dry run as `t` and `d` on Patterns.
     #[test]
-    fn x_and_d_on_a_read_only_profile_send_nothing_whatever_follows() {
+    fn capital_t_and_d_on_the_key_list_run_the_patterns_bulk_actions() {
+        let mut app = on_key_list(Env::Local, None);
+        assert!(app.handle_key(ch('T')).is_empty());
+        let b = app.bulk.as_ref().expect("the bulk dialog");
+        assert_eq!((b.pattern.as_str(), b.delete), ("user:{id}:cart", false));
+        assert!(matches!(b.stage, Stage::Ttl { .. }));
+        let s = steps(&app.handle_key(key(KeyCode::Enter)));
+        assert!(
+            matches!(&s[..], [(_, Request::Count { pattern, .. })] if pattern == "user:{id}:cart"),
+            "{s:?}"
+        );
+
+        let mut app = on_key_list(Env::Local, None);
+        let s = steps(&app.handle_key(ch('D')));
+        let b = app.bulk.as_ref().expect("the bulk dialog");
+        assert_eq!((b.pattern.as_str(), b.delete), ("user:{id}:cart", true));
+        assert!(
+            matches!(&s[..], [(_, Request::Count { pattern, .. })] if pattern == "user:{id}:cart"),
+            "{s:?}"
+        );
+    }
+
+    /// Narrowed to one node, `D` on the key list still runs on every primary: the
+    /// question's first line says so.
+    #[test]
+    fn narrowed_to_a_node_the_question_says_it_runs_on_every_node() {
+        let mut app = on_key_list(Env::Local, None);
+        let cluster = crate::tui::fixtures::cluster_report();
+        let s = app.session.as_mut().unwrap();
+        s.server.as_mut().unwrap().mode = ServerMode::Cluster;
+        s.nodes = crate::tui::fixtures::live_nodes();
+        let mut report = s.report.clone().expect("a report");
+        report.nodes = cluster.nodes.clone();
+        s.report = Some(report);
+        let n = &cluster.nodes.as_ref().unwrap()[1];
+        app.patterns.node = Some(super::super::NodeKey {
+            id: n.id.clone(),
+            endpoint: n.endpoint.clone(),
+        });
+        let addr = n.endpoint.to_string();
+        assert!(app.narrowed_node().is_some());
+        let mut e = app.handle_key(ch('D'));
+        assert_eq!(
+            app.bulk.as_ref().unwrap().narrowed.as_deref(),
+            Some(addr.as_str())
+        );
+        for _ in 0..3 {
+            let s = steps(&e);
+            assert_eq!(s.len(), 1, "{s:?}");
+            e = testing::reply(&mut app, s[0].0, counted(Walk::Done, 10, 0));
+        }
+        let lines = app.confirm.as_ref().expect("the question").lines();
+        let want = format!("On every node, not only {addr}: the pattern's keys on every primary.");
+        assert!(lines.contains(&want), "{want}: {lines:?}");
+    }
+
+    #[test]
+    fn capital_t_and_d_on_the_key_list_of_a_read_only_profile_send_nothing() {
+        for (env, ro) in [(Env::Prod, None), (Env::Local, Some(true))] {
+            for k in ['T', 'D'] {
+                // Each key from a fresh key list, staying on it.
+                let mut app = on_key_list(env, ro);
+                let mut all = app.handle_key(ch(k));
+                assert_eq!(app.screen(), Screen::KeyList, "{k}");
+                assert!(app.bulk.is_none() && app.confirm.is_none(), "{k}");
+                let n = app.notice.as_ref().unwrap();
+                assert!(n.error && n.text.contains("read-only"), "{k}: {}", n.text);
+                assert!(steps(&all).is_empty() && writes(&all) == 0, "{k}: {all:?}");
+                all.extend(app.handle_key(ch('y')));
+                all.extend(app.handle_key(key(KeyCode::Enter)));
+                assert!(steps(&all).is_empty(), "{k}: {all:?}");
+                assert_eq!(writes(&all), 0, "{k}");
+            }
+        }
+    }
+
+    #[test]
+    fn t_and_d_on_a_read_only_profile_send_nothing_whatever_follows() {
         for (env, ro) in [
             (Env::Prod, None),
             (Env::Prod, Some(true)),
             (Env::Stage, Some(true)),
             (Env::Local, Some(true)),
         ] {
-            for k in ['x', 'D'] {
+            for k in ['t', 'd'] {
                 let mut app = app_with(env, ro);
                 let e = app.handle_key(ch(k));
                 assert!(e.is_empty(), "{e:?}");
@@ -1063,7 +1191,7 @@ mod tests {
                 let n = app.notice.as_ref().unwrap();
                 assert!(n.error && n.text.contains("read-only"), "{}", n.text);
                 let mut all = Vec::new();
-                for c in ['y', '\n', 'x', 'D', 'u'] {
+                for c in ['y', '\n', 't', 'd', 'u'] {
                     all.extend(app.handle_key(ch(c)));
                 }
                 all.extend(type_text(&mut app, "user:{id}:cart"));
@@ -1099,7 +1227,7 @@ mod tests {
             )
         );
         // Other keys do nothing; y starts the first batch with the permit.
-        assert!(app.handle_key(ch('x')).is_empty());
+        assert!(app.handle_key(ch('t')).is_empty());
         let e = app.handle_key(ch('y'));
         let s = steps(&e);
         assert_eq!(s.len(), 1);
@@ -1171,7 +1299,7 @@ mod tests {
     #[test]
     fn the_ttl_prompt_changes_the_ttl_and_says_what_is_wrong() {
         let mut app = app_with(Env::Local, None);
-        app.handle_key(ch('x'));
+        app.handle_key(ch('t'));
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         type_text(&mut app, "soon");
         assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
@@ -1199,7 +1327,7 @@ mod tests {
     #[test]
     fn a_ttl_can_be_pasted() {
         let mut app = app_with(Env::Local, None);
-        app.handle_key(ch('x'));
+        app.handle_key(ch('t'));
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         app.handle_paste("10m\n".into());
         let e = app.handle_key(key(KeyCode::Enter));
@@ -1248,7 +1376,7 @@ mod tests {
         let open = other.confirm.take().unwrap();
 
         let mut app = app_with(Env::Local, None);
-        app.handle_key(ch('x'));
+        app.handle_key(ch('t'));
         let e = app.handle_key(key(KeyCode::Enter));
         let s = steps(&e);
         app.confirm = Some(open.clone());
@@ -1264,7 +1392,7 @@ mod tests {
     #[test]
     fn prod_needs_the_pattern_typed_and_y_is_not_enough() {
         let mut app = app_with(Env::Prod, Some(false));
-        app.handle_key(ch('D'));
+        app.handle_key(ch('d'));
         let Some(Bulk {
             stage: Stage::Counting { req, .. },
             ..
@@ -1284,7 +1412,7 @@ mod tests {
         assert!(app.notice.as_ref().unwrap().text.contains("did not match"));
 
         // Again, with the pattern typed.
-        app.handle_key(ch('D'));
+        app.handle_key(ch('d'));
         let Some(Bulk {
             stage: Stage::Counting { req, .. },
             ..
@@ -1346,7 +1474,7 @@ mod tests {
     #[test]
     fn esc_during_the_dry_run_closes_it_and_its_answer_is_dropped() {
         let mut app = app_with(Env::Local, None);
-        let e = app.handle_key(ch('D'));
+        let e = app.handle_key(ch('d'));
         let s = steps(&e);
         app.handle_key(key(KeyCode::Esc));
         assert!(app.bulk.is_none());
@@ -1357,7 +1485,7 @@ mod tests {
     #[test]
     fn a_refused_batch_stops_the_run_and_turns_the_action_off() {
         let mut app = app_with(Env::Local, None);
-        let e = app.handle_key(ch('D'));
+        let e = app.handle_key(ch('d'));
         let s = steps(&e);
         testing::reply(&mut app, s[0].0, counted(Walk::Done, 4, 0));
         let s = steps(&app.handle_key(ch('y')));
@@ -1365,7 +1493,7 @@ mod tests {
         assert!(steps(&e).is_empty());
         assert!(app.notice.as_ref().unwrap().error);
         app.handle_key(key(KeyCode::Esc));
-        app.handle_key(ch('D'));
+        app.handle_key(ch('d'));
         assert!(app.bulk.is_none());
         assert!(app.notice.as_ref().unwrap().text.contains("refused UNLINK"));
     }
@@ -1373,7 +1501,7 @@ mod tests {
     #[test]
     fn nothing_to_change_says_so_without_asking() {
         let mut app = app_with(Env::Local, None);
-        app.handle_key(ch('x'));
+        app.handle_key(ch('t'));
         let s = steps(&app.handle_key(key(KeyCode::Enter)));
         testing::reply(&mut app, s[0].0, counted(Walk::Done, 5, 5));
         assert!(app.confirm.is_none());
@@ -1390,7 +1518,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .version = "6.2.14".into();
-        assert!(app.handle_key(ch('x')).is_empty());
+        assert!(app.handle_key(ch('t')).is_empty());
         assert!(app.bulk.is_none());
         let n = app.notice.as_ref().unwrap();
         assert!(
@@ -1399,13 +1527,13 @@ mod tests {
             n.text
         );
         // Delete still works there.
-        assert_eq!(steps(&app.handle_key(ch('D'))).len(), 1);
+        assert_eq!(steps(&app.handle_key(ch('d'))).len(), 1);
         // Valkey has EXPIRE NX in every version.
         let mut app = app_with(Env::Local, None);
         let server = app.session.as_mut().unwrap().server.as_mut().unwrap();
         server.flavor = crate::model::ServerFlavor::Valkey;
         server.version = "7.2.5".into();
-        app.handle_key(ch('x'));
+        app.handle_key(ch('t'));
         assert!(app.bulk.is_some());
     }
 
@@ -1414,7 +1542,7 @@ mod tests {
         // A cluster whose nodes are not known yet: nothing to walk.
         let mut app = app_with(Env::Local, None);
         app.session.as_mut().unwrap().server.as_mut().unwrap().mode = ServerMode::Cluster;
-        for k in ['x', 'D'] {
+        for k in ['t', 'd'] {
             assert!(app.handle_key(ch(k)).is_empty());
             assert!(app.bulk.is_none());
             assert!(
@@ -1431,7 +1559,7 @@ mod tests {
         let s = app.session.as_mut().unwrap();
         s.nodes = crate::tui::fixtures::live_nodes();
         s.nodes[1].role = crate::model::NodeRole::Replica;
-        for k in ['x', 'D'] {
+        for k in ['t', 'd'] {
             assert!(app.handle_key(ch(k)).is_empty());
             assert!(app.bulk.is_none());
             assert_eq!(app.notice.as_ref().unwrap().text, bulk::CLUSTER_REPLICA_OFF);
@@ -1440,7 +1568,7 @@ mod tests {
         let s = app.session.as_mut().unwrap();
         s.nodes = crate::tui::fixtures::live_nodes();
         s.nodes[2].connected = false;
-        assert!(app.handle_key(ch('D')).is_empty());
+        assert!(app.handle_key(ch('d')).is_empty());
         assert!(app.notice.as_ref().unwrap().text.contains("10.0.1.13:6379"));
         let mut app = app_with(Env::Local, None);
         app.session.as_mut().unwrap().target = Some(ScanTarget::Replica(crate::model::Endpoint {
@@ -1448,7 +1576,7 @@ mod tests {
             port: 1,
             tls: false,
         }));
-        assert!(app.handle_key(ch('D')).is_empty());
+        assert!(app.handle_key(ch('d')).is_empty());
         assert_eq!(app.notice.as_ref().unwrap().text, bulk::REPLICA_OFF);
     }
 
@@ -1461,7 +1589,7 @@ mod tests {
         s.nodes = crate::tui::fixtures::live_nodes();
         s.nodes.truncate(1);
         s.nodes[0].slots.clear();
-        for k in ['x', 'D'] {
+        for k in ['t', 'd'] {
             assert!(app.handle_key(ch(k)).is_empty());
             assert!(app.bulk.is_none());
             assert_eq!(app.notice.as_ref().unwrap().text, bulk::SLOTS_UNKNOWN);
@@ -1470,7 +1598,7 @@ mod tests {
         let s = app.session.as_mut().unwrap();
         s.nodes = crate::tui::fixtures::live_nodes();
         s.nodes.truncate(2);
-        assert!(app.handle_key(ch('D')).is_empty());
+        assert!(app.handle_key(ch('d')).is_empty());
         assert_eq!(app.notice.as_ref().unwrap().text, bulk::SLOTS_UNKNOWN);
     }
 
@@ -1499,7 +1627,7 @@ mod tests {
         s.server.as_mut().unwrap().mode = ServerMode::Cluster;
         s.nodes = crate::tui::fixtures::live_nodes();
         // The dry run: each primary's own walk, one node at a time, from the start.
-        assert!(app.handle_key(ch('x')).is_empty());
+        assert!(app.handle_key(ch('t')).is_empty());
         let mut e = app.handle_key(key(KeyCode::Enter));
         for (node, (matched, with_ttl)) in [(300, 0), (500, 100), (400, 100)].iter().enumerate() {
             let s = step_dests(&e);
@@ -1589,9 +1717,9 @@ mod tests {
         let s = app.session.as_mut().unwrap();
         s.server.as_mut().unwrap().mode = ServerMode::Cluster;
         s.nodes = crate::tui::fixtures::live_nodes();
-        for k in ['x', 'D'] {
+        for k in ['t', 'd'] {
             let mut all = app.handle_key(ch(k));
-            for c in ['y', '\n', 'x', 'D'] {
+            for c in ['y', '\n', 't', 'd'] {
                 all.extend(app.handle_key(ch(c)));
             }
             all.extend(app.handle_key(key(KeyCode::Enter)));
@@ -1603,7 +1731,7 @@ mod tests {
     #[test]
     fn a_closed_connection_stops_the_run() {
         let mut app = app_with(Env::Local, None);
-        let s = steps(&app.handle_key(ch('D')));
+        let s = steps(&app.handle_key(ch('d')));
         testing::reply(&mut app, s[0].0, counted(Walk::Done, 4, 0));
         app.handle_key(ch('y'));
         let (id, scan) = {
@@ -1636,7 +1764,7 @@ mod tests {
             ))
         }) {
             app.patterns.sel = i;
-            assert!(app.handle_key(ch('D')).is_empty());
+            assert!(app.handle_key(ch('d')).is_empty());
             assert!(app.bulk.is_none());
         }
     }
@@ -1644,7 +1772,7 @@ mod tests {
     #[test]
     fn snapshot_ttl_prompt_80x24() {
         let mut app = app_with(Env::Stage, Some(false));
-        app.handle_key(ch('x'));
+        app.handle_key(ch('t'));
         let t = testing::render(&app, 80, 24);
         insta::assert_snapshot!("bulk_ttl_80x24", t.backend());
     }
@@ -1652,7 +1780,7 @@ mod tests {
     #[test]
     fn snapshot_dry_run_question_on_prod_80x24() {
         let mut app = app_with(Env::Prod, Some(false));
-        app.handle_key(ch('x'));
+        app.handle_key(ch('t'));
         dry_run_expire_from_ttl(&mut app);
         type_text(&mut app, "user:{id");
         let t = testing::render(&app, 80, 24);
@@ -1664,7 +1792,7 @@ mod tests {
     #[test]
     fn snapshot_delete_question_80x24() {
         let mut app = app_with(Env::Local, None);
-        let s = steps(&app.handle_key(ch('D')));
+        let s = steps(&app.handle_key(ch('d')));
         testing::reply(&mut app, s[0].0, counted(Walk::Done, 3_120, 7));
         let t = testing::render(&app, 80, 24);
         insta::assert_snapshot!("bulk_delete_question_80x24", t.backend());

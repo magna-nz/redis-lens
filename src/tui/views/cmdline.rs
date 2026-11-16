@@ -1688,7 +1688,7 @@ impl App {
             ),
             LiveState::Closed(_) => Some(
                 "The live connection is closed, so the command line is off until the next \
-                 connect or analysis (r on Overview)."
+                 connect or analysis (a on Overview)."
                     .into(),
             ),
         }
@@ -2170,11 +2170,11 @@ mod tests {
         app.handle_key(ch('?'));
         app.handle_key(ch(':'));
         assert!(!app.views.cmdline.open && app.help);
-        // esc clears what is typed into the help, then closes it; `a` is on Connections.
+        // esc clears what is typed into the help, then closes it; `+` is on Connections.
         app.handle_key(key(KeyCode::Esc));
         app.handle_key(key(KeyCode::Esc));
         app.handle_key(ch('0'));
-        app.handle_key(ch('a'));
+        app.handle_key(ch('+'));
         app.handle_key(ch(':'));
         assert!(!app.views.cmdline.open);
         assert_eq!(app.add.as_ref().unwrap().input, ":");
@@ -2587,7 +2587,7 @@ mod tests {
         let debug = format!("{:?} {:?}", app.views, app.session);
         assert!(!value::leaks(&debug, MARK), "{debug}");
         app.handle_key(key(KeyCode::Esc));
-        let effects = app.handle_key(ch('s'));
+        let effects = app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         let [Effect::SaveSnapshot(report)] = &effects[..] else {
             panic!("{effects:?}");
         };

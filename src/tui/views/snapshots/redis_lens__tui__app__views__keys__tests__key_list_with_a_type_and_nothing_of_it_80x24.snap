@@ -1,13 +1,11 @@
 ---
 source: src/tui/views/keys.rs
-assertion_line: 1042
 expression: "testing::render(&app, 80, 24).backend()"
 ---
-" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Keys  ·  Streams  ·  Search                                                 "
+" prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys   ● analyzed 14:02 "
+" 1    2  Browse › Keys · Streams · Search   3   4   5                         0 "
 "┌─ ‹ user:{id}:cart ── type string · 0… ─┬─ Keys ──────────────────────────────┐"
-"│ KEY                     SIZE▼  EXPIRES │                                     │"
+"│   KEY                   SIZE▼  EXPIRES │                                     │"
 "│ No loaded key is of type string. t for │ 3 keys matched user:*:cart but      │"
 "│ another type, esc to clear.            │ belong to other patterns, so they   │"
 "│                                        │ are not listed.                     │"
@@ -24,6 +22,7 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│                                        │                                     │"
 "│                                        │                                     │"
 "│                                        │                                     │"
-"│ 9 of ~388K loaded. n loads 1,000 more. │                                     │"
+"│                                        │                                     │"
+"│ 9 of ~388K loaded. m loads 1,000 more. │                                     │"
 "└────────────────────────────────────────┴─────────────────────────────────────┘"
 " Showing string keys.                                                           "

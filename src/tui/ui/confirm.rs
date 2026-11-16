@@ -80,9 +80,9 @@ fn typed_line(c: &Confirm, w: usize) -> Line<'static> {
         typed
     };
     Line::from(vec![
-        Span::styled(" › ", style::amber()),
+        Span::styled(" › ", style::focus()),
         Span::styled(shown, style::fgb()),
-        Span::styled("▏", style::amber()),
+        Span::styled("▏", style::focus()),
     ])
 }
 

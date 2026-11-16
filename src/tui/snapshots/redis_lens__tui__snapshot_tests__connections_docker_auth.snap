@@ -3,7 +3,7 @@ source: src/tui/snapshot_tests.rs
 expression: t.backend()
 ---
 " redis-lens 0.1.0   not connected                                                         pick a connection, then enter "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
+" 1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                                0  Connections "
 "┌─ Connections ──────────────────────────────────────────────────────────────────────────────── 3 saved · 4 in Docker ─┐"
 "│   NAME                   ENV     ADDRESS                                  ACCESS     STATUS        SIGN-IN    MEMORY │"
 "│ SAVED                                                                                                                │"
@@ -13,9 +13,9 @@ expression: t.backend()
 "│ DOCKER · 4 Redis-compatible containers                                                                               │"
 "│   pw-redis-1              LOCAL  127.0.0.1:6390                           writes on  ○ not open    password        — │"
 "│   myapp-redis-1           LOCAL  127.0.0.1:6390                           writes on  ○ not open    none            — │"
-"│   acl-valkey-1            LOCAL  127.0.0.1:6391                           writes on  ○ not open    required        — │"
+"│ › acl-valkey-1            LOCAL  127.0.0.1:6391                           writes on  ○ not open    required        — │"
 "│   odd-valkey-1            LOCAL  127.0.0.1:6392                           writes on  ○ not open    unknown         — │"
-"│ + Add a connection  press a, then paste a redis:// URL                                                               │"
+"│   + Add a connection  press +, then paste a redis:// URL                                                             │"
 "│                                                                                                                      │"
 "├─ acl-valkey-1 ───────────────────────────────────────────────────────────────────────────── LOCAL · found in Docker ─┤"
 "│ Address   127.0.0.1:6391 · TLS off                                                                                   │"
@@ -37,4 +37,4 @@ expression: t.backend()
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   enter Connect   a Add   w Writes   / Filter                                                            ? Help"
+" ↑↓ Move   enter Connect   + Add   w Writes   / Filter                                                            ? Help"

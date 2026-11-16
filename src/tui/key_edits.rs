@@ -1,11 +1,13 @@
-//! What the key edits ask of `App` (spec "Edits on the Key detail (P3)", `N` on the key
+//! What the key edits ask of `App` (spec "Edits on the Key detail (P3)", `+` on the key
 //! list). The views can't move between screens or reach each other, so after every
 //! call into the views `App` takes what they left here ([`App::after_key_edits`]):
 //!
 //! - `$EDITOR` to run for a value too big for the inline prompt ([`Effect::Editor`]);
 //! - after `D`, back to the key list, without the deleted key;
 //! - after `R`, the key list's row renamed; after any write, its TTL and length;
-//! - after `N`, the new key in the key list and its detail open.
+//! - after `+` on the key list, the new key in the key list and its detail open;
+//! - after `d`, `R` or `t` on the key list, the key's value, if it is that key's, closed,
+//!   renamed or given the new TTL.
 
 use super::views::value::Nav;
 use super::{App, Effect, Owner, Screen};
@@ -25,7 +27,34 @@ impl App {
         if let Some(row) = self.views.keys.opened.take() {
             out.extend(self.open_new_key(row));
         }
+        for nav in std::mem::take(&mut self.views.keys.nav) {
+            self.key_list_nav(nav);
+        }
         out
+    }
+
+    /// A write of the key list on a key whose value may be open below it.
+    fn key_list_nav(&mut self, nav: Nav) {
+        let open =
+            |app: &Self, key: &str| app.views.value.row.as_ref().is_some_and(|r| r.key == key);
+        match nav {
+            Nav::Deleted(key) if open(self, &key) => {
+                // The value of a deleted key is not shown again.
+                self.views.value.close();
+                self.patterns.detail_open = false;
+            }
+            Nav::Renamed { old, new } if open(self, &old) => {
+                if let Some(r) = self.views.value.row.as_mut() {
+                    r.key = new;
+                }
+            }
+            Nav::Row(row) if open(self, &row.key) => {
+                if let Some(r) = self.views.value.row.as_mut() {
+                    r.ttl = row.ttl;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn value_nav(&mut self, nav: Nav) -> Vec<Effect> {
@@ -50,7 +79,7 @@ impl App {
         }
     }
 
-    /// `N` added `row`: list it, and show it when the key list is still on screen.
+    /// `+` on the key list added `row`: list it, and show it when the key list is still on screen.
     fn open_new_key(&mut self, row: KeyRow) -> Vec<Effect> {
         self.views.keys.add_row(row.clone());
         if self.screen() != Screen::KeyList {
