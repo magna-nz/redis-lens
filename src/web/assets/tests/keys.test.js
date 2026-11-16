@@ -7,7 +7,8 @@ import { readFileSync, readdirSync } from 'node:fs';
 import {
   AREAS, ACTS, KEYS, actsOf, conflicts, keyOf, keyLabel, ariaKey, dispatch, hintFor, entryFor, listMove, paneStep,
   slashTarget, selectedRow, screenOf, hashOf, areaHash, screenList, panelsOf, allScreens, onScreen, sheetModel,
-  screenActions, gotoModel, gotoFlat, gotoStep, matchRank, reasonLines, readOnlyLine,
+  screenActions, gotoModel, gotoFlat, gotoStep, gotoDefault, matchRank, reasonLines, readOnlyLine, openStep, keyVerdict,
+  REPEATS, isWrite,
 } from '../keys.js';
 import { PANELS as BROWSE_PANELS, readOnlyText, writeOff } from '../views/browse.js';
 import { PANELS as ANALYZE_PANELS } from '../views/analyze.js';
@@ -71,7 +72,9 @@ test('no two entries claim the same key in the same place', () => {
   assert.ok(extra({ keys: ['w'], screens: ['server/clients'] }).length >= 1);
   assert.ok(extra({ keys: ['r'], screens: ['analyze/*'] }).length >= 1, 'analyze/* covers Slots, which has r');
   assert.deepEqual(extra({ keys: ['d'], screens: ['server/clients'] }), []);
-  assert.deepEqual(extra({ keys: ['j'], screens: ['overview'] }), [], 'j is a list key; elsewhere it is free');
+  // A list key and a key that is not one clash too: in a list the list key would hide it.
+  assert.ok(extra({ keys: ['j'], screens: ['overview'] }).length >= 1, 'a j of its own on Overview would be hidden in its lists');
+  assert.ok(extra({ keys: ['Escape'], screens: ['browse/keys'], panes: ['value'] }).length >= 1);
 });
 
 test('every write is a press of its button, never a handler of its own', () => {
@@ -234,10 +237,13 @@ test('list keys need a list; Enter and Space stay the browser\'s on a button; Ta
   // that is not a button (a table row), the keys open it.
   assert.equal(act('Enter', { screen: 'browse/keys', pane: 'keys', inList: true, native: true, onRow: true }), null);
   assert.equal(act('Enter', { screen: 'server/slowlog', pane: 'slowlog', inList: true, native: false, onRow: true }), 'list.open');
-  // Space on a button that is not a row presses it; on a row, or nothing, it pauses.
+  // Space on a button, a link or a row does what the browser does; with the focus on none
+  // of them it pauses or resumes.
   assert.equal(act('Space', { screen: 'pubsub', native: true, onRow: false }), null);
-  assert.equal(act('Space', { screen: 'pubsub', pane: 'channels', inList: true, native: true, onRow: true }), 'pause|live');
+  assert.equal(act('Space', { screen: 'pubsub', pane: 'channels', inList: true, native: true, onRow: true }), null);
+  assert.equal(act('Space', { screen: 'server/slowlog', pane: 'slowlog', inList: true, native: false, onRow: true }), null);
   assert.equal(act('Space', { screen: 'pubsub' }), 'pause|live');
+  assert.equal(act('Space', { screen: 'pubsub', pane: 'tail' }), 'pause|live');
   for (const k of ['Tab', 'Shift', 'Control']) assert.equal(dispatch(k, { screen: 'browse/keys', pane: 'keys', inList: true }), null, k);
 });
 
@@ -492,4 +498,154 @@ test('a read-only connection shows one line under a bar of writes, with the key 
   const browse = read('views/browse.js');
   assert.equal((browse.match(/whyLines\(/g) || []).length, 5);
   assert.match(browse, /whyLines\(buttons\.map\(\(b\) => \(b\.disabled \? b\.title : null\)\)\)/);
+});
+
+// ---- What the page does with a key (the decisions app.js acts on) ----
+
+const entry = (key, c) => dispatch(key, c);
+
+test('Enter, → and l on a row open it only through the row or its open control, never through a write', () => {
+  // A pending entry's row: its only controls are Ack (XACK) and Claim, neither marked open.
+  assert.equal(openStep('Enter', { open: false, control: false, opens: [], right: false }), null);
+  assert.equal(openStep('ArrowRight', { open: false, control: false, opens: [], right: false }), null);
+  // Even a write wrongly marked as the open control is never pressed.
+  assert.equal(openStep('Enter', { open: false, opens: [{ act: 'stream.ack', disabled: false }] }), null);
+  assert.deepEqual(openStep('Enter', { open: false, opens: [{ act: 'key.delete', disabled: false }, { act: null, disabled: false }] }), { do: 'press', index: 1 });
+  assert.equal(openStep('Enter', { open: false, control: true, controlAct: 'item.delete' }), null);
+  // A consumer's row: Pending (a read) is its open control.
+  assert.deepEqual(openStep('Enter', { open: false, opens: [{ act: 'stream.pending', disabled: false }] }), { do: 'press', index: 0 });
+  assert.equal(openStep('Enter', { open: false, opens: [{ act: null, disabled: true }] }), null, 'an open control that is off');
+  // A row that is a button opens itself; the open row moves to the pane on the right.
+  assert.deepEqual(openStep('l', { open: false, control: true }), { do: 'row' });
+  assert.deepEqual(openStep('l', { open: true, control: true, right: true }), { do: 'right' });
+  assert.equal(openStep('l', { open: true, control: true, right: false }), null);
+  // A row with nothing to open: → and l may still move right; Enter does nothing.
+  assert.deepEqual(openStep('ArrowRight', { open: false, opens: [], right: true }), { do: 'right' });
+  assert.equal(openStep('Enter', { open: false, opens: [], right: true }), null);
+  assert.equal(isWrite('stream.ack'), true);
+  assert.equal(isWrite('stream.pending'), false);
+});
+
+test('every row\'s open control is marked, and no write is', () => {
+  for (const file of sources.filter((f) => f.startsWith('views/'))) {
+    for (const line of read(file).split('\n').filter((l) => l.includes("'data-open'"))) {
+      for (const m of line.matchAll(/'data-act': '([\w.]+)'/g)) assert.equal(isWrite(m[1]), false, `${file}: a write marked open: ${line.trim()}`);
+    }
+  }
+  const has = (file, re) => assert.match(read(file), re, `${file}: ${re}`);
+  has('views/connections.js', /text: status === 'failed' \? 'Connect again' : 'Connect', 'data-open': ''/);
+  has('views/streams.js', /text: 'Pending', 'data-open': ''/);
+  has('views/analyze.js', /const keyButton = \(k\) => h\('button', \{ type: 'button', class: 'linkish mono clip', 'data-open': ''/);
+  has('views/analyze.js', /const patternButton = [^\n]*'data-open': ''/);
+  has('views/analyze.js', /text: 'Show', 'data-open': ''/);
+  has('views/analyze.js', /text: 'Compare', 'data-open': ''/);
+  // The pending entries' Ack and Claim are not.
+  const pending = read('views/streams.js').split('\n').filter((l) => /text: '(Ack|Claim)'/.test(l));
+  assert.ok(pending.length >= 3);
+  for (const l of pending) assert.doesNotMatch(l, /data-open/);
+  // app.js opens through openStep only, and presses only `[data-open]` controls.
+  const app = read('app.js');
+  const body = app.slice(app.indexOf('function listOpen'), app.indexOf('function listBack'));
+  assert.match(body, /openStep\(key, \{/);
+  assert.match(body, /row\.querySelectorAll\('\[data-open\]'\)/);
+  assert.doesNotMatch(body, /querySelector\('button/);
+  // Every row gets the tabindex attribute itself (a table row has none of its own), so
+  // the keys can move the focus onto a table row.
+  assert.match(app, /if \(r\.getAttribute\('tabindex'\) !== want\) r\.setAttribute\('tabindex', want\);/);
+});
+
+test('a held key fires once, except for moving in a list', () => {
+  for (const e of KEYS) {
+    const v = keyVerdict(e, { control: { disabled: false }, repeat: true });
+    if (actsOf(e).every((a) => REPEATS.has(a))) assert.equal(v.run, true, e.name);
+    else assert.deepEqual(v, { run: false, say: null, pass: false }, `${e.keys.join(' ')} ${e.name}`);
+  }
+  // In particular: d in the value pane, d on Search, w, [ ] r m a.
+  for (const [key, c] of [['d', { screen: 'browse/keys', pane: 'value', inList: true }], ['d', { screen: 'browse/search' }], ['w', { screen: 'overview' }],
+    ['[', { screen: 'overview' }], [']', { screen: 'overview' }], ['r', { screen: 'browse/streams' }], ['m', { screen: 'browse/keys' }], ['a', { screen: 'overview' }]]) {
+    const e = entry(key, c);
+    assert.ok(e, key);
+    assert.equal(keyVerdict(e, { repeat: true, row: { open: true }, control: { disabled: false } }).run, false, key);
+    assert.equal(keyVerdict(e, { repeat: false, row: { open: true }, control: { disabled: false } }).run, true, key);
+  }
+  assert.equal(keyVerdict(entry('j', { screen: 'overview', inList: true }), { repeat: true }).run, true);
+  // app.js passes the repeat on.
+  assert.match(read('app.js'), /runEntry\(entry, null, \{ repeat: e\.repeat, key \}\)/);
+});
+
+test('a row key acts only when the selected row is the open one, even with the focus off the rows', () => {
+  const del = entry('d', { screen: 'browse/keys', pane: 'keys', inList: true });
+  const on = { control: { disabled: false } };
+  // The focus on "Load more": the row checked is the pane's selected row.
+  assert.deepEqual(keyVerdict(del, { ...on, pane: 'keys', row: { open: false } }), { run: false, say: 'Open the selected row first (enter), then press d.', pass: false });
+  assert.deepEqual(keyVerdict(del, { ...on, pane: 'keys', row: { open: true } }), { run: true });
+  for (const [key, pane] of [['t', 'keys'], ['R', 'keys'], ['d', 'value'], ['t', 'value'], ['e', 'value'], ['y', 'value']]) {
+    const e = entry(key, { screen: 'browse/keys', pane, inList: true });
+    assert.equal(keyVerdict(e, { ...on, pane, row: { open: false } }).run, false, `${key} in ${pane}`);
+    assert.equal(keyVerdict(e, { ...on, pane, row: { open: true } }).run, true, `${key} in ${pane}`);
+  }
+  // A string value has no item rows: y copies it.
+  assert.equal(keyVerdict(entry('y', { screen: 'browse/keys', pane: 'value' }), { ...on, pane: 'value', row: null }).run, true);
+  // A group of patterns has no keys of its own.
+  for (const key of ['t', 'd']) {
+    const v = keyVerdict(entry(key, { screen: 'browse/keys', pane: 'patterns', inList: true }), { ...on, pane: 'patterns', row: { open: false, group: true } });
+    assert.equal(v.run, false);
+    assert.equal(v.say, `A group has no keys of its own: open one of its patterns, then press ${key}.`);
+  }
+  // app.js checks the focused row, else the pane's selected one; Browse marks its groups.
+  assert.match(read('app.js'), /const gateRow = row \|\| selectedOf\(pane\);/);
+  assert.match(read('views/browse.js'), /class: 'row row-pat group', 'data-group': ''/);
+});
+
+test('a key whose control is off or missing says why; Space passes quietly to the browser', () => {
+  const ttl = entry('T', { screen: 'browse/keys', pane: 'value', inList: true });
+  assert.deepEqual(keyVerdict(ttl, { pane: 'value', control: { disabled: true, title: 'Read-only: nothing is written.' } }), { run: false, say: 'Read-only: nothing is written.', pass: false });
+  assert.deepEqual(keyVerdict(ttl, { pane: 'value', control: null }), { run: false, say: 'T: set the key\'s expiry is not on this screen now.', pass: false });
+  const snap = entry('ctrl+s', { screen: 'overview' });
+  assert.equal(keyVerdict(snap, { control: null }).say, 'A snapshot is saved on Analyze, once an analysis is done.');
+  const space = entry('Space', { screen: 'overview' });
+  assert.deepEqual(keyVerdict(space, { control: null }), { run: false, say: null, pass: true }, 'nothing live: the page scrolls');
+  assert.deepEqual(keyVerdict(space, { control: { disabled: true, title: 'x' } }), { run: false, say: null, pass: true }, 'disconnected: no toast');
+  assert.deepEqual(keyVerdict(space, { control: { disabled: false } }), { run: true });
+});
+
+test('Go to picks a default that goes where the text points, and Find only when nothing else matched', () => {
+  const pick = (text, h = held()) => {
+    const g = gotoModel(text, h);
+    const at = gotoDefault(g, text);
+    return at < 0 ? null : gotoFlat(g)[at];
+  };
+  assert.equal(pick('slow').label, 'Server › Slow log');
+  assert.equal(pick('overview').label, 'Overview');
+  assert.equal(pick('connections').label, 'Connections');
+  assert.equal(pick('big').label, 'Analyze › Big keys');
+  assert.equal(pick('Slow log').label, 'Server › Slow log');
+  // A pattern, then a loaded key.
+  assert.deepEqual([pick('session').kind, pick('session').label], ['pattern', 'session:{uuid}']);
+  assert.deepEqual([pick('1002').kind, pick('1002').label], ['key', 'cart:1002']);
+  // Nothing else: Find.
+  assert.equal(pick('zzz-nothing').kind, 'find');
+  // An action that is on can be the default; one that is off is not.
+  assert.equal(pick('copy').label, 'Copy the pattern');
+  assert.equal(pick('delete every').kind, 'action', 'an off action, never Find, when it is all there is');
+  assert.equal(pick('delete every').off !== null, true);
+  // The command, and nothing typed.
+  assert.equal(pick(':INFO').kind, 'command');
+  assert.equal(gotoDefault([], 'x'), -1);
+  assert.equal(pick('').kind, 'screen');
+  // app.js starts on it.
+  assert.match(read('app.js'), /at = gotoDefault\(groups, input\.value\);/);
+});
+
+test('Go to never shows a typed secret, and leaves an input method its keys', () => {
+  const [g] = gotoModel(':AUTH default hunter2', held());
+  assert.equal(g.items[0].detail, 'AUTH *** ***');
+  assert.equal(g.items[0].text, 'AUTH default hunter2', 'the line itself goes to the command line as typed');
+  assert.equal(gotoModel(':CONFIG SET requirepass s3cret', held())[0].items[0].detail, 'CONFIG SET requirepass ***');
+  assert.equal(gotoModel(':HELLO 3 AUTH alice hunter2', held())[0].items[0].detail.includes('hunter2'), false);
+  const app = read('app.js');
+  const body = app.slice(app.indexOf('function openGoto'), app.indexOf('function findKeys'));
+  assert.match(body, /text: item\.detail \|\|/);
+  assert.equal((body.match(/item\.text/g) || []).length, 2, 'item.text only goes to setLine and findKeys, never on screen');
+  assert.match(body, /if \(e\.isComposing \|\| e\.keyCode === 229\) return;/);
 });

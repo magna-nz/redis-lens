@@ -340,8 +340,8 @@ export function mount(root, ctx, route) {
   }
 
   const openKey = (k) => ctx.openKey(k);
-  const keyButton = (k) => h('button', { type: 'button', class: 'linkish mono clip', text: k.name, title: `Open ${k.name} on Browse`, onclick: () => openKey(k) });
-  const patternButton = (p, node = null) => h('button', { type: 'button', class: 'linkish mono clip', text: p.name, title: `List the keys of ${p.name} on Browse`, onclick: () => ctx.openPattern(p, node) });
+  const keyButton = (k) => h('button', { type: 'button', class: 'linkish mono clip', 'data-open': '', text: k.name, title: `Open ${k.name} on Browse`, onclick: () => openKey(k) });
+  const patternButton = (p, node = null) => h('button', { type: 'button', class: 'linkish mono clip', 'data-open': '', text: p.name, title: `List the keys of ${p.name} on Browse`, onclick: () => ctx.openPattern(p, node) });
   const nodeName = (i) => {
     const s = ctx.state();
     const n = s.conn && typeof i === 'number' ? s.conn.nodes[i] : null;
@@ -582,7 +582,7 @@ export function mount(root, ctx, route) {
         { label: 'Keys', cls: 'mono right', cell: (r) => fmtCount(r.keys) },
         { label: 'Memory', cls: 'mono right', cell: (r) => fmtBytes(r.memory) },
         { label: 'Sampled', cls: 'mono right', cell: (r) => fmtCount(r.sampledKeys) },
-        { label: 'Patterns', cls: 'right', cell: (r) => (r.status === 'failed' ? DASH : h('button', { type: 'button', class: 'btn quiet', text: 'Show', 'aria-label': `Show the patterns of ${r.endpoint}`, onclick: () => ctx.openPattern(null, r.index) })) },
+        { label: 'Patterns', cls: 'right', cell: (r) => (r.status === 'failed' ? DASH : h('button', { type: 'button', class: 'btn quiet', text: 'Show', 'data-open': '', 'aria-label': `Show the patterns of ${r.endpoint}`, onclick: () => ctx.openPattern(null, r.index) })) },
       ], d.rows, { caption: 'One row per shard', cls: 'shards', rowKey: (r, i) => `n:${i}` }),
       d.rows.filter((r) => r.note).map((r) => notice(`${r.endpoint}: ${r.note}`)));
   }
@@ -644,7 +644,7 @@ export function mount(root, ctx, route) {
         {
           label: 'Compare', cls: 'right',
           cell: (r) => (r.current || !a.report ? '' : h('button', {
-            type: 'button', class: 'btn quiet', text: 'Compare', 'aria-label': `Compare this analysis with the snapshot of ${r.utc || r.file}`,
+            type: 'button', class: 'btn quiet', text: 'Compare', 'data-open': '', 'aria-label': `Compare this analysis with the snapshot of ${r.utc || r.file}`,
             onclick: async () => {
               try {
                 store.compare = { a: r.file, b: 'current' };

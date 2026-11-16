@@ -697,7 +697,7 @@ function mountKeys(root, ctx) {
       if (r.kind === 'group') {
         const closed = store.closed.has(r.key) && !store.filter;
         out.push(h('li', null, h('button', {
-          type: 'button', class: 'row row-pat group', 'aria-expanded': closed ? 'false' : 'true', 'data-row': `g:${r.key}`,
+          type: 'button', class: 'row row-pat group', 'data-group': '', 'aria-expanded': closed ? 'false' : 'true', 'data-row': `g:${r.key}`,
           title: r.reason || '',
           onclick: () => {
             if (store.closed.has(r.key)) store.closed.delete(r.key);

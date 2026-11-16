@@ -4,13 +4,17 @@
 // buttons, the `?` sheet and the Actions group of Go to are all built from it, so none of
 // them can name a key that does nothing, or miss one that does.
 //
-// Pure: no DOM, no globals at import time. tests/keys.test.js imports it in Node.
+// Pure: no DOM, no globals at import time (it imports only ui.js's pure maskCommand).
+// tests/keys.test.js imports it in Node. The decisions app.js acts on (what Enter does on a
+// row, whether a key may fire now, Go to's default row) are functions here, on plain data.
 //
 // A key never does more than its button: an action is either "press" (the page presses the
 // control that carries `data-act="<act>"`, exactly as a click does, so a write goes through
 // the server's write gate and its question as a click would) or "app" (a handler of the
 // page's own: moving in a list, an area, Go to, the sheet). Nothing here reads from or
 // writes to a server.
+
+import { maskCommand } from './ui.js';
 
 // ---------------------------------------------------------------------------------------
 // Areas, panels and screens
@@ -184,7 +188,9 @@ export const PANE_LABELS = {
  *  `panes`: only with the focus in one of these panes; `list`: only with the focus in a
  *  list; `act`: the action, or actions tried in order (the first that is on the screen);
  *  `open`: in these panes, the selected row must be the one that is open (the action acts
- *  on what is open, so it says to open the row first rather than act on another). */
+ *  on what is open, so it says to open the row first rather than act on another); `quiet`:
+ *  when its control is not there or is off, the key does nothing and the browser keeps it
+ *  (Space scrolls the page when nothing is live). */
 export const KEYS = [
   // Moving.
   { keys: ['j', 'ArrowDown'], name: 'Next row', screens: ALL, list: true, act: 'list.down' },
@@ -211,7 +217,7 @@ export const KEYS = [
   { keys: ['b'], name: 'Database list', screens: ALL, act: 'db' },
   { keys: ['['], name: 'Previous node', screens: ALL, act: 'node.prev' },
   { keys: [']'], name: 'Next node', screens: ALL, act: 'node.next' },
-  { keys: ['Space'], name: 'Pause or resume what is live (the tail, else the live figures)', screens: ALL, act: ['pause', 'live'] },
+  { keys: ['Space'], name: 'Pause or resume what is live (the tail, else the live figures)', screens: ALL, act: ['pause', 'live'], quiet: true },
   { keys: ['ctrl+s'], name: 'Save a snapshot', screens: ALL, act: 'snapshot', missing: 'A snapshot is saved on Analyze, once an analysis is done.' },
   // Screens that have them.
   { keys: ['r'], name: 'Read again', screens: ['browse/streams', 'browse/search', 'analyze/slots', 'connections'], act: 'refresh' },
@@ -219,7 +225,7 @@ export const KEYS = [
   { keys: ['s'], name: 'Sort', screens: ['browse/keys', 'analyze/slots'], act: 'sort' },
   { keys: ['a'], name: 'Analyze the keys (it asks first)', screens: ['overview', 'analyze/*', 'browse/streams'], act: 'analyze' },
   // Browse › Keys: lower case on the selected row, upper case on what it belongs to.
-  { keys: ['y'], name: 'Copy the value', screens: ['browse/keys'], panes: ['value'], act: 'copy.value' },
+  { keys: ['y'], name: 'Copy the value', screens: ['browse/keys'], panes: ['value'], act: 'copy.value', open: ['value'] },
   { keys: ['Y'], name: 'Copy the key name', screens: ['browse/keys'], panes: ['value'], act: 'copy.name' },
   { keys: ['y'], name: 'Copy the pattern', screens: ['browse/keys'], panes: ['patterns'], act: 'copy.pattern', open: ['patterns'] },
   { keys: ['Y'], name: 'Copy the pattern\'s scan command', screens: ['browse/keys'], panes: ['patterns'], act: 'copy.command', open: ['patterns'] },
@@ -273,8 +279,9 @@ export function onScreen(spec, screen) {
 }
 
 /** Pairs of entries that claim the same key in the same place: the same key, a screen in
- *  common, panes in common (no panes is every pane) and the same list condition. The
- *  table must have none (tests/keys.test.js). */
+ *  common and panes in common (no panes is every pane). A list key and a key that is not
+ *  one clash too: in a list the list key would hide the other. The table must have none
+ *  (tests/keys.test.js). */
 export function conflicts(table = KEYS) {
   const screens = allScreens();
   const out = [];
@@ -284,7 +291,6 @@ export function conflicts(table = KEYS) {
       const b = table[j];
       const key = a.keys.find((k) => b.keys.includes(k));
       if (!key) continue;
-      if (!!a.list !== !!b.list) continue;
       const where = screens.find((s) => onScreen(a.screens, s) && onScreen(b.screens, s));
       if (!where) continue;
       const panes = !a.panes || !b.panes || a.panes.some((p) => b.panes.includes(p));
@@ -346,12 +352,13 @@ export function ariaKey(k) {
  *  - `dialog`: a dialog or menu is open, or the focus is in the command-line drawer (they
  *    handle their own keys);
  *  - `native`: the focus is on a control that Enter presses by itself (a button, a link);
- *  - `onRow`: that control is a row of a list.
+ *  - `onRow`: the focus is on a row of a list.
  *  No key runs in an input or behind a dialog. Tab is never taken. */
 export function dispatch(key, c = {}) {
   if (!key || c.dialog || c.inInput) return null;
   if (key === 'Enter' && c.native) return null;
-  if (key === 'Space' && c.native && !c.onRow) return null;
+  // Enter and Space on a button, a link or a row do what the browser does with them.
+  if (key === 'Space' && (c.native || c.onRow)) return null;
   const screen = c.screen || '';
   for (const entry of KEYS) {
     if (!entry.keys.includes(key)) continue;
@@ -414,6 +421,62 @@ export function selectedRow(rows, remembered = null) {
   if (kept >= 0) return kept;
   const open = rows.findIndex((r) => r.open);
   return open >= 0 ? open : 0;
+}
+
+// ---------------------------------------------------------------------------------------
+// Whether a key acts now
+// ---------------------------------------------------------------------------------------
+
+/** The actions a held key may repeat: moving in a list. Nothing else fires twice from one
+ *  press, so holding `d` never deletes one item after another. */
+export const REPEATS = new Set(['list.down', 'list.up', 'list.pageDown', 'list.pageUp', 'list.home', 'list.end']);
+
+/** Whether an action is a write. */
+export const isWrite = (act) => !!(act && ACTS[act] && ACTS[act].write);
+
+/** What Enter, → or l does on a row. `r`:
+ *  - `open`: the row is the one open in its list;
+ *  - `control`: the row is itself a button or a link, `controlAct` its `data-act`;
+ *  - `opens`: the row's `[data-open]` controls in order, `{ act, disabled }`;
+ *  - `right`: there is a pane to the right.
+ *  Returns `{ do: 'right' }` (to that pane), `{ do: 'row' }` (press the row),
+ *  `{ do: 'press', index }` (press that `[data-open]` control), or null (nothing). A row is
+ *  only opened through itself or a control marked `data-open`, never through a write: a
+ *  write is only ever its own key's, or a click. */
+export function openStep(key, r = {}) {
+  if (r.open) return r.right ? { do: 'right' } : null;
+  if (r.control) return isWrite(r.controlAct) ? null : { do: 'row' };
+  const index = (r.opens || []).findIndex((o) => !isWrite(o.act) && !o.disabled);
+  if (index >= 0) return { do: 'press', index };
+  return key !== 'Enter' && r.right ? { do: 'right' } : null;
+}
+
+/** Whether a key's entry may act now, and what to say when not. `c`:
+ *  - `repeat`: the key is held (`KeyboardEvent.repeat`);
+ *  - `pane`: the focused pane's id;
+ *  - `row`: the row the entry would act on: the focused row, else the pane's selected row
+ *    (`{ open, group }`), or null;
+ *  - `control`: the control it would press (`{ disabled, title }`), null when none is shown.
+ *  Returns `{ run: true }`, or `{ run: false, say, pass }`: `say` the message to show (or
+ *  null), `pass` true to leave the key to the browser. */
+export function keyVerdict(entry, c = {}) {
+  const acts = actsOf(entry);
+  if (c.repeat && !acts.every((a) => REPEATS.has(a))) return { run: false, say: null, pass: false };
+  if (ACTS[acts[0]].run === 'app') return { run: true };
+  const key = keyLabel(entry.keys[0]);
+  if (entry.open && c.pane && entry.open.includes(c.pane) && c.row) {
+    if (c.row.group) return { run: false, say: `A group has no keys of its own: open one of its patterns, then press ${key}.`, pass: false };
+    if (!c.row.open) return { run: false, say: `Open the selected row first (${keyLabel('Enter')}), then press ${key}.`, pass: false };
+  }
+  if (!c.control) {
+    if (entry.quiet) return { run: false, say: null, pass: true };
+    return { run: false, say: entry.missing || `${key}: ${entry.name.toLowerCase()} is not on this screen now.`, pass: false };
+  }
+  if (c.control.disabled) {
+    if (entry.quiet) return { run: false, say: null, pass: true };
+    return { run: false, say: c.control.title || `${entry.name}: off now.`, pass: false };
+  }
+  return { run: true };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -507,7 +570,9 @@ export function gotoModel(text, held = {}) {
   const t = raw.trim();
   if (t.startsWith(':')) {
     const rest = t.slice(1).trim();
-    return [{ id: 'command', label: 'Command line', items: [{ kind: 'command', label: 'Run in the command line', detail: rest, text: rest }] }];
+    // The detail is shown and announced: credentials in it are masked as the command line
+    // masks its echo. `text` (what goes into the command line) is never drawn.
+    return [{ id: 'command', label: 'Command line', items: [{ kind: 'command', label: 'Run in the command line', detail: maskCommand(rest), text: rest }] }];
   }
   const finding = t.startsWith('/');
   const q = finding ? t.slice(1).trim() : t;
@@ -536,6 +601,38 @@ export function gotoFlat(groups) {
   const out = [];
   groups.forEach((g, gi) => g.items.forEach((it) => out.push({ ...it, group: gi })));
   return out;
+}
+
+/** The result Enter picks before any arrow is pressed, as an index in `gotoFlat`: the
+ *  command when there is one; else a Screen or Action (not off) whose name, or a word of
+ *  it, starts with the text, the closest first; else the first Pattern; else the first
+ *  loaded Key; else any other Screen or Action; and only when nothing else matched, Find.
+ *  So Enter never starts a read the user did not point at. -1 when there is nothing. */
+export function gotoDefault(groups, text = '') {
+  const flat = gotoFlat(groups);
+  if (!flat.length) return -1;
+  const t = String(text ?? '').trim();
+  const q = t.startsWith('/') ? t.slice(1).trim() : t;
+  const first = (pred) => flat.findIndex(pred);
+  const cmd = first((x) => x.kind === 'command');
+  if (cmd >= 0) return cmd;
+  const named = (x) => (x.kind === 'screen' || x.kind === 'action') && !x.off;
+  let best = -1;
+  let bestRank = 3;
+  flat.forEach((x, i) => {
+    if (!named(x)) return;
+    const r = matchRank(x.label, q);
+    if (r !== null && r < bestRank) {
+      best = i;
+      bestRank = r;
+    }
+  });
+  if (best >= 0 && bestRank <= 2) return best;
+  for (const pred of [(x) => x.kind === 'pattern', (x) => x.kind === 'key', named, (x) => x.kind !== 'find']) {
+    const i = first(pred);
+    if (i >= 0) return i;
+  }
+  return first((x) => x.kind === 'find');
 }
 
 /** Moving in Go to's results: `down`, `up` (wrapping), `group` (Tab: the first item of the

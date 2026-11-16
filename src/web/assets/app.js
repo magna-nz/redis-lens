@@ -12,7 +12,8 @@ import {
 } from './ui.js';
 import {
   ACTS, actsOf, keyOf, keyLabel, dispatch, hintFor, listMove, paneStep, slashTarget, selectedRow,
-  screenOf, areaHash, screenList, screenActions, sheetModel, gotoModel, gotoFlat, gotoStep,
+  screenOf, areaHash, screenList, screenActions, sheetModel, gotoModel, gotoFlat, gotoStep, gotoDefault,
+  openStep, keyVerdict,
 } from './keys.js';
 import * as connections from './views/connections.js';
 import * as overview from './views/overview.js';
@@ -529,6 +530,12 @@ const paneOf = (el) => (el && el.closest ? el.closest('[data-pane]') : null);
 const rowsOf = (pane) => Array.from(pane.querySelectorAll('[data-row]')).filter(visible);
 const panesShown = () => Array.from($('view').querySelectorAll('[data-pane]')).filter(visible);
 const isOpenRow = (r) => r.getAttribute('aria-current') === 'true' || r.getAttribute('aria-pressed') === 'true' || r.classList.contains('on') || !!r.closest('tr.on');
+/** A row that only groups others (a folder of patterns, a group of clients). */
+const isGroupRow = (r) => r.hasAttribute('data-group');
+/** A pane's selected row (the one Tab reaches), or null. */
+const selectedOf = (pane) => (pane ? rowsOf(pane).find((r) => r.classList.contains('sel')) || null : null);
+/** A row as keys.js's decisions see it. */
+const rowFacts = (r) => (r ? { open: isOpenRow(r), group: isGroupRow(r) } : null);
 
 /** The row the focus is on, or the row of the list item it is in (a row's own tools). */
 function focusedRow(el) {
@@ -573,7 +580,10 @@ function syncPane(pane) {
   const at = selectedRow(rows.map((r) => ({ key: r.dataset.row, open: isOpenRow(r) })), paneSel.has(id) ? paneSel.get(id) : null);
   rows.forEach((r, i) => {
     const on = i === at;
-    if (r.tabIndex !== (on ? 0 : -1)) r.tabIndex = on ? 0 : -1;
+    // The attribute itself: a table row's tabIndex is -1 without one, and then the keys
+    // could not move the focus onto it.
+    const want = on ? '0' : '-1';
+    if (r.getAttribute('tabindex') !== want) r.setAttribute('tabindex', want);
     r.classList.toggle('sel', on);
   });
 }
@@ -608,25 +618,29 @@ function listMoveTo(act) {
   if (next >= 0) focusRow(pane, rows[next]);
 }
 
-/** Enter, → or l: open the row; on the row that is open already, go to the pane on the
- *  right. Moving never opens a row: only this, or a click, does. */
-function listOpen() {
+/** Enter, → or l: open the row, through the row itself or its `[data-open]` control
+ *  (never a write); on the row that is open already, go to the pane on the right
+ *  (keys.js openStep decides). Moving never opens a row: only this, or a click, does. */
+function listOpen(key) {
   const el = document.activeElement;
   const pane = paneOf(el);
   if (!pane) return;
-  const row = focusedRow(el) || rowsOf(pane).find((r) => r.tabIndex === 0);
+  const row = focusedRow(el) || selectedOf(pane);
   if (!row) return;
-  if (isOpenRow(row)) {
-    const panes = panesShown();
-    const next = paneStep(panes.length, panes.indexOf(pane), 1);
-    if (next >= 0) focusPane(panes[next]);
-    return;
-  }
-  if (row.matches('button, a[href]')) row.click();
-  else {
-    const open = row.querySelector('[data-open]') || (row.tagName === 'TR' ? row.querySelector('button, a[href]') : null);
-    if (open && !open.disabled) open.click();
-  }
+  const panes = panesShown();
+  const next = paneStep(panes.length, panes.indexOf(pane), 1);
+  const opens = Array.from(row.querySelectorAll('[data-open]')).filter(visible);
+  const step = openStep(key, {
+    open: isOpenRow(row),
+    control: row.matches('button, a[href]'),
+    controlAct: row.dataset.act || null,
+    opens: opens.map((o) => ({ act: o.dataset.act || null, disabled: !!o.disabled })),
+    right: next >= 0,
+  });
+  if (!step) return;
+  if (step.do === 'right') focusPane(panes[next]);
+  else if (step.do === 'row') row.click();
+  else opens[step.index].click();
 }
 
 /** Esc, ← or h: the pane on the left, else the screen's way back (Clients' groups). */
@@ -704,50 +718,55 @@ function press(found, entry) {
   el.click();
 }
 
-/** Run an entry of the key table. `where` names the pane and row to act in (Go to runs an
- *  action of a pane the focus is not in); by default, where the focus is. */
-function runEntry(entry, where = null) {
-  const acts = actsOf(entry);
-  if (ACTS[acts[0]].run === 'app') {
-    APP[acts[0]](entry);
-    return;
-  }
+/** The control an entry would press, as keys.js's verdict sees it: a row of pills is off
+ *  only when every pill is. */
+function controlFacts(found) {
+  if (!found.length) return null;
+  const pills = found.filter((el) => el.classList.contains('pill'));
+  if (found.length > 1 && pills.length === found.length) return { disabled: pills.every((el) => el.disabled), title: pills[0].title || null };
+  return { disabled: !!found[0].disabled, title: found[0].title || null };
+}
+
+/** Where an entry acts and what it would press. `where` names the pane and row (Go to runs
+ *  an action of a pane the focus is not in); by default, where the focus is. The row the
+ *  verdict checks is the focused row, else the pane's selected row, so a key pressed from a
+ *  pane's own button ("Load more") still needs the selected row to be the open one. The
+ *  control is looked for in the focused row only, never in a row the focus is not on. */
+function entryPlan(entry, where = null) {
   const el = document.activeElement;
   const pane = where ? where.pane : paneOf(el);
   const row = where ? where.row : focusedRow(el);
-  const off = entryOff(entry, pane, row);
-  if (off) {
-    notify(off, 'info');
-    return;
+  if (ACTS[actsOf(entry)[0]].run === 'app') return { pane, found: [], facts: { pane: null, row: null, control: null } };
+  const gateRow = row || selectedOf(pane);
+  let found = [];
+  for (const act of actsOf(entry)) {
+    found = findAct(act, ACTS[act].in, pane, row);
+    if (found.length) break;
   }
-  for (const act of acts) {
-    const found = findAct(act, ACTS[act].in, pane, row);
-    if (found.length) {
-      press(found, entry);
-      return;
-    }
-  }
-  notify(entry.missing || `${keyLabel(entry.keys[0])}: ${entry.name.toLowerCase()} is not on this screen now.`, 'info');
+  return { pane, found, facts: { pane: pane ? pane.dataset.pane : null, row: rowFacts(gateRow), control: controlFacts(found) } };
 }
 
-/** Why an entry can't run where it would, before looking for its control: it acts on the
- *  open row of a list, and the selected row is another one. */
-function entryOff(entry, pane, row) {
-  if (entry.open && pane && row && entry.open.includes(pane.dataset.pane) && !isOpenRow(row)) {
-    return `Open the selected row first (${keyLabel('Enter')}), then press ${keyLabel(entry.keys[0])}.`;
+/** Run an entry of the key table, if keys.js's verdict lets it. Returns whether the key
+ *  was taken (false leaves it to the browser). */
+function runEntry(entry, where = null, { repeat = false, key = null } = {}) {
+  const plan = entryPlan(entry, where);
+  const verdict = keyVerdict(entry, { ...plan.facts, repeat });
+  if (!verdict.run) {
+    if (verdict.say) notify(verdict.say, 'info');
+    return !verdict.pass;
   }
-  return null;
+  const acts = actsOf(entry);
+  if (ACTS[acts[0]].run === 'app') APP[acts[0]](entry, key);
+  else press(plan.found, entry);
+  return true;
 }
 
 /** Whether an entry's control is there and on, for Go to's Actions: null, or why not. */
 function entryState(entry, pane, row) {
-  const off = entryOff(entry, pane, row);
-  if (off) return off;
-  for (const act of actsOf(entry)) {
-    const found = findAct(act, ACTS[act].in, pane, row);
-    if (found.length) return found[0].disabled ? found[0].title || 'Off now.' : null;
-  }
-  return entry.missing || 'Not on this screen now.';
+  const plan = entryPlan(entry, { pane, row });
+  const verdict = keyVerdict(entry, plan.facts);
+  if (verdict.run) return null;
+  return verdict.say || 'Not on this screen now.';
 }
 
 // ----- The page's own actions -----
@@ -792,7 +811,7 @@ const APP = {
   'list.pageUp': () => listMoveTo('list.pageUp'),
   'list.home': () => listMoveTo('list.home'),
   'list.end': () => listMoveTo('list.end'),
-  'list.open': () => listOpen(),
+  'list.open': (entry, key) => listOpen(key),
   'list.back': () => listBack(),
   'area.overview': () => goArea('1'),
   'area.browse': () => goArea('2'),
@@ -825,8 +844,7 @@ function onKey(e) {
     onRow: !!row,
   });
   if (!entry) return;
-  e.preventDefault();
-  runEntry(entry);
+  if (runEntry(entry, null, { repeat: e.repeat, key })) e.preventDefault();
 }
 
 // ----- Hints: each control with an action shows its key, from the table -----
@@ -835,9 +853,10 @@ function onKey(e) {
  *  control with `data-act`, for the screen and pane it is in. A control that draws its own
  *  hint (`.key-hint`) only gets `aria-keyshortcuts`. Attributes only, so a control's text
  *  (which the views use to put the focus back) never changes. */
-function applyHints() {
+function applyHints(roots = null) {
   const screen = screenOf(currentRoute());
-  for (const el of document.querySelectorAll('[data-act]')) {
+  const els = roots ? roots.flatMap((r) => [...(r.matches('[data-act]') ? [r] : []), ...r.querySelectorAll('[data-act]')]) : document.querySelectorAll('[data-act]');
+  for (const el of els) {
     const pane = paneOf(el);
     const hint = hintFor(el.dataset.act, screen, pane ? pane.dataset.pane : null);
     if (!hint) {
@@ -852,16 +871,36 @@ function applyHints() {
 }
 
 /** After the views draw: each list's selection, the hints, and the focus put back on the
- *  row it was on when that row was drawn anew. */
-function afterDraw() {
-  for (const pane of $('view').querySelectorAll('[data-pane]')) syncPane(pane);
+ *  row it was on when that row was drawn anew. Only the parts that changed are looked at,
+ *  and a change inside a list's own rows that adds or takes no row (a Pub/Sub message
+ *  in the tail, a figure) costs nothing. */
+function afterDraw(records) {
+  const roots = [];
+  for (const r of records || []) {
+    const t = r.target;
+    const touched = [t, ...r.addedNodes, ...r.removedNodes].some((n) => n.nodeType === 1 && (n.matches('[data-row], [data-pane], [data-act]') || n.querySelector('[data-row], [data-pane], [data-act]')));
+    if (!touched) continue;
+    if (!roots.some((x) => x.contains(t))) {
+      for (let i = roots.length - 1; i >= 0; i -= 1) if (t.contains(roots[i])) roots.splice(i, 1);
+      roots.push(t);
+    }
+  }
+  if (records && !roots.length) return;
+  const view = $('view');
+  const panes = new Set();
+  for (const root of records ? roots : [view]) {
+    const up = paneOf(root);
+    if (up) panes.add(up);
+    for (const p of root.querySelectorAll('[data-pane]')) panes.add(p);
+  }
+  for (const pane of panes) if (pane.isConnected) syncPane(pane);
   const el = document.activeElement;
   if (lastRow && !lastRow.el.isConnected && (!el || el === document.body)) {
-    const pane = Array.from($('view').querySelectorAll('[data-pane]')).find((p) => p.dataset.pane === lastRow.pane);
+    const pane = Array.from(view.querySelectorAll('[data-pane]')).find((p) => p.dataset.pane === lastRow.pane);
     const row = pane ? rowsOf(pane).find((r) => r.dataset.row === lastRow.key) : null;
     if (row) row.focus({ preventScroll: true });
   }
-  applyHints();
+  applyHints(records ? roots : null);
 }
 
 function watchFocus() {
@@ -1022,7 +1061,7 @@ function openGoto() {
   const search = () => {
     groups = gotoModel(input.value, src.model);
     flat = gotoFlat(groups);
-    at = flat.length ? 0 : -1;
+    at = gotoDefault(groups, input.value);
     draw();
   };
 
@@ -1054,6 +1093,8 @@ function openGoto() {
 
   input.addEventListener('input', search);
   input.addEventListener('keydown', (e) => {
+    // An input method is composing: its Enter and arrows are its own.
+    if (e.isComposing || e.keyCode === 229) return;
     const move = { ArrowDown: 'down', ArrowUp: 'up' }[e.key] || (e.key === 'Tab' ? (e.shiftKey ? 'groupBack' : 'group') : null);
     if (move) {
       e.preventDefault();

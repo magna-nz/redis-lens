@@ -299,7 +299,7 @@ export function mount(root, ctx, { head, body: area }) {
           {
             label: '', cls: 'nowrap', cell: (c) => [
               c.pending ? h('button', {
-                type: 'button', class: 'btn quiet', text: 'Pending', 'aria-label': `List the pending entries of ${c.name.name}`, 'data-act': 'stream.pending', onclick: () => listPending(r, g, c),
+                type: 'button', class: 'btn quiet', text: 'Pending', 'data-open': '', 'aria-label': `List the pending entries of ${c.name.name}`, 'data-act': 'stream.pending', onclick: () => listPending(r, g, c),
               }) : null,
               writesOff() || !g.pending ? null : h('button', {
                 type: 'button', class: 'btn quiet', text: 'Claim', 'aria-label': `Claim pending entries of ${g.name.name} from ${c.name.name} (XAUTOCLAIM)`, 'data-act': 'stream.claim', onclick: () => openClaim(r, g, { name: c.name, idleMs: c.idleMs }),
