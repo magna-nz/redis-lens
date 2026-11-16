@@ -783,6 +783,126 @@ export function liveModel(state) {
   };
 }
 
+/** The row a list beside its detail shows (Slow log, Clients, Nodes): the one picked,
+ *  found again by its key in the rows of the newest reading, so a reading that reorders the
+ *  list keeps it. `rows`: `{ key }` in order; `picked`: the key picked, or null for none
+ *  yet (then the first row). A picked row that is gone is not swapped for another: `gone`
+ *  is true and `index` -1, so the detail says so instead of showing a row the user did not
+ *  pick. */
+export function listPick(rows, picked) {
+  const list = rows || [];
+  if (picked === null || picked === undefined) {
+    return list.length ? { key: list[0].key, index: 0, gone: false } : { key: null, index: -1, gone: false };
+  }
+  const index = list.findIndex((r) => r.key === picked);
+  return { key: picked, index, gone: index < 0 };
+}
+
+/** Whether a reply may be drawn: it answers the newest ask (`seq`), for the session or node
+ *  still shown (`who`), and, when it was asked for one row, for the row still picked
+ *  (`pick`). A late reply (a slow poll overtaken by a newer one, a read for another node or
+ *  row) is dropped, so a list or a detail never shows a reading of something else. */
+export function replyFits(sent, now) {
+  if (!sent || !now) return false;
+  if (sent.seq !== now.seq) return false;
+  if ((sent.who ?? null) !== (now.who ?? null)) return false;
+  if (sent.pick !== undefined && sent.pick !== now.pick) return false;
+  return true;
+}
+
+// ---- The session mark: which connection, which connect of this page, which database ----
+
+/** Whether a state starts a new connect: connected now (an analysis's own reconnect
+ *  counts as connected), and not before, or to another server or at another time. The
+ *  page counts these (`noteState`), so a mark made before a reconnect never matches after. */
+export function connectStarted(prev, next) {
+  const on = (s) => !!(s && s.conn && (s.connected || analyzing(s)));
+  const id = (s) => (s && s.conn ? `${s.conn.name}|${s.conn.docker}|${s.conn.connectedAt}` : null);
+  return on(next) && (!on(prev) || id(prev) !== id(next));
+}
+
+/** Where a state is: the connection, which connect of this page it is (`connects`), and
+ *  the database. Browse marks its history entries with it, and a dialog that sends when
+ *  answered is marked with it when it opens. Null when not connected. */
+export function placeOf(state, connects = 0) {
+  const c = state && state.conn;
+  if (!c) return null;
+  return `${c.name}|${c.docker}|${connects}|${state.analysis ? state.analysis.db : 0}`;
+}
+
+/** Whether a dialog's answer may send: only on the connection, connect and database it
+ *  was opened for (its mark when it opened is the mark now), and only when it was opened
+ *  on a connection at all. */
+export function answerSends(atOpen, atAnswer) {
+  return atOpen !== null && atOpen !== undefined && atOpen === atAnswer;
+}
+
+/** What a dialog says when the connection changed under it. */
+export const STALE_TEXT = 'The connection changed: nothing was sent.';
+export const STALE_START_TEXT = 'The connection changed: nothing was started.';
+
+let connectsSeen = 0;
+let markState = null;
+const markWatchers = new Set();
+
+/** Every state the page hears (browse.js's `init` passes them on, from boot): counts the
+ *  connects, and tells the open dialogs the mark now. */
+export function noteState(s) {
+  if (connectStarted(markState, s)) connectsSeen += 1;
+  markState = s;
+  const mark = sessionMark();
+  for (const f of Array.from(markWatchers)) f(mark);
+}
+
+/** The connects this page has seen. */
+export function connectCount() {
+  return connectsSeen;
+}
+
+/** The mark of the session now. */
+export function sessionMark() {
+  return placeOf(markState, connectsSeen);
+}
+
+/** Calls `fn(mark)` on every state; returns the function that stops it. */
+export function watchSessionMark(fn) {
+  markWatchers.add(fn);
+  return () => markWatchers.delete(fn);
+}
+
+/** The colour role of a leading mark: ▲ the warning colour, ✗ danger, ✓ ok. */
+export const GLYPH_ROLES = { '▲': 'glyph', '✗': 'glyph bad', '✓': 'glyph good' };
+
+/** A text that starts with a mark and a space (`▲ partial`), split: `{ glyph, cls, rest }`;
+ *  without a mark, `glyph` and `cls` are null and `rest` is the whole text. */
+export function glyphParts(text) {
+  const s = String(text ?? '');
+  const g = s.charAt(0);
+  if (GLYPH_ROLES[g] && s.charAt(1) === ' ') return { glyph: g, cls: GLYPH_ROLES[g], rest: s.slice(2) };
+  return { glyph: null, cls: null, rest: s };
+}
+
+/** The server's own words for why writes are off, for the read-only line: its reason (it
+ *  can say why the profile is read-only), without its closing "Turn writes on in
+ *  Connections." (the line's button turns them on here). The fixed line when it sent none. */
+export function writesReason(text) {
+  const s = String(text ?? '').replace(/\s*Turn writes on in Connections\.\s*$/, '').trim();
+  return s || READ_ONLY_TEXT;
+}
+
+/** A poll's tick: `'read'` or `'skip'`. The first read always goes; after it, a tick reads
+ *  only while the figures are live and the page is shown, and never while the previous
+ *  read is still out (its reply is drawn when it comes, however slow). */
+export function pollTick({ inFlight = false, first = false, live = true, hidden = false } = {}) {
+  if (inFlight) return 'skip';
+  if (first) return 'read';
+  return live && !hidden ? 'read' : 'skip';
+}
+
+/** The words of the one read-only line a screen shows (drawn by `writesOffLine`). */
+export const READ_ONLY_TEXT = 'Edits are off: this connection is read-only.';
+export const WRITES_ON_TEXT = 'Turn writes on (w)';
+
 // ---------------------------------------------------------------------------------------
 // 2. DOM helpers and shared components
 // ---------------------------------------------------------------------------------------
@@ -1003,6 +1123,55 @@ export function readOnlyNote(text) {
   return h('p', { class: 'note muted' }, icon('lock', 16), h('span', { text }));
 }
 
+/** The one read-only line of a screen, as Browse draws it: the lock, the reason, and the
+ *  button that turns writes on (the top bar's access button: the server asks first). */
+export function writesOffLine(ctx, text = READ_ONLY_TEXT) {
+  return h('div', { class: 'line read-only-line' }, readOnlyNote(text),
+    ctx && ctx.toggleWrites ? h('button', { type: 'button', class: 'linkish small', text: WRITES_ON_TEXT, onclick: () => ctx.toggleWrites() }) : null);
+}
+
+/** A text with a leading mark (`▲ partial`, `✗ failed`) drawn with the mark in its colour
+ *  role (`glyphParts`); a text without one is returned as it is. */
+export function glyphText(text) {
+  const p = glyphParts(text);
+  if (!p.glyph) return p.rest;
+  return [h('span', { class: p.cls, 'aria-hidden': 'true', text: `${p.glyph} ` }), p.rest];
+}
+
+/** A small "About this" disclosure for a screen's explanation: closed by default, so the
+ *  explanation is there when wanted and out of the way otherwise. */
+export function aboutThis(...lines) {
+  const kept = lines.flat().filter(Boolean);
+  if (!kept.length) return null;
+  return h('details', { class: 'about' }, h('summary', { text: 'About this' }), kept.map((t) => (typeof t === 'string' ? h('p', { class: 'muted small', text: t }) : t)));
+}
+
+/** The width from which Overview, Server and the screens with a list beside its detail fill
+ *  the window's height, their panes side by side (below it they stack and the page scrolls). */
+export const FILL_WIDE = '(min-width: 1100px)';
+
+/** Fill the window's height (`body.fill-view`, app.css) while the window matches `query`.
+ *  Returns the function that stops it (a view's unmount). */
+export function fillWhile(query = FILL_WIDE) {
+  const mq = typeof window !== 'undefined' && typeof window.matchMedia === 'function' ? window.matchMedia(query) : null;
+  const set = () => document.body.classList.toggle('fill-view', !mq || mq.matches);
+  set();
+  if (mq) mq.addEventListener('change', set);
+  return () => {
+    if (mq) mq.removeEventListener('change', set);
+    document.body.classList.remove('fill-view');
+  };
+}
+
+/** A pane as Browse builds one: a fixed head (its title and tools), then a body that
+ *  scrolls inside itself, then a foot. `id` names it for the keys (`data-pane`). */
+export function paneCard({ id = null, label = '', title = null, tools = null, body = null, foot = null, cls = '' } = {}) {
+  return h('section', { class: `card pane ${cls}`.trim(), 'data-pane': id, 'aria-label': label || null },
+    h('div', { class: 'pane-head' }, title, tools ? h('div', { class: 'pane-tools' }, tools) : null),
+    h('div', { class: 'pane-scroll pane-body' }, body),
+    h('div', { class: 'pane-foot' }, foot));
+}
+
 /** A semantic table with the mockup's row look. `columns`: `{ label, cls, cell(row) }`,
  *  where `cell` returns a string or a node. It sits in a box that scrolls sideways on a
  *  narrow screen. `rowKey(row, i)`: the rows are rows of a list the keys move in (app.js),
@@ -1028,25 +1197,45 @@ let dialogSeq = 0;
 
 /** A modal dialog on the native `<dialog>` element: the browser keeps focus inside it,
  *  Escape closes it, and focus goes back to where it was. `build(close)` returns the body
- *  nodes; `close(result)` closes it. Returns a promise of the result (null when dismissed). */
-export function openDialog({ title, build, wide = false, onClose = null }) {
+ *  nodes; `close(result)` closes it. Returns a promise of the result (null when dismissed).
+ *
+ *  `session: true` for a dialog that sends something to the server when it is answered:
+ *  it is marked with the session (`sessionMark`) when it opens, closes by itself when the
+ *  connection, the connect or the database changes while it is open, and an answer given
+ *  after such a change resolves to null; either way `onStale()` says so. `build` gets
+ *  `holds()` as its third argument, for a dialog that sends from inside itself. */
+export function openDialog({ title, build, wide = false, onClose = null, session = false, onStale = null }) {
   return new Promise((resolve) => {
     dialogSeq += 1;
     const titleId = `dlg-title-${dialogSeq}`;
     let result = null;
+    const mark = session ? sessionMark() : null;
+    const holds = () => !session || answerSends(mark, sessionMark());
+    let stale = false;
     const dlg = h('dialog', { class: wide ? 'dialog wide' : 'dialog', 'aria-labelledby': titleId });
     const close = (value = null) => {
       result = value;
       if (dlg.open) dlg.close();
     };
+    const unwatch = session ? watchSessionMark((now) => {
+      if (!answerSends(mark, now) && dlg.open) {
+        stale = true;
+        close(null);
+      }
+    }) : null;
     const head = h('div', { class: 'dialog-head' },
       h('h2', { id: titleId, class: 'dialog-title', text: title }),
       h('button', { type: 'button', class: 'btn icon-btn quiet', 'aria-label': 'Close', onclick: () => close(null) }, icon('close', 18)));
     const body = h('div', { class: 'dialog-body' });
-    add(body, build(close, dlg));
+    add(body, build(close, dlg, holds));
     dlg.append(head, body);
     dlg.addEventListener('close', () => {
       dlg.remove();
+      if (unwatch) unwatch();
+      if (session && (stale || (result !== null && !holds()))) {
+        result = null;
+        if (onStale) onStale();
+      }
       if (onClose) onClose(result);
       resolve(result);
     });
@@ -1062,9 +1251,11 @@ export function openDialog({ title, build, wide = false, onClose = null }) {
  *  (`code` is shown exactly, in a box; `after` is a muted line under it). Resolves to
  *  `{ typed }` when confirmed and null when cancelled. Cancel has the focus for a Yes/No
  *  question; for a typed one the text box does, and Yes stays off until the text matches. */
-export function confirmDialog(confirm) {
+export function confirmDialog(confirm, { session = false, onStale = null } = {}) {
   let state = confirmStart(confirm);
   return openDialog({
+    session,
+    onStale,
     title: confirm.title || 'Please confirm',
     build(close) {
       const error = h('p', { class: 'field-error', role: 'alert' });

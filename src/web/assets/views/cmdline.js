@@ -90,6 +90,9 @@ export function helpLines(help, line) {
 /** Mount the panel once. `onClose` hides it. Returns `{ focus(), refresh() }`. */
 export function mount(root, ctx, onClose) {
   const access = h('span', { class: 'muted small' });
+  // On a read-only connection, the way to turn writes on, as every screen has it: the top
+  // bar's access button (the server asks first). A write sent anyway is refused by the gate.
+  const writesOn = h('button', { type: 'button', class: 'linkish small inline', text: 'Turn writes on', hidden: true, onclick: () => ctx.toggleWrites && ctx.toggleWrites() });
   const viewBox = h('div');
   const out = h('div', { class: 'box cmd-out', tabindex: '0', role: 'log', 'aria-live': 'polite', 'aria-label': 'Command output' });
   const helper = h('p', { class: 'cmd-help small', id: 'cmd-help' });
@@ -286,7 +289,7 @@ export function mount(root, ctx, onClose) {
 
   fill(root,
     h('div', { class: 'cmd-head' },
-      h('div', null, h('h2', { class: 'lbl', text: 'Command line' }), access),
+      h('div', null, h('h2', { class: 'lbl', text: 'Command line' }), access, ' ', writesOn),
       h('div', { class: 'toolbar' },
         viewBox,
         h('button', {
@@ -312,6 +315,7 @@ export function mount(root, ctx, onClose) {
     const s = ctx.state();
     if (!s.connected || !s.conn) access.textContent = 'not connected: connect first';
     else access.textContent = `${s.conn.name} · ${s.conn.readOnly ? 'read-only: readonly commands' : 'writes ask as usual'}${session.pipeline ? ' · pipeline' : ''}`;
+    writesOn.hidden = !(s.connected && s.conn && s.conn.readOnly && ctx.toggleWrites);
 
     // The command names and help belong to one connection: forget them when it changes,
     // and read the names once the panel is open on a live connection.

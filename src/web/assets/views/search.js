@@ -10,7 +10,7 @@
 // boxes have autocomplete off; nothing goes to storage, the console or an address.
 
 import {
-  h, fill, DASH, fmtBytes, fmtGrouped, fmtPercent, plural, notice, emptyState, readOnlyNote, errorText, table, copyText,
+  h, fill, DASH, fmtBytes, fmtGrouped, fmtPercent, plural, notice, emptyState, errorText, table, copyText, writesOffLine, glyphText, listPick, writesReason,
 } from '../ui.js';
 
 // ---------------------------------------------------------------------------------------
@@ -65,6 +65,15 @@ export function commandOff(list, cmd) {
 export function queryStart(list) {
   return list && !list.off && typeof list.lastQueryCopy === 'string' ? list.lastQueryCopy : '';
 }
+
+/** Where the screen's one read-only line goes: in the index's pane when one is shown (its
+ *  head has Drop index), else in the list's (its head has New index). */
+export function readOnlyPlace({ shown = false } = {}) {
+  return shown ? 'index' : 'indexes';
+}
+
+/** What the detail shows when the index picked left the list (dropped elsewhere). */
+export const INDEX_GONE = 'The index picked is no longer listed: pick another index.';
 
 /** An index's schema field in one line: `title TEXT SORTABLE`, `$.a AS a TAG`. */
 export function fieldText(f) {
@@ -129,6 +138,14 @@ export function mount(root, ctx, { head, body: area }) {
   }
 
   const writesOff = () => (store.list && store.list.writes) || null;
+  /** The one line that says why the writes are off, in the pane that is its place now: on
+   *  a read-only connection the read-only line with its button, else the server's reason. */
+  const offLine = (here, shown) => {
+    const off = writesOff();
+    if (!off || here !== readOnlyPlace({ shown })) return null;
+    const c = ctx.state().conn;
+    return h('div', { class: 'bar-why pane-note' }, c && c.readOnly ? writesOffLine(ctx, writesReason(off)) : notice(off, 'info'));
+  };
 
   function draw() {
     const l = store.list;
@@ -150,15 +167,18 @@ export function mount(root, ctx, { head, body: area }) {
         h('p', { class: 'muted small', text: 'Read again asks the server again.' })));
       return;
     }
-    const picked = l.indexes.find((i) => i.name.id === store.picked) || l.indexes[0] || null;
-    if (picked) store.picked = picked.name.id;
+    // The index picked, kept by its name (`listPick`); one that left the list stays picked
+    // and says so, and no other index is shown or queried in its place.
+    const at = listPick(l.indexes.map((i) => ({ key: i.name.id })), store.picked);
+    const picked = at.index >= 0 ? l.indexes[at.index] : null;
+    store.picked = at.key;
+    if (at.gone) store.results = null;
     const keepFocus = box.contains(document.activeElement) && document.activeElement !== queryBox ? document.activeElement.id : null;
     const hadQueryFocus = document.activeElement === queryBox;
     fill(box,
       store.error ? notice(store.error) : null,
       l.error ? notice(l.error) : null,
-      writesOff() ? readOnlyNote(writesOff()) : null,
-      h('div', { class: 'browse search' }, listCard(l, picked), picked ? detailCard(l, picked) : null),
+      h('div', { class: 'lv search' }, listCard(l, picked), picked ? detailCard(l, picked) : at.gone ? goneCard() : null),
       picked ? queryCard(l, picked) : null);
     if (hadQueryFocus) queryBox.focus();
     else if (keepFocus) {
@@ -167,11 +187,21 @@ export function mount(root, ctx, { head, body: area }) {
     }
   }
 
+  function goneCard() {
+    return h('section', { class: 'card pane lv-detail', 'data-pane': 'index', 'aria-label': 'The index' },
+      h('div', { class: 'pane-head' }, h('h2', { class: 'lbl', text: 'Index' })),
+      h('div', { class: 'pane-scroll pane-body pad' }, notice(INDEX_GONE, 'info')));
+  }
+
   function listCard(l, picked) {
-    return h('div', { class: 'card stack browse-col search-list', 'data-pane': 'indexes' },
-      h('div', { class: 'card-head' }, h('h2', { class: 'lbl', text: `Indexes · ${l.indexes.length}` })),
-      l.firstOf ? h('p', { class: 'muted small', text: l.firstOf }) : null,
-      l.notes.map((n) => h('p', { class: 'muted small', text: n })),
+    // New index stays in sight: it opens the form under the list (the form is the same).
+    const create = writesOff() ? null : h('button', { type: 'button', class: 'btn', text: 'New index…', 'data-act': 'search.create', title: 'Create an index (FT.CREATE): it asks first', onclick: openCreate });
+    return h('section', { class: 'card pane lv-list search-list', 'data-pane': 'indexes', 'aria-label': 'Indexes' },
+      h('div', { class: 'pane-head' }, h('h2', { class: 'lbl', text: `Indexes · ${l.indexes.length}` }), create ? h('div', { class: 'pane-tools' }, create) : null),
+      offLine('indexes', !!picked),
+      h('div', { class: 'pane-scroll pane-body' },
+      l.firstOf ? h('p', { class: 'muted small pad-x', text: l.firstOf }) : null,
+      l.notes.map((n) => h('p', { class: 'muted small pad-x', text: n })),
       l.indexes.length ? table([
         {
           label: 'Index', cls: 'keycell', cell: (i) => h('button', {
@@ -185,11 +215,20 @@ export function mount(root, ctx, { head, body: area }) {
         { label: 'On', cls: 'mono nowrap', cell: (i) => i.on || DASH },
         { label: 'Docs', cls: 'mono right nowrap', cell: (i) => (typeof i.docs === 'number' ? fmtGrouped(i.docs) : DASH) },
         { label: 'Size', cls: 'mono right nowrap', cell: (i) => (typeof i.bytes === 'number' ? fmtBytes(i.bytes) : DASH) },
-        { label: 'Indexed', cls: 'mono nowrap', cell: (i) => (i.building ? `▲ ${i.progressText || 'building'}` : i.progressText || DASH) },
+        { label: 'Indexed', cls: 'mono nowrap', cell: (i) => (i.building ? glyphText(`▲ ${i.progressText || 'building'}`) : i.progressText || DASH) },
       ], l.indexes.map((i) => ({ ...i, rowClass: picked && i.name.id === picked.name.id ? 'on' : '' })), { caption: 'The indexes', cls: 'indexes' })
         : emptyState(l.empty ? l.empty.title : 'The module has no indexes.'),
-      !l.indexes.length && l.empty && l.empty.text ? h('p', { class: 'muted small', text: l.empty.text }) : null,
-      writesOff() ? null : createBox());
+      !l.indexes.length && l.empty && l.empty.text ? h('p', { class: 'muted small pad-x', text: l.empty.text }) : null,
+      writesOff() ? null : createBox()));
+  }
+
+  /** The head's New index…: opens the create form and goes into it. */
+  function openCreate() {
+    const d = createBox();
+    d.open = true;
+    d.scrollIntoView({ block: 'nearest' });
+    const first = d.querySelector('input');
+    if (first) first.focus();
   }
 
   function detailCard(l, i) {
@@ -201,9 +240,11 @@ export function mount(root, ctx, { head, body: area }) {
       ['Indexed', i.progressText || (typeof i.progress === 'number' ? fmtPercent(i.progress) : DASH)],
       ['Failures', typeof i.failures === 'number' ? fmtGrouped(i.failures) : DASH],
     ];
-    return h('div', { class: 'card stack browse-col search-detail', 'data-pane': 'index' },
-      h('div', { class: 'value-head' }, h('h2', { class: 'key-title mono wrap-any', text: i.name.name }),
-        writesOff() ? null : h('button', { type: 'button', class: 'btn danger', text: 'Drop index', 'aria-label': `Drop the index ${i.name.name} (FT.DROPINDEX, the documents stay)`, 'data-act': 'search.drop', onclick: (ev) => drop(i, ev.currentTarget) })),
+    return h('section', { class: 'card pane lv-detail search-detail', 'data-pane': 'index', 'aria-label': 'The index' },
+      h('div', { class: 'pane-head' }, h('h2', { class: 'key-title mono clip', text: i.name.name, title: i.name.name }),
+        writesOff() ? null : h('div', { class: 'pane-tools' }, h('button', { type: 'button', class: 'btn danger', text: 'Drop index', 'aria-label': `Drop the index ${i.name.name} (FT.DROPINDEX, the documents stay)`, 'data-act': 'search.drop', onclick: (ev) => drop(i, ev.currentTarget) }))),
+      offLine('index', true),
+      h('div', { class: 'pane-scroll pane-body pad' },
       i.infoText ? notice(i.infoText, 'info') : h('dl', { class: 'facts' }, facts.map(([k, v]) => h('div', null, h('dt', { text: k }), h('dd', { class: 'mono', text: v })))),
       i.building ? notice('Still indexing: queries may miss documents until it is done.', 'info') : null,
       i.leftOut ? h('p', { class: 'muted small', text: i.leftOut }) : null,
@@ -213,7 +254,7 @@ export function mount(root, ctx, { head, body: area }) {
         { label: 'Path', cls: 'mono', cell: (f) => f.path || DASH },
         { label: 'Type', cls: 'mono nowrap', cell: (f) => f.type || DASH },
         { label: 'Flags', cls: 'mono', cell: (f) => (f.flags.length ? f.flags.join(' ') : DASH) },
-      ], i.schema, { caption: `The fields of ${i.name.name}` }) : h('p', { class: 'muted', text: i.fieldsText || 'The module returned no fields.' }));
+      ], i.schema, { caption: `The fields of ${i.name.name}` }) : h('p', { class: 'muted', text: i.fieldsText || 'The module returned no fields.' })));
   }
 
   // ---------- queries ----------
@@ -331,12 +372,17 @@ export function mount(root, ctx, { head, body: area }) {
     const s = f.shown;
     formatSeq += 1;
     const id = `search-fmt-${formatSeq}`;
-    const select = h('select', { class: 'field', id, 'data-act': 'format', onchange: () => openField(f.at.r, f.at.d, f.at.k, select.value) },
-      s.formats.map((x) => h('option', { value: x.toLowerCase(), selected: x === s.format, text: x })));
+    // The formats as pills, the key once on their label (`f` steps through them), as Browse.
+    const formats = h('div', { class: 'tabs', role: 'group', 'aria-label': 'Show the field as', id },
+      h('span', { class: 'lbl hint-label', 'data-hint-of': 'format', text: 'Show as' }),
+      s.formats.map((x) => h('button', {
+        type: 'button', class: x === s.format ? 'pill small on' : 'pill small', 'aria-pressed': x === s.format ? 'true' : 'false', text: x, 'data-act': 'format',
+        onclick: () => openField(f.at.r, f.at.d, f.at.k, x.toLowerCase()),
+      })));
     return h('section', { class: 'value-box', 'aria-label': `${f.name} of ${f.key.name}` },
       h('div', { class: 'value-label toolbar' },
         h('span', { class: 'mono wrap-any grow', text: `${f.key.name} · ${f.name} · ${s.header}` }),
-        h('label', { htmlFor: id, class: 'sr-only', text: 'Format' }), select,
+        formats,
         s.copy !== null ? h('button', {
           type: 'button', class: 'btn quiet', text: 'Copy',
           onclick: async () => {
@@ -368,7 +414,7 @@ export function mount(root, ctx, { head, body: area }) {
     const error = h('p', { class: 'form-error', role: 'alert' });
     const button = h('button', { type: 'submit', class: 'btn', text: 'Create' });
     return h('details', { class: 'advanced' },
-      h('summary', { text: 'Create an index (FT.CREATE)', 'data-act': 'search.create' }),
+      h('summary', { text: 'Create an index (FT.CREATE)' }),
       h('form', {
         class: 'form', autocomplete: 'off',
         onsubmit: async (ev) => {
@@ -419,7 +465,12 @@ export function mount(root, ctx, { head, body: area }) {
     if (!alive) return;
     const before = store.who;
     follow(s);
-    if (store.who !== before) load();
+    if (store.who !== before) {
+      // Another connection or node: the create form and the query go at once, before the
+      // list is read again, so nothing typed for one is sent to another.
+      draw();
+      load();
+    }
   });
 
   draw();
