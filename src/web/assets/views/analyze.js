@@ -8,7 +8,7 @@
 
 import {
   h, fill, refill, DASH, fmtBytes, fmtCount, fmtGrouped, fmtPercent, fmtDuration, fmtClock, plural, barPercent, meter, setVar,
-  table, pills, notice, emptyState, connectFirst, errorText, confirmDialog, copyText, fmtSignedBytes, fmtSignedCount, sparkline, expiryText,
+  table, pills, notice, emptyState, connectFirst, errorText, confirmDialog, copyText, fmtSignedBytes, fmtSignedCount, sparkline, expiryText, patternName,
 } from '../ui.js';
 
 // ---------------------------------------------------------------------------------------
@@ -403,11 +403,11 @@ export function mount(root, ctx, route) {
         },
       },
       h('span', { class: 'glyph', 'aria-hidden': 'true', text: r.warning ? '▲' : '' }),
-      h('span', { class: 'name' }, h('span', { class: 'mono clip block', text: r.pattern.name }), h('span', { class: 'sub', text: `${r.status || DASH} · ~${fmtCount(r.estKeys)} keys` })),
+      h('span', { class: 'name' }, patternName(r.pattern.name, { cls: 'mono clip block' }), h('span', { class: 'sub', text: `${r.status || DASH} · ~${fmtCount(r.estKeys)} keys` })),
       h('span', { class: 'mono right', text: `${fmtPercent(r.noTtlRatio)} no TTL` }),
       h('span', { class: 'mono right', text: fmtBytes(r.estBytes) }))))));
     const detail = sel ? h('div', { class: 'card stack' },
-      h('h2', { class: 'mono key-title wrap-any', text: sel.pattern.name }),
+      h('h2', { class: 'key-title wrap-any' }, patternName(sel.pattern.name)),
       h('p', { text: `~${fmtGrouped(sel.estKeys)} keys · ${fmtBytes(sel.estBytes)} · ${sel.status || DASH}` }),
       sel.explain.map((t, i) => (i === 0 && sel.warning ? notice(t) : h('p', { class: 'muted', text: t }))),
       sel.ttlHist && d.ttlLabels.length === sel.ttlHist.length ? histogram(d.ttlLabels, sel.ttlHist) : null,

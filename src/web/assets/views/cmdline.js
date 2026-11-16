@@ -1,4 +1,5 @@
-// The command line panel: one command at a time, drawn the way redis-cli draws replies.
+// The command line: a drawer docked to the bottom of the window on every screen, one
+// command at a time, drawn the way redis-cli draws replies.
 //
 // The redis-lens process decides what is sent: readonly commands go, writes go through
 // the write gate (the confirm dialog), and refusals come back in its own fixed wording.
@@ -281,7 +282,7 @@ export function mount(root, ctx, onClose) {
           onclick: () => {
             session.entries = [];
             drawOutput();
-            input.focus();
+            input.focus({ preventScroll: true });
           },
         }),
         h('button', { type: 'button', class: 'btn', text: 'Close', onclick: onClose }))),
@@ -331,5 +332,14 @@ export function mount(root, ctx, onClose) {
   drawOutput();
   refresh();
   busy(session.running);
-  return { focus: () => input.focus(), refresh };
+  return { focus: () => input.focus({ preventScroll: true }), refresh };
+}
+
+/** The drawer's state: `{ open }`. `toggle`, `open` and `close` give the next state and
+ *  where the focus goes (`input` when it opens, `toggle` when it closes with the focus
+ *  inside it). The drawer is the page's, not a route: the address never changes. */
+export function drawerStep(state, action, focusInside = false) {
+  const open = action === 'toggle' ? !state.open : action === 'open';
+  if (open === state.open) return { open, focus: open ? 'input' : null };
+  return { open, focus: open ? 'input' : focusInside ? 'toggle' : null };
 }

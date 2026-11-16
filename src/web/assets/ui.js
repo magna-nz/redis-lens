@@ -618,6 +618,132 @@ export function parseRoute(hash, names, fallback) {
   return { name, sub: name === parts[0] ? parts[1] ?? null : null };
 }
 
+/** The placeholders redis-lens's pattern inference writes (`src/pattern/`), and no other
+ *  text in braces: a key name may hold `{...}` of its own (a cluster hash tag). */
+export const PLACEHOLDERS = ['id', 'uuid', 'ulid', 'hash', 'ip', 'var'];
+const PLACEHOLDER_RE = new RegExp(`\\{(?:${PLACEHOLDERS.join('|')})\\}`, 'g');
+
+/** A pattern's name in parts, `{ text, ph }`, with `ph` true for each placeholder, so they
+ *  can be drawn in their own colour. A `literal` row (a key name kept as it is, not a
+ *  pattern) is one plain part. The parts joined give the name back exactly. */
+export function splitPlaceholders(name, literal = false) {
+  const s = String(name ?? '');
+  if (!s) return [];
+  if (literal) return [{ text: s, ph: false }];
+  const out = [];
+  let last = 0;
+  for (const m of s.matchAll(PLACEHOLDER_RE)) {
+    if (m.index > last) out.push({ text: s.slice(last, m.index), ph: false });
+    out.push({ text: m[0], ph: true });
+    last = m.index + m[0].length;
+  }
+  if (last < s.length) out.push({ text: s.slice(last), ph: false });
+  return out;
+}
+
+/** What one saved connection or Docker container shows in the top bar's connection menu:
+ *  its name, environment, address (as its card on Connections shows it) and what a click
+ *  connects to. Built field by field from the listing, so nothing else of a profile (its
+ *  URL, which may hold a user name) can reach the menu. */
+function connMenuItem(p, state) {
+  const c = state && state.conn;
+  const docker = p.docker === true;
+  const current = !!c && c.name === p.name && !!c.docker === docker;
+  let status = null;
+  if (current) status = state.connected ? 'connected' : state.connecting ? 'connecting' : state.failed ? 'failed' : null;
+  return {
+    key: `${docker ? 'docker' : 'saved'}:${p.name}`,
+    name: String(p.name ?? ''),
+    env: String(p.env || 'OTHER').toUpperCase(),
+    address: [p.address || DASH, p.tls ? 'TLS' : null, p.db ? `db ${p.db}` : null, docker ? 'Docker' : null].filter(Boolean).join(' · '),
+    docker,
+    target: docker ? { docker: String(p.container ?? p.name) } : { name: String(p.name ?? '') },
+    current,
+    status,
+  };
+}
+
+/** The connection menu: the saved connections, then the containers Docker discovery found. */
+export function connMenuModel(profiles, containers, state) {
+  return {
+    saved: (profiles || []).map((p) => connMenuItem(p, state)),
+    docker: (containers || []).map((p) => connMenuItem(p, state)),
+  };
+}
+
+/** The connection button: status dot, name, environment, and its accessible name. */
+export function connButtonModel(state) {
+  const s = state || {};
+  if ((s.connected || analyzing(s)) && s.conn) {
+    return { dot: s.lost || analyzing(s) ? 'busy' : 'ok', name: s.conn.name, env: String(s.conn.env || 'OTHER').toUpperCase(), note: analyzing(s) ? 'analyzing…' : null, aria: `Connected to ${s.conn.name}, ${s.conn.env}. Switch connection.` };
+  }
+  if (s.connecting) return { dot: 'busy', name: s.connecting.name, env: null, note: 'connecting…', aria: `Connecting to ${s.connecting.name}. Switch connection.` };
+  if (s.failed && s.conn) return { dot: 'bad', name: s.conn.name, env: null, note: 'failed', aria: `The connect to ${s.conn.name} failed. Switch connection.` };
+  return { dot: null, name: null, env: null, note: 'Not connected', aria: 'Not connected. Pick a connection.' };
+}
+
+/** The access button: Read-only or Writes on, for the connection the session is on. It
+ *  toggles the session's writes (`setSessionWrites(next)`), which the server asks about
+ *  before turning them on. Not shown without a connection. */
+export function accessModel(state) {
+  const s = state || {};
+  const c = s.conn;
+  if (!c || !(s.connected || analyzing(s))) return { show: false };
+  const on = !c.readOnly;
+  return {
+    show: true,
+    on,
+    next: !on,
+    label: on ? 'Writes on' : 'Read-only',
+    tone: on ? 'danger' : 'warn',
+    aria: on
+      ? `Writes on for ${c.name}. Turn writes off.`
+      : `Read-only: ${c.name} gets no writes. Turn writes on (it asks first).`,
+    title: on
+      ? 'Key edits, deletes and write commands reach the server; deletes, bulk actions and @dangerous commands still ask each time. Click to turn writes off.'
+      : `${c.writesOff || 'redis-lens sends no write to this connection.'} Click to turn writes on: it asks first.`,
+  };
+}
+
+/** The database control: `db N` from the state at once; the list (`getDbs`) is read only
+ *  when it is opened. On a cluster it says why there is no other database. */
+export function dbModel(state) {
+  const s = state || {};
+  const c = s.conn;
+  if (!c || !(s.connected || analyzing(s))) return { show: false };
+  const db = s.analysis && typeof s.analysis.db === 'number' ? s.analysis.db : 0;
+  const cluster = c.topology === 'cluster' || (Array.isArray(c.nodes) && c.nodes.length > 0);
+  return { show: true, db, label: `db ${db}`, off: cluster ? 'A cluster only has database 0.' : null };
+}
+
+/** The node select on a cluster: one option per node, the picked one selected. Null when
+ *  there is nothing to pick. */
+export function nodeModel(state) {
+  const s = state || {};
+  const c = s.conn;
+  const nodes = c && Array.isArray(c.nodes) ? c.nodes : [];
+  if (!(s.connected || analyzing(s)) || nodes.length < 2) return null;
+  return {
+    picked: c.pickedNode,
+    options: nodes.map((n, i) => ({ value: n.id, text: `${n.address} · ${i + 1} of ${nodes.length}`, selected: n.id === c.pickedNode })),
+  };
+}
+
+/** The Live button and the interval beside it. */
+export function liveModel(state) {
+  const s = state || {};
+  const live = s.live !== false;
+  const every = s.polling ? s.polling.intervalSecs : null;
+  return {
+    enabled: !!s.connected,
+    live,
+    label: live ? 'Live' : 'Paused',
+    aria: live ? 'Live: pause the live figures' : 'Paused: resume the live figures',
+    every,
+    options: (s.polling ? s.polling.intervals : []).map((n) => ({ value: String(n), text: `every ${n} s` })),
+  };
+}
+
 // ---------------------------------------------------------------------------------------
 // 2. DOM helpers and shared components
 // ---------------------------------------------------------------------------------------
@@ -763,6 +889,63 @@ export function envBadge(env) {
   return badge(name, name === 'PROD' ? 'env-prod' : '');
 }
 
+/** A pattern's name with its placeholders (`{id}`, `{uuid}`…) in their own colour. Its
+ *  text is the name exactly; a `literal` row is drawn plain. */
+export function patternName(name, { literal = false, cls = 'mono' } = {}) {
+  return h('span', { class: cls }, splitPlaceholders(name, literal).map((p) => (p.ph ? h('span', { class: 'ph', text: p.text }) : p.text)));
+}
+
+/** A button and the menu it opens (a disclosure: the menu holds ordinary buttons and links).
+ *  `build(close)` fills the menu when it opens and may fill it again later. Escape closes it
+ *  and gives the focus back to its button; so does a click outside it or the focus leaving
+ *  it; ↑ ↓ move between its items. */
+export function menuButton(button, menu, build) {
+  let open = false;
+  const items = () => Array.from(menu.querySelectorAll('button:not(:disabled), a[href], select, input'));
+  const close = (refocus = true) => {
+    if (!open) return;
+    open = false;
+    menu.hidden = true;
+    button.setAttribute('aria-expanded', 'false');
+    document.removeEventListener('pointerdown', outside, true);
+    if (refocus) button.focus({ preventScroll: true });
+  };
+  const outside = (e) => {
+    if (!menu.contains(e.target) && !button.contains(e.target)) close(false);
+  };
+  const show = () => {
+    open = true;
+    menu.hidden = false;
+    button.setAttribute('aria-expanded', 'true');
+    document.addEventListener('pointerdown', outside, true);
+    build(close);
+    const first = items()[0];
+    if (first) first.focus({ preventScroll: true });
+  };
+  button.addEventListener('click', () => (open ? close() : show()));
+  const keys = (e) => {
+    if (!open) return;
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      const list = items();
+      if (!list.length) return;
+      e.preventDefault();
+      const at = list.indexOf(document.activeElement);
+      const next = e.key === 'ArrowDown' ? (at + 1) % list.length : (at <= 0 ? list.length - 1 : at - 1);
+      list[next].focus({ preventScroll: true });
+    }
+  };
+  menu.addEventListener('keydown', keys);
+  button.addEventListener('keydown', keys);
+  menu.addEventListener('focusout', (e) => {
+    if (open && e.relatedTarget && !menu.contains(e.relatedTarget) && e.relatedTarget !== button) close(false);
+  });
+  return { close, isOpen: () => open, refocusFirst: () => { const f = items()[0]; if (f) f.focus({ preventScroll: true }); } };
+}
+
 /** A calm empty or error state: one sentence, and an optional action. */
 export function emptyState(text, action = null) {
   return h('div', { class: 'empty' }, h('p', { text }), action);
@@ -901,7 +1084,7 @@ export function createToasts(region) {
   return function notify(text, kind = 'info') {
     if (!text) return;
     const toast = h('div', { class: `toast ${kind}` },
-      h('span', { 'aria-hidden': 'true', class: 'glyph', text: kind === 'error' ? '✗' : kind === 'ok' ? '✓' : '•' }),
+      h('span', { 'aria-hidden': 'true', class: kind === 'error' ? 'glyph bad' : 'glyph', text: kind === 'error' ? '✗' : kind === 'ok' ? '✓' : '•' }),
       h('span', { class: 'toast-text', text }),
       h('button', { type: 'button', class: 'btn icon-btn quiet', 'aria-label': 'Dismiss', onclick: () => toast.remove() }, icon('close', 16)));
     region.append(toast);
@@ -920,16 +1103,6 @@ export function pills(items, current, onPick = null, label = '') {
     }
     return h('button', { type: 'button', class: on ? 'pill on' : 'pill', 'aria-pressed': on ? 'true' : 'false', text: item.label, onclick: () => onPick && onPick(item.id) });
   }));
-}
-
-/** The node picker shown on a cluster: the views that read one node read the picked one. */
-export function nodePicker(conn, onPick) {
-  const nodes = conn && Array.isArray(conn.nodes) ? conn.nodes : [];
-  if (nodes.length < 2) return null;
-  const id = `node-pick-${(dialogSeq += 1)}`;
-  const select = h('select', { class: 'field', id, onchange: () => onPick(Number(select.value)) },
-    nodes.map((n, i) => h('option', { value: n.id, selected: n.id === conn.pickedNode, text: `${n.address} · ${i + 1} of ${nodes.length}` })));
-  return h('div', { class: 'picker' }, h('label', { htmlFor: id, text: 'Node' }), select);
 }
 
 /** Put text on the clipboard, at the user's click. The browser may refuse (no permission,

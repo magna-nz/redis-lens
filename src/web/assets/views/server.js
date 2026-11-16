@@ -6,7 +6,7 @@
 
 import {
   h, fill, refill, DASH, fmtBytes, fmtCount, fmtDuration, fmtRate, fmtTook, fmtClock, fmtGrouped, plural,
-  barPercent, barChart, meter, table, pills, notice, emptyState, connectFirst, nodePicker,
+  barPercent, barChart, meter, table, pills, notice, emptyState, connectFirst,
   fillLog, errorText,
 } from '../ui.js';
 import { spanText } from './overview.js';
@@ -123,7 +123,6 @@ export function mount(root, ctx, route) {
     return () => {};
   }
 
-  const conn = state.conn;
   const tab = TABS.some((t) => t.id === route.sub) ? route.sub : 'clients';
   let alive = true;
   const timers = [];
@@ -156,8 +155,7 @@ export function mount(root, ctx, route) {
   const panel = h('div');
   view.append(
     h('div', { class: 'view-head' },
-      h('h1', { class: 'title', id: 'server-title', text: 'Server' }),
-      h('div', { class: 'actions' }, nodePicker(conn, (index) => ctx.pickNode(index)))),
+      h('h1', { class: 'title', id: 'server-title', text: 'Server' })),
     h('div', { class: 'cols stretch' }, ops.el, clients.el),
     pills(TABS, tab, null, 'Server panels'),
     panel);
