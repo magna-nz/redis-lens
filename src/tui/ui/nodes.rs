@@ -11,7 +11,9 @@ use crate::model::{NodeReport, NodeRole, NodeStatus};
 use crate::tui::app::App;
 
 use super::analysis::{Col, MARK, Tier, head_row, need_report, notice, paragraph, pick_cols};
-use super::widgets::{Section, Title, fit, pad_l, pad_r, rows, scroll_offset, sections, trunc};
+use super::widgets::{
+    self, Section, Title, fit, gutter_area, pad_l, pad_r, rows, scroll_offset, sections, trunc,
+};
 use super::{mark_previous, server_label, style};
 
 const SLOTS_W: usize = 12;
@@ -194,13 +196,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         ],
     );
     let (list, detail) = (inner[0], inner[1]);
-    let iw = usize::from(list.width);
-    let cols = columns(endpoint_width(iw));
+    // The columns start after the marker gutter.
+    let iw = usize::from(gutter_area(list).width);
+    let cols = columns(endpoint_width(iw + usize::from(widgets::GUTTER)));
     let (keep, slots_w) = pick_cols(&cols, iw, usize::MAX, app.more_here());
     let slots_w = slots_w.min(SLOTS_CAP);
     rows(
         frame,
-        list,
+        gutter_area(list),
         vec![head_row(&cols, &keep, slots_w, &[KEYS, MEMORY, SAMPLED])],
         None,
     );
@@ -216,7 +219,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         .take(usize::from(body.height))
         .map(|n| node_row(n, &cols, &keep, slots_w))
         .collect();
-    rows(frame, body, lines, Some(sel - off));
+    widgets::list(frame, body, lines, Some(sel - off));
     detail_lines(frame, detail, n, report.sampled_keys);
 }
 

@@ -1,0 +1,28 @@
+---
+source: src/tui/snapshot_tests.rs
+expression: "buffer_lines(&render(&app, 80, 24)).join(\"\\n\")"
+---
+ prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys   ● analyzed 14:02 
+ 1   2    3  Analyze › Big keys · Expiry · Changes · Hot keys   4   5         0 
+┌─ Big keys ────────── top 6 of 100K sampled ─┬─ session:c41f0e9a-2d6b-47e8-… ─┐
+│   KEY                  SIZE TYPE        TTL │ Size     200M                  │
+│ › session:c41f0e9a…  ▲ 200M string  23h 12m │ Length   —                     │
+│   session:7a2d9b14…  ▲ 190M string  16h 40m │ TTL      23h 12m               │
+│   session:9f1c2a7e…  ▲ 180M string  11h 04m │ Pattern  session:{uuid}        │
+│   session:03be77d1…  ▲ 170M string   2h 51m │                                │
+│   session:e8b03c5d…  ▲ 160M string  47m 00s │ THINGS TO LOOK AT              │
+│   cache:search:a17…  ▲ 150M string    never │ ▲ session:c41f0e9a-2d6b-47e8-… │
+│                                             │   is a single 200M string.     │
+│                                             │   Split it, or compress it.    │
+│                                             │   Reading it blocks the        │
+│                                             │   server.                      │
+│                                             │ … and 11 more                  │
+│                                             │ Lengths and encodings are read │
+│                                             │ once the live connection is    │
+│                                             │ open.                          │
+│                                             │                                │
+│                                             │                                │
+│                                             │                                │
+│                                             │                                │
+└─────────────────────────────────────────────┴────────────────────────────────┘
+ ↑↓ Move   tab Next panel   y Copy   r Analyze           ctrl-f Find key  ? Help

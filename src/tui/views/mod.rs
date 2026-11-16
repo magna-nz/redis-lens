@@ -70,7 +70,7 @@
 //! # Drawing
 //!
 //! `ui/<view>.rs` has `pub fn draw(frame: &mut Frame, area: Rect, state: &State,
-//! ctx: &Ctx<'_>)`. `area` is the body between the header (with the tab bar) and the
+//! ctx: &Ctx<'_>)`. `area` is the body between the area row and the
 //! key bar. `ctx.screen` says which panel to draw. Big keys is drawn only once an
 //! analysis has finished (`ctx.report()` is `Some`).
 //!

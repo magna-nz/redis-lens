@@ -1,15 +1,14 @@
 ---
 source: src/tui/views/server.rs
-assertion_line: 2762
 expression: "testing::render(&app, 80, 24).backend()"
 ---
-" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Clients  ·  Slow log  ·  Monitor                                            "
+" prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys   ● analyzed 14:02 "
+" 1   2   3    4  Server › Clients · Slow log · Monitor   5                    0 "
 "┌─ Slow log ──────────────────────────────────── 0 entries · UTC · every 10 s ─┐"
 "│ threshold 10.0ms · keeps 128 entries                                         │"
-"│   TIME       DURATION COMMAND       KEYS                                     │"
-"│ The slow log is empty.                                                       │"
+"│     TIME       DURATION COMMAND       KEYS                                   │"
+"│   The slow log is empty.                                                     │"
+"│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"

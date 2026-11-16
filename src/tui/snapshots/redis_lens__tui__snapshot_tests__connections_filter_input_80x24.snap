@@ -3,14 +3,14 @@ source: src/tui/snapshot_tests.rs
 expression: t.backend()
 ---
 " redis-lens 0.1.0   not connected                 pick a connection, then enter "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+" 1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub        0  Connections "
 "┌─ Connections ────────────────────────────── 2 of 3 saved · 0 of 0 in Docker ─┐"
 "│   NAME          ENV     ADDRESS                     ACCESS     STATUS        │"
 "│ SAVED                                                                        │"
-"│   prod-cache-01  PROD   prod-cache-01.internal:6380 read-only  ○ not open    │"
+"│ › prod-cache-01  PROD   prod-cache-01.internal:6380 read-only  ○ not open    │"
 "│   staging-cache  STAGE  staging-cache.internal:6379 writes on  ○ not open    │"
 "│ DOCKER · searching…                                                          │"
-"│ + Add a connection  press a, then paste a redis:// URL                       │"
+"│   + Add a connection  press a, then paste a redis:// URL                     │"
 "│                                                                              │"
 "├─ prod-cache-01 ─────────────────────────────────────────────── PROD · saved ─┤"
 "│ Address   prod-cache-01.internal:6380 · TLS on                               │"

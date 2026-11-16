@@ -8,6 +8,11 @@
 //! tells a state by colour alone: every state has its words (`read-only`, `✗ failed`,
 //! `PROD`), so the colourless mode only has to keep selection, badges and the active tab
 //! apart, with reverse video and bold.
+//!
+//! Roles: focus (blue) marks where the keys go: the focused pane, the current panel, the
+//! `›` marker, the input cursor and key hints. Amber is for warnings, `▲` notes,
+//! `read-only`, notices and progress; red for PROD, `writes on` and errors; teal for
+//! what is fine; the placeholder colour for the `{id}` parts of a pattern.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -27,7 +32,11 @@ pub const SEL: Color = Color::Rgb(0x23, 0x30, 0x44);
 pub const AMBER: Color = Color::Rgb(0xe8, 0xb4, 0x5c);
 pub const RED: Color = Color::Rgb(0xf0, 0x76, 0x62);
 pub const TEAL: Color = Color::Rgb(0x5f, 0xc6, 0xb4);
-pub const BLUE: Color = Color::Rgb(0x84, 0xaa, 0xf0);
+/// Focus: the focused pane's border and title, the current panel, the `›` marker, the
+/// input cursor and key hints.
+pub const FOCUS: Color = Color::Rgb(0x6c, 0xb6, 0xff);
+/// `{placeholders}` in patterns.
+pub const PH: Color = Color::Rgb(0xb7, 0x9c, 0xf5);
 
 /// What a colour is for. `bg` is the text colour on a filled badge, not a background
 /// that is painted.
@@ -43,7 +52,8 @@ pub struct Palette {
     pub amber: Color,
     pub red: Color,
     pub teal: Color,
-    pub blue: Color,
+    pub focus: Color,
+    pub ph: Color,
 }
 
 pub const DARK_PALETTE: Palette = Palette {
@@ -57,7 +67,8 @@ pub const DARK_PALETTE: Palette = Palette {
     amber: AMBER,
     red: RED,
     teal: TEAL,
-    blue: BLUE,
+    focus: FOCUS,
+    ph: PH,
 };
 
 /// The same roles for a light terminal: dark text, and accents dark enough to read on
@@ -73,7 +84,8 @@ pub const LIGHT_PALETTE: Palette = Palette {
     amber: Color::Rgb(0x8f, 0x5e, 0x00),
     red: Color::Rgb(0xc0, 0x39, 0x2b),
     teal: Color::Rgb(0x0f, 0x76, 0x6e),
-    blue: Color::Rgb(0x2f, 0x5f, 0xc4),
+    focus: Color::Rgb(0x0b, 0x5c, 0xad),
+    ph: Color::Rgb(0x6f, 0x42, 0xc1),
 };
 
 /// How the screen is drawn.
@@ -166,6 +178,8 @@ pub enum Role {
     Tab,
     TabOn,
     Key,
+    /// The focus colour alone: a focused border, `›`, the input cursor, key hints.
+    Focus,
 }
 
 /// The style of `role` in `mode`. Pure.
@@ -176,7 +190,9 @@ pub fn role(role: Role, mode: Mode) -> Style {
         let plain = Style::new();
         return match role {
             Role::Fg | Role::Ok | Role::Amber | Role::Ph | Role::Cmd => plain,
-            Role::Fgb | Role::Hd | Role::Warn | Role::Phb | Role::Title => plain.add_modifier(bold),
+            Role::Fgb | Role::Hd | Role::Warn | Role::Phb | Role::Title | Role::Focus => {
+                plain.add_modifier(bold)
+            }
             Role::Dim | Role::Tab | Role::Border | Role::Track => plain.add_modifier(Modifier::DIM),
             Role::Sel | Role::Key => plain.add_modifier(Modifier::REVERSED),
             Role::Brand | Role::TabOn => plain.add_modifier(Modifier::REVERSED | bold),
@@ -190,16 +206,17 @@ pub fn role(role: Role, mode: Mode) -> Style {
         Role::Warn => Style::new().fg(p.red),
         Role::Ok => Style::new().fg(p.teal),
         Role::Amber => Style::new().fg(p.amber),
-        Role::Ph => Style::new().fg(p.blue),
-        Role::Phb => Style::new().fg(p.blue).add_modifier(bold),
+        Role::Ph => Style::new().fg(p.ph),
+        Role::Phb => Style::new().fg(p.ph).add_modifier(bold),
         Role::Track => Style::new().fg(p.faint),
         Role::Cmd => Style::new().fg(p.hi),
         Role::Sel => Style::new().bg(p.sel),
         Role::Border => Style::new().fg(p.border),
-        Role::Title => Style::new().fg(p.amber).add_modifier(bold),
+        Role::Title => Style::new().fg(p.focus).add_modifier(bold),
         Role::Brand => Style::new().bg(p.amber).fg(p.bg).add_modifier(bold),
-        Role::TabOn => Style::new().bg(p.sel).fg(p.amber).add_modifier(bold),
+        Role::TabOn => Style::new().bg(p.sel).fg(p.focus).add_modifier(bold),
         Role::Key => Style::new().bg(p.faint).fg(p.hi),
+        Role::Focus => Style::new().fg(p.focus),
     }
 }
 
@@ -259,8 +276,14 @@ pub fn sel() -> Style {
 pub fn border() -> Style {
     role(Role::Border, mode())
 }
+/// The focused pane's title and the current panel: the focus colour, bold.
 pub fn title() -> Style {
     role(Role::Title, mode())
+}
+/// The focus colour: a focused pane's border, the `›` marker, the input cursor, key
+/// hints.
+pub fn focus() -> Style {
+    role(Role::Focus, mode())
 }
 pub fn brand() -> Style {
     role(Role::Brand, mode())
@@ -303,7 +326,7 @@ pub fn env_badge(env: Env) -> Style {
 mod tests {
     use super::*;
 
-    const ROLES: [Role; 18] = [
+    const ROLES: [Role; 19] = [
         Role::Fg,
         Role::Fgb,
         Role::Dim,
@@ -322,6 +345,7 @@ mod tests {
         Role::Tab,
         Role::TabOn,
         Role::Key,
+        Role::Focus,
     ];
 
     const ENVS: [Env; 4] = [Env::Prod, Env::Stage, Env::Local, Env::Other];
@@ -339,6 +363,32 @@ mod tests {
         assert_eq!(env_badge_in(Env::Prod, Mode::Dark).fg, Some(BG));
         // The wrappers are the dark roles while nothing sets the mode.
         assert_eq!(dim(), role(Role::Dim, Mode::Dark));
+    }
+
+    /// Focus is its own colour, not amber; placeholders have theirs.
+    #[test]
+    fn focus_and_placeholders_have_their_own_colours() {
+        let d = Mode::Dark;
+        assert_eq!(role(Role::Focus, d).fg, Some(FOCUS));
+        assert_eq!(role(Role::Title, d).fg, Some(FOCUS));
+        assert!(role(Role::Title, d).add_modifier.contains(Modifier::BOLD));
+        assert_eq!(role(Role::Ph, d).fg, Some(PH));
+        assert_eq!(role(Role::Phb, d).fg, Some(PH));
+        for r in [Role::Focus, Role::Title, Role::Ph, Role::TabOn] {
+            for m in [Mode::Dark, Mode::Light] {
+                assert_ne!(role(r, m).fg, Some(mode_amber(m)), "{r:?} {m:?}");
+            }
+        }
+        // Without colour the focus is bold, so a focused border still stands out.
+        assert!(
+            role(Role::Focus, Mode::Mono)
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    fn mode_amber(m: Mode) -> Color {
+        m.palette().unwrap().amber
     }
 
     #[test]
@@ -393,12 +443,13 @@ mod tests {
             ("amber", p.amber),
             ("red", p.red),
             ("teal", p.teal),
-            ("blue", p.blue),
+            ("focus", p.focus),
+            ("ph", p.ph),
         ] {
             assert!(contrast(c, p.bg) >= 4.5, "{name} on white");
         }
         // Text on the selected row, and badges' white text on their fills.
-        for c in [p.fg, p.hi, p.amber, p.dim] {
+        for c in [p.fg, p.hi, p.amber, p.dim, p.focus, p.ph] {
             assert!(contrast(c, p.sel) >= 4.0, "{c:?} on the selection");
         }
         for fill in [p.red, p.amber, p.teal] {

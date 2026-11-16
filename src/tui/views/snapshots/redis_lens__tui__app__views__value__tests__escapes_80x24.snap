@@ -1,16 +1,15 @@
 ---
 source: src/tui/views/value.rs
-assertion_line: 1888
 expression: t.backend()
 ---
-" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Keys  ·  Streams  ·  Search                                                 "
+" prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys   ● analyzed 14:02 "
+" 1    2  Browse › Keys · Streams · Search   3   4   5                         0 "
 "┌─ ‹ user:{id}:cart ────────┬─ user:10293:cart ─────────────────────── string ─┐"
-"│ KEY                       │ 20 bytes · 80B · expires in 6d 04h               │"
-"│ user:10293:cart           │                                                  │"
+"│   KEY                     │ 20 bytes · 80B · expires in 6d 04h               │"
+"│ › user:10293:cart         │                                                  │"
 "│                           │ value · text · 16 bytes · auto-detected          │"
 "│                           │ ok\x1b[2J\u{9b}31m done                          │"
+"│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │                                                  │"

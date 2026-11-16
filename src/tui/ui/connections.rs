@@ -35,7 +35,8 @@ const MEMORY: usize = 6;
 /// with `v`.
 fn columns(wide: bool) -> [Col; 7] {
     [
-        // The marker `›` and a space come first in the cell, so the heading is indented.
+        // The selection's marker `›` and a space come first in the cell, so the heading
+        // is indented.
         Col::new("  NAME", if wide { 24 } else { 15 }, Tier::Base),
         Col::new("ENV", 7, Tier::Base),
         // Takes what the others leave, at least this much.
@@ -209,7 +210,7 @@ fn first_run_panel(frame: &mut Frame, area: Rect, app: &App) {
         Line::default(),
     ];
     lines.extend(paragraph(
-        vec![Span::styled(" a  ", style::amber())],
+        vec![Span::styled(" a  ", style::focus())],
         "    ",
         "Add one: paste a redis:// or rediss:// URL, or a StackExchange.Redis string. The password goes to the OS keychain, never to a file.",
         style::fg(),
@@ -279,9 +280,11 @@ fn entry_line(
         let w = cols[i].w;
         match i {
             0 => {
+                // The selected row's marker; the connected one is bold and says so
+                // in STATUS.
                 spans.push(Span::styled(
-                    if active { "› " } else { "  " },
-                    style::amber(),
+                    if selected { "› " } else { "  " },
+                    style::focus(),
                 ));
                 spans.push(Span::styled(
                     cell(&e.profile.name, w.saturating_sub(2)),
@@ -363,9 +366,12 @@ fn list_lines(app: &App, iw: usize) -> (Vec<(Line<'static>, Option<ConnSel>)>, u
             Some(ConnSel::Entry(e.id)),
         ));
     }
+    let add = app.conn_sel == ConnSel::Add;
     lines.push((
         Line::from(vec![
-            Span::styled(" + Add a connection", style::amber()),
+            Span::raw(" "),
+            Span::styled(if add { "› " } else { "  " }, style::focus()),
+            Span::styled("+ Add a connection", style::focus()),
             Span::styled("  press a, then paste a redis:// URL", style::dim()),
         ]),
         Some(ConnSel::Add),

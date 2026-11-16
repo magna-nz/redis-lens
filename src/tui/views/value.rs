@@ -3254,7 +3254,7 @@ mod tests {
         assert_eq!(app.screen(), Screen::KeyDetail);
         testing::reply(&mut app, id, page(Some("hash"), fields(), None));
         let all = text(&testing::render(&app, 80, 24));
-        let frame = all.lines().nth(3).unwrap();
+        let frame = all.lines().nth(2).unwrap();
         assert!(frame.starts_with("┌─ ‹ user:{id}:cart"), "{frame}");
         assert!(frame.contains("┬─ user:10293:cart"), "{frame}");
         // → moves into the value pane, ← comes back to the items.

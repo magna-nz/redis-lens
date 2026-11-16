@@ -27,8 +27,8 @@ use crate::value::escape;
 
 use super::patterns::wrap_words;
 use super::widgets::{
-    Pane, Title, fit, marquee_spans, pad_l, pad_r, rows, scroll_offset, split_at, split_frame,
-    trunc,
+    Pane, Title, fit, gutter_area, list, marquee_spans, pad_l, pad_r, rows, scroll_offset,
+    split_at, split_frame, trunc,
 };
 use super::{spinner, style};
 
@@ -82,7 +82,7 @@ impl Cols {
     }
 
     fn new(inner: usize, more: bool, lfu: bool, node: bool) -> Self {
-        let all = inner >= WIDE || more;
+        let all = inner >= super::widgets::after_gutter(WIDE) || more;
         let mut c = Self {
             key: 0,
             ty: all,
@@ -159,14 +159,15 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Title::new(&right_title, &right_right),
         Pane::Left,
     );
+    // The columns start after the marker gutter.
     let c = Cols::new(
-        usize::from(left.width),
+        usize::from(gutter_area(left).width),
         ctx.more,
         state.lfu,
         state.by_node(),
     );
     let sort = state.sort.effective(state.sizes, state.freq);
-    rows(frame, left, vec![header(&c, sort)], None);
+    rows(frame, gutter_area(left), vec![header(&c, sort)], None);
     let body = Rect {
         y: left.y + 1,
         height: left.height.saturating_sub(2),
@@ -191,7 +192,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                 key_row(row, &c, state, node, (i == sel).then_some(ticks))
             })
             .collect();
-        rows(frame, body, lines, Some(sel - off));
+        list(frame, body, lines, Some(sel - off));
     }
     let bottom = Rect {
         y: left.y + left.height.saturating_sub(1),

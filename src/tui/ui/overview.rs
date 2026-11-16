@@ -48,7 +48,7 @@ const TOP_PATTERNS: usize = 3;
 /// From this width on, "Keys" also shows what TTLs free.
 const WIDE: usize = 100;
 
-/// Draws Overview into `area`, the body between the tab row and the footer.
+/// Draws Overview into `area`, the body between the area row and the footer.
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let Some(ctx) = app.ctx() else {
         let inner = sections(
@@ -70,7 +70,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     // The frame's top border, the divider and the bottom border.
     let keys_h = usize::from(area.height.saturating_sub(3).saturating_sub(now_rows));
     let (keys, keys_right) = keys_lines(app, ctx.session, w, keys_h);
-    let inner = sections(
+    // The keys move the findings in "Keys": that section has the focus.
+    let inner = super::widgets::sections_focused(
         frame,
         area,
         &[
@@ -83,6 +84,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                 rows: None,
             },
         ],
+        1,
     );
     rows(frame, inner[0], now, None);
     rows(frame, inner[1], keys, None);
@@ -330,7 +332,7 @@ fn shard_lines(s: &Session, app: &App, w: usize) -> Vec<Line<'static>> {
             NodeRole::Replica => "replica",
         };
         let mut spans = vec![
-            Span::styled(mark, style::amber()),
+            Span::styled(mark, style::focus()),
             Span::styled(pad_r(&slots_text(&n.slots), sw), style::fg()),
             Span::styled(
                 pad_r(&trunc(&n.endpoint.to_string(), nw - 1), nw),
@@ -507,7 +509,7 @@ fn finding_rows(found: &[Finding], sel: usize, w: usize) -> Vec<Line<'static>> {
             };
             let cursor = if i == sel { " › " } else { "   " };
             let text = vec![
-                Span::styled(cursor, style::amber()),
+                Span::styled(cursor, style::focus()),
                 Span::styled(format!("{mark} "), st),
                 Span::styled(f.text.clone(), style::fg()),
             ];
@@ -666,7 +668,7 @@ fn keys_lines(app: &App, s: &Session, w: usize, h: usize) -> (Vec<Line<'static>>
         let e = estimate_for(Depth::Quick, app);
         let mut prompt = vec![Line::from(fit(
             vec![
-                Span::styled("   r", style::amber()),
+                Span::styled("   r", style::focus()),
                 Span::styled(analyze_text(&e), style::fg()),
             ],
             w,
@@ -941,7 +943,7 @@ pub fn draw_analyze(frame: &mut Frame, area: Rect, d: &AnalyzeDialog, app: &App)
         };
         lines.push(Line::from(fit(
             vec![
-                Span::styled(mark, style::amber()),
+                Span::styled(mark, style::focus()),
                 Span::styled(pad_r(depth.label(), 8), st),
                 Span::styled(pad_r(&format!("{} keys", format::grouped(e.keys)), 16), st),
                 Span::styled(
@@ -966,11 +968,11 @@ pub fn draw_analyze(frame: &mut Frame, area: Rect, d: &AnalyzeDialog, app: &App)
     }
     lines.push(Line::default());
     lines.push(Line::from(vec![
-        Span::styled(" enter", style::amber()),
+        Span::styled(" enter", style::focus()),
         Span::styled(" Start   ", style::fg()),
-        Span::styled("↑↓", style::amber()),
+        Span::styled("↑↓", style::focus()),
         Span::styled(" Pick   ", style::fg()),
-        Span::styled("esc", style::amber()),
+        Span::styled("esc", style::focus()),
         Span::styled(" Cancel", style::fg()),
     ]));
     let h = u16::try_from(lines.len())

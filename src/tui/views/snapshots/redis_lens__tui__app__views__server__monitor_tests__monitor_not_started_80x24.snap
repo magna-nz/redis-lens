@@ -1,14 +1,13 @@
 ---
 source: src/tui/views/server.rs
-assertion_line: 3481
 expression: "testing::render(&app, 80, 24).backend()"
 ---
-" prod-cache-01   STAGE   writes on   15G / 24G · 7.92M keys    ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Clients  ·  Slow log  ·  Monitor                                            "
+" prod-cache-01  STAGE   w  writes on   15G / 24G · 7.92M keys  ● analyzed 14:02 "
+" 1   2   3    4  Server › Clients · Slow log · Monitor   5                    0 "
 "┌─ Monitor ────────────────────────────────────────────────────── not started ─┐"
 "│ enter starts MONITOR, after asking. It shows every command the server runs.  │"
-"│ TIME          COMMAND                                                        │"
+"│   TIME          COMMAND                                                      │"
+"│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"

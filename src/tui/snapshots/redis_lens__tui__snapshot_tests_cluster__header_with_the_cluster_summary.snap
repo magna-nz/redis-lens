@@ -1,34 +1,33 @@
 ---
 source: src/tui/snapshot_tests_cluster.rs
-assertion_line: 421
 expression: snap
 ---
 cluster · 3 shards at 140:
- prod-cache-01   PROD   read-only   cluster · 3 shards · Redis 7.4.2 · 15G / 24G · 7.92M keys                          ● analyzed 14:02 UTC 
-  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                                                
-    Keys  ·  Streams  ·  Search                                                                                                             
+ prod-cache-01  PROD   w  read-only    b  db 0   cluster · 3 shards · Redis 7.4.2 · 15G / 24G · 7.92M keys             ● analyzed 14:02 UTC 
+ 1 Overview    2  Browse › Keys · Streams · Search   3 Analyze   4 Server   5 Pub/Sub                                         0 Connections 
+┌─ Patterns ────────────────────────────────────────────────────────────── by memory ─┬─ session:{uuid} ────────────────────────── string ─┐
 
 cluster · 3 shards at 120:
- prod-cache-01   PROD   read-only   cluster · 3 shards · Redis 7.4.2 · 15G / 24G · 7.92M keys      ● analyzed 14:02 UTC 
-  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            
-    Keys  ·  Streams  ·  Search                                                                                         
+ prod-cache-01  PROD   w  read-only    b  db 0   cluster · 3 shards · 15G / 24G · 7.92M keys       ● analyzed 14:02 UTC 
+ 1 Overview    2  Browse › Keys · Streams · Search   3 Analyze   4 Server   5 Pub/Sub                     0 Connections 
+┌─ Patterns ────────────────────────────────────────────────── by memory ─┬─ session:{uuid} ────────────────── string ─┐
 
 cluster · 3 shards at 80:
- prod-cache-01   PROD   read-only   cluster · 3 shards · 15G / 24G   ● analyzed 
-  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    
-    Keys  ·  Streams  ·  Search                                                 
+ prod-cache-01  PROD   w  read-only    b  db 0   cluster · 3 shards  ● analyzed 
+ 1    2  Browse › Keys · Streams · Search   3   4   5                         0 
+┌─ Patterns ───────────────── by memory ─┬─ session:{uuid} ─────────── string ─┐
 
 cluster · 3 shards · 1 unreachable at 140:
- prod-cache-01   PROD   read-only   cluster · 3 shards · 1 unreachable · Redis 7.4.2 · 15G / 24G · 7.92M keys          ● analyzed 14:02 UTC 
-  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                                                
-    Keys  ·  Streams  ·  Search                                                                                                             
+ prod-cache-01  PROD   w  read-only    b  db 0   cluster · 3 shards · 1 unreachable · 15G / 24G · 7.92M keys           ● analyzed 14:02 UTC 
+ 1 Overview    2  Browse › Keys · Streams · Search   3 Analyze   4 Server   5 Pub/Sub                                         0 Connections 
+┌─ Patterns ────────────────────────────────────────────────────────────── by memory ─┬─ session:{uuid} ────────────────────────── string ─┐
 
 cluster · 3 shards · 1 unreachable at 120:
- prod-cache-01   PROD   read-only   cluster · 3 shards · 1 unreachable · 15G / 24G · 7.92M keys    ● analyzed 14:02 UTC 
-  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            
-    Keys  ·  Streams  ·  Search                                                                                         
+ prod-cache-01  PROD   w  read-only   cluster · 3 shards · 1 unreachable · 15G / 24G · 7.92M keys  ● analyzed 14:02 UTC 
+ 1 Overview    2  Browse › Keys · Streams · Search   3 Analyze   4 Server   5 Pub/Sub                     0 Connections 
+┌─ Patterns ────────────────────────────────────────────────── by memory ─┬─ session:{uuid} ────────────────── string ─┐
 
 cluster · 3 shards · 1 unreachable at 80:
- prod-cache-01   PROD   read-only   cluster · 3 shards · 1 unreach…  ● analyzed 
-  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    
-    Keys  ·  Streams  ·  Search
+ prod-cache-01  PROD   w  read-only   cluster · 3 shards · 1 unrea…  ● analyzed 
+ 1    2  Browse › Keys · Streams · Search   3   4   5                         0 
+┌─ Patterns ───────────────── by memory ─┬─ session:{uuid} ─────────── string ─┐

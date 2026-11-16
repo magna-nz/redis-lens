@@ -21,7 +21,7 @@ fn entry(h: &KeyHelp, inner: usize) -> Line<'static> {
     let keys = pad_r(h.keys, KEYS_W.min(inner));
     let room = inner.saturating_sub(width(&keys) + 1);
     Line::from(vec![
-        Span::styled(keys, style::amber()),
+        Span::styled(keys, style::focus()),
         Span::raw(" "),
         Span::styled(trunc(h.help, room), style::fg()),
     ])
@@ -35,7 +35,7 @@ fn heading(text: &str, inner: usize) -> Line<'static> {
 fn prompt(query: &str, inner: usize) -> Line<'static> {
     if query.is_empty() {
         Line::from(vec![
-            Span::styled("› ".to_string(), style::amber()),
+            Span::styled("› ".to_string(), style::focus()),
             Span::styled(
                 trunc(
                     "type to find any action or screen…",
@@ -46,9 +46,9 @@ fn prompt(query: &str, inner: usize) -> Line<'static> {
         ])
     } else {
         Line::from(vec![
-            Span::styled("› ".to_string(), style::amber()),
+            Span::styled("› ".to_string(), style::focus()),
             Span::styled(trunc(query, inner.saturating_sub(3)), style::fgb()),
-            Span::styled("▏".to_string(), style::amber()),
+            Span::styled("▏".to_string(), style::focus()),
         ])
     }
 }
@@ -112,7 +112,7 @@ pub fn draw_for(
             let text = trunc(&hit.text(), text_w);
             let gap = text_w.saturating_sub(width(&text)) + 1;
             lines.push(Line::from(vec![
-                Span::styled(mark.to_string(), style::amber()),
+                Span::styled(mark.to_string(), style::focus()),
                 Span::styled(text, style::fg()),
                 Span::raw(" ".repeat(gap)),
                 Span::styled(trunc(&place, place_w), style::dim()),

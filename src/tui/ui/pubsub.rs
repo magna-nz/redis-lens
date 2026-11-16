@@ -20,7 +20,7 @@ use super::analysis::{left_width, notice, paragraph};
 use super::streams::live_wait;
 use super::style;
 use super::widgets::{
-    Pane, Title, bar, fit, pad_l, pad_r, rows, scroll_offset, split_frame, width,
+    self, Pane, Title, bar, fit, gutter_area, pad_l, pad_r, rows, scroll_offset, split_frame, width,
 };
 
 const SUBS_W: usize = 6;
@@ -97,14 +97,15 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) 
         Title::new(selected.as_deref().unwrap_or("Totals"), ""),
         Pane::Left,
     );
-    let w = usize::from(list.width).saturating_sub(1);
-    let (head, lines, sel) = list_lines(state, ctx, w, ctx.more && w >= 50);
+    // The columns start after the marker gutter.
+    let w = usize::from(gutter_area(list).width).saturating_sub(1);
+    let (head, lines, sel) = list_lines(state, ctx, w, ctx.more && w >= widgets::after_gutter(50));
     let body = if head.spans.is_empty() {
         list
     } else {
         below_header(list)
     };
-    rows(frame, list, vec![head], None);
+    rows(frame, gutter_area(list), vec![head], None);
     let at = sel.unwrap_or(0);
     let off = scroll_offset(at, usize::from(body.height));
     let lines: Vec<Line<'static>> = lines
@@ -112,7 +113,7 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) 
         .skip(off)
         .take(usize::from(body.height))
         .collect();
-    rows(frame, body, lines, sel.map(|s| s - off));
+    widgets::list(frame, body, lines, sel.map(|s| s - off));
     totals(frame, detail, state, ctx);
 }
 
@@ -289,13 +290,15 @@ fn channels_narrow(frame: &mut Frame, inner: Rect, state: &PubSubState, ctx: &Ct
         );
         return;
     }
-    let (head, lines, sel) = list_lines(state, ctx, w, false);
+    // The columns start after the marker gutter.
+    let lw = usize::from(gutter_area(inner).width).saturating_sub(1);
+    let (head, lines, sel) = list_lines(state, ctx, lw, false);
     let body = if head.spans.is_empty() {
         inner
     } else {
         below_header(inner)
     };
-    rows(frame, inner, vec![head], None);
+    rows(frame, gutter_area(inner), vec![head], None);
     let at = sel.unwrap_or(0);
     let off = scroll_offset(at, usize::from(body.height));
     let lines: Vec<Line<'static>> = lines
@@ -303,7 +306,7 @@ fn channels_narrow(frame: &mut Frame, inner: Rect, state: &PubSubState, ctx: &Ct
         .skip(off)
         .take(usize::from(body.height))
         .collect();
-    rows(frame, body, lines, sel.map(|s| s - off));
+    widgets::list(frame, body, lines, sel.map(|s| s - off));
 }
 
 /// `HH:MM:SS.mmm`, UTC, of a receive stamp.

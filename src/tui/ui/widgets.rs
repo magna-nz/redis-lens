@@ -316,26 +316,28 @@ impl<'a> Title<'a> {
 }
 
 /// The spans of a border line `w` cells wide between `start` and `end` (corner or tee
-/// characters): `start─ Title ───── right ─end`. The title in `title_style`.
+/// characters): `start─ Title ───── right ─end`. The title in `title_style`, the line in
+/// `line` (the normal border, or the focus colour on a focused pane).
 fn border_line(
     w: usize,
     start: &str,
     end: &str,
     t: Title<'_>,
     title_style: Style,
+    line: Style,
 ) -> Vec<Span<'static>> {
     if w < 2 {
-        return vec![Span::styled(start.to_string(), style::border())];
+        return vec![Span::styled(start.to_string(), line)];
     }
     let inner = w - 2;
-    let mut spans = vec![Span::styled(start.to_string(), style::border())];
+    let mut spans = vec![Span::styled(start.to_string(), line)];
     let mut used = 0;
     if !t.left.is_empty() && inner >= 5 {
         let title = trunc(t.left, inner.saturating_sub(4).max(1));
-        spans.push(Span::styled("─ ", style::border()));
+        spans.push(Span::styled("─ ", line));
         used += 2 + width(&title) + 1;
         spans.push(Span::styled(title, title_style));
-        spans.push(Span::styled(" ", style::border()));
+        spans.push(Span::styled(" ", line));
     }
     let room = inner.saturating_sub(used + 1);
     let right = if !t.right.is_empty() && room > 6 {
@@ -349,13 +351,13 @@ fn border_line(
         width(&right) + 3
     };
     let fill = inner.saturating_sub(used + right_w);
-    spans.push(Span::styled("─".repeat(fill), style::border()));
+    spans.push(Span::styled("─".repeat(fill), line));
     if !right.is_empty() {
-        spans.push(Span::styled(" ", style::border()));
+        spans.push(Span::styled(" ", line));
         spans.push(Span::styled(right, style::dim()));
-        spans.push(Span::styled(" ─", style::border()));
+        spans.push(Span::styled(" ─", line));
     }
-    spans.push(Span::styled(end.to_string(), style::border()));
+    spans.push(Span::styled(end.to_string(), line));
     spans
 }
 
@@ -363,11 +365,8 @@ fn put(frame: &mut Frame, x: u16, y: u16, w: u16, spans: Vec<Span<'static>>) {
     frame.render_widget(Line::from(spans), Rect::new(x, y, w, 1));
 }
 
-fn put_char(frame: &mut Frame, x: u16, y: u16, c: &str) {
-    frame.render_widget(
-        Span::styled(c.to_string(), style::border()),
-        Rect::new(x, y, 1, 1),
-    );
+fn put_char(frame: &mut Frame, x: u16, y: u16, c: &str, st: Style) {
+    frame.render_widget(Span::styled(c.to_string(), st), Rect::new(x, y, 1, 1));
 }
 
 /// The width of the left pane of a [`split_frame`] `total` cells wide: `ratio` of it
@@ -395,8 +394,9 @@ pub fn split_at(total: u16, ratio: f64) -> u16 {
 /// ```
 ///
 /// `left_w` is the left pane's width counted from the frame's left edge to the divider
-/// (see [`split_at`]). `focus` says which pane has the keys: its title is drawn
-/// highlighted, the other dim. Returns the inner areas of the left and the right pane.
+/// (see [`split_at`]). `focus` says which pane has the keys: its title is drawn bold in
+/// the focus colour and its border (with the shared divider) in the focus colour; the
+/// other pane keeps the normal border and a dim title. Returns the inner areas of the left and the right pane.
 /// A frame too small for two panes gets everything on the left.
 pub fn split_frame(
     frame: &mut Frame,
@@ -410,9 +410,12 @@ pub fn split_frame(
         return (Rect::default(), Rect::default());
     }
     let left_w = left_w.clamp(1, area.width.saturating_sub(2));
-    let (lt, rt) = match focus {
-        Pane::Left => (style::title(), style::dim()),
-        Pane::Right => (style::dim(), style::title()),
+    // The focused pane: its title bold in the focus colour, its border segment (and the
+    // shared divider) in the focus colour; the other pane dim and normal.
+    let (on, off) = (style::focus(), style::border());
+    let (lt, rt, lb, rb) = match focus {
+        Pane::Left => (style::title(), style::dim(), on, off),
+        Pane::Right => (style::dim(), style::title(), off, on),
     };
     let x = area.x;
     let y = area.y;
@@ -425,32 +428,36 @@ pub fn split_frame(
         x,
         y,
         left_w,
-        border_line(usize::from(left_w) + 1, "┌", "┬", left, lt),
+        border_line(usize::from(left_w) + 1, "┌", "┬", left, lt, lb),
     );
     put(
         frame,
         div,
         y,
         right_w,
-        border_line(usize::from(right_w), "┬", "┐", right, rt),
+        border_line(usize::from(right_w), "┬", "┐", right, rt, rb),
     );
     for row in y + 1..bottom {
-        put_char(frame, x, row, "│");
-        put_char(frame, div, row, "│");
-        put_char(frame, x + area.width - 1, row, "│");
+        put_char(frame, x, row, "│", lb);
+        put_char(frame, x + area.width - 1, row, "│", rb);
     }
-    let mut bot = vec![Span::styled("└", style::border())];
+    let mut bot = vec![Span::styled("└", lb)];
     bot.push(Span::styled(
         "─".repeat(usize::from(left_w.saturating_sub(1))),
-        style::border(),
+        lb,
     ));
-    bot.push(Span::styled("┴", style::border()));
+    bot.push(Span::styled("┴", on));
     bot.push(Span::styled(
         "─".repeat(usize::from(right_w.saturating_sub(2))),
-        style::border(),
+        rb,
     ));
-    bot.push(Span::styled("┘", style::border()));
+    bot.push(Span::styled("┘", rb));
     put(frame, x, bottom, area.width, bot);
+    // The divider is the focused pane's.
+    put_char(frame, div, y, "┬", on);
+    for row in y + 1..bottom {
+        put_char(frame, div, row, "│", on);
+    }
     let h = area.height.saturating_sub(2);
     let l = Rect::new(x + 1, y + 1, left_w.saturating_sub(1), h);
     let r = Rect::new(div + 1, y + 1, right_w.saturating_sub(2), h);
@@ -479,8 +486,21 @@ pub struct Section<'a> {
 ///
 /// Also the layout of a full-width list with its details below (Connections, Clients,
 /// Slow log, Nodes). Returns the inner area of each section, in order; a section that
-/// gets no room has an empty one. The first section's title is drawn highlighted.
+/// gets no room has an empty one. The first section has the keys: see
+/// [`sections_focused`].
 pub fn sections(frame: &mut Frame, area: Rect, list: &[Section<'_>]) -> Vec<Rect> {
+    sections_focused(frame, area, list, 0)
+}
+
+/// [`sections`] where section `focus` has the keys (its list has the selection): its
+/// title is bold in the focus colour, and its border, with the border under it, is in
+/// the focus colour. The other sections keep the normal border and a dim title.
+pub fn sections_focused(
+    frame: &mut Frame,
+    area: Rect,
+    list: &[Section<'_>],
+    focus: usize,
+) -> Vec<Rect> {
     let mut out = vec![Rect::default(); list.len()];
     if list.is_empty() || area.width < 4 || area.height < 2 {
         return out;
@@ -497,6 +517,8 @@ pub fn sections(frame: &mut Frame, area: Rect, list: &[Section<'_>]) -> Vec<Rect
     let bottom = area.y + area.height - 1;
     let w = usize::from(area.width);
     let mut fills_left = fills;
+    let (on, off) = (style::focus(), style::border());
+    let mut side = off;
     for (i, sec) in list.iter().enumerate() {
         if y >= bottom {
             break;
@@ -506,14 +528,25 @@ pub fn sections(frame: &mut Frame, area: Rect, list: &[Section<'_>]) -> Vec<Rect
         } else {
             ("├", "┤")
         };
-        let st = if i == 0 { style::title() } else { style::hd() };
+        let st = if i == focus {
+            style::title()
+        } else {
+            style::hd()
+        };
+        // The line above the focused section and the one under it are its own.
+        let line = if i == focus || i == focus + 1 {
+            on
+        } else {
+            off
+        };
         put(
             frame,
             area.x,
             y,
             area.width,
-            border_line(w, start, end, sec.title, st),
+            border_line(w, start, end, sec.title, st, line),
         );
+        side = if i == focus { on } else { off };
         y += 1;
         let want = match sec.rows {
             Some(n) => n,
@@ -526,23 +559,21 @@ pub fn sections(frame: &mut Frame, area: Rect, list: &[Section<'_>]) -> Vec<Rect
         };
         let h = want.min(bottom.saturating_sub(y));
         for row in y..y + h {
-            put_char(frame, area.x, row, "│");
-            put_char(frame, area.x + area.width - 1, row, "│");
+            put_char(frame, area.x, row, "│", side);
+            put_char(frame, area.x + area.width - 1, row, "│", side);
         }
         out[i] = Rect::new(area.x + 1, y, area.width - 2, h);
         y += h;
     }
-    // Rows no section took stay inside the frame.
+    // Rows no section took stay inside the frame, and the bottom border belongs to the
+    // last section.
     for row in y..bottom {
-        put_char(frame, area.x, row, "│");
-        put_char(frame, area.x + area.width - 1, row, "│");
+        put_char(frame, area.x, row, "│", side);
+        put_char(frame, area.x + area.width - 1, row, "│", side);
     }
-    let mut bot = vec![Span::styled("└", style::border())];
-    bot.push(Span::styled(
-        "─".repeat(w.saturating_sub(2)),
-        style::border(),
-    ));
-    bot.push(Span::styled("┘", style::border()));
+    let mut bot = vec![Span::styled("└", side)];
+    bot.push(Span::styled("─".repeat(w.saturating_sub(2)), side));
+    bot.push(Span::styled("┘", side));
     put(frame, area.x, bottom, area.width, bot);
     out
 }
@@ -598,6 +629,83 @@ pub fn rows(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, selected: 
         };
         frame.render_widget(line, r);
     }
+}
+
+/// Cells the marker gutter takes at the left of a list: a space and `›`.
+pub const GUTTER: u16 = 2;
+
+/// A width threshold set for a list's whole inner width, measured instead on the
+/// width after the gutter ([`gutter_area`]): it still switches at the same terminal
+/// width.
+pub const fn after_gutter(at: usize) -> usize {
+    at.saturating_sub(GUTTER as usize)
+}
+
+/// `area` less the marker gutter on its left: where a list's column header and rows
+/// go, so they line up. See [`list`].
+pub fn gutter_area(area: Rect) -> Rect {
+    let g = GUTTER.min(area.width);
+    Rect {
+        x: area.x + g,
+        width: area.width - g,
+        ..area
+    }
+}
+
+/// The marker on a list's selected row: `›` in the focus colour, after a space.
+pub fn marker(selected: bool) -> [Span<'static>; 2] {
+    [
+        Span::raw(" "),
+        Span::styled(if selected { "›" } else { " " }, style::focus()),
+    ]
+}
+
+/// A list's rows in `area`, one per row from the top, after a 2-cell gutter: the
+/// `selected` row gets the selection background across the whole row, gutter included,
+/// and `›` in the focus colour in the gutter. The rows are drawn in
+/// [`gutter_area`]`(area)`, so build them for its width, and draw the column header
+/// there too.
+pub fn list(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, selected: Option<usize>) {
+    let n = lines.len().min(usize::from(area.height));
+    for i in 0..n {
+        let r = Rect {
+            y: area.y + i as u16,
+            height: 1,
+            width: GUTTER.min(area.width),
+            ..area
+        };
+        let on = selected == Some(i);
+        let line = Line::from(marker(on).to_vec());
+        frame.render_widget(if on { line.style(style::sel()) } else { line }, r);
+    }
+    rows(frame, gutter_area(area), lines, selected);
+}
+
+/// Lines in `area` where a list follows text: the first `full` lines (a status line,
+/// facts) across the whole width, then the column header and the rows as a [`list`]
+/// behind the marker gutter. `selected` counts from the first line.
+pub fn list_below(
+    frame: &mut Frame,
+    area: Rect,
+    mut lines: Vec<Line<'static>>,
+    full: usize,
+    selected: Option<usize>,
+) {
+    let full = full.min(lines.len()).min(usize::from(area.height));
+    let rest = lines.split_off(full);
+    rows(frame, area, lines, None);
+    let n = full as u16;
+    let below = Rect {
+        y: area.y + n,
+        height: area.height - n,
+        ..area
+    };
+    list(
+        frame,
+        below,
+        rest,
+        selected.and_then(|s| s.checked_sub(full)),
+    );
 }
 
 /// First row to show so that `selected` is on screen in a list `height` rows tall.
@@ -762,6 +870,108 @@ mod tests {
         );
         assert_eq!(inner.0, Rect::new(1, 1, 13, 2));
         assert_eq!(inner.1, Rect::new(15, 1, 14, 2));
+    }
+
+    fn buffer_with(w: u16, h: u16, f: impl FnOnce(&mut Frame)) -> ratatui::buffer::Buffer {
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        t.draw(f).unwrap();
+        t.backend().buffer().clone()
+    }
+
+    /// The focused pane's border, the shared divider with it, is in the focus colour
+    /// and its title bold in it; the other pane keeps the normal border, a dim title.
+    #[test]
+    fn a_split_frame_draws_the_focused_pane_in_the_focus_colour() {
+        let draw = |focus| {
+            buffer_with(30, 4, |f| {
+                split_frame(
+                    f,
+                    f.area(),
+                    14,
+                    Title::new("List", ""),
+                    Title::new("Detail", ""),
+                    focus,
+                );
+            })
+        };
+        let (on, off) = (style::FOCUS, style::BORDER);
+        let b = draw(Pane::Left);
+        // Left edge, top, bottom, the divider: focus; right edge: normal.
+        for (x, y) in [(0, 0), (0, 1), (5, 0), (5, 3), (14, 0), (14, 1), (14, 3)] {
+            assert_eq!(b[(x, y)].fg, on, "({x}, {y})");
+        }
+        for (x, y) in [(25, 0), (29, 0), (29, 1), (20, 3), (29, 3)] {
+            assert_eq!(b[(x, y)].fg, off, "({x}, {y})");
+        }
+        assert_eq!(b[(3, 0)].style(), b[(3, 0)].style().patch(style::title()));
+        assert_eq!(b[(17, 0)].fg, style::DIM);
+        let b = draw(Pane::Right);
+        for (x, y) in [(14, 0), (14, 1), (14, 3), (29, 1), (29, 3), (25, 0)] {
+            assert_eq!(b[(x, y)].fg, on, "({x}, {y})");
+        }
+        for (x, y) in [(0, 0), (0, 1), (5, 3)] {
+            assert_eq!(b[(x, y)].fg, off, "({x}, {y})");
+        }
+        assert_eq!(b[(17, 0)].fg, style::FOCUS);
+        assert_eq!(b[(3, 0)].fg, style::DIM);
+    }
+
+    /// The first section has the keys: its border down to the one under it is in the
+    /// focus colour, the next section's sides are not.
+    #[test]
+    fn sections_draw_the_first_in_the_focus_colour() {
+        let b = buffer_with(20, 7, |f| {
+            sections(
+                f,
+                f.area(),
+                &[
+                    Section {
+                        title: Title::new("Now", ""),
+                        rows: Some(1),
+                    },
+                    Section {
+                        title: Title::new("Keys", ""),
+                        rows: None,
+                    },
+                ],
+            );
+        });
+        for (x, y) in [(0, 0), (19, 0), (0, 1), (19, 1), (0, 2), (10, 2), (19, 2)] {
+            assert_eq!(b[(x, y)].fg, style::FOCUS, "({x}, {y})");
+        }
+        for (x, y) in [(0, 3), (19, 4), (0, 6), (10, 6)] {
+            assert_eq!(b[(x, y)].fg, style::BORDER, "({x}, {y})");
+        }
+        assert_eq!(b[(3, 0)].fg, style::FOCUS);
+        assert_ne!(b[(3, 2)].fg, style::FOCUS, "the second title is not");
+    }
+
+    /// A list's selected row: `›` in the focus colour in a 2-cell gutter, on the
+    /// selection background across the row; the rows start after the gutter.
+    #[test]
+    fn a_list_marks_its_selected_row_in_the_gutter() {
+        let area = Rect::new(1, 0, 12, 3);
+        assert_eq!(gutter_area(area), Rect::new(3, 0, 10, 3));
+        let b = buffer_with(14, 3, |f| {
+            list(
+                f,
+                area,
+                vec![Line::raw(" one"), Line::raw(" two"), Line::raw(" three")],
+                Some(1),
+            );
+        });
+        let row = |y: u16| (0..14).map(|x| b[(x, y)].symbol()).collect::<String>();
+        assert_eq!(row(0), "    one       ");
+        assert_eq!(row(1), "  › two       ");
+        assert_eq!(row(2), "    three     ");
+        assert_eq!(b[(2, 1)].fg, style::FOCUS);
+        for x in 1..13 {
+            assert_eq!(b[(x, 1)].bg, style::SEL, "{x}");
+        }
+        assert_ne!(b[(1, 0)].bg, style::SEL);
+        // Nothing selected: no marker.
+        let b = buffer_with(14, 1, |f| list(f, area, vec![Line::raw(" one")], None));
+        assert_eq!(b[(2, 0)].symbol(), " ");
     }
 
     #[test]
