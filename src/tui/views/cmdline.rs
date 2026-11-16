@@ -185,6 +185,16 @@ pub(crate) fn tokens(line: &str) -> Vec<Tok> {
     }
 }
 
+/// A pasted character as a one-line input takes it: tabs and newlines as spaces, other
+/// control characters left out (`None`). The command line's paste and Go to's.
+pub fn paste_char(c: char) -> Option<char> {
+    match c {
+        '\n' | '\r' | '\t' => Some(' '),
+        c if c.is_control() => None,
+        c => Some(c),
+    }
+}
+
 /// The input line as it is drawn: each argument as typed, escaped, except the
 /// credential arguments ([`command::secrets`]), which show as [`MASK`] (an `ACL
 /// SETUSER` rule keeps its first character). Masked from the first character typed.
@@ -703,7 +713,14 @@ impl CmdlineState {
         self.prefetch(act);
     }
 
-    /// Pasted text: one line, tabs and newlines as spaces, no control characters.
+    /// Go to's `:` row: `text` replaces the input line, as if pasted into an empty one.
+    /// Nothing is run: `enter` still does that.
+    pub(crate) fn set_input(&mut self, text: &str, act: &mut Act<'_>) {
+        self.input.clear();
+        self.paste(text, act);
+    }
+
+    /// Pasted text: one line, tabs and newlines as spaces ([`paste_char`]).
     pub(crate) fn paste(&mut self, text: &str, act: &mut Act<'_>) {
         if let Some(c) = self.confirm.as_mut() {
             if let Some(t) = c.typed.as_mut() {
@@ -717,11 +734,10 @@ impl CmdlineState {
             if n >= MAX_INPUT {
                 break;
             }
-            match c {
-                '\n' | '\r' | '\t' => self.input.push(' '),
-                c if c.is_control() => continue,
-                c => self.input.push(c),
-            }
+            let Some(c) = paste_char(c) else {
+                continue;
+            };
+            self.input.push(c);
             n += 1;
         }
         self.hist_at = None;
@@ -1720,6 +1736,17 @@ impl App {
     pub(in crate::tui) fn cmdline_paste(&mut self, text: &str) -> Vec<Effect> {
         self.with_views(Owner::Cmdline, "paste", |v, act| v.cmdline.paste(text, act))
             .map_or_else(Vec::new, |(_, e)| e)
+    }
+
+    /// Go to's `:` row once the panel is open: `text` in its input line, not run.
+    pub(in crate::tui) fn cmdline_set_input(&mut self, text: &str) -> Vec<Effect> {
+        if !self.views.cmdline.open {
+            return Vec::new();
+        }
+        self.with_views(Owner::Cmdline, "paste", |v, act| {
+            v.cmdline.set_input(text, act)
+        })
+        .map_or_else(Vec::new, |(_, e)| e)
     }
 
     /// Every tick while the panel is open, whatever is on screen.
@@ -3378,6 +3405,46 @@ mod tests {
         }
         assert!(!app.in_grace());
         assert!(!text(&app, 120, 36).contains("wait…"));
+        assert_eq!(writes(&app.handle_key(ch('y'))).len(), 1);
+    }
+
+    /// A question a late reply opens closes Go to too, is drawn on top, and takes no
+    /// `y` for its grace period: a `y` typed for Go to's text answers nothing.
+    #[test]
+    fn a_reply_opened_question_closes_go_to_and_waits_before_y() {
+        let mut app = opened();
+        writable(&mut app, Env::Local);
+        let mut e = type_text(&mut app, "DEL k");
+        e.extend(app.handle_key(key(KeyCode::Enter)));
+        let info = reqs(&e)
+            .into_iter()
+            .find_map(|(id, r)| matches!(r, Request::Info { .. }).then_some(id))
+            .expect("a COMMAND INFO");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.views.cmdline.open);
+        testing::show(&mut app, Screen::Patterns);
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert!(app.goto.is_some());
+        type_text(&mut app, "cart");
+        testing::reply_now(
+            &mut app,
+            info,
+            Ok(LiveReply::Command(Reply::Info(Some(del_info())))),
+        );
+        assert!(app.confirm.is_some(), "the write gate asks");
+        assert!(app.goto.is_none(), "the question closed Go to");
+        assert!(app.in_grace());
+        let drawn = text(&app, 120, 36);
+        assert!(
+            drawn.contains("Run command?") && drawn.contains("wait…"),
+            "{drawn}"
+        );
+        assert!(!drawn.contains("Go to ─"), "{drawn}");
+        assert!(writes(&app.handle_key(ch('y'))).is_empty());
+        assert!(app.confirm.is_some());
+        for _ in 0..crate::tui::app::GRACE_TICKS {
+            app.apply(Msg::Tick);
+        }
         assert_eq!(writes(&app.handle_key(ch('y'))).len(), 1);
     }
 

@@ -25,4 +25,4 @@ expression: t
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" a Analyze keys   ↑↓ Move   enter Go there   v More           . Actions   ? Keys"
+" a Analyze keys   ↑↓ Move   enter Go there   v More            ^K Go to   ? Keys"

@@ -5,11 +5,10 @@
 //! its database, the picked node on a cluster, the server's figures, the status on the
 //! right). Row 2 is the areas with the current area's panels inline (`1 Overview
 //! 2 Browse › Keys · Streams · Search 3 Analyze 4 Server 5 Pub/Sub`, `0 Connections` at
-//! the right). The footer has the 3 to 5 keys of the screen and `ctrl-f Find key
-//! : Command  ? Help` on the right (the `ctrl-f` prompt takes its place while it is
-//! open). Dialogs
-//! (the write gate's question, a bulk action, the database list, "Analyze the keys?",
-//! `?`) draw over the screen dimmed.
+//! the right). The footer has the 3 to 5 keys of the screen and `. Actions   ^K Go to
+//! ? Keys` on the right (the `ctrl-f` prompt takes its place while it is open).
+//! Dialogs (a bulk action, the database list, "Analyze the keys?", `?`, Go to) draw
+//! over the screen dimmed.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -33,6 +32,7 @@ mod connections;
 mod dbs;
 mod delta;
 mod diff;
+mod goto;
 pub mod help;
 pub(crate) mod hot;
 mod keys;
@@ -173,6 +173,7 @@ pub fn dialog_open(app: &App) -> bool {
             .as_ref()
             .is_some_and(|b| !matches!(b.stage, crate::tui::app::bulk::Stage::Asking { .. }))
         || app.dbs.is_some()
+        || app.goto.is_some()
 }
 
 /// The question open as a sheet, if any: the write gate's, Monitor's or the command
@@ -238,6 +239,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if app.menu.is_some() {
         actions::draw(frame, body, app);
+    }
+    if app.goto.is_some() {
+        goto::draw(frame, body, app);
     }
     if let Some(d) = &app.analyze {
         overview::draw_analyze(frame, body, d, app);
@@ -1002,8 +1006,8 @@ fn input_line(label: &str, text: String, hint: &str, w: usize) -> Line<'static> 
     ])
 }
 
-/// The footer's key hints: the screen's 3 to 5 keys, then `ctrl-f Find key  : Command
-/// ? Help` against the right edge ([`keymap::footer_fit`]): the screen's keys that do
+/// The footer's key hints: the screen's 3 to 5 keys, then `. Actions   ^K Go to
+/// ? Keys` against the right edge ([`keymap::footer_fit`]): the screen's keys that do
 /// not fit are left out from the end.
 fn key_line(app: &App, w: usize) -> Line<'static> {
     let screen = app.screen();
@@ -1086,6 +1090,8 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
         help_footer(app)
     } else if app.menu.is_some() {
         hints_line(&actions::footer(), actions::FOOTER_NOTE)
+    } else if app.goto.is_some() {
+        hints_line(&goto::footer(), goto::FOOTER_NOTE)
     } else if let Some(b) = &app.bulk {
         bulk::footer(b)
     } else if let Some(l) = &app.dbs {

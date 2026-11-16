@@ -37,4 +37,4 @@ expression: t.backend()
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   enter Connect   + Add   w Writes   / Filter                                                . Actions   ? Keys"
+" ↑↓ Move   enter Connect   + Add   w Writes   / Filter                                     . Actions   ^K Go to   ? Keys"

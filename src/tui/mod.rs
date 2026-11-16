@@ -2023,6 +2023,172 @@ pub async fn run_key_list_for_tests(
     out
 }
 
+/// What [`run_goto_for_tests`] saw in one phase.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct GoToPhase {
+    /// What the app asked of the live connection during the phase, as `Debug` text.
+    pub requests: Vec<String>,
+    /// The screen at the end, as `Debug` text.
+    pub screen: String,
+    /// Go to is still open at the end.
+    pub open: bool,
+    /// The pattern whose keys the key list holds at the end, if any.
+    pub key_list: Option<String>,
+}
+
+/// Go to (`ctrl-k`) against a real server, for the integration tests: connects
+/// `profile` without an analysis exactly as the TUI does, goes to Browse › Keys until
+/// the key names read first are in, then to 1 Overview. Then for each phase it sends
+/// the phase's number on `ready` and waits for `go` (so the test can reset and read
+/// the server's command counts in between), forgets the loaded keys when the phase
+/// says so (so a `→` reads them again as the first time), presses the phase's keys
+/// with a tick after each, carries out what the app asks and waits for every answer.
+/// Then it lets the screen poll for the phase's number of ticks: each one a
+/// `Msg::TickAt` 100 ms after the one before (a clock of its own, so every run polls
+/// alike), every answer waited for before the next. After the last phase it sends the
+/// number of phases and waits once more. The live connection is closed again at the
+/// end.
+#[doc(hidden)]
+pub async fn run_goto_for_tests(
+    profile: Profile,
+    credentials: Option<Credentials>,
+    phases: Vec<(bool, Vec<crossterm::event::KeyEvent>, u32)>,
+    ready: mpsc::UnboundedSender<usize>,
+    mut go: mpsc::UnboundedReceiver<()>,
+) -> Vec<GoToPhase> {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::HashSet;
+    let press = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+    let mut app = App::new(vec![profile.clone()]);
+    let effects = app.handle_key(press(KeyCode::Enter));
+    let (id, scan) = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::Connect { id, scan, .. } => Some((*id, *scan)),
+            _ => None,
+        })
+        .expect("enter connects");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let slot: LiveSlot = Arc::new(Mutex::new(Some(LiveSession::new(id, scan))));
+    connect_and_scan(
+        Run { id, scan },
+        profile,
+        SecretSource::Container(credentials),
+        None,
+        StopFlag::new(),
+        tx,
+        Arc::clone(&slot),
+    )
+    .await;
+    let mut pending: HashSet<live::ReqId> = HashSet::new();
+    let carry_out =
+        |effects: Vec<Effect>, pending: &mut HashSet<live::ReqId>, log: &mut Vec<String>| {
+            for e in effects {
+                if let Effect::Live {
+                    req_id, to, req, ..
+                } = e
+                {
+                    log.push(format!("{req:?}"));
+                    pending.insert(req_id);
+                    let guard = lock(&slot);
+                    let handle = guard.as_ref().and_then(|s| s.handle.as_ref());
+                    assert!(
+                        handle.is_some_and(|h| h.send_to(req_id, to, req)),
+                        "the live connection is open"
+                    );
+                }
+            }
+        };
+    let mut log = Vec::new();
+    macro_rules! next {
+        () => {{
+            let incoming = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                .await
+                .expect("the app gets an answer in time");
+            match incoming {
+                Some(Incoming::Msg(m)) => {
+                    if let Msg::Live { req_id, .. } = &*m {
+                        pending.remove(req_id);
+                    }
+                    let connected = matches!(*m, Msg::Connected { .. });
+                    let effects = app.apply(*m);
+                    carry_out(effects, &mut pending, &mut log);
+                    Some(connected)
+                }
+                _ => None,
+            }
+        }};
+    }
+    // Connect, then Browse, then the names read first.
+    loop {
+        match next!() {
+            Some(true) => {
+                let effects = app.handle_key(press(KeyCode::Char('2')));
+                carry_out(effects, &mut pending, &mut log);
+            }
+            Some(false) => {}
+            None => panic!("the connect ended before the names were read"),
+        }
+        let names = &app.patterns.names;
+        if app.screen() == app::Screen::Patterns
+            && names.started()
+            && !names.is_reading()
+            && pending.is_empty()
+        {
+            break;
+        }
+    }
+    // Overview, and whatever it reads when it shows.
+    let effects = app.handle_key(press(KeyCode::Char('1')));
+    carry_out(effects, &mut pending, &mut log);
+    while !pending.is_empty() {
+        next!().expect("an answer to every request");
+    }
+    let mut out = Vec::new();
+    let n = phases.len();
+    let mut clock = std::time::Instant::now();
+    for (i, (fresh, keys, polls)) in phases.into_iter().enumerate() {
+        let _ = ready.send(i);
+        go.recv().await;
+        if fresh {
+            app.views.keys = Default::default();
+        }
+        let mut requests = Vec::new();
+        for key in keys {
+            let effects = app.handle_key(key);
+            carry_out(effects, &mut pending, &mut requests);
+            let effects = app.apply(Msg::Tick);
+            carry_out(effects, &mut pending, &mut requests);
+        }
+        while !pending.is_empty() {
+            let before = log.len();
+            next!().expect("an answer to every request");
+            requests.extend(log.drain(before..));
+        }
+        for _ in 0..polls {
+            clock += Duration::from_millis(100);
+            let effects = app.apply(Msg::TickAt(clock));
+            carry_out(effects, &mut pending, &mut requests);
+            while !pending.is_empty() {
+                let before = log.len();
+                next!().expect("an answer to every request");
+                requests.extend(log.drain(before..));
+            }
+        }
+        out.push(GoToPhase {
+            requests,
+            screen: format!("{:?}", app.screen()),
+            open: app.goto.is_some(),
+            key_list: app.views.keys.pattern.clone(),
+        });
+    }
+    let _ = ready.send(n);
+    go.recv().await;
+    drop(lock(&slot).take());
+    out
+}
+
 /// The OS keychain: where the TUI reads a saved profile's credentials from.
 fn keyring() -> Arc<dyn SecretStore> {
     Arc::new(KeyringStore)

@@ -3278,6 +3278,31 @@ mod tests {
         assert!(app.views.value.row.is_none());
     }
 
+    /// A reply that goes back to the key list (the delete's answer) closes Go to,
+    /// saying why: its rows were for the value's screen.
+    #[test]
+    fn a_reply_that_switches_the_screen_closes_go_to() {
+        let mut app = hash_app();
+        app.views.keys.rows = vec![cart(), row("user:7:cart", KeyType::Hash, Some(1), Some(80))];
+        app.handle_key(ch('D'));
+        let e = app.handle_key(ch('y'));
+        let id = write_ids(&e)[0];
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert!(app.goto.is_some());
+        for c in "user".chars() {
+            app.handle_key(ch(c));
+        }
+        testing::reply(&mut app, id, Ok(LiveReply::Write(WriteReply::Int(1))));
+        assert_eq!(app.screen(), Screen::KeyList);
+        assert!(app.goto.is_none());
+        let n = notice(&app);
+        assert!(
+            n.contains("Deleted user:10293:cart.")
+                && n.contains(crate::tui::app::goto::SCREEN_CHANGED),
+            "{n}"
+        );
+    }
+
     #[test]
     fn on_prod_with_writes_on_edits_ask_and_deletes_need_the_key_name() {
         let mut app = hash_app();

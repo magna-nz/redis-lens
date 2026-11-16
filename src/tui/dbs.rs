@@ -179,6 +179,10 @@ impl App {
             return effects;
         }
         self.db_resub = tail;
+        // The key list and the open value stay as they were: what they hold was read
+        // on the old database.
+        self.list_db.get_or_insert(old);
+        self.value_db.get_or_insert(old);
         self.set_info(format!(
             "Switched to db {db} for this session. The saved profile is unchanged."
         ));

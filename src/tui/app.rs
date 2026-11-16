@@ -67,6 +67,10 @@ pub mod find;
 #[path = "actions.rs"]
 pub mod actions;
 
+/// `ctrl-k`: the Go to box.
+#[path = "goto.rs"]
+pub mod goto;
+
 use views::{Act, Ctx, LiveState, Owner, TailCmd, ViewState, Views};
 
 /// The five areas and the home screen, switched with `0` to `5` (spec "Navigation").
@@ -1233,6 +1237,14 @@ pub struct App {
     pub confirm: Option<confirm::Confirm>,
     /// The Actions menu (`.`), if open. While it is open every key goes to it.
     pub menu: Option<actions::Menu>,
+    /// The Go to box (`ctrl-k`), if open. While it is open every key goes to it.
+    pub goto: Option<goto::GoTo>,
+    /// The database the key list's rows were read on, once a database switch (`b`)
+    /// left them from another one; `None` while they are the session's database's (or
+    /// read since). Go to lists no key of another database.
+    pub list_db: Option<u32>,
+    /// The same for the open value.
+    pub value_db: Option<u32>,
     /// A question that a reply (not the key being handled) opened ignores its answer
     /// keys until `tick` reaches this, so a key typed for something else can't answer
     /// it (spec "The confirm sheet").
@@ -1426,6 +1438,7 @@ pub fn key_of(token: &str) -> Option<KeyEvent> {
         "ctrl-t" => KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
         "ctrl-u" => KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
         "ctrl-f" => KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        "ctrl-k" => KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
         "ctrl-o" => KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
         t => {
             let mut cs = t.chars();
@@ -1491,6 +1504,9 @@ impl App {
             dashboard: DashboardLink::default(),
             confirm: None,
             menu: None,
+            goto: None,
+            list_db: None,
+            value_db: None,
             grace_until: None,
             bulk: None,
             dbs: None,
@@ -2203,6 +2219,7 @@ impl App {
             return Vec::new();
         }
         self.close_menu_changed();
+        self.close_goto_changed();
         let mut out = self.on_active("hide", |v, act| v.on_hide(act));
         self.set_screen(to);
         out.extend(self.on_active("show", |v, act| v.on_show(act)));
@@ -2311,14 +2328,16 @@ impl App {
         self.grace_until.is_some_and(|u| self.tick < u) && self.question().is_some()
     }
 
-    /// After a key or a message: a question that just opened closes the Actions menu
-    /// and the help, so what takes the keys is what is on top; one that a message
+    /// After a key or a message: a question that just opened closes the Actions menu,
+    /// Go to and the help, so what takes the keys is what is on top; one that a message
     /// opened waits [`GRACE_TICKS`] before it takes an answer. The menu closes too
-    /// when what it was opened on changed under it.
+    /// when what it was opened on changed under it, and Go to when another screen
+    /// shows.
     fn after_change(&mut self, asking: bool, from_message: bool) {
         if self.question().is_some() {
             if !asking {
                 self.menu = None;
+                self.goto = None;
                 self.help = false;
                 self.grace_until = from_message.then_some(self.tick + GRACE_TICKS);
             }
@@ -2326,6 +2345,7 @@ impl App {
             self.grace_until = None;
         }
         self.check_menu();
+        self.check_goto();
     }
 
     fn key_inner(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -2370,6 +2390,10 @@ impl App {
         if self.menu.is_some() {
             return self.menu_key(key);
         }
+        // And Go to (goto.rs): every printable key is its text.
+        if self.goto.is_some() {
+            return self.goto_key(key);
+        }
         // Monitor's question is a sheet like the write gate's: it takes every key, so
         // neither Find key nor the dashboard opens over it.
         if self.monitor_asking() {
@@ -2406,6 +2430,10 @@ impl App {
         // A view's own text input takes every key, as the Patterns filter does.
         if self.view_input().is_some() {
             return self.key_to_view(key).1;
+        }
+        // `ctrl-k` opens Go to wherever no input, question or overlay takes the keys.
+        if goto::is_goto(&key) {
+            return self.open_goto();
         }
         // `ctrl-s` saves a snapshot where an analysis is shown.
         if is_snapshot_key(&key) {
@@ -3063,6 +3091,7 @@ impl App {
         self.views.server.new_run();
         self.confirm = None;
         self.menu = None;
+        self.goto = None;
         self.bulk = None;
         self.dbs = None;
         self.db_resub = None;
@@ -3280,6 +3309,10 @@ impl App {
             return Vec::new();
         }
         if self.menu.is_some() {
+            return Vec::new();
+        }
+        if self.goto.is_some() {
+            self.goto_paste(&text);
             return Vec::new();
         }
         if self.views.cmdline.open {
@@ -3555,10 +3588,13 @@ impl App {
         // The previous session's view states and live requests go with it; nothing is
         // shown from them, so none is told it is hidden.
         self.views = Views::default();
+        self.list_db = None;
+        self.value_db = None;
         self.live_pending.clear();
         self.live_writes.clear();
         self.confirm = None;
         self.menu = None;
+        self.goto = None;
         self.bulk = None;
         self.dbs = None;
         self.db_resub = None;
@@ -3662,6 +3698,7 @@ impl App {
                 v.keys.open(pattern, &nodes, narrowed, act)
             })
             .map_or_else(Vec::new, |(_, e)| e);
+        self.list_db = None;
         out.extend(self.switch(Screen::KeyList));
         out
     }
@@ -3679,6 +3716,7 @@ impl App {
                 v.value.open(row, pattern, act)
             })
             .map_or_else(Vec::new, |(_, e)| e);
+        self.value_db = None;
         out.extend(self.switch(Screen::KeyDetail));
         out
     }
@@ -8017,7 +8055,7 @@ mod tests {
                     .as_ref()
                     .map(|s| (s.scan, s.phase.clone(), s.picked)),
                 &app.views,
-                (&app.confirm, &app.find, &app.menu),
+                (&app.confirm, &app.find, &app.menu, &app.goto),
             )
         )
     }
@@ -8038,6 +8076,7 @@ mod tests {
             "shift-tab" => vec![key(KeyCode::BackTab)],
             "ctrl-c" => vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
             "ctrl-f" => vec![KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)],
+            "ctrl-k" => vec![KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)],
             "ctrl-o" => vec![KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)],
             "ctrl-s" => vec![snap()],
             "ctrl-t" => vec![KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)],
@@ -8064,6 +8103,7 @@ mod tests {
             KeyCode::BackTab => "shift-tab".into(),
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-c".into(),
             KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-f".into(),
+            KeyCode::Char('k') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-k".into(),
             KeyCode::Char('o') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-o".into(),
             KeyCode::Char('s') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-s".into(),
             KeyCode::Char('t') if k.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-t".into(),
