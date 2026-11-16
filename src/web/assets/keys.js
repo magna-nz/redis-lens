@@ -147,9 +147,9 @@ export const ACTS = {
   'item.ttl': { run: 'press', in: 'pane', name: 'Set the TTL of the selected field', write: true, sends: 'HEXPIRE' },
   'item.delete': { run: 'press', in: 'pane', name: 'Delete the selected item', write: true },
   'key.add': { run: 'press', in: 'view', name: 'Add a key', write: true },
-  'key.ttl': { run: 'press', in: 'pane', name: 'Set the key\'s expiry', write: true, sends: 'EXPIRE' },
-  'key.rename': { run: 'press', in: 'pane', name: 'Rename the key', write: true, sends: 'RENAMENX' },
-  'key.delete': { run: 'press', in: 'pane', name: 'Delete the key', write: true, sends: 'UNLINK' },
+  'key.ttl': { run: 'press', in: 'view', name: 'Set the key\'s expiry', write: true, sends: 'EXPIRE' },
+  'key.rename': { run: 'press', in: 'view', name: 'Rename the key', write: true, sends: 'RENAMENX' },
+  'key.delete': { run: 'press', in: 'view', name: 'Delete the key', write: true, sends: 'UNLINK' },
   'pattern.bulkTtl': { run: 'press', in: 'view', name: 'Set a TTL on every key of the pattern (dry run first)', write: true, sends: 'EXPIRE … NX' },
   'pattern.bulkDelete': { run: 'press', in: 'view', name: 'Delete every key of the pattern (dry run first)', write: true, sends: 'UNLINK' },
   // Browse › Streams.

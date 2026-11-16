@@ -320,10 +320,16 @@ test('the context bar and the rail', () => {
   assert.match(read('views/connections.js'), /'Served by the redis-lens running in your terminal at '/, 'Connections says it in text');
   assert.match(read('app.js'), /class: 'glyph bad', 'aria-hidden': 'true', text: '✗'/, 'the banner\'s ✗ is the danger colour');
   const nav = html.slice(html.indexOf('<nav class="nav"'), html.indexOf('</nav>'));
-  const hints = Array.from(nav.matchAll(/<span>([^<]+)<\/span>\n<span class="key-hint" aria-hidden="true">([^<]+)<\/span>/g), (m) => [m[1], m[2]]);
+  // Each rail entry's key is its `data-hint` (the one way keys are shown), with its label.
+  const hints = Array.from(nav.matchAll(/aria-keyshortcuts="([^"]+)" data-hint="([^"]+)">\n<svg[^\n]*\n<span>([^<]+)<\/span>/g), (m) => {
+    assert.equal(m[1], m[2], 'the hint is the key');
+    return [m[3], m[2]];
+  });
   assert.deepEqual(hints, [['Overview', '1'], ['Browse', '2'], ['Analyze', '3'], ['Server', '4'], ['Pub/Sub', '5'], ['Connections', '0'], ['Command line', ':']]);
   assert.ok(nav.indexOf('nav-sep') > nav.indexOf('data-nav="pubsub"') && nav.indexOf('nav-sep') < nav.indexOf('data-nav="connections"'), 'a rule before Connections');
-  assert.match(read('app.css'), /body\.keys-on \.key-hint \{ display: inline-block; \}/, 'the key hints wait for keys-on');
+  assert.doesNotMatch(html, /key-hint/, 'no second kind of hint in the markup');
+  assert.doesNotMatch(read('app.js'), /key-hint/, 'nor drawn by the chrome');
+  assert.match(read('app.css'), /body\.keys-on \[data-hint\]::after \{/, 'the key hints wait for keys-on');
 });
 
 test('the views no longer draw a node or database picker of their own', () => {

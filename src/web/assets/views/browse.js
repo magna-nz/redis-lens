@@ -191,26 +191,51 @@ export function valueFoot(v) {
 /** A whole Browse memory, as it starts. */
 export function blank() {
   return {
-    who: null, conn: null, tree: null, treeError: null, sort: null, node: null, filter: '', closed: new Set(),
+    who: null, place: null, conn: null, tree: null, treeError: null, sort: null, node: null, filter: '', closed: new Set(),
     picked: null, list: null, listError: null, listFilter: '', listShown: CHUNK, finding: null,
     value: null, valueError: null, valueId: null, item: null, shown: null, format: null, itemsShown: CHUNK,
     dbs: null, dbsError: null, bulk: null, anchor: 'patterns',
   };
 }
 
-/** Follow the session: another connection starts Browse afresh; a new run (an analysis, a
- *  database switch) drops the key list and the value, which redis-lens drops then too, and
- *  keeps the filter, the sort and the closed groups, as the TUI does. */
-export function follow(store, state) {
+/** Whether a state starts a new connect: connected now (an analysis's own reconnect
+ *  counts as connected), and not before, or to another server or at another time. The
+ *  page counts these (`init`), so a mark made before a reconnect never matches after it. */
+export function connectStarted(prev, next) {
+  const on = (s) => !!(s && s.conn && (s.connected || analyzing(s)));
+  const id = (s) => (s && s.conn ? `${s.conn.name}|${s.conn.docker}|${s.conn.connectedAt}` : null);
+  return on(next) && (!on(prev) || id(prev) !== id(next));
+}
+
+/** Where a state is: the connection, which connect of this page it is (`connects`), and
+ *  the database. A history entry Browse shows is marked with it; an entry with another
+ *  mark was shown for another connection or database. Null when not connected. */
+export function placeOf(state, connects = 0) {
+  const c = state && state.conn;
+  if (!c) return null;
+  return `${c.name}|${c.docker}|${connects}|${state.analysis ? state.analysis.db : 0}`;
+}
+
+/** The place and the run (an analysis, a database switch): what Browse holds is for one. */
+export function whoOf(state, connects = 0) {
+  const place = placeOf(state, connects);
+  return place === null ? null : `${place}|${state.analysis ? state.analysis.run : 0}`;
+}
+
+/** Follow the session: another connection (or a new connect) starts Browse afresh; a new
+ *  run (an analysis, a database switch) drops the key list and the value, which redis-lens
+ *  drops then too, and keeps the filter, the sort and the closed groups, as the TUI does. */
+export function follow(store, state, connects = 0) {
   const c = state.conn;
-  const conn = c ? `${c.name}|${c.docker}` : null;
-  const who = conn ? `${conn}|${state.analysis ? state.analysis.run : 0}` : null;
+  const conn = c ? `${c.name}|${c.docker}|${connects}` : null;
+  const who = whoOf(state, connects);
+  const place = placeOf(state, connects);
   if (conn !== store.conn) {
-    Object.assign(store, blank(), { conn, who });
+    Object.assign(store, blank(), { conn, who, place });
     return 'reset';
   }
   if (who !== store.who) {
-    Object.assign(store, { who, tree: null, treeError: null, node: null, picked: null, list: null, listError: null, finding: null, value: null, valueError: null, valueId: null, item: null, shown: null, format: null, dbs: null, dbsError: null, anchor: 'patterns' });
+    Object.assign(store, { who, place, tree: null, treeError: null, node: null, picked: null, list: null, listError: null, finding: null, value: null, valueError: null, valueId: null, item: null, shown: null, format: null, dbs: null, dbsError: null, anchor: 'patterns' });
     return 'run';
   }
   return null;
@@ -326,19 +351,111 @@ const listOf = (p) => (p.find !== null ? `f:${p.find}` : p.p !== null ? `p:${p.p
  *  `{ who, params }`, `who` the session and run (`follow`'s): another one starts over, so
  *  everything `to` names is read. Otherwise only what changed: a new key reads only the
  *  value, a new pattern or Find only its keys, a sort or node only the tree. A `to` without
- *  a sort keeps the one shown. Nothing is read for the same state. */
-export function routeLoads(from, to) {
+ *  a sort keeps the one shown. Nothing is read for the same state, unless `retry` says a
+ *  pane failed (`retryOf`) and the user asked for it again (a click or Enter on the open
+ *  row, Find with the same text): then that pane is read again. */
+export function routeLoads(from, to, retry = null) {
   const b = to.params;
   const fresh = !from || from.who !== to.who;
   const a = fresh ? NO_PARAMS : from.params;
   const list = listOf(b);
   return {
     tree: fresh || (b.sort !== null && b.sort !== a.sort) || b.node !== a.node,
-    keys: list !== null && (fresh || list !== listOf(a)),
+    keys: list !== null && (fresh || list !== listOf(a) || !!(retry && retry.keys)),
     clearList: list === null && listOf(a) !== null,
-    value: b.k !== null && (fresh || b.k !== a.k),
+    value: b.k !== null && (fresh || b.k !== a.k || !!(retry && retry.value)),
     clearValue: b.k === null && a.k !== null,
   };
+}
+
+/** Which panes an explicit open of what is shown reads again: the key list when it shows
+ *  an error or no key, the value when it shows an error or the key is gone. A pane still
+ *  reading, or showing what it read, is not read again. `s`: Browse's memory. */
+export function retryOf(s) {
+  return {
+    keys: !!s.listError || !!(s.list && s.list.rows.length === 0),
+    value: !!s.valueError || !!(s.value && s.value.gone),
+  };
+}
+
+/** Whether a reply is still wanted: nothing was opened since it was asked for (`seq`), and
+ *  it is for what is shown (`id`: the key list's, the tree's sort and node, the value's
+ *  view). `sent` is taken before asking, `now` once it answers; a reply for something no
+ *  longer shown is dropped, never drawn under another title. */
+export function replyWanted(sent, now) {
+  return !!sent && !!now && sent.seq === now.seq && sent.id === now.id;
+}
+
+/** The tree's row of a pattern (a pattern row, or one in a group), or null. */
+export function treeRowOf(tree, id) {
+  if (!tree || id === null || id === undefined) return null;
+  for (const r of tree.rows || []) {
+    if (r.kind === 'pattern' && r.pattern.id === id) return r;
+    if (r.kind === 'group') for (const c of r.children) if (c.pattern.id === id) return c;
+  }
+  return null;
+}
+
+/** Whether every key of a pattern may be acted on at once (a bulk TTL or delete): only for
+ *  a row of the tree the server gave for this session. A pattern known only from an
+ *  address lists its keys and nothing more: its id could name any glob, and redis-lens
+ *  turns placeholders into `*`, so `{id}` alone would be the whole keyspace. */
+export function bulkAllowed(tree, id) {
+  return treeRowOf(tree, id) !== null;
+}
+
+/** Why a pattern's bulk actions are not offered, in the About panel. */
+export const BULK_NOT_LISTED = 'Bulk actions are offered only for a pattern listed in Patterns. This one came from an address, so only its keys are listed.';
+
+/** Whether an address's node can be used with the tree shown: `ok` (none, or a node the
+ *  analysis's patterns can be narrowed to), `drop` (not one: it is left out before any key
+ *  is read), `unknown` (no tree yet: wait for it). */
+export function nodeCheck(tree, node) {
+  if (node === null || node === undefined) return 'ok';
+  if (!tree || tree.source === 'none') return 'unknown';
+  return tree.source === 'analysis' && (tree.nodes || []).some((n) => n.index === node) ? 'ok' : 'drop';
+}
+
+/** What to do with a history entry Browse is shown on: `foreign` when it was shown for
+ *  another connection or database (`mark` is not `place`: it is passed over, not applied
+ *  and not rewritten); `keep` for a new entry that names nothing (the rail's link, a digit:
+ *  what Browse holds stays); `apply` otherwise (a link, a reload, Back and Forward). */
+export function entryPlan({ params, mark = null, place = null }) {
+  if (mark !== null && mark !== place) return 'foreign';
+  if (!opensAnything(params) && params.sort === null && mark === null) return 'keep';
+  return 'apply';
+}
+
+/** How the address follows what Browse shows: `push` a step, `replace` the current entry,
+ *  or `none`. `push`: the user opened something (a key added). `user`: a change the user
+ *  made in place (a sort, a node, a rename, a delete). An entry of another connection or
+ *  database (`foreign`) is never rewritten: what the user does is a new step after it, and
+ *  what Browse does on its own leaves it. The same address needs nothing. */
+export function urlStep({ push = false, user = false, same = false, foreign = false }) {
+  if (foreign) return push || user ? 'push' : 'none';
+  if (same) return 'none';
+  return push ? 'push' : 'replace';
+}
+
+/** Whether a link to `to` from `from` would only add a second entry for the screen shown:
+ *  the rail's Browse link or the Keys tab, clicked on Browse › Keys. Such a click does
+ *  nothing. Routes as `parseRoute` gives them. */
+export function linkStays(from, to) {
+  const keys = (r) => !!r && r.name === 'browse' && panelOf(r.sub) === 'keys';
+  return keys(from) && keys(to) && !to.query;
+}
+
+/** The address a Browse route is written as, when it is written another way: `#/browse/keys`
+ *  is `#/browse`. Null when it is already. */
+export function canonicalHref(route) {
+  if (!route || route.name !== 'browse' || route.sub !== 'keys') return null;
+  return route.query ? `#/browse?${route.query}` : '#/browse';
+}
+
+/** Where the one read-only line goes: under the value's action bar when a key is open and
+ *  its pane shows, else in the key list's pane. Never two at once. */
+export function readOnlyPlace({ valueOpen = false, shown = PANES } = {}) {
+  return valueOpen && shown.includes('value') ? 'value' : 'keys';
 }
 
 // ---------------------------------------------------------------------------------------
@@ -451,8 +568,8 @@ export const NEW_KEY_TYPES = [['string', 'String'], ['hash', 'Hash'], ['list', '
 export function readOnlyText(conn) {
   if (!conn) return 'Connect first.';
   return conn.env === 'PROD'
-    ? 'Read-only: this is a production connection, so nothing is written to it. Turn writes on in Connections.'
-    : `Read-only: nothing is written to ${conn.name}. Turn writes on in Connections.`;
+    ? 'Read-only: this is a production connection, so nothing is written to it. Turn writes on with the top bar\'s Read-only button (w).'
+    : `Read-only: nothing is written to ${conn.name}. Turn writes on with the top bar's Read-only button (w).`;
 }
 
 /** Why a write that sends `cmds` is off now, or null when it may be tried: no
@@ -610,17 +727,25 @@ export function bulkRunLabel(b) {
 const store = blank();
 let active = null;
 
-const whoOf = (state) => {
-  const c = state && state.conn;
-  return c ? `${c.name}|${c.docker}|${state.analysis ? state.analysis.run : 0}` : null;
-};
+// The connects this page has seen (`connectStarted`), for the history marks. Counted from
+// boot on, whatever area is shown (app.js calls `init` before any view hears a state).
+let connects = 0;
+let lastState = null;
+
+/** Called once at boot: count each new connect. */
+export function init(api) {
+  api.on('state', (s) => {
+    if (connectStarted(lastState, s)) connects += 1;
+    lastState = s;
+  });
+}
 
 /** The address of Browse › Keys with a change on top of what it shows (for Overview,
  *  Analyze, Go to and the other panels): `{ p }` opens a pattern, `{ k }` a key, `{ find }`
  *  runs Find, `{ node }` narrows the patterns. What Browse holds for another session is
  *  not carried over. Going there reads what a click would, and is a step in the history. */
 export function hrefFor(change, state) {
-  const who = whoOf(state);
+  const who = whoOf(state, connects);
   return linkFrom(who && store.who === who ? shownParams(store) : NO_PARAMS, change);
 }
 
@@ -630,11 +755,18 @@ export function onRoute(route) {
   if (active) active.applyRoute(route);
 }
 
+/** Another area's jump to the address shown already (Go to's Find with the same text, a
+ *  key opened again): read again the panes that failed (`retryOf`). False when Browse ›
+ *  Keys is not shown, so the caller goes there as usual. */
+export function reopen() {
+  return active ? active.reopen() : false;
+}
+
 /** What Browse holds already for the session and run of `state`: the tree's patterns
  *  (from the analysis, or from the names read so far) and the keys of the list loaded.
  *  Go to searches these; it reads nothing from the server. Empty for another session. */
 export function held(state) {
-  const who = whoOf(state);
+  const who = whoOf(state, connects);
   if (!who || store.who !== who) return { patterns: [], keys: [] };
   const patterns = [];
   for (const r of (store.tree && store.tree.rows) || []) {
@@ -693,7 +825,7 @@ function mountKeys(root, ctx, route) {
     view.append(h('h1', { class: 'title', id: 'browse-title', text: 'Browse' }), panelTabs('keys'), gate);
     return () => {};
   }
-  follow(store, state);
+  follow(store, state, connects);
 
   let alive = true;
   const timers = new Set();
@@ -714,11 +846,18 @@ function mountKeys(root, ctx, route) {
   // did when the picker was here, and hands it to the top bar.
   const subtitle = h('p', { class: 'subtitle' });
   const crumbsBox = h('nav', { class: 'crumbs', 'aria-label': 'Where you are in Browse' });
+  // Back or Forward to an entry of another connection or database: said here, once.
+  const foreignBox = h('div', { class: 'foreign-note', role: 'status', hidden: true });
   view.append(h('div', { class: 'browse-bar' },
     h('h1', { class: 'title', id: 'browse-title', text: 'Browse' }),
     panelTabs('keys'),
     crumbsBox,
-    subtitle));
+    subtitle), foreignBox);
+  function showForeign(on) {
+    if (foreignBox.hidden === !on) return;
+    foreignBox.hidden = !on;
+    fill(foreignBox, on ? notice('That address was for another connection or database, so it is not shown here. What Browse holds for this one stays.', 'info') : null);
+  }
 
   // ---------- the three panes ----------
   const patFilter = h('input', {
@@ -764,8 +903,16 @@ function mountKeys(root, ctx, route) {
     }
     panesBox.dataset.count = String(shownPanes.length);
     drawCrumbs();
+    // The read-only line moves with the panes shown (one place only).
+    if (roMoved()) {
+      drawKeys();
+      if (store.value) drawValue();
+    }
     if (lost) toPane(shownPanes.includes(store.anchor) ? store.anchor : shownPanes[0]);
   }
+  /** Where the read-only line goes now (`readOnlyPlace`), and where it was drawn last. */
+  let roAt = null;
+  const roPlace = () => readOnlyPlace({ valueOpen: !!store.value, shown: shownPanes });
   function toPane(id) {
     if (ctx.focusPane) ctx.focusPane(cards[id]);
   }
@@ -818,34 +965,59 @@ function mountKeys(root, ctx, route) {
   }
 
   // ---------- the address ----------
-  /** Put what Browse shows in the address: a new step in the history (`push`, for what
-   *  the user opened), or in place of the current one (a sort, a node, a key renamed or
-   *  deleted). The address then names what is shown, so nothing more is read. */
-  function syncUrl(push = false) {
-    if (!alive) return;
+  /** Whether the address shown is still Browse › Keys's (a reply may come after the user
+   *  left for another area: it must not write Browse's address over that one's). */
+  const onKeysRoute = () => {
+    const r = ctx.currentRoute ? ctx.currentRoute() : null;
+    return !r || (r.name === 'browse' && panelOf(r.sub) === 'keys');
+  };
+  /** Put what Browse shows in the address (`urlStep`): a new step in the history (`push`,
+   *  for what the user opened), or in place of the current one (`user`: a sort, a node, a
+   *  key renamed or deleted; neither: Browse's own correction, such as a sort no longer
+   *  offered). An entry of another connection or database is never rewritten. The
+   *  address then names what is shown, so nothing more is read. */
+  function syncUrl(push = false, { user = false } = {}) {
+    if (!alive || !onKeysRoute()) return;
     const href = browseHref(shownParams(store));
-    if (push) ctx.navigate(href);
-    else {
+    const foreign = entryPlan({ params: NO_PARAMS, mark: entryMark(), place: store.place }) === 'foreign';
+    const step = urlStep({ push, user, same: window.location.hash === href, foreign });
+    if (step === 'push') {
+      showForeign(false);
+      if (window.location.hash === href) {
+        ctx.pushRoute(href);
+        markEntry();
+      } else ctx.navigate(href);
+    } else if (step === 'replace') {
       ctx.replaceRoute(href);
       markEntry();
-    }
+    } else if (!foreign) markEntry();
   }
-  /** Open something (a click, Enter): a step in the history; the route change reads it. */
+  /** Open something (a click, Enter): a step in the history; the route change reads it.
+   *  Opening what is shown already adds no step: it reads again what failed (`retryOf`). */
   function go(change) {
     if (!alive) return;
-    ctx.navigate(browseHref({ ...shownParams(store), ...change }));
+    const next = cleanParams({ ...shownParams(store), ...change });
+    if (sameParams(next, shownParams(store))) {
+      reopenShown(next);
+      return;
+    }
+    ctx.navigate(browseHref(next));
   }
-  // Each history entry Browse shows is marked with the session and run it was shown for
-  // (`follow`'s `who`), so Back to an entry from another connection or database is not
-  // applied to this one: its pattern and key ids may name other keys there. An entry
-  // without a mark (a link, a page just opened) is applied to the connection there is.
+  /** Open again what is shown, at the user's asking: the panes that failed are read again. */
+  function reopenShown(next = shownParams(store)) {
+    const foreign = entryPlan({ params: NO_PARAMS, mark: entryMark(), place: store.place }) === 'foreign';
+    // Shown over an entry of another connection: the user's open is a step after it.
+    if (foreign) syncUrl(true);
+    applyParams(next, { retry: retryOf(store) });
+  }
+  // Each history entry Browse shows is marked with the place it was shown for (`placeOf`:
+  // the connection, which connect, the database), so Back to an entry from another
+  // connection or database is not applied to this one: its pattern and key ids may name
+  // other keys there. An entry without a mark (a link, a page just opened) is applied to
+  // the connection there is. Entries of the same place stay good across a new analysis.
   const entryMark = () => (ctx.routeTag ? ctx.routeTag() : null);
   const markEntry = () => {
-    if (ctx.setRouteTag) ctx.setRouteTag(store.who);
-  };
-  const staleEntry = () => {
-    const mark = entryMark();
-    return mark !== null && mark !== store.who;
+    if (ctx.setRouteTag && onKeysRoute()) ctx.setRouteTag(store.place);
   };
   /** What a pattern id names: the tree's row, the pattern shown, or its name from the id. */
   function patternRef(id) {
@@ -855,16 +1027,39 @@ function mountKeys(root, ctx, route) {
     if (store.list && store.list.pattern && store.list.pattern.id === id) return store.list.pattern;
     return { id, name: nameOfId(id), copy: null };
   }
+  /** What a key id names: its row in the list, else its name from the id, with the type
+   *  another area knew (handed over in the history entry, never in the address). */
   function keyRef(id) {
     const row = store.list ? store.list.rows.find((r) => r.id === id) : null;
-    return row || { id, name: nameOfId(id), type: null };
+    if (row) return row;
+    const data = ctx.routeData ? ctx.routeData() : null;
+    const type = data && data.keyType && data.keyType.id === id && typeof data.keyType.type === 'string' ? data.keyType.type : null;
+    return { id, name: nameOfId(id), type };
   }
 
+  // An address whose node is not known yet (no tree): applied once the tree is read, so
+  // the keys are never read with a node the analysis does not have.
+  let pending = null;
+
   /** Show the state an address names, reading only what changed (`routeLoads`). */
-  function applyParams(next, { mounting = false } = {}) {
+  function applyParams(asked, { mounting = false, retry = null, mark = true } = {}) {
+    let next = asked;
+    if (mark) showForeign(false);
+    const check = store.treeError && !store.tree ? 'drop' : nodeCheck(store.tree, next.node);
+    if (check === 'unknown') {
+      pending = { next, retry, mark };
+      if (next.sort !== null) store.sort = next.sort;
+      store.node = next.node;
+      if (mark) markEntry();
+      drawKeys(opensAnything({ ...next, node: null }) ? 'Reading the patterns first…' : null);
+      return;
+    }
+    pending = null;
+    const dropped = check === 'drop';
+    if (dropped) next = { ...next, node: null };
     const from = shownParams(store);
-    const loads = routeLoads({ who: store.who, params: from }, { who: store.who, params: next });
-    markEntry();
+    const loads = routeLoads({ who: store.who, params: from }, { who: store.who, params: next }, retry);
+    if (mark) markEntry();
     if (next.sort !== null) store.sort = next.sort;
     store.node = next.node;
     if (loads.tree && !mounting) loadTree();
@@ -894,22 +1089,26 @@ function mountKeys(root, ctx, route) {
     else if (loads.clearValue) reveal(store.list || store.listError ? 'keys' : 'patterns');
     else if (loads.clearList) reveal('patterns');
     drawCrumbs();
+    // A node the analysis does not have left the address too (in place).
+    if (dropped) syncUrl();
   }
 
   /** A route while Browse › Keys is shown: Back, Forward, a link, another area's jump. */
   function applyRoute(r) {
     if (!alive || !r || r.name !== 'browse' || panelOf(r.sub) !== 'keys') return;
-    // Back to an entry of another connection or database: keep what is shown, and say so
-    // in the address in place.
-    if (staleEntry()) {
-      syncUrl();
+    const next = parseBrowseQuery(r.query);
+    const plan = entryPlan({ params: next, mark: entryMark(), place: store.place });
+    // Back to an entry of another connection or database: what is shown stays, the entry
+    // is left as it is, and a line says why.
+    if (plan === 'foreign') {
+      showForeign(true);
       return;
     }
-    const next = parseBrowseQuery(r.query);
-    // A new entry with no state (the rail's Browse link, the digit): what Browse shows
-    // stays, as when it is opened from another area. Back to an entry that showed nothing
-    // (it is marked) does empty it.
-    if (!opensAnything(next) && next.sort === null && entryMark() === null) {
+    // A new entry with no state (a link typed, `#/browse` from elsewhere): what Browse
+    // shows stays, as when it is opened from another area. Back to an entry that showed
+    // nothing (it is marked) does empty it.
+    if (plan === 'keep') {
+      showForeign(false);
       syncUrl();
       return;
     }
@@ -939,40 +1138,57 @@ function mountKeys(root, ctx, route) {
     try {
       const tree = await ctx.api.getBrowse({ sort: store.sort, node: store.node });
       if (!alive || mine !== treeSeq) return;
+      const knew = store.picked ? bulkAllowed(store.tree, store.picked.id) : null;
       store.tree = tree;
       store.treeError = null;
       store.sort = tree.sort;
       // The address names the sort shown, so it is not asked for again.
-      if (asked !== null && asked !== tree.sort) syncUrl();
+      if (asked !== null && asked !== tree.sort && !pending) syncUrl();
+      // The open pattern's About panel offers its bulk actions only once the tree lists it.
+      if (store.picked && !pending && knew !== bulkAllowed(tree, store.picked.id)) drawKeys();
     } catch (err) {
       if (!alive || mine !== treeSeq) return;
-      // A sort or node no longer offered (a new run): back to the defaults, in the address
-      // too, so it is not asked for again.
+      // A sort or node no longer offered (a new run, an address): back to the defaults, in
+      // the address too, so it is not asked for again.
       if ((err.status === 400 && store.sort) || (err.status === 422 && store.node !== null)) {
         store.sort = null;
         store.node = null;
-        syncUrl();
+        if (!pending) syncUrl();
         loadTree();
         return;
       }
       store.treeError = errorText(err);
     }
     drawTree();
+    // An address waiting for the tree (its node): shown now, its node checked first.
+    if (pending) {
+      const p = pending;
+      pending = null;
+      applyParams(store.tree || store.treeError ? p.next : { ...p.next, node: null }, { retry: p.retry, mark: p.mark });
+    }
     const t = store.tree;
     // Names are read by redis-lens in the background: look again while it reads, and while
     // nothing is there yet (the live connection opening, an analysis starting).
     if (!store.treeError && t && ((t.names && t.names.reading) || t.source === 'none')) later(loadTree, 900);
   }
 
+  /** What a tree reply is for: the session and run, the sort and the node. */
+  const treeAsk = () => ({ seq: treeSeq, id: `${store.who}|${store.sort}|${store.node}` });
   async function moreNames(button) {
     button.disabled = true;
+    const sent = treeAsk();
     try {
-      store.tree = await ctx.api.moreNames({ sort: store.sort });
+      const tree = await ctx.api.moreNames({ sort: store.sort });
+      // A sort, node or run changed meanwhile: that tree is read already; this one is not
+      // drawn over it.
+      if (!alive || !replyWanted(sent, treeAsk())) return;
+      store.tree = tree;
       store.treeError = null;
     } catch (err) {
+      if (!alive || !replyWanted(sent, treeAsk())) return;
       ctx.notify(errorText(err), 'error');
     }
-    if (alive) drawTree();
+    drawTree();
   }
 
   function drawTree() {
@@ -985,7 +1201,7 @@ function mountKeys(root, ctx, route) {
         class: 'field', id: 'browse-sort', 'data-act': 'sort',
         onchange: () => {
           store.sort = select.value;
-          syncUrl();
+          syncUrl(false, { user: true });
           loadTree();
         },
       }, t.sorts.map((s) => h('option', { value: s, selected: s === t.sort, text: SORT_LABELS[s] || s })));
@@ -997,7 +1213,7 @@ function mountKeys(root, ctx, route) {
         class: 'field', id: 'browse-node',
         onchange: () => {
           store.node = select.value === '' ? null : Number(select.value);
-          syncUrl();
+          syncUrl(false, { user: true });
           loadTree();
         },
       }, h('option', { value: '', selected: t.node === null, text: 'All nodes' }),
@@ -1118,13 +1334,7 @@ function mountKeys(root, ctx, route) {
 
   /** The tree's row of a pattern, when it is in the tree shown. */
   function rowOf(id) {
-    const t = store.tree;
-    if (!t) return null;
-    for (const r of t.rows) {
-      if (r.kind === 'pattern' && r.pattern.id === id) return r;
-      if (r.kind === 'group') for (const c of r.children) if (c.pattern.id === id) return c;
-    }
-    return null;
+    return treeRowOf(store.tree, id);
   }
 
   /** Whether a pattern is a literal key name in the tree shown (its `{…}` is not a placeholder). */
@@ -1180,14 +1390,21 @@ function mountKeys(root, ctx, route) {
     drawKeys();
   }
 
+  /** What a key list reply is for: the list opened (`listSeq`) and its id. */
+  const listAsk = () => ({ seq: listSeq, id: store.list ? store.list.list : null });
   async function moreKeys(button) {
     const l = store.list;
     if (!l) return;
     button.disabled = true;
     button.textContent = 'Reading…';
+    const sent = listAsk();
     try {
-      store.list = mergeList(l, await ctx.api.moreKeys(l.list));
+      const next = await ctx.api.moreKeys(l.list);
+      // Another pattern, Find or Back meanwhile: this page is not that list's.
+      if (!alive || !replyWanted(sent, listAsk())) return;
+      store.list = mergeList(store.list, next);
     } catch (err) {
+      if (!alive || !replyWanted(sent, listAsk())) return;
       // A list redis-lens no longer keeps (it keeps the newest 16): read it again.
       if (err.status === 404) {
         if (l.kind === 'find' && store.finding) runFind(store.finding);
@@ -1196,7 +1413,7 @@ function mountKeys(root, ctx, route) {
       }
       ctx.notify(errorText(err), 'error');
     }
-    if (alive) drawKeys();
+    drawKeys();
   }
 
   /** Clear search: a step in the history, back to the pattern Find came from (its keys
@@ -1217,6 +1434,7 @@ function mountKeys(root, ctx, route) {
   }
 
   function drawKeys(busy = null) {
+    if (roMoved() && store.value) drawValue();
     const l = store.list;
     const finding = store.finding !== null;
     const titleText = finding
@@ -1236,7 +1454,7 @@ function mountKeys(root, ctx, route) {
         !finding && store.picked ? aboutPattern(row, store.picked) : null));
     // Why Add key is off, and the pattern's ▲ reason: a line each, above the rows.
     const lines = [
-      addOff ? whyLines([addOff]) : null,
+      addOff ? whyLines([addOff], 'keys') : null,
       row && row.marked && row.reason ? h('p', { class: 'pane-note warn-line' }, h('span', { class: 'glyph', 'aria-hidden': 'true', text: '▲ ' }), row.reason) : null,
     ];
     if (busy) {
@@ -1293,9 +1511,10 @@ function mountKeys(root, ctx, route) {
     const rows = q ? l.rows.filter((r) => r.name.toLowerCase().includes(q)) : l.rows;
     const shown = rows.slice(0, store.listShown);
     const nodes = ctx.state().conn ? ctx.state().conn.nodes : [];
+    // The open key's writes are on the value pane's bar, with their keys (t, R, d reach
+    // them from this list too); its row carries none of its own.
     refill(box, shown.length ? shown.map((r) => {
       const on = store.valueId === r.id;
-      const open = on && store.value && store.value.key && store.value.key.id === r.id;
       return h('li', null, h('button', {
         type: 'button', class: `row row-key${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null, 'data-row': r.id,
         onclick: () => go({ k: r.id }),
@@ -1305,9 +1524,7 @@ function mountKeys(root, ctx, route) {
       h('span', { class: 'mono right', text: fmtBytes(r.bytes) }),
       h('span', { class: 'mono right muted', text: typeof r.length === 'number' ? fmtGrouped(r.length) : DASH }),
       h('span', { class: `mono right${r.ttl === 'never' ? ' never' : ' muted'}`, text: r.ttl || DASH }),
-      typeof r.node === 'number' && nodes[r.node] ? h('span', { class: 'sr-only', text: `on node ${nodes[r.node].address}` }) : null),
-      // The open key's own writes, beside its row as well as above its value.
-      open ? h('div', { class: 'row-tools', role: 'group', 'aria-label': `Write to ${r.name}` }, keyButtons(store.value, true)) : null);
+      typeof r.node === 'number' && nodes[r.node] ? h('span', { class: 'sr-only', text: `on node ${nodes[r.node].address}` }) : null));
     }) : h('li', { class: 'muted pad', text: q ? 'No loaded key matches the filter.' : listFoot(l) }));
     fill(showBox, rows.length > shown.length
       ? h('button', {
@@ -1324,27 +1541,59 @@ function mountKeys(root, ctx, route) {
    *  the rows stay where they are: its figures, copying it, every key of it at once, and
    *  the details. `r`: its row in the tree, null when the tree shown does not hold it. */
   let aboutOpen = null;
+  // A click outside the open panel closes it, as the top bar's menus close.
+  let aboutOutside = null;
+  const dropOutside = () => {
+    if (aboutOutside) document.removeEventListener('pointerdown', aboutOutside, true);
+    aboutOutside = null;
+  };
   function aboutPattern(r, pattern) {
+    const summary = h('summary', { class: 'btn', text: 'About ▾', title: 'About this pattern: its figures, the scan command, every key of it at once' });
+    const close = (refocus) => {
+      if (!box.open) return;
+      box.open = false;
+      if (refocus) summary.focus({ preventScroll: true });
+    };
     // It stays open while the list is drawn again, for the same pattern.
-    return h('details', {
+    const box = h('details', {
       class: 'pop', open: aboutOpen === pattern.id,
-      ontoggle: (e) => {
-        if (e.currentTarget.open) aboutOpen = pattern.id;
-        else if (aboutOpen === pattern.id) aboutOpen = null;
+      ontoggle: () => {
+        if (box.open) {
+          aboutOpen = pattern.id;
+          dropOutside();
+          aboutOutside = (e) => {
+            if (!box.isConnected) dropOutside();
+            else if (!box.contains(e.target)) close(false);
+          };
+          document.addEventListener('pointerdown', aboutOutside, true);
+        } else {
+          if (aboutOpen === pattern.id) aboutOpen = null;
+          dropOutside();
+        }
+      },
+      // Esc closes it and the focus goes back to its button (not to the pane on the left).
+      onkeydown: (e) => {
+        if (e.key !== 'Escape' || !box.open) return;
+        e.preventDefault();
+        e.stopPropagation();
+        close(true);
       },
     },
-      h('summary', { class: 'btn', text: 'About ▾', title: 'About this pattern: its figures, the scan command, every key of it at once' }),
+      summary,
       h('div', { class: 'pop-body', role: 'group', 'aria-label': 'About this pattern' }, patternSummary(r, pattern)));
+    return box;
   }
 
   function patternSummary(r, pattern) {
     const t = store.tree;
     const copyPattern = h('div', { class: 'row-actions' }, copyButton('Copy pattern', pattern.copy, 'the pattern', 'The pattern has control characters, so it is not copied: a pasted copy would name other keys.', { act: 'copy.pattern' }));
+    // Not a row of the tree the server gave (an address named it): its keys only, no bulk
+    // action (`bulkAllowed`).
     if (!r) {
       return h('div', { class: 'summary' },
         h('p', { class: 'muted small', text: 'The patterns shown do not hold this one, so there are no figures for it here.' }),
         copyPattern,
-        bulkButtons(pattern));
+        h('p', { class: 'muted small', text: BULK_NOT_LISTED }));
     }
     const exact = treeExact(t, ctx.state().analysis.report);
     const parts = [keysText(r, exact)];
@@ -1369,7 +1618,7 @@ function mountKeys(root, ctx, route) {
       h('p', { text: parts.join(' · ') }),
       r.marked && r.reason ? notice(r.reason) : r.reason ? h('p', { class: 'muted small', text: r.reason }) : null,
       copyPattern,
-      bulkButtons(r.pattern),
+      bulkAllowed(t, r.pattern.id) ? bulkButtons(r.pattern) : h('p', { class: 'muted small', text: BULK_NOT_LISTED }),
       h('div', { class: 'details-body' }, details));
   }
 
@@ -1413,12 +1662,16 @@ function mountKeys(root, ctx, route) {
     if (!v) return;
     button.disabled = true;
     button.textContent = 'Reading…';
+    // What a value reply is for: the key opened (`valueSeq`) and its view.
+    const valueAsk = () => ({ seq: valueSeq, id: store.value ? store.value.view : null });
+    const sent = valueAsk();
     try {
       const next = await ctx.api.moreValue(v.view);
-      if (!alive || store.value !== v) return;
+      if (!alive || !replyWanted(sent, valueAsk()) || store.value !== v) return;
       store.value = next;
       if (next.notice && next.items.length === v.items.length) ctx.notify(next.notice, 'info');
     } catch (err) {
+      if (!alive || !replyWanted(sent, valueAsk())) return;
       if (err.status === 404 && store.valueId) {
         openValue({ id: store.valueId, type: v.meta && v.meta.type });
         return;
@@ -1466,6 +1719,8 @@ function mountKeys(root, ctx, route) {
   }
 
   function drawValue(busy = null, key = null) {
+    // A key opened or closed: the read-only line moves between the two panes.
+    if (roMoved()) drawKeys();
     valueCard.setAttribute('aria-busy', busy ? 'true' : 'false');
     const v = store.value;
     const focusedName = valueCard.contains(document.activeElement) ? (document.activeElement.getAttribute('aria-label') || document.activeElement.textContent.trim()) : null;
@@ -1562,8 +1817,9 @@ function mountKeys(root, ctx, route) {
   }
 
   function shownBox(shown, v) {
+    // The key (f) belongs to the group: its hint is on the label, once (app.js `applyHints`).
     const formats = shown.formats.length > 1
-      ? h('div', { class: 'tabs', role: 'group', 'aria-label': 'Show the value as' }, shown.formats.map((f) => h('button', {
+      ? h('div', { class: 'tabs', role: 'group', 'aria-label': 'Show the value as' }, h('span', { class: 'lbl hint-label', 'data-hint-of': 'format', text: 'Show as' }), shown.formats.map((f) => h('button', {
         type: 'button', class: shown.format === f ? 'pill small on' : 'pill small', 'aria-pressed': shown.format === f ? 'true' : 'false', text: f === 'text' ? 'Text' : f === 'hex' ? 'Hex' : f, 'data-act': 'format',
         onclick: () => pickFormat(f),
       })))
@@ -1636,16 +1892,13 @@ function mountKeys(root, ctx, route) {
     });
   }
 
-  /** The key's own writes: its expiry, rename, delete. `beside` names the key in each
-   *  button's label, for the copies beside its row in the key list. */
-  function keyButtons(v, beside = false) {
+  /** The key's own writes: its expiry, rename, delete. */
+  function keyButtons(v) {
     const c = conn();
-    const name = v.key ? v.key.name : '';
-    const opt = (what) => (beside ? { quiet: true, aria: `${what} ${name}` } : {});
     return [
-      writeButton('Set expiry', keyOff(c, KEY_CMDS.ttl, v), () => ttlDialog(null), { ...opt('Set the expiry of'), act: 'key.ttl' }),
-      writeButton('Rename', keyOff(c, KEY_CMDS.rename, v), () => renameDialog(), { ...opt('Rename'), act: 'key.rename' }),
-      writeButton('Delete key', keyOff(c, KEY_CMDS.delete, v), (b) => deleteKey(b), { ...opt('Delete'), danger: true, act: 'key.delete' }),
+      writeButton('Set expiry', keyOff(c, KEY_CMDS.ttl, v), () => ttlDialog(null), { act: 'key.ttl' }),
+      writeButton('Rename', keyOff(c, KEY_CMDS.rename, v), () => renameDialog(), { act: 'key.rename' }),
+      writeButton('Delete key', keyOff(c, KEY_CMDS.delete, v), (b) => deleteKey(b), { danger: true, act: 'key.delete' }),
     ];
   }
 
@@ -1660,19 +1913,32 @@ function mountKeys(root, ctx, route) {
     buttons.push(...keyButtons(v));
     return h('div', { class: 'stack-sm write-bar' },
       h('div', { class: 'row-actions', role: 'group', 'aria-label': 'Write to this key' }, buttons),
-      whyLines(buttons.map((b) => (b.disabled ? b.title : null))));
+      whyLines(buttons.map((b) => (b.disabled ? b.title : null)), 'value'));
   }
 
   /** Why the buttons of a bar that are off are off, as text under it (not only in their
-   *  titles): each reason once, and a read-only connection's as the one line that says
-   *  which key turns writes on (keys.js `reasonLines`). */
-  function whyLines(offs) {
+   *  titles): each reason once. A read-only connection's reason is one line on the whole
+   *  screen (`readOnlyPlace`): drawn only by the bar at `here` when that is its place,
+   *  with the button that turns writes on, as the top bar's does. */
+  function whyLines(offs, here = null) {
     const c = conn();
-    const lines = reasonLines(offs, c ? readOnlyText(c) : null);
+    const ro = c ? readOnlyText(c) : null;
+    const lines = reasonLines(here !== null && here === roPlace() ? offs : offs.filter((o) => o !== ro), ro);
     if (!lines.length) return null;
     return h('div', { class: 'bar-why' }, lines.map((t) => (t === readOnlyLine()
-      ? h('div', { class: 'line' }, readOnlyNote(t), h('a', { href: '#/connections', class: 'small', text: 'Open Connections' }))
+      ? h('div', { class: 'line read-only-line' }, readOnlyNote('Edits are off: this connection is read-only.'),
+        ctx.toggleWrites ? h('button', { type: 'button', class: 'linkish small', text: 'Turn writes on (w)', onclick: () => ctx.toggleWrites() }) : null)
       : notice(t, 'info'))));
+  }
+  /** Whether the read-only line's place moved since it was drawn (a key opened or closed,
+   *  the panes shown changed), on a read-only connection. */
+  function roMoved() {
+    const p = roPlace();
+    const c = conn();
+    if (p === roAt) return false;
+    const was = roAt;
+    roAt = p;
+    return was !== null && !!c && c.readOnly;
   }
 
   /** The writes of the selected field, element, member or entry, under the items. */
@@ -1889,7 +2155,7 @@ function mountKeys(root, ctx, route) {
       } else if (r.value) takeValue(r.value);
       // A deleted key leaves the address, a renamed one is there under its new name; in
       // place, so Back does not reopen what is gone.
-      syncUrl();
+      syncUrl(false, { user: true });
     }
     drawKeys();
     drawValue();
@@ -2105,10 +2371,18 @@ function mountKeys(root, ctx, route) {
       h('div', { class: 'row-actions' },
         writeButton('Set a TTL on every key…', expire, () => bulkExpireDialog(pattern), { act: 'pattern.bulkTtl' }),
         writeButton('Delete every key…', remove, (b) => startBulk(b, pattern), { danger: true, act: 'pattern.bulkDelete' })),
-      c && c.readOnly ? whyLines([expire, remove]) : h('p', { class: 'muted small', text: [expire || remove, 'A dry run counts the keys first: nothing is written until you confirm.'].filter(Boolean).join(' ') }));
+      c && c.readOnly ? whyLines([expire, remove], null) : h('p', { class: 'muted small', text: [expire || remove, 'A dry run counts the keys first: nothing is written until you confirm.'].filter(Boolean).join(' ') }));
+  }
+
+  /** A bulk action only for a pattern the tree lists, checked again as it starts. */
+  function bulkRefused(pattern) {
+    if (bulkAllowed(store.tree, pattern.id)) return false;
+    ctx.notify(BULK_NOT_LISTED, 'info');
+    return true;
   }
 
   function bulkExpireDialog(pattern) {
+    if (bulkRefused(pattern)) return;
     writeDialog({
       title: 'Set a TTL on every key of the pattern',
       sub: pattern.name,
@@ -2120,12 +2394,15 @@ function mountKeys(root, ctx, route) {
       ],
       yes: 'Count the keys',
       value: false,
-      send: (values) => ctx.api.startBulk({ pattern: pattern.id, action: 'expire', ttl: values.ttl }),
+      send: (values) => (bulkAllowed(store.tree, pattern.id)
+        ? ctx.api.startBulk({ pattern: pattern.id, action: 'expire', ttl: values.ttl })
+        : Promise.reject(new Error(BULK_NOT_LISTED))),
       done: (r) => takeBulk(r.bulk, true),
     });
   }
 
   async function startBulk(button, pattern) {
+    if (bulkRefused(pattern)) return;
     button.disabled = true;
     try {
       takeBulk((await ctx.api.startBulk({ pattern: pattern.id, action: 'delete' })).bulk, true);
@@ -2244,10 +2521,18 @@ function mountKeys(root, ctx, route) {
   let refusedNow = refusedKey(ctx.state());
   function onState(next) {
     if (!alive) return;
-    const what = follow(store, next);
+    const what = follow(store, next, connects);
     if (what) {
-      // What the address named belongs to the run before: it leaves the address too.
-      syncUrl();
+      // What the address named belongs to the run before. Its entry stays as it is (Back
+      // goes to it: applied again on the same database, passed over on another), and what
+      // is shown now is a new step.
+      if (onKeysRoute()) {
+        const named = parseBrowseQuery(((ctx.currentRoute && ctx.currentRoute()) || {}).query);
+        if (opensAnything(named) || named.sort !== null) ctx.pushRoute(browseHref(shownParams(store)));
+        markEntry();
+      }
+      showForeign(false);
+      pending = null;
       relayout();
       drawRows();
       drawKeys();
@@ -2280,24 +2565,25 @@ function mountKeys(root, ctx, route) {
   })];
 
   // ---------- the address on mount ----------
-  // No state in the address (the rail's link, a digit): show what Browse holds, and put it
-  // in the address in place. An entry shown for another connection or database (Back
-  // after a switch) is not applied here: what Browse holds is. Otherwise (a reload, a link
-  // in a new tab, Back from another area) the address is shown, reading only what Browse
-  // does not hold already, exactly what a click would read. Never anything else: the
-  // address carries no connection, so it never connects.
+  // As `applyRoute` does for the same entry (`entryPlan`). A new entry with no state (the
+  // rail's link, a digit): show what Browse holds, and put it in the address in place. An
+  // entry shown for another connection or database (Back after a switch) is not applied
+  // and not rewritten: what Browse holds is shown, and a line says why. Otherwise (a
+  // reload, a link in a new tab, Back from another area, Back to an entry that showed
+  // nothing) the address is shown, reading only what Browse does not hold already, exactly
+  // what a click would read. Never anything else: the address carries no connection, so
+  // it never connects.
   const fromAddress = parseBrowseQuery(route && route.query);
+  const plan = entryPlan({ params: fromAddress, mark: entryMark(), place: store.place });
   let start;
-  if (!opensAnything(fromAddress) && fromAddress.sort === null) {
+  if (plan === 'keep') {
     start = shownParams(store);
     if (opensAnything(start)) ctx.replaceRoute(browseHref(start));
-  } else if (staleEntry()) {
-    start = shownParams(store);
-    ctx.replaceRoute(browseHref(start));
-  } else start = fromAddress;
-  markEntry();
+    markEntry();
+  } else if (plan === 'foreign') start = shownParams(store);
+  else start = fromAddress;
 
-  active = { applyRoute };
+  active = { applyRoute, reopen: () => (alive ? (reopenShown(parseBrowseQuery(((ctx.currentRoute && ctx.currentRoute()) || {}).query)), true) : false) };
   // Draw what is kept at once, then read what may have changed meanwhile.
   relayout();
   if (store.tree) drawTree();
@@ -2305,13 +2591,18 @@ function mountKeys(root, ctx, route) {
   drawKeys();
   drawValue();
   drawBulk();
-  applyParams(start, { mounting: true });
+  if (plan === 'foreign') {
+    // Shown as Browse holds it, without touching the entry (no mark either).
+    applyParams(start, { mounting: true, mark: false });
+    showForeign(true);
+  } else applyParams(start, { mounting: true });
   loadTree();
   loadDbs();
   refreshBulk();
 
   return () => {
     alive = false;
+    dropOutside();
     if (active && active.applyRoute === applyRoute) active = null;
     if (sizes) sizes.disconnect();
     document.body.classList.remove('fill-view');

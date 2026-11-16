@@ -45,7 +45,6 @@
 <button class="goto-box" id="goto-btn" type="button" aria-haspopup="dialog" data-act="goto" aria-label="Go to: a pattern, a key, a screen or an action; find keys by name">
 <svg class="icon" aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4a7 7 0 1 0 0 14a7 7 0 0 0 0-14zM20 20l-3.5-3.5"></path></svg>
 <span class="goto-ph">Go to: a pattern, key, screen or action</span>
-<span class="key-hint" aria-hidden="true" id="goto-hint">ctrl-k</span>
 </button>
 </form>
 <div class="topbar-end">
@@ -68,41 +67,34 @@
 <div class="shell">
 
 <nav class="nav" aria-label="Areas">
-<a class="navb" href="#/overview" data-nav="overview" aria-keyshortcuts="1">
+<a class="navb" href="#/overview" data-nav="overview" aria-keyshortcuts="1" data-hint="1">
 <svg class="icon" aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z"></path></svg>
 <span>Overview</span>
-<span class="key-hint" aria-hidden="true">1</span>
 </a>
-<a class="navb" href="#/browse" data-nav="browse" aria-keyshortcuts="2">
+<a class="navb" href="#/browse" data-nav="browse" aria-keyshortcuts="2" data-hint="2">
 <svg class="icon" aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10"></path></svg>
 <span>Browse</span>
-<span class="key-hint" aria-hidden="true">2</span>
 </a>
-<a class="navb" href="#/analyze" data-nav="analyze" aria-keyshortcuts="3">
+<a class="navb" href="#/analyze" data-nav="analyze" aria-keyshortcuts="3" data-hint="3">
 <svg class="icon" aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 20V10M12 20V4M19 20v-7"></path></svg>
 <span>Analyze</span>
-<span class="key-hint" aria-hidden="true">3</span>
 </a>
-<a class="navb" href="#/server" data-nav="server" aria-keyshortcuts="4">
+<a class="navb" href="#/server" data-nav="server" aria-keyshortcuts="4" data-hint="4">
 <svg class="icon" aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-8 4 16 3-8h4"></path></svg>
 <span>Server</span>
-<span class="key-hint" aria-hidden="true">4</span>
 </a>
-<a class="navb" href="#/pubsub" data-nav="pubsub" aria-keyshortcuts="5">
+<a class="navb" href="#/pubsub" data-nav="pubsub" aria-keyshortcuts="5" data-hint="5">
 <svg class="icon" aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12a7 7 0 0 1 14 0M8.5 12a3.5 3.5 0 0 1 7 0M12 12v8"></path></svg>
 <span>Pub/Sub</span>
-<span class="key-hint" aria-hidden="true">5</span>
 </a>
 <div class="nav-sep" role="presentation"></div>
-<a class="navb" href="#/connections" data-nav="connections" aria-keyshortcuts="0">
+<a class="navb" href="#/connections" data-nav="connections" aria-keyshortcuts="0" data-hint="0">
 <svg class="icon" aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v6M15 3v6M6 9h12v3a6 6 0 0 1-12 0zM12 18v3"></path></svg>
 <span>Connections</span>
-<span class="key-hint" aria-hidden="true">0</span>
 </a>
-<button class="navb" id="cmd-toggle" type="button" aria-expanded="false" aria-controls="cmdline" aria-keyshortcuts=":">
+<button class="navb" id="cmd-toggle" type="button" aria-expanded="false" aria-controls="cmdline" aria-keyshortcuts=":" data-hint=":">
 <svg class="icon" aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6l6 6-6 6M12 18h8"></path></svg>
 <span>Command line</span>
-<span class="key-hint" aria-hidden="true">:</span>
 </button>
 </nav>
 

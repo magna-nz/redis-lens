@@ -7,6 +7,8 @@ import { readFileSync } from 'node:fs';
 import {
   NO_PARAMS, parseBrowseQuery, browseQuery, browseHref, cleanParams, sameParams, opensAnything, shownParams, linkFrom,
   routeLoads, paneLayout, revealPane, crumbsModel, nameOfId, hrefFor, blank, follow, PANES, WIDE, NARROW, MAX_FIND,
+  retryOf, replyWanted, treeRowOf, bulkAllowed, BULK_NOT_LISTED, nodeCheck, entryPlan, urlStep, linkStays, canonicalHref,
+  readOnlyPlace, connectStarted, placeOf, whoOf, mergeList,
 } from '../views/browse.js';
 import { parseRoute } from '../ui.js';
 
@@ -231,15 +233,17 @@ test('the other views\' routes parse exactly as before', () => {
 
 test('the jumps from other areas are addresses, and a change inside Browse does not mount it again', () => {
   const app = read('app.js');
-  assert.match(app, /findKey\(text\) \{[\s\S]*?ctx\.navigate\(browse\.hrefFor\(\{ find: q \}, store\.state\)\)/);
-  assert.match(app, /openKey\(name\) \{\n\s+ctx\.navigate\(browse\.hrefFor\(\{ k: name\.id \}, store\.state\)\);/);
-  assert.match(app, /openPattern\(name, node = null\) \{[\s\S]*?ctx\.navigate\(browse\.hrefFor\(change, store\.state\)\);/);
+  assert.match(app, /findKey\(text\) \{[\s\S]*?toBrowse\(browse\.hrefFor\(\{ find: q \}, store\.state\)\)/);
+  assert.match(app, /openKey\(name\) \{\n\s+toBrowse\(browse\.hrefFor\(\{ k: name\.id \}, store\.state\), /);
+  assert.match(app, /openPattern\(name, node = null\) \{[\s\S]*?toBrowse\(browse\.hrefFor\(change, store\.state\)\);/);
+  // To the address shown already: Browse reads again what failed, with no step.
+  assert.match(app, /function toBrowse\(href, data = null\) \{\n\s+if \(window\.location\.hash === href && browse\.reopen\(\)\) return;\n\s+ctx\.navigate\(href, data\);/);
   assert.doesNotMatch(app, /requestFind|requestKey|requestPattern/);
   // Same screen, same session: the view is told the route; it is not torn down.
   assert.match(app, /mounted\.key === key\) \{\n[^\n]*\n[^\n]*\n\s+if \(typeof VIEWS\[route\.name\]\.onRoute === 'function'\) VIEWS\[route\.name\]\.onRoute\(route\);\n\s+return;/);
   assert.match(app, /window\.history\.replaceState\(window\.history\.state, '', hash\)/);
   const browse = read('views/browse.js');
-  assert.doesNotMatch(browse, /pending/);
+  assert.doesNotMatch(browse, /requestFind|requestKey|requestPattern|store\.pending/);
   // Opening is a step in the history; the route change does the read.
   assert.match(browse, /onclick: \(\) => go\(\{ p: r\.pattern\.id, k: null, find: null \}\)/);
   assert.match(browse, /onclick: \(\) => go\(\{ k: r\.id \}\)/);
@@ -258,4 +262,221 @@ test('three panes fill the window: no height caps on Browse › Keys, each pane 
   assert.match(css, /\.pane-scroll \{ position: relative; flex: 1 1 auto; min-height: 0; overflow-y: auto;/);
   assert.match(css, /\.pane\.pane-off \{ display: none; \}/);
   assert.match(css, /\.pane\.pats \{ flex: 26 1 0;[^}]*\}\n\.pane\.keys \{ flex: 32 1 0;[^}]*\}\n\.pane\.value \{ flex: 42 1 0;/);
+});
+
+// ---- Review fixes: each rule as a pure function ----
+
+const tree = (rows, extra = {}) => ({ source: 'analysis', rows, nodes: [{ index: 0 }, { index: 1 }], ...extra });
+const patRow = (id) => ({ kind: 'pattern', pattern: { id, name: id } });
+const groupRow = (key, ids) => ({ kind: 'group', key, label: key, children: ids.map(patRow) });
+
+test('bulk actions only for a pattern the tree lists: never for one an address alone names', () => {
+  const t = tree([patRow('61'), groupRow('user:', ['62', '63'])]);
+  assert.equal(bulkAllowed(t, '61'), true, 'a pattern row');
+  assert.equal(bulkAllowed(t, '63'), true, 'a pattern in a group');
+  assert.equal(treeRowOf(t, '63').pattern.id, '63');
+  // `{id}` alone, which the server would scan as `*`: not in the tree, so no bulk action.
+  assert.equal(bulkAllowed(t, hex('{id}')), false);
+  assert.equal(bulkAllowed(t, 'user:'), false, 'a group is not a pattern');
+  assert.equal(bulkAllowed(null, '61'), false, 'no tree yet: nothing offered');
+  assert.equal(bulkAllowed(tree([]), '61'), false);
+  assert.equal(bulkAllowed(t, null), false);
+  assert.match(BULK_NOT_LISTED, /only for a pattern listed in Patterns/);
+  // The view: the About panel of a pattern the tree does not hold has no bulk buttons, and
+  // a bulk action checks again as it starts.
+  const browse = read('views/browse.js');
+  const summary = browse.slice(browse.indexOf('function patternSummary('), browse.indexOf('// ---------- a key\'s value'));
+  const unlisted = summary.slice(summary.indexOf('if (!r) {'), summary.indexOf('const exact'));
+  assert.doesNotMatch(unlisted, /bulkButtons/);
+  assert.match(unlisted, /BULK_NOT_LISTED/);
+  assert.match(summary, /bulkAllowed\(t, r\.pattern\.id\) \? bulkButtons\(r\.pattern\)/);
+  assert.match(browse, /function bulkExpireDialog\(pattern\) \{\n\s+if \(bulkRefused\(pattern\)\) return;/);
+  assert.match(browse, /async function startBulk\(button, pattern\) \{\n\s+if \(bulkRefused\(pattern\)\) return;/);
+});
+
+test('opening what is shown again reads again a pane that failed, and only then', () => {
+  const who = 'demo|false|1|0|1';
+  const at = (o) => ({ who, params: params(o) });
+  const none = { tree: false, keys: false, clearList: false, value: false, clearValue: false };
+  const P = '61';
+  const K = '62';
+  // What failed: an error, no key in the list, a key gone.
+  assert.deepEqual(retryOf({ ...blank(), listError: 'boom' }), { keys: true, value: false });
+  assert.deepEqual(retryOf({ ...blank(), list: { rows: [] } }), { keys: true, value: false });
+  assert.deepEqual(retryOf({ ...blank(), list: { rows: [{}] } }), { keys: false, value: false });
+  assert.deepEqual(retryOf({ ...blank(), valueError: 'timeout' }), { keys: false, value: true });
+  assert.deepEqual(retryOf({ ...blank(), value: { gone: true } }), { keys: false, value: true });
+  assert.deepEqual(retryOf({ ...blank(), value: { gone: false } }), { keys: false, value: false });
+  assert.deepEqual(retryOf(blank()), { keys: false, value: false }, 'nothing open, or still reading: nothing again');
+  // The same state with a retry: that pane, and nothing else.
+  assert.deepEqual(routeLoads(at({ p: P }), at({ p: P }), { keys: true, value: false }), { ...none, keys: true });
+  assert.deepEqual(routeLoads(at({ p: P, k: K }), at({ p: P, k: K }), { keys: false, value: true }), { ...none, value: true });
+  assert.deepEqual(routeLoads(at({ find: 'x' }), at({ find: 'x' }), { keys: true, value: false }), { ...none, keys: true }, 'Find with the same text');
+  assert.deepEqual(routeLoads(at({ p: P }), at({ p: P }), { keys: false, value: false }), none, 'nothing failed: nothing read');
+  assert.deepEqual(routeLoads(at({}), at({}), { keys: true, value: true }), none, 'nothing to read again');
+  // The view: a click on what is shown goes through the retry, not a step.
+  const browse = read('views/browse.js');
+  assert.match(browse, /function go\(change\) \{[\s\S]*?if \(sameParams\(next, shownParams\(store\)\)\) \{\n\s+reopenShown\(next\);/);
+  assert.match(browse, /applyParams\(next, \{ retry: retryOf\(store\) \}\)/);
+});
+
+test('an address\'s node is checked against the tree before any key is read', () => {
+  const t = tree([patRow('61')]);
+  assert.equal(nodeCheck(t, null), 'ok');
+  assert.equal(nodeCheck(t, 1), 'ok');
+  assert.equal(nodeCheck(t, 9999), 'drop', 'a crafted node');
+  assert.equal(nodeCheck({ ...t, source: 'names' }, 0), 'drop', 'names only: no node to narrow to');
+  assert.equal(nodeCheck(null, 1), 'unknown', 'no tree yet: wait');
+  assert.equal(nodeCheck({ ...t, source: 'none' }, 1), 'unknown');
+  assert.equal(nodeCheck(null, null), 'ok');
+});
+
+test('a late reply is dropped when something else was opened since it was asked for', () => {
+  assert.equal(replyWanted({ seq: 3, id: 7 }, { seq: 3, id: 7 }), true);
+  // Load more on A, then Back to B: B was opened since (the sequence moved on).
+  assert.equal(replyWanted({ seq: 3, id: 7 }, { seq: 4, id: 8 }), false);
+  assert.equal(replyWanted({ seq: 3, id: 7 }, { seq: 4, id: 7 }), false, 'the same list opened again');
+  assert.equal(replyWanted({ seq: 3, id: 7 }, { seq: 3, id: null }), false, 'the list was closed');
+  assert.equal(replyWanted({ seq: 1, id: 'w|keys|null' }, { seq: 1, id: 'w|name|null' }), false, 'another sort');
+  assert.equal(replyWanted(null, { seq: 1, id: 1 }), false);
+  // Every reply is checked before it is drawn.
+  const browse = read('views/browse.js');
+  for (const fn of ['moreKeys', 'moreNames', 'moreValue']) {
+    const at = browse.indexOf(`async function ${fn}(`);
+    const body = browse.slice(at, browse.indexOf('\n  }\n', at));
+    assert.match(body, /const sent = \w+Ask\(\);/, fn);
+    assert.match(body, /if \(!alive \|\| !replyWanted\(sent, \w+Ask\(\)\)/, fn);
+  }
+  assert.match(browse, /store\.list = mergeList\(store\.list, next\);/);
+  // mergeList itself is unchanged: the check above is what keeps two lists apart.
+  assert.equal(mergeList({ list: 1, rows: [{ id: 'a' }], loaded: 2, newFrom: 1 }, { list: 2, rows: [{ id: 'b' }], loaded: 1, newFrom: 0 }).rows[0].id, 'b');
+});
+
+test('a history mark names the connection, the connect and the database; a new analysis keeps it', () => {
+  const st = (o = {}) => ({
+    conn: { name: 'demo', docker: false, connectedAt: 100, ...(o.conn || {}) },
+    connected: o.connected ?? true, analysis: { db: o.db ?? 0, run: o.run ?? 1, running: o.running ?? false }, failed: null,
+  });
+  assert.equal(placeOf(st(), 1), 'demo|false|1|0');
+  assert.equal(placeOf(st({ db: 2 }), 1), 'demo|false|1|2', 'the database is in it');
+  assert.notEqual(placeOf(st(), 1), placeOf(st(), 2), 'a reconnect is another place');
+  assert.equal(placeOf(st({ run: 5 }), 1), placeOf(st({ run: 1 }), 1), 'a new analysis on the same database is the same place');
+  assert.equal(placeOf({ conn: null }, 1), null);
+  assert.equal(whoOf(st({ run: 5 }), 1), 'demo|false|1|0|5', 'what Browse holds is for one run');
+  // A new connect: connected now and not before, or to another server or at another time.
+  assert.equal(connectStarted(null, st()), true);
+  assert.equal(connectStarted(st({ connected: false }), st()), true);
+  assert.equal(connectStarted(st(), st()), false, 'the same connection');
+  assert.equal(connectStarted(st(), st({ run: 2, db: 3 })), false, 'a database switch or an analysis is not a connect');
+  assert.equal(connectStarted(st(), st({ conn: { connectedAt: 101 } })), true, 'connected again');
+  assert.equal(connectStarted(st(), st({ conn: { name: 'other' } })), true);
+  assert.equal(connectStarted(st(), st({ connected: false, running: true })), false, 'an analysis\'s own reconnect');
+  assert.equal(connectStarted(st(), { conn: null, connected: false }), false);
+  // follow: a new connect starts afresh; a new run keeps the place.
+  const store = blank();
+  follow(store, st(), 1);
+  assert.equal(store.place, 'demo|false|1|0');
+  Object.assign(store, { picked: { id: '61' } });
+  assert.equal(follow(store, st({ run: 2 }), 1), 'run');
+  assert.equal(store.place, 'demo|false|1|0');
+  assert.equal(follow(store, st({ run: 2 }), 2), 'reset', 'a reconnect to the same server');
+  assert.equal(store.place, 'demo|false|2|0');
+  assert.equal(follow(store, st({ run: 3, db: 1 }), 2), 'run');
+  assert.equal(store.place, 'demo|false|2|1');
+  // The page counts the connects from boot on, before any view hears a state.
+  const app = read('app.js');
+  assert.ok(app.indexOf('browse.init(api);') > 0 && app.indexOf('browse.init(api);') < app.indexOf("api.on('state', applyState);"));
+});
+
+test('a history entry: applied, kept or passed over (never rewritten) by where it was shown', () => {
+  const here = 'demo|false|1|0';
+  const P = params({ p: '61' });
+  assert.equal(entryPlan({ params: P, mark: here, place: here }), 'apply', 'Back on the same database, even after a new analysis');
+  assert.equal(entryPlan({ params: P, mark: null, place: here }), 'apply', 'a link, a reload with no mark');
+  assert.equal(entryPlan({ params: P, mark: 'demo|false|1|2', place: here }), 'foreign', 'another database');
+  assert.equal(entryPlan({ params: P, mark: 'demo|false|0|0', place: here }), 'foreign', 'before a reconnect');
+  assert.equal(entryPlan({ params: NO_PARAMS, mark: null, place: here }), 'keep', 'a new entry naming nothing: what Browse holds stays');
+  assert.equal(entryPlan({ params: NO_PARAMS, mark: here, place: here }), 'apply', 'Back to an entry that showed nothing empties Browse');
+  assert.equal(entryPlan({ params: params({ sort: 'keys' }), mark: null, place: here }), 'apply');
+  assert.equal(entryPlan({ params: NO_PARAMS, mark: 'x', place: here }), 'foreign');
+  // The view: the same plan on mount and on a route change, and a passed-over entry is
+  // neither replaced nor marked.
+  const browse = read('views/browse.js');
+  const route = browse.slice(browse.indexOf('function applyRoute(r) {'), browse.indexOf('// ---------- the database list'));
+  assert.match(route, /if \(plan === 'foreign'\) \{\n\s+showForeign\(true\);\n\s+return;/);
+  assert.match(browse, /const plan = entryPlan\(\{ params: fromAddress, mark: entryMark\(\), place: store\.place \}\);/);
+  assert.match(browse, /applyParams\(start, \{ mounting: true, mark: false \}\);\n\s+showForeign\(true\);/);
+  assert.match(browse, /That address was for another connection or database/);
+});
+
+test('the address follows Browse: a step, in place, or nothing; another place\'s entry is never rewritten', () => {
+  assert.equal(urlStep({ push: true }), 'push', 'a key added');
+  assert.equal(urlStep({ user: true }), 'replace', 'a sort, a node, a rename, a delete');
+  assert.equal(urlStep({}), 'replace', 'Browse\'s own correction');
+  assert.equal(urlStep({ same: true }), 'none');
+  assert.equal(urlStep({ push: true, same: true }), 'none');
+  assert.equal(urlStep({ foreign: true }), 'none', 'passed over: left as it is');
+  assert.equal(urlStep({ foreign: true, same: true }), 'none');
+  assert.equal(urlStep({ foreign: true, user: true }), 'push', 'the user\'s change is a step after it');
+  assert.equal(urlStep({ foreign: true, push: true, same: true }), 'push');
+  // The rail's Browse link and the Keys tab, on Browse › Keys: nothing (no second entry).
+  const r = (hash) => parseRoute(hash, ['overview', 'browse', 'analyze', 'server', 'pubsub', 'connections'], null);
+  assert.equal(linkStays(r('#/browse?p=61'), r('#/browse')), true);
+  assert.equal(linkStays(r('#/browse'), r('#/browse')), true);
+  assert.equal(linkStays(r('#/browse/keys'), r('#/browse')), true);
+  assert.equal(linkStays(r('#/browse/streams'), r('#/browse')), false, 'from another panel it goes');
+  assert.equal(linkStays(r('#/overview'), r('#/browse')), false);
+  assert.equal(linkStays(r('#/browse'), r('#/browse?p=61')), false, 'a link that names something goes');
+  assert.equal(linkStays(r('#/browse'), r('#/browse/search')), false);
+  // `#/browse/keys` is written `#/browse`, in place, and not mounted again.
+  assert.equal(canonicalHref(r('#/browse/keys?p=61')), '#/browse?p=61');
+  assert.equal(canonicalHref(r('#/browse/keys')), '#/browse');
+  assert.equal(canonicalHref(r('#/browse?p=61')), null);
+  assert.equal(canonicalHref(r('#/browse/streams')), null);
+  const app = read('app.js');
+  assert.match(app, /document\.addEventListener\('click', stayOnLinks\);/);
+  assert.match(app, /if \(hash && !browse\.linkStays\(currentRoute\(\), parseRoute\(hash, NAMES, null\)\)\) ctx\.navigate\(hash\);/);
+  assert.match(app, /const canonical = typeof VIEWS\[route\.name\]\.canonicalHref === 'function'/);
+  // Browse writes the address only while it is shown.
+  const browse = read('views/browse.js');
+  assert.match(browse, /function syncUrl\(push = false, \{ user = false \} = \{\}\) \{\n\s+if \(!alive \|\| !onKeysRoute\(\)\) return;/);
+});
+
+test('the read-only line: once on the screen, under the value\'s bar when a key is open, with the button that turns writes on', () => {
+  assert.equal(readOnlyPlace({ valueOpen: true, shown: PANES }), 'value');
+  assert.equal(readOnlyPlace({ valueOpen: false, shown: PANES }), 'keys');
+  assert.equal(readOnlyPlace({ valueOpen: true, shown: ['patterns', 'keys'] }), 'keys', 'the value pane hidden');
+  assert.equal(readOnlyPlace({ valueOpen: true, shown: ['value'] }), 'value');
+  assert.equal(readOnlyPlace(), 'keys');
+  const browse = read('views/browse.js');
+  assert.doesNotMatch(browse, /Open Connections/);
+  assert.match(browse, /text: 'Turn writes on \(w\)', onclick: \(\) => ctx\.toggleWrites\(\)/);
+  assert.match(browse, /reasonLines\(here !== null && here === roPlace\(\) \? offs : offs\.filter\(\(o\) => o !== ro\), ro\)/);
+  // Only the keys pane and the value's bar may draw it; the item bar and the bulk panel never.
+  assert.match(browse, /addOff \? whyLines\(\[addOff\], 'keys'\)/);
+  assert.match(browse, /whyLines\(buttons\.map\(\(b\) => \(b\.disabled \? b\.title : null\)\), 'value'\)/);
+  assert.match(browse, /whyLines\(\[expire, remove\], null\)/);
+});
+
+test('one key hint per control, the format key once on its label, and the key list gives the name the width', () => {
+  const app = read('app.js');
+  assert.match(app, /else if \(el\.textContent\.trim\(\) === label\) el\.removeAttribute\('data-hint'\);/, 'not on a control whose text is its key');
+  assert.match(app, /\.hint-label\[data-hint-of="\$\{el\.dataset\.act\}"\]/);
+  const browse = read('views/browse.js');
+  assert.match(browse, /h\('span', \{ class: 'lbl hint-label', 'data-hint-of': 'format', text: 'Show as' \}\)/);
+  assert.doesNotMatch(browse, /row-tools/, 'the open row has no actions line: the value pane\'s bar has them');
+  const css = read('app.css');
+  assert.match(css, /\.row-key, \.key-cols \{ grid-template-columns: minmax\(0, 1fr\) 44px 44px 50px 52px; gap: 6px; \}/);
+  assert.doesNotMatch(css, /row-tools|\.key-hint/);
+  // The open key's T, R, D reach the value pane's bar from the key list too.
+  const keys = read('keys.js');
+  for (const id of ['key\\.ttl', 'key\\.rename', 'key\\.delete']) assert.match(keys, new RegExp(`'${id}': \\{ run: 'press', in: 'view'`), id);
+});
+
+test('the About panel closes on Esc and a click outside, and the focus goes back to its button', () => {
+  const browse = read('views/browse.js');
+  const about = browse.slice(browse.indexOf('function aboutPattern('), browse.indexOf('function patternSummary('));
+  assert.match(about, /if \(e\.key !== 'Escape' \|\| !box\.open\) return;[\s\S]*?close\(true\);/);
+  assert.match(about, /document\.addEventListener\('pointerdown', aboutOutside, true\);/);
+  assert.match(about, /if \(refocus\) summary\.focus/);
 });

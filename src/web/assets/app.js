@@ -89,10 +89,30 @@ const ctx = {
   series: () => store.series,
   figures: () => store.figures,
   figuresOff: () => store.figuresOff,
-  navigate(hash) {
+  /** Go to `hash`, a step in the history. `data`: what the new entry carries besides its
+   *  address (Browse's key type), in `history.state`, never in the address. */
+  navigate(hash, data = null) {
     if (window.location.hash === hash) render();
-    else window.location.hash = hash;
+    else {
+      window.location.hash = hash;
+      // The hash change is a step already, synchronously: its entry is the one marked.
+      if (data) window.history.replaceState({ ...data }, '');
+    }
   },
+  /** A step in the history to `hash` without drawing anything again (the view shows it
+   *  already): Browse's new step after an entry it must not rewrite. */
+  pushRoute(hash) {
+    window.history.pushState(null, '', hash);
+  },
+  /** The route shown. */
+  currentRoute: () => currentRoute(),
+  /** What the current history entry carries besides its address (`navigate`'s `data`). */
+  routeData: () => {
+    const s = window.history.state;
+    return s && typeof s === 'object' ? s : null;
+  },
+  /** The top bar's access button: turn writes on or off (the server asks first). */
+  toggleWrites: () => toggleWrites(),
   /** Put `hash` in the address in place of the current one: no step in the history, and
    *  nothing is drawn again (the view shows it already). The page's own query (`?mock`)
    *  stays. */
@@ -150,16 +170,18 @@ const ctx = {
   findKey(text) {
     const q = String(text ?? '').trim();
     if (!q) return;
-    ctx.navigate(browse.hrefFor({ find: q }, store.state));
+    toBrowse(browse.hrefFor({ find: q }, store.state));
   },
-  /** Open a key's value (`Name`), or a pattern's keys, on Browse. */
+  /** Open a key's value (`Name`), or a pattern's keys, on Browse. A key's type, when this
+   *  area knows it, goes with the step (not in the address), so its value is read as a
+   *  click on its row reads it. */
   openKey(name) {
-    ctx.navigate(browse.hrefFor({ k: name.id }, store.state));
+    toBrowse(browse.hrefFor({ k: name.id }, store.state), typeof name.type === 'string' && name.type ? { keyType: { id: name.id, type: name.type } } : null);
   },
   openPattern(name, node = null) {
     const change = name ? { p: name.id } : {};
     if (node !== null) change.node = node;
-    ctx.navigate(browse.hrefFor(change, store.state));
+    toBrowse(browse.hrefFor(change, store.state));
   },
   /** Start an analysis from another area (Overview's buttons): Analyze asks first, with
    *  its estimate, as the TUI does. */
@@ -174,6 +196,23 @@ const ctx = {
 function currentRoute() {
   const fallback = store.state.connected || store.state.connecting ? 'overview' : 'connections';
   return parseRoute(window.location.hash, NAMES, fallback);
+}
+
+/** Another area's jump to Browse › Keys. To the address shown already (Find with the same
+ *  text, the open key again), Browse reads again what failed instead: no step. */
+function toBrowse(href, data = null) {
+  if (window.location.hash === href && browse.reopen()) return;
+  ctx.navigate(href, data);
+}
+
+/** A link to the screen shown that would only add a second history entry for it (the
+ *  rail's Browse link, the Keys tab, on Browse › Keys): it does nothing (browse.js
+ *  `linkStays`). Other links go as usual. */
+function stayOnLinks(e) {
+  if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  const a = e.target && e.target.closest ? e.target.closest('a[href^="#/"]') : null;
+  if (!a) return;
+  if (browse.linkStays(currentRoute(), parseRoute(a.getAttribute('href'), NAMES, null))) e.preventDefault();
 }
 
 /** The connection's status and live state as the areas see them: while an analysis runs it
@@ -193,7 +232,14 @@ function viewKey() {
 
 function render() {
   if (store.locked) return;
-  const route = currentRoute();
+  let route = currentRoute();
+  // A route written another way (`#/browse/keys`): written as the screen's own address, in
+  // place, so the screen shown is not drawn again for it.
+  const canonical = typeof VIEWS[route.name].canonicalHref === 'function' ? VIEWS[route.name].canonicalHref(route) : null;
+  if (canonical) {
+    window.history.replaceState(window.history.state, '', canonical);
+    route = currentRoute();
+  }
   for (const link of document.querySelectorAll('[data-nav]')) {
     const on = link.dataset.nav === route.name;
     link.classList.toggle('on', on);
@@ -248,7 +294,8 @@ function renderChrome() {
   accessBtn.hidden = !access.show;
   if (access.show) {
     accessBtn.className = `btn ctx-btn ${access.tone}`;
-    fill(accessBtn, h('span', { class: 'access-word', text: access.label }), h('span', { class: 'key-hint', 'aria-hidden': 'true', text: 'w' }));
+    // Its key (w) is drawn from `data-hint`, as on every control with an action.
+    fill(accessBtn, h('span', { class: 'access-word', text: access.label }));
     accessBtn.setAttribute('aria-label', access.aria);
     accessBtn.setAttribute('aria-pressed', access.on ? 'true' : 'false');
     accessBtn.title = access.title;
@@ -815,7 +862,7 @@ function entryState(entry, pane, row) {
 
 function goArea(digit) {
   const hash = areaHash(digit, currentRoute(), { cluster: isCluster() });
-  if (hash) ctx.navigate(hash);
+  if (hash && !browse.linkStays(currentRoute(), parseRoute(hash, NAMES, null))) ctx.navigate(hash);
 }
 
 /** `/`: the focused list's filter, else the screen's own box (Search's query), else Go to. */
@@ -891,10 +938,15 @@ function onKey(e) {
 
 // ----- Hints: each control with an action shows its key, from the table -----
 
-/** Set `data-hint` (drawn by app.css when `keys-on`) and `aria-keyshortcuts` on every
- *  control with `data-act`, for the screen and pane it is in. A control that draws its own
- *  hint (`.key-hint`) only gets `aria-keyshortcuts`. Attributes only, so a control's text
- *  (which the views use to put the focus back) never changes. */
+/** Whether this is a Mac, where Go to's key is shown as cmd-k. */
+const MAC = /Mac|iPhone|iPad/.test((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '');
+
+/** Set `data-hint` (drawn by app.css when `keys-on`: the one way a key is shown on a
+ *  control) and `aria-keyshortcuts` on every control with `data-act`, for the screen and
+ *  pane it is in. Shown once: not on a control whose text is the key already (`?`), and
+ *  for a row of pills on the group's label (`.hint-label[data-hint-of]`, Browse's "Show
+ *  as"), not on each pill. Attributes only, so a control's text (which the views use to
+ *  put the focus back) never changes. */
 function applyHints(roots = null) {
   const screen = screenOf(currentRoute());
   const els = roots ? roots.flatMap((r) => [...(r.matches('[data-act]') ? [r] : []), ...r.querySelectorAll('[data-act]')]) : document.querySelectorAll('[data-act]');
@@ -907,8 +959,13 @@ function applyHints(roots = null) {
       continue;
     }
     if (el.getAttribute('aria-keyshortcuts') !== hint.aria) el.setAttribute('aria-keyshortcuts', hint.aria);
-    if (el.querySelector('.key-hint')) continue;
-    if (el.dataset.hint !== hint.label) el.dataset.hint = hint.label;
+    const label = MAC && el.dataset.act === 'goto' ? 'cmd-k' : hint.label;
+    const group = el.classList.contains('pill') && el.parentElement ? el.parentElement.querySelector(`:scope > .hint-label[data-hint-of="${el.dataset.act}"]`) : null;
+    if (group) {
+      if (group.dataset.hint !== label) group.dataset.hint = label;
+      el.removeAttribute('data-hint');
+    } else if (el.textContent.trim() === label) el.removeAttribute('data-hint');
+    else if (el.dataset.hint !== label) el.dataset.hint = label;
   }
 }
 
@@ -1280,7 +1337,6 @@ async function boot() {
   $('find-form').addEventListener('submit', (e) => e.preventDefault());
   $('goto-btn').addEventListener('click', () => openGoto());
   $('keys-btn').addEventListener('click', () => openSheet());
-  if (/Mac|iPhone|iPad/.test((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '')) $('goto-hint').textContent = 'cmd-k';
   document.addEventListener('keydown', onKey);
   watchFocus();
   document.body.classList.add('keys-on');
@@ -1288,6 +1344,7 @@ async function boot() {
 
   // The stores that keep running whatever view is shown (the tail, Monitor) hear about a
   // new state first, so a view drawn for it finds them up to date.
+  browse.init(api);
   pubsub.init(api);
   server.init(api);
   analyze.init(api);
@@ -1315,6 +1372,7 @@ async function boot() {
   commandLine = cmdline.mount($('cmdline'), ctx, () => setCommandLine(false));
 
   window.addEventListener('hashchange', render);
+  document.addEventListener('click', stayOnLinks);
   // The event stream is closed when the page goes away (or into the back-forward cache),
   // and opened again if it comes back from there.
   window.addEventListener('pagehide', () => api.stop());
