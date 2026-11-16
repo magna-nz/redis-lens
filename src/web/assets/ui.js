@@ -716,6 +716,37 @@ export function dbModel(state) {
   return { show: true, db, label: `db ${db}`, off: cluster ? 'A cluster only has database 0.' : null };
 }
 
+/** Which session and run a database list belongs to: a list read for one is never shown
+ *  for another (a switch, an analysis or a reconnect starts a new run). */
+export function dbListKey(state) {
+  const s = state || {};
+  return s.conn ? `${s.conn.name}|${s.conn.docker}|${s.analysis ? s.analysis.run : 0}` : null;
+}
+
+/** What to keep of a database list that arrived: the list stamped with the key it was
+ *  asked for, or null when that key is not the current one any more (the reply is late). */
+export function dbListReply(sentKey, nowKey, dbs, error = null) {
+  if (sentKey === null || sentKey !== nowKey) return null;
+  return { who: sentKey, dbs: dbs ?? null, error: error ?? null };
+}
+
+/** Which item of a menu gets the focus after it is drawn. `items`: `{ key, current,
+ *  disabled }` in order. `had` is the key of the item that had the focus (null when none
+ *  did); `moved` whether the user has moved the focus in the menu since it opened. The item
+ *  that had it keeps it once the user has moved; otherwise the current item, else the
+ *  first. -1 leaves the focus where it is (the user moved it out of the items). */
+export function menuFocus(items, { had = null, moved = false } = {}) {
+  const usable = items.map((it, i) => ({ it, i })).filter(({ it }) => !it.disabled);
+  if (!usable.length) return -1;
+  if (moved && had !== null) {
+    const same = usable.find(({ it }) => it.key === had);
+    if (same) return same.i;
+  }
+  if (moved && had === null) return -1;
+  const current = usable.find(({ it }) => it.current);
+  return (current || usable[0]).i;
+}
+
 /** The node select on a cluster: one option per node, the picked one selected. Null when
  *  there is nothing to pick. */
 export function nodeModel(state) {
@@ -918,7 +949,10 @@ export function menuButton(button, menu, build) {
     menu.hidden = false;
     button.setAttribute('aria-expanded', 'true');
     document.addEventListener('pointerdown', outside, true);
+    // `build` places the focus itself when it knows better (the current database); only
+    // when it left the focus outside the menu does the first item get it.
     build(close);
+    if (menu.contains(document.activeElement)) return;
     const first = items()[0];
     if (first) first.focus({ preventScroll: true });
   };

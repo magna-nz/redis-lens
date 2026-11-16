@@ -546,7 +546,10 @@ function mountKeys(root, ctx) {
   view.append(bulkBox, h('div', { class: 'browse' }, patCard, keysCard, valueCard));
 
   // ---------- the database list, for the top bar's database control ----------
+  // The key is taken before asking, so a reply that arrives after a switch or a new run is
+  // not shown for the new one.
   async function loadDbs() {
+    const key = ctx.dbListKey ? ctx.dbListKey() : null;
     try {
       store.dbs = await ctx.api.getDbs();
       store.dbsError = null;
@@ -554,11 +557,7 @@ function mountKeys(root, ctx) {
       store.dbs = null;
       store.dbsError = errorText(err);
     }
-    if (alive) drawDbs();
-  }
-
-  function drawDbs() {
-    if (ctx.showDbs) ctx.showDbs(store.dbs, store.dbsError);
+    if (alive && ctx.showDbs) ctx.showDbs(key, store.dbs, store.dbsError);
   }
 
   // ---------- the tree ----------
@@ -729,6 +728,12 @@ function mountKeys(root, ctx) {
     }
     return null;
   }
+
+  /** Whether a pattern is a literal key name in the tree shown (its `{…}` is not a placeholder). */
+  const literalOf = (pattern) => {
+    const r = pattern ? rowOf(pattern.id) : null;
+    return !!(r && r.literal === true);
+  };
 
   // ---------- a pattern's keys, and Find ----------
   let listSeq = 0;
@@ -1045,7 +1050,7 @@ function mountKeys(root, ctx) {
         h('h2', { class: 'mono key-title wrap-any', text: name }),
         h('span', { class: 'badge mono', text: v.type || v.kind })),
       h('p', { class: 'muted small', text: valueFacts(v, node) || DASH }),
-      v.pattern ? h('p', { class: 'muted small' }, 'Pattern ', patternName(v.pattern.name)) : null,
+      v.pattern ? h('p', { class: 'muted small' }, 'Pattern ', patternName(v.pattern.name, { literal: literalOf(v.pattern) })) : null,
       h('div', { class: 'row-actions' },
         copyButton('Copy name', copyName, 'the key name', 'The name has control characters, so it is not copied: a pasted copy would name another key.'),
         shown ? copyButton('Copy value', shown.copy, 'the value', shown.copyRefused || 'This value is not copied as text: show it as hex to copy it.') : null),
@@ -1757,7 +1762,7 @@ function mountKeys(root, ctx) {
     }
     refill(bulkBox, [
       h('div', { class: 'card-head' },
-        h('h2', { class: 'bulk-title wrap-any', tabIndex: -1 }, `${b.title} `, patternName(b.pattern.name), b.action === 'expire' && b.ttl ? ` · TTL ${b.ttl}` : ''),
+        h('h2', { class: 'bulk-title wrap-any', tabIndex: -1 }, `${b.title} `, patternName(b.pattern.name, { literal: literalOf(b.pattern) }), b.action === 'expire' && b.ttl ? ` · TTL ${b.ttl}` : ''),
         h('span', { class: `badge${b.prod ? ' env-prod' : ''}`, text: `${stage} · ${b.profile || ''}`.trim() })),
       bar,
       progress ? h('p', { role: 'status', text: progress.text }) : null,
@@ -1830,7 +1835,6 @@ function mountKeys(root, ctx) {
 
   active = { takePending };
   // Draw what is kept at once, then read what may have changed meanwhile.
-  drawDbs();
   if (store.tree) drawTree();
   else drawRows();
   drawKeys();

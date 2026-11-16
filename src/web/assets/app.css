@@ -90,8 +90,6 @@ input::placeholder { color: var(--muted); opacity: 1; }
 .small { font-size: 12px; }
 .wrap-any { overflow-wrap: anywhere; }
 .clip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.warn-text { color: var(--warn); }
-.danger-text { color: var(--danger); }
 /* A pattern's {placeholder} parts. */
 .ph { color: var(--ph); }
 
@@ -799,6 +797,9 @@ textarea.field { min-height: 96px; padding: 8px; resize: vertical; line-height: 
   .btn, .field, .pill, .navb, .find, .menu-item, .check, .switch, details.advanced > summary, .cmd-in, .linkish { min-height: 44px; }
   .btn.icon-btn { width: 44px; }
   .pill.small { min-height: 36px; }
+  /* Rules above that set their own compact size for one place: 44px again here. */
+  .row-item.entry, .search .facts dd .btn { min-height: 44px; }
+  .stream-detail .item-actions .tbl td { height: 44px; }
   .row { min-height: 44px; }
   .tbl td { height: 44px; }
   .find input, .cmd-in input { height: 40px; }

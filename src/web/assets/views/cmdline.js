@@ -272,6 +272,18 @@ export function mount(root, ctx, onClose) {
     }
   });
 
+  // Escape closes the drawer from anywhere inside it: the output, the view pills, Clear,
+  // Close. The input handles its own Escape first (and marks the event handled).
+  if (!root.dataset.escape) {
+    root.dataset.escape = 'on';
+    root.addEventListener('keydown', (e) => {
+      if (drawerEscapes(e)) {
+        e.preventDefault();
+        onClose();
+      }
+    });
+  }
+
   fill(root,
     h('div', { class: 'cmd-head' },
       h('div', null, h('h2', { class: 'lbl', text: 'Command line' }), access),
@@ -333,6 +345,12 @@ export function mount(root, ctx, onClose) {
   refresh();
   busy(session.running);
   return { focus: () => input.focus({ preventScroll: true }), refresh };
+}
+
+/** Whether a key press inside the drawer closes it: Escape without a modifier that no
+ *  control inside handled already (the input's own Escape). */
+export function drawerEscapes(e) {
+  return e.key === 'Escape' && !e.defaultPrevented && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey;
 }
 
 /** The drawer's state: `{ open }`. `toggle`, `open` and `close` give the next state and

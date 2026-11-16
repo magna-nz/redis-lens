@@ -8,6 +8,7 @@ import {
   h, fill, setIcon, envBadge, createThemeStore, createToasts, confirmDialog,
   parseRoute, pushSeries, errorText, analyzing, plural, menuButton,
   connMenuModel, connButtonModel, accessModel, dbModel, nodeModel, liveModel,
+  dbListKey, dbListReply, menuFocus,
 } from './ui.js';
 import * as connections from './views/connections.js';
 import * as overview from './views/overview.js';
@@ -108,9 +109,13 @@ const ctx = {
   },
   openCommandLine: () => setCommandLine(true),
   /** Browse reads the database list when it mounts (as it did when the picker was on it):
-   *  the top bar's database menu shows that list at once when it is opened next. */
-  showDbs(dbs, error) {
-    dbCache = { who: dbWho(), dbs, error };
+   *  the top bar's database menu shows that list at once when it is opened next. Browse
+   *  takes `dbListKey()` before it asks and hands it back with the reply, so a late reply
+   *  for another session or run is dropped. */
+  dbListKey: () => dbListKey(store.state),
+  showDbs(sentKey, dbs, error) {
+    const kept = dbListReply(sentKey, dbListKey(store.state), dbs, error);
+    if (kept) dbCache = kept;
   },
   /** Find keys by name (the search field in the top bar): the results show on Browse. */
   findKey(text) {
@@ -256,7 +261,7 @@ function buildConnMenu(close) {
   const draw = (saved, docker, dockerNote) => {
     const model = connMenuModel(saved, docker, store.state);
     const item = (it) => h('button', {
-      type: 'button', class: 'menu-item', 'aria-current': it.current ? 'true' : null,
+      type: 'button', class: 'menu-item', 'aria-current': it.current ? 'true' : null, 'data-key': it.key,
       'aria-label': `${it.current && it.status ? `${it.name}, ${it.status}` : `Connect to ${it.name}`}, ${it.env}, ${it.address}`,
       onclick: () => {
         close();
@@ -278,15 +283,8 @@ function buildConnMenu(close) {
     else if (!model.docker.length) kids.push(h('p', { class: 'menu-note', text: 'No Redis or Valkey container is running.' }));
     else kids.push(...model.docker.map(item));
     kids.push(h('div', { class: 'menu-sep', role: 'presentation' }),
-      h('a', { class: 'menu-item plain', href: '#/connections', text: 'Manage connections', onclick: () => close(false) }));
-    // Keep the focus across a redraw; until the user moves it, it goes to the first entry.
-    const label = (el) => el.getAttribute('aria-label') || el.textContent;
-    const had = menu.contains(document.activeElement) ? label(document.activeElement) : null;
-    fill(menu, kids);
-    const list = Array.from(menu.querySelectorAll('button:not(:disabled), a'));
-    const again = had !== null && moved ? list.find((el) => label(el) === had) : null;
-    const target = again || (had !== null || !moved ? list[0] : null);
-    if (target) target.focus({ preventScroll: true });
+      h('a', { class: 'menu-item plain', href: '#/connections', 'data-key': 'manage', text: 'Manage connections', onclick: () => close(false) }));
+    redrawMenu(menu, kids, moved);
   };
   let moved = false;
   menu.onkeydown = () => {
@@ -339,14 +337,14 @@ function buildDbMenu(close) {
     fill(menu, h('p', { class: 'menu-note', text: model.off }));
     return;
   }
-  const who = dbWho();
+  const who = dbListKey(store.state);
   const draw = (d, error, reading) => {
     const kids = [h('p', { class: 'lbl menu-group', text: 'Databases' })];
     if (error) kids.push(h('p', { class: 'menu-note', text: `Database: ${error}` }));
-    else if (d && d.off) kids.push(h('p', { class: 'menu-note', text: d.off }));
+    if (d && d.off) kids.push(h('p', { class: 'menu-note', text: d.off }));
     else if (d) {
       kids.push(...d.rows.map((r) => h('button', {
-        type: 'button', class: 'menu-item', 'aria-current': r.current ? 'true' : null,
+        type: 'button', class: 'menu-item', 'aria-current': r.current ? 'true' : null, 'data-key': `db${r.db}`,
         onclick: async (e) => {
           const button = e.currentTarget;
           if (r.current) {
@@ -371,14 +369,7 @@ function buildDbMenu(close) {
       for (const line of [d.note, d.unread]) if (line) kids.push(h('p', { class: 'menu-note', text: line }));
     }
     if (reading) kids.push(h('p', { class: 'menu-note', role: 'status', text: d ? 'Reading the list again…' : 'Reading the databases…' }));
-    // Keep the focus where it was across a redraw; until the user moves it, it goes to the
-    // current database.
-    const focused = menu.contains(document.activeElement) ? document.activeElement.textContent : null;
-    fill(menu, kids);
-    const list = Array.from(menu.querySelectorAll('button:not(:disabled)'));
-    const again = focused !== null && moved ? list.find((el) => el.textContent === focused) : null;
-    const target = again || (focused !== null || !moved ? list.find((el) => el.getAttribute('aria-current') === 'true') || list[0] : null);
-    if (target) target.focus({ preventScroll: true });
+    redrawMenu(menu, kids, moved);
   };
   let moved = false;
   menu.onkeydown = () => {
@@ -388,22 +379,26 @@ function buildDbMenu(close) {
     moved = true;
   };
   const known = dbCache && dbCache.who === who ? dbCache : null;
-  draw(known && known.dbs, null, true);
-  api.getDbs().then(
-    (d) => {
-      dbCache = { who, dbs: d, error: null };
-      if (menus.db.isOpen() && dbWho() === who) draw(d, null, false);
-    },
-    (err) => {
-      if (menus.db.isOpen() && dbWho() === who) draw(null, errorText(err), false);
-    },
-  );
+  draw(known && known.dbs, known && known.error, true);
+  const settle = (dbs, error) => {
+    const kept = dbListReply(who, dbListKey(store.state), dbs, error);
+    if (!kept) return;
+    dbCache = kept;
+    if (menus.db.isOpen()) draw(kept.dbs, kept.error, false);
+  };
+  api.getDbs().then((d) => settle(d, null), (err) => settle(null, errorText(err)));
 }
 
-/** Which session and run a database list belongs to. */
-function dbWho() {
-  const s = store.state;
-  return s.conn ? `${s.conn.name}|${s.conn.docker}|${s.analysis ? s.analysis.run : 0}` : null;
+/** Draw a menu's items again, keeping the focus where `menuFocus` says: on the item that
+ *  had it once the user has moved, else on the current item (the current database), else
+ *  on the first. Items carry `data-key`. */
+function redrawMenu(menu, kids, moved) {
+  const active = document.activeElement;
+  const had = active && menu.contains(active) && active.dataset ? active.dataset.key ?? null : null;
+  fill(menu, kids);
+  const list = Array.from(menu.querySelectorAll('[data-key]'));
+  const at = menuFocus(list.map((el) => ({ key: el.dataset.key, current: el.getAttribute('aria-current') === 'true', disabled: el.disabled === true })), { had, moved });
+  if (at >= 0) list[at].focus({ preventScroll: true });
 }
 
 /** The access button: writes on or off for the session, through the server's write gate;
@@ -418,7 +413,7 @@ async function toggleWrites() {
   button.setAttribute('aria-busy', 'true');
   try {
     const done = await api.setSessionWrites(access.next);
-    notify(done.message || (access.next ? 'Writes are on for this session.' : 'Writes are off for this session.'), 'ok');
+    notify(done.message || (access.next ? 'Writes are on.' : 'Writes are off.'), 'ok');
     await loadState();
   } catch (err) {
     notify(errorText(err), err.cancelled ? 'info' : 'error');
@@ -456,7 +451,7 @@ function banner(text, action, run) {
     },
   }) : null;
   return h('div', { class: 'banner', role: 'alert' },
-    h('p', null, h('span', { class: 'glyph', 'aria-hidden': 'true', text: '✗' }), h('span', { text })),
+    h('p', null, h('span', { class: 'glyph bad', 'aria-hidden': 'true', text: '✗' }), h('span', { text })),
     button);
 }
 
@@ -592,7 +587,6 @@ async function boot() {
     if (acceptSignIn(window)) window.location.reload();
   });
   applyTheme();
-  $('brand').title = `Served by the redis-lens running in your terminal at ${window.location.host || '127.0.0.1'}. Only this computer can open it.`;
   $('theme-toggle').addEventListener('click', () => {
     theme = themes.other(theme);
     themes.save(theme);

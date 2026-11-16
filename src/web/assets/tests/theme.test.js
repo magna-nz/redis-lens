@@ -116,6 +116,7 @@ for (const [name, selector] of [['dark', ':root'], ['light', ':root[data-theme="
       ['danger', solid(t.danger), 'panel (field errors)', solid(t.panel)],
       ['danger', solid(t.danger), 'panel2 (destructive buttons, writes on)', solid(t.panel2)],
       ['danger', solid(t.danger), 'danger-soft on panel (a destructive button pointed at)', dangerOnPanel],
+      ['danger', solid(t.danger), 'danger-soft on bg (the ✗ on the banner)', dangerOnBg],
       ['danger-ink', solid(t['danger-ink']), 'danger (the PROD badge)', solid(t.danger)],
       ['ph', solid(t.ph), 'bg', solid(t.bg)],
       ['ph', solid(t.ph), 'panel ({id} in a pattern)', solid(t.panel)],
@@ -211,6 +212,10 @@ test('compact density, with 44px targets again on a small screen', () => {
   assert.match(small, /\.btn, \.field, \.pill[^{]*\{ min-height: 44px; \}/);
   assert.match(small, /\.row \{ min-height: 44px; \}/);
   assert.match(small, /\.tbl td \{ height: 44px; \}/);
+  // Places with a compact size of their own get the touch size back too.
+  assert.match(small, /\.row-item\.entry, \.search \.facts dd \.btn \{ min-height: 44px; \}/);
+  assert.match(small, /\.stream-detail \.item-actions \.tbl td \{ height: 44px; \}/);
+  assert.match(small, /\.pill\.small \{ min-height: 36px; \}/);
 });
 
 test('motion is switched off for people who ask for less of it', () => {

@@ -6,9 +6,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   PLACEHOLDERS, splitPlaceholders, connMenuModel, connButtonModel, accessModel, dbModel, nodeModel, liveModel, parseRoute,
+  menuFocus, dbListKey, dbListReply,
 } from '../ui.js';
 import { adaptProfile, adaptContainer, adaptState, adaptConnections, adaptDocker } from '../api.js';
-import { drawerStep } from '../views/cmdline.js';
+import { drawerStep, drawerEscapes } from '../views/cmdline.js';
 import { loadDocker, dockerKnown } from '../views/connections.js';
 import { createMockServer } from '../mock.js';
 import { createApi, createReal } from '../api.js';
@@ -33,6 +34,13 @@ test('the six placeholders, and only those, are split out of a pattern name', ()
 
 test('a literal row is never split: it is a key name, not a pattern', () => {
   assert.deepEqual(splitPlaceholders('config:{id}', true), [{ text: 'config:{id}', ph: false }]);
+  // Browse passes it wherever its data knows: the tree row, and through the tree the value's
+  // Pattern line and the bulk title. (Analysis rows carry no literal flag: an analysis
+  // names patterns, never single keys.)
+  const browse = read('views/browse.js');
+  assert.match(browse, /patternName\(r\.pattern\.name, \{ literal: r\.literal === true/);
+  assert.match(browse, /patternName\(v\.pattern\.name, \{ literal: literalOf\(v\.pattern\) \}\)/);
+  assert.match(browse, /patternName\(b\.pattern\.name, \{ literal: literalOf\(b\.pattern\) \}\)/);
 });
 
 test('the parts give the name back exactly', () => {
@@ -165,6 +173,42 @@ test('the models read the state the server sends', () => {
   assert.equal(liveModel(adaptState({ status: 'idle' })).enabled, false);
 });
 
+// ---- Menu focus and the database list ----
+
+test('a menu focuses the current item when it opens, so enter keeps the current database', () => {
+  const dbs = [{ key: 'db0' }, { key: 'db1' }, { key: 'db3', current: true }];
+  assert.equal(menuFocus(dbs), 2, 'on db 3 the focus starts on db 3, not db 0');
+  assert.equal(menuFocus([{ key: 'db0' }, { key: 'db1' }]), 0, 'no current item: the first');
+  assert.equal(menuFocus([{ key: 'db0', disabled: true }, { key: 'db1' }]), 1, 'a disabled item is skipped');
+  assert.equal(menuFocus([{ key: 'a', current: true, disabled: true }, { key: 'b' }]), 1);
+  assert.equal(menuFocus([]), -1);
+  // A redraw (the list read again) before the user moved: back to the current one.
+  assert.equal(menuFocus(dbs, { had: 'db0', moved: false }), 2);
+  // Once the user moved, the item they are on keeps the focus.
+  assert.equal(menuFocus(dbs, { had: 'db1', moved: true }), 1);
+  assert.equal(menuFocus(dbs, { had: 'gone', moved: true }), 2, 'their item went: the current one');
+  assert.equal(menuFocus(dbs, { had: null, moved: true }), -1, 'focus they put elsewhere stays there');
+});
+
+test('a database list is kept only for the session and run it was asked for', () => {
+  const s = (name, run, docker = false) => ({ conn: { name, docker }, analysis: { run } });
+  assert.equal(dbListKey(s('demo', 3)), 'demo|false|3');
+  assert.equal(dbListKey(s('demo', 3, true)), 'demo|true|3');
+  assert.equal(dbListKey({ conn: null }), null);
+  const dbs = { rows: [{ db: 0 }] };
+  assert.deepEqual(dbListReply('demo|false|3', 'demo|false|3', dbs), { who: 'demo|false|3', dbs, error: null });
+  assert.deepEqual(dbListReply('demo|false|3', 'demo|false|3', null, 'refused'), { who: 'demo|false|3', dbs: null, error: 'refused' });
+  // The key is the one taken when the request was sent: a reply after a switch (a new run)
+  // or another connect is dropped, never stamped with the new key.
+  assert.equal(dbListReply(dbListKey(s('demo', 3)), dbListKey(s('demo', 4)), dbs), null);
+  assert.equal(dbListReply(dbListKey(s('demo', 3)), dbListKey(s('other', 3)), dbs), null);
+  assert.equal(dbListReply(null, null, dbs), null);
+  const app = read('app.js');
+  assert.match(app, /draw\(known && known\.dbs, known && known\.error, true\)/, 'a kept error is drawn, not dropped');
+  const browse = read('views/browse.js');
+  assert.ok(browse.indexOf('const key = ctx.dbListKey') < browse.indexOf('store.dbs = await ctx.api.getDbs()'), 'Browse takes the key before it asks');
+});
+
 // ---- Docker discovery is shared ----
 
 test('the menu and Connections share one Docker discovery', async () => {
@@ -178,6 +222,29 @@ test('the menu and Connections share one Docker discovery', async () => {
   assert.equal(dockerKnown(), a);
   await loadDocker(api, true);
   assert.equal(asked, 2, 'Look again asks again');
+});
+
+test('a late answer to an older Docker ask never replaces a newer one', async () => {
+  const replies = [];
+  const api = { listDocker: () => new Promise((resolve) => replies.push(resolve)) };
+  const first = loadDocker(api, true);
+  const again = loadDocker(api, true);
+  const newer = { containers: [{ name: 'new' }] };
+  const older = { containers: [{ name: 'old' }] };
+  replies[1](newer);
+  assert.equal(await again, newer);
+  replies[0](older);
+  assert.equal(await first, newer, 'the older caller gets the newest answer');
+  assert.equal(dockerKnown(), newer, 'and the kept answer is still the newest');
+  // The other order: the older one first, while the newer is still asking.
+  const a = loadDocker(api, true);
+  const b = loadDocker(api, true);
+  const latest = { containers: [{ name: 'latest' }] };
+  replies[2]({ containers: [{ name: 'stale' }] });
+  replies[3](latest);
+  assert.equal(await a, latest);
+  assert.equal(await b, latest);
+  assert.equal(dockerKnown(), latest);
 });
 
 test('in ?mock: the menu lists the sample connections and containers, without credentials', async () => {
@@ -214,6 +281,15 @@ test('the drawer opens and closes without touching the route', () => {
   assert.deepEqual(parseRoute(hash, ['overview', 'server'], 'overview'), before);
 });
 
+test('escape closes the drawer from anywhere inside it, once', () => {
+  const key = (k, more = {}) => ({ key: k, defaultPrevented: false, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, ...more });
+  assert.equal(drawerEscapes(key('Escape')), true, 'from Clear, Close, the pills or the output');
+  assert.equal(drawerEscapes(key('Escape', { defaultPrevented: true })), false, 'the input handled it already');
+  assert.equal(drawerEscapes(key('Escape', { ctrlKey: true })), false);
+  assert.equal(drawerEscapes(key('Enter')), false);
+  assert.match(read('views/cmdline.js'), /root\.addEventListener\('keydown', \(e\) => \{\n\s+if \(drawerEscapes\(e\)\)/);
+});
+
 test('opening the drawer scrolls nothing and changes no address', () => {
   const app = read('app.js');
   const body = app.slice(app.indexOf('function setCommandLine'), app.indexOf('\n}\n', app.indexOf('function setCommandLine')));
@@ -240,6 +316,9 @@ test('the context bar and the rail', () => {
   assert.match(bar, /<label class="sr-only" for="poll-interval">/);
   assert.doesNotMatch(bar, /field poll/, 'the interval is a visible select, not a transparent one');
   assert.doesNotMatch(html, /nav-note|served-at/, 'the long note left the rail');
+  assert.doesNotMatch(bar, /title="Served by/, 'no tooltip on the brand, which no keyboard reaches');
+  assert.match(read('views/connections.js'), /'Served by the redis-lens running in your terminal at '/, 'Connections says it in text');
+  assert.match(read('app.js'), /class: 'glyph bad', 'aria-hidden': 'true', text: '✗'/, 'the banner\'s ✗ is the danger colour');
   const nav = html.slice(html.indexOf('<nav class="nav"'), html.indexOf('</nav>'));
   const hints = Array.from(nav.matchAll(/<span>([^<]+)<\/span>\n<span class="key-hint" aria-hidden="true">([^<]+)<\/span>/g), (m) => [m[1], m[2]]);
   assert.deepEqual(hints, [['Overview', '1'], ['Browse', '2'], ['Analyze', '3'], ['Server', '4'], ['Pub/Sub', '5'], ['Connections', '0'], ['Command line', ':']]);

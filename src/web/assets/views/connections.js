@@ -36,21 +36,29 @@ const WRITES_HINT = 'With writes on, key edits, deletes and write commands reach
  *  the page first shows Connections and when "Look again" is pressed, not on every redraw. */
 let dockerFound = null;
 let dockerAsking = null;
+let dockerSeq = 0;
 
 /** What Docker discovery found, asked once and kept: Connections and the top bar's
  *  connection menu share it, so opening the menu pings no container that was pinged
- *  already. `again` asks Docker again ("Look again"). */
+ *  already. `again` asks Docker again ("Look again"). Each ask is numbered and only the
+ *  newest one is kept: an older reply that arrives after a newer ask is dropped, and its
+ *  caller gets the newest answer instead. */
 export function loadDocker(api, again = false) {
   if (dockerFound && !again) return Promise.resolve(dockerFound);
   if (dockerAsking && !again) return dockerAsking;
+  dockerSeq += 1;
+  const mine = dockerSeq;
   const asking = api.listDocker().then(
     (found) => {
-      if (dockerAsking === asking) dockerAsking = null;
+      // Not kept; the caller still gets an answer when the newer ask failed.
+      if (mine !== dockerSeq) return dockerAsking || dockerFound || found;
+      dockerAsking = null;
       dockerFound = found;
       return found;
     },
     (err) => {
-      if (dockerAsking === asking) dockerAsking = null;
+      if (mine !== dockerSeq && (dockerAsking || dockerFound)) return dockerAsking || dockerFound;
+      if (mine === dockerSeq) dockerAsking = null;
       throw err;
     },
   );
