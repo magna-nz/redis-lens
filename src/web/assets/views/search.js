@@ -10,7 +10,7 @@
 // boxes have autocomplete off; nothing goes to storage, the console or an address.
 
 import {
-  h, fill, DASH, fmtBytes, fmtGrouped, fmtPercent, plural, notice, emptyState, readOnlyNote, errorText, table, nodePicker, copyText,
+  h, fill, DASH, fmtBytes, fmtGrouped, fmtPercent, plural, notice, emptyState, readOnlyNote, errorText, table, copyText,
 } from '../ui.js';
 
 // ---------------------------------------------------------------------------------------
@@ -96,9 +96,8 @@ export function mount(root, ctx, { head, body: area }) {
   follow(state);
   let alive = true;
   const conn = state.conn;
-  const picker = nodePicker(conn, (index) => ctx.pickNode(index));
   const readAgain = h('button', { type: 'button', class: 'btn', text: 'Read again', onclick: () => load(true) });
-  head.actions.append(...[picker, readAgain].filter(Boolean));
+  head.actions.append(readAgain);
   const box = h('div', { class: 'stack-lg', 'aria-live': 'polite' });
   area.append(box);
   // The query box lives across draws, so what is typed stays while the list is read again.
@@ -204,7 +203,7 @@ export function mount(root, ctx, { head, body: area }) {
     ];
     return h('div', { class: 'card stack browse-col search-detail' },
       h('div', { class: 'value-head' }, h('h2', { class: 'key-title mono wrap-any', text: i.name.name }),
-        writesOff() ? null : h('button', { type: 'button', class: 'btn', text: 'Drop index', 'aria-label': `Drop the index ${i.name.name} (FT.DROPINDEX, the documents stay)`, onclick: (ev) => drop(i, ev.currentTarget) })),
+        writesOff() ? null : h('button', { type: 'button', class: 'btn danger', text: 'Drop index', 'aria-label': `Drop the index ${i.name.name} (FT.DROPINDEX, the documents stay)`, onclick: (ev) => drop(i, ev.currentTarget) })),
       i.infoText ? notice(i.infoText, 'info') : h('dl', { class: 'facts' }, facts.map(([k, v]) => h('div', null, h('dt', { text: k }), h('dd', { class: 'mono', text: v })))),
       i.building ? notice('Still indexing: queries may miss documents until it is done.', 'info') : null,
       i.leftOut ? h('p', { class: 'muted small', text: i.leftOut }) : null,

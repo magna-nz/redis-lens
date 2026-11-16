@@ -7,7 +7,7 @@
 
 import {
   h, fill, DASH, TailBuffer, fmtClock, fmtGrouped, fmtRate, plural, emptyState, notice,
-  readOnlyNote, connectFirst, nodePicker, fillLog, errorText,
+  readOnlyNote, connectFirst, fillLog, errorText,
 } from '../ui.js';
 
 const SHOWN = 300;
@@ -103,8 +103,7 @@ export function mount(root, ctx) {
   const right = h('div', { class: 'card stack col wide' });
   view.append(
     h('div', { class: 'view-head' },
-      h('h1', { class: 'title', id: 'pubsub-title', text: 'Pub/Sub' }),
-      h('div', { class: 'actions' }, nodePicker(conn, (index) => ctx.pickNode(index)))),
+      h('h1', { class: 'title', id: 'pubsub-title', text: 'Pub/Sub' })),
     h('div', { class: 'cols' }, left, right));
 
   // ---------- Channels ----------

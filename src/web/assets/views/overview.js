@@ -8,7 +8,7 @@
 
 import {
   h, fill, DASH, fmtBytes, fmtCount, fmtDuration, fmtPercent, fmtRate, fmtClock, fmtGrouped, plural, barPercent,
-  barChart, meter, setVar, table, notice, emptyState, connectFirst, nodePicker, errorText,
+  barChart, meter, setVar, table, notice, emptyState, connectFirst, errorText, patternName,
 } from '../ui.js';
 
 /** The line under a live tile: how far back the bars go, or that they are paused. */
@@ -114,9 +114,7 @@ export function mount(root, ctx) {
   drawButtons();
   const head = h('div', { class: 'view-head' },
     h('div', null, h('h1', { class: 'title', id: 'overview-title', text: 'Overview' }), subtitle),
-    h('div', { class: 'actions' },
-      nodePicker(conn, (index) => ctx.pickNode(index)),
-      quick, deep));
+    h('div', { class: 'actions' }, quick, deep));
 
   const tile = (label) => {
     const value = h('span', { class: 'tile-value', text: DASH });
@@ -286,7 +284,7 @@ export function mount(root, ctx) {
         type: 'button', class: 'row row-pattern', title: `List the keys of ${t.pattern.name} on Browse`,
         onclick: () => ctx.openPattern(t.pattern),
       },
-      h('span', { class: 'mono clip name', text: t.pattern.name }),
+      patternName(t.pattern.name, { cls: 'mono clip name' }),
       meter(barPercent(byBytes ? t.estBytes : t.estKeys, max)),
       h('span', { class: 'mono right', text: byBytes ? fmtBytes(t.estBytes) : `~${fmtCount(t.estKeys)}` }),
       h('span', { class: 'mono right muted', text: typeof t.share === 'number' ? fmtPercent(t.share) : DASH }))))),
@@ -311,7 +309,7 @@ export function mount(root, ctx) {
       checks.length ? h('details', { class: 'advanced' },
         h('summary', { text: `Every permission check (${checks.length})` }),
         h('ul', { class: 'list' }, checks.map((c) => h('li', { class: 'row row-check' },
-          h('span', { 'aria-hidden': 'true', class: c.status === 'allowed' ? 'glyph good' : c.status === 'denied' ? 'glyph' : 'muted', text: glyph[c.status] }),
+          h('span', { 'aria-hidden': 'true', class: c.status === 'allowed' ? 'glyph good' : c.status === 'denied' ? 'glyph bad' : 'muted', text: glyph[c.status] }),
           h('span', null,
             h('span', { class: 'mono name', text: c.name }),
             h('span', { class: 'sr-only', text: ` ${word[c.status]}` }),

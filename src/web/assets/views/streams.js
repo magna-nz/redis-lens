@@ -472,7 +472,7 @@ export function mount(root, ctx, { head, body: area }) {
     const by = h('select', { class: 'field', id: byId }, h('option', { value: 'MAXLEN', text: 'MAXLEN: keep the newest entries' }), h('option', { value: 'MINID', text: 'MINID: drop entries older than an ID' }));
     const value = input('Value', '');
     const error = h('p', { class: 'form-error', role: 'alert' });
-    const button = h('button', { type: 'submit', class: 'btn', text: 'Trim' });
+    const button = h('button', { type: 'submit', class: 'btn danger', text: 'Trim' });
     return h('details', { class: 'advanced' },
       h('summary', { text: 'Trim the stream (XTRIM)' }),
       h('form', {

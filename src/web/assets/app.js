@@ -6,7 +6,9 @@
 import { api, TEXT, initApi, acceptSignIn, adaptAnalysis } from './api.js';
 import {
   h, fill, setIcon, envBadge, createThemeStore, createToasts, confirmDialog,
-  parseRoute, pushSeries, errorText, analyzing,
+  parseRoute, pushSeries, errorText, analyzing, plural, menuButton,
+  connMenuModel, connButtonModel, accessModel, dbModel, nodeModel, liveModel,
+  dbListKey, dbListReply, menuFocus,
 } from './ui.js';
 import * as connections from './views/connections.js';
 import * as overview from './views/overview.js';
@@ -106,6 +108,15 @@ const ctx = {
     }
   },
   openCommandLine: () => setCommandLine(true),
+  /** Browse reads the database list when it mounts (as it did when the picker was on it):
+   *  the top bar's database menu shows that list at once when it is opened next. Browse
+   *  takes `dbListKey()` before it asks and hands it back with the reply, so a late reply
+   *  for another session or run is dropped. */
+  dbListKey: () => dbListKey(store.state),
+  showDbs(sentKey, dbs, error) {
+    const kept = dbListReply(sentKey, dbListKey(store.state), dbs, error);
+    if (kept) dbCache = kept;
+  },
   /** Find keys by name (the search field in the top bar): the results show on Browse. */
   findKey(text) {
     const q = String(text ?? '').trim();
@@ -178,45 +189,238 @@ function render() {
 
 // ---------- Chrome ----------
 
+/** The database list the menu showed last, for the session and run it was read in. */
+let dbCache = null;
+let menus = null;
+
 function renderChrome() {
   const s = store.state;
-  const pill = $('conn-pill');
-  const db = s.analysis && s.analysis.db ? `db ${s.analysis.db}` : null;
-  if ((s.connected || analyzing(s)) && s.conn) {
-    const access = analyzing(s) ? 'analyzing…' : s.conn.readOnly ? 'read-only' : 'writes on';
-    fill(pill,
-      h('span', { class: s.lost || analyzing(s) ? 'dot busy' : 'dot ok', 'aria-hidden': 'true' }),
-      h('span', { class: 'mono name clip', text: s.conn.name }),
-      envBadge(s.conn.env),
-      db ? h('span', { class: 'badge mono', text: db }) : null,
-      h('span', { class: 'muted access', text: access }));
-    pill.setAttribute('aria-label', `Connected to ${s.conn.name}, ${s.conn.env}${db ? `, ${db}` : ''}, ${access}. Open Connections.`);
-  } else if (s.connecting) {
-    fill(pill,
-      h('span', { class: 'dot busy', 'aria-hidden': 'true' }),
-      h('span', { class: 'mono name clip', text: s.connecting.name }),
-      h('span', { class: 'muted', text: 'connecting…' }));
-    pill.setAttribute('aria-label', `Connecting to ${s.connecting.name}. Open Connections.`);
-  } else {
-    fill(pill, h('span', { class: 'dot', 'aria-hidden': 'true' }), h('span', { text: 'Not connected' }), h('span', { class: 'muted access', text: 'pick a connection' }));
-    pill.setAttribute('aria-label', 'Not connected. Open Connections.');
+
+  // The connection button: status dot, name, environment. It opens the connection menu.
+  const conn = connButtonModel(s);
+  fill($('conn-btn'),
+    h('span', { class: conn.dot ? `dot ${conn.dot}` : 'dot', 'aria-hidden': 'true' }),
+    conn.name ? h('span', { class: 'mono name clip', text: conn.name }) : null,
+    conn.env ? envBadge(conn.env) : null,
+    conn.note ? h('span', { class: conn.name ? 'muted' : '', text: conn.note }) : null,
+    h('span', { class: 'caret', 'aria-hidden': 'true', text: '▾' }));
+  $('conn-btn').setAttribute('aria-label', conn.aria);
+
+  // Access: Read-only or Writes on; a click asks the server to switch (it asks first).
+  const access = accessModel(s);
+  const accessBtn = $('access-btn');
+  accessBtn.hidden = !access.show;
+  if (access.show) {
+    accessBtn.className = `btn ctx-btn ${access.tone}`;
+    fill(accessBtn, h('span', { class: 'access-word', text: access.label }), h('span', { class: 'key-hint', 'aria-hidden': 'true', text: 'w' }));
+    accessBtn.setAttribute('aria-label', access.aria);
+    accessBtn.setAttribute('aria-pressed', access.on ? 'true' : 'false');
+    accessBtn.title = access.title;
   }
 
-  const live = $('live-toggle');
-  live.disabled = !s.connected;
-  live.querySelector('.dot').classList.toggle('ok', s.connected && s.live);
-  $('live-label').textContent = s.live ? 'Live' : 'Paused';
-  live.setAttribute('aria-label', s.live ? 'Live: pause the live figures' : 'Paused: resume the live figures');
+  // The database: shown from the state; the list is read when the menu opens.
+  const db = dbModel(s);
+  $('db-wrap').hidden = !db.show;
+  if (db.show) {
+    $('db-label').textContent = db.label;
+    $('db-btn').setAttribute('aria-label', `Database: ${db.label}. ${db.off ? db.off : 'Pick another database.'}`);
+  } else if (menus) menus.db.close(false);
 
-  // How often the figures are read: the TUI's + and -, as one quiet list.
+  // The node, on a cluster: the views that read one node read the picked one.
+  const node = nodeModel(s);
+  $('node-wrap').hidden = !node;
+  const select = $('node-select');
+  if (node && document.activeElement !== select) {
+    fill(select, node.options.map((o) => h('option', { value: o.value, selected: o.selected, text: o.text })));
+  }
+
+  // Live / Paused, and how often the figures are read (the TUI's + and -).
+  const live = liveModel(s);
+  const liveBtn = $('live-toggle');
+  liveBtn.disabled = !live.enabled;
+  liveBtn.querySelector('.dot').classList.toggle('ok', live.enabled && live.live);
+  $('live-label').textContent = live.label;
+  liveBtn.setAttribute('aria-label', live.aria);
   const every = $('poll-interval');
-  every.disabled = !s.connected;
-  if (every.options.length !== s.polling.intervals.length) {
-    fill(every, s.polling.intervals.map((n) => h('option', { value: String(n), text: `every ${n} s` })));
+  every.disabled = !live.enabled;
+  if (every.options.length !== live.options.length) {
+    fill(every, live.options.map((o) => h('option', { value: o.value, text: o.text })));
   }
-  if (document.activeElement !== every) every.value = String(s.polling.intervalSecs);
+  if (document.activeElement !== every) every.value = String(live.every);
 
   renderBanner();
+}
+
+// ---------- The top bar's menus ----------
+
+/** The connection menu: the saved connections, then the Docker containers, each
+ *  connecting on click, then Manage connections. Only names, environments and masked
+ *  addresses are drawn: a listing carries no credential, and the URL is never shown. */
+function buildConnMenu(close) {
+  const menu = $('conn-menu');
+  const draw = (saved, docker, dockerNote) => {
+    const model = connMenuModel(saved, docker, store.state);
+    const item = (it) => h('button', {
+      type: 'button', class: 'menu-item', 'aria-current': it.current ? 'true' : null, 'data-key': it.key,
+      'aria-label': `${it.current && it.status ? `${it.name}, ${it.status}` : `Connect to ${it.name}`}, ${it.env}, ${it.address}`,
+      onclick: () => {
+        close();
+        if (it.current && (it.status === 'connected' || it.status === 'connecting')) return;
+        ctx.connect(it.target);
+      },
+    },
+    h('span', { class: it.status === 'connected' ? 'dot ok' : it.status === 'connecting' ? 'dot busy' : it.status === 'failed' ? 'dot bad' : 'dot', 'aria-hidden': 'true' }),
+    h('span', { class: 'mono name clip', text: it.name }),
+    envBadge(it.env),
+    h('span', { class: 'sub mono clip', text: it.address }));
+    const kids = [h('p', { class: 'lbl menu-group', text: 'Saved connections' })];
+    if (saved === null) kids.push(h('p', { class: 'menu-note', text: 'Reading the saved connections…' }));
+    else if (!model.saved.length) kids.push(h('p', { class: 'menu-note', text: 'No saved connections yet.' }));
+    else kids.push(...model.saved.map(item));
+    kids.push(h('p', { class: 'lbl menu-group', text: 'Found in Docker' }));
+    if (dockerNote) kids.push(h('p', { class: 'menu-note', text: dockerNote }));
+    else if (docker === null) kids.push(h('p', { class: 'menu-note', text: 'Looking for containers in Docker…' }));
+    else if (!model.docker.length) kids.push(h('p', { class: 'menu-note', text: 'No Redis or Valkey container is running.' }));
+    else kids.push(...model.docker.map(item));
+    kids.push(h('div', { class: 'menu-sep', role: 'presentation' }),
+      h('a', { class: 'menu-item plain', href: '#/connections', 'data-key': 'manage', text: 'Manage connections', onclick: () => close(false) }));
+    redrawMenu(menu, kids, moved);
+  };
+  let moved = false;
+  menu.onkeydown = () => {
+    moved = true;
+  };
+  menu.onpointerdown = () => {
+    moved = true;
+  };
+  let saved = null;
+  let docker = connections.dockerKnown() ? connections.dockerKnown().containers : null;
+  let dockerNote = null;
+  draw(saved, docker, dockerNote);
+  api.listConnections().then(
+    (r) => {
+      saved = r.profiles;
+      if (menus.conn.isOpen()) draw(saved, docker, dockerNote);
+    },
+    (err) => {
+      saved = [];
+      if (menus.conn.isOpen()) {
+        draw(saved, docker, dockerNote);
+        notify(errorText(err), 'error');
+      }
+    },
+  );
+  // Discovery pings every container: the menu reuses what Connections found.
+  if (docker === null) {
+    connections.loadDocker(api).then(
+      (found) => {
+        docker = found.containers;
+        if (menus.conn.isOpen()) draw(saved, docker, dockerNote);
+      },
+      (err) => {
+        dockerNote = `Docker could not be asked: ${errorText(err)}`;
+        if (menus.conn.isOpen()) draw(saved, docker, dockerNote);
+      },
+    );
+  }
+}
+
+/** The database menu: read (`INFO keyspace`) only now that it is open. */
+function buildDbMenu(close) {
+  const menu = $('db-menu');
+  const model = dbModel(store.state);
+  if (!model.show) {
+    close(false);
+    return;
+  }
+  if (model.off) {
+    fill(menu, h('p', { class: 'menu-note', text: model.off }));
+    return;
+  }
+  const who = dbListKey(store.state);
+  const draw = (d, error, reading) => {
+    const kids = [h('p', { class: 'lbl menu-group', text: 'Databases' })];
+    if (error) kids.push(h('p', { class: 'menu-note', text: `Database: ${error}` }));
+    if (d && d.off) kids.push(h('p', { class: 'menu-note', text: d.off }));
+    else if (d) {
+      kids.push(...d.rows.map((r) => h('button', {
+        type: 'button', class: 'menu-item', 'aria-current': r.current ? 'true' : null, 'data-key': `db${r.db}`,
+        onclick: async (e) => {
+          const button = e.currentTarget;
+          if (r.current) {
+            close();
+            return;
+          }
+          button.disabled = true;
+          try {
+            const done = await api.switchDb(r.db);
+            notify(done.switched ? done.text || `Switched to db ${r.db}.` : `Already on db ${r.db}.`, 'ok');
+            dbCache = null;
+            close();
+          } catch (err) {
+            notify(errorText(err), err.cancelled ? 'info' : 'error');
+            button.disabled = false;
+          }
+        },
+      },
+      h('span', { class: r.current ? 'dot ok' : 'dot', 'aria-hidden': 'true' }),
+      h('span', { class: 'mono name', text: `db ${r.db}` }),
+      h('span', { class: 'muted small', text: plural(r.keys, 'key', 'keys') }))));
+      for (const line of [d.note, d.unread]) if (line) kids.push(h('p', { class: 'menu-note', text: line }));
+    }
+    if (reading) kids.push(h('p', { class: 'menu-note', role: 'status', text: d ? 'Reading the list again…' : 'Reading the databases…' }));
+    redrawMenu(menu, kids, moved);
+  };
+  let moved = false;
+  menu.onkeydown = () => {
+    moved = true;
+  };
+  menu.onpointerdown = () => {
+    moved = true;
+  };
+  const known = dbCache && dbCache.who === who ? dbCache : null;
+  draw(known && known.dbs, known && known.error, true);
+  const settle = (dbs, error) => {
+    const kept = dbListReply(who, dbListKey(store.state), dbs, error);
+    if (!kept) return;
+    dbCache = kept;
+    if (menus.db.isOpen()) draw(kept.dbs, kept.error, false);
+  };
+  api.getDbs().then((d) => settle(d, null), (err) => settle(null, errorText(err)));
+}
+
+/** Draw a menu's items again, keeping the focus where `menuFocus` says: on the item that
+ *  had it once the user has moved, else on the current item (the current database), else
+ *  on the first. Items carry `data-key`. */
+function redrawMenu(menu, kids, moved) {
+  const active = document.activeElement;
+  const had = active && menu.contains(active) && active.dataset ? active.dataset.key ?? null : null;
+  fill(menu, kids);
+  const list = Array.from(menu.querySelectorAll('[data-key]'));
+  const at = menuFocus(list.map((el) => ({ key: el.dataset.key, current: el.getAttribute('aria-current') === 'true', disabled: el.disabled === true })), { had, moved });
+  if (at >= 0) list[at].focus({ preventScroll: true });
+}
+
+/** The access button: writes on or off for the session, through the server's write gate;
+ *  turning them on asks first (the confirm handler). */
+let switchingWrites = false;
+async function toggleWrites() {
+  const access = accessModel(store.state);
+  if (!access.show || switchingWrites) return;
+  // Not disabled while it asks, so the focus stays on the button.
+  const button = $('access-btn');
+  switchingWrites = true;
+  button.setAttribute('aria-busy', 'true');
+  try {
+    const done = await api.setSessionWrites(access.next);
+    notify(done.message || (access.next ? 'Writes are on.' : 'Writes are off.'), 'ok');
+    await loadState();
+  } catch (err) {
+    notify(errorText(err), err.cancelled ? 'info' : 'error');
+  } finally {
+    switchingWrites = false;
+    button.removeAttribute('aria-busy');
+  }
 }
 
 function renderBanner() {
@@ -247,7 +451,7 @@ function banner(text, action, run) {
     },
   }) : null;
   return h('div', { class: 'banner', role: 'alert' },
-    h('p', null, h('span', { class: 'glyph', 'aria-hidden': 'true', text: '✗' }), h('span', { text })),
+    h('p', null, h('span', { class: 'glyph bad', 'aria-hidden': 'true', text: '✗' }), h('span', { text })),
     button);
 }
 
@@ -264,10 +468,17 @@ function showLocked() {
         h('h1', { text: 'This page is locked' }),
         h('p', null, 'Open the dashboard from redis-lens: press ', h('span', { class: 'kbd', text: 'ctrl-o' }), ' in the terminal, or run ', h('span', { class: 'kbd', text: 'redis-lens --dashboard' }), '.'),
         h('p', { class: 'muted', text: 'The session this page had is gone: redis-lens was started again, or the page was opened without it.' }))));
-  $('conn-pill').hidden = true;
-  $('live-toggle').hidden = true;
-  $('poll-interval').hidden = true;
-  $('find-form').hidden = true;
+  hideChrome();
+}
+
+/** A locked page, or `?mock` without sample data: the top bar keeps only the brand and the theme. */
+function hideChrome() {
+  if (menus) {
+    menus.conn.close(false);
+    menus.db.close(false);
+  }
+  document.body.classList.remove('drawer-open');
+  for (const id of ['ctx', 'live-seg', 'find-form']) $(id).hidden = true;
 }
 
 /** `?mock` in a build without the sample servers: say so, and show nothing made up. */
@@ -278,27 +489,25 @@ function showNoMock(text) {
       h('div', { class: 'card locked-card' },
         h('h1', { text: 'No sample data here' }),
         h('p', { text }))));
-  $('conn-pill').hidden = true;
-  $('live-toggle').hidden = true;
-  $('poll-interval').hidden = true;
-  $('find-form').hidden = true;
+  hideChrome();
 }
 
 // ---------- The command line panel ----------
 
+// A drawer docked to the bottom of the window on every screen. Opening it moves the focus
+// into it without scrolling the page; it never changes the address.
 function setCommandLine(open) {
   const section = $('cmdline');
   const toggle = $('cmd-toggle');
-  section.hidden = !open;
-  toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-  toggle.classList.toggle('on', open);
-  if (open) {
-    commandLine.refresh();
-    section.scrollIntoView({ block: 'nearest' });
-    commandLine.focus();
-  } else if (section.contains(document.activeElement)) {
-    toggle.focus();
-  }
+  if (!commandLine || !section || !toggle) return;
+  const next = cmdline.drawerStep({ open: !section.hidden }, open ? 'open' : 'close', section.contains(document.activeElement));
+  section.hidden = !next.open;
+  document.body.classList.toggle('drawer-open', next.open);
+  toggle.setAttribute('aria-expanded', next.open ? 'true' : 'false');
+  toggle.classList.toggle('on', next.open);
+  if (next.open) commandLine.refresh();
+  if (next.focus === 'input') commandLine.focus();
+  else if (next.focus === 'toggle') toggle.focus({ preventScroll: true });
 }
 
 // ---------- State ----------
@@ -378,7 +587,6 @@ async function boot() {
     if (acceptSignIn(window)) window.location.reload();
   });
   applyTheme();
-  $('served-at').textContent = window.location.host || '127.0.0.1';
   $('theme-toggle').addEventListener('click', () => {
     theme = themes.other(theme);
     themes.save(theme);
@@ -398,6 +606,14 @@ async function boot() {
   $('live-toggle').addEventListener('click', () => setPolling({ paused: store.state.live }));
   $('poll-interval').addEventListener('change', (e) => setPolling({ intervalSecs: Number(e.target.value) }));
   $('cmd-toggle').addEventListener('click', () => setCommandLine($('cmdline').hidden));
+
+  // The context bar: connection menu, access, database menu, node.
+  menus = {
+    conn: menuButton($('conn-btn'), $('conn-menu'), buildConnMenu),
+    db: menuButton($('db-btn'), $('db-menu'), buildDbMenu),
+  };
+  $('access-btn').addEventListener('click', toggleWrites);
+  $('node-select').addEventListener('change', (e) => ctx.pickNode(Number(e.target.value)));
 
   // Find a key, from anywhere: the results show on Browse. `/` comes here from any area
   // when no text box has the focus.

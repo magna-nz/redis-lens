@@ -6,6 +6,7 @@ import './api.test.js';
 import './browse-api.test.js';
 import './browse-mock.test.js';
 import './browse.test.js';
+import './chrome.test.js';
 import './confirm.test.js';
 import './csp.test.js';
 import './edits-api.test.js';

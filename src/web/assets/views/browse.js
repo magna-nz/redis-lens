@@ -18,7 +18,7 @@
 import {
   h, fill, refill, DASH, fmtBytes, fmtCount, fmtGrouped, fmtPercent, plural, barPercent, meter,
   notice, emptyState, connectFirst, analyzing, errorText, copyText, expiryText, fmtSignedBytes,
-  openDialog, readOnlyNote, pills,
+  openDialog, readOnlyNote, pills, patternName,
 } from '../ui.js';
 import * as streams from './streams.js';
 import * as search from './search.js';
@@ -511,13 +511,14 @@ function mountKeys(root, ctx) {
     timers.add(t);
   };
 
-  // ---------- the head: title, database, node ----------
+  // ---------- the head: title, the node the patterns are of ----------
+  // The database is picked in the top bar (app.js); Browse reads the list on mount, as it
+  // did when the picker was here, and hands it to the top bar.
   const subtitle = h('p', { class: 'subtitle' });
-  const dbBox = h('div', { class: 'picker' });
   const nodeBox = h('div', { class: 'picker' });
   view.append(h('div', { class: 'view-head' },
     h('div', null, h('h1', { class: 'title', id: 'browse-title', text: 'Browse' }), subtitle),
-    h('div', { class: 'actions' }, nodeBox, dbBox)),
+    h('div', { class: 'actions' }, nodeBox)),
   panelTabs('keys'));
 
   // ---------- the three cards ----------
@@ -544,8 +545,11 @@ function mountKeys(root, ctx) {
   const bulkBox = h('section', { class: 'card stack bulk', 'aria-label': 'Bulk action', hidden: true });
   view.append(bulkBox, h('div', { class: 'browse' }, patCard, keysCard, valueCard));
 
-  // ---------- the database picker ----------
+  // ---------- the database list, for the top bar's database control ----------
+  // The key is taken before asking, so a reply that arrives after a switch or a new run is
+  // not shown for the new one.
   async function loadDbs() {
+    const key = ctx.dbListKey ? ctx.dbListKey() : null;
     try {
       store.dbs = await ctx.api.getDbs();
       store.dbsError = null;
@@ -553,40 +557,7 @@ function mountKeys(root, ctx) {
       store.dbs = null;
       store.dbsError = errorText(err);
     }
-    if (alive) drawDbs();
-  }
-
-  function drawDbs() {
-    const d = store.dbs;
-    if (!d) {
-      fill(dbBox, store.dbsError ? h('span', { class: 'muted small', text: `Database: ${store.dbsError}` }) : null);
-      return;
-    }
-    if (d.off) {
-      fill(dbBox, h('span', { class: 'muted small', text: d.off }));
-      return;
-    }
-    const select = h('select', {
-      class: 'field', id: 'browse-db',
-      onchange: async () => {
-        const db = Number(select.value);
-        select.disabled = true;
-        try {
-          const r = await ctx.api.switchDb(db);
-          ctx.notify(r.switched ? r.text || `Switched to db ${db}.` : `Already on db ${db}.`, 'ok');
-        } catch (err) {
-          ctx.notify(errorText(err), 'error');
-          select.value = String(d.current);
-        } finally {
-          select.disabled = false;
-        }
-      },
-    }, d.rows.map((r) => h('option', { value: String(r.db), selected: r.current, text: `db ${r.db} · ${plural(r.keys, 'key', 'keys')}` })));
-    fill(dbBox,
-      h('label', { htmlFor: 'browse-db', text: 'Database' }),
-      select,
-      h('span', { class: 'sr-only', text: [d.note, d.unread].filter(Boolean).join(' ') }));
-    select.title = [d.note, d.unread].filter(Boolean).join(' ');
+    if (alive && ctx.showDbs) ctx.showDbs(key, store.dbs, store.dbsError);
   }
 
   // ---------- the tree ----------
@@ -740,7 +711,7 @@ function mountKeys(root, ctx) {
       onclick: () => openPattern(r.pattern, r),
     },
     h('span', { class: 'name' },
-      h('span', { class: 'mono clip block', text: r.pattern.name }),
+      patternName(r.pattern.name, { literal: r.literal === true, cls: 'mono clip block' }),
       h('span', { class: 'sub', text: `${keysText(r, exact)}${r.type ? ` · ${r.type}` : ''}${change}` })),
     h('span', { class: 'glyph', 'aria-hidden': 'true', text: r.marked ? '▲' : '' }),
     r.marked ? h('span', { class: 'sr-only', text: 'marked: worth a look' }) : null,
@@ -757,6 +728,12 @@ function mountKeys(root, ctx) {
     }
     return null;
   }
+
+  /** Whether a pattern is a literal key name in the tree shown (its `{…}` is not a placeholder). */
+  const literalOf = (pattern) => {
+    const r = pattern ? rowOf(pattern.id) : null;
+    return !!(r && r.literal === true);
+  };
 
   // ---------- a pattern's keys, and Find ----------
   let listSeq = 0;
@@ -1073,7 +1050,7 @@ function mountKeys(root, ctx) {
         h('h2', { class: 'mono key-title wrap-any', text: name }),
         h('span', { class: 'badge mono', text: v.type || v.kind })),
       h('p', { class: 'muted small', text: valueFacts(v, node) || DASH }),
-      v.pattern ? h('p', { class: 'muted small' }, 'Pattern ', h('span', { class: 'mono', text: v.pattern.name })) : null,
+      v.pattern ? h('p', { class: 'muted small' }, 'Pattern ', patternName(v.pattern.name, { literal: literalOf(v.pattern) })) : null,
       h('div', { class: 'row-actions' },
         copyButton('Copy name', copyName, 'the key name', 'The name has control characters, so it is not copied: a pasted copy would name another key.'),
         shown ? copyButton('Copy value', shown.copy, 'the value', shown.copyRefused || 'This value is not copied as text: show it as hex to copy it.') : null),
@@ -1203,9 +1180,10 @@ function mountKeys(root, ctx) {
   }
 
   /** A button for one write: off, saying why in its title, when it can't be sent. */
-  function writeButton(label, off, run, { primary = false, quiet = false, aria = null } = {}) {
+  function writeButton(label, off, run, { primary = false, quiet = false, danger = false, aria = null } = {}) {
+    const cls = primary ? 'btn primary' : quiet ? 'btn quiet' : 'btn';
     return h('button', {
-      type: 'button', class: primary ? 'btn primary' : quiet ? 'btn quiet' : 'btn', text: label, disabled: !!off, title: off || null, 'aria-label': aria,
+      type: 'button', class: danger ? `${cls} danger` : cls, text: label, disabled: !!off, title: off || null, 'aria-label': aria,
       onclick: (e) => run(e.currentTarget),
     });
   }
@@ -1219,7 +1197,7 @@ function mountKeys(root, ctx) {
     return [
       writeButton('Set expiry', keyOff(c, KEY_CMDS.ttl, v), () => ttlDialog(null), opt('Set the expiry of')),
       writeButton('Rename', keyOff(c, KEY_CMDS.rename, v), () => renameDialog(), opt('Rename')),
-      writeButton('Delete key', keyOff(c, KEY_CMDS.delete, v), (b) => deleteKey(b), opt('Delete')),
+      writeButton('Delete key', keyOff(c, KEY_CMDS.delete, v), (b) => deleteKey(b), { ...opt('Delete'), danger: true }),
     ];
   }
 
@@ -1261,7 +1239,7 @@ function mountKeys(root, ctx) {
       const off = v.fieldTtls ? keyOff(c, e.fieldTtl.cmds, v) : v.fieldTtlsOff || 'Field TTLs need Redis 7.4 or later, or Valkey 9.0 or later.';
       buttons.push(writeButton(e.fieldTtl.label, off, () => ttlDialog(item), { aria: `Set the TTL of ${label}` }));
     }
-    if (e.remove) buttons.push(writeButton(e.remove.label, keyOff(c, e.remove.cmds, v), (b) => removeItem(b, item), { aria: `Delete ${label}` }));
+    if (e.remove) buttons.push(writeButton(e.remove.label, keyOff(c, e.remove.cmds, v), (b) => removeItem(b, item), { aria: `Delete ${label}`, danger: true }));
     return h('div', { class: 'item-actions', role: 'group', 'aria-label': `Write to the selected ${label}` },
       h('p', { class: 'small muted wrap-any' }, 'Selected: ', h('span', { class: 'mono', text: label })),
       h('div', { class: 'row-actions' }, buttons),
@@ -1666,7 +1644,7 @@ function mountKeys(root, ctx) {
       h('p', { class: 'lbl', text: 'Every key of the pattern' }),
       h('div', { class: 'row-actions' },
         writeButton('Set a TTL on every key…', expire, () => bulkExpireDialog(pattern)),
-        writeButton('Delete every key…', remove, (b) => startBulk(b, pattern))),
+        writeButton('Delete every key…', remove, (b) => startBulk(b, pattern), { danger: true })),
       c && c.readOnly ? null : h('p', { class: 'muted small', text: [expire || remove, 'A dry run counts the keys first: nothing is written until you confirm.'].filter(Boolean).join(' ') }));
   }
 
@@ -1784,7 +1762,7 @@ function mountKeys(root, ctx) {
     }
     refill(bulkBox, [
       h('div', { class: 'card-head' },
-        h('h2', { class: 'bulk-title wrap-any', tabIndex: -1 }, `${b.title} `, h('span', { class: 'mono', text: b.pattern.name }), b.action === 'expire' && b.ttl ? ` · TTL ${b.ttl}` : ''),
+        h('h2', { class: 'bulk-title wrap-any', tabIndex: -1 }, `${b.title} `, patternName(b.pattern.name, { literal: literalOf(b.pattern) }), b.action === 'expire' && b.ttl ? ` · TTL ${b.ttl}` : ''),
         h('span', { class: `badge${b.prod ? ' env-prod' : ''}`, text: `${stage} · ${b.profile || ''}`.trim() })),
       bar,
       progress ? h('p', { role: 'status', text: progress.text }) : null,
@@ -1857,7 +1835,6 @@ function mountKeys(root, ctx) {
 
   active = { takePending };
   // Draw what is kept at once, then read what may have changed meanwhile.
-  drawDbs();
   if (store.tree) drawTree();
   else drawRows();
   drawKeys();
