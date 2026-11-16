@@ -36,8 +36,8 @@ test('the edits each type offers, as the TUI offers them; a stream entry is not 
 
 test('why a write is off: no connection, read-only (prod says so), a refused command, the value', () => {
   assert.equal(writeOff(null), 'Connect first.');
-  assert.equal(writeOff(conn({ readOnly: true })), 'Read-only: nothing is written to local. Turn writes on in Connections.');
-  assert.equal(writeOff(conn({ readOnly: true, env: 'PROD', name: 'p' })), 'Read-only: this is a production connection, so nothing is written to it. Turn writes on in Connections.');
+  assert.equal(writeOff(conn({ readOnly: true })), 'Read-only: nothing is written to local. Turn writes on with the top bar\'s Read-only button (w).');
+  assert.equal(writeOff(conn({ readOnly: true, env: 'PROD', name: 'p' })), 'Read-only: this is a production connection, so nothing is written to it. Turn writes on with the top bar\'s Read-only button (w).');
   assert.equal(readOnlyText(null), 'Connect first.');
   assert.equal(writeOff(conn({ refused: ['HSET'] }), ['HSET']), 'Off: the server refused HSET for this user.');
   assert.equal(writeOff(conn({ refused: ['hset'] }), ['HSET']), 'Off: the server refused HSET for this user.', 'case does not matter');
