@@ -974,20 +974,7 @@ fn input_line(label: &str, text: String, hint: &str, w: usize) -> Line<'static> 
 /// not fit are left out from the end.
 fn key_line(app: &App, w: usize) -> Line<'static> {
     let screen = app.screen();
-    let c = keymap::FooterCtx {
-        ready: app.session.is_some(),
-        analyzed: app.report().is_some(),
-        analyzing: app.analyzing(),
-        writes: app
-            .session
-            .as_ref()
-            .is_some_and(|s| !s.profile.is_read_only()),
-        not_read: screen == Screen::KeyDetail
-            && matches!(
-                app.views.value.items,
-                Some(crate::live::values::Items::NotRead | crate::live::values::Items::Module(_))
-            ),
-    };
+    let c = app.footer_ctx();
     let (left, right) = keymap::footer_fit(screen, c, w);
     let mut spans = vec![Span::raw(" ")];
     for (i, (k, l)) in left.iter().enumerate() {

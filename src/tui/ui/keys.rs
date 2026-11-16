@@ -414,7 +414,7 @@ fn empty_lines(state: &KeysState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>>
     } else if let (Some(glob), true) = (&state.find, state.pages > 0 && !state.is_loading()) {
         (
             format!(
-                " No key matches {} in the part read so far. n scans further.",
+                " No key matches {} in the part read so far. m scans further.",
                 escape(glob)
             ),
             style::dim(),
@@ -426,7 +426,7 @@ fn empty_lines(state: &KeysState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>>
         )
     } else if state.pages > 0 && !state.is_loading() {
         (
-            " No key of this pattern in the part read so far. n reads further.".to_string(),
+            " No key of this pattern in the part read so far. m reads further.".to_string(),
             style::dim(),
         )
     } else if !ctx.live_ready() {
@@ -446,7 +446,7 @@ fn empty_lines(state: &KeysState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>>
         .collect()
 }
 
-/// The list's bottom line: how far it got, and `n`.
+/// The list's bottom line: how far it got, and `m`.
 fn status(state: &KeysState, est: Option<(u64, bool)>, tick: u64) -> String {
     let n = format::grouped(state.rows.len() as u64);
     let of = match est {
@@ -462,18 +462,18 @@ fn status(state: &KeysState, est: Option<(u64, bool)>, tick: u64) -> String {
         };
     }
     if state.find.is_some() && !state.is_loading() && state.rows.is_empty() && state.pages > 0 {
-        return " No key matched yet. n scans further.".to_string();
+        return " No key matched yet. m scans further.".to_string();
     }
     if state.done {
         format!(" All {n} keys loaded.")
     } else if state.is_loading() {
         format!(" {} {n}{of} loaded, loading more…", spinner(tick))
     } else if state.rows.is_empty() && state.pages > 0 {
-        " No keys found yet. n reads further.".to_string()
+        " No keys found yet. m reads further.".to_string()
     } else if state.rows.is_empty() {
         " No keys loaded yet.".to_string()
     } else {
-        format!(" {n}{of} loaded. n loads 1,000 more.")
+        format!(" {n}{of} loaded. m loads 1,000 more.")
     }
 }
 

@@ -485,7 +485,7 @@ mod tests {
                 s.contains("Hot keys ranks the keys read most often."),
                 "{s}"
             );
-            assert!(s.contains("r  Analyze: "), "{s}");
+            assert!(s.contains("a  Analyze: "), "{s}");
             insta::assert_snapshot!(format!("hot_keys_no_analysis_{w}x{h}"), s);
         }
     }

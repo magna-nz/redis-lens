@@ -2,13 +2,14 @@
 //! its live requests are in `src/live/pubsub.rs`.
 //!
 //! - **Counts:** the active channels, their subscriber counts and the pattern count,
-//!   every 5 s while the view is shown (`p` pauses). They read no payload.
-//! - **The live tail:** `enter` subscribes to the selected channel, `s` to a channel or
+//!   every 5 s while the view is shown (`space` pauses them when no tail is open). They
+//!   read no payload.
+//! - **The live tail:** `enter` subscribes to the selected channel, `+` to a channel or
 //!   pattern typed in. The subscription runs on a connection of its own in the runner
 //!   ([`Act::subscribe`]); its messages arrive through [`PubSubState::tail_batch`],
 //!   also while another view is shown. The last [`TAIL_KEPT`] stay in memory, never
-//!   saved. `space` pauses what is shown, `c` clears, `/` filters, `esc` clears the
-//!   filter or stops the tail.
+//!   saved. `space` pauses what is shown, `ctrl-l` clears, `/` filters, `esc` clears
+//!   the filter or stops the tail.
 //! - **Publish (P3):** `P` opens a form for a channel (the selected one to start with)
 //!   and a message, and sends `PUBLISH` through [`Act::write`], the one gate. The
 //!   message is a value: it is drawn in the form and nowhere else. On a shard channel
@@ -25,7 +26,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::streams::form::{self, Field, Form, Step, write_failed, write_off};
 use super::streams::{list_move, off_text, plain};
@@ -62,7 +63,7 @@ const SHARD_PATTERN_HINT: &str =
 pub struct PubSubState {
     pub counts: Counts,
     pub sel: usize,
-    /// Polling the counts is paused (`p`).
+    /// Polling the counts is paused (`space` without a tail).
     pub paused: bool,
     /// An answer has arrived (so an empty list means no channels, not "not read yet").
     pub loaded: bool,
@@ -563,13 +564,13 @@ impl PubSubState {
         }
         self.tail.status = TailStatus::Stopped;
         self.tail.restart_rate(None);
-        act.info("Stopped the tail. Its messages stay until c clears them.");
+        act.info("Stopped the tail. Its messages stay until ctrl-l clears them.");
     }
 
     fn toggle_pause(&mut self, act: &mut Act<'_>) {
         let t = &mut self.tail;
         if t.id.is_none() {
-            act.info("Nothing to pause: subscribe first (enter or s).");
+            act.info("Nothing to pause: subscribe first (enter or +).");
         } else if t.frozen.take().is_some() {
             t.new_while_paused = 0;
             act.info("Tail resumed.");
@@ -577,6 +578,17 @@ impl PubSubState {
             t.frozen = Some(t.rows.clone());
             t.new_while_paused = 0;
             act.info("Tail paused: messages still arrive. Press space to show them.");
+        }
+    }
+
+    /// `space` without a tail: pause or resume polling the counts.
+    fn toggle_counts(&mut self, act: &mut Act<'_>) {
+        self.paused = !self.paused;
+        if self.paused {
+            act.info("Polling paused. Press space to resume, r to refresh once.");
+        } else {
+            act.info("Polling resumed.");
+            self.last_sent = None;
         }
     }
 
@@ -742,7 +754,7 @@ impl ViewState for PubSubState {
         }
         match self.editing.as_ref()? {
             Editing::Subscribe(text) => Some(Input {
-                label: "s",
+                label: "+",
                 text: text.clone(),
                 hint: "   channel, or pattern with * ? [ · enter to subscribe · esc to cancel",
             }),
@@ -784,22 +796,17 @@ impl ViewState for PubSubState {
             self.edit_key(key, act);
             return true;
         }
+        // `ctrl-l` clears the tail, as it clears the command line's output.
+        if key.code == KeyCode::Char('l') && key.modifiers == KeyModifiers::CONTROL {
+            self.clear(act);
+            return true;
+        }
         if !plain(&key) {
             return false;
         }
         match key.code {
             KeyCode::Char('P') => {
                 self.open_publish(act);
-                return true;
-            }
-            KeyCode::Char('p') => {
-                self.paused = !self.paused;
-                if self.paused {
-                    act.info("Polling paused. Press p to resume, r to refresh once.");
-                } else {
-                    act.info("Polling resumed.");
-                    self.last_sent = None;
-                }
                 return true;
             }
             KeyCode::Enter => {
@@ -810,11 +817,11 @@ impl ViewState for PubSubState {
                 };
                 match to {
                     Some(to) => self.start(to, act),
-                    None => act.info("No channel selected: press s to type one."),
+                    None => act.info("No channel selected: press + to type one."),
                 }
                 return true;
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('+') => {
                 self.editing = Some(Editing::Subscribe(String::new()));
                 return true;
             }
@@ -829,19 +836,21 @@ impl ViewState for PubSubState {
                 }
                 return true;
             }
+            // `space` pauses whatever is live: the tail while one is open, the counts
+            // otherwise.
             KeyCode::Char(' ') => {
-                self.toggle_pause(act);
-                return true;
-            }
-            KeyCode::Char('c') => {
-                self.clear(act);
+                if self.tail.id.is_some() {
+                    self.toggle_pause(act);
+                } else {
+                    self.toggle_counts(act);
+                }
                 return true;
             }
             KeyCode::Char('/') => {
                 if self.tail.id.is_some() {
                     self.editing = Some(Editing::Filter);
                 } else {
-                    act.info("Nothing to filter yet: subscribe first (enter or s).");
+                    act.info("Nothing to filter yet: subscribe first (enter or +).");
                 }
                 return true;
             }
@@ -987,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn polls_every_five_seconds_while_shown_and_p_pauses() {
+    fn polls_every_five_seconds_while_shown_and_space_pauses_without_a_tail() {
         let (mut app, t0) = loaded();
         assert_eq!(tick(&mut app, t0, 4_900), None);
         let id = tick(&mut app, t0, 5_000).expect("a poll at 5 s");
@@ -998,7 +1007,7 @@ mod tests {
         // Paused: no polls; `r` still reads.
         let id = app.views.pubsub.pending.unwrap();
         answer(&mut app, id, counts());
-        app.handle_key(key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Char(' ')));
         assert!(app.views.pubsub.paused);
         assert_eq!(tick(&mut app, t0, 60_000), None);
         let effects = app.handle_key(key(KeyCode::Char('r')));
@@ -1008,7 +1017,7 @@ mod tests {
     #[test]
     fn does_not_poll_while_hidden() {
         let (mut app, t0) = loaded();
-        app.handle_key(key(KeyCode::Char('1')));
+        crate::tui::app::views::testing::area(&mut app, '1');
         assert_eq!(tick(&mut app, t0, 60_000), None);
     }
 
@@ -1115,6 +1124,9 @@ mod tests {
 
     fn ch(c: char) -> KeyEvent {
         key(KeyCode::Char(c))
+    }
+    fn ctrl(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char(c), crossterm::event::KeyModifiers::CONTROL)
     }
 
     fn type_text(app: &mut App, text: &str) -> Vec<Effect> {
@@ -1223,11 +1235,11 @@ mod tests {
     }
 
     #[test]
-    fn s_asks_for_a_channel_or_a_pattern() {
+    fn plus_asks_for_a_channel_or_a_pattern() {
         let (mut app, _) = loaded();
-        assert!(app.handle_key(ch('s')).is_empty());
+        assert!(app.handle_key(ch('+')).is_empty());
         let input = app.view_input().expect("an input");
-        assert_eq!(input.label, "s");
+        assert_eq!(input.label, "+");
         // Every key is text, digits and q included.
         assert!(type_text(&mut app, "q1:*").is_empty());
         assert_eq!(app.view_input().unwrap().text, "q1:*");
@@ -1241,14 +1253,14 @@ mod tests {
 
         // A name without * ? [ is a channel; a paste goes into the input, without
         // control characters.
-        app.handle_key(ch('s'));
+        app.handle_key(ch('+'));
         app.handle_paste("news\n".into());
         let effects = app.handle_key(key(KeyCode::Enter));
         let (_, to) = subscribe_of(&effects).expect("a subscribe");
         assert_eq!(to, Subscription::Channel("news".into()));
 
         // esc cancels: nothing is sent.
-        app.handle_key(ch('s'));
+        app.handle_key(ch('+'));
         type_text(&mut app, "x");
         assert!(app.handle_key(key(KeyCode::Esc)).is_empty());
         assert!(app.view_input().is_none());
@@ -1284,6 +1296,8 @@ mod tests {
         );
         app.handle_key(ch(' '));
         assert!(app.views.pubsub.tail.paused());
+        // With a tail open, `space` pauses the tail, not the counts.
+        assert!(!app.views.pubsub.paused);
         batch(&mut app, tail, vec![msg(3, "a", b"three")], 2);
         assert_eq!(shown(&app), ["one", "two"]);
         assert_eq!(app.views.pubsub.tail.rows.len(), 3);
@@ -1294,11 +1308,34 @@ mod tests {
         assert!(!screen_text(&app, 120, 36).contains("paused"));
     }
 
+    /// With a tail open, the other screens' write keys do nothing here: no write is
+    /// sent, even with writes on and `skip_non_prod_confirm` set.
     #[test]
-    fn c_clears_the_tail() {
+    fn no_row_write_key_acts_with_a_tail_open() {
+        for k in ['d', 'D', '-', 'e', 't', 'T', 'R', 'c', 'A', 'X'] {
+            let (mut app, _, _) = subscribed();
+            let s = app.session.as_mut().unwrap();
+            s.profile.env = crate::model::Env::Local;
+            s.profile.read_only = None;
+            app.settings.skip_non_prod_confirm = true;
+            let mut effects = app.handle_key(ch(k));
+            effects.extend(app.handle_key(ch('y')));
+            assert!(
+                !testing::requests(&effects)
+                    .iter()
+                    .any(|(_, r)| matches!(r, crate::live::LiveRequest::Write(_))),
+                "{k}: {effects:?}"
+            );
+            assert!(app.confirm.is_none(), "{k}");
+            assert!(app.views.pubsub.tail.id.is_some(), "{k}: the tail stays");
+        }
+    }
+
+    #[test]
+    fn ctrl_l_clears_the_tail() {
         let (mut app, _, tail) = subscribed();
         batch(&mut app, tail, vec![msg(1, "a", b"one")], 4);
-        app.handle_key(ch('c'));
+        app.handle_key(ctrl('l'));
         let t = &app.views.pubsub.tail;
         assert!(t.rows.is_empty() && t.dropped == 0);
         assert_eq!(t.status, TailStatus::Live, "clearing does not stop it");
@@ -1369,7 +1406,7 @@ mod tests {
         });
         assert!(shown(&app).is_empty());
         // A new subscription replaces the tail: the old one's messages are stale.
-        app.handle_key(ch('s'));
+        app.handle_key(ch('+'));
         type_text(&mut app, "news");
         let (new, _) = subscribe_of(&app.handle_key(key(KeyCode::Enter))).unwrap();
         assert_ne!(new, old);
@@ -1397,8 +1434,8 @@ mod tests {
         let (mut app, _, tail) = subscribed();
         batch(&mut app, tail, vec![msg(1, "a", b"kept")], 0);
         let (id, scan) = ids(&app);
-        app.handle_key(ch('2'));
-        app.handle_key(ch('r'));
+        crate::tui::app::views::testing::area(&mut app, '2');
+        app.handle_key(ch('a'));
         let effects = app.handle_key(key(KeyCode::Enter));
         assert!(
             matches!(effects[..], [Effect::Connect { .. }]),
@@ -1473,7 +1510,7 @@ mod tests {
         app.apply(at(t0, 8_000));
         assert_eq!(app.views.pubsub.tail.rate, 0.0);
         // Messages that arrive while another view is shown are left out of the rate.
-        app.handle_key(ch('1'));
+        crate::tui::app::views::testing::area(&mut app, '1');
         batch(
             &mut app,
             tail,
@@ -1481,7 +1518,7 @@ mod tests {
             0,
         );
         app.apply(at(t0, 9_000));
-        app.handle_key(ch('5'));
+        crate::tui::app::views::testing::area(&mut app, '5');
         app.apply(at(t0, 10_000));
         assert_eq!(app.views.pubsub.tail.rate, 0.0);
         assert_eq!(app.views.pubsub.tail.rows.len(), 130, "but they are kept");
@@ -1494,7 +1531,7 @@ mod tests {
         m.pattern = Some("orders:*".into());
         batch(&mut app, tail, vec![m], 0);
         app.handle_key(ch(' '));
-        app.handle_key(ch('c'));
+        app.handle_key(ctrl('l'));
         batch(
             &mut app,
             tail,
@@ -1514,8 +1551,8 @@ mod tests {
             .unwrap_or_default();
         assert!(!value::leaks(&notice, MARKER), "{notice}");
         // A snapshot holds the report only.
-        app.handle_key(ch('2'));
-        let effects = app.handle_key(ch('s'));
+        crate::tui::app::views::testing::area(&mut app, '2');
+        let effects = app.handle_key(ctrl('s'));
         let [Effect::SaveSnapshot(report)] = &effects[..] else {
             panic!("expected a snapshot, got {effects:?}");
         };
@@ -1570,7 +1607,7 @@ mod tests {
         insta::assert_snapshot!("tail_80x24", testing::render(&app, 80, 24).backend());
         insta::assert_snapshot!("tail_120x36", testing::render(&app, 120, 36).backend());
         // A pattern subscription, paused and filtered.
-        app.handle_key(ch('s'));
+        app.handle_key(ch('+'));
         type_text(&mut app, "orders:*");
         let (tail, _) = subscribe_of(&app.handle_key(key(KeyCode::Enter))).unwrap();
         let (id, scan) = ids(&app);

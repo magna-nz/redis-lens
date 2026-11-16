@@ -210,7 +210,7 @@ fn first_run_panel(frame: &mut Frame, area: Rect, app: &App) {
         Line::default(),
     ];
     lines.extend(paragraph(
-        vec![Span::styled(" a  ", style::focus())],
+        vec![Span::styled(" +  ", style::focus())],
         "    ",
         "Add one: paste a redis:// or rediss:// URL, or a StackExchange.Redis string. The password goes to the OS keychain, never to a file.",
         style::fg(),
@@ -342,7 +342,7 @@ fn list_lines(app: &App, iw: usize) -> (Vec<(Line<'static>, Option<ConnSel>)>, u
         ));
     } else if n_saved == 0 {
         lines.push(group(
-            "   No saved connections yet. Press a to add one.".into(),
+            "   No saved connections yet. Press + to add one.".into(),
         ));
     }
     for e in app.saved_shown() {
@@ -372,7 +372,7 @@ fn list_lines(app: &App, iw: usize) -> (Vec<(Line<'static>, Option<ConnSel>)>, u
             Span::raw(" "),
             Span::styled(if add { "› " } else { "  " }, style::focus()),
             Span::styled("+ Add a connection", style::focus()),
-            Span::styled("  press a, then paste a redis:// URL", style::dim()),
+            Span::styled("  press +, then paste a redis:// URL", style::dim()),
         ]),
         Some(ConnSel::Add),
     ));
@@ -667,7 +667,7 @@ fn add_panel(frame: &mut Frame, inner: Rect, app: &App, add: Option<&AddState>) 
                     if add.is_some() {
                         " Paste or type one, then press enter."
                     } else {
-                        " Press a (or enter), then paste or type one."
+                        " Press + (or enter), then paste or type one."
                     },
                     style::fg(),
                 )),

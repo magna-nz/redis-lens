@@ -112,7 +112,7 @@ pub fn draw(frame: &mut Frame, area: Rect, st: &SlotsState, ctx: &Ctx<'_>) {
         };
         format!("{n} range{}{more}", if n == 1 { "" } else { "s" })
     };
-    let hot_right = format!("by {} · o changes the order", st.order.label());
+    let hot_right = format!("by {} · s changes the order", st.order.label());
     let selected = st.selected();
     let detail_title = selected.map_or_else(
         || "Details".to_string(),

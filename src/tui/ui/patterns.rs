@@ -4,7 +4,7 @@
 //! - **Before an analysis** the rows come from key names alone
 //!   ([`crate::tui::app::views::names`]): PATTERN and KEYS, the keys estimated
 //!   (`~1.9M`), and nothing a name does not tell (no type, size, TTL or `▲`). The
-//!   bottom line says how many names were read and that `n` reads more.
+//!   bottom line says how many names were read and that `m` reads more.
 //! - **After an analysis** the rows are the analysis's patterns, sorted by memory:
 //!   PATTERN, KEYS, MEMORY and a `▲` mark at 80 columns; TYPE and the share bar join in
 //!   at wider widths, and `v` adds the average size, the no-TTL share and the change
@@ -409,7 +409,7 @@ fn names_table(
     );
 }
 
-/// The names tree's bottom line: how many names were read, and that `n` reads more.
+/// The names tree's bottom line: how many names were read, and that `m` reads more.
 fn names_bottom(app: &App, names: &NamesState) -> (String, Style) {
     let read = format::grouped(names.names_read());
     if names.is_reading() {
@@ -443,7 +443,7 @@ fn names_bottom(app: &App, names: &NamesState) -> (String, Style) {
         )
     } else {
         (
-            format!(" {read} names read{nodes} · n reads more"),
+            format!(" {read} names read{nodes} · m reads more"),
             style::dim(),
         )
     }

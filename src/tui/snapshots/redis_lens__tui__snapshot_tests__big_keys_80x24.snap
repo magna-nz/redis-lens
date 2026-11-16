@@ -25,4 +25,4 @@ expression: "buffer_lines(&render(&app, 80, 24)).join(\"\\n\")"
 │                                             │                                │
 │                                             │                                │
 └─────────────────────────────────────────────┴────────────────────────────────┘
- ↑↓ Move   tab Next panel   y Copy   r Analyze           ctrl-f Find key  ? Help
+ ↑↓ Move   tab Next panel   y Copy   a Analyze           ctrl-f Find key  ? Help

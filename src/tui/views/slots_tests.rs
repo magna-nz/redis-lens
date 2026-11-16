@@ -285,16 +285,16 @@ fn the_hottest_slots_are_ordered_and_o_cycles_the_order() {
     assert_eq!(slots(&app), [6000, 10, 12000, 11]);
     // The node of a slot is the node that answered for it.
     assert_eq!(app.views.slots.hottest[0].node, 1);
-    app.handle_key(ch('o'));
+    app.handle_key(ch('s'));
     assert_eq!(app.views.slots.order, Order::Cpu);
     assert_eq!(slots(&app), [12000, 10, 6000, 11]);
-    app.handle_key(ch('o'));
+    app.handle_key(ch('s'));
     assert_eq!(app.views.slots.order, Order::NetIn);
     assert_eq!(slots(&app), [6000, 10, 12000, 11]);
-    app.handle_key(ch('o'));
+    app.handle_key(ch('s'));
     assert_eq!(app.views.slots.order, Order::NetOut);
     assert_eq!(slots(&app), [12000, 10, 6000, 11]);
-    app.handle_key(ch('o'));
+    app.handle_key(ch('s'));
     assert_eq!(app.views.slots.order, Order::Keys);
     assert_eq!(slots(&app), [6000, 10, 12000, 11]);
 }

@@ -345,7 +345,7 @@ fn patterns_narrowed_to_a_node() {
     // esc: back to Nodes, then the merged rows with their Δ column on 1.
     app.handle_key(key(KeyCode::Esc));
     assert_eq!(app.screen(), Screen::Nodes);
-    app.handle_key(ch('2'));
+    crate::tui::app::views::testing::area(&mut app, '2');
     let back = buffer_lines(&render(&app, 120, 36));
     assert!(back[2].starts_with("┌─ Patterns "), "{}", back[2]);
     assert!(!back[2].contains("node"), "{}", back[2]);
@@ -839,7 +839,7 @@ fn a_classic_tail_is_not_opened_on_a_node_discovery_did_not_use() {
     app.handle_key(ch(']'));
     app.handle_key(ch(']'));
     assert_eq!(app.session.as_ref().unwrap().picked, 2);
-    let mut effects = app.handle_key(ch('s'));
+    let mut effects = app.handle_key(ch('+'));
     effects.extend(press_all(&mut app, "news"));
     effects.extend(app.handle_key(key(KeyCode::Enter)));
     assert!(!opens_its_own_connection(&effects), "{effects:?}");
@@ -847,7 +847,7 @@ fn a_classic_tail_is_not_opened_on_a_node_discovery_did_not_use() {
     assert!(all.contains(NODE_3_NOT_CONNECTED), "{all}");
     // On a connected node the same keys do subscribe.
     app.handle_key(ch('['));
-    let mut effects = app.handle_key(ch('s'));
+    let mut effects = app.handle_key(ch('+'));
     effects.extend(press_all(&mut app, "news"));
     effects.extend(app.handle_key(key(KeyCode::Enter)));
     assert!(
@@ -901,7 +901,7 @@ fn the_pick_lasts_across_a_rescan_that_keeps_its_node() {
     assert_eq!(app.session.as_ref().unwrap().picked, 2);
     // A rescan whose list still has the node (same ID and address): kept.
     show(&mut app, Screen::Patterns);
-    app.handle_key(ch('r'));
+    app.handle_key(ch('a'));
     let scan = scan_of(&app);
     app.apply(Msg::Nodes {
         id,
@@ -1123,14 +1123,14 @@ fn the_key_list_walks_every_primary_in_slot_order_one_node_at_a_time() {
     let p = pages(&effects);
     assert_eq!((p[0].1.clone(), p[0].2), (never(1), 0));
     assert_eq!(app.views.keys.nodes_done, 1);
-    // Node 1 has more: its cursor is kept, and nothing is sent until `n`.
+    // Node 1 has more: its cursor is kept, and nothing is sent until `m`.
     let effects = answer(
         &mut app,
         p[0].0,
         page_reply(vec![key_row("user:2:cart")], 77),
     );
     assert!(pages(&effects).is_empty(), "{effects:?}");
-    let effects = app.handle_key(ch('n'));
+    let effects = app.handle_key(ch('m'));
     let p = pages(&effects);
     assert_eq!(
         p.iter()
@@ -1150,9 +1150,9 @@ fn the_key_list_walks_every_primary_in_slot_order_one_node_at_a_time() {
         p[0].0,
         page_reply(vec![key_row("user:4:cart"), key_row("user:5:cart")], 0),
     );
-    // Every node is done: nothing more is sent, `n` included.
+    // Every node is done: nothing more is sent, `m` included.
     assert!(pages(&effects).is_empty(), "{effects:?}");
-    assert!(pages(&app.handle_key(ch('n'))).is_empty());
+    assert!(pages(&app.handle_key(ch('m'))).is_empty());
     let k = &app.views.keys;
     assert_eq!(k.nodes_done, 3);
     for (key, node) in [

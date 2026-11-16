@@ -5,7 +5,7 @@
 //! The names are read with the engine's pager ([`crate::live::names`]): one
 //! `SCAN cursor COUNT 1000` a page, through the command budget, on a cluster every
 //! primary in turn ([`Walk`]). Nothing else about a key is read. The first time
-//! Browse › Keys shows, [`FIRST_PAGES`] pages are read one after the other; `n` reads
+//! Browse › Keys shows, [`FIRST_PAGES`] pages are read one after the other; `m` reads
 //! one more. Only one page is ever in flight, so a node's cursor is never sent twice.
 //!
 //! The patterns are inferred with [`NamePatterns`], exactly as an analysis infers
@@ -41,7 +41,7 @@ pub struct NamesState {
     tree: NamePatterns,
     /// Pages answered.
     pub pages: u64,
-    /// Pages to read before stopping: [`FIRST_PAGES`], then one more per `n`.
+    /// Pages to read before stopping: [`FIRST_PAGES`], then one more per `m`.
     want: u64,
     /// The request in flight, and what it asked, to send again when the connection it
     /// went on was replaced.
@@ -52,7 +52,7 @@ pub struct NamesState {
     pub error: Option<String>,
     /// Nodes whose `SCAN` was refused, left out of the walk.
     pub refused: Vec<usize>,
-    /// Nodes of a cluster left out because a page failed again when `n` asked for it
+    /// Nodes of a cluster left out because a page failed again when `m` asked for it
     /// again ([`NODE_SKIPPED`]): the other nodes' walk goes on without them.
     pub skipped: Vec<usize>,
     /// The cluster node whose last page failed, once: a second failure leaves it out.
@@ -115,7 +115,7 @@ impl NamesState {
     }
 
     /// The answer to the page in flight. A refused `SCAN` leaves its node out and says
-    /// why; any other failure stops the reading until `n` asks again.
+    /// why; any other failure stops the reading until `m` asks again.
     pub fn reply(&mut self, result: Result<LiveReply, LiveError>) {
         let Some((_, ask)) = self.pending.take() else {
             return;
@@ -131,7 +131,7 @@ impl NamesState {
                 self.error = Some(SCAN_REFUSED.to_string());
                 self.rebuild();
             }
-            // A cluster node that fails again after `n` asked once more is left out, so
+            // A cluster node that fails again after `m` asked once more is left out, so
             // one shard that does not answer does not stall every other shard's walk.
             Err(LiveError::Failed(_) | LiveError::Unsupported(_))
                 if self.failed_node == Some(ask.node)
@@ -148,7 +148,7 @@ impl NamesState {
             Err(e) => {
                 self.failed_node = Some(ask.node);
                 self.retry = Some(ask);
-                // Stops here: `n` tries again.
+                // Stops here: `m` tries again.
                 self.want = self.pages;
                 self.error = Some(match e {
                     LiveError::Closed => "The live connection is closed.".to_string(),
@@ -180,7 +180,7 @@ impl NamesState {
         }
     }
 
-    /// `n`: one more page. `Err` says why there is none to read.
+    /// `m`: one more page. `Err` says why there is none to read.
     pub fn more(&mut self) -> Result<(), String> {
         if !self.started() {
             return Err("Key names are read once the live connection is open.".to_string());
@@ -299,7 +299,7 @@ mod tests {
         assert_eq!(s.pages, FIRST_PAGES);
         assert!(s.next_page().is_none(), "stops after the first pages");
         s.more().unwrap();
-        let ask = s.next_page().expect("n reads one more");
+        let ask = s.next_page().expect("m reads one more");
         let LiveRequest::Names(crate::live::names::Request::Page { cursor, .. }) = ask.req else {
             panic!("a names page");
         };
@@ -382,9 +382,9 @@ mod tests {
             .collect()
     }
 
-    /// A cluster node whose page fails, and fails again when `n` asks once more, is
+    /// A cluster node whose page fails, and fails again when `m` asks once more, is
     /// left out with a reason; the other nodes' walk goes on. A standalone server's
-    /// failing page is asked again on every `n`, as before.
+    /// failing page is asked again on every `m`, as before.
     #[test]
     fn a_cluster_node_that_fails_twice_is_left_out_and_the_walk_goes_on() {
         let mut s = NamesState::default();
@@ -412,7 +412,7 @@ mod tests {
         assert!(s.done() && !s.complete(), "a node left out: never complete");
         assert!(NODE_SKIPPED.contains("left out"));
 
-        // Standalone: never left out, `n` asks again.
+        // Standalone: never left out, `m` asks again.
         let mut s = NamesState::default();
         s.start(&[], 10);
         for i in 0..3 {

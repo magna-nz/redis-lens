@@ -507,7 +507,7 @@ fn msg_lines(state: &ValueState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>> 
         let why = why.as_deref().unwrap_or("it was closed");
         (
             format!(
-                " ✗ The live connection is closed: {why}. r on Overview analyzes again and reopens it."
+                " ✗ The live connection is closed: {why}. a on Overview analyzes again and reopens it."
             ),
             style::warn(),
         )
@@ -708,7 +708,7 @@ fn divider_line(state: &ValueState, w: usize) -> Line<'static> {
             style::dim(),
         ))
     } else if !state.done() && !state.is_loading() && state.pages > 0 {
-        Some(("n loads more".to_string(), style::dim()))
+        Some(("m loads more".to_string(), style::dim()))
     } else {
         None
     };

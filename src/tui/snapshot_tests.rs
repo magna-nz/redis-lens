@@ -485,8 +485,8 @@ fn scanning_progress_header() {
         })
     };
     connected(&mut app);
-    // `r`, `enter`: a Quick analysis.
-    app.handle_key(ch('r'));
+    // `a`, `enter`: a Quick analysis.
+    app.handle_key(ch('a'));
     app.handle_key(key(KeyCode::Enter));
     connected(&mut app);
     app.apply(Msg::ScanProgress {
@@ -509,7 +509,7 @@ fn scanning_progress_header() {
 fn add_preview_masks_password() {
     let mut app = App::new(fixtures::profiles());
     app.apply(Msg::DockerFound(vec![fixtures::docker_instance()]));
-    app.handle_key(ch('a'));
+    app.handle_key(ch('+'));
     app.handle_paste(fixtures::PROD_URL.to_string());
     let t = render(&app, 120, 36);
     for line in buffer_lines(&t) {
@@ -526,7 +526,7 @@ fn add_preview_masks_password() {
 #[test]
 fn add_password_step() {
     let mut app = App::new(vec![]);
-    app.handle_key(ch('a'));
+    app.handle_key(ch('+'));
     app.handle_paste("redis://lens@staging-cache.internal:6379".into());
     app.handle_key(key(KeyCode::Enter));
     for c in "hunter2".chars() {
@@ -886,7 +886,7 @@ fn diff_view_without_history() {
     let t = render(&app, 120, 36);
     let text = buffer_lines(&t).join("\n");
     assert!(text.contains("No earlier snapshot for prod-cache-01."));
-    assert!(text.contains("Press s to save one; the next analysis compares against it."));
+    assert!(text.contains("Press ctrl-s to save one; the next analysis compares against it."));
     insta::assert_snapshot!(t.backend());
 }
 
@@ -1047,7 +1047,7 @@ fn small_terminals_do_not_panic() {
     empty.patterns.clear();
     apps.push(scanned_with(empty, fixtures::perms_ok()).0);
     let mut adding = App::new(fixtures::profiles());
-    adding.handle_key(ch('a'));
+    adding.handle_key(ch('+'));
     adding.handle_paste(fixtures::PROD_URL.into());
     apps.push(adding);
     for app in &mut apps {
@@ -1200,7 +1200,7 @@ fn patterns_long_child_name_keeps_its_indent() {
 fn patterns_sorted_by_keys() {
     let mut app = scanned(true);
     select_pattern(&mut app, "user:{id}:cart");
-    app.handle_key(ch('o'));
+    app.handle_key(ch('s'));
     let t = render(&app, 120, 36);
     let lines = buffer_lines(&t);
     assert!(lines[2].contains("by keys"), "{}", lines[2]);
@@ -1219,7 +1219,7 @@ fn patterns_sorted_by_keys() {
 #[test]
 fn patterns_sorted_by_name_shows_an_up_arrow() {
     let mut app = scanned(true);
-    press(&mut app, "oooo");
+    press(&mut app, "ssss");
     let lines = buffer_lines(&render(&app, 120, 36));
     assert!(lines[2].contains("by name"), "{}", lines[2]);
     assert!(lines[3].starts_with("│   PATTERN ▲"), "{}", lines[3]);
@@ -1337,7 +1337,7 @@ fn rescanning(view: char) -> (App, ConnId, ScanId) {
     go(&mut app, view);
     press(&mut app, "j");
     let id = app.session.as_ref().unwrap().id;
-    app.handle_key(ch('r'));
+    app.handle_key(ch('a'));
     let effects = app.handle_key(key(KeyCode::Enter));
     let [Effect::Connect { scan, .. }] = effects[..] else {
         panic!("unexpected effects {effects:?}");
@@ -1408,7 +1408,7 @@ fn every_view_marks_previous_results_until_the_rescans_first_partial() {
     let (mut app2, id2) = scanned_with(fixtures::report_lru(), fixtures::perms_freq_skipped());
     set_history(&mut app2, id2, None);
     go(&mut app2, '3');
-    app2.handle_key(ch('r'));
+    app2.handle_key(ch('a'));
     app2.handle_key(key(KeyCode::Enter));
     for view in ['3', '4'] {
         go(&mut app2, view);
@@ -1420,7 +1420,7 @@ fn every_view_marks_previous_results_until_the_rescans_first_partial() {
         scan,
         partial: fixtures::partial(true),
     });
-    app.handle_key(ch('2'));
+    crate::tui::app::views::testing::area(&mut app, '2');
     let line = top(&app, 120);
     assert!(line.contains("partial · 3,200 / 100,000 sampled"), "{line}");
     assert!(!line.contains("previous"), "{line}");
@@ -1458,7 +1458,8 @@ fn patterns_rescan_failed_keeps_previous_results_marked() {
 #[test]
 fn help_over_patterns_80x24() {
     let mut app = scanned_with_history(true);
-    press(&mut app, "2j?");
+    crate::tui::app::views::testing::area(&mut app, '2');
+    press(&mut app, "j?");
     let t = render(&app, 80, 24);
     let text = buffer_lines(&t).join("\n");
     assert!(text.contains("Help · Browse › Keys"));
@@ -1702,8 +1703,8 @@ fn a_slow_keychain_during_a_rescan_shows_the_hint_in_the_header() {
     let t0 = Instant::now();
     let mut app = scanned_with_history(true);
     app.apply(Msg::TickAt(t0));
-    app.handle_key(ch('2'));
-    app.handle_key(ch('r'));
+    crate::tui::app::views::testing::area(&mut app, '2');
+    app.handle_key(ch('a'));
     app.handle_key(key(KeyCode::Enter));
     let text = |app: &App| buffer_lines(&render(app, 140, 40)).join("\n");
     assert!(!text(&app).contains("Waiting for the OS keychain"));
@@ -2023,28 +2024,30 @@ fn big_keys_without_an_analysis_says_what_it_needs() {
         );
         assert!(
             text.contains(&format!(
-                "r  Analyze: {} keys",
+                "a  Analyze: {} keys",
                 crate::format::grouped(est.keys)
             )),
             "{text}"
         );
-        assert!(lines[h as usize - 1].starts_with(" r Analyze"), "{text}");
+        assert!(lines[h as usize - 1].starts_with(" a Analyze"), "{text}");
     }
 }
 
-/// Streams before an analysis: the footer offers `r Analyze`, which is what `r` does
-/// there (its key table row says Refresh, for once there are streams).
+/// Streams before an analysis: the footer offers `a Analyze`, which is what `a` does
+/// there; `r` refreshes only once there are streams, so before that it does nothing.
 #[test]
-fn streams_before_an_analysis_offer_r_analyze_in_the_footer() {
+fn streams_before_an_analysis_offer_a_analyze_in_the_footer() {
     let mut app = connected_without_analysis(Screen::Streams);
     let lines = buffer_lines(&render(&app, 80, 24));
     assert!(
-        lines[23].starts_with(" r Analyze   tab Next panel"),
+        lines[23].starts_with(" a Analyze   tab Next panel"),
         "{}",
         lines[23]
     );
     assert!(!lines[23].contains("Refresh"), "{}", lines[23]);
-    let effects = app.handle_key(ch('r'));
+    assert!(app.handle_key(ch('r')).is_empty());
+    assert!(app.analyze.is_none(), "r does not analyze any more");
+    let effects = app.handle_key(ch('a'));
     assert!(effects.is_empty(), "{effects:?}");
-    assert!(app.analyze.is_some(), "r opens Analyze the keys?");
+    assert!(app.analyze.is_some(), "a opens Analyze the keys?");
 }

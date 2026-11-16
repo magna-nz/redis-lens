@@ -445,7 +445,7 @@ mod tests {
                 s.contains("Expiry ranks patterns by TTL risk. It needs a sample of the keys:"),
                 "{s}"
             );
-            assert!(s.contains("r  Analyze: "), "{s}");
+            assert!(s.contains("a  Analyze: "), "{s}");
             assert!(s.contains("is on Overview (1)"), "{s}");
             insta::assert_snapshot!(format!("expiry_no_analysis_{w}x{h}"), s);
         }

@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn another_views_text_input_waits_under_the_prompt() {
         let mut app = on(Screen::PubSub);
-        app.handle_key(ch('s'));
+        app.handle_key(ch('+'));
         type_text(&mut app, "orders");
         assert!(app.view_input().is_some());
         app.handle_key(ctrl('f'));
@@ -477,13 +477,13 @@ mod tests {
         assert!(!app.find.open);
         // "Analyze the keys?".
         let mut app = on(Screen::Patterns);
-        app.handle_key(ch('r'));
+        app.handle_key(ch('a'));
         assert!(app.analyze.is_some());
         app.handle_key(ctrl('f'));
         assert!(!app.find.open);
         // The add flow.
         let mut app = on(Screen::Connections);
-        app.handle_key(ch('a'));
+        app.handle_key(ch('+'));
         assert!(app.add.is_some());
         app.handle_key(ctrl('f'));
         assert!(!app.find.open);
@@ -498,7 +498,7 @@ mod tests {
             .position(|r| matches!(r, crate::tui::tree::Row::Pattern { .. }))
             .unwrap();
         app.patterns.sel = at;
-        app.handle_key(ch('D'));
+        app.handle_key(ch('d'));
         assert!(app.bulk.is_some(), "{}", notice(&app));
         app.handle_key(ctrl('f'));
         assert!(!app.find.open);
@@ -507,7 +507,7 @@ mod tests {
         let s = app.session.as_mut().unwrap();
         s.profile.env = Env::Prod;
         s.profile.read_only = Some(false);
-        app.handle_key(ch('N'));
+        app.handle_key(ch('+'));
         type_text(&mut app, "9");
         app.handle_key(key(KeyCode::Enter));
         app.handle_key(key(KeyCode::Enter));
@@ -590,6 +590,41 @@ mod tests {
         assert_eq!(app.find.text, "cart");
     }
 
+    /// Find results are of no pattern: `T` and `D` (the pattern's bulk actions) say so
+    /// and start nothing, on any profile.
+    #[test]
+    fn capital_t_and_d_on_find_results_start_no_bulk_action() {
+        let mut app = results();
+        let s = app.session.as_mut().unwrap();
+        s.profile.env = crate::model::Env::Local;
+        s.profile.read_only = None;
+        for k in ['T', 'D'] {
+            let effects = app.handle_key(ch(k));
+            assert!(testing::requests(&effects).is_empty(), "{effects:?}");
+            assert!(app.bulk.is_none() && app.confirm.is_none());
+            assert_eq!(
+                notice(&app),
+                "T and D work on every key of a pattern: Find results are of no pattern."
+            );
+        }
+        assert_eq!(app.screen(), Screen::KeyList);
+    }
+
+    /// `Y` on Find results copies the pattern the selected key belongs to.
+    #[test]
+    fn capital_y_on_find_results_copies_the_keys_pattern() {
+        let mut app = results();
+        let copied: Vec<_> = app
+            .handle_key(ch('Y'))
+            .into_iter()
+            .filter_map(|e| match e {
+                Effect::Copy(t) => Some(t.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copied, ["cart:archive:{id}"], "{}", notice(&app));
+    }
+
     #[test]
     fn the_results_page_on_with_n_and_open_a_value() {
         let mut app = results();
@@ -597,12 +632,12 @@ mod tests {
         assert_eq!(app.views.keys.other_pattern, 0);
         assert!(last_line(&app, 120, 36).contains("ctrl-f Find key"));
         let foot = text(&testing::render(&app, 120, 36));
-        assert!(foot.contains("3 loaded. n loads 1,000 more."), "{foot}");
+        assert!(foot.contains("3 loaded. m loads 1,000 more."), "{foot}");
         assert!(foot.contains("‹ Find: *cart*"), "{foot}");
         // Ticks load nothing more on their own.
         let effects = app.apply(Msg::TickAt(std::time::Instant::now()));
         assert!(testing::requests(&effects).is_empty());
-        let (id, req) = find_request(&app.handle_key(ch('n')));
+        let (id, req) = find_request(&app.handle_key(ch('m')));
         assert!(
             matches!(req, Request::Find { cursor: 4_242, .. }),
             "{req:?}"
@@ -615,18 +650,18 @@ mod tests {
         assert!(app.views.keys.done);
         let all = text(&testing::render(&app, 120, 36));
         assert!(all.contains("4 keys match."), "{all}");
-        // `/`, `t`, `o` and `y` work as on a pattern's keys.
-        app.handle_key(ch('t'));
+        // `/`, `ctrl-t`, `s` and `y` work as on a pattern's keys.
+        app.handle_key(ctrl('t'));
         assert_eq!(app.views.keys.visible().len(), 1);
-        app.handle_key(ch('t'));
-        app.handle_key(ch('t'));
-        app.handle_key(ch('t'));
-        app.handle_key(ch('t'));
-        app.handle_key(ch('t'));
-        app.handle_key(ch('t'));
-        app.handle_key(ch('t'));
+        app.handle_key(ctrl('t'));
+        app.handle_key(ctrl('t'));
+        app.handle_key(ctrl('t'));
+        app.handle_key(ctrl('t'));
+        app.handle_key(ctrl('t'));
+        app.handle_key(ctrl('t'));
+        app.handle_key(ctrl('t'));
         assert_eq!(app.views.keys.visible().len(), 4);
-        app.handle_key(ch('o'));
+        app.handle_key(ch('s'));
         assert_eq!(notice(&app), "Keys sorted by length.");
         app.handle_key(ch('/'));
         type_text(&mut app, "promo");
@@ -658,7 +693,7 @@ mod tests {
         // `esc` goes back to where the find started, and closes the results.
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen(), Screen::Overview);
-        app.handle_key(ch('2'));
+        crate::tui::app::views::testing::area(&mut app, '2');
         assert_eq!(app.screen(), Screen::Patterns);
     }
 
@@ -833,20 +868,20 @@ mod tests {
     }
 
     #[test]
-    fn n_on_the_results_starts_with_an_empty_name() {
+    fn plus_on_the_results_starts_with_an_empty_name() {
         let mut app = results();
         let s = app.session.as_mut().unwrap();
         s.profile.env = Env::Local;
         s.profile.read_only = None;
-        app.handle_key(ch('N'));
+        app.handle_key(ch('+'));
         let form = app.views.keys.form.as_ref().expect("the form");
         assert_eq!(form.fields[0].text, "");
     }
 
     #[test]
-    fn n_on_the_results_of_a_read_only_profile_sends_nothing() {
+    fn plus_on_the_results_of_a_read_only_profile_sends_nothing() {
         let mut app = results();
-        let effects = app.handle_key(ch('N'));
+        let effects = app.handle_key(ch('+'));
         assert!(app.views.keys.form.is_none());
         assert!(notice(&app).contains("read-only"), "{}", notice(&app));
         assert!(testing::requests(&effects).is_empty());
@@ -862,20 +897,20 @@ mod tests {
         let all = text(&testing::render(&app, 120, 36));
         assert!(all.contains("No key matches *nope*."), "{all}");
         assert!(all.contains("ctrl-f searches again"), "{all}");
-        // A first page that found nothing yet: n scans further.
+        // A first page that found nothing yet: m scans further.
         let mut app = on(Screen::Overview);
         let (id, _) = find_request(&find(&mut app, "nope"));
         testing::reply(&mut app, id, page(Vec::new(), 55));
         let all = text(&testing::render(&app, 120, 36));
         assert!(
-            all.contains("No key matched yet. n scans further."),
+            all.contains("No key matched yet. m scans further."),
             "{all}"
         );
         assert!(
-            all.contains("No key matches *nope* in the part read so far. n scans further."),
+            all.contains("No key matches *nope* in the part read so far. m scans further."),
             "{all}"
         );
-        let (_, req) = find_request(&app.handle_key(ch('n')));
+        let (_, req) = find_request(&app.handle_key(ch('m')));
         assert!(matches!(req, Request::Find { cursor: 55, .. }));
     }
 

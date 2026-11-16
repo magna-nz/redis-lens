@@ -5,13 +5,93 @@
 //! `app.rs` and, on the screens a view state owns (`app::views`), in that state; tests
 //! in `app.rs` keep the table and the handlers in step. Every phase 1 key is here,
 //! also those of views that are still stubs.
+//!
+//! Every row is tagged with its [`Verb`]: the key grammar (`docs/ui-redesign.md` §5)
+//! gives each of its letters one meaning on every screen, and a test checks that no
+//! screen binds one of them to a verb of another kind.
 
 use super::app::Screen;
 use super::ui::widgets::width;
 
+/// What kind of action a key is, in the key grammar. A grammar key ([`grammar`]) means
+/// one [`Verb`] on every screen; [`Verb::Screen`] is a screen's own verb, on a key the
+/// grammar leaves free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    Move,
+    Open,
+    Back,
+    Area,
+    Panel,
+    Filter,
+    Sort,
+    More,
+    MoreRows,
+    Analyze,
+    Refresh,
+    Pause,
+    /// `y`: the selected row's thing.
+    Copy,
+    /// `Y`: its parent's.
+    CopyParent,
+    Edit,
+    Add,
+    /// `t`: a TTL on the selected row.
+    Ttl,
+    /// `T`: a TTL on its parent.
+    TtlParent,
+    /// `d`: delete the selected row.
+    Delete,
+    /// `D`: delete its parent.
+    DeleteParent,
+    Rename,
+    Format,
+    Writes,
+    Databases,
+    Node,
+    Help,
+    Snapshot,
+    FindKey,
+    Command,
+    Dashboard,
+    Quit,
+    /// A screen's own verb, on a key the grammar leaves free.
+    Screen,
+}
+
+/// The letters of the key grammar and the one verb each means wherever it is bound.
+pub fn grammar(key: &str) -> Option<Verb> {
+    Some(match key {
+        "a" => Verb::Analyze,
+        "r" => Verb::Refresh,
+        "space" => Verb::Pause,
+        "s" => Verb::Sort,
+        "m" => Verb::MoreRows,
+        "v" => Verb::More,
+        "/" => Verb::Filter,
+        "y" => Verb::Copy,
+        "Y" => Verb::CopyParent,
+        "e" => Verb::Edit,
+        "+" => Verb::Add,
+        "t" => Verb::Ttl,
+        "T" => Verb::TtlParent,
+        "d" => Verb::Delete,
+        "D" => Verb::DeleteParent,
+        "R" => Verb::Rename,
+        "f" => Verb::Format,
+        "w" => Verb::Writes,
+        "b" => Verb::Databases,
+        "?" => Verb::Help,
+        "0" | "1" | "2" | "3" | "4" | "5" => Verb::Area,
+        _ => return None,
+    })
+}
+
 /// One row of the key table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyHelp {
+    /// What kind of action it is in the key grammar.
+    pub verb: Verb,
     /// All keys that do this, for the overlay and the spec, e.g. `"↑↓ j k"`.
     /// Whitespace separates alternatives; no alternative repeats within a view.
     pub keys: &'static str,
@@ -26,6 +106,7 @@ pub struct KeyHelp {
 }
 
 const fn k(
+    verb: Verb,
     keys: &'static str,
     footer_keys: &'static str,
     label: &'static str,
@@ -33,6 +114,7 @@ const fn k(
     in_footer: bool,
 ) -> KeyHelp {
     KeyHelp {
+        verb,
         keys,
         footer_keys,
         label,
@@ -42,6 +124,7 @@ const fn k(
 }
 
 const CONNECTIONS_KEY: KeyHelp = k(
+    Verb::Area,
     "0",
     "0",
     "Connections",
@@ -49,25 +132,42 @@ const CONNECTIONS_KEY: KeyHelp = k(
     true,
 );
 const AREAS: KeyHelp = k(
+    Verb::Area,
     "1 2 3 4 5",
     "1-5",
     "Areas",
-    "Overview, Browse, Analyze, Server, Pub/Sub",
+    "Overview, Browse, Analyze, Server, Pub/Sub; the current area's digit again: its next panel",
     false,
 );
 const MORE: KeyHelp = k(
+    Verb::More,
     "v",
     "v",
     "More",
     "Show more columns and details, or fewer again",
     true,
 );
-const HELP: KeyHelp = k("?", "?", "Help", "Help here; type to find any action", true);
-const QUIT: KeyHelp = k("q ctrl-c", "q", "Quit", "Quit", false);
+const HELP: KeyHelp = k(
+    Verb::Help,
+    "?",
+    "?",
+    "Help",
+    "Help here; type to find any action",
+    true,
+);
+const QUIT: KeyHelp = k(Verb::Quit, "q ctrl-c", "q", "Quit", "Quit", false);
 
-const COMMAND_LINE_KEY: KeyHelp = k(":", ":", "Command", "Open the command line", true);
+const COMMAND_LINE_KEY: KeyHelp = k(
+    Verb::Command,
+    ":",
+    ":",
+    "Command",
+    "Open the command line",
+    true,
+);
 
 const FIND_KEY: KeyHelp = k(
+    Verb::FindKey,
     "ctrl-f",
     "ctrl-f",
     "Find key",
@@ -76,6 +176,7 @@ const FIND_KEY: KeyHelp = k(
 );
 
 const DATABASES_KEY: KeyHelp = k(
+    Verb::Databases,
     "b",
     "b",
     "Database",
@@ -84,6 +185,7 @@ const DATABASES_KEY: KeyHelp = k(
 );
 
 const DASHBOARD_KEY: KeyHelp = k(
+    Verb::Dashboard,
     "ctrl-o",
     "ctrl-o",
     "Dashboard",
@@ -94,6 +196,7 @@ const DASHBOARD_KEY: KeyHelp = k(
 /// `w` from every screen: on Connections for the selected profile, elsewhere for the
 /// connected one. Connections' footer shows it.
 const WRITES_KEY: KeyHelp = k(
+    Verb::Writes,
     "w",
     "w",
     "Writes",
@@ -115,9 +218,11 @@ static GLOBAL: [KeyHelp; 10] = [
 ];
 
 /// The keys of the command line panel while it is open (`:`). Its input line replaces
-/// the footer, so none of them is in a footer.
+/// the footer, so none of them is in a footer. The grammar does not reach in there:
+/// the command line takes every key while it is open.
 static COMMAND_LINE: [KeyHelp; 9] = [
     k(
+        Verb::Screen,
         "enter",
         "enter",
         "Run",
@@ -125,6 +230,7 @@ static COMMAND_LINE: [KeyHelp; 9] = [
         false,
     ),
     k(
+        Verb::Screen,
         "↑↓",
         "↑↓",
         "History",
@@ -132,15 +238,31 @@ static COMMAND_LINE: [KeyHelp; 9] = [
         false,
     ),
     k(
+        Verb::Screen,
         "tab",
         "tab",
         "Complete",
         "Complete a command, subcommand or loaded key name",
         false,
     ),
-    k("PgUp PgDn", "PgUp", "Scroll", "Scroll the output", false),
-    k("ctrl-l", "ctrl-l", "Clear", "Clear the output", false),
     k(
+        Verb::Move,
+        "PgUp PgDn",
+        "PgUp",
+        "Scroll",
+        "Scroll the output",
+        false,
+    ),
+    k(
+        Verb::Screen,
+        "ctrl-l",
+        "ctrl-l",
+        "Clear",
+        "Clear the output",
+        false,
+    ),
+    k(
+        Verb::Screen,
         "ctrl-u",
         "ctrl-u",
         "Clear line",
@@ -148,6 +270,7 @@ static COMMAND_LINE: [KeyHelp; 9] = [
         false,
     ),
     k(
+        Verb::Screen,
         "ctrl-t",
         "ctrl-t",
         "View",
@@ -155,6 +278,7 @@ static COMMAND_LINE: [KeyHelp; 9] = [
         false,
     ),
     k(
+        Verb::Screen,
         "ctrl-p",
         "ctrl-p",
         "Pipeline",
@@ -162,6 +286,7 @@ static COMMAND_LINE: [KeyHelp; 9] = [
         false,
     ),
     k(
+        Verb::Back,
         "esc",
         "esc",
         "Close",
@@ -170,9 +295,24 @@ static COMMAND_LINE: [KeyHelp; 9] = [
     ),
 ];
 
-const MOVE: KeyHelp = k("↑↓ j k", "↑↓", "Move", "Move the selection", true);
-const PAGE: KeyHelp = k("PgUp PgDn", "PgUp", "Page", "Move one page", false);
+const MOVE: KeyHelp = k(
+    Verb::Move,
+    "↑↓ j k",
+    "↑↓",
+    "Move",
+    "Move the selection",
+    true,
+);
+const PAGE: KeyHelp = k(
+    Verb::Move,
+    "PgUp PgDn",
+    "PgUp",
+    "Page",
+    "Move one page",
+    false,
+);
 const ENDS: KeyHelp = k(
+    Verb::Move,
     "Home End g G",
     "Home",
     "First/last",
@@ -180,6 +320,7 @@ const ENDS: KeyHelp = k(
     false,
 );
 const PANEL: KeyHelp = k(
+    Verb::Panel,
     "tab shift-tab",
     "tab",
     "Next panel",
@@ -187,6 +328,7 @@ const PANEL: KeyHelp = k(
     true,
 );
 const COPY_PATTERN: KeyHelp = k(
+    Verb::Copy,
     "y",
     "y",
     "Copy",
@@ -194,6 +336,7 @@ const COPY_PATTERN: KeyHelp = k(
     true,
 );
 const COPY_KEY: KeyHelp = k(
+    Verb::Copy,
     "y",
     "y",
     "Copy",
@@ -201,6 +344,7 @@ const COPY_KEY: KeyHelp = k(
     true,
 );
 const COPY_CMD: KeyHelp = k(
+    Verb::CopyParent,
     "Y",
     "Y",
     "Copy cmd",
@@ -208,52 +352,76 @@ const COPY_CMD: KeyHelp = k(
     false,
 );
 const ANALYZE: KeyHelp = k(
-    "r",
-    "r",
+    Verb::Analyze,
+    "a",
+    "a",
     "Analyze",
     "Analyze again (Quick or Deep); old results stay",
     true,
 );
 const SNAPSHOT: KeyHelp = k(
-    "s",
-    "s",
-    "Snapshot",
+    Verb::Snapshot,
+    "ctrl-s",
+    "ctrl-s",
+    "Save",
     "Save a snapshot of the analysis",
     true,
 );
-const REFRESH: KeyHelp = k("r", "r", "Refresh", "Refresh this panel now", true);
-const PAUSE: KeyHelp = k("p", "p", "Pause", "Pause or resume polling", true);
+const REFRESH: KeyHelp = k(
+    Verb::Refresh,
+    "r",
+    "r",
+    "Refresh",
+    "Refresh this panel now",
+    true,
+);
+const PAUSE: KeyHelp = k(
+    Verb::Pause,
+    "space",
+    "space",
+    "Pause",
+    "Pause or resume polling",
+    true,
+);
 /// `[` `]` on the screens that read the picked node of a cluster: only in `?`, so the
 /// footers stay short.
 const PICK_NODE: KeyHelp = k(
+    Verb::Node,
     "[ ]",
     "[ ]",
     "Node",
     "Pick the previous or next node (cluster only)",
     false,
 );
+/// `T` on the key list and `t` on Patterns: the bulk TTL of a pattern.
+const BULK_TTL_HELP: &str = "Set a TTL on every key of the pattern (writes)";
+/// `D` on the key list and `d` on Patterns: the bulk delete of a pattern.
+const BULK_DELETE_HELP: &str = "Delete every key of the pattern (writes)";
 
 static CONNECTIONS: [KeyHelp; 8] = [
     MOVE,
     PAGE,
     ENDS,
     k(
+        Verb::Open,
         "enter",
         "enter",
         "Connect",
         "Connect: reads the server's own figures, no keys",
         true,
     ),
-    k("a", "a", "Add", "Add a connection", true),
+    k(Verb::Add, "+", "+", "Add", "Add a connection", true),
     k(
+        Verb::Filter,
         "/",
         "/",
         "Filter",
         "Filter the profiles by name or tag",
         true,
     ),
-    k("esc", "esc", "Clear", "Clear the filter", false),
+    k(Verb::Back, "esc", "esc", "Clear", "Clear the filter", false),
     k(
+        Verb::Refresh,
         "r",
         "r",
         "Docker",
@@ -264,8 +432,9 @@ static CONNECTIONS: [KeyHelp; 8] = [
 
 static OVERVIEW: [KeyHelp; 9] = [
     k(
-        "r",
-        "r",
+        Verb::Analyze,
+        "a",
+        "a",
         "Analyze keys",
         "Analyze the keys: Quick (10,000) or Deep (100,000)",
         true,
@@ -274,6 +443,7 @@ static OVERVIEW: [KeyHelp; 9] = [
     PAGE,
     ENDS,
     k(
+        Verb::Open,
         "enter",
         "enter",
         "Go there",
@@ -281,18 +451,27 @@ static OVERVIEW: [KeyHelp; 9] = [
         true,
     ),
     k(
+        Verb::Back,
         "esc",
         "esc",
         "Stop",
         "Stop the analysis and keep what it has sampled",
         true,
     ),
-    k("p", "p", "Pause", "Pause or resume the live figures", true),
     k(
-        "+ -",
-        "+-",
+        Verb::Pause,
+        "space",
+        "space",
+        "Pause",
+        "Pause or resume the live figures",
+        true,
+    ),
+    k(
+        Verb::Screen,
+        "< >",
+        "<>",
         "Interval",
-        "Poll the live figures more or less often, 1 to 60 s",
+        "Poll the live figures less or more often, 1 to 60 s",
         true,
     ),
     PICK_NODE,
@@ -304,6 +483,7 @@ static PATTERNS: [KeyHelp; 16] = [
     ENDS,
     PANEL,
     k(
+        Verb::Open,
         "→ l enter",
         "→",
         "Open",
@@ -311,21 +491,31 @@ static PATTERNS: [KeyHelp; 16] = [
         true,
     ),
     k(
+        Verb::Back,
         "← h",
         "←",
         "Fold",
         "Collapse a group, or go up to it",
         false,
     ),
-    k("/", "/", "Filter", "Filter patterns by name", true),
     k(
-        "n",
-        "n",
-        "More names",
+        Verb::Filter,
+        "/",
+        "/",
+        "Filter",
+        "Filter patterns by name",
+        true,
+    ),
+    k(
+        Verb::MoreRows,
+        "m",
+        "m",
+        "More rows",
         "Before an analysis: read 1,000 more key names",
         true,
     ),
     k(
+        Verb::Back,
         "esc",
         "esc",
         "Clear",
@@ -333,8 +523,9 @@ static PATTERNS: [KeyHelp; 16] = [
         false,
     ),
     k(
-        "o",
-        "o",
+        Verb::Sort,
+        "s",
+        "s",
         "Sort",
         "Sort by memory, keys, avg size, no-TTL % or name",
         true,
@@ -343,28 +534,17 @@ static PATTERNS: [KeyHelp; 16] = [
     COPY_CMD,
     ANALYZE,
     SNAPSHOT,
-    k(
-        "x",
-        "x",
-        "Expire",
-        "Set a TTL on every key of the pattern (writes)",
-        false,
-    ),
-    k(
-        "D",
-        "D",
-        "Delete",
-        "Delete every key of the pattern (writes)",
-        false,
-    ),
+    k(Verb::Ttl, "t", "t", "Expire", BULK_TTL_HELP, false),
+    k(Verb::Delete, "d", "d", "Delete", BULK_DELETE_HELP, false),
 ];
 
-static KEY_LIST: [KeyHelp; 12] = [
+static KEY_LIST: [KeyHelp; 18] = [
     MOVE,
     PAGE,
     ENDS,
     PANEL,
     k(
+        Verb::Open,
         "→ l enter",
         "→",
         "Value",
@@ -372,22 +552,93 @@ static KEY_LIST: [KeyHelp; 12] = [
         true,
     ),
     k(
+        Verb::Back,
         "← h esc",
         "esc",
         "Back",
         "Clear the filters first, then go back",
         true,
     ),
-    k("/", "/", "Filter", "Filter the loaded keys by name", true),
-    k("o", "o", "Sort", "Sort the loaded keys", false),
-    k("t", "t", "Type", "Show one type of the loaded keys", false),
-    k("n", "n", "More keys", "Load 1,000 more keys", true),
+    k(
+        Verb::Filter,
+        "/",
+        "/",
+        "Filter",
+        "Filter the loaded keys by name",
+        true,
+    ),
+    k(Verb::Sort, "s", "s", "Sort", "Sort the loaded keys", false),
+    k(
+        Verb::Screen,
+        "ctrl-t",
+        "ctrl-t",
+        "Type",
+        "Show one type of the loaded keys",
+        false,
+    ),
+    k(
+        Verb::MoreRows,
+        "m",
+        "m",
+        "More rows",
+        "Load 1,000 more keys",
+        true,
+    ),
     COPY_KEY,
-    k("N", "N", "New key", "Add a key (writes)", false),
+    k(
+        Verb::CopyParent,
+        "Y",
+        "Y",
+        "Copy pattern",
+        "Copy the pattern of the selected key",
+        false,
+    ),
+    k(Verb::Add, "+", "+", "New key", "Add a key (writes)", true),
+    k(
+        Verb::Ttl,
+        "t",
+        "t",
+        "TTL",
+        "Set or remove the selected key's TTL (writes)",
+        false,
+    ),
+    k(
+        Verb::Delete,
+        "d",
+        "d",
+        "Delete",
+        "Delete the selected key (writes)",
+        false,
+    ),
+    k(
+        Verb::Rename,
+        "R",
+        "R",
+        "Rename",
+        "Rename the selected key, never over another (writes)",
+        false,
+    ),
+    k(
+        Verb::TtlParent,
+        "T",
+        "T",
+        "Expire all",
+        BULK_TTL_HELP,
+        false,
+    ),
+    k(
+        Verb::DeleteParent,
+        "D",
+        "D",
+        "Delete all",
+        BULK_DELETE_HELP,
+        false,
+    ),
 ];
 
-static KEY_DETAIL: [KeyHelp; 15] = [
+static KEY_DETAIL: [KeyHelp; 17] = [
     k(
+        Verb::Move,
         "↑↓ j k",
         "↑↓",
         "Move",
@@ -397,8 +648,16 @@ static KEY_DETAIL: [KeyHelp; 15] = [
     PAGE,
     ENDS,
     PANEL,
-    k("→ l", "→", "Value", "Move into the value pane", true),
     k(
+        Verb::Open,
+        "→ l",
+        "→",
+        "Value",
+        "Move into the value pane",
+        true,
+    ),
+    k(
+        Verb::Back,
         "← h esc",
         "esc",
         "Back",
@@ -406,14 +665,23 @@ static KEY_DETAIL: [KeyHelp; 15] = [
         true,
     ),
     k(
+        Verb::Format,
         "f",
         "f",
         "Format",
         "Show the value as text, hex, JSON, MessagePack, PHP, Pickle, Protobuf or Java",
         true,
     ),
-    k("n", "n", "More", "Load the next 100 items", false),
     k(
+        Verb::MoreRows,
+        "m",
+        "m",
+        "More rows",
+        "Load the next 100 items",
+        false,
+    ),
+    k(
+        Verb::Copy,
         "y",
         "y",
         "Copy",
@@ -421,6 +689,15 @@ static KEY_DETAIL: [KeyHelp; 15] = [
         true,
     ),
     k(
+        Verb::CopyParent,
+        "Y",
+        "Y",
+        "Copy key",
+        "Copy the key name to the clipboard",
+        false,
+    ),
+    k(
+        Verb::Edit,
         "e",
         "e",
         "Edit",
@@ -428,14 +705,31 @@ static KEY_DETAIL: [KeyHelp; 15] = [
         true,
     ),
     k(
+        Verb::Add,
         "+",
         "+",
         "Add",
         "Add a field, element or member (writes)",
         true,
     ),
-    k("t", "t", "TTL", "Set or remove the TTL (writes)", false),
     k(
+        Verb::Ttl,
+        "t",
+        "t",
+        "Field TTL",
+        "Set or remove the selected hash field's TTL (writes)",
+        false,
+    ),
+    k(
+        Verb::TtlParent,
+        "T",
+        "T",
+        "TTL",
+        "Set or remove the key's TTL (writes)",
+        false,
+    ),
+    k(
+        Verb::Rename,
         "R",
         "R",
         "Rename",
@@ -443,13 +737,21 @@ static KEY_DETAIL: [KeyHelp; 15] = [
         false,
     ),
     k(
+        Verb::Delete,
         "d",
         "d",
         "Delete",
         "Delete the selected field, element or member (writes)",
         true,
     ),
-    k("D", "D", "Delete key", "Delete the key (writes)", true),
+    k(
+        Verb::DeleteParent,
+        "D",
+        "D",
+        "Delete key",
+        "Delete the key (writes)",
+        true,
+    ),
 ];
 
 static TTL: [KeyHelp; 8] = [
@@ -486,21 +788,23 @@ static CLIENTS: [KeyHelp; 10] = [
     ENDS,
     PANEL,
     k(
+        Verb::Open,
         "enter",
         "enter",
         "List",
         "List the selected group's connections",
         true,
     ),
-    k("esc", "esc", "Back", "Back to the groups", false),
+    k(Verb::Back, "esc", "esc", "Back", "Back to the groups", true),
     PAUSE,
     REFRESH,
     k(
-        "K",
-        "K",
-        "Kill",
-        "Kill the selected connection (writes)",
-        false,
+        Verb::Delete,
+        "d",
+        "d",
+        "End",
+        "End the selected connection (writes)",
+        true,
     ),
     PICK_NODE,
 ];
@@ -514,51 +818,70 @@ static SLOW_LOG: [KeyHelp; 10] = [
     REFRESH,
     COPY_LINE,
     k(
-        "c",
-        "c",
+        Verb::Edit,
+        "e",
+        "e",
         "Threshold",
         "Change the slow log threshold or length (writes)",
         false,
     ),
-    k("R", "R", "Reset", "Reset the slow log (writes)", false),
+    k(
+        Verb::DeleteParent,
+        "D",
+        "D",
+        "Reset",
+        "Reset the slow log (writes)",
+        false,
+    ),
     PICK_NODE,
 ];
 
 static MONITOR: [KeyHelp; 8] = [
-    k("↑↓ j k", "↑↓", "Scroll", "Scroll the lines", true),
+    k(
+        Verb::Move,
+        "↑↓ j k",
+        "↑↓",
+        "Scroll",
+        "Scroll the lines",
+        true,
+    ),
     PAGE,
     ENDS,
     PANEL,
     k(
+        Verb::Open,
         "enter",
         "enter",
         "Start",
         "Start MONITOR (asks; stops at 30 s or 10,000 lines)",
         true,
     ),
-    k("esc", "esc", "Stop", "Stop MONITOR now", true),
+    k(Verb::Back, "esc", "esc", "Stop", "Stop MONITOR now", true),
     COPY_LINE,
     PICK_NODE,
 ];
 
 /// `f` on the screens that show a value: a key's value, stream entries, a Search result.
 const FORMAT: KeyHelp = k(
+    Verb::Format,
     "f",
     "f",
     "Format",
     "Show the value as text, hex, JSON, MessagePack, PHP, Pickle, Protobuf or Java",
-    false,
+    true,
 );
 /// `y` on the screens that show a value.
 const COPY_VALUE: KeyHelp = k(
+    Verb::Copy,
     "y",
     "y",
     "Copy",
     "Copy the selected value as shown to the clipboard",
-    false,
+    true,
 );
 /// `y` on the Slow log and Monitor.
 const COPY_LINE: KeyHelp = k(
+    Verb::Copy,
     "y",
     "y",
     "Copy",
@@ -567,6 +890,7 @@ const COPY_LINE: KeyHelp = k(
 );
 /// `←` `h` on Streams and Search.
 const LEFT: KeyHelp = k(
+    Verb::Back,
     "← h",
     "←",
     "Left",
@@ -574,8 +898,9 @@ const LEFT: KeyHelp = k(
     false,
 );
 
-static STREAMS: [KeyHelp; 16] = [
+static STREAMS: [KeyHelp; 17] = [
     k(
+        Verb::Move,
         "↑↓ j k",
         "↑↓",
         "Move",
@@ -586,6 +911,7 @@ static STREAMS: [KeyHelp; 16] = [
     ENDS,
     PANEL,
     k(
+        Verb::Open,
         "→ l",
         "→",
         "Details",
@@ -594,16 +920,25 @@ static STREAMS: [KeyHelp; 16] = [
     ),
     LEFT,
     k(
+        Verb::Open,
         "enter",
         "enter",
         "Entries",
         "List the selected stream's entries",
         true,
     ),
-    k("n", "n", "More", "Load 100 more entries", false),
+    k(
+        Verb::MoreRows,
+        "m",
+        "m",
+        "More rows",
+        "Load 100 more entries",
+        true,
+    ),
     FORMAT,
     COPY_VALUE,
     k(
+        Verb::Back,
         "esc",
         "esc",
         "Back",
@@ -612,13 +947,23 @@ static STREAMS: [KeyHelp; 16] = [
     ),
     PAUSE,
     k(
+        Verb::Refresh,
         "r",
         "r",
         "Refresh",
-        "Refresh this panel or the entries; before an analysis, analyze",
+        "Refresh this panel or the entries",
         false,
     ),
     k(
+        Verb::Analyze,
+        "a",
+        "a",
+        "Analyze",
+        "Before an analysis: analyze the keys; the list of streams comes from it",
+        true,
+    ),
+    k(
+        Verb::Screen,
         "c",
         "c",
         "Claim",
@@ -626,47 +971,79 @@ static STREAMS: [KeyHelp; 16] = [
         false,
     ),
     k(
+        Verb::Screen,
         "A",
         "A",
         "Ack",
         "Acknowledge the selected pending entry (writes)",
         false,
     ),
-    k("X", "X", "Trim", "Trim the stream (writes)", false),
+    k(
+        Verb::Screen,
+        "-",
+        "-",
+        "Trim",
+        "Trim the stream (writes)",
+        false,
+    ),
 ];
 
-static PUBSUB: [KeyHelp; 14] = [
+static PUBSUB: [KeyHelp; 13] = [
     MOVE,
     PAGE,
     ENDS,
     k(
+        Verb::Open,
         "enter",
         "enter",
         "Subscribe",
         "Subscribe to the selected channel",
         true,
     ),
-    k("s", "s", "Sub", "Subscribe to a channel or pattern", false),
     k(
+        Verb::Add,
+        "+",
+        "+",
+        "Sub",
+        "Subscribe to a channel or pattern",
+        true,
+    ),
+    k(
+        Verb::Screen,
         "S",
         "S",
         "Shard",
         "Subscribe to a shard channel (SSUBSCRIBE)",
         false,
     ),
-    k("space", "space", "Pause", "Pause or resume the tail", true),
-    k("c", "c", "Clear", "Clear the tail", false),
-    k("/", "/", "Filter", "Filter the tail", true),
     k(
+        Verb::Pause,
+        "space",
+        "space",
+        "Pause",
+        "Pause or resume the tail; without a tail, the counts",
+        true,
+    ),
+    k(
+        Verb::Screen,
+        "ctrl-l",
+        "ctrl-l",
+        "Clear",
+        "Clear the tail",
+        false,
+    ),
+    k(Verb::Filter, "/", "/", "Filter", "Filter the tail", true),
+    k(
+        Verb::Back,
         "esc",
         "esc",
         "Stop",
         "Clear the filter, or stop the tail",
-        false,
+        true,
     ),
-    PAUSE,
     REFRESH,
     k(
+        Verb::Screen,
         "P",
         "P",
         "Publish",
@@ -678,6 +1055,7 @@ static PUBSUB: [KeyHelp; 14] = [
 
 static SEARCH: [KeyHelp; 17] = [
     k(
+        Verb::Move,
         "↑↓ j k",
         "↑↓",
         "Move",
@@ -688,6 +1066,7 @@ static SEARCH: [KeyHelp; 17] = [
     ENDS,
     PANEL,
     k(
+        Verb::Open,
         "→ l",
         "→",
         "Details",
@@ -695,13 +1074,42 @@ static SEARCH: [KeyHelp; 17] = [
         true,
     ),
     LEFT,
-    k("/", "/", "Query", "Run a query on the selected index", true),
-    k("enter", "enter", "Open", "Open the selected result", true),
-    k("e", "e", "Explain", "Explain the query", false),
-    k("P", "P", "Profile", "Profile the query", false),
+    k(
+        Verb::Filter,
+        "/",
+        "/",
+        "Query",
+        "Run a query on the selected index",
+        true,
+    ),
+    k(
+        Verb::Open,
+        "enter",
+        "enter",
+        "Open",
+        "Open the selected result",
+        true,
+    ),
+    k(
+        Verb::Screen,
+        "x",
+        "x",
+        "Explain",
+        "Explain the query",
+        false,
+    ),
+    k(
+        Verb::Screen,
+        "X",
+        "X",
+        "Profile",
+        "Profile the query",
+        false,
+    ),
     FORMAT,
     COPY_VALUE,
     k(
+        Verb::Back,
         "esc",
         "esc",
         "Back",
@@ -709,10 +1117,18 @@ static SEARCH: [KeyHelp; 17] = [
         true,
     ),
     REFRESH,
-    k("C", "C", "Create", "Create an index (writes)", false),
     k(
-        "D",
-        "D",
+        Verb::Add,
+        "+",
+        "+",
+        "Create",
+        "Create an index (writes)",
+        true,
+    ),
+    k(
+        Verb::Delete,
+        "d",
+        "d",
         "Drop",
         "Drop the selected index, its documents stay (writes)",
         false,
@@ -726,6 +1142,7 @@ static NODES: [KeyHelp; 7] = [
     ENDS,
     PANEL,
     k(
+        Verb::Open,
         "enter",
         "enter",
         "This node only",
@@ -738,6 +1155,7 @@ static NODES: [KeyHelp; 7] = [
 
 static SLOTS: [KeyHelp; 6] = [
     k(
+        Verb::Move,
         "↑↓ j k",
         "↑↓",
         "Move",
@@ -748,13 +1166,15 @@ static SLOTS: [KeyHelp; 6] = [
     ENDS,
     PANEL,
     k(
-        "o",
-        "o",
-        "Order",
+        Verb::Sort,
+        "s",
+        "s",
+        "Sort",
         "Sort the hottest slots by keys, CPU, net in or out",
         true,
     ),
     k(
+        Verb::Refresh,
         "r",
         "r",
         "Refresh",
@@ -805,7 +1225,8 @@ fn find_key(screen: Screen, keys: &str) -> (&'static str, &'static str) {
     (h.footer_keys, h.label)
 }
 
-/// What the footer depends on besides the screen.
+/// What the footer depends on besides the screen: enough that it never shows a key
+/// that does nothing in the current state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FooterCtx {
     /// A session exists (the live screens have something to work on).
@@ -816,63 +1237,116 @@ pub struct FooterCtx {
     pub analyzing: bool,
     /// Writes are on for the session's profile.
     pub writes: bool,
-    /// The key's value is a module type's summary (`Items::Module`) or a type
-    /// redis-lens does not read (`Items::NotRead`): there is nothing to format or copy
+    /// The value on screen could not be read: a module type's summary
+    /// (`Items::Module`), a type redis-lens does not read (`Items::NotRead`), or the
+    /// explain or profile text of a Search query. There is nothing to format or copy
     /// there, and `d` deletes no item (`D` deletes the key).
     pub not_read: bool,
+    /// The view on screen is off: its permission probe was refused, the module or
+    /// command it needs is missing, or the server is too old. No key that needs it.
+    pub off: bool,
+    /// One level down inside the screen: a group's connections on Clients, a stream's
+    /// entries, a Search result. The footer shows the way back.
+    pub drill: bool,
+    /// Pub/Sub: a live tail is open.
+    pub tail: bool,
+    /// A key's value has a list of items (`→` moves into the value pane).
+    pub list: bool,
+    /// A key's value: `e` edits the selected row or the value.
+    pub edit: bool,
+    /// A key's value: `+` adds to it.
+    pub add: bool,
+    /// A key's value: `d` deletes the selected item.
+    pub item: bool,
+    /// The list on screen has more to load (`m` reads it): a pattern's keys or a
+    /// stream's entries not read to the end.
+    pub more: bool,
+    /// The list on screen has no row: the keys that need a selected row are left out.
+    pub empty: bool,
 }
 
-/// The 3 to 5 keys that matter on `screen`, as `(key, label)` in display order. The
-/// footer puts [`footer_right`] after them, against the right edge.
+/// The 3 to 5 keys that matter on `screen`, as `(key, label)` in display order, and
+/// only keys that do something in state `c`. The footer puts [`footer_right`] after
+/// them, against the right edge.
 pub fn footer(screen: Screen, c: FooterCtx) -> Vec<(&'static str, &'static str)> {
     const MOVE: &str = "↑↓ j k";
     const TAB: &str = "tab shift-tab";
     const OPEN: &str = "→ l enter";
     const BACK: &str = "← h esc";
+    let value_keys: Vec<&str>;
     let order: &[&str] = match screen {
-        Screen::Connections => &[MOVE, "enter", "a", "w", "/"],
-        Screen::Overview if c.analyzing => &["esc", "p", "+ -"],
-        Screen::Overview if c.analyzed => &[MOVE, "enter", "r", "v"],
-        Screen::Overview if c.ready => &["r", MOVE, "enter", "v"],
-        Screen::Patterns if c.analyzed => &[MOVE, OPEN, "/", "o", "v"],
-        Screen::Patterns => &[MOVE, OPEN, "/", "n", "r"],
-        Screen::KeyList => &[MOVE, OPEN, "/", "n", BACK],
+        Screen::Connections => &[MOVE, "enter", "+", "w", "/"],
+        // A view that is off: only the way to another panel, or home.
+        s if c.off && s.area().has_panels() => &[TAB, "0"],
+        _ if c.off => &["0"],
+        Screen::Overview if c.analyzing => &["esc", "space", "< >"],
+        Screen::Overview if c.analyzed => &[MOVE, "enter", "a", "v"],
+        Screen::Overview if c.ready => &["a", MOVE, "enter", "v"],
+        Screen::Patterns if c.analyzed => &[MOVE, OPEN, "/", "s", TAB],
+        Screen::Patterns => &[MOVE, OPEN, "/", "a", TAB],
+        Screen::KeyList if c.empty && c.more && c.writes => &["m", "+", BACK],
+        Screen::KeyList if c.empty && c.more => &["m", BACK],
+        Screen::KeyList if c.empty && c.writes => &["+", BACK],
+        Screen::KeyList if c.empty => &[BACK],
+        Screen::KeyList if c.more => &[MOVE, OPEN, "/", "m", BACK],
+        Screen::KeyList => &[MOVE, OPEN, "/", "y", BACK],
         Screen::KeyDetail if c.not_read && c.writes => &[MOVE, "D", BACK],
         Screen::KeyDetail if c.not_read => &[MOVE, BACK],
-        Screen::KeyDetail if c.writes => &[MOVE, "e", "+", "d", "f"],
-        Screen::KeyDetail => &[MOVE, "→ l", "f", "y", BACK],
+        Screen::KeyDetail if c.writes => {
+            // The write keys this value takes, then the format and copy keys while
+            // there is room, and always the way back.
+            let mut v = vec![MOVE];
+            v.extend(
+                [(c.edit, "e"), (c.add, "+"), (c.item, "d")]
+                    .iter()
+                    .filter_map(|(on, k)| on.then_some(*k)),
+            );
+            for k in ["f", "y"] {
+                if v.len() < 4 {
+                    v.push(k);
+                }
+            }
+            v.push(BACK);
+            value_keys = v;
+            &value_keys
+        }
+        Screen::KeyDetail if c.list => &[MOVE, "→ l", "f", "y", BACK],
+        Screen::KeyDetail => &[MOVE, "f", "y", BACK],
         Screen::BigKeys | Screen::Ttl | Screen::Diff | Screen::HotKeys if c.analyzed => {
-            &[MOVE, TAB, "y", "r", "s"]
+            &[MOVE, TAB, "y", "a", "ctrl-s"]
         }
         Screen::Nodes if c.analyzed => &[MOVE, "enter", TAB],
         Screen::BigKeys | Screen::Ttl | Screen::Diff | Screen::HotKeys | Screen::Nodes
             if c.ready =>
         {
-            &["r", TAB]
+            &["a", TAB]
         }
-        // Streams are found by an analysis: before one, `r` analyzes.
-        Screen::Streams if c.ready && !c.analyzed => &["r", TAB],
-        Screen::Streams if c.ready => &[MOVE, "→ l", "enter", "p", "esc"],
-        Screen::Search if c.ready => &[MOVE, "→ l", "/", "enter", "esc"],
-        Screen::PubSub if c.ready => &[MOVE, "enter", "space", "/"],
-        Screen::Slots if c.ready => &[MOVE, TAB, "o", "r"],
+        // Streams are found by an analysis: before one, `a` analyzes.
+        Screen::Streams if c.ready && !c.analyzed => &["a", TAB],
+        Screen::Streams if c.ready && c.drill && c.more => &[MOVE, "m", "f", "y", "esc"],
+        Screen::Streams if c.ready && c.drill => &[MOVE, "f", "y", "esc"],
+        // An analysis that found no stream: a Deep one may find some.
+        Screen::Streams if c.ready && c.empty => &["a", TAB],
+        Screen::Streams if c.ready => &[MOVE, "→ l", "enter", TAB],
+        Screen::Search if c.ready && c.drill && c.not_read => &[MOVE, "esc", TAB],
+        Screen::Search if c.ready && c.drill => &[MOVE, "f", "y", "esc", TAB],
+        Screen::Search if c.ready && c.empty && c.writes => &["+", "r", TAB],
+        Screen::Search if c.ready && c.empty => &["r", TAB],
+        Screen::Search if c.ready => &[MOVE, "→ l", "/", "enter", TAB],
+        Screen::PubSub if c.ready && c.tail => &[MOVE, "space", "/", "esc"],
+        Screen::PubSub if c.ready && c.empty => &["+", "space", "r"],
+        Screen::PubSub if c.ready => &[MOVE, "enter", "+", "space", "r"],
+        Screen::Slots if c.ready => &[MOVE, TAB, "s", "r"],
+        Screen::Clients if c.ready && c.drill && c.writes => &[MOVE, "esc", "d", "space", "r"],
+        Screen::Clients if c.ready && c.drill => &[MOVE, "esc", "space", "r"],
+        Screen::Clients | Screen::SlowLog if c.ready && c.empty => &[TAB, "space", "r"],
         Screen::Clients if c.ready => &[MOVE, TAB, "enter", "r"],
-        Screen::SlowLog if c.ready => &[MOVE, TAB, "p", "r"],
+        Screen::SlowLog if c.ready => &[MOVE, TAB, "space", "r"],
         Screen::Monitor if c.ready => &[TAB, "enter", "esc", MOVE],
         s if s.area().has_panels() => &[TAB, "0"],
         _ => &["0"],
     };
-    order
-        .iter()
-        .map(|keys| match find_key(screen, keys) {
-            // Streams' `r` refreshes the list; before an analysis it analyzes, and the
-            // footer says so.
-            (k, _) if screen == Screen::Streams && !c.analyzed && *keys == "r" => {
-                (k, ANALYZE.label)
-            }
-            hint => hint,
-        })
-        .collect()
+    order.iter().map(|keys| find_key(screen, keys)).collect()
 }
 
 /// The keys at the right of the footer: `ctrl-f Find key  : Command  ? Help`, or only
@@ -906,8 +1380,12 @@ pub fn footer_fit(screen: Screen, c: FooterCtx, w: usize) -> (Vec<Hint>, Vec<Hin
     if !fits(&left, &right) {
         right.retain(|(k, _)| *k != ":");
     }
+    // The screen's keys go from the end, but its way back (`esc`) goes last of all.
     while !left.is_empty() && !fits(&left, &right) {
-        left.pop();
+        match left.iter().rposition(|(k, _)| *k != "esc") {
+            Some(i) => left.remove(i),
+            None => left.remove(left.len() - 1),
+        };
     }
     if !fits(&left, &right) {
         right.clear();
@@ -949,7 +1427,7 @@ impl Hit {
         }
     }
 
-    /// Where it is, for the right of its line: `Server › Slow log`, `c on Slow log`,
+    /// Where it is, for the right of its line: `Server › Slow log`, `e on Slow log`,
     /// `everywhere`.
     pub fn place(&self) -> String {
         match (self.key, self.screen) {
@@ -1085,38 +1563,39 @@ mod tests {
         }
     }
 
+    /// Every footer context: each flag on and off.
     fn contexts() -> Vec<FooterCtx> {
-        let mut out = Vec::new();
-        for ready in [false, true] {
-            for analyzed in [false, true] {
-                for analyzing in [false, true] {
-                    for writes in [false, true] {
-                        out.push(FooterCtx {
-                            ready,
-                            analyzed,
-                            analyzing,
-                            writes,
-                            not_read: false,
-                        });
-                    }
+        (0..1u32 << 14)
+            .map(|b| {
+                let on = |i: u32| b & (1 << i) != 0;
+                FooterCtx {
+                    ready: on(0),
+                    analyzed: on(1),
+                    analyzing: on(2),
+                    writes: on(3),
+                    not_read: on(4),
+                    off: on(5),
+                    drill: on(6),
+                    tail: on(7),
+                    list: on(8),
+                    edit: on(9),
+                    add: on(10),
+                    item: on(11),
+                    more: on(12),
+                    empty: on(13),
                 }
-            }
-        }
-        out
+            })
+            .collect()
     }
 
     #[test]
     fn footer_is_a_subset_of_the_table() {
         for v in Screen::ALL {
             for c in contexts() {
-                // Before an analysis Streams' `r` analyzes, and its footer says so with
-                // the label of Analyze's `r` (its own row says Refresh).
-                let analyzes = (v == Screen::Streams && !c.analyzed).then_some(&ANALYZE);
                 for (key, label) in footer(v, c).into_iter().chain(footer_right(c.ready)) {
                     let hit = global()
                         .iter()
                         .chain(for_screen(v))
-                        .chain(analyzes)
                         .find(|h| h.footer_keys == key && h.label == label)
                         .unwrap_or_else(|| panic!("{key} {label} missing in {}", v.title()));
                     assert!(hit.in_footer, "{key} {label} is not marked in_footer");
@@ -1128,9 +1607,18 @@ mod tests {
     #[test]
     fn footers_hold_three_to_five_keys_once_there_is_something_to_do() {
         for v in Screen::ALL {
-            for c in contexts().into_iter().filter(|c| c.ready && c.analyzed) {
+            // A value that could not be read, a view that is off or an empty list has
+            // little to do.
+            for c in contexts()
+                .into_iter()
+                .filter(|c| c.ready && c.analyzed && !c.off && !c.not_read && !c.empty)
+            {
                 let n = footer(v, c).len();
-                assert!((3..=5).contains(&n), "{} has {n} footer keys", v.title());
+                assert!(
+                    (3..=5).contains(&n),
+                    "{} has {n} footer keys: {c:?}",
+                    v.title()
+                );
             }
         }
     }
@@ -1168,46 +1656,96 @@ mod tests {
             ),
             ["Stop", "Pause", "Interval"]
         );
+        // Browse footers show how to reach Streams and Search.
         assert_eq!(
             names(Screen::Patterns, connected),
-            ["Move", "Open", "Filter", "More names", "Analyze"]
+            ["Move", "Open", "Filter", "Analyze", "Next panel"]
         );
         assert_eq!(
             names(Screen::Patterns, analyzed),
-            ["Move", "Open", "Filter", "Sort", "More"]
+            ["Move", "Open", "Filter", "Sort", "Next panel"]
         );
+        assert_eq!(
+            names(
+                Screen::KeyList,
+                FooterCtx {
+                    more: true,
+                    ..analyzed
+                }
+            ),
+            ["Move", "Value", "Filter", "More rows", "Back"]
+        );
+        // Read to the end: `m` has nothing to read, `y` takes its place.
         assert_eq!(
             names(Screen::KeyList, analyzed),
-            ["Move", "Value", "Filter", "More keys", "Back"]
+            ["Move", "Value", "Filter", "Copy", "Back"]
+        );
+        // An empty list: only what does something there.
+        assert_eq!(
+            names(
+                Screen::KeyList,
+                FooterCtx {
+                    empty: true,
+                    ..analyzed
+                }
+            ),
+            ["Back"]
         );
         assert_eq!(
-            names(Screen::KeyDetail, analyzed),
+            names(
+                Screen::KeyList,
+                FooterCtx {
+                    empty: true,
+                    more: true,
+                    writes: true,
+                    ..analyzed
+                }
+            ),
+            ["More rows", "New key", "Back"]
+        );
+        assert_eq!(
+            names(
+                Screen::KeyDetail,
+                FooterCtx {
+                    list: true,
+                    ..analyzed
+                }
+            ),
             ["Move", "Value", "Format", "Copy", "Back"]
+        );
+        // A string has no items: `→` does nothing there.
+        assert_eq!(
+            names(Screen::KeyDetail, analyzed),
+            ["Move", "Format", "Copy", "Back"]
         );
         assert_eq!(
             names(
                 Screen::KeyDetail,
                 FooterCtx {
                     writes: true,
+                    list: true,
+                    edit: true,
+                    add: true,
+                    item: true,
                     ..analyzed
                 }
             ),
-            ["Move", "Edit", "Add", "Delete", "Format"]
+            ["Move", "Edit", "Add", "Delete", "Back"]
         );
         assert_eq!(
             names(Screen::Ttl, analyzed),
-            ["Move", "Next panel", "Copy", "Analyze", "Snapshot"]
+            ["Move", "Next panel", "Copy", "Analyze", "Save"]
         );
         assert_eq!(names(Screen::Ttl, connected), ["Analyze", "Next panel"]);
-        // Before an analysis there are no streams yet: `r` analyzes.
+        // Before an analysis there are no streams yet: `a` analyzes.
         assert_eq!(names(Screen::Streams, connected), ["Analyze", "Next panel"]);
         assert_eq!(
             names(Screen::Streams, analyzed),
-            ["Move", "Details", "Entries", "Pause", "Back"]
+            ["Move", "Details", "Entries", "Next panel"]
         );
         assert_eq!(
             names(Screen::Search, connected),
-            ["Move", "Details", "Query", "Open", "Back"]
+            ["Move", "Details", "Query", "Open", "Next panel"]
         );
         assert_eq!(
             names(Screen::Nodes, analyzed),
@@ -1225,6 +1763,211 @@ mod tests {
         assert_eq!(footer_right(false), [("?", "Help")]);
     }
 
+    /// The footer of a view that is off names no key that needs the view.
+    #[test]
+    fn an_off_view_shows_no_key_that_needs_it() {
+        let off = FooterCtx {
+            ready: true,
+            analyzed: true,
+            off: true,
+            ..FooterCtx::default()
+        };
+        for v in [
+            Screen::Clients,
+            Screen::SlowLog,
+            Screen::Streams,
+            Screen::Search,
+            Screen::Slots,
+        ] {
+            assert_eq!(
+                footer(v, off).iter().map(|h| h.0).collect::<Vec<_>>(),
+                ["tab", "0"],
+                "{}",
+                v.title()
+            );
+        }
+        assert_eq!(footer(Screen::PubSub, off), [("0", "Connections")]);
+    }
+
+    /// A read-only connection shows no write key anywhere; with writes on, a key's
+    /// value shows only the write keys its value takes, and always its way back.
+    #[test]
+    fn write_keys_show_only_with_writes_on_and_the_value_keeps_its_way_back() {
+        let writes_keys = |v: Screen| {
+            for_screen(v)
+                .iter()
+                .filter(|h| h.help.contains("(writes)"))
+                .map(|h| h.footer_keys)
+                .collect::<Vec<_>>()
+        };
+        for v in Screen::ALL
+            .into_iter()
+            .filter(|v| *v != Screen::Connections)
+        {
+            for c in contexts().into_iter().filter(|c| !c.writes) {
+                for (key, _) in footer(v, c) {
+                    assert!(
+                        !writes_keys(v).contains(&key),
+                        "{key} is a write key in the read-only footer of {}",
+                        v.title()
+                    );
+                }
+            }
+        }
+        for c in contexts()
+            .into_iter()
+            .filter(|c| c.ready && c.writes && !c.off)
+        {
+            let keys: Vec<_> = footer(Screen::KeyDetail, c).iter().map(|h| h.0).collect();
+            assert!(keys.contains(&"esc"), "{keys:?} {c:?}");
+            for (on, key) in [(c.edit, "e"), (c.add, "+"), (c.item, "d")] {
+                assert!(
+                    on || c.not_read || !keys.contains(&key),
+                    "{key} in {keys:?} {c:?}"
+                );
+            }
+        }
+    }
+
+    /// Trimmed to fit, a footer keeps its way back: wherever `footer` shows `esc`, it
+    /// is still there at 80 and at 100 columns.
+    #[test]
+    fn footer_fit_keeps_the_way_back_at_80_and_100_columns() {
+        for v in Screen::ALL {
+            for c in contexts() {
+                if !footer(v, c).iter().any(|h| h.0 == "esc") {
+                    continue;
+                }
+                for w in [80, 100] {
+                    let (left, _) = footer_fit(v, c, w);
+                    assert!(
+                        left.iter().any(|h| h.0 == "esc"),
+                        "{} at {w}: {left:?} {c:?}",
+                        v.title()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A drill-down shows its way back, and not the key that went down.
+    #[test]
+    fn a_drill_down_shows_its_way_back() {
+        let c = FooterCtx {
+            ready: true,
+            analyzed: true,
+            drill: true,
+            ..FooterCtx::default()
+        };
+        for v in [Screen::Clients, Screen::Streams, Screen::Search] {
+            let f = footer(v, c);
+            assert!(f.contains(&("esc", "Back")), "{}: {f:?}", v.title());
+            assert!(!f.iter().any(|h| h.0 == "enter"), "{}: {f:?}", v.title());
+        }
+        let up = footer(Screen::Clients, FooterCtx { drill: false, ..c });
+        assert!(up.contains(&("enter", "List")) && !up.contains(&("esc", "Back")));
+        // With writes on, `d` ends the selected connection of the group.
+        let w = footer(Screen::Clients, FooterCtx { writes: true, ..c });
+        assert!(w.contains(&("d", "End")), "{w:?}");
+    }
+
+    /// Pub/Sub's `space` pauses the tail while one is open and the counts otherwise:
+    /// it is in both footers; `/` filters only a tail.
+    #[test]
+    fn pub_sub_footer_with_and_without_a_tail() {
+        let c = FooterCtx {
+            ready: true,
+            ..FooterCtx::default()
+        };
+        let none = footer(Screen::PubSub, c);
+        let tail = footer(Screen::PubSub, FooterCtx { tail: true, ..c });
+        assert!(none.contains(&("space", "Pause")) && tail.contains(&("space", "Pause")));
+        assert!(!none.iter().any(|h| h.0 == "/"), "{none:?}");
+        assert!(tail.contains(&("/", "Filter")) && tail.contains(&("esc", "Stop")));
+    }
+
+    /// Each letter of the key grammar means one kind of action on every screen: a
+    /// screen may add verbs on other keys, never give one of these another meaning.
+    #[test]
+    fn grammar_keys_mean_one_thing_on_every_screen() {
+        let rows = Screen::ALL
+            .into_iter()
+            .map(|s| (s.title(), for_screen(s)))
+            .chain([("Everywhere", global())]);
+        for (title, rows) in rows {
+            for h in rows {
+                for t in h.keys.split_whitespace() {
+                    if let Some(want) = grammar(t) {
+                        assert_eq!(
+                            h.verb, want,
+                            "{t:?} on {title} is bound to {:?} ({}), the grammar says {want:?}",
+                            h.verb, h.help
+                        );
+                    }
+                }
+            }
+        }
+        // And the other way round: a row of a grammar verb is on its grammar key (or
+        // keys that move, open, go back and the like, which the grammar lists too).
+        for s in Screen::ALL {
+            for h in for_screen(s) {
+                let grammar_verb = !matches!(
+                    h.verb,
+                    Verb::Screen
+                        | Verb::Move
+                        | Verb::Open
+                        | Verb::Back
+                        | Verb::Panel
+                        | Verb::Node
+                        | Verb::Snapshot
+                );
+                if grammar_verb {
+                    assert!(
+                        h.keys
+                            .split_whitespace()
+                            .any(|t| grammar(t) == Some(h.verb)),
+                        "{} on {} is {:?} but not on its grammar key",
+                        h.keys,
+                        s.title(),
+                        h.verb
+                    );
+                }
+            }
+        }
+        // `ctrl-s` saves a snapshot wherever one can be saved, and plain `s` never does.
+        for s in Screen::ALL {
+            for h in for_screen(s) {
+                if h.verb == Verb::Snapshot {
+                    assert_eq!(h.keys, "ctrl-s", "{}", s.title());
+                }
+            }
+        }
+    }
+
+    /// The keys the grammar retired are bound nowhere any more (their old screens
+    /// included), or only to their grammar meaning.
+    #[test]
+    fn retired_keys_are_gone_from_the_table() {
+        let bound = |s: Screen, key: &str| {
+            for_screen(s)
+                .iter()
+                .any(|h| h.keys.split_whitespace().any(|t| t == key))
+        };
+        for s in Screen::ALL {
+            for key in ["o", "n", "N", "p", "K", "C"] {
+                assert!(!bound(s, key), "{key} is still bound on {}", s.title());
+            }
+        }
+        assert!(!bound(Screen::Patterns, "x"));
+        assert!(!bound(Screen::Streams, "X"));
+        assert!(!bound(Screen::Search, "P") && !bound(Screen::Search, "e"));
+        assert!(!bound(Screen::SlowLog, "c") && !bound(Screen::SlowLog, "R"));
+        assert!(!bound(Screen::PubSub, "c") && !bound(Screen::PubSub, "s"));
+        assert!(!bound(Screen::Overview, "+") && !bound(Screen::Overview, "-"));
+        assert!(!bound(Screen::Overview, "r") && !bound(Screen::Patterns, "r"));
+        assert!(!bound(Screen::Connections, "a"));
+    }
+
     /// `tab` is in the table exactly where it does something: on the screens of an
     /// area with panels, where it switches panels and nothing else.
     #[test]
@@ -1237,7 +1980,8 @@ mod tests {
 
     /// At 80 columns every footer fits as [`footer_fit`] trims it: `ctrl-f` and `?`
     /// always show once connected, `:` gives way first, and at most one of the
-    /// screen's keys is left out (the last). From 100 columns nothing is left out.
+    /// screen's keys is left out (the last but its way back). From 100 columns
+    /// nothing is left out.
     #[test]
     fn footer_fits_80_columns() {
         for v in Screen::ALL {
@@ -1246,8 +1990,10 @@ mod tests {
                 let (left, right) = footer_fit(v, c, 80);
                 let w = footer_width(&left) + 4 + footer_right_width(&right);
                 assert!(w <= 80, "{} footer is {w} columns", v.title());
+                // At most one key left out, the order kept, and never the way back.
+                let kept: Vec<_> = all.iter().filter(|h| left.contains(h)).copied().collect();
                 assert!(
-                    left.len() + 1 >= all.len() && all.starts_with(&left),
+                    left.len() + 1 >= all.len() && kept == left,
                     "{}: {left:?} of {all:?}",
                     v.title()
                 );
@@ -1276,15 +2022,18 @@ mod tests {
         let c = FooterCtx {
             ready: true,
             analyzed: true,
+            more: true,
             ..FooterCtx::default()
         };
         // The key list's five keys fit beside `ctrl-f` and `?` at 81 columns...
         let (left, right) = footer_fit(Screen::KeyList, c, 81);
         assert_eq!(left, footer(Screen::KeyList, c));
         assert_eq!(right, [("ctrl-f", "Find key"), ("?", "Help")]);
-        // ...at 80 the last one goes too; with room, `:` is back.
+        // ...at 80 one more goes too, the last but the way back; with room, `:` is back.
         let (left, _) = footer_fit(Screen::KeyList, c, 80);
         assert_eq!(left.len(), 4);
+        assert_eq!(left.last(), Some(&("esc", "Back")));
+        assert!(!left.contains(&("m", "More rows")), "{left:?}");
         assert_eq!(footer_fit(Screen::KeyList, c, 100).1, footer_right(true));
         // Before connecting the right side is `? Help` alone.
         let (_, right) = footer_fit(Screen::Connections, FooterCtx::default(), 80);
@@ -1322,10 +2071,10 @@ mod tests {
             lines[0],
             ("Go to Server › Slow log".into(), "Server › Slow log".into())
         );
-        assert!(lines.contains(&("Reset the slow log (writes)".into(), "R on Slow log".into())));
+        assert!(lines.contains(&("Reset the slow log (writes)".into(), "D on Slow log".into())));
         assert!(lines.contains(&(
             "Change the slow log threshold or length (writes)".into(),
-            "c on Slow log".into()
+            "e on Slow log".into()
         )));
         // Every word must match; case does not matter.
         assert!(

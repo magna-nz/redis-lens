@@ -104,7 +104,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                     style::fgb(),
                 ),
                 line(
-                    " Press s to save one; the next analysis compares against it.".to_string(),
+                    " Press ctrl-s to save one; the next analysis compares against it.".to_string(),
                     style::dim(),
                 ),
             ],
@@ -561,7 +561,7 @@ mod tests {
                 s.contains("Changes compares this analysis with the last snapshot."),
                 "{s}"
             );
-            assert!(s.contains("r  Analyze: "), "{s}");
+            assert!(s.contains("a  Analyze: "), "{s}");
             insta::assert_snapshot!(format!("changes_no_analysis_{w}x{h}"), s);
         }
     }
