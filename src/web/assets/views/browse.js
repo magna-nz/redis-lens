@@ -18,7 +18,7 @@
 import {
   h, fill, refill, DASH, fmtBytes, fmtCount, fmtGrouped, fmtPercent, plural, barPercent, meter,
   notice, emptyState, connectFirst, analyzing, errorText, copyText, expiryText, fmtSignedBytes,
-  openDialog, readOnlyNote, pills, patternName,
+  openDialog, readOnlyNote, pills, patternName, connectStarted, placeOf, noteState, connectCount, STALE_TEXT,
 } from '../ui.js';
 import { reasonLines, readOnlyLine } from '../keys.js';
 import * as streams from './streams.js';
@@ -198,23 +198,9 @@ export function blank() {
   };
 }
 
-/** Whether a state starts a new connect: connected now (an analysis's own reconnect
- *  counts as connected), and not before, or to another server or at another time. The
- *  page counts these (`init`), so a mark made before a reconnect never matches after it. */
-export function connectStarted(prev, next) {
-  const on = (s) => !!(s && s.conn && (s.connected || analyzing(s)));
-  const id = (s) => (s && s.conn ? `${s.conn.name}|${s.conn.docker}|${s.conn.connectedAt}` : null);
-  return on(next) && (!on(prev) || id(prev) !== id(next));
-}
-
-/** Where a state is: the connection, which connect of this page it is (`connects`), and
- *  the database. A history entry Browse shows is marked with it; an entry with another
- *  mark was shown for another connection or database. Null when not connected. */
-export function placeOf(state, connects = 0) {
-  const c = state && state.conn;
-  if (!c) return null;
-  return `${c.name}|${c.docker}|${connects}|${state.analysis ? state.analysis.db : 0}`;
-}
+// `connectStarted` and `placeOf` (the session mark) are ui.js's: the dialogs that send
+// when answered are marked with the same place as Browse's history entries.
+export { connectStarted, placeOf };
 
 /** The place and the run (an analysis, a database switch): what Browse holds is for one. */
 export function whoOf(state, connects = 0) {
@@ -736,15 +722,15 @@ const store = blank();
 let active = null;
 
 // The connects this page has seen (`connectStarted`), for the history marks. Counted from
-// boot on, whatever area is shown (app.js calls `init` before any view hears a state).
+// boot on, whatever area is shown (app.js calls `init` before any view hears a state), by
+// ui.js's session mark, which the dialogs that send when answered share.
 let connects = 0;
-let lastState = null;
 
-/** Called once at boot: count each new connect. */
+/** Called once at boot: count each new connect (`noteState`). */
 export function init(api) {
   api.on('state', (s) => {
-    if (connectStarted(lastState, s)) connects += 1;
-    lastState = s;
+    noteState(s);
+    connects = connectCount();
   });
 }
 
@@ -2049,7 +2035,11 @@ function mountKeys(root, ctx, route) {
     const seq = formSeq;
     openDialog({
       title,
-      build(close) {
+      // Marked with the session: it closes when the connection or database changes, and
+      // nothing it holds is sent anywhere else (`holds` is checked before each send).
+      session: true,
+      onStale: () => ctx.notify(STALE_TEXT, 'info'),
+      build(close, dlg, holds) {
         const error = h('p', { class: 'form-error', role: 'alert' });
         const rows = [];
         const choices = () => {
@@ -2072,6 +2062,11 @@ function mountKeys(root, ctx, route) {
         // `check`: read and check the boxes first (an extra button such as "Remove the TTL"
         // sends without them).
         const go = async (sender, check = true) => {
+          if (!holds()) {
+            close(null);
+            ctx.notify(STALE_TEXT, 'info');
+            return;
+          }
           const values = {};
           for (const r of check ? rows : []) {
             if (r.row.hidden) continue;
@@ -2087,8 +2082,9 @@ function mountKeys(root, ctx, route) {
           error.textContent = '';
           try {
             const result = await sender(values);
+            const same = holds();
             close(true);
-            if (alive) done(result);
+            if (alive && same) done(result);
           } catch (err) {
             buttons.forEach((b) => { b.disabled = false; });
             if (err.cancelled || (value && stale(err))) {

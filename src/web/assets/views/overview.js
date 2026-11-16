@@ -14,7 +14,7 @@
 
 import {
   h, fill, DASH, fmtBytes, fmtCount, fmtDuration, fmtPercent, fmtRate, fmtClock, fmtGrouped, plural, barPercent,
-  barChart, meter, setVar, table, notice, emptyState, connectFirst, errorText, patternName, fillWhile,
+  barChart, meter, setVar, table, notice, emptyState, connectFirst, errorText, patternName, fillWhile, listPick,
 } from '../ui.js';
 import { askAnalyze, heldPanel, freedBars, progressPercent, statusText } from './analyze.js';
 
@@ -77,21 +77,33 @@ export const CHANGES_TEXT = {
 /** The lines of "Turned off, and why": the figures that could not be read, the gaps, each
  *  refused check, the provider's notice. No line twice. */
 export function offLines(data, conn) {
-  const lines = [];
-  const add = (text) => {
-    if (text && !lines.includes(text)) lines.push(text);
+  return offRows(data, conn).map((r) => r.text);
+}
+
+/** The lines of "Turned off, and why", each with its kind: `off` (a feature turned off,
+ *  drawn "Off: …"), `refused` (commands refused this session) or `notice` (the provider's
+ *  notice). Only an `off` line says "Off:". Each text once. */
+export function offRows(data, conn) {
+  const rows = [];
+  const add = (text, kind) => {
+    if (text && !rows.some((r) => r.text === text)) rows.push({ text, kind });
   };
   if (data) {
-    add(data.figuresFailed);
-    data.gaps.forEach(add);
-    for (const c of data.checks) if (c.status === 'denied') add(`${c.name}: ${c.why || 'refused for this user'}`);
-    if (data.provider) add(data.provider.notice);
+    add(data.figuresFailed, 'off');
+    data.gaps.forEach((g) => add(g, 'off'));
+    for (const c of data.checks) if (c.status === 'denied') add(`${c.name}: ${c.why || 'refused for this user'}`, 'off');
+    if (data.provider) add(data.provider.notice, 'notice');
   }
   if (conn) {
-    add(conn.providerNotice);
-    if (conn.refused.length) add(`Refused by the server this session: ${conn.refused.join(', ')}.`);
+    add(conn.providerNotice, 'notice');
+    if (conn.refused.length) add(`Refused by the server this session: ${conn.refused.join(', ')}.`, 'refused');
   }
-  return lines;
+  return rows;
+}
+
+/** How a row of "Turned off, and why" reads on screen. */
+export function offRowText(r) {
+  return r.kind === 'off' ? `Off: ${r.text}` : r.text;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -116,6 +128,13 @@ export function factsLine(data, f, conn) {
     persistenceText(f),
     (f && f.policy) || sv.policy || c.policy || null,
   ].filter(Boolean).join(' · ') || DASH;
+}
+
+/** Where the server is, after the facts: the address (masked, as the state gives it), TLS,
+ *  and what the session reads (`reading <target>`). Empty when none is known. */
+export function whereLine(conn) {
+  const c = conn || {};
+  return [c.address || null, c.tls ? 'TLS' : null, c.target ? `reading ${c.target}` : null].filter(Boolean).join(' · ');
 }
 
 /** How old the analysis is, for the head line beside Analyze. */
@@ -148,7 +167,7 @@ export function tilesModel({ f = null, data = null, conn = null, series = null, 
   return [
     { id: 'memory', label: 'Memory', value: fmtBytes(used), sub: memorySubText, meter: max && used !== null ? barPercent(used, max) : null, bars: null },
     { id: 'ops', label: 'Commands / sec', value: fmtRate(ops), sub: spanText(s.ops.length, s.everySecs, live), meter: null, bars: s.ops },
-    { id: 'clients', label: 'Clients', value: f && num(f.clients) ? fmtCount(f.clients) : DASH, sub: blocked !== null ? `${fmtGrouped(blocked)} blocked` : spanText(s.clients.length, s.everySecs, live), meter: null, bars: s.clients },
+    { id: 'clients', label: 'Clients', value: f && num(f.clients) ? fmtCount(f.clients) : DASH, sub: blocked === null ? spanText(s.clients.length, s.everySecs, live) : live ? `${fmtGrouped(blocked)} blocked` : `${fmtGrouped(blocked)} blocked · paused`, meter: null, bars: s.clients },
     { id: 'hits', label: 'Hit rate', value: f && num(f.hitRate) ? fmtPercent(f.hitRate) : DASH, sub: 'of key lookups', meter: f && num(f.hitRate) ? Math.round(Math.max(0, Math.min(1, f.hitRate)) * 100) : null, bars: null },
     { id: 'evicted', label: 'Evicted / expired', value: ev === null && ex === null ? DASH : `${fmtRate(ev)} / ${fmtRate(ex)}`, sub: 'keys per second', meter: null, bars: null },
     {
@@ -176,6 +195,8 @@ export function moreFigures({ f = null, data = null, conn = null } = {}) {
     ['Evicted / sec', n(f && f.evictedPerSec, fmtRate)],
     ['Expired / sec', n(f && f.expiredPerSec, fmtRate)],
     conn && conn.via ? ['Sentinel', conn.via] : null,
+    // Also in the head line, which leaves it out on a narrow window.
+    whereLine(conn) ? ['Server at', whereLine(conn)] : null,
   ].filter(Boolean);
 }
 
@@ -202,6 +223,9 @@ export function findingsModel(data) {
     return { key: n > 1 ? `${f.text}#${n}` : f.text, warn: f.severity === 'warn', text: f.text, label: f.label || null, href: f.where ? `#/${f.where}` : null, from };
   });
 }
+
+/** The box's words when the finding picked is no longer reported. */
+export const FINDING_GONE = 'That finding is no longer reported: pick another.';
 
 /** The box under the list for the picked finding: its text, where it came from and where
  *  it is looked into. Only what the server sent for it (the API sends no longer text). */
@@ -288,7 +312,11 @@ export function mount(root, ctx) {
   let shardLive = new Map();
 
   // ---------- the head line: facts, analysis age, Analyze ----------
-  const factsText = h('p', { class: 'mono muted small ov-facts' });
+  // The server's facts, then where it is (the masked address, TLS, what is read): the
+  // second part is the first to go on a narrow window (app.css).
+  const factsMain = h('span');
+  const factsWhere = h('span', { class: 'ov-facts-where' });
+  const factsText = h('p', { class: 'mono muted small ov-facts' }, factsMain, factsWhere);
   const ageText = h('span', { class: 'muted small' });
   const analyzeButton = h('button', { type: 'button', class: 'btn', text: 'Analyze', 'data-act': 'analyze', onclick: () => askAnalyze(ctx) });
   const drawButtons = () => {
@@ -339,7 +367,9 @@ export function mount(root, ctx) {
   function drawLive() {
     const s = ctx.state();
     const f = ctx.figures() || (data && data.figures);
-    factsText.textContent = factsLine(data, f, conn);
+    factsMain.textContent = factsLine(data, f, conn);
+    const where = whereLine(conn);
+    factsWhere.textContent = where ? ` · ${where}` : '';
     for (const t of tilesModel({ f, data, conn, series: ctx.series(), live: s.live })) {
       const el = tileEls.get(t.id);
       el.value.textContent = t.value;
@@ -387,12 +417,16 @@ export function mount(root, ctx) {
 
   // ---------- Things to look at ----------
   /** The finding picked: the one the list's selection is on (moving in the list picks; a
-   *  click picks). Kept by its key across readings; the first when it is gone. */
+   *  click picks). Kept by its key across readings (`listPick`): one no longer reported
+   *  stays picked and the box says so; no other finding takes its place. */
   let picked = null;
+  let pickedGone = false;
   let rowsNow = [];
   function drawFindings() {
     rowsNow = findingsModel(data);
-    if (!rowsNow.some((r) => r.key === picked)) picked = rowsNow.length ? rowsNow[0].key : null;
+    const at = listPick(rowsNow, picked);
+    picked = at.key;
+    pickedGone = at.gone;
     findCount.textContent = data ? `Things to look at · ${rowsNow.length}` : 'Things to look at';
     const scroll = findPane.querySelector('.pane-scroll');
     if (!rowsNow.length) {
@@ -409,12 +443,18 @@ export function mount(root, ctx) {
     drawBox();
     // The list's selection (app.js keeps it per pane, by the row's key) is the finding
     // picked: once it is marked, the box follows it.
+    // A finding no longer reported stays picked until another row is moved to or clicked.
+    if (pickedGone) return;
     queueMicrotask(() => {
       const sel = alive ? findList.querySelector('[data-row].sel') : null;
       if (sel) pickRow(sel);
     });
   }
   function drawBox() {
+    if (pickedGone) {
+      fill(findBox, h('p', { class: 'muted small', text: FINDING_GONE }));
+      return;
+    }
     const box = findingBox(rowsNow.find((r) => r.key === picked) || null, data);
     if (!box) {
       fill(findBox);
@@ -426,8 +466,9 @@ export function mount(root, ctx) {
       box.link ? h('a', { class: 'small', href: box.link.href, text: box.link.text }) : null);
   }
   function pickRow(row) {
-    if (!row || !findList.contains(row) || row.dataset.row === picked) return;
+    if (!row || !findList.contains(row) || (row.dataset.row === picked && !pickedGone)) return;
     picked = row.dataset.row;
+    pickedGone = false;
     for (const r of findList.querySelectorAll('[data-row]')) r.classList.toggle('picked', r.dataset.row === picked);
     drawBox();
   }
@@ -457,7 +498,8 @@ export function mount(root, ctx) {
         h('div', { class: 'pane-scroll pad' }, emptyState(mem.text, mem.state === 'prompt'
           ? h('button', { type: 'button', class: 'btn primary', text: 'Analyze', title: 'It asks first, quick or deep, with what each costs.', onclick: () => askAnalyze(ctx) }) : null),
         mem.last ? h('p', { class: 'muted small', text: mem.last }) : null,
-        mem.line ? h('p', { class: 'muted small', text: mem.line }) : null));
+        mem.line ? h('p', { class: 'muted small', text: mem.line }) : null,
+        h('p', { class: 'small' }, h('a', { href: '#/analyze', text: 'Every panel of the analysis is on Analyze.' }))));
     } else {
       fill(memPane, head(mem.title, h('span', { class: 'muted small', text: 'open in Browse ›' })),
         h('div', { class: 'pane-scroll' }, h('ul', { class: 'list' }, mem.rows.map((r) => h('li', null, h('button', {
@@ -471,7 +513,8 @@ export function mount(root, ctx) {
         h('div', { class: 'pane-foot' },
           mem.note ? notice(mem.note, 'info') : null,
           h('p', { class: 'muted small', text: mem.line }),
-          mem.changes ? h('p', { class: 'small' }, h('a', { href: mem.changes.href, text: mem.changes.text })) : null));
+          mem.changes ? h('p', { class: 'small' }, h('a', { href: mem.changes.href, text: mem.changes.text })) : null,
+          h('p', { class: 'small' }, h('a', { href: '#/analyze', text: 'Every panel of the analysis is on Analyze.' }))));
     }
     const fr = m.freed;
     freedPane.hidden = !fr;
@@ -488,7 +531,7 @@ export function mount(root, ctx) {
 
   // ---------- Turned off, and why ----------
   function drawOff() {
-    const lines = offLines(data, conn);
+    const lines = offRows(data, conn);
     const checks = data ? data.checks : [];
     if (!lines.length && !checks.length) {
       fill(offBox);
@@ -498,7 +541,7 @@ export function mount(root, ctx) {
     const word = { allowed: 'allowed', denied: 'refused', skipped: 'not checked' };
     fill(offBox,
       h('h2', { class: 'sr-only', text: lines.length ? 'Turned off, and why' : 'Permissions' }),
-      lines.length ? lines.map((l) => h('p', { class: 'note off-line' }, h('span', { 'aria-hidden': 'true', class: 'glyph', text: '▲' }), h('span', { text: `Off: ${l}` }))) : notice('Every check passed.', 'ok'),
+      lines.length ? lines.map((l) => h('p', { class: 'note off-line' }, h('span', { 'aria-hidden': 'true', class: l.kind === 'notice' ? 'muted' : 'glyph', text: l.kind === 'notice' ? '•' : '▲' }), h('span', { text: offRowText(l) }))) : notice('Every check passed.', 'ok'),
       checks.length ? h('details', { class: 'about' },
         h('summary', { text: `Every permission check (${checks.length})` }),
         h('ul', { class: 'list' }, checks.map((c) => h('li', { class: 'row row-check' },
@@ -540,8 +583,12 @@ export function mount(root, ctx) {
       if (alive && mine === readSeq) take(next);
     } catch (err) {
       if (!alive || mine !== readSeq) return;
+      // The list and the picked finding's box were drawn from the reading that failed to
+      // come again: both go, so the box never shows a finding under the error.
       drawnFrom.findings = null;
+      rowsNow = [];
       fill(findList);
+      fill(findBox);
       fill(findPane.querySelector('.pane-scroll'), notice(errorText(err)));
     }
   }

@@ -10,7 +10,7 @@
 // boxes have autocomplete off; nothing goes to storage, the console or an address.
 
 import {
-  h, fill, DASH, fmtBytes, fmtGrouped, fmtPercent, plural, notice, emptyState, errorText, table, copyText, writesOffLine,
+  h, fill, DASH, fmtBytes, fmtGrouped, fmtPercent, plural, notice, emptyState, errorText, table, copyText, writesOffLine, glyphText, listPick, writesReason,
 } from '../ui.js';
 
 // ---------------------------------------------------------------------------------------
@@ -71,6 +71,9 @@ export function queryStart(list) {
 export function readOnlyPlace({ shown = false } = {}) {
   return shown ? 'index' : 'indexes';
 }
+
+/** What the detail shows when the index picked left the list (dropped elsewhere). */
+export const INDEX_GONE = 'The index picked is no longer listed: pick another index.';
 
 /** An index's schema field in one line: `title TEXT SORTABLE`, `$.a AS a TAG`. */
 export function fieldText(f) {
@@ -141,7 +144,7 @@ export function mount(root, ctx, { head, body: area }) {
     const off = writesOff();
     if (!off || here !== readOnlyPlace({ shown })) return null;
     const c = ctx.state().conn;
-    return h('div', { class: 'bar-why pane-note' }, c && c.readOnly ? writesOffLine(ctx) : notice(off, 'info'));
+    return h('div', { class: 'bar-why pane-note' }, c && c.readOnly ? writesOffLine(ctx, writesReason(off)) : notice(off, 'info'));
   };
 
   function draw() {
@@ -164,20 +167,30 @@ export function mount(root, ctx, { head, body: area }) {
         h('p', { class: 'muted small', text: 'Read again asks the server again.' })));
       return;
     }
-    const picked = l.indexes.find((i) => i.name.id === store.picked) || l.indexes[0] || null;
-    if (picked) store.picked = picked.name.id;
+    // The index picked, kept by its name (`listPick`); one that left the list stays picked
+    // and says so, and no other index is shown or queried in its place.
+    const at = listPick(l.indexes.map((i) => ({ key: i.name.id })), store.picked);
+    const picked = at.index >= 0 ? l.indexes[at.index] : null;
+    store.picked = at.key;
+    if (at.gone) store.results = null;
     const keepFocus = box.contains(document.activeElement) && document.activeElement !== queryBox ? document.activeElement.id : null;
     const hadQueryFocus = document.activeElement === queryBox;
     fill(box,
       store.error ? notice(store.error) : null,
       l.error ? notice(l.error) : null,
-      h('div', { class: 'lv search' }, listCard(l, picked), picked ? detailCard(l, picked) : null),
+      h('div', { class: 'lv search' }, listCard(l, picked), picked ? detailCard(l, picked) : at.gone ? goneCard() : null),
       picked ? queryCard(l, picked) : null);
     if (hadQueryFocus) queryBox.focus();
     else if (keepFocus) {
       const again = document.getElementById(keepFocus);
       if (again) again.focus();
     }
+  }
+
+  function goneCard() {
+    return h('section', { class: 'card pane lv-detail', 'data-pane': 'index', 'aria-label': 'The index' },
+      h('div', { class: 'pane-head' }, h('h2', { class: 'lbl', text: 'Index' })),
+      h('div', { class: 'pane-scroll pane-body pad' }, notice(INDEX_GONE, 'info')));
   }
 
   function listCard(l, picked) {
@@ -202,7 +215,7 @@ export function mount(root, ctx, { head, body: area }) {
         { label: 'On', cls: 'mono nowrap', cell: (i) => i.on || DASH },
         { label: 'Docs', cls: 'mono right nowrap', cell: (i) => (typeof i.docs === 'number' ? fmtGrouped(i.docs) : DASH) },
         { label: 'Size', cls: 'mono right nowrap', cell: (i) => (typeof i.bytes === 'number' ? fmtBytes(i.bytes) : DASH) },
-        { label: 'Indexed', cls: 'mono nowrap', cell: (i) => (i.building ? `▲ ${i.progressText || 'building'}` : i.progressText || DASH) },
+        { label: 'Indexed', cls: 'mono nowrap', cell: (i) => (i.building ? glyphText(`▲ ${i.progressText || 'building'}`) : i.progressText || DASH) },
       ], l.indexes.map((i) => ({ ...i, rowClass: picked && i.name.id === picked.name.id ? 'on' : '' })), { caption: 'The indexes', cls: 'indexes' })
         : emptyState(l.empty ? l.empty.title : 'The module has no indexes.'),
       !l.indexes.length && l.empty && l.empty.text ? h('p', { class: 'muted small pad-x', text: l.empty.text }) : null,
@@ -452,7 +465,12 @@ export function mount(root, ctx, { head, body: area }) {
     if (!alive) return;
     const before = store.who;
     follow(s);
-    if (store.who !== before) load();
+    if (store.who !== before) {
+      // Another connection or node: the create form and the query go at once, before the
+      // list is read again, so nothing typed for one is sent to another.
+      draw();
+      load();
+    }
   });
 
   draw();

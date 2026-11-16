@@ -92,7 +92,7 @@ export function mount(root, ctx, onClose) {
   const access = h('span', { class: 'muted small' });
   // On a read-only connection, the way to turn writes on, as every screen has it: the top
   // bar's access button (the server asks first). A write sent anyway is refused by the gate.
-  const writesOn = h('button', { type: 'button', class: 'linkish small inline', text: 'Turn writes on (w)', hidden: true, onclick: () => ctx.toggleWrites && ctx.toggleWrites() });
+  const writesOn = h('button', { type: 'button', class: 'linkish small inline', text: 'Turn writes on', hidden: true, onclick: () => ctx.toggleWrites && ctx.toggleWrites() });
   const viewBox = h('div');
   const out = h('div', { class: 'box cmd-out', tabindex: '0', role: 'log', 'aria-live': 'polite', 'aria-label': 'Command output' });
   const helper = h('p', { class: 'cmd-help small', id: 'cmd-help' });

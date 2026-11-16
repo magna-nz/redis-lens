@@ -5,15 +5,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
-import { listPick, replyFits, READ_ONLY_TEXT, WRITES_ON_TEXT, FILL_WIDE } from '../ui.js';
 import {
-  tilesModel, moreFigures, factsLine, analysisAge, findingsModel, findingBox, rightCards,
+  listPick, replyFits, READ_ONLY_TEXT, WRITES_ON_TEXT, FILL_WIDE, writesReason, pollTick, answerSends, placeOf,
+  connectStarted, glyphParts, STALE_TEXT, STALE_START_TEXT,
+} from '../ui.js';
+import { PANE_LABELS } from '../keys.js';
+import {
+  tilesModel, moreFigures, factsLine, analysisAge, findingsModel, findingBox, rightCards, whereLine, offRows, offRowText, FINDING_GONE,
 } from '../views/overview.js';
 import { slowModel, slowDetail, slowKeyOpens, clientsModel, groupFacts } from '../views/server.js';
-import { nodesModel, nodeFacts, choiceModel, DEPTHS } from '../views/analyze.js';
+import { nodesModel, nodeFacts, choiceModel, DEPTHS, askKey } from '../views/analyze.js';
 import { readOnlyPlace as browsePlace, itemReasons, PANES } from '../views/browse.js';
-import { readOnlyPlace as streamsPlace } from '../views/streams.js';
-import { readOnlyPlace as searchPlace } from '../views/search.js';
+import { readOnlyPlace as streamsPlace, pickRow as streamPickRow, pickGone as streamPickGone, STREAM_GONE } from '../views/streams.js';
+import { readOnlyPlace as searchPlace, INDEX_GONE } from '../views/search.js';
 import { readOnlyPlace as pubsubPlace, PUBLISH_OFF } from '../views/pubsub.js';
 
 const read = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
@@ -197,7 +201,7 @@ test('a reply or a poll is drawn only while it matches what is shown', () => {
   assert.equal(replyFits({ seq: 3, who: 'n1', pick: 'a' }, { seq: 3, who: 'n1', pick: 'a' }), true);
   assert.equal(replyFits(null, { seq: 1 }), false);
   // The Server panels and Overview read through it, or a sequence of their own.
-  assert.match(read('views/server.js'), /if \(alive && replyFits\(sent, \{ seq, who: who\(\) \}\)\) draw\(data\);/);
+  assert.match(read('views/server.js'), /if \(alive && replyFits\(sent, \{ who: who\(\) \}\)\) draw\(data\);/);
   assert.match(read('views/overview.js'), /if \(alive && mine === readSeq\) take\(next\);/);
 });
 
@@ -294,20 +298,35 @@ test('each screen\'s one read-only line has one place', () => {
   assert.equal(PUBLISH_OFF, 'Publishing is off: this connection is read-only.');
   assert.equal(READ_ONLY_TEXT, 'Edits are off: this connection is read-only.');
   assert.equal(WRITES_ON_TEXT, 'Turn writes on (w)');
-  // Each draws it with the button that turns writes on, as Browse does, and nowhere else.
+  // Each draws it with the button that turns writes on, as Browse does, and nowhere else;
+  // Streams and Search with the server's own reason (it can say why the profile is
+  // read-only), without the sentence that sends the user to Connections.
   for (const file of ['views/streams.js', 'views/search.js']) {
     const src = read(file);
-    assert.match(src, /c && c\.readOnly \? writesOffLine\(ctx\) : notice\(off, 'info'\)/, file);
+    assert.match(src, /c && c\.readOnly \? writesOffLine\(ctx, writesReason\(off\)\) : notice\(off, 'info'\)/, file);
     assert.doesNotMatch(src, /readOnlyNote\(/, `${file}: not the server's sentence in a second place`);
   }
+  assert.equal(writesReason('Not sent: prod is read-only. Turn writes on in Connections.'), 'Not sent: prod is read-only.');
+  assert.equal(writesReason('prod is read-only: the profile says so (read_only = true).'), 'prod is read-only: the profile says so (read_only = true).');
+  assert.equal(writesReason(null), READ_ONLY_TEXT);
+  assert.equal(writesReason('Turn writes on in Connections.'), READ_ONLY_TEXT);
   assert.match(read('views/pubsub.js'), /writesOffLine\(ctx, PUBLISH_OFF\)/);
   assert.match(read('ui.js'), /text: WRITES_ON_TEXT, onclick: \(\) => ctx\.toggleWrites\(\)/);
-  assert.match(read('views/cmdline.js'), /text: 'Turn writes on \(w\)'[^\n]*ctx\.toggleWrites\(\)/);
+  // The command line's button names no key: `w` does nothing while the focus is in it.
+  assert.match(read('views/cmdline.js'), /text: 'Turn writes on', hidden: true[^\n]*ctx\.toggleWrites\(\)/);
+  assert.doesNotMatch(read('views/cmdline.js'), /Turn writes on \(w\)/);
 });
 
 test('no screen still says "in Connections" as the way to turn writes on', () => {
   const files = ['app.js', 'ui.js', 'keys.js', 'index.html', ...readdirSync(new URL('../views/', import.meta.url)).map((f) => `views/${f}`)];
-  for (const file of files) assert.doesNotMatch(read(file), /[Tt]urn writes on in Connections/, file);
+  // ui.js's `writesReason` names the sentence only to take it off the server's reason.
+  const shown = (file) => {
+    const src = read(file);
+    if (file !== 'ui.js') return src;
+    const at = src.indexOf('export function writesReason');
+    return src.slice(0, at) + src.slice(src.indexOf('\n}\n', at));
+  };
+  for (const file of files) assert.doesNotMatch(shown(file), /[Tt]urn writes on in Connections/, file);
 });
 
 test('a reason is shown once in a pane: the selected item\'s bar leaves out what the value\'s notes say', () => {

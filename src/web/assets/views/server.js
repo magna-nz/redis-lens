@@ -9,7 +9,7 @@
 import {
   h, fill, DASH, fmtBytes, fmtCount, fmtDuration, fmtRate, fmtTook, fmtClock, fmtGrouped, plural,
   barPercent, barChart, meter, table, pills, notice, emptyState, connectFirst,
-  fillLog, errorText, listPick, replyFits, paneCard, aboutThis, fillWhile,
+  fillLog, errorText, listPick, replyFits, pollTick, paneCard, aboutThis, fillWhile,
 } from '../ui.js';
 import { spanText } from './overview.js';
 import { hexOfText } from './browse.js';
@@ -234,27 +234,30 @@ export function mount(root, ctx, route) {
   drawCharts();
 
   /** Read a panel now and again every 5 s while the figures are live and the tab is open.
-   *  Only the newest reading is drawn, and only for the node it was read for. */
-  let seq = 0;
+   *  One read at a time: a tick while one is still out is skipped (`pollTick`), so a server
+   *  slower than 5 s still gets its reply drawn. A reply is dropped only when the
+   *  connection, the node or the panel changed while it was out (`replyFits`). */
   const who = () => {
     const c = ctx.state().conn;
-    return c ? `${c.name}|${c.docker}|${c.pickedNode}` : null;
+    return c ? `${c.name}|${c.docker}|${c.connectedAt}|${c.pickedNode}|${tab}` : null;
   };
   function poll(read, draw, failed) {
-    const once = async () => {
-      seq += 1;
-      const sent = { seq, who: who() };
+    let inFlight = false;
+    const once = async (first) => {
+      if (pollTick({ inFlight, first, live: ctx.state().live, hidden: document.hidden }) !== 'read') return;
+      inFlight = true;
+      const sent = { who: who() };
       try {
         const data = await read();
-        if (alive && replyFits(sent, { seq, who: who() })) draw(data);
+        if (alive && replyFits(sent, { who: who() })) draw(data);
       } catch (err) {
-        if (alive && replyFits(sent, { seq, who: who() })) failed(err);
+        if (alive && replyFits(sent, { who: who() })) failed(err);
+      } finally {
+        inFlight = false;
       }
     };
-    once();
-    timers.push(setInterval(() => {
-      if (ctx.state().live && !document.hidden) once();
-    }, 5000));
+    once(true);
+    timers.push(setInterval(() => once(false), 5000));
   }
 
   /** A list pane and its detail pane. Moving in the list (or a click) picks the row: the
@@ -356,7 +359,7 @@ export function mount(root, ctx, route) {
             { label: 'Last command', cls: 'mono', cell: (c) => c.cmd || DASH },
             { label: 'DB', cls: 'mono right', cell: (c) => (c.db === null ? DASH : String(c.db)) },
             { label: 'Memory', cls: 'mono right', cell: (c) => fmtBytes(c.memory) },
-          ], m.members, { caption: `Connections of ${g.name}`, cls: 'conns' })
+          ], m.members, { caption: `Connections of ${g.name}`, cls: 'conns', rowKey: (c) => (c.id !== null ? `c:${c.id}` : `a:${c.addr}`) })
           : emptyState('No connections in this group any more.'));
       fill(ui.foot, aboutThis('The connection redis-lens itself reads with is named redis-lens. User names are never shown.'));
     }
@@ -394,6 +397,7 @@ export function mount(root, ctx, route) {
   }
 
   // ---------- Slow log ----------
+  // (A failed read clears the settings line too: it came with the reading that is gone.)
   function slowPanel() {
     const ui = listAndDetail({ id: 'slowlog', label: 'Slow log', detailId: 'entry', detailLabel: 'The entry' });
     let last = null;
@@ -475,6 +479,7 @@ export function mount(root, ctx, route) {
       drawnList = '';
       drawnDetail = '';
       last = null;
+      sideNote.textContent = '';
       fill(panel, h('div', { class: 'card' }, notice(errorText(err))));
     });
   }

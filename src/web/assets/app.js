@@ -8,7 +8,7 @@ import {
   h, fill, setIcon, envBadge, createThemeStore, createToasts, confirmDialog,
   parseRoute, pushSeries, errorText, analyzing, plural, menuButton,
   connMenuModel, connButtonModel, accessModel, dbModel, nodeModel, liveModel,
-  dbListKey, dbListReply, menuFocus, openDialog, patternName, icon,
+  dbListKey, dbListReply, menuFocus, openDialog, patternName, icon, sessionMark, STALE_TEXT,
 } from './ui.js';
 import {
   ACTS, actsOf, keyOf, keyLabel, dispatch, hintFor, listMove, paneStep, slashTarget, selectedRow,
@@ -1349,7 +1349,10 @@ async function boot() {
   server.init(api);
   analyze.init(api);
 
-  api.setConfirmHandler((confirm) => confirmDialog(confirm));
+  // A question the server asks is marked with the session when it opens, if there is one:
+  // it closes, and nothing is sent, when the connection or database changes under it. (A
+  // question asked with no connection yet, such as a connect's, has no session to keep.)
+  api.setConfirmHandler((confirm) => confirmDialog(confirm, { session: sessionMark() !== null, onStale: () => notify(STALE_TEXT, 'info') }));
   api.on('state', applyState);
   api.on('figures', applyFigures);
   api.on('notice', (n) => notify(n.text, n.kind));

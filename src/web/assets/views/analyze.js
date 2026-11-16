@@ -9,7 +9,7 @@
 import {
   h, fill, refill, DASH, fmtBytes, fmtCount, fmtGrouped, fmtPercent, fmtDuration, fmtClock, plural, barPercent, meter, setVar,
   table, pills, notice, emptyState, connectFirst, errorText, confirmDialog, copyText, fmtSignedBytes, fmtSignedCount, sparkline, expiryText, patternName,
-  openDialog, listPick, paneCard, aboutThis,
+  openDialog, listPick, paneCard, aboutThis, fillWhile, glyphText, STALE_START_TEXT,
 } from '../ui.js';
 
 // ---------------------------------------------------------------------------------------
@@ -197,6 +197,18 @@ export function choiceModel(info, preferred = 'quick') {
   });
 }
 
+/** What a key does in the ask (`askAnalyze`), from the control with the focus: `'analyze'`
+ *  (the Analyze button), `'cancel'`, `'choice'` (a Quick or Deep option) or anything else.
+ *  Enter starts the analysis only on the Analyze button and cancels on Cancel; anywhere
+ *  else it does nothing (a choice is picked with the arrows or Space, never submitted).
+ *  Returns `'start'`, `'cancel'` or `'none'`. */
+export function askKey(focused, key) {
+  if (key !== 'Enter') return 'none';
+  if (focused === 'analyze') return 'start';
+  if (focused === 'cancel') return 'cancel';
+  return 'none';
+}
+
 /** The ask with the choice in it: quick or deep, with what each costs; Analyze starts the
  *  one ticked. A choice, not a confirm (docs/ui-redesign.md §11): it stays centred. Resolves
  *  to the depth started, or null. */
@@ -212,22 +224,34 @@ export async function askAnalyze(ctx, preferred = 'quick') {
   const options = choiceModel(info, preferred);
   const depth = await openDialog({
     title: 'Analyze the keys?',
+    // Marked with the session: an answer after the connection or database changed starts
+    // nothing, and the dialog closes by itself when it changes.
+    session: true,
+    onStale: () => ctx.notify(STALE_START_TEXT, 'info'),
     build(close) {
-      const radios = options.map((o) => h('input', { type: 'radio', name: 'analyze-depth', id: `analyze-${o.depth}`, value: o.depth, checked: o.checked, 'data-autofocus': o.checked ? true : null }));
-      return h('form', {
-        class: 'form',
-        onsubmit: (e) => {
-          e.preventDefault();
-          const on = radios.find((r) => r.checked);
-          close(on ? on.value : null);
-        },
-      },
-      h('fieldset', { class: 'group' }, h('legend', { text: 'How many keys' }),
-        options.map((o, i) => h('div', { class: 'check' }, radios[i], h('label', { htmlFor: radios[i].id }, h('span', { class: 'strong', text: o.label }), h('span', { class: 'hint', text: o.text }))))),
-      h('p', { class: 'muted', text: 'The panels show the results; the earlier ones stay until it has its own.' }),
-      h('div', { class: 'dialog-actions' },
-        h('button', { type: 'button', class: 'btn', text: 'Cancel', onclick: () => close(null) }),
-        h('button', { type: 'submit', class: 'btn primary', text: 'Analyze' })));
+      // No form: Enter on a choice never submits. Only the Analyze button starts it
+      // (`askKey`); the focus starts on Cancel, as in every other question.
+      const radios = options.map((o) => h('input', { type: 'radio', name: 'analyze-depth', id: `analyze-${o.depth}`, value: o.depth, checked: o.checked }));
+      const picked = () => {
+        const on = radios.find((r) => r.checked);
+        return on ? on.value : null;
+      };
+      const cancel = h('button', { type: 'button', class: 'btn', text: 'Cancel', 'data-autofocus': true, 'data-ask': 'cancel', onclick: () => close(null) });
+      const start = h('button', { type: 'button', class: 'btn primary', text: 'Analyze', 'data-ask': 'analyze', onclick: () => close(picked()) });
+      const box = h('div', { class: 'form' },
+        h('fieldset', { class: 'group' }, h('legend', { text: 'How many keys' }),
+          options.map((o, i) => h('div', { class: 'check' }, radios[i], h('label', { htmlFor: radios[i].id }, h('span', { class: 'strong', text: o.label }), h('span', { class: 'hint', text: o.text }))))),
+        h('p', { class: 'muted', text: 'The panels show the results; the earlier ones stay until it has its own.' }),
+        h('div', { class: 'dialog-actions' }, cancel, start));
+      box.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        const t = e.target;
+        const does = askKey(t && t.dataset ? t.dataset.ask || (t.type === 'radio' ? 'choice' : null) : null, e.key);
+        e.preventDefault();
+        if (does === 'start') close(picked());
+        else if (does === 'cancel') close(null);
+      });
+      return box;
     },
   });
   if (!depth) return null;
@@ -278,6 +302,13 @@ export function mount(root, ctx, route) {
   // Nodes has two panes of its own (the list and the node).
   const body = h('div', { class: 'stack-lg', 'data-pane': tab === 'nodes' ? null : 'panel' });
   view.append(body);
+  // Nodes is a list and its detail, as Server's Slow log: from a wide window the two panes
+  // fill the height and scroll inside themselves (app.css).
+  const unfill = tab === 'nodes' ? fillWhile() : () => {};
+  if (tab === 'nodes') {
+    view.classList.add('lv-view');
+    body.classList.add('lv-area');
+  }
 
   function drawHead() {
     const a = ctx.state().analysis;
@@ -319,7 +350,8 @@ export function mount(root, ctx, route) {
       return;
     }
     const e = info.estimates.find((x) => x.depth === depth) || null;
-    const answer = await confirmDialog({ kind: 'ask', title: 'Analyze the keys?', text: estimateText(e), yes: 'Analyze', after: 'The panels show the results; the earlier ones stay until it has its own.' });
+    const answer = await confirmDialog({ kind: 'ask', title: 'Analyze the keys?', text: estimateText(e), yes: 'Analyze', after: 'The panels show the results; the earlier ones stay until it has its own.' },
+      { session: true, onStale: () => ctx.notify(STALE_START_TEXT, 'info') });
     if (!answer || !alive) return;
     try {
       await ctx.api.startAnalysis(depth);
@@ -605,7 +637,7 @@ export function mount(root, ctx, route) {
       ].filter(Boolean), d.rows, { caption: 'The most-read sampled keys', cls: 'hot', rowKey: (r, i) => r.key.id ?? `h:${i}` }),
       // The thresholds come only with rows; with none there is nothing to mark.
       d.empty || !d.rows.length ? null
-        : h('p', { class: 'muted small', text: `▲ hot and big: an LFU counter of ${fmtGrouped(d.hotFreq)} or more and ${fmtBytes(d.hotBigBytes)} or more.` }));
+        : h('p', { class: 'muted small' }, glyphText(`▲ hot and big: an LFU counter of ${fmtGrouped(d.hotFreq)} or more and ${fmtBytes(d.hotBigBytes)} or more.`)));
   }
 
   // ---------- Hot keys from the last Monitor run ----------
@@ -675,12 +707,12 @@ export function mount(root, ctx, route) {
     const list = table([
       { label: 'Slots', cls: 'mono nowrap', cell: (r) => r.slots || DASH },
       { label: 'Node', cls: 'mono nowrap', cell: (r) => r.endpoint || DASH },
-      { label: 'State', cls: 'nowrap', cell: (r) => NODE_STATE[r.status] },
+      { label: 'State', cls: 'nowrap', cell: (r) => glyphText(NODE_STATE[r.status] || DASH) },
       { label: 'Keys', cls: 'mono right', cell: (r) => fmtCount(r.keys) },
       { label: 'Memory', cls: 'mono right', cell: (r) => fmtBytes(r.memory) },
       { label: '', cls: 'right', cell: (r) => showButton(r, 'btn quiet', true) || DASH },
     ], rowsOf(), { caption: 'One row per shard', cls: 'nodes', rowKey: (r) => r.key });
-    const detail = paneCard({ id: 'node', label: 'The node', cls: 'detail' });
+    const detail = paneCard({ id: 'node', label: 'The node', cls: 'lv-detail' });
     const drawDetail = () => {
       const r = m.sel;
       const [head, scroll] = [detail.querySelector('.pane-head'), detail.querySelector('.pane-body')];
@@ -691,7 +723,7 @@ export function mount(root, ctx, route) {
       }
       fill(head, h('h2', { class: 'mono key-title clip', text: r.endpoint || DASH, title: r.endpoint || null }), h('div', { class: 'pane-tools' }, showButton(r, 'btn', false)));
       fill(scroll, h('div', { class: 'stack pad' },
-        h('dl', { class: 'facts' }, nodeFacts(r).map(([k, v]) => h('div', null, h('dt', { text: k }), h('dd', { class: 'mono', text: v })))),
+        h('dl', { class: 'facts' }, nodeFacts(r).map(([k, v]) => h('div', null, h('dt', { text: k }), h('dd', { class: 'mono' }, glyphText(v))))),
         r.note ? notice(r.note) : null));
     };
     const pick = (key) => {
@@ -701,7 +733,7 @@ export function mount(root, ctx, route) {
       for (const tr of list.querySelectorAll('tr[data-row]')) tr.classList.toggle('on', tr.dataset.row === m.key);
       drawDetail();
     };
-    const listPane = paneCard({ id: 'nodes', label: 'Shards', title: h('h2', { class: 'lbl', text: `Shards · ${d.rows.length}` }), body: list });
+    const listPane = paneCard({ id: 'nodes', label: 'Shards', title: h('h2', { class: 'lbl', text: `Shards · ${d.rows.length}` }), body: list, cls: 'lv-list' });
     const follow = (e) => {
       const row = e.target.closest ? e.target.closest('tr[data-row]') : null;
       if (row && listPane.contains(row)) pick(row.dataset.row);
@@ -743,7 +775,7 @@ export function mount(root, ctx, route) {
         table([
           { label: 'Slots', cls: 'mono nowrap', cell: (r) => `${fig(r.start, String)}-${fig(r.end, String)}` },
           { label: 'Node', cls: 'mono nowrap', cell: (r) => r.endpoint || DASH },
-          { label: 'State', cell: (r) => (r.error ? `✗ ${r.error}` : r.status || DASH) },
+          { label: 'State', cell: (r) => (r.error ? glyphText(`✗ ${r.error}`) : r.status || DASH) },
           ...cols([]),
         ], d.ranges, { caption: 'Each shard\'s slot ranges', cls: 'slots' })));
   }
@@ -841,6 +873,7 @@ export function mount(root, ctx, route) {
 
   return () => {
     alive = false;
+    unfill();
     offs.forEach((off) => off());
   };
 }

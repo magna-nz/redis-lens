@@ -988,6 +988,7 @@ details.about > p + p { margin-top: 4px; }
 .ov-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; flex: 1 1 360px; min-width: 0; }
 .ov-title .title { font-size: 17px; }
 .ov-facts { min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 1280px) { .ov-facts-where { display: none; } }
 .ov-analyze { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .ov-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; }
 .ov-tiles .tile { display: flex; flex-direction: column; gap: 2px; padding: 8px 12px; min-width: 0; }

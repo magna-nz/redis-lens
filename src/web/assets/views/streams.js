@@ -11,7 +11,7 @@
 // open and nothing goes to storage, the console or an address.
 
 import {
-  h, fill, DASH, fmtBytes, fmtGrouped, plural, notice, emptyState, errorText, table, writesOffLine, aboutThis, fillWhile,
+  h, fill, DASH, fmtBytes, fmtGrouped, plural, notice, emptyState, errorText, table, writesOffLine, aboutThis, fillWhile, writesReason, listPick,
 } from '../ui.js';
 import { streamWriteText } from '../api.js';
 
@@ -97,11 +97,22 @@ export function readOnlyPlace({ shown = false } = {}) {
   return shown ? 'stream' : 'streams';
 }
 
-/** The row of the list to show: the one picked, else the first one. */
+/** The row of the list to show (`listPick`): the one picked, the first when none is
+ *  picked yet, and none when the one picked is no longer in the list (`pickGone`): no
+ *  other stream takes its place. */
 export function pickRow(list, id) {
   if (!list || !list.rows.length) return null;
-  return list.rows.find((r) => r.key.id === id) || list.rows[0];
+  const at = listPick(list.rows.map((r) => ({ key: r.key.id })), id ?? null);
+  return at.index >= 0 ? list.rows[at.index] : null;
 }
+
+/** Whether the stream picked is no longer in the list read now. */
+export function pickGone(list, id) {
+  return !!(list && Array.isArray(list.rows) && id !== null && id !== undefined && !list.rows.some((r) => r.key.id === id));
+}
+
+/** What the detail shows when the stream picked left the list. */
+export const STREAM_GONE = 'The stream picked is no longer in the list: its forms are closed. Pick another stream.';
 
 // ---------------------------------------------------------------------------------------
 // The view
@@ -195,7 +206,7 @@ export function mount(root, ctx, { head, body: area }) {
     const off = writesOff();
     if (!off || here !== readOnlyPlace({ shown: !!pickRow(store.list, store.picked) })) return null;
     const c = ctx.state().conn;
-    return h('div', { class: 'bar-why pane-note' }, c && c.readOnly ? writesOffLine(ctx) : notice(off, 'info'));
+    return h('div', { class: 'bar-why pane-note' }, c && c.readOnly ? writesOffLine(ctx, writesReason(off)) : notice(off, 'info'));
   };
   const nodeName = (r) => r.endpoint || (typeof r.node === 'number' ? `node ${r.node + 1}` : DASH);
 
@@ -231,14 +242,31 @@ export function mount(root, ctx, { head, body: area }) {
     }
     const row = pickRow(l, store.picked);
     if (row) store.picked = row.key.id;
+    // The stream picked left the list: its pending list, entries and claim form close with
+    // it, and no other stream is shown or marked open in its place.
+    const gone = pickGone(l, store.picked);
+    let closedEntries = false;
+    if (gone && (store.pending || store.entries || store.claim)) {
+      closedEntries = !!store.entries;
+      store.pending = null;
+      store.entries = null;
+      store.claim = null;
+    }
     const focusedId = box.contains(document.activeElement) ? document.activeElement.id : null;
     fill(box,
       store.error ? notice(store.error) : null,
-      h('div', { class: 'lv streams' }, listCard(l, row), row ? detailCard(row) : null));
+      h('div', { class: 'lv streams' }, listCard(l, row), row ? detailCard(row) : gone ? goneCard() : null));
+    if (closedEntries) queueMicrotask(entriesClosed);
     if (focusedId) {
       const again = document.getElementById(focusedId);
       if (again) again.focus();
     }
+  }
+
+  function goneCard() {
+    return h('section', { class: 'card pane lv-detail stream-detail', 'data-pane': 'stream', 'aria-label': 'The stream' },
+      h('div', { class: 'pane-head' }, h('h2', { class: 'lbl', text: 'Stream' })),
+      h('div', { class: 'pane-scroll pane-body pad' }, notice(STREAM_GONE, 'info')));
   }
 
   function listCard(l, picked) {
@@ -596,6 +624,9 @@ export function mount(root, ctx, { head, body: area }) {
     const ended = s.analysis.status !== lastStatus && (s.analysis.status === 'done' || s.analysis.status === 'none');
     lastStatus = s.analysis.status;
     if (store.who !== before || ended) again = true;
+    // Another connection or run: the open forms (claim, trim) go at once, before the list is
+    // read again, so nothing typed for one connection is sent to another.
+    if (store.who !== before) draw();
     if (again && s.liveState === 'ready' && s.connected) {
       again = false;
       load();

@@ -180,7 +180,7 @@ const KEYS_PANES = { patterns: 'Patterns', keys: 'Keys', value: 'Value' };
 export const PANE_LABELS = {
   ...KEYS_PANES, streams: 'Streams', stream: 'The stream', indexes: 'Indexes', index: 'The index', results: 'Results',
   channels: 'Channels', tail: 'The tail', clients: 'Clients', slowlog: 'Slow log', panel: 'The panel', findings: 'Things to look at',
-  'top-patterns': 'Memory by key pattern', saved: 'Saved connections', docker: 'Found in Docker',
+  'top-patterns': 'Memory by key pattern', conns: 'Connections of the group', entry: 'The entry', nodes: 'Nodes', node: 'The node', saved: 'Saved connections', docker: 'Found in Docker',
 };
 
 /** The key table. `keys`: the key values (`KeyboardEvent.key`, `Space`, `ctrl+k`, `meta+k`);
