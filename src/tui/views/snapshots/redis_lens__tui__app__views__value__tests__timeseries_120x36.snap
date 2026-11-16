@@ -2,12 +2,11 @@
 source: src/tui/views/value.rs
 expression: t.backend()
 ---
-" prod-cache-01   PROD   read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys           ● analyzed 14:02 UTC "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
-"    Keys  ·  Streams  ·  Search                                                                                         "
+" prod-cache-01  PROD   w  read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys         ● analyzed 14:02 UTC "
+" 1 Overview    2  Browse › Keys · Streams · Search   3 Analyze   4 Server   5 Pub/Sub                     0 Connections "
 "┌─ ‹ user:{id}:cart ────────────────────┬─ mod:1 ────────────────────────────────────────────────────────── TSDB-TYPE ─┐"
-"│ KEY                      SIZE EXPIRES │ 4.0K · expires in 6d 04h   stored as listpack · LFU 14                       │"
-"│ mod:1                    4.0K  6d 04h │                                                                              │"
+"│   KEY                    SIZE EXPIRES │ 4.0K · expires in 6d 04h   stored as listpack · LFU 14                       │"
+"│ › mod:1                  4.0K  6d 04h │                                                                              │"
 "│                                       │ totalSamples     40                                                          │"
 "│                                       │ memoryUsage      5336                                                        │"
 "│                                       │ firstTimestamp   2023-11-14 22:13:20.000 · 1700000000000                     │"
@@ -36,5 +35,6 @@ expression: t.backend()
 "│                                       │ 2023-11-14 22:13:48.000  20.5                                                │"
 "│                                       │ 2023-11-14 22:13:47.000  26.5                                                │"
 "│                                       │ 2023-11-14 22:13:46.000  25.5                                                │"
+"│                                       │ 2023-11-14 22:13:45.000  24.5                                                │"
 "└───────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────┘"
 " ↑↓ Move   esc Back                                                                   ctrl-f Find key  : Command  ? Help"

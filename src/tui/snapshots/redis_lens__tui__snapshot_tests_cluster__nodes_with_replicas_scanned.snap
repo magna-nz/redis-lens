@@ -2,14 +2,13 @@
 source: src/tui/snapshot_tests_cluster.rs
 expression: t.backend()
 ---
-" prod-cache-01   PROD   read-only   cluster · 3 shards · replicas 2/3 · 15G / 24G · 7.92M keys     ● analyzed 14:02 UTC "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                            "
-"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys  ·  Nodes  ·  Slots                                                    "
+" prod-cache-01  PROD   w  read-only   cluster · 3 shards · replicas 2/3 · 15G / 24G · 7.92M keys   ● analyzed 14:02 UTC "
+" 1 Overview   2 Browse    3  Analyze › Big keys · Expiry · Changes · Hot keys · Nodes · Slots   4 Server   5 Pub/Sub  0 "
 "┌─ Nodes ────────────────────────────────────────────────────────────────────────────── 3 shards · 2 read on replicas ─┐"
-"│ SLOTS             NODE                     ROLE     STATE          KEYS  MEMORY                                      │"
-"│ 0-5460            10.0.1.21:6379           replica  ✓ analyzed    3.17M    5.9G                                      │"
-"│ 5461-10922        10.0.1.22:6379           replica  ✓ analyzed    2.77M    5.2G                                      │"
-"│ 10923-16383       10.0.1.13:6379           primary  ✓ analyzed    1.98M    3.7G                                      │"
+"│   SLOTS             NODE                     ROLE     STATE          KEYS  MEMORY                                    │"
+"│   0-5460            10.0.1.21:6379           replica  ✓ analyzed    3.17M    5.9G                                    │"
+"│   5461-10922        10.0.1.22:6379           replica  ✓ analyzed    2.77M    5.2G                                    │"
+"│ › 10923-16383       10.0.1.13:6379           primary  ✓ analyzed    1.98M    3.7G                                    │"
 "├─ 10.0.1.13:6379 ──────────────────────────────────────────────────────────────────────────────── primary · analyzed ─┤"
 "│ Node    c3f5e1a49d6f8a0b2c4e6a8d0f2b3c5e7a9d1f43                                                                     │"
 "│ Slots   10923-16383 (5,461 slots)                                                                                    │"
@@ -19,6 +18,7 @@ expression: t.backend()
 "│ enter shows only this node's patterns in Browse; esc there shows all again.                                          │"
 "│                                                                                                                      │"
 "│ ▲ replica not used: 10.0.1.23:6379: timed out                                                                        │"
+"│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"

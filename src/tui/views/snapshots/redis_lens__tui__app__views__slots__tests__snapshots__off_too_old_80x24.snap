@@ -1,11 +1,9 @@
 ---
 source: src/tui/views/slots_tests.rs
-assertion_line: 503
 expression: render(&app)
 ---
-" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Big keys  ·  Expiry  ·  Changes  ·  Hot keys  ·  Nodes  ·  Slots            "
+" prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys         ● analyzed "
+" 1   2    3  Analyze › Slots · 6 of 6   4   5                                 0 "
 "┌─ Slots ──────────────────────────────────────────────────────────────── off ─┐"
 "│                                                                              │"
 "│ ▲ CLUSTER SLOT-STATS needs Redis 8.2 or Valkey 8.0; 10.0.1.12:6379 runs      │"
@@ -25,5 +23,6 @@ expression: render(&app)
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
+"│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   tab Next panel   o Order   r Refresh          ctrl-f Find key  ? Help"
+" tab Next panel   0 Connections               ctrl-f Find key  : Command  ? Help"

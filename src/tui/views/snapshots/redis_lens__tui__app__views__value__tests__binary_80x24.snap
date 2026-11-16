@@ -1,16 +1,14 @@
 ---
 source: src/tui/views/value.rs
-assertion_line: 1888
 expression: t.backend()
 ---
-" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Keys  ·  Streams  ·  Search                                                 "
+" prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys   ● analyzed 14:02 "
+" 1    2  Browse › Keys · Streams · Search   3   4   5                         0 "
 "┌─ ‹ user:{id}:cart ────────┬─ user:10293:cart ──────────────── hash · 1 of 3 ─┐"
-"│ KEY                       │ 3 fields · 3.1K · expires in 6d 04h              │"
-"│ user:10293:cart           │                                                  │"
-"│                           │  FIELD          VALUE                        TTL │"
-"│                           │› na\x1b[2Jme    9b 1b 5b 32 4a ff              — │"
+"│   KEY                     │ 3 fields · 3.1K · expires in 6d 04h              │"
+"│ › user:10293:cart         │                                                  │"
+"│                           │   FIELD         VALUE                        TTL │"
+"│                           │ › na\x1b[2Jme   9b 1b 5b 32 4a ff              — │"
 "│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │                                                  │"
@@ -18,6 +16,7 @@ expression: t.backend()
 "│                           │──────────────────────────────────────────────────│"
 "│                           │ na\x1b[2Jme · hex · 6 bytes · auto-detected      │"
 "│                           │ 00000000  9b 1b 5b 32 4a ff        |..[2J.|      │"
+"│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │                                                  │"

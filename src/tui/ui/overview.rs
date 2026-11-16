@@ -48,7 +48,7 @@ const TOP_PATTERNS: usize = 3;
 /// From this width on, "Keys" also shows what TTLs free.
 const WIDE: usize = 100;
 
-/// Draws Overview into `area`, the body between the tab row and the footer.
+/// Draws Overview into `area`, the body between the area row and the footer.
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let Some(ctx) = app.ctx() else {
         let inner = sections(
@@ -70,7 +70,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     // The frame's top border, the divider and the bottom border.
     let keys_h = usize::from(area.height.saturating_sub(3).saturating_sub(now_rows));
     let (keys, keys_right) = keys_lines(app, ctx.session, w, keys_h);
-    let inner = sections(
+    // The keys move the findings in "Keys": that section has the focus.
+    let inner = super::widgets::sections_focused(
         frame,
         area,
         &[
@@ -83,6 +84,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                 rows: None,
             },
         ],
+        1,
     );
     rows(frame, inner[0], now, None);
     rows(frame, inner[1], keys, None);
@@ -101,11 +103,11 @@ fn now_titles(ctx: &Ctx<'_>, app: &App) -> (String, String) {
     let right = if state.overview.poll.off.is_some() {
         "off".to_string()
     } else if state.paused {
-        "INFO paused · p resumes".to_string()
+        "INFO paused · space resumes".to_string()
     } else if cluster {
         format!("[ ] picks a node · INFO every {every}")
     } else {
-        format!("INFO every {every} · p pauses")
+        format!("INFO every {every} · space pauses")
     };
     (left, right)
 }
@@ -330,7 +332,7 @@ fn shard_lines(s: &Session, app: &App, w: usize) -> Vec<Line<'static>> {
             NodeRole::Replica => "replica",
         };
         let mut spans = vec![
-            Span::styled(mark, style::amber()),
+            Span::styled(mark, style::focus()),
             Span::styled(pad_r(&slots_text(&n.slots), sw), style::fg()),
             Span::styled(
                 pad_r(&trunc(&n.endpoint.to_string(), nw - 1), nw),
@@ -507,7 +509,7 @@ fn finding_rows(found: &[Finding], sel: usize, w: usize) -> Vec<Line<'static>> {
             };
             let cursor = if i == sel { " › " } else { "   " };
             let text = vec![
-                Span::styled(cursor, style::amber()),
+                Span::styled(cursor, style::focus()),
                 Span::styled(format!("{mark} "), st),
                 Span::styled(f.text.clone(), style::fg()),
             ];
@@ -610,7 +612,7 @@ fn keys_lines(app: &App, s: &Session, w: usize, h: usize) -> (Vec<Line<'static>>
             ""
         };
         let again = if w >= WIDE {
-            " · r analyzes again"
+            " · a analyzes again"
         } else {
             ""
         };
@@ -666,7 +668,7 @@ fn keys_lines(app: &App, s: &Session, w: usize, h: usize) -> (Vec<Line<'static>>
         let e = estimate_for(Depth::Quick, app);
         let mut prompt = vec![Line::from(fit(
             vec![
-                Span::styled("   r", style::amber()),
+                Span::styled("   a", style::focus()),
                 Span::styled(analyze_text(&e), style::fg()),
             ],
             w,
@@ -941,7 +943,7 @@ pub fn draw_analyze(frame: &mut Frame, area: Rect, d: &AnalyzeDialog, app: &App)
         };
         lines.push(Line::from(fit(
             vec![
-                Span::styled(mark, style::amber()),
+                Span::styled(mark, style::focus()),
                 Span::styled(pad_r(depth.label(), 8), st),
                 Span::styled(pad_r(&format!("{} keys", format::grouped(e.keys)), 16), st),
                 Span::styled(
@@ -966,11 +968,11 @@ pub fn draw_analyze(frame: &mut Frame, area: Rect, d: &AnalyzeDialog, app: &App)
     }
     lines.push(Line::default());
     lines.push(Line::from(vec![
-        Span::styled(" enter", style::amber()),
+        Span::styled(" enter", style::focus()),
         Span::styled(" Start   ", style::fg()),
-        Span::styled("↑↓", style::amber()),
+        Span::styled("↑↓", style::focus()),
         Span::styled(" Pick   ", style::fg()),
-        Span::styled("esc", style::amber()),
+        Span::styled("esc", style::focus()),
         Span::styled(" Cancel", style::fg()),
     ]));
     let h = u16::try_from(lines.len())
@@ -1124,7 +1126,7 @@ mod tests {
     #[test]
     fn the_analyze_dialog() {
         let mut app = overview_app(false);
-        app.handle_key(key(KeyCode::Char('r')));
+        app.handle_key(key(KeyCode::Char('a')));
         insta::assert_snapshot!("analyze_80x24", snap(&app, 80, 24));
         app.handle_key(key(KeyCode::Down));
         insta::assert_snapshot!("analyze_deep_120x36", snap(&app, 120, 36));
@@ -1151,7 +1153,7 @@ mod tests {
             for (w, h) in [(1, 1), (0, 0), (20, 5), (40, 12), (200, 3), (3, 40)] {
                 testing::render(&app, w, h);
             }
-            app.handle_key(key(KeyCode::Char('r')));
+            app.handle_key(key(KeyCode::Char('a')));
             for (w, h) in [(1, 1), (0, 0), (20, 5), (40, 12), (200, 3), (3, 40)] {
                 testing::render(&app, w, h);
             }
@@ -1233,7 +1235,7 @@ mod tests {
     /// [`just_connected`] with a Quick analysis 4,100 keys in.
     fn analyzing() -> App {
         let mut app = just_connected(Some(3));
-        app.handle_key(key(KeyCode::Char('r')));
+        app.handle_key(key(KeyCode::Char('a')));
         let effects = app.handle_key(key(KeyCode::Enter));
         let [Effect::Connect { id, scan, .. }] = effects[..] else {
             panic!("expected a connect, got {effects:?}");
@@ -1495,7 +1497,7 @@ mod tests {
         no_heading_without_rows(&t);
         insta::assert_snapshot!("cluster_analyzed_80x24", t);
         // The dialog splits the sample across the shards that answered.
-        app.handle_key(key(KeyCode::Char('r')));
+        app.handle_key(key(KeyCode::Char('a')));
         let t = text_of(&app, 80, 24);
         assert!(t.contains("across 3 shards"), "{t}");
     }
@@ -1527,7 +1529,7 @@ mod tests {
         assert_eq!((got.keys, got.commands), (want.keys, want.commands));
         assert_eq!(got.duration, want.duration);
         let mut app = app;
-        app.handle_key(key(KeyCode::Char('r')));
+        app.handle_key(key(KeyCode::Char('a')));
         let t = text_of(&app, 80, 24);
         let line = format!("about {} commands", crate::format::count(want.commands));
         assert!(t.contains(&line), "{line}:\n{t}");

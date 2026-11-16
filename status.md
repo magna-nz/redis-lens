@@ -3,7 +3,31 @@
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
 **Current milestone:** the first release, v0.1.0 (`claude/release-0.1.0`). The web dashboard is done: phases 1 to 4 merged as #26, #28, #29 and #30 ([Web dashboard](#web-dashboard-2026-11-15)). On main: Redis Insight parity phases 1 to 5 (#15 to #23), the TUI redesign (#21), the shorter README (#24), Find key (#25) and the release pipeline with the switch to MIT (#27).
-**Last updated:** 2026-11-16 (dashboard phase 4 merged as #30; v0.1.0 release notes merged as #31; the first v0.1.0 run stopped before publishing because GitHub retired the macos-14 runner, so Apple Silicon now builds on macos-15 and the tag is re-cut)
+**Last updated:** 2026-11-17 (UI redesign under way: terminal chunk 1 in its PR, dashboard chunk 1 in #33; see [UI redesign](#ui-redesign-2026-11-17))
+
+## UI redesign (2026-11-17)
+
+A redesign of the terminal UI and the web dashboard to one design: brief in [docs/ui-redesign.md](docs/ui-redesign.md), mockup at https://claude.ai/artifact/WzCEbkbaSv65p7jayi6d2x, approved by the owner ("build the TUI and the dashboard like this"). Built in chunks, one PR each, two tracks side by side. Each chunk: implementer [opus], then verifier [opus], then the fixes the verifier asked for.
+
+Merging: the owner asked for each PR to be merged once reviewed and green. Auto mode blocks the admin merge and the repository does not allow auto-merge, so the PRs wait for the owner. Each track's branches are stacked, so the last PR of a track carries the earlier ones.
+
+| Chunk | What | State |
+|---|---|---|
+| Terminal 1 | Colour roles (focus, placeholder; amber for warnings only), the context bar and the area row in place of the header, tab row and sub-tab row, `w` from every screen, the focused pane's border, the `›` gutter on every list | **done**, #34, CI green |
+| Terminal 2 | The key grammar (every rebinding in the brief's section 5), the current area's digit again for its next panel, footers that only show keys that work and never drop the way back, and new writes on the key list (`t`, `d`, `R` on the selected key, `T`/`D` for the pattern's bulk action) through the one gate; `tests/tui_key_list_writes_it.rs` on Redis and Valkey | **done**, in its PR (stacked on Terminal 1) |
+| Terminal 3 | Actions menu (`.`), one docked confirm | not started |
+| Terminal 4 | Go to (`ctrl-k`) | not started |
+| Terminal 5 | Browse in three panes from 120 columns | not started |
+| Terminal 6 | Overview and Server layouts that use their height | not started |
+| Dashboard 1 | Context bar (connection menu, access, database, node), colour roles, 28px density, the command line as a drawer | **done**, #33, CI green |
+| Dashboard 2 | Key grammar, Go to, the keys sheet, list navigation | **done**, #35 (stacked on #33) |
+| Dashboard 3 | Browse in three panes, its state in the URL | built, in review |
+| Dashboard 4 | Overview and Server layouts | not started |
+| Docs | README, site, screenshots, changelog | not started |
+
+For the owner to decide: the grammar puts some destructive actions on lower-case keys and changes a few old habits. `d` on the key list deletes the selected key and `D` there starts the pattern's bulk delete; `t` on a hash field in the value pane is now the field's TTL (`T` is the key's); `d` on Clients ends the selected connection. Each still goes through the gate (read-only sends nothing, production asks for the typed name, a bulk action always does its dry run), but with `skip_non_prod_confirm` a single lower-case key deletes a key on a non-production profile.
+
+Known and left: the local Docker sometimes fails to publish a test container's port (`PortNotExposed` at `tests/common/mod.rs:126`) when several suites run at once, and CI's Redis 6.2 job once failed `ssh_cluster_it` with a connection reset; both pass on a rerun. At widths where a name column only just fitted, a list can drop a column 2 cells sooner than before (the gutter); the site (`docs/index.html`) still describes the tab row and sub-tab row until the docs chunk; the dashboard's Overview and Analyze colour a placeholder in a literal key name such as `cfg:{id}` (their rows carry no `literal` flag).
 
 ## Overnight run (2026-11-10): approvals and plan
 

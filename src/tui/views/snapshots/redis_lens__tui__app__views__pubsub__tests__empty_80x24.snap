@@ -1,17 +1,16 @@
 ---
 source: src/tui/views/pubsub.rs
-assertion_line: 1109
 expression: "testing::render(&app, 80, 24).backend()"
 ---
-" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
+" prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys   ● analyzed 14:02 "
+" 1 Overview   2 Browse   3 Analyze   4 Server    5  Pub/Sub       0 Connections "
 "┌─ Pub/Sub ────────── most subscribers first ─┬─ Totals ───────────────────────┐"
-"│ No active channels.                         │ Channels       0               │"
+"│   No active channels.                       │ Channels       0               │"
 "│                                             │ Patterns       0               │"
 "│                                             │ Subscribers    0               │"
 "│                                             │                                │"
 "│                                             │ Counts read no payloads. enter │"
-"│                                             │ or s starts a live tail, S a   │"
+"│                                             │ or + starts a live tail, S a   │"
 "│                                             │ shard one.                     │"
 "│                                             │                                │"
 "│                                             │                                │"
@@ -26,4 +25,4 @@ expression: "testing::render(&app, 80, 24).backend()"
 "│                                             │                                │"
 "│                                             │                                │"
 "└─────────────────────────────────────────────┴────────────────────────────────┘"
-" ↑↓ Move   enter Subscribe   space Pause   / Filter      ctrl-f Find key  ? Help"
+" + Sub   space Pause   r Refresh              ctrl-f Find key  : Command  ? Help"

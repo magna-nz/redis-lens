@@ -4,7 +4,7 @@
 //!
 //! The metadata comes from the key list's row, so it costs no command. The value is
 //! read in pages of [`PAGE_ITEMS`](crate::live::values::PAGE_ITEMS): the first when the screen shows, the next with
-//! `n`, up to [`MAX_ITEMS`] held. Collections list their items, and the selected one's
+//! `m`, up to [`MAX_ITEMS`] held. Collections list their items, and the selected one's
 //! value shows below them; `tab` moves the focus between the two so a long value can
 //! be scrolled. `f` shows the value in the next format, `y` copies it as shown, `esc`
 //! (handled by `App`) goes back to the key list.
@@ -110,7 +110,7 @@ pub struct ValueState {
     loading: Option<ReqId>,
     /// Why the last read failed, in redis-lens's own words.
     pub error: Option<String>,
-    /// The last read was refused: `n` does not ask again.
+    /// The last read was refused: `m` does not ask again.
     denied: bool,
     /// `TYPE` said `none`.
     pub gone: bool,
@@ -167,8 +167,18 @@ impl ValueState {
         };
     }
 
+    /// The key was deleted from the key list (`d`): nothing of it is shown again. What
+    /// was learned about field TTLs stays, as after `D` here.
+    pub fn close(&mut self) {
+        let httl_off = self.httl_off.take();
+        *self = Self {
+            httl_off,
+            ..Self::default()
+        };
+    }
+
     /// A value another view has read already, shown with this screen's value pane:
-    /// a Search result's fields as `Items::Hash`. Nothing more is loaded (`n` says so).
+    /// a Search result's fields as `Items::Hash`. Nothing more is loaded (`m` says so).
     pub fn preloaded(row: KeyRow, items: Items, tick: u64) -> Self {
         Self {
             row: Some(row),
@@ -593,17 +603,16 @@ pub enum FormAction {
     Edit(Target),
     /// `+`.
     Add(AddTo),
-    /// `t`: of the key, or of `field` when the form's first choice says so.
+    /// `T` (the key's, `field` `None`) or `t` (the selected hash field's).
     Ttl { field: Option<Raw> },
     /// `R`.
     Rename,
-    /// `N` on the key list.
+    /// `+` on the key list.
     NewKey,
 }
 
-/// The types `N` creates, as the form's choice shows them.
+/// The types `+` on the key list creates, as the form's choice shows them.
 pub const NEW_KEY_TYPES: [&str; 6] = ["string", "hash", "list", "set", "zset", "stream"];
-const TTL_FOR: [&str; 2] = ["key", "field"];
 
 /// One field of a [`Form`].
 #[derive(Clone)]
@@ -702,7 +711,33 @@ impl Form {
         }
     }
 
-    /// `N` on the key list of `pattern`: the name starts with the pattern's text before
+    /// `T` on a key's value, `t` on the key list: the TTL of `key`.
+    pub(crate) fn key_ttl(key: &str) -> Self {
+        let mut form = Self::new(
+            "Set the key's TTL".into(),
+            key,
+            vec![FormField::text("TTL", "")],
+            FormAction::Ttl { field: None },
+        );
+        form.notes
+            .push("90s, 10m, 24h or 7d sets it; - or persist removes it.".into());
+        form
+    }
+
+    /// `R` on a key's value or on the key list: a new name for `key`.
+    pub(crate) fn rename(key: &str) -> Self {
+        let mut form = Self::new(
+            "Rename key".into(),
+            key,
+            vec![FormField::text("new name", key)],
+            FormAction::Rename,
+        );
+        form.notes
+            .push("RENAMENX: an existing key is never overwritten.".into());
+        form
+    }
+
+    /// `+` on the key list of `pattern`: the name starts with the pattern's text before
     /// its first placeholder.
     pub fn new_key(pattern: &str) -> Self {
         let prefix = pattern.split('{').next().unwrap_or("");
@@ -792,7 +827,7 @@ impl Form {
         }
     }
 
-    /// A choice changed: `N`'s type picks the fields after it.
+    /// A choice changed: `+`'s type picks the fields after it.
     fn chose(&mut self, at: usize) {
         if self.action == FormAction::NewKey && at == 1 {
             let mut fields = new_key_fields(self.fields[1].choice);
@@ -817,7 +852,7 @@ impl Form {
         self.original.as_deref().is_some_and(|o| o == self.text(0))
     }
 
-    /// The op the form sends for `key` (for `N`, the name typed), or which field is
+    /// The op the form sends for `key` (for `+`, the name typed), or which field is
     /// wrong and why.
     pub fn op(&self, key: &str) -> Result<WriteOp, (usize, String)> {
         let k = || key.to_string();
@@ -853,18 +888,14 @@ impl Form {
                 }
             },
             FormAction::Ttl { field } => {
-                let (i, of_field) = match self.fields.first() {
-                    Some(f) if f.is_choice() => (1, f.choice == 1),
-                    _ => (0, false),
-                };
-                let ttl = parse_ttl(self.text(i)).map_err(|e| (i, e))?;
-                match (of_field, field) {
-                    (true, Some(field)) => WriteOp::FieldTtl {
+                let ttl = parse_ttl(self.text(0)).map_err(|e| (0, e))?;
+                match field {
+                    Some(field) => WriteOp::FieldTtl {
                         key: k(),
                         field: field.clone(),
                         ttl,
                     },
-                    _ => WriteOp::KeyTtl { key: k(), ttl },
+                    None => WriteOp::KeyTtl { key: k(), ttl },
                 }
             }
             FormAction::Rename => {
@@ -917,7 +948,7 @@ impl Form {
     }
 }
 
-/// The value fields of `N` for the type at `t` in [`NEW_KEY_TYPES`].
+/// The value fields of `+` for the type at `t` in [`NEW_KEY_TYPES`].
 fn new_key_fields(t: usize) -> Vec<FormField> {
     match t {
         0 => vec![FormField::text("value", "")],
@@ -1058,7 +1089,8 @@ impl ValueState {
         match c {
             'e' => self.start_edit(act),
             '+' => self.start_add(act),
-            't' => self.start_ttl(act),
+            't' => self.start_field_ttl(act),
+            'T' => self.start_ttl(act),
             'R' => self.start_rename(act),
             'd' => self.delete_item(act),
             'D' => self.delete_key(act),
@@ -1339,7 +1371,7 @@ impl ValueState {
         (fields.get(self.selected()).map(|f| f.name.clone()), None)
     }
 
-    /// `t`.
+    /// `T`: the key's TTL.
     fn start_ttl(&mut self, act: &mut Act<'_>) {
         let Some(key) = self.key_name() else {
             return;
@@ -1351,20 +1383,44 @@ impl ValueState {
         if !self.may_write(&probe, act) {
             return;
         }
-        let (field, off) = self.ttl_field();
-        let mut fields = Vec::new();
-        let mut title = "Set the key's TTL".to_string();
-        if let Some(f) = &field {
-            fields.push(FormField::choice("of", &TTL_FOR, 0));
-            title = format!("Set the TTL of the key or field {}", shown(f));
+        self.form = Some(Form::key_ttl(&key));
+    }
+
+    /// `t`: the selected hash field's TTL. Only a hash's fields have one; elsewhere,
+    /// or when field TTLs are off, it says why (`T` sets the key's).
+    fn start_field_ttl(&mut self, act: &mut Act<'_>) {
+        let Some(key) = self.key_name() else {
+            return;
+        };
+        if !matches!(self.items, Some(Items::Hash(_))) {
+            act.info("t sets the TTL of a hash field: T sets the key's.");
+            return;
         }
-        fields.push(FormField::text("TTL", ""));
-        let mut form = Form::new(title, &key, fields, FormAction::Ttl { field });
+        let (field, off) = self.ttl_field();
+        if let Some(why) = off {
+            act.info(format!("{why} T sets the key's TTL."));
+            return;
+        }
+        let Some(field) = field else {
+            act.info("No field is selected.");
+            return;
+        };
+        let probe = WriteOp::FieldTtl {
+            key: key.clone(),
+            field: field.clone(),
+            ttl: WriteTtl::Seconds(60),
+        };
+        if !self.may_write(&probe, act) {
+            return;
+        }
+        let mut form = Form::new(
+            format!("Set the TTL of field {}", shown(&field)),
+            &key,
+            vec![FormField::text("TTL", "")],
+            FormAction::Ttl { field: Some(field) },
+        );
         form.notes
             .push("90s, 10m, 24h or 7d sets it; - or persist removes it.".into());
-        if let Some(why) = off {
-            form.notes.push(why);
-        }
         self.form = Some(form);
     }
 
@@ -1380,15 +1436,7 @@ impl ValueState {
         if !self.may_write(&probe, act) {
             return;
         }
-        let mut form = Form::new(
-            "Rename key".into(),
-            &key,
-            vec![FormField::text("new name", key.clone())],
-            FormAction::Rename,
-        );
-        form.notes
-            .push("RENAMENX: an existing key is never overwritten.".into());
-        self.form = Some(form);
+        self.form = Some(Form::rename(&key));
     }
 
     /// `d`: the selected field, element, member or entry.
@@ -1724,12 +1772,21 @@ impl ViewState for ValueState {
                 }
                 true
             }
-            Some('n') => {
+            Some('m') => {
                 self.more(act);
                 true
             }
             Some('y') => {
                 self.copy(act);
+                true
+            }
+            // The parent of an item is its key: `Y` copies its name. Only on a key's
+            // value: a stream entry's or a Search result's value has its own screen.
+            Some('Y') if act.screen == Screen::KeyDetail => {
+                match self.key_name() {
+                    Some(k) => act.copy(CopyText::key(&k)),
+                    None => act.info("Nothing selected to copy."),
+                }
                 true
             }
             Some(c) => self.edit_key(c, act),
@@ -1820,7 +1877,7 @@ mod tests {
             s.version = v.to_string();
         }
         testing::live_ready(&mut app);
-        app.handle_key(ch('2'));
+        crate::tui::app::views::testing::area(&mut app, '2');
         let at = {
             let data = app.pattern_data().expect("patterns");
             let name = |i: usize| data.patterns[i].pattern.as_str();
@@ -1979,7 +2036,7 @@ mod tests {
                 id,
                 page(Some("hash"), fields(), Some(At::Cursor(9))),
             );
-            let (_, next) = one_request(&app.handle_key(ch('n')));
+            let (_, next) = one_request(&app.handle_key(ch('m')));
             assert!(!next.field_ttls, "{v}");
             let all = text(&testing::render(&app, 120, 36));
             assert!(!all.contains("fields expire"), "{all}");
@@ -2016,7 +2073,7 @@ mod tests {
         );
         assert!(all.contains("for this user."), "{all}");
         assert!(!all.contains("Field TTL  "), "{all}");
-        let (_, req) = one_request(&app.handle_key(ch('n')));
+        let (_, req) = one_request(&app.handle_key(ch('m')));
         assert!(!req.field_ttls);
         // Another key does not ask either.
         app.handle_key(key(KeyCode::Esc));
@@ -2138,7 +2195,7 @@ mod tests {
             "{all}"
         );
         assert!(!all.contains("NOPERM"));
-        let effects = app.handle_key(ch('n'));
+        let effects = app.handle_key(ch('m'));
         assert!(value_requests(&effects).is_empty());
         assert_eq!(
             notice(&app),
@@ -2156,7 +2213,7 @@ mod tests {
         testing::reply(&mut app, id, Ok(LiveReply::Value(Reply::Gone)));
         snap(&app, "gone");
         assert!(text(&testing::render(&app, 80, 24)).contains("The key no longer exists."));
-        app.handle_key(ch('n'));
+        app.handle_key(ch('m'));
         assert_eq!(notice(&app), "The key no longer exists.");
     }
 
@@ -2187,12 +2244,12 @@ mod tests {
         testing::reply(&mut app, id, page(Some("vectorset"), items, None));
         let all = text(&testing::render(&app, 120, 36));
         assert!(all.contains("vector sets can't be read in pages"), "{all}");
-        app.handle_key(ch('n'));
+        app.handle_key(ch('m'));
         assert!(notice(&app).starts_with("Vector sets can't be read in pages"));
     }
 
     #[test]
-    fn n_loads_the_next_page_until_the_end() {
+    fn m_loads_the_next_page_until_the_end() {
         let (mut app, id, _) = open(row("queue:jobs", KeyType::String, Some(250), Some(200)));
         // TYPE said list, not the key list's string: the next pages read a list.
         let items = Items::List(
@@ -2205,17 +2262,17 @@ mod tests {
             id,
             page(Some("list"), items, Some(At::Index(100))),
         );
-        let (id, req) = one_request(&app.handle_key(ch('n')));
+        let (id, req) = one_request(&app.handle_key(ch('m')));
         assert_eq!(
             (req.kind.clone(), req.at.clone()),
             (Kind::List, Some(At::Index(100)))
         );
-        assert!(value_requests(&app.handle_key(ch('n'))).is_empty());
+        assert!(value_requests(&app.handle_key(ch('m'))).is_empty());
         assert_eq!(notice(&app), "Still loading the value…");
         let items = Items::List((0..50).map(|_| Raw::from("x")).collect());
         testing::reply(&mut app, id, page(None, items, None));
         assert_eq!(app.views.value.loaded(), 150);
-        assert!(value_requests(&app.handle_key(ch('n'))).is_empty());
+        assert!(value_requests(&app.handle_key(ch('m'))).is_empty());
         assert_eq!(notice(&app), "All 150 items are loaded.");
         let all = text(&testing::render(&app, 120, 36));
         assert!(all.contains("150 of 250"), "{all}");
@@ -2235,7 +2292,7 @@ mod tests {
                 id,
                 page(Some("set"), items, Some(At::Cursor(p + 1))),
             );
-            let effects = app.handle_key(ch('n'));
+            let effects = app.handle_key(ch('m'));
             match value_requests(&effects).into_iter().next() {
                 Some((next, _)) => id = next,
                 None => break,
@@ -2243,7 +2300,7 @@ mod tests {
         }
         assert_eq!(app.views.value.loaded(), MAX_ITEMS);
         assert!(app.views.value.capped);
-        assert!(value_requests(&app.handle_key(ch('n'))).is_empty());
+        assert!(value_requests(&app.handle_key(ch('m'))).is_empty());
         assert_eq!(
             notice(&app),
             "At most 10,000 items are held, so no more are loaded."
@@ -2252,7 +2309,7 @@ mod tests {
         let (mut app, id, _) = open(row("s", KeyType::Set, Some(2), Some(1)));
         let items = Items::Set(vec![Raw::from("a"), Raw::from("b")]);
         testing::reply(&mut app, id, page(Some("set"), items, Some(At::Cursor(3))));
-        let (id, _) = one_request(&app.handle_key(ch('n')));
+        let (id, _) = one_request(&app.handle_key(ch('m')));
         let items = Items::Set(vec![Raw::from("b"), Raw::from("c")]);
         testing::reply(&mut app, id, page(None, items, None));
         assert_eq!(app.views.value.loaded(), 3);
@@ -2275,6 +2332,22 @@ mod tests {
         assert_eq!(app.views.value.format, Some(want));
         let all = text(&testing::render(&app, 120, 36));
         assert!(all.contains(&format!("shown as {}", want.label())), "{all}");
+    }
+
+    /// `Y` on a key's value copies the key's name, whatever item is selected.
+    #[test]
+    fn capital_y_copies_the_key_name() {
+        let mut app = hash_app();
+        app.handle_key(key(KeyCode::Down));
+        let copied: Vec<String> = app
+            .handle_key(ch('Y'))
+            .into_iter()
+            .filter_map(|e| match e {
+                Effect::Copy(t) => Some(t.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copied, ["user:10293:cart"]);
     }
 
     #[test]
@@ -2327,7 +2400,7 @@ mod tests {
         let (mut app, id, _) = open(cart());
         testing::reply(&mut app, id, page(Some("hash"), fields(), None));
         app.handle_key(ch('0'));
-        let effects = app.handle_key(ch('2'));
+        let effects = crate::tui::app::views::testing::area(&mut app, '2');
         assert_eq!(app.screen(), Screen::KeyDetail);
         assert!(value_requests(&effects).is_empty());
         app.handle_key(key(KeyCode::Esc));
@@ -2400,7 +2473,7 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen(), Screen::Patterns);
-        let effects = app.handle_key(ch('s'));
+        let effects = app.handle_key(ctrl('s'));
         let [Effect::SaveSnapshot(report)] = &effects[..] else {
             panic!("{effects:?}");
         };
@@ -2508,6 +2581,29 @@ mod tests {
             .into_iter()
             .filter_map(|(id, r)| matches!(r, LiveRequest::Write(_)).then_some(id))
             .collect()
+    }
+
+    /// The footer on a key's value shows the write keys only with writes on, and its
+    /// way back either way.
+    #[test]
+    fn the_footer_shows_write_keys_only_with_writes_on() {
+        let footer = |app: &App| {
+            let t = testing::render(app, 120, 36);
+            let b = t.backend().buffer();
+            (0..b.area.width)
+                .map(|x| b[(x, b.area.height - 1)].symbol().to_string())
+                .collect::<String>()
+        };
+        let mut app = hash_app();
+        set_profile(&mut app, Env::Prod, None);
+        let ro = footer(&app);
+        assert!(ro.contains("esc Back"), "{ro}");
+        for w in ["e Edit", "+ Add", "d Delete", "D Delete"] {
+            assert!(!ro.contains(w), "{w} on a read-only profile: {ro}");
+        }
+        set_profile(&mut app, Env::Local, None);
+        let rw = footer(&app);
+        assert!(rw.contains("e ") && rw.contains("esc Back"), "{rw}");
     }
 
     fn set_profile(app: &mut App, env: Env, read_only: Option<bool>) {
@@ -2775,7 +2871,7 @@ mod tests {
     }
 
     #[test]
-    fn ttls_parse_and_t_sets_the_key_or_field_ttl() {
+    fn ttls_parse_and_t_sets_the_field_ttl_and_shift_t_the_keys() {
         assert_eq!(parse_ttl("90s"), Ok(WTtl::Seconds(90)));
         assert_eq!(parse_ttl("10m"), Ok(WTtl::Seconds(600)));
         assert_eq!(parse_ttl("24h"), Ok(WTtl::Seconds(86_400)));
@@ -2790,7 +2886,14 @@ mod tests {
         assert!(parse_ttl("5300w").is_err());
 
         let mut app = string_app("x");
-        app.handle_key(ch('t'));
+        // `t` is a field's TTL: a string has none, and says so.
+        assert!(writes(&app.handle_key(ch('t'))).is_empty());
+        assert!(app.views.value.form.is_none());
+        assert_eq!(
+            notice(&app),
+            "t sets the TTL of a hash field: T sets the key's."
+        );
+        app.handle_key(ch('T'));
         type_text(&mut app, "10m");
         let e = app.handle_key(key(KeyCode::Enter));
         assert_eq!(
@@ -2809,7 +2912,7 @@ mod tests {
         assert_eq!(notice(&app), "TTL set to 10m 00s.");
         assert!(value_requests(&e).is_empty());
         assert_eq!(meta_requests(&e).len(), 1);
-        app.handle_key(ch('t'));
+        app.handle_key(ch('T'));
         type_text(&mut app, "0");
         assert!(writes(&app.handle_key(key(KeyCode::Enter))).is_empty());
         app.handle_key(ctrl('u'));
@@ -2823,12 +2926,12 @@ mod tests {
             }]
         ));
 
-        // A hash on Redis 7.4 (the fixture): the key or the selected field.
+        // A hash on Redis 7.4 (the fixture): `t` is the selected field's, `T` the key's.
         let mut app = hash_app();
         app.handle_key(ch('t'));
-        assert!(app.views.value.form.as_ref().unwrap().fields[0].is_choice());
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Enter));
+        let form = app.views.value.form.as_ref().unwrap();
+        assert_eq!(form.fields.len(), 1);
+        assert!(!form.fields[0].is_choice());
         type_text(&mut app, "1h");
         assert_eq!(
             writes(&app.handle_key(key(KeyCode::Enter))),
@@ -2838,15 +2941,22 @@ mod tests {
                 ttl: WTtl::Seconds(3_600)
             }]
         );
-        // Redis 7.2: the key only, and the form says why.
+        let mut app = hash_app();
+        app.handle_key(ch('T'));
+        type_text(&mut app, "1h");
+        assert_eq!(
+            writes(&app.handle_key(key(KeyCode::Enter))),
+            [WriteOp::KeyTtl {
+                key: "user:10293:cart".into(),
+                ttl: WTtl::Seconds(3_600)
+            }]
+        );
+        // Redis 7.2: no field TTL, and `t` says why; `T` still sets the key's.
         let mut app = loaded_on(cart(), "hash", fields(), Some("7.2.4"));
         app.handle_key(ch('t'));
-        let form = app.views.value.form.as_ref().unwrap();
-        assert!(!form.fields[0].is_choice());
-        assert!(
-            form.notes.iter().any(|n| n.contains("Redis 7.4")),
-            "{form:?}"
-        );
+        assert!(app.views.value.form.is_none());
+        assert!(notice(&app).contains("Redis 7.4"), "{}", notice(&app));
+        app.handle_key(ch('T'));
         type_text(&mut app, "1h");
         assert!(matches!(
             &writes(&app.handle_key(key(KeyCode::Enter)))[..],
@@ -2891,6 +3001,53 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         let e = app.handle_key(key(KeyCode::Enter));
         assert!(value_requests(&e).is_empty());
+    }
+
+    /// `t` used to set the key's TTL; now it is the selected hash field's (`T` is the
+    /// key's). On a hash it opens the field TTL form naming the field; on any other
+    /// type it sends nothing and points to `T`.
+    #[test]
+    fn t_is_the_field_ttl_on_a_hash_and_points_to_capital_t_elsewhere() {
+        let mut app = hash_app();
+        set_profile(&mut app, Env::Local, None);
+        assert!(writes(&app.handle_key(ch('t'))).is_empty());
+        let form = app.views.value.form.as_ref().expect("the field TTL form");
+        assert_eq!(form.title, "Set the TTL of field sku:44812");
+        assert!(matches!(form.action, FormAction::Ttl { field: Some(_) }));
+        for mut app in [list_app(), set_app()] {
+            set_profile(&mut app, Env::Local, None);
+            let mut e = app.handle_key(ch('t'));
+            assert!(app.views.value.form.is_none());
+            assert_eq!(
+                notice(&app),
+                "t sets the TTL of a hash field: T sets the key's."
+            );
+            e.extend(app.handle_key(key(KeyCode::Enter)));
+            assert!(writes(&e).is_empty(), "{e:?}");
+        }
+    }
+
+    /// With the focus in the value box the edit keys still act on the selected item,
+    /// the one whose value the box shows, and on nothing else.
+    #[test]
+    fn with_the_focus_in_the_value_d_still_deletes_the_selected_item() {
+        let mut app = hash_app();
+        app.handle_key(key(KeyCode::Down));
+        let field = match app.views.value.items.as_ref() {
+            Some(Items::Hash(f)) => f[app.views.value.selected()].name.clone(),
+            other => panic!("a hash, got {other:?}"),
+        };
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.views.value.focus, Focus::Value);
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(ch('d'));
+        assert_eq!(
+            writes(&app.handle_key(ch('y'))),
+            [WriteOp::HDel {
+                key: "user:10293:cart".into(),
+                field
+            }]
+        );
     }
 
     #[test]
@@ -3098,7 +3255,7 @@ mod tests {
             (Env::Local, Some(true)),
         ] {
             for make in apps {
-                for k in ['e', '+', 't', 'R', 'd', 'D'] {
+                for k in ['e', '+', 't', 'T', 'R', 'd', 'D'] {
                     let mut app = make();
                     set_profile(&mut app, env, ro);
                     let mut effects = app.handle_key(ch(k));
@@ -3109,6 +3266,7 @@ mod tests {
                                 || n.contains("off")
                                 || n.contains("adds to")
                                 || n.contains("deletes a field")
+                                || n.contains("TTL of a hash field")
                                 || n.contains("can't be edited"),
                             "{k}: {n}"
                         );
@@ -3254,7 +3412,7 @@ mod tests {
         assert_eq!(app.screen(), Screen::KeyDetail);
         testing::reply(&mut app, id, page(Some("hash"), fields(), None));
         let all = text(&testing::render(&app, 80, 24));
-        let frame = all.lines().nth(3).unwrap();
+        let frame = all.lines().nth(2).unwrap();
         assert!(frame.starts_with("┌─ ‹ user:{id}:cart"), "{frame}");
         assert!(frame.contains("┬─ user:10293:cart"), "{frame}");
         // → moves into the value pane, ← comes back to the items.
@@ -3303,7 +3461,7 @@ mod tests {
         let mut app = hash_app();
         set_profile(&mut app, Env::Prod, None);
         app.handle_key(key(KeyCode::Right));
-        for k in ['d', 'D', 'e', '+', 't', 'R'] {
+        for k in ['d', 'D', 'e', '+', 't', 'T', 'R'] {
             assert!(writes(&app.handle_key(ch(k))).is_empty(), "{k}");
             assert!(app.confirm.is_none(), "{k}");
             app.handle_key(key(KeyCode::Esc));
@@ -3393,7 +3551,7 @@ mod tests {
         // The move keys scroll the summary; n, f and y say what they do here.
         app.handle_key(key(KeyCode::End));
         assert!(app.views.value.scroll > 0);
-        app.handle_key(ch('n'));
+        app.handle_key(ch('m'));
         assert_eq!(notice(&app), "The value is loaded.");
         app.handle_key(ch('f'));
         assert!(notice(&app).contains("no formats"), "{}", notice(&app));
@@ -3483,7 +3641,7 @@ mod tests {
         snap(&app, "array");
         app.handle_key(key(KeyCode::End));
         assert_eq!(app.views.value.selected_value(), Some(&Raw::from("v1000")));
-        let effects = app.handle_key(ch('n'));
+        let effects = app.handle_key(ch('m'));
         let (_, req) = one_request(&effects);
         assert_eq!((req.kind, req.at), (Kind::Array, Some(At::Index(1001))));
         app.handle_key(ch('e'));

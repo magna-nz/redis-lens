@@ -15,7 +15,9 @@ use crate::tui::app::views::slots::{
 
 use super::analysis::{Col, MARK, Tier, head_row, notice, paragraph, pick_cols};
 use super::style;
-use super::widgets::{Section, Title, pad_l, pad_r, rows, scroll_offset, sections, trunc};
+use super::widgets::{
+    Section, Title, gutter_area, list, pad_l, pad_r, rows, scroll_offset, sections_focused, trunc,
+};
 
 const NODE_W: usize = 19;
 const NUM_W: usize = 7;
@@ -110,14 +112,15 @@ pub fn draw(frame: &mut Frame, area: Rect, st: &SlotsState, ctx: &Ctx<'_>) {
         };
         format!("{n} range{}{more}", if n == 1 { "" } else { "s" })
     };
-    let hot_right = format!("by {} · o changes the order", st.order.label());
+    let hot_right = format!("by {} · s changes the order", st.order.label());
     let selected = st.selected();
     let detail_title = selected.map_or_else(
         || "Details".to_string(),
         |h| format!("Slot {}", h.stat.slot),
     );
     let detail_right = selected.map_or_else(String::new, |h| nodes[h.node].endpoint.to_string());
-    let inner = sections(
+    // The keys move the hottest slots: that section has the focus.
+    let inner = sections_focused(
         frame,
         area,
         &[
@@ -134,6 +137,7 @@ pub fn draw(frame: &mut Frame, area: Rect, st: &SlotsState, ctx: &Ctx<'_>) {
                 rows: Some(detail_h),
             },
         ],
+        1,
     );
 
     // The ranges.
@@ -157,7 +161,9 @@ pub fn draw(frame: &mut Frame, area: Rect, st: &SlotsState, ctx: &Ctx<'_>) {
 
     // The hottest slots.
     let cols = columns("SLOT", false);
-    let (keep, first_w) = pick_cols(&cols, w, WIDE_AT, ctx.more);
+    // A list: its columns start after the marker gutter.
+    let hw = usize::from(gutter_area(inner[1]).width);
+    let (keep, first_w) = pick_cols(&cols, hw, super::widgets::after_gutter(WIDE_AT), ctx.more);
     let first_w = first_w.min(FIRST_CAP);
     let numeric: Vec<usize> = (2..cols.len()).collect();
     let body = Rect {
@@ -167,7 +173,7 @@ pub fn draw(frame: &mut Frame, area: Rect, st: &SlotsState, ctx: &Ctx<'_>) {
     };
     rows(
         frame,
-        inner[1],
+        gutter_area(inner[1]),
         vec![head_row(&cols, &keep, first_w, &numeric)],
         None,
     );
@@ -219,7 +225,7 @@ pub fn draw(frame: &mut Frame, area: Rect, st: &SlotsState, ctx: &Ctx<'_>) {
                 Line::from(spans)
             })
             .collect();
-        rows(frame, body, lines, Some(sel - off));
+        list(frame, body, lines, Some(sel - off));
     }
 
     // The selected slot's keys.

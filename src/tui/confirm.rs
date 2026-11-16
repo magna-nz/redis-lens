@@ -28,7 +28,7 @@ pub enum ConfirmFor {
     },
     /// `w` on Connections: turning writes on for entry `id`.
     WritesOn { id: ConnId },
-    /// `x` or `D` on Patterns, after the dry run (`super::bulk`): `summary` says what
+    /// `t` or `d` on Patterns (`T` or `D` on its key list), after the dry run (`super::bulk`): `summary` says what
     /// it found, as lines safe to draw.
     Bulk { op: WriteOp, summary: Vec<String> },
 }
@@ -383,13 +383,25 @@ impl App {
         .map_or_else(Vec::new, |(_, e)| e)
     }
 
-    /// `w` on Connections: writes off at once; on after asking.
+    /// `w`: writes off at once; on after asking. On Connections for the selected
+    /// profile, on every other screen for the connected one.
     pub(super) fn toggle_writes(&mut self) -> Vec<Effect> {
-        let super::ConnSel::Entry(id) = self.conn_sel else {
-            self.set_info("Select a connection first.");
-            return Vec::new();
+        let id = if self.screen() == super::Screen::Connections {
+            let super::ConnSel::Entry(id) = self.conn_sel else {
+                self.set_info("Select a connection first.");
+                return Vec::new();
+            };
+            id
+        } else {
+            let Some(id) = self.session.as_ref().map(|s| s.id) else {
+                self.set_info("Connect first: writes are set for the connected profile.");
+                return Vec::new();
+            };
+            id
         };
         let Some(e) = self.entry(id) else {
+            // Gone from the list, as a Docker rescan can drop a container.
+            self.set_info("That connection is no longer listed: there are no writes to set.");
             return Vec::new();
         };
         if !e.profile.is_read_only() {
@@ -880,6 +892,113 @@ mod tests {
         let e = app.handle_key(ch('y'));
         assert!(set_writes(&e).is_empty());
         assert!(!app.entry(id).unwrap().profile.is_read_only());
+    }
+
+    /// `w` away from Connections asks about the connected profile, with the very
+    /// question `w` asks on Connections: on a read-only prod profile, its typed name.
+    #[test]
+    fn w_on_any_screen_asks_the_connections_question_for_the_connected_profile() {
+        let mut app = testing::scanned();
+        testing::live_ready(&mut app);
+        let id = on_connections(&mut app, "prod-cache-01");
+        app.handle_key(ch('w'));
+        let on_connections_question = app.confirm.clone().unwrap();
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.confirm.is_none());
+        for screen in [
+            Screen::Overview,
+            Screen::Patterns,
+            Screen::KeyDetail,
+            Screen::Ttl,
+            Screen::Clients,
+            Screen::Streams,
+            Screen::PubSub,
+        ] {
+            testing::show(&mut app, screen);
+            assert_eq!(app.screen(), screen);
+            assert!(app.handle_key(ch('w')).is_empty(), "{screen:?}");
+            let c = app.confirm.clone().unwrap_or_else(|| panic!("{screen:?}"));
+            assert_eq!(c, on_connections_question, "{screen:?}");
+            assert_eq!(c.what, ConfirmFor::WritesOn { id });
+            assert_eq!(c.expect, Expect::Type("prod-cache-01".into()));
+            // `y` is not the name: nothing is set, and enter refuses.
+            assert!(set_writes(&app.handle_key(ch('y'))).is_empty());
+            assert!(set_writes(&app.handle_key(key(KeyCode::Enter))).is_empty());
+            assert!(app.notice.as_ref().unwrap().text.contains("did not match"));
+            assert!(app.session.as_ref().unwrap().profile.is_read_only());
+            assert_eq!(app.screen(), screen, "the question keeps the screen");
+        }
+        // The typed name turns them on, once saved, from where `w` was pressed.
+        app.handle_key(ch('w'));
+        type_text(&mut app, "prod-cache-01");
+        let e = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(set_writes(&e), vec![("prod-cache-01".to_string(), true)]);
+        assert_eq!(app.screen(), Screen::PubSub);
+    }
+
+    #[test]
+    fn w_on_another_screen_asks_y_or_n_outside_prod_and_turns_writes_off_at_once() {
+        let mut app = testing::scanned();
+        let id = app.session.as_ref().unwrap().id;
+        let e = app.entry_mut(id).unwrap();
+        e.profile.env = Env::Stage;
+        e.profile.read_only = Some(true);
+        let name = e.profile.name.clone();
+        testing::show(&mut app, Screen::Overview);
+        assert!(app.handle_key(ch('w')).is_empty());
+        assert_eq!(app.confirm.as_ref().unwrap().expect, Expect::YesNo);
+        assert!(app.handle_key(ch('n')).is_empty());
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("writes stay off")
+        );
+        app.handle_key(ch('w'));
+        assert_eq!(
+            set_writes(&app.handle_key(ch('y'))),
+            vec![(name.clone(), true)]
+        );
+        app.apply(Msg::WritesSaved {
+            name: name.clone(),
+            on: true,
+        });
+        assert!(!app.session.as_ref().unwrap().profile.is_read_only());
+        // Off: at once, without a question.
+        assert_eq!(set_writes(&app.handle_key(ch('w'))), vec![(name, false)]);
+        assert!(app.confirm.is_none());
+        assert!(app.session.as_ref().unwrap().profile.is_read_only());
+    }
+
+    /// `w` in a text input is a letter; with no connection it says what to do.
+    #[test]
+    fn w_types_in_an_input_and_needs_a_connection() {
+        let mut app = testing::scanned();
+        testing::show(&mut app, Screen::Patterns);
+        app.handle_key(ch('/'));
+        app.handle_key(ch('w'));
+        assert!(app.confirm.is_none());
+        assert_eq!(app.patterns.filter, "w");
+        let mut app = App::new(crate::tui::fixtures::profiles());
+        crate::tui::app::views::testing::area(&mut app, '1');
+        assert!(app.handle_key(ch('w')).is_empty());
+        assert!(app.confirm.is_none());
+        assert!(app.notice.as_ref().unwrap().text.contains("Connect first"));
+    }
+
+    /// `w` once the session's entry is gone from the list (a Docker rescan dropped its
+    /// container) says so and asks nothing.
+    #[test]
+    fn w_says_so_when_the_connection_is_no_longer_listed() {
+        let mut app = testing::scanned();
+        testing::show(&mut app, Screen::Patterns);
+        let id = app.session.as_ref().unwrap().id;
+        app.entries.retain(|e| e.id != id);
+        assert!(app.handle_key(ch('w')).is_empty());
+        assert!(app.confirm.is_none());
+        let n = app.notice.as_ref().expect("a notice");
+        assert!(n.text.contains("no longer listed"), "{}", n.text);
     }
 
     #[test]

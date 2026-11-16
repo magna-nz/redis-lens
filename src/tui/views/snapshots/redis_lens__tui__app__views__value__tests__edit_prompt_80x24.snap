@@ -1,18 +1,16 @@
 ---
 source: src/tui/views/value.rs
-assertion_line: 3174
 expression: t.backend()
 ---
-" prod-cache-01   LOCAL   writes on   15G / 24G · 7.92M keys    ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Keys  ·  Streams  ·  Search                                                 "
+" prod-cache-01  LOCAL   w  writes on   15G / 24G · 7.92M keys  ● analyzed 14:02 "
+" 1    2  Browse › Keys · Streams · Search   3   4   5                         0 "
 "┌─ ‹ user:{id}:cart ────────┬─ user:10293:cart ───────────────────────── hash ─┐"
-"│ KEY                       │ 3 fields · 3.1K · expires in 6d 04h              │"
-"│ user:10293:cart           │                                                  │"
-"│                           │  FIELD          VALUE                        TTL │"
-"│                           │  sku:44812      {"qty":2,"price":19.99}   2h 10m │"
-"│                           │› sku:44813      {"qty":1,"price":4.50}         — │"
-"│                           │  coupon         "WINTER10"                     — │"
+"│   KEY                     │ 3 fields · 3.1K · expires in 6d 04h              │"
+"│ › user:10293:cart         │                                                  │"
+"│                           │   FIELD         VALUE                        TTL │"
+"│                           │   sku:44812     {"qty":2,"price":19.99}   2h 10m │"
+"│                           │ › sku:44813     {"qty":1,"price":4.50}         — │"
+"│                           │   coupon        "WINTER10"                     — │"
 "│                           │                                                  │"
 "│                           │                                                  │"
 "│                           │──────────────────────────────────────────────────│"
@@ -20,6 +18,7 @@ expression: t.backend()
 "│                           │ {                                                │"
 "│                           │   "qty": 1,                                      │"
 "│                           │   "price": 4.50                                  │"
+"│                           │ }                                                │"
 "│   ┌─ Edit field sku:44813 ───────────────────────────── user:10293:cart ─┐   │"
 "│   │ value › {"qty":1,"price":4.50}▏                                      │   │"
 "│   │                                                                      │   │"
