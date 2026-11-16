@@ -103,12 +103,13 @@ export function mount(root, ctx) {
   let shardLive = new Map();
 
   const subtitle = h('p', { class: 'mono subtitle' });
-  const quick = h('button', { type: 'button', class: 'btn', text: 'Analyze 10,000 keys', onclick: () => ctx.analyze('quick') });
+  const quick = h('button', { type: 'button', class: 'btn', text: 'Analyze 10,000 keys', 'data-act': 'analyze', onclick: () => ctx.analyze('quick') });
   const deep = h('button', { type: 'button', class: 'btn primary', text: 'Analyze 100,000 keys', onclick: () => ctx.analyze('deep') });
   const drawButtons = () => {
     const a = ctx.state().analysis;
     quick.disabled = a.running;
     deep.disabled = a.running;
+    quick.title = a.running ? 'An analysis is running: wait for it, or stop it on Analyze.' : '';
     deep.textContent = a.running ? 'Analyzing…' : 'Analyze 100,000 keys';
   };
   drawButtons();
@@ -139,8 +140,8 @@ export function mount(root, ctx) {
   const facts = h('dl', { class: 'facts' });
   const factsCard = h('div', { class: 'card stack' }, h('h2', { class: 'lbl', text: 'Server' }), liveNote, facts);
   const shardsBox = h('div');
-  const findings = h('div', { class: 'card col' }, h('h2', { class: 'lbl', text: 'Things to look at' }), h('p', { class: 'muted', text: 'Reading what the server reports…' }));
-  const patterns = h('div', { class: 'card col' });
+  const findings = h('div', { class: 'card col', 'data-pane': 'findings' }, h('h2', { class: 'lbl', text: 'Things to look at' }), h('p', { class: 'muted', text: 'Reading what the server reports…' }));
+  const patterns = h('div', { class: 'card col', 'data-pane': 'top-patterns' });
   const offBox = h('div');
 
   view.append(head, tiles, factsCard, shardsBox, h('div', { class: 'cols stretch' }, findings, patterns), offBox);
@@ -251,7 +252,7 @@ export function mount(root, ctx) {
         h('span', null, h('span', { text: f.text }), f.label ? h('span', { class: 'sub', text: f.label }) : null),
         h('span', { class: 'chev', 'aria-hidden': 'true', text: to ? '›' : '' }),
       ];
-      return h('li', null, to ? h('a', { class: 'row row-finding', href: to }, inner) : h('div', { class: 'row row-finding' }, inner));
+      return h('li', null, to ? h('a', { class: 'row row-finding', href: to, 'data-row': f.text }, inner) : h('div', { class: 'row row-finding', 'data-row': f.text }, inner));
     };
     const server = (data ? data.findings : []).map(row);
     // The analysis's findings repeat the server's own: each is listed once, under the server.
@@ -281,7 +282,7 @@ export function mount(root, ctx) {
     fill(patterns,
       h('h2', { class: 'lbl', text: byBytes ? 'Memory by key pattern' : 'Keys by key pattern' }),
       h('ul', { class: 'list' }, a.topPatterns.map((t) => h('li', null, h('button', {
-        type: 'button', class: 'row row-pattern', title: `List the keys of ${t.pattern.name} on Browse`,
+        type: 'button', class: 'row row-pattern', title: `List the keys of ${t.pattern.name} on Browse`, 'data-row': t.pattern.id ?? t.pattern.name,
         onclick: () => ctx.openPattern(t.pattern),
       },
       patternName(t.pattern.name, { cls: 'mono clip name' }),

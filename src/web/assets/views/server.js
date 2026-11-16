@@ -11,7 +11,7 @@ import {
 } from '../ui.js';
 import { spanText } from './overview.js';
 
-const TABS = [
+export const TABS = [
   { id: 'clients', label: 'Clients', href: '#/server/clients' },
   { id: 'slowlog', label: 'Slow log', href: '#/server/slowlog' },
   { id: 'monitor', label: 'Monitor', href: '#/server/monitor' },
@@ -152,7 +152,8 @@ export function mount(root, ctx, route) {
   }
   offs.push(ctx.api.on('figures', drawCharts), ctx.api.on('live', drawCharts));
 
-  const panel = h('div');
+  // The panel's list is one pane for the keys (Monitor's log has no rows).
+  const panel = h('div', { 'data-pane': tab === 'monitor' ? null : tab });
   view.append(
     h('div', { class: 'view-head' },
       h('h1', { class: 'title', id: 'server-title', text: 'Server' })),
@@ -212,7 +213,7 @@ export function mount(root, ctx, route) {
               g.memory !== null ? fmtBytes(g.memory) : null,
             ].filter(Boolean).join(' · ');
             const idle = g.flagged ? `▲ ${g.idleConns ? `${fmtGrouped(g.idleConns)} ` : ''}idle for an hour or more · ` : '';
-            return h('li', null, h('button', { type: 'button', class: 'row row-group', 'data-group': '', 'aria-label': `${g.name}: ${plural(g.connections, 'connection', 'connections')}. List them.`, onclick: () => pick(g) },
+            return h('li', null, h('button', { type: 'button', class: 'row row-group', 'data-group': '', 'data-row': `${g.by}:${g.name}`, 'aria-label': `${g.name}: ${plural(g.connections, 'connection', 'connections')}. List them.`, onclick: () => pick(g) },
               h('span', null,
                 h('span', { class: 'mono name', text: g.name }),
                 h('span', { class: 'sub small' }, idle ? h('span', { class: 'glyph', text: idle }) : null, facts)),
@@ -246,7 +247,7 @@ export function mount(root, ctx, route) {
             { label: 'Last command', cls: 'mono', cell: (c) => c.cmd || DASH },
             { label: 'DB', cls: 'mono right', cell: (c) => (c.db === null ? DASH : String(c.db)) },
             { label: 'Memory', cls: 'mono right', cell: (c) => fmtBytes(c.memory) },
-          ], rows, { caption: `Connections of ${group.name}`, cls: 'conns' })
+          ], rows, { caption: `Connections of ${group.name}`, cls: 'conns', rowKey: (c, i) => `${c.addr || ''}#${i}` })
           : emptyState('No connections in this group any more.'),
         h('p', { class: 'muted small', text: 'The connection redis-lens itself reads with is named redis-lens. User names are never shown.' }));
     }
@@ -297,7 +298,7 @@ export function mount(root, ctx, route) {
               ];
             },
           },
-        ], data.entries, { caption: 'Slow log entries, newest first', cls: 'slow' })
+        ], data.entries, { caption: 'Slow log entries, newest first', cls: 'slow', rowKey: (e, i) => (e.id ?? `${e.at}#${i}`) })
         : emptyState('The slow log is empty.'),
       data.keysOff ? notice(`Key names are missing: ${data.keysOff}.`) : null,
       h('p', { class: 'muted small', text: 'Arguments are shown with credentials masked, on screen only.' }));

@@ -15,6 +15,7 @@ import './edits.test.js';
 import './format.test.js';
 import './forms.test.js';
 import './history.test.js';
+import './keys.test.js';
 import './mock.test.js';
 import './p4-api.test.js';
 import './p4-mock.test.js';

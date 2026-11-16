@@ -997,10 +997,11 @@ export function readOnlyNote(text) {
 
 /** A semantic table with the mockup's row look. `columns`: `{ label, cls, cell(row) }`,
  *  where `cell` returns a string or a node. It sits in a box that scrolls sideways on a
- *  narrow screen. */
-export function table(columns, rows, { caption = '', cls = '' } = {}) {
+ *  narrow screen. `rowKey(row, i)`: the rows are rows of a list the keys move in (app.js),
+ *  each named by that key, so the selection stays on it when the table is drawn again. */
+export function table(columns, rows, { caption = '', cls = '', rowKey = null } = {}) {
   const head = h('tr', null, columns.map((c) => h('th', { scope: 'col', class: c.cls || '', text: c.label })));
-  const body = rows.map((row) => h('tr', { class: row.rowClass || '' }, columns.map((c) => h('td', { class: c.cls || '' }, c.cell(row)))));
+  const body = rows.map((row, i) => h('tr', { class: row.rowClass || '', 'data-row': rowKey ? String(rowKey(row, i)) : null }, columns.map((c) => h('td', { class: c.cls || '' }, c.cell(row)))));
   return h('div', { class: 'scroll-x' },
     h('table', { class: `tbl ${cls}`.trim() },
       caption ? h('caption', { class: 'sr-only', text: caption }) : null,
@@ -1129,13 +1130,13 @@ export function createToasts(region) {
 
 /** A row of pills. `items`: `{ id, label, href? }`. With `href` they are links (tabs kept
  *  in the address); without, buttons that call `onPick(id)`. */
-export function pills(items, current, onPick = null, label = '') {
+export function pills(items, current, onPick = null, label = '', { act = null } = {}) {
   return h('div', { class: 'tabs', role: 'group', 'aria-label': label || null }, items.map((item) => {
     const on = item.id === current;
     if (item.href) {
-      return h('a', { class: on ? 'pill on' : 'pill', href: item.href, 'aria-current': on ? 'true' : null, text: item.label });
+      return h('a', { class: on ? 'pill on' : 'pill', href: item.href, 'aria-current': on ? 'true' : null, text: item.label, 'data-act': act });
     }
-    return h('button', { type: 'button', class: on ? 'pill on' : 'pill', 'aria-pressed': on ? 'true' : 'false', text: item.label, onclick: () => onPick && onPick(item.id) });
+    return h('button', { type: 'button', class: on ? 'pill on' : 'pill', 'aria-pressed': on ? 'true' : 'false', text: item.label, 'data-act': act, onclick: () => onPick && onPick(item.id) });
   }));
 }
 

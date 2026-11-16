@@ -344,7 +344,16 @@ export function mount(root, ctx, onClose) {
   drawOutput();
   refresh();
   busy(session.running);
-  return { focus: () => input.focus({ preventScroll: true }), refresh };
+  /** Put a line in the input, typed in but not run (Go to's `:`): enter runs it, as ever. */
+  function setLine(text) {
+    input.value = String(text ?? '').slice(0, MAX_LINE);
+    cycle = null;
+    drawHelp();
+    input.focus({ preventScroll: true });
+    input.setSelectionRange(input.value.length, input.value.length);
+  }
+
+  return { focus: () => input.focus({ preventScroll: true }), refresh, setLine };
 }
 
 /** Whether a key press inside the drawer closes it: Escape without a modifier that no

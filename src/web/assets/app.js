@@ -8,8 +8,12 @@ import {
   h, fill, setIcon, envBadge, createThemeStore, createToasts, confirmDialog,
   parseRoute, pushSeries, errorText, analyzing, plural, menuButton,
   connMenuModel, connButtonModel, accessModel, dbModel, nodeModel, liveModel,
-  dbListKey, dbListReply, menuFocus,
+  dbListKey, dbListReply, menuFocus, openDialog, patternName, icon,
 } from './ui.js';
+import {
+  ACTS, actsOf, keyOf, keyLabel, dispatch, hintFor, listMove, paneStep, slashTarget, selectedRow,
+  screenOf, areaHash, screenList, screenActions, sheetModel, gotoModel, gotoFlat, gotoStep,
+} from './keys.js';
 import * as connections from './views/connections.js';
 import * as overview from './views/overview.js';
 import * as browse from './views/browse.js';
@@ -175,6 +179,8 @@ function render() {
   document.title = `${TITLES[route.name]} · redis-lens`;
   const key = viewKey();
   if (mounted && mounted.name === route.name && mounted.sub === route.sub && mounted.key === key) return;
+  // Another screen: the row the focus was on is not looked for there.
+  if (!mounted || mounted.name !== route.name || mounted.sub !== route.sub) lastRow = null;
   if (mounted) {
     try {
       mounted.unmount();
@@ -185,6 +191,7 @@ function render() {
   const root = fill($('view'));
   const unmount = VIEWS[route.name].mount(root, ctx, route);
   mounted = { name: route.name, sub: route.sub, key, unmount: typeof unmount === 'function' ? unmount : () => {} };
+  applyHints();
 }
 
 // ---------- Chrome ----------
@@ -510,6 +517,576 @@ function setCommandLine(open) {
   else if (next.focus === 'toggle') toggle.focus({ preventScroll: true });
 }
 
+// ---------- Keys ----------
+
+// The key grammar (docs/ui-redesign.md §5), from the one table in keys.js. A key does
+// what clicking its control does and nothing more: a "press" action clicks the control that
+// carries `data-act`, so a write goes through the server's write gate and its question as
+// a click would. No key runs while the focus is in a text box or a dialog or menu is open.
+
+const visible = (el) => !!el && el.isConnected && el.getClientRects().length > 0;
+const paneOf = (el) => (el && el.closest ? el.closest('[data-pane]') : null);
+const rowsOf = (pane) => Array.from(pane.querySelectorAll('[data-row]')).filter(visible);
+const panesShown = () => Array.from($('view').querySelectorAll('[data-pane]')).filter(visible);
+const isOpenRow = (r) => r.getAttribute('aria-current') === 'true' || r.getAttribute('aria-pressed') === 'true' || r.classList.contains('on') || !!r.closest('tr.on');
+
+/** The row the focus is on, or the row of the list item it is in (a row's own tools). */
+function focusedRow(el) {
+  if (!el || !el.closest) return null;
+  const row = el.closest('[data-row]');
+  if (row) return row;
+  const item = el.closest('li, tr');
+  return item ? item.querySelector('[data-row]') : null;
+}
+
+/** Whether the focus is where text is typed: then no key is taken. */
+function typing(el) {
+  return !!el && el !== document.body && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
+}
+
+/** A dialog or menu that handles its own keys, or the command-line drawer with the focus. */
+function openLayer(el) {
+  if (document.querySelector('dialog[open]')) return 'dialog';
+  if (menus && (menus.conn.isOpen() || menus.db.isOpen())) return 'menu';
+  const drawer = $('cmdline');
+  if (drawer && el && drawer.contains(el)) return 'drawer';
+  return null;
+}
+
+const isCluster = () => {
+  const s = store.state;
+  return !!(s.conn && (s.conn.topology === 'cluster' || (s.conn.nodes || []).length > 1 || (s.analysis && s.analysis.report && s.analysis.report.cluster)));
+};
+
+// ----- Lists: one selected row each, the browser's focus and the selection the same -----
+
+/** The row each pane has selected, by its `data-row`, kept while the pane is drawn again. */
+const paneSel = new Map();
+/** The row the focus was last on, to put it back when its list is drawn again. */
+let lastRow = null;
+
+/** A roving tabindex: the selected row is the one Tab reaches; the others take the focus
+ *  only from the keys or a click. */
+function syncPane(pane) {
+  const rows = rowsOf(pane);
+  const id = pane.dataset.pane;
+  const at = selectedRow(rows.map((r) => ({ key: r.dataset.row, open: isOpenRow(r) })), paneSel.has(id) ? paneSel.get(id) : null);
+  rows.forEach((r, i) => {
+    const on = i === at;
+    if (r.tabIndex !== (on ? 0 : -1)) r.tabIndex = on ? 0 : -1;
+    r.classList.toggle('sel', on);
+  });
+}
+
+function focusRow(pane, row) {
+  paneSel.set(pane.dataset.pane, row.dataset.row);
+  syncPane(pane);
+  row.focus();
+}
+
+/** Into a pane: on its selected row, or on the pane itself when it has no rows. */
+function focusPane(pane) {
+  const rows = rowsOf(pane);
+  if (rows.length) {
+    syncPane(pane);
+    focusRow(pane, rows.find((r) => r.tabIndex === 0) || rows[0]);
+    return;
+  }
+  if (!pane.hasAttribute('tabindex')) pane.tabIndex = -1;
+  pane.focus();
+}
+
+function listMoveTo(act) {
+  const pane = paneOf(document.activeElement);
+  if (!pane) return;
+  const rows = rowsOf(pane);
+  if (!rows.length) return;
+  const cur = rows.indexOf(focusedRow(document.activeElement));
+  const at = cur >= 0 ? cur : rows.findIndex((r) => r.tabIndex === 0);
+  const page = Math.max(1, Math.floor((pane.clientHeight || 300) / 28) - 2);
+  const next = listMove(at, rows.length, act, page);
+  if (next >= 0) focusRow(pane, rows[next]);
+}
+
+/** Enter, → or l: open the row; on the row that is open already, go to the pane on the
+ *  right. Moving never opens a row: only this, or a click, does. */
+function listOpen() {
+  const el = document.activeElement;
+  const pane = paneOf(el);
+  if (!pane) return;
+  const row = focusedRow(el) || rowsOf(pane).find((r) => r.tabIndex === 0);
+  if (!row) return;
+  if (isOpenRow(row)) {
+    const panes = panesShown();
+    const next = paneStep(panes.length, panes.indexOf(pane), 1);
+    if (next >= 0) focusPane(panes[next]);
+    return;
+  }
+  if (row.matches('button, a[href]')) row.click();
+  else {
+    const open = row.querySelector('[data-open]') || (row.tagName === 'TR' ? row.querySelector('button, a[href]') : null);
+    if (open && !open.disabled) open.click();
+  }
+}
+
+/** Esc, ← or h: the pane on the left, else the screen's way back (Clients' groups). */
+function listBack() {
+  const pane = paneOf(document.activeElement);
+  const panes = panesShown();
+  const prev = paneStep(panes.length, panes.indexOf(pane), -1);
+  if (prev >= 0) {
+    focusPane(panes[prev]);
+    return;
+  }
+  const back = Array.from($('view').querySelectorAll('[data-back]')).find(visible);
+  if (back) back.click();
+}
+
+// ----- Pressing a control -----
+
+/** The controls carrying `data-act="<act>"` where the action looks: the selected row
+ *  first, then the focused pane, then the screen, then the page, as far as `scope` goes. */
+function findAct(act, scope, pane, row) {
+  const pick = (root) => Array.from(root.querySelectorAll(`[data-act="${act}"]`)).filter(visible);
+  if (row) {
+    const got = pick(row.closest('li, tr') || row);
+    if (got.length) return got;
+  }
+  if (scope === 'row') return [];
+  if (pane) {
+    const got = pick(pane);
+    if (got.length || scope === 'pane') return got;
+  }
+  const got = pick($('view'));
+  if (got.length || scope !== 'page') return got;
+  return pick(document);
+}
+
+/** Press a control as a click does: a button or a link is clicked, a `<summary>` opens its
+ *  form and puts the focus in it, a text box or select gets the focus, a checkbox is ticked
+ *  and the focus goes to its form's text box, and a row of pills moves to the next pill. */
+function press(found, entry) {
+  const pills = found.filter((el) => el.classList.contains('pill'));
+  if (found.length > 1 && pills.length === found.length) {
+    const at = pills.findIndex((el) => el.getAttribute('aria-pressed') === 'true' || el.getAttribute('aria-current') === 'true');
+    const next = pills[(at + 1) % pills.length];
+    if (!next.disabled) next.click();
+    return;
+  }
+  const el = found[0];
+  if (el.disabled) {
+    notify(el.title || `${entry.name}: off now.`, 'info');
+    return;
+  }
+  if (el.tagName === 'SUMMARY') {
+    const box = el.parentElement;
+    if (box && !box.open) box.open = true;
+    const field = box && box.querySelector('input:not([type="hidden"]):not([type="checkbox"]), select, textarea');
+    (field || el).focus();
+    return;
+  }
+  if (el.tagName === 'SELECT' || el.tagName === 'TEXTAREA') {
+    el.focus();
+    return;
+  }
+  if (el.tagName === 'INPUT') {
+    if (el.type === 'checkbox') {
+      if (!el.checked) el.click();
+      const form = el.closest('form');
+      const text = form && form.querySelector('input[type="text"], input[type="search"]');
+      (text || el).focus();
+      return;
+    }
+    el.focus();
+    if (typeof el.select === 'function') el.select();
+    return;
+  }
+  el.click();
+}
+
+/** Run an entry of the key table. `where` names the pane and row to act in (Go to runs an
+ *  action of a pane the focus is not in); by default, where the focus is. */
+function runEntry(entry, where = null) {
+  const acts = actsOf(entry);
+  if (ACTS[acts[0]].run === 'app') {
+    APP[acts[0]](entry);
+    return;
+  }
+  const el = document.activeElement;
+  const pane = where ? where.pane : paneOf(el);
+  const row = where ? where.row : focusedRow(el);
+  const off = entryOff(entry, pane, row);
+  if (off) {
+    notify(off, 'info');
+    return;
+  }
+  for (const act of acts) {
+    const found = findAct(act, ACTS[act].in, pane, row);
+    if (found.length) {
+      press(found, entry);
+      return;
+    }
+  }
+  notify(entry.missing || `${keyLabel(entry.keys[0])}: ${entry.name.toLowerCase()} is not on this screen now.`, 'info');
+}
+
+/** Why an entry can't run where it would, before looking for its control: it acts on the
+ *  open row of a list, and the selected row is another one. */
+function entryOff(entry, pane, row) {
+  if (entry.open && pane && row && entry.open.includes(pane.dataset.pane) && !isOpenRow(row)) {
+    return `Open the selected row first (${keyLabel('Enter')}), then press ${keyLabel(entry.keys[0])}.`;
+  }
+  return null;
+}
+
+/** Whether an entry's control is there and on, for Go to's Actions: null, or why not. */
+function entryState(entry, pane, row) {
+  const off = entryOff(entry, pane, row);
+  if (off) return off;
+  for (const act of actsOf(entry)) {
+    const found = findAct(act, ACTS[act].in, pane, row);
+    if (found.length) return found[0].disabled ? found[0].title || 'Off now.' : null;
+  }
+  return entry.missing || 'Not on this screen now.';
+}
+
+// ----- The page's own actions -----
+
+function goArea(digit) {
+  const hash = areaHash(digit, currentRoute(), { cluster: isCluster() });
+  if (hash) ctx.navigate(hash);
+}
+
+/** `/`: the focused list's filter, else the screen's own box (Search's query), else Go to. */
+function slash() {
+  const pane = paneOf(document.activeElement);
+  const inPane = pane ? Array.from(pane.querySelectorAll('[data-act="filter"]')).find(visible) : null;
+  const onScreen = Array.from($('view').querySelectorAll('[data-act="filter"]')).find((el) => visible(el) && !paneOf(el));
+  const to = slashTarget({ paneFilter: !!inPane, screenFilter: !!onScreen });
+  if (to === 'goto') {
+    openGoto();
+    return;
+  }
+  const box = to === 'pane' ? inPane : onScreen;
+  box.focus();
+  if (typeof box.select === 'function') box.select();
+}
+
+/** `[` and `]`: the previous or next node on a cluster, as the node select picks one. */
+function stepNode(dir) {
+  const select = $('node-select');
+  if ($('node-wrap').hidden || select.options.length < 2) {
+    notify('There is one node here: no other to pick.', 'info');
+    return;
+  }
+  const n = select.options.length;
+  select.selectedIndex = (select.selectedIndex + dir + n) % n;
+  ctx.pickNode(Number(select.value));
+}
+
+/** The handlers of the table's `app` actions (tests/keys.test.js checks there is one for each). */
+const APP = {
+  'list.down': () => listMoveTo('list.down'),
+  'list.up': () => listMoveTo('list.up'),
+  'list.pageDown': () => listMoveTo('list.pageDown'),
+  'list.pageUp': () => listMoveTo('list.pageUp'),
+  'list.home': () => listMoveTo('list.home'),
+  'list.end': () => listMoveTo('list.end'),
+  'list.open': () => listOpen(),
+  'list.back': () => listBack(),
+  'area.overview': () => goArea('1'),
+  'area.browse': () => goArea('2'),
+  'area.analyze': () => goArea('3'),
+  'area.server': () => goArea('4'),
+  'area.pubsub': () => goArea('5'),
+  'area.connections': () => goArea('0'),
+  'filter': () => slash(),
+  'goto': () => openGoto(),
+  'sheet': () => openSheet(),
+  'cmdline': () => setCommandLine(true),
+  'node.prev': () => stepNode(-1),
+  'node.next': () => stepNode(1),
+};
+
+function onKey(e) {
+  if (store.locked || e.defaultPrevented || e.isComposing) return;
+  const key = keyOf(e);
+  if (!key) return;
+  const el = document.activeElement;
+  const pane = paneOf(el);
+  const row = el && el.closest ? el.closest('[data-row]') : null;
+  const entry = dispatch(key, {
+    screen: screenOf(currentRoute()),
+    pane: pane ? pane.dataset.pane : null,
+    inList: !!(pane && rowsOf(pane).length),
+    inInput: typing(el),
+    dialog: openLayer(el),
+    native: !!(el && el !== document.body && el.matches && el.matches('button, a[href], summary')),
+    onRow: !!row,
+  });
+  if (!entry) return;
+  e.preventDefault();
+  runEntry(entry);
+}
+
+// ----- Hints: each control with an action shows its key, from the table -----
+
+/** Set `data-hint` (drawn by app.css when `keys-on`) and `aria-keyshortcuts` on every
+ *  control with `data-act`, for the screen and pane it is in. A control that draws its own
+ *  hint (`.key-hint`) only gets `aria-keyshortcuts`. Attributes only, so a control's text
+ *  (which the views use to put the focus back) never changes. */
+function applyHints() {
+  const screen = screenOf(currentRoute());
+  for (const el of document.querySelectorAll('[data-act]')) {
+    const pane = paneOf(el);
+    const hint = hintFor(el.dataset.act, screen, pane ? pane.dataset.pane : null);
+    if (!hint) {
+      el.removeAttribute('data-hint');
+      el.removeAttribute('aria-keyshortcuts');
+      continue;
+    }
+    if (el.getAttribute('aria-keyshortcuts') !== hint.aria) el.setAttribute('aria-keyshortcuts', hint.aria);
+    if (el.querySelector('.key-hint')) continue;
+    if (el.dataset.hint !== hint.label) el.dataset.hint = hint.label;
+  }
+}
+
+/** After the views draw: each list's selection, the hints, and the focus put back on the
+ *  row it was on when that row was drawn anew. */
+function afterDraw() {
+  for (const pane of $('view').querySelectorAll('[data-pane]')) syncPane(pane);
+  const el = document.activeElement;
+  if (lastRow && !lastRow.el.isConnected && (!el || el === document.body)) {
+    const pane = Array.from($('view').querySelectorAll('[data-pane]')).find((p) => p.dataset.pane === lastRow.pane);
+    const row = pane ? rowsOf(pane).find((r) => r.dataset.row === lastRow.key) : null;
+    if (row) row.focus({ preventScroll: true });
+  }
+  applyHints();
+}
+
+function watchFocus() {
+  document.addEventListener('focusin', (e) => {
+    const t = e.target;
+    const pane = paneOf(t);
+    for (const p of document.querySelectorAll('.pane-on')) if (p !== pane) p.classList.remove('pane-on');
+    if (pane) pane.classList.add('pane-on');
+    const row = t && t.closest ? t.closest('[data-row]') : null;
+    if (pane && row) {
+      paneSel.set(pane.dataset.pane, row.dataset.row);
+      syncPane(pane);
+      lastRow = { pane: pane.dataset.pane, key: row.dataset.row, el: row };
+    } else lastRow = null;
+  });
+  // The focus left for nothing (a click on the page): forget the row and the pane. A row
+  // that was drawn anew is not connected any more, so it is kept to be put back.
+  document.addEventListener('focusout', (e) => {
+    if (e.relatedTarget) return;
+    const was = e.target;
+    queueMicrotask(() => {
+      if (!was.isConnected || (document.activeElement && document.activeElement !== document.body)) return;
+      if (lastRow && lastRow.el === was) lastRow = null;
+      for (const p of document.querySelectorAll('.pane-on')) p.classList.remove('pane-on');
+    });
+  });
+  new MutationObserver(afterDraw).observe($('view'), { childList: true, subtree: true });
+}
+
+// ----- The keys sheet (?) -----
+
+function openSheet() {
+  if (document.querySelector('dialog[open]')) return;
+  const back = document.activeElement;
+  const pane = paneOf(back);
+  const screen = screenOf(currentRoute());
+  const where = screenList({ cluster: true }).find((s) => s.id === screen);
+  openDialog({
+    title: `Keys · ${where ? where.label : TITLES[currentRoute().name]}`,
+    wide: true,
+    onClose: () => {
+      if (back && back.isConnected && back !== document.body) back.focus({ preventScroll: true });
+    },
+    build() {
+      const box = h('div', { 'aria-live': 'polite' });
+      const filter = h('input', {
+        class: 'field', type: 'search', id: 'sheet-filter', placeholder: 'Filter: a key, or what it does', autocomplete: 'off', spellcheck: false, 'data-autofocus': true,
+        oninput: () => draw(),
+      });
+      const draw = () => {
+        const groups = sheetModel({ screen, pane: pane ? pane.dataset.pane : null, filter: filter.value });
+        fill(box, groups.length ? groups.map((g) => h('section', { class: 'sheet-group', 'aria-labelledby': `sheet-${g.id}` },
+          h('h3', { class: 'lbl', id: `sheet-${g.id}`, text: g.label }),
+          h('ul', { class: 'sheet-rows' }, g.rows.map((r) => h('li', null,
+            h('span', { class: 'sheet-keys' }, r.keys.map((k) => h('kbd', { class: 'key-cap', text: k }))),
+            h('span', { text: r.name }),
+            r.sends ? h('span', { class: 'sheet-sends', text: `sends ${r.sends}` }) : h('span')))))) : h('p', { class: 'muted', text: 'No key matches the filter.' }));
+      };
+      draw();
+      return [
+        h('label', { class: 'sr-only', htmlFor: 'sheet-filter', text: 'Filter the keys' }), filter,
+        box,
+        h('p', { class: 'muted small sheet-group', text: 'A key does what its button does: a write still goes through the write gate and asks first where it should. Keys wait while you type in a box. Tab and Shift-Tab move as in any page.' }),
+      ];
+    },
+  });
+}
+
+// ----- Go to (ctrl-k) -----
+
+/** What Go to searches: the names Browse holds, the screens, this screen's actions (each
+ *  with whether it is off now, and why). Read from the page only, when Go to opens. */
+function gotoSources(pane, row) {
+  const b = browse.held(store.state);
+  const screens = screenList({ cluster: isCluster() });
+  const screen = screenOf(currentRoute());
+  const actions = screenActions(screen, pane ? pane.dataset.pane : null).map((a) => {
+    const e = a.entry;
+    // An action of another pane acts there, on that pane's selected row.
+    const there = e.panes && !(pane && e.panes.includes(pane.dataset.pane))
+      ? panesShown().find((p) => e.panes.includes(p.dataset.pane)) || null
+      : pane;
+    const thereRow = there === pane ? row : there ? rowsOf(there).find((r) => r.tabIndex === 0) || null : null;
+    return { ...a, where: { pane: there, row: thereRow }, off: entryState(e, there, thereRow) };
+  });
+  return {
+    patterns: b.patterns, keys: b.keys, screens, actions,
+    model: { patterns: b.patterns.map((p) => p.name), keys: b.keys.map((k) => k.name), screens, actions: actions.map((a) => ({ name: a.name, keys: a.keys, off: a.off })) },
+  };
+}
+
+let gotoShown = false;
+
+function openGoto() {
+  if (gotoShown || store.locked || document.querySelector('dialog[open]')) return;
+  gotoShown = true;
+  const back = document.activeElement;
+  const pane = paneOf(back);
+  const row = focusedRow(back);
+  const src = gotoSources(pane, row);
+  let groups = [];
+  let flat = [];
+  let at = -1;
+  const input = h('input', {
+    class: 'field mono goto-input', type: 'text', id: 'goto-input', role: 'combobox', 'aria-expanded': 'true', 'aria-controls': 'goto-list',
+    'aria-autocomplete': 'list', 'aria-label': 'Go to', autocomplete: 'off', spellcheck: false, maxlength: '512',
+    placeholder: 'A pattern, a key, a screen or an action; : for a command',
+  });
+  const list = h('div', { class: 'goto-list', id: 'goto-list', role: 'listbox', 'aria-label': 'Results' });
+  const cap = (k) => h('kbd', { class: 'key-cap', text: k });
+  const dlg = h('dialog', { class: 'dialog goto', 'aria-label': 'Go to' },
+    h('div', { class: 'goto-head' }, icon('search', 16), input),
+    list,
+    h('p', { class: 'goto-foot muted small' },
+      h('span', null, cap('↑'), ' ', cap('↓'), ' pick'), h('span', null, cap('enter'), ' go'),
+      h('span', null, cap('tab'), ' next group'), h('span', null, cap(':'), ' a command'), h('span', null, cap('esc'), ' close')));
+
+  const side = (item) => {
+    if (item.off) return [h('span', { text: `off: ${item.off}` })];
+    if (item.keys && item.keys.length) return item.keys.slice(0, 4).map(cap);
+    if (item.kind === 'find') return [cap('/')];
+    if (item.kind === 'command') return [cap('enter')];
+    return [];
+  };
+  const label = (item) => {
+    if (item.kind === 'pattern') return patternName(item.label, { cls: 'mono goto-label' });
+    if (item.kind === 'key') return h('span', { class: 'mono goto-label', text: item.label });
+    if (item.kind === 'command') return h('span', { class: 'goto-label' }, `${item.label}: `, h('span', { class: 'mono', text: item.detail || '(nothing typed yet)' }));
+    return h('span', { class: 'goto-label', text: item.label });
+  };
+
+  const draw = () => {
+    if (at >= flat.length) at = flat.length - 1;
+    let n = -1;
+    fill(list, flat.length ? groups.map((g, gi) => h('div', { role: 'group', 'aria-labelledby': `goto-g-${gi}` },
+      h('p', { class: 'lbl goto-group', id: `goto-g-${gi}`, text: g.label }),
+      g.items.map((item) => {
+        n += 1;
+        const i = n;
+        return h('div', {
+          role: 'option', id: `goto-o-${i}`, class: item.off ? 'goto-item off' : 'goto-item',
+          'aria-selected': i === at ? 'true' : 'false', 'aria-disabled': item.off ? 'true' : null,
+          onpointermove: () => {
+            if (at !== i) {
+              at = i;
+              draw();
+            }
+          },
+          onclick: () => choose(i),
+        }, label(item), h('span', { class: 'goto-side' }, side(item)));
+      }))) : h('p', { class: 'goto-empty', text: input.value.trim() ? 'Nothing here matches. Go to looks only at what the page holds: the patterns and keys Browse has read, the screens and this screen\'s actions.' : 'Type to look for a pattern, a key, a screen or an action.' }));
+    if (at >= 0) {
+      input.setAttribute('aria-activedescendant', `goto-o-${at}`);
+      const opt = document.getElementById(`goto-o-${at}`);
+      if (opt) opt.scrollIntoView({ block: 'nearest' });
+    } else input.removeAttribute('aria-activedescendant');
+  };
+  const search = () => {
+    groups = gotoModel(input.value, src.model);
+    flat = gotoFlat(groups);
+    at = flat.length ? 0 : -1;
+    draw();
+  };
+
+  const close = () => {
+    if (dlg.open) dlg.close();
+  };
+  /** Go: close, give the focus back, then do what the item says. Only Find asks the server
+   *  for anything, and only now that its row is chosen. */
+  function choose(i) {
+    const item = flat[i];
+    if (!item) return;
+    if (item.off) {
+      notify(item.off, 'info');
+      return;
+    }
+    close();
+    if (item.kind === 'pattern') ctx.openPattern(src.patterns[item.ref]);
+    else if (item.kind === 'key') ctx.openKey(src.keys[item.ref]);
+    else if (item.kind === 'find') findKeys(item.text);
+    else if (item.kind === 'screen') ctx.navigate(src.screens[item.ref].hash);
+    else if (item.kind === 'command') {
+      setCommandLine(true);
+      if (commandLine) commandLine.setLine(item.text);
+    } else if (item.kind === 'action') {
+      const a = src.actions[item.ref];
+      runEntry(a.entry, a.where);
+    }
+  }
+
+  input.addEventListener('input', search);
+  input.addEventListener('keydown', (e) => {
+    const move = { ArrowDown: 'down', ArrowUp: 'up' }[e.key] || (e.key === 'Tab' ? (e.shiftKey ? 'groupBack' : 'group') : null);
+    if (move) {
+      e.preventDefault();
+      at = gotoStep(groups, at, move);
+      draw();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      choose(at);
+    }
+  });
+  dlg.addEventListener('close', () => {
+    dlg.remove();
+    gotoShown = false;
+    const now = document.activeElement;
+    if ((!now || now === document.body) && back && back.isConnected && back !== document.body) back.focus({ preventScroll: true });
+  });
+  document.body.append(dlg);
+  dlg.showModal();
+  input.focus();
+  search();
+}
+
+/** Find keys by name (Go to's Find row): the results show on Browse. */
+function findKeys(text) {
+  const q = String(text ?? '').trim();
+  if (!q) return;
+  if (!store.state.connected && !analyzing(store.state)) {
+    notify('Connect first: open Connections and pick a connection. Then keys can be found.', 'info');
+    return;
+  }
+  ctx.findKey(q);
+}
+
 // ---------- State ----------
 
 const targetOf = (conn) => (conn.docker ? { docker: conn.name } : { name: conn.name });
@@ -615,26 +1192,16 @@ async function boot() {
   $('access-btn').addEventListener('click', toggleWrites);
   $('node-select').addEventListener('change', (e) => ctx.pickNode(Number(e.target.value)));
 
-  // Find a key, from anywhere: the results show on Browse. `/` comes here from any area
-  // when no text box has the focus.
-  $('find-form').addEventListener('submit', (e) => {
-    e.preventDefault();
-    const text = $('find-input').value.trim();
-    if (!text) return;
-    if (!store.state.connected && !analyzing(store.state)) {
-      notify('Connect first: open Connections and pick a connection. Then keys can be found.', 'info');
-      return;
-    }
-    ctx.findKey(text);
-  });
-  document.addEventListener('keydown', (e) => {
-    if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey || store.locked) return;
-    const t = e.target;
-    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.closest('dialog'))) return;
-    e.preventDefault();
-    $('find-input').focus();
-    $('find-input').select();
-  });
+  // The keys (keys.js): Go to from the top bar's box, ctrl-k or `/`; the keys sheet from
+  // the `?` button. The hints show once the keys are bound.
+  $('find-form').addEventListener('submit', (e) => e.preventDefault());
+  $('goto-btn').addEventListener('click', () => openGoto());
+  $('keys-btn').addEventListener('click', () => openSheet());
+  if (/Mac|iPhone|iPad/.test((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '')) $('goto-hint').textContent = 'cmd-k';
+  document.addEventListener('keydown', onKey);
+  watchFocus();
+  document.body.classList.add('keys-on');
+  applyHints();
 
   // The stores that keep running whatever view is shown (the tail, Monitor) hear about a
   // new state first, so a view drawn for it finds them up to date.
