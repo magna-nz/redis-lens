@@ -1,0 +1,16 @@
+---
+source: src/tui/ui/sheet.rs
+expression: all
+---
+                                                            
+                                                            
+┌─ Delete this key? ── prod-cache-01-eu-west-1-pr… · PROD ─┐
+│ Key user:10293:cart:a-rather-long-key-name-that-does-no… │
+│ Sends   UNLINK user:10293:cart:a-rather-long-key-name-t… │
+│ This can't be undone.                                    │
+│                                                          │
+│ Type                                                     │
+│ user:10293:cart:a-rather-long-key-name-that-does-not-fit │
+│ -on-one-line and press enter                             │
+│ › ▏                                                      │
+└──────────────────────────────────────────────────────────┘

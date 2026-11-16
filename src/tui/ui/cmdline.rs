@@ -19,6 +19,48 @@ use crate::tui::app::views::cmdline::{
     Body, CmdlineState, Entry, Tone, dropped_text, numbered, runs_end, took_text,
 };
 
+/// The command line's own question, while a `@dangerous` command waits for it: the one
+/// confirm sheet ([`super::sheet`]). The command is the masked line the panel shows
+/// ([`crate::live::command::masked_line`]): an `AUTH` password never shows.
+pub fn confirm_sheet(state: &CmdlineState, ctx: &Ctx<'_>) -> Option<super::sheet::Sheet> {
+    use super::sheet::{Answer, Sheet, right_of};
+    let c = state.confirm.as_ref()?;
+    let times = match c.times {
+        0 | 1 => String::new(),
+        n => format!("  ({n} times)"),
+    };
+    let mut lines = vec![
+        (
+            "",
+            format!("{} is @dangerous and asks first.", c.command),
+            style::amber(),
+        ),
+        ("Sends", format!("{}{times}", c.line), style::fgb()),
+        (
+            "",
+            "A command typed here can't be undone.".to_string(),
+            style::fg(),
+        ),
+    ];
+    if let Some(s) = &state.status {
+        lines.push(("", s.clone(), style::warn()));
+    }
+    Some(Sheet {
+        title: "Run this command?".into(),
+        right: right_of(&c.profile, ctx.profile().env),
+        lines,
+        answer: match &c.typed {
+            Some(t) => Answer::Type {
+                name: c.profile.clone(),
+                typed: t.clone(),
+                verb: "Send",
+            },
+            None => Answer::YesNo("Send"),
+        },
+        wait: false,
+    })
+}
+
 /// The panel's height in a body `body` rows tall: half of it, 6 to 16 rows.
 pub fn height(body: u16) -> u16 {
     (body / 2).clamp(6, 16).min(body)

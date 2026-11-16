@@ -27,7 +27,7 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::keys::{list_move, plain};
-use super::{Act, Input, ViewState};
+use super::{Act, Ctx, InFlight, Input, Plan, ViewState};
 use crate::live::keys::{KeyRow, Reply as KeysReply, Request as KeysRequest};
 use crate::live::values::{
     At, Items, Kind, MAX_ITEMS, Reply, Request, VECTOR_SAMPLE, field_ttls_supported,
@@ -429,21 +429,35 @@ impl ValueState {
     }
 
     fn more(&mut self, act: &mut Act<'_>) {
-        if self.loading.is_some_and(|id| act.in_flight(id)) {
-            act.info("Still loading the value…");
-        } else if self.gone {
-            act.info("The key no longer exists.");
-        } else if self.denied {
-            if let Some(e) = &self.error {
-                act.info(e.clone());
+        let block = {
+            let a: &Act<'_> = act;
+            self.more_block(&|id| a.in_flight(id))
+        };
+        if let Some(why) = block {
+            if !why.is_empty() {
+                act.info(why);
             }
+        } else if !self.load(act) {
+            act.info("The live connection is not open, so no more can be loaded.");
+        }
+    }
+
+    /// Why `m` loads nothing now, for `m` and the Actions menu. Empty: refused, and
+    /// the reason is on screen already.
+    fn more_block(&self, in_flight: InFlight<'_>) -> Option<String> {
+        if self.loading.is_some_and(in_flight) {
+            Some("Still loading the value…".into())
+        } else if self.gone {
+            Some("The key no longer exists.".into())
+        } else if self.denied {
+            Some(self.error.clone().unwrap_or_default())
         } else if self.capped || (self.loaded() >= MAX_ITEMS && self.next.is_some()) {
-            act.info(format!(
+            Some(format!(
                 "At most {} items are held, so no more are loaded.",
                 crate::format::grouped(MAX_ITEMS as u64)
-            ));
+            ))
         } else if self.done() {
-            act.info(match self.kind() {
+            Some(match self.kind() {
                 Some(Kind::Vector) => format!(
                     "Vector sets can't be read in pages: these are {VECTOR_SAMPLE} random elements."
                 ),
@@ -454,29 +468,47 @@ impl ValueState {
                     "All {} items are loaded.",
                     crate::format::grouped(self.loaded() as u64)
                 ),
-            });
-        } else if !self.load(act) {
-            act.info("The live connection is not open, so no more can be loaded.");
+            })
+        } else {
+            None
         }
     }
 
     fn copy(&mut self, act: &mut Act<'_>) {
+        match self.copy_plan() {
+            Ok(text) => act.copy(CopyText::value(&text)),
+            Err(why) => act.info(why),
+        }
+    }
+
+    /// What `y` copies, or why it copies nothing: for `y` and the Actions menu.
+    fn copy_plan(&self) -> Result<String, &'static str> {
         if matches!(self.items, Some(Items::Module(_))) {
-            act.info("A module type's summary is not copied: only values are.");
-            return;
+            return Err("A module type's summary is not copied: only values are.");
         }
         if matches!(self.items, Some(Items::Stream(_))) {
-            act.info("A stream entry has several fields, so y does not copy it.");
-            return;
+            return Err("A stream entry has several fields, so y does not copy it.");
         }
         let Some(raw) = self.selected_value() else {
-            act.info("Nothing selected to copy.");
-            return;
+            return Err("Nothing selected to copy.");
         };
         let d = self.memo.decode(raw);
-        match value::copy_text(&d, self.shown_format(&d)) {
-            Ok(text) => act.copy(CopyText::value(&text)),
-            Err(CopyRefusal::ControlCharacters) => act.info(COPY_REFUSED),
+        value::copy_text(&d, self.shown_format(&d)).map_err(|e| match e {
+            CopyRefusal::ControlCharacters => COPY_REFUSED,
+        })
+    }
+
+    /// What `f` says instead of showing another format, if anything; else the format
+    /// shown now. For `f` and the Actions menu.
+    fn format_plan(&self) -> Result<Format, &'static str> {
+        if matches!(self.items, Some(Items::Module(_))) {
+            return Err("A module type's summary has no formats: f works on values.");
+        }
+        match self.format_source() {
+            Some(raw) => Ok(self
+                .format
+                .unwrap_or_else(|| self.memo.decode(raw).detected)),
+            None => Err("No value to format yet."),
         }
     }
 }
@@ -1050,35 +1082,159 @@ fn shown(raw: &Raw) -> String {
 }
 
 impl ValueState {
-    fn key_name(&self) -> Option<String> {
+    pub(crate) fn key_name(&self) -> Option<String> {
         self.row.as_ref().map(|r| r.key.clone())
     }
 
-    /// True when a write may start: the key is there, the gate would not refuse
-    /// `probe` (a read-only profile, a command the server refused), the live connection
-    /// is open and no other write waits for its answer. Otherwise says why.
-    fn may_write(&self, probe: &WriteOp, act: &mut Act<'_>) -> bool {
-        if let Decision::Refuse(why) = act.write_decision(probe) {
-            act.error(why);
-            return false;
+    /// Why a write may not start now, with whether it is an error notice: the gate
+    /// would refuse `probe` (a read-only profile, a command the server refused), the
+    /// key is gone, the live connection is not open, or another write waits for its
+    /// answer. `None`: it may start.
+    fn write_block(
+        &self,
+        probe: &WriteOp,
+        ctx: &Ctx<'_>,
+        in_flight: InFlight<'_>,
+    ) -> Option<(String, bool)> {
+        if let Decision::Refuse(why) = ctx.write_decision(probe) {
+            return Some((why, true));
         }
         if self.gone {
-            act.info("The key no longer exists.");
-            return false;
+            return Some(("The key no longer exists.".into(), false));
         }
-        if !act.live_ready() {
-            act.error("Not sent: the live connection is not open.");
-            return false;
+        if !ctx.live_ready() {
+            return Some(("Not sent: the live connection is not open.".into(), true));
         }
-        if self
-            .writing
-            .as_ref()
-            .is_some_and(|(id, _)| act.in_flight(*id))
-        {
-            act.info("The last write has not answered yet.");
-            return false;
+        if self.writing.as_ref().is_some_and(|(id, _)| in_flight(*id)) {
+            return Some(("The last write has not answered yet.".into(), false));
         }
-        true
+        None
+    }
+
+    /// The edit key `c` on the key detail, worked out without doing it: the op it
+    /// sends (`d`, `D`) or the one its form's gate check uses (`e`, `+`, `t`, `T`,
+    /// `R`), or what it says instead, with whether that is an error. The handlers and
+    /// [`ViewState::plan`] both come here, so the menu says what the key does.
+    fn edit_plan(
+        &self,
+        c: char,
+        ctx: &Ctx<'_>,
+        in_flight: InFlight<'_>,
+    ) -> Result<WriteOp, (String, bool)> {
+        let info = |t: &str| Err((t.to_string(), false));
+        let Some(key) = self.key_name() else {
+            return info("No key is open.");
+        };
+        let probe = match c {
+            'e' => {
+                let (target, now, _) = self.edit_target().map_err(|why| (why, false))?;
+                // A score that does not parse as typed still probes the command.
+                target
+                    .op(&key, now)
+                    .or_else(|_| target.op(&key, Raw::from("0")))
+                    .map_err(|why| (why, true))?
+            }
+            '+' => match self.add_form(&key) {
+                Ok(f) => f.4,
+                Err(why) => return info(why),
+            },
+            't' => {
+                if !matches!(self.items, Some(Items::Hash(_))) {
+                    return info("t sets the TTL of a hash field: T sets the key's.");
+                }
+                let (field, off) = self.ttl_field();
+                if let Some(why) = off {
+                    return Err((format!("{why} T sets the key's TTL."), false));
+                }
+                let Some(field) = field else {
+                    return info("No field is selected.");
+                };
+                WriteOp::FieldTtl {
+                    key,
+                    field,
+                    ttl: WriteTtl::Seconds(60),
+                }
+            }
+            'T' => WriteOp::KeyTtl {
+                key,
+                ttl: WriteTtl::Seconds(60),
+            },
+            'R' => WriteOp::Rename {
+                new: format!("{key}:"),
+                key,
+            },
+            'd' => {
+                let i = self.selected();
+                let op = match &self.items {
+                    Some(Items::Hash(f)) => f.get(i).map(|f| WriteOp::HDel {
+                        key: key.clone(),
+                        field: f.name.clone(),
+                    }),
+                    Some(Items::Set(v)) => v.get(i).map(|m| WriteOp::SRem {
+                        key: key.clone(),
+                        member: m.clone(),
+                    }),
+                    Some(Items::ZSet(v)) => v.get(i).map(|m| WriteOp::ZRem {
+                        key: key.clone(),
+                        member: m.member.clone(),
+                    }),
+                    Some(Items::Stream(v)) => v.get(i).map(|e| WriteOp::XDel {
+                        key: key.clone(),
+                        id: e.id.clone(),
+                    }),
+                    Some(Items::List(v)) => v.get(i).map(|e| WriteOp::LDel {
+                        key: key.clone(),
+                        index: i as u64,
+                        old: e.clone(),
+                        marker: next_list_marker(),
+                    }),
+                    Some(Items::String { .. } | Items::Json { .. } | Items::JsonNotRead { .. }) => {
+                        return info(
+                            "d deletes a field, element, member or entry: D deletes the key.",
+                        );
+                    }
+                    Some(
+                        Items::Vector(_) | Items::Array(_) | Items::Module(_) | Items::NotRead,
+                    ) => {
+                        return info(
+                            "redis-lens does not delete items of this type: D deletes the key.",
+                        );
+                    }
+                    None => None,
+                };
+                match op {
+                    Some(op) => op,
+                    None if self.gone => return info("The key no longer exists."),
+                    None => return info("Nothing is selected to delete."),
+                }
+            }
+            'D' => WriteOp::Unlink { key },
+            _ => return info("Not an edit key."),
+        };
+        match self.write_block(&probe, ctx, in_flight) {
+            Some(block) => Err(block),
+            None => Ok(probe),
+        }
+    }
+
+    /// [`Self::edit_plan`] for a key pressed: the op, or `None` once its notice is
+    /// shown.
+    fn checked(&self, c: char, act: &mut Act<'_>) -> Option<WriteOp> {
+        let plan = {
+            let a: &Act<'_> = act;
+            self.edit_plan(c, a, &|id| a.in_flight(id))
+        };
+        match plan {
+            Ok(op) => Some(op),
+            Err((why, true)) => {
+                act.error(why);
+                None
+            }
+            Err((why, false)) => {
+                act.info(why);
+                None
+            }
+        }
     }
 
     /// The edit keys, on the key detail only. True when `c` is one.
@@ -1086,15 +1242,19 @@ impl ValueState {
         if act.screen != Screen::KeyDetail || self.row.is_none() {
             return false;
         }
+        if !matches!(c, 'e' | '+' | 't' | 'T' | 'R' | 'd' | 'D') {
+            return false;
+        }
+        let Some(op) = self.checked(c, act) else {
+            return true;
+        };
         match c {
             'e' => self.start_edit(act),
             '+' => self.start_add(act),
-            't' => self.start_field_ttl(act),
-            'T' => self.start_ttl(act),
-            'R' => self.start_rename(act),
-            'd' => self.delete_item(act),
-            'D' => self.delete_key(act),
-            _ => return false,
+            't' => self.start_field_ttl(op),
+            'T' => self.start_ttl(),
+            'R' => self.start_rename(),
+            _ => self.send_write(op, act),
         }
         true
     }
@@ -1196,32 +1356,20 @@ impl ValueState {
         })
     }
 
-    /// `e`.
+    /// `e`, once [`Self::edit_plan`] let it start.
     fn start_edit(&mut self, act: &mut Act<'_>) {
         let Some(key) = self.key_name() else {
             return;
         };
-        let (target, now, title) = match self.edit_target() {
-            Ok(t) => t,
-            Err(why) => {
-                act.info(why);
-                return;
-            }
-        };
-        let Ok(probe) = target.op(&key, now.clone()).or_else(|_| {
-            // A score that does not parse as typed still probes the command.
-            target.op(&key, Raw::from("0"))
-        }) else {
+        let Ok((target, now, title)) = self.edit_target() else {
             return;
         };
-        if !self.may_write(&probe, act) {
-            return;
-        }
         let ext = if target == Target::Json {
             "json"
         } else {
             "txt"
         };
+        let _ = act;
         match inline_text(&now) {
             Some(text) => {
                 let label = target.label();
@@ -1280,13 +1428,15 @@ impl ValueState {
         }
     }
 
-    /// `+`.
-    fn start_add(&mut self, act: &mut Act<'_>) {
-        let Some(key) = self.key_name() else {
-            return;
-        };
-        let k = || key.clone();
-        let (to, title, fields, note, probe) = match self.kind() {
+    /// What `+` adds to this key's type: the form's target, title, fields and note, and
+    /// the op its gate check uses. Or why `+` does nothing here.
+    #[allow(clippy::type_complexity)]
+    fn add_form(
+        &self,
+        key: &str,
+    ) -> Result<(AddTo, &'static str, Vec<FormField>, &'static str, WriteOp), &'static str> {
+        let k = || key.to_string();
+        Ok(match self.kind() {
             Some(Kind::Hash) => (
                 AddTo::Hash,
                 "Add field",
@@ -1340,17 +1490,22 @@ impl ValueState {
                 },
             ),
             Some(Kind::String | Kind::Json) => {
-                act.info("+ adds to a hash, list, set, sorted set or stream: e edits this value.");
-                return;
+                return Err(
+                    "+ adds to a hash, list, set, sorted set or stream: e edits this value.",
+                );
             }
-            _ => {
-                act.info("redis-lens does not add to this type.");
-                return;
-            }
-        };
-        if !self.may_write(&probe, act) {
+            _ => return Err("redis-lens does not add to this type."),
+        })
+    }
+
+    /// `+`, once [`Self::edit_plan`] let it start.
+    fn start_add(&mut self, _act: &mut Act<'_>) {
+        let Some(key) = self.key_name() else {
             return;
-        }
+        };
+        let Ok((to, title, fields, note, _)) = self.add_form(&key) else {
+            return;
+        };
         let mut form = Form::new(title.into(), &key, fields, FormAction::Add(to));
         form.notes.push(note.into());
         self.form = Some(form);
@@ -1371,48 +1526,21 @@ impl ValueState {
         (fields.get(self.selected()).map(|f| f.name.clone()), None)
     }
 
-    /// `T`: the key's TTL.
-    fn start_ttl(&mut self, act: &mut Act<'_>) {
+    /// `T`: the key's TTL, once [`Self::edit_plan`] let it start.
+    fn start_ttl(&mut self) {
         let Some(key) = self.key_name() else {
             return;
         };
-        let probe = WriteOp::KeyTtl {
-            key: key.clone(),
-            ttl: WriteTtl::Seconds(60),
-        };
-        if !self.may_write(&probe, act) {
-            return;
-        }
         self.form = Some(Form::key_ttl(&key));
     }
 
-    /// `t`: the selected hash field's TTL. Only a hash's fields have one; elsewhere,
-    /// or when field TTLs are off, it says why (`T` sets the key's).
-    fn start_field_ttl(&mut self, act: &mut Act<'_>) {
-        let Some(key) = self.key_name() else {
+    /// `t`: the selected hash field's TTL, once [`Self::edit_plan`] let it start (only
+    /// a hash's fields have one, and only where field TTLs work). `probe` names the
+    /// field.
+    fn start_field_ttl(&mut self, probe: WriteOp) {
+        let WriteOp::FieldTtl { key, field, .. } = probe else {
             return;
         };
-        if !matches!(self.items, Some(Items::Hash(_))) {
-            act.info("t sets the TTL of a hash field: T sets the key's.");
-            return;
-        }
-        let (field, off) = self.ttl_field();
-        if let Some(why) = off {
-            act.info(format!("{why} T sets the key's TTL."));
-            return;
-        }
-        let Some(field) = field else {
-            act.info("No field is selected.");
-            return;
-        };
-        let probe = WriteOp::FieldTtl {
-            key: key.clone(),
-            field: field.clone(),
-            ttl: WriteTtl::Seconds(60),
-        };
-        if !self.may_write(&probe, act) {
-            return;
-        }
         let mut form = Form::new(
             format!("Set the TTL of field {}", shown(&field)),
             &key,
@@ -1424,82 +1552,12 @@ impl ValueState {
         self.form = Some(form);
     }
 
-    /// `R`.
-    fn start_rename(&mut self, act: &mut Act<'_>) {
+    /// `R`, once [`Self::edit_plan`] let it start.
+    fn start_rename(&mut self) {
         let Some(key) = self.key_name() else {
             return;
         };
-        let probe = WriteOp::Rename {
-            key: key.clone(),
-            new: format!("{key}:"),
-        };
-        if !self.may_write(&probe, act) {
-            return;
-        }
         self.form = Some(Form::rename(&key));
-    }
-
-    /// `d`: the selected field, element, member or entry.
-    fn delete_item(&mut self, act: &mut Act<'_>) {
-        let Some(key) = self.key_name() else {
-            return;
-        };
-        let i = self.selected();
-        let op = match &self.items {
-            Some(Items::Hash(f)) => f.get(i).map(|f| WriteOp::HDel {
-                key: key.clone(),
-                field: f.name.clone(),
-            }),
-            Some(Items::Set(v)) => v.get(i).map(|m| WriteOp::SRem {
-                key: key.clone(),
-                member: m.clone(),
-            }),
-            Some(Items::ZSet(v)) => v.get(i).map(|m| WriteOp::ZRem {
-                key: key.clone(),
-                member: m.member.clone(),
-            }),
-            Some(Items::Stream(v)) => v.get(i).map(|e| WriteOp::XDel {
-                key: key.clone(),
-                id: e.id.clone(),
-            }),
-            Some(Items::List(v)) => v.get(i).map(|e| WriteOp::LDel {
-                key: key.clone(),
-                index: i as u64,
-                old: e.clone(),
-                marker: next_list_marker(),
-            }),
-            Some(Items::String { .. } | Items::Json { .. } | Items::JsonNotRead { .. }) => {
-                act.info("d deletes a field, element, member or entry: D deletes the key.");
-                return;
-            }
-            Some(Items::Vector(_) | Items::Array(_) | Items::Module(_) | Items::NotRead) => {
-                act.info("redis-lens does not delete items of this type: D deletes the key.");
-                return;
-            }
-            None => None,
-        };
-        let Some(op) = op else {
-            act.info(if self.gone {
-                "The key no longer exists."
-            } else {
-                "Nothing is selected to delete."
-            });
-            return;
-        };
-        if self.may_write(&op, act) {
-            self.send_write(op, act);
-        }
-    }
-
-    /// `D`: the key.
-    fn delete_key(&mut self, act: &mut Act<'_>) {
-        let Some(key) = self.key_name() else {
-            return;
-        };
-        let op = WriteOp::Unlink { key };
-        if self.may_write(&op, act) {
-            self.send_write(op, act);
-        }
     }
 
     fn send_write(&mut self, op: WriteOp, act: &mut Act<'_>) {
@@ -1753,22 +1811,15 @@ impl ViewState for ValueState {
             return true;
         }
         match plain(&key) {
-            Some('f') if matches!(self.items, Some(Items::Module(_))) => {
-                act.info("A module type's summary has no formats: f works on values.");
-                true
-            }
             Some('f') => {
-                match self.format_source() {
-                    Some(raw) => {
-                        let from = self
-                            .format
-                            .unwrap_or_else(|| self.memo.decode(raw).detected);
+                match self.format_plan() {
+                    Ok(from) => {
                         let to = from.next();
                         self.format = Some(to);
                         self.scroll = 0;
                         act.info(format!("Shown as {}.", to.label()));
                     }
-                    None => act.info("No value to format yet."),
+                    Err(why) => act.info(why),
                 }
                 true
             }
@@ -1818,6 +1869,34 @@ impl ViewState for ValueState {
     fn on_paste(&mut self, text: &str, _act: &mut Act<'_>) {
         if let Some(f) = self.form.as_mut() {
             f.paste(text);
+        }
+    }
+
+    fn plan(&self, token: &str, ctx: &Ctx<'_>, in_flight: InFlight<'_>) -> Option<Plan> {
+        let off = |why: &str| Some(Plan::Off(why.to_string()));
+        match token {
+            // At the right: the format `f` switches to.
+            "f" => match self.format_plan() {
+                Ok(f) => Some(Plan::Run(Some(format!("→ {}", f.next().label())))),
+                Err(why) => off(why),
+            },
+            "y" => match self.copy_plan() {
+                Ok(_) => Some(Plan::Run(None)),
+                Err(why) => off(why),
+            },
+            "Y" if ctx.screen == Screen::KeyDetail && self.key_name().is_none() => {
+                off("Nothing selected to copy.")
+            }
+            "m" => self.more_block(in_flight).map(Plan::Off),
+            "e" | "+" | "t" | "T" | "R" | "d" | "D" if ctx.screen == Screen::KeyDetail => {
+                let c = token.chars().next()?;
+                Some(match self.edit_plan(c, ctx, in_flight) {
+                    Ok(op) if matches!(c, 'd' | 'D') => Plan::Write(op),
+                    Ok(op) => Plan::Form(op),
+                    Err((why, _)) => Plan::Off(why),
+                })
+            }
+            _ => None,
         }
     }
 }
@@ -3709,5 +3788,215 @@ mod tests {
         s.server.as_mut().unwrap().mode = ServerMode::Standalone;
         assert!(!s.read_alone());
         assert!(!header(&app).contains("standalone"), "{}", header(&app));
+    }
+
+    /// The Actions menu on a hash field with writes on (`local`): the field's
+    /// actions with the command each sends or `asks first`, then the key's.
+    #[test]
+    fn menu_on_a_hash_field_with_writes_on() {
+        let mut app = hash_app();
+        app.handle_key(key(KeyCode::Right));
+        app.handle_key(ch('.'));
+        for (w, h) in [(120, 36), (80, 24)] {
+            insta::assert_snapshot!(
+                format!("menu_value_hash_writes_on_{w}x{h}"),
+                testing::render(&app, w, h).backend()
+            );
+        }
+        let all = text(&testing::render(&app, 120, 36));
+        assert!(all.contains("asks first"), "{all}");
+        assert!(all.contains("Actions"), "{all}");
+    }
+
+    /// On a read-only `prod` profile every write is off and says so.
+    #[test]
+    fn menu_on_a_value_on_read_only_prod() {
+        let mut app = hash_app();
+        set_profile(&mut app, Env::Prod, None);
+        app.handle_key(ch('.'));
+        for (w, h) in [(120, 36), (80, 24)] {
+            insta::assert_snapshot!(
+                format!("menu_value_read_only_prod_{w}x{h}"),
+                testing::render(&app, w, h).backend()
+            );
+        }
+        let all = text(&testing::render(&app, 120, 36));
+        assert!(all.contains("off: read-only"), "{all}");
+    }
+
+    /// The Actions menu on the key list (`local`, writes on).
+    #[test]
+    fn menu_on_the_key_list() {
+        let mut app = key_list(vec![cart()], None);
+        set_profile(&mut app, Env::Local, None);
+        app.handle_key(ch('.'));
+        for (w, h) in [(120, 36), (80, 24)] {
+            insta::assert_snapshot!(
+                format!("menu_key_list_{w}x{h}"),
+                testing::render(&app, w, h).backend()
+            );
+        }
+    }
+
+    /// The confirm sheet for deleting a key: typed on `prod`, `y`/`n` elsewhere.
+    #[test]
+    fn delete_sheets() {
+        let mut app = hash_app();
+        set_profile(&mut app, Env::Prod, Some(false));
+        app.handle_key(ch('D'));
+        assert!(app.confirm.is_some());
+        insta::assert_snapshot!(
+            "sheet_delete_prod_120x36",
+            testing::render(&app, 120, 36).backend()
+        );
+        let mut app = hash_app();
+        set_profile(&mut app, Env::Stage, Some(false));
+        app.handle_key(ch('D'));
+        assert!(app.confirm.is_some());
+        insta::assert_snapshot!(
+            "sheet_delete_stage_80x24",
+            testing::render(&app, 80, 24).backend()
+        );
+        let all = text(&testing::render(&app, 80, 24));
+        assert!(all.contains("y  Delete    n  Cancel"), "{all}");
+    }
+
+    /// A question the user's own key opens takes `y` at once: no grace period.
+    #[test]
+    fn a_key_opened_question_takes_y_at_once() {
+        let mut app = hash_app();
+        app.handle_key(ch('D'));
+        assert!(app.confirm.is_some() && !app.in_grace());
+        assert_eq!(writes(&app.handle_key(ch('y'))).len(), 1);
+    }
+
+    /// The menu never outlives a screen switch (review: `skip_non_prod_confirm`, `D`
+    /// on a value, `.`, the UNLINK reply goes back to the key list): it closes and
+    /// says so, so its `d` can't delete the key now selected there.
+    #[test]
+    fn a_reply_that_switches_the_screen_closes_the_menu() {
+        let mut app = hash_app();
+        app.settings = crate::write::Settings {
+            skip_non_prod_confirm: true,
+            ..crate::write::Settings::default()
+        };
+        app.views.keys.rows = vec![cart(), row("user:7:cart", KeyType::Hash, Some(1), Some(80))];
+        let e = app.handle_key(ch('D'));
+        let id = write_ids(&e)[0];
+        assert!(
+            app.confirm.is_none(),
+            "skip_non_prod_confirm sends it at once"
+        );
+        app.handle_key(ch('.'));
+        assert_eq!(app.menu.map(|m| m.screen), Some(Screen::KeyDetail));
+        testing::reply(&mut app, id, Ok(LiveReply::Write(WriteReply::Int(1))));
+        assert_eq!(app.screen(), Screen::KeyList);
+        assert!(app.menu.is_none());
+        let n = notice(&app);
+        assert!(n.contains("Deleted user:10293:cart."), "{n}");
+        assert!(n.contains(crate::tui::app::actions::SCREEN_CHANGED), "{n}");
+    }
+
+    /// The menu's labels are what its lines do, on every value type, a gone value, a
+    /// server without field TTLs, prod with writes on and `skip_non_prod_confirm`.
+    #[test]
+    fn menu_labels_match_their_outcome_on_values() {
+        use crate::tui::app::views::testing::check_menu_labels;
+        type Make = fn() -> App;
+        let makes: [(&str, Make); 6] = [
+            ("hash", hash_app),
+            ("list", list_app),
+            ("set", set_app),
+            ("zset", zset_app),
+            ("stream", stream_app),
+            ("string", || string_app("hello")),
+        ];
+        for (name, make) in makes {
+            check_menu_labels(&make, name);
+            check_menu_labels(
+                &|| {
+                    let mut app = make();
+                    set_profile(&mut app, Env::Prod, Some(false));
+                    app
+                },
+                &format!("{name} on prod, writes on"),
+            );
+            check_menu_labels(
+                &|| {
+                    let mut app = make();
+                    app.settings = crate::write::Settings {
+                        skip_non_prod_confirm: true,
+                        ..crate::write::Settings::default()
+                    };
+                    app
+                },
+                &format!("{name}, skip_non_prod_confirm"),
+            );
+            check_menu_labels(
+                &|| {
+                    let mut app = make();
+                    set_profile(&mut app, Env::Prod, None);
+                    app
+                },
+                &format!("{name}, read-only"),
+            );
+        }
+        check_menu_labels(
+            &|| {
+                let mut app = hash_app();
+                app.views.value.gone = true;
+                app
+            },
+            "a gone value",
+        );
+        check_menu_labels(
+            &|| loaded_on(cart(), "hash", fields(), Some("7.2.4")),
+            "a hash without field TTLs",
+        );
+        check_menu_labels(
+            &|| {
+                let mut app = key_list(vec![cart()], None);
+                set_profile(&mut app, Env::Local, None);
+                app
+            },
+            "the key list",
+        );
+        check_menu_labels(
+            &|| {
+                let mut app = key_list(vec![cart()], None);
+                set_profile(&mut app, Env::Prod, Some(false));
+                app
+            },
+            "the key list on prod, writes on",
+        );
+    }
+
+    /// `R` is the key's (the parent's) on a value; `f` shows the format it switches
+    /// to; `v` is "More columns"; the TTL forms say they set or remove one.
+    #[test]
+    fn menu_groups_and_labels_on_a_value() {
+        use crate::tui::app::actions::Status;
+        use crate::tui::keymap::Group;
+        let app = hash_app();
+        let lines = app.menu_lines();
+        let line = |t: &str| lines.iter().find(|l| l.token() == t).unwrap().clone();
+        assert_eq!(line("R").group, Group::Parent);
+        assert_eq!(line("d").group, Group::Row);
+        assert!(
+            matches!(&line("f").status, Status::Ready(Some(n)) if n.starts_with("→ ")),
+            "{:?}",
+            line("f").status
+        );
+        assert_eq!(line("v").label, "More columns");
+        assert!(
+            matches!(&line("T").status, Status::Form { sends, .. } if sends == "EXPIRE / PERSIST")
+        );
+        assert!(
+            matches!(&line("t").status, Status::Form { sends, .. } if sends == "HEXPIRE / HPERSIST")
+        );
+        let app = key_list(vec![cart()], None);
+        let lines = app.menu_lines();
+        let r = lines.iter().find(|l| l.token() == "R").unwrap();
+        assert_eq!(r.group, Group::Row, "on the key list R is the key's own");
     }
 }

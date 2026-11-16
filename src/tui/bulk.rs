@@ -282,51 +282,67 @@ impl App {
     /// `t` (expire) or `d` (`delete`) on Patterns: the bulk action of the selected
     /// pattern ([`Self::bulk_for`]).
     pub(super) fn bulk_start(&mut self, delete: bool) -> Vec<Effect> {
-        if self.session.is_none() {
-            self.set_info("Nothing to change: connect first (0 Connections, then enter).");
-            return Vec::new();
+        match self.bulk_pattern() {
+            Ok(pattern) => self.bulk_for(pattern, delete),
+            Err(why) => {
+                self.set_info(why);
+                Vec::new()
+            }
         }
-        let Some(pattern) = self.selected_single_pattern() else {
-            self.set_info("Select a pattern first: t and d work on one pattern, not a group.");
-            return Vec::new();
-        };
-        self.bulk_for(pattern, delete)
+    }
+
+    /// The pattern `t` and `d` on Patterns act on, or why none.
+    pub(super) fn bulk_pattern(&self) -> Result<String, &'static str> {
+        if self.session.is_none() {
+            return Err("Nothing to change: connect first (0 Connections, then enter).");
+        }
+        self.selected_single_pattern()
+            .ok_or("Select a pattern first: t and d work on one pattern, not a group.")
     }
 
     /// `T` (expire) or `D` (`delete`) on a pattern's keys: the bulk action of the
     /// pattern the list belongs to, the same as `t` or `d` on its Patterns row. Not on
     /// a Find's results: they are of no pattern.
     pub(super) fn key_list_bulk(&mut self, delete: bool) -> Vec<Effect> {
-        let keys = &self.views.keys;
-        let pattern = match (&keys.find, &keys.pattern) {
-            (None, Some(p)) => p.clone(),
-            _ => {
-                self.set_info(
-                    "T and D work on every key of a pattern: Find results are of no pattern.",
-                );
-                return Vec::new();
+        match self.key_list_pattern() {
+            Ok(pattern) => self.bulk_for(pattern, delete),
+            Err(why) => {
+                self.set_info(why);
+                Vec::new()
             }
-        };
-        self.bulk_for(pattern, delete)
+        }
+    }
+
+    /// The pattern `T` and `D` on the key list act on, or why none.
+    pub(super) fn key_list_pattern(&self) -> Result<String, &'static str> {
+        let keys = &self.views.keys;
+        match (&keys.find, &keys.pattern) {
+            (None, Some(p)) => Ok(p.clone()),
+            _ => Err("T and D work on every key of a pattern: Find results are of no pattern."),
+        }
     }
 
     /// Checks that the bulk action on `pattern` can run, then opens the TTL input (not
     /// `delete`) or starts the dry run (`delete`). Nothing is sent when it can't: a
     /// read-only profile is refused with its reason before any `SCAN`.
-    fn bulk_for(&mut self, pattern: String, delete: bool) -> Vec<Effect> {
+    /// What the bulk action on `pattern` would send and where, or why it can't run
+    /// (the session is gone: an info; otherwise an error). Nothing is sent: for the
+    /// keys and the Actions menu.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn bulk_plan(
+        &self,
+        pattern: &str,
+        delete: bool,
+    ) -> Result<(WriteOp, Vec<(usize, String)>), (String, bool)> {
         let Some(s) = self.session.as_ref() else {
-            self.set_info("Nothing to change: connect first (0 Connections, then enter).");
-            return Vec::new();
+            return Err((
+                "Nothing to change: connect first (0 Connections, then enter).".into(),
+                false,
+            ));
         };
         let report_nodes = self.report().is_some_and(|r| r.nodes.is_some());
-        let nodes = match bulk_nodes(s, report_nodes) {
-            Ok(n) => n,
-            Err(why) => {
-                self.set_error(why);
-                return Vec::new();
-            }
-        };
-        let glob = crate::analysis::match_glob(&pattern);
+        let nodes = bulk_nodes(s, report_nodes).map_err(|why| (why, true))?;
+        let glob = crate::analysis::match_glob(pattern);
         let action = if delete {
             BulkAction::Delete
         } else {
@@ -335,24 +351,43 @@ impl App {
             }
         };
         let op = WriteOp::Bulk {
-            pattern: pattern.clone(),
-            glob: glob.clone(),
+            pattern: pattern.to_string(),
+            glob,
             action,
         };
         if let Decision::Refuse(why) =
             crate::write::decide_op(&op, &s.profile, &self.settings, &s.refusals)
         {
-            self.set_error(why);
-            return Vec::new();
+            return Err((why, true));
         }
         if !delete && let Some(why) = s.server.as_ref().and_then(bulk::expire_off) {
-            self.set_error(why);
-            return Vec::new();
+            return Err((why.to_string(), true));
         }
         if s.live != LiveState::Ready {
-            self.set_error("Not available yet: the live connection is not open.");
-            return Vec::new();
+            return Err((
+                "Not available yet: the live connection is not open.".into(),
+                true,
+            ));
         }
+        Ok((op, nodes))
+    }
+
+    fn bulk_for(&mut self, pattern: String, delete: bool) -> Vec<Effect> {
+        let (glob, nodes) = match self.bulk_plan(&pattern, delete) {
+            Ok((WriteOp::Bulk { glob, .. }, nodes)) => (glob, nodes),
+            Ok(_) => return Vec::new(),
+            Err((why, true)) => {
+                self.set_error(why);
+                return Vec::new();
+            }
+            Err((why, false)) => {
+                self.set_info(why);
+                return Vec::new();
+            }
+        };
+        let Some(s) = self.session.as_ref() else {
+            return Vec::new();
+        };
         let files_as = self
             .report()
             .map_or_else(|| s.profile.name.clone(), |r| r.profile.clone());
@@ -673,6 +708,7 @@ impl App {
             expect,
             typed: String::new(),
             profile: b.profile.clone(),
+            env: s.profile.env,
             prod: b.prod,
         });
         Vec::new()

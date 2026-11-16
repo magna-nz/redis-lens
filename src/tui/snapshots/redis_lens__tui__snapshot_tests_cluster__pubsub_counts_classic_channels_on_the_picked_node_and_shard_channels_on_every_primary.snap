@@ -25,4 +25,4 @@ expression: t.backend()
 "│                                             │                                │"
 "│                                             │                                │"
 "└─────────────────────────────────────────────┴────────────────────────────────┘"
-" ↑↓ Move   enter Subscribe   + Sub   space Pause         ctrl-f Find key  ? Help"
+" ↑↓ Move   enter Subscribe   + Sub   space Pause   r Refresh              ? Keys"

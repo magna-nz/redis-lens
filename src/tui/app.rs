@@ -63,6 +63,10 @@ mod key_edits;
 #[path = "find.rs"]
 pub mod find;
 
+/// `.`: the Actions menu of the focused pane.
+#[path = "actions.rs"]
+pub mod actions;
+
 use views::{Act, Ctx, LiveState, Owner, TailCmd, ViewState, Views};
 
 /// The five areas and the home screen, switched with `0` to `5` (spec "Navigation").
@@ -1227,6 +1231,12 @@ pub struct App {
     /// The write gate's question on screen, if any. While it is open every key goes to
     /// it.
     pub confirm: Option<confirm::Confirm>,
+    /// The Actions menu (`.`), if open. While it is open every key goes to it.
+    pub menu: Option<actions::Menu>,
+    /// A question that a reply (not the key being handled) opened ignores its answer
+    /// keys until `tick` reaches this, so a key typed for something else can't answer
+    /// it (spec "The confirm sheet").
+    pub grace_until: Option<u64>,
     /// The bulk action's dialog (`t` or `d` on Patterns, `T` or `D` on its key list), if open. While it is open
     /// every key goes to it, after the confirm dialog.
     pub bulk: Option<bulk::Bulk>,
@@ -1392,6 +1402,9 @@ fn list_move(key: &KeyEvent, cur: usize, len: usize, page: usize) -> Option<usiz
 
 /// The key event a key-table token stands for, for `?` to press: `None` for one it
 /// can't (none in the tables).
+/// Ticks (100 ms each) a question opened by a reply ignores its answer keys.
+pub const GRACE_TICKS: u64 = 5;
+
 pub fn key_of(token: &str) -> Option<KeyEvent> {
     let plain = |c| KeyEvent::new(c, KeyModifiers::NONE);
     Some(match token {
@@ -1477,6 +1490,8 @@ impl App {
             settings: crate::write::Settings::default(),
             dashboard: DashboardLink::default(),
             confirm: None,
+            menu: None,
+            grace_until: None,
             bulk: None,
             dbs: None,
             db_resub: None,
@@ -2187,6 +2202,7 @@ impl App {
         if self.screen() == to {
             return Vec::new();
         }
+        self.close_menu_changed();
         let mut out = self.on_active("hide", |v, act| v.on_hide(act));
         self.set_screen(to);
         out.extend(self.on_active("show", |v, act| v.on_show(act)));
@@ -2210,6 +2226,13 @@ impl App {
         let n = panels.len();
         let to = panels[if back { (i + n - 1) % n } else { (i + 1) % n }];
         self.switch(self.screen_of(to))
+    }
+
+    /// Monitor's question is open on screen (`enter` on Server › Monitor).
+    pub fn monitor_asking(&self) -> bool {
+        self.screen() == Screen::Monitor
+            && self.active_owner().is_some()
+            && self.views.server.monitor.prompt.is_some()
     }
 
     /// Passes `key` to the view state on screen. True when it did something.
@@ -2256,9 +2279,53 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let asking = self.question().is_some();
         let effects = self.key_inner(key);
+        self.after_change(asking, false);
         self.track_selection();
         effects
+    }
+
+    /// What is open as a question (the confirm sheet): `Some(true)` for a `y`/`n`
+    /// one, `Some(false)` for one whose name is typed.
+    pub fn question(&self) -> Option<bool> {
+        if let Some(c) = &self.confirm {
+            return Some(matches!(c.expect, confirm::Expect::YesNo));
+        }
+        if self.views.cmdline.open
+            && let Some(c) = &self.views.cmdline.confirm
+        {
+            return Some(c.typed.is_none());
+        }
+        if self.monitor_asking() {
+            return Some(matches!(
+                self.views.server.monitor.prompt,
+                Some(views::server::Prompt::YesNo)
+            ));
+        }
+        None
+    }
+
+    /// The open question came from a reply and does not take answers yet.
+    pub fn in_grace(&self) -> bool {
+        self.grace_until.is_some_and(|u| self.tick < u) && self.question().is_some()
+    }
+
+    /// After a key or a message: a question that just opened closes the Actions menu
+    /// and the help, so what takes the keys is what is on top; one that a message
+    /// opened waits [`GRACE_TICKS`] before it takes an answer. The menu closes too
+    /// when what it was opened on changed under it.
+    fn after_change(&mut self, asking: bool, from_message: bool) {
+        if self.question().is_some() {
+            if !asking {
+                self.menu = None;
+                self.help = false;
+                self.grace_until = from_message.then_some(self.tick + GRACE_TICKS);
+            }
+        } else {
+            self.grace_until = None;
+        }
+        self.check_menu();
     }
 
     fn key_inner(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -2267,6 +2334,15 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return vec![Effect::Quit];
+        }
+        // A question a reply just opened takes only a cancel for now.
+        if self.in_grace() {
+            let yes_no = self.question() == Some(true);
+            let cancel =
+                key.code == KeyCode::Esc || (yes_no && matches!(plain_char(&key), Some('n' | 'N')));
+            if !cancel {
+                return Vec::new();
+            }
         }
         if self.help {
             return self.help_key(key);
@@ -2289,6 +2365,15 @@ impl App {
         // And "Analyze the keys?".
         if self.analyze.is_some() {
             return self.analyze_key(key);
+        }
+        // And the Actions menu (actions.rs).
+        if self.menu.is_some() {
+            return self.menu_key(key);
+        }
+        // Monitor's question is a sheet like the write gate's: it takes every key, so
+        // neither Find key nor the dashboard opens over it.
+        if self.monitor_asking() {
+            return self.key_to_view(key).1;
         }
         // The command line panel takes every key while it is open (views/cmdline.rs).
         if self.views.cmdline.open {
@@ -2351,6 +2436,7 @@ impl App {
                 self.help_find = HelpFind::default();
                 return Vec::new();
             }
+            Some('.') => return self.open_menu(),
             Some('v') => {
                 self.more.toggle(self.area);
                 return Vec::new();
@@ -2800,71 +2886,84 @@ impl App {
 
     /// `r` on Server, Streams, Pub/Sub and Search: the panel on screen fetches now.
     fn refresh(&mut self) -> Vec<Effect> {
-        let Some(ctx) = self.ctx() else {
-            self.set_info("Nothing to refresh: connect first (0 Connections, then enter).");
-            return Vec::new();
-        };
-        if let Some(why) = ctx.off_reason() {
+        if let Some(why) = self.refresh_block() {
             self.set_info(why);
             return Vec::new();
         }
         self.on_active("refresh", |v, act| v.refresh(act))
     }
 
+    /// Why `r` reads nothing now: for `r` and the Actions menu.
+    fn refresh_block(&self) -> Option<String> {
+        let Some(ctx) = self.ctx() else {
+            return Some("Nothing to refresh: connect first (0 Connections, then enter).".into());
+        };
+        ctx.off_reason()
+    }
+
     /// Only a finished report is ever saved, never partial results, and not the
     /// previous run's report while a rescan runs.
     fn save_snapshot(&mut self) -> Vec<Effect> {
+        if let Some(why) = self.snapshot_block() {
+            self.set_info(why);
+            return Vec::new();
+        }
+        match self.report() {
+            Some(r) => vec![Effect::SaveSnapshot(Box::new(r.clone()))],
+            None => Vec::new(),
+        }
+    }
+
+    /// Why `ctrl-s` saves nothing now: for `ctrl-s` and the Actions menu.
+    fn snapshot_block(&self) -> Option<&'static str> {
         let rescan_running = self.session.as_ref().is_some_and(|s| {
             s.rescan
                 && s.partial.is_none()
                 && matches!(s.phase, Phase::Connecting | Phase::Scanning)
         });
         if rescan_running {
-            self.set_info(
-                "An analysis is running. Press ctrl-s again when it finishes to save it.",
-            );
-            return Vec::new();
+            return Some("An analysis is running. Press ctrl-s again when it finishes to save it.");
         }
         if self
             .session
             .as_ref()
             .is_some_and(views::overview::stopped_early)
         {
-            self.set_info(
+            return Some(
                 "This analysis was stopped early, so its results are partial and are not saved. Press a to analyze again.",
             );
-            return Vec::new();
         }
         match self.report() {
-            Some(r) => vec![Effect::SaveSnapshot(Box::new(r.clone()))],
-            None if self.session.as_ref().is_some_and(|s| s.partial.is_some()) => {
-                self.set_info(
-                    "These are partial results. Press ctrl-s again when the analysis finishes to save it.",
-                );
-                Vec::new()
-            }
-            None => {
-                self.set_info("Nothing to save yet: press a to analyze the keys first.");
-                Vec::new()
-            }
+            Some(_) => None,
+            None if self.session.as_ref().is_some_and(|s| s.partial.is_some()) => Some(
+                "These are partial results. Press ctrl-s again when the analysis finishes to save it.",
+            ),
+            None => Some("Nothing to save yet: press a to analyze the keys first."),
         }
     }
 
     /// `r` on Overview, Browse › Keys and Analyze: "Analyze the keys?". While a connect
     /// or an analysis runs it only says so; with no connection it says to connect first.
     fn open_analyze(&mut self) -> Vec<Effect> {
-        let Some(s) = self.session.as_ref() else {
-            self.set_info("Nothing to analyze: connect first (0 Connections, then enter).");
-            return Vec::new();
-        };
-        match s.phase {
-            Phase::Scanning => self.set_info(
-                "An analysis is already running. esc on 1 Overview stops it and keeps what it has.",
-            ),
-            Phase::Connecting => self.set_info("Still connecting. Press a again once connected."),
-            _ => self.analyze = Some(views::overview::AnalyzeDialog::default()),
+        match self.analyze_block() {
+            Some(why) => self.set_info(why),
+            None => self.analyze = Some(views::overview::AnalyzeDialog::default()),
         }
         Vec::new()
+    }
+
+    /// Why `a` asks nothing now: for `a` and the Actions menu.
+    fn analyze_block(&self) -> Option<&'static str> {
+        let Some(s) = self.session.as_ref() else {
+            return Some("Nothing to analyze: connect first (0 Connections, then enter).");
+        };
+        match s.phase {
+            Phase::Scanning => Some(
+                "An analysis is already running. esc on 1 Overview stops it and keeps what it has.",
+            ),
+            Phase::Connecting => Some("Still connecting. Press a again once connected."),
+            _ => None,
+        }
     }
 
     /// The keys of "Analyze the keys?": `↑↓` `j` `k` pick, `enter` starts, `esc`
@@ -2963,6 +3062,7 @@ impl App {
         self.live_writes.clear();
         self.views.server.new_run();
         self.confirm = None;
+        self.menu = None;
         self.bulk = None;
         self.dbs = None;
         self.db_resub = None;
@@ -3046,6 +3146,23 @@ impl App {
     /// `y` (`command` false) and `Y` on Patterns, TTL, Diff and Hot keys: the selected
     /// row's pattern or key name, or the suggested command for its pattern.
     fn copy(&mut self, command: bool) -> Vec<Effect> {
+        match self.copy_pick(command) {
+            None => Vec::new(),
+            Some(Err(why)) => {
+                self.set_info(why);
+                Vec::new()
+            }
+            Some(Ok(text)) => {
+                let (notice, effect) = copy_checked(text, self.tick);
+                self.notice = Some(notice);
+                effect.into_iter().collect()
+            }
+        }
+    }
+
+    /// What `y` (`command` false) or `Y` copies on the screen, or why nothing: for the
+    /// keys and the Actions menu. `None`: the key does nothing on this screen.
+    fn copy_pick(&self, command: bool) -> Option<Result<CopyText, &'static str>> {
         // `None` inside: a command was asked for and the pattern has no safe one.
         let of_pattern = |p: String| {
             if command {
@@ -3056,7 +3173,7 @@ impl App {
         };
         let text = match self.screen() {
             // A command line has no scan command: `Y` does nothing there.
-            Screen::SlowLog | Screen::Monitor if command => return Vec::new(),
+            Screen::SlowLog | Screen::Monitor if command => return None,
             Screen::SlowLog => self.views.server.slow.copy_text().map(Some),
             Screen::Monitor => self.views.server.monitor.copy_text().map(Some),
             Screen::Patterns => self.selected_pattern_label().map(of_pattern),
@@ -3069,21 +3186,17 @@ impl App {
                     Some(CopyText::key(&k))
                 }
             }),
-            _ => return Vec::new(),
+            _ => return None,
         };
         let Some(text) = text else {
-            self.set_info("Nothing selected to copy.");
-            return Vec::new();
+            return Some(Err("Nothing selected to copy."));
         };
         let Some(text) = text else {
-            self.set_info(
+            return Some(Err(
                 "No command to copy: the pattern has characters that are not safe to paste into a shell. y copies the pattern.",
-            );
-            return Vec::new();
+            ));
         };
-        let (notice, effect) = copy_checked(text, self.tick);
-        self.notice = Some(notice);
-        effect.into_iter().collect()
+        Some(Ok(text))
     }
 
     /// Moving through the TTL, Diff, Hot keys and Nodes panels. Returns whether `key`
@@ -3164,6 +3277,9 @@ impl App {
         }
         if self.bulk.is_some() {
             self.bulk_paste(&text);
+            return Vec::new();
+        }
+        if self.menu.is_some() {
             return Vec::new();
         }
         if self.views.cmdline.open {
@@ -3442,6 +3558,7 @@ impl App {
         self.live_pending.clear();
         self.live_writes.clear();
         self.confirm = None;
+        self.menu = None;
         self.bulk = None;
         self.dbs = None;
         self.db_resub = None;
@@ -3625,17 +3742,8 @@ impl App {
     /// `m` on Browse › Keys: 1,000 more key names. Once an analysis has results the
     /// tree is the analysis's, so it says so instead.
     fn more_names(&mut self) -> Vec<Effect> {
-        if self.pattern_data().is_some_and(|d| !d.names) {
-            let text = if self.analysis_running() {
-                "An analysis is running: its patterns replace the key names."
-            } else {
-                "These patterns come from the analysis. a analyzes again."
-            };
-            self.set_info(text);
-            return Vec::new();
-        }
-        if self.analysis_running() {
-            self.set_info("An analysis is running: its patterns replace the key names.");
+        if let Some(why) = self.more_names_block() {
+            self.set_info(why);
             return Vec::new();
         }
         match self.patterns.names.more() {
@@ -3645,6 +3753,21 @@ impl App {
                 Vec::new()
             }
         }
+    }
+
+    /// Why `m` on Browse › Keys reads no names, before asking the names themselves.
+    fn more_names_block(&self) -> Option<&'static str> {
+        if self.pattern_data().is_some_and(|d| !d.names) {
+            return Some(if self.analysis_running() {
+                "An analysis is running: its patterns replace the key names."
+            } else {
+                "These patterns come from the analysis. a analyzes again."
+            });
+        }
+        if self.analysis_running() {
+            return Some("An analysis is running: its patterns replace the key names.");
+        }
+        None
     }
 
     /// `s`: the next sort (see [`SortBy::next`]). The selected row stays selected. On
@@ -3745,7 +3868,9 @@ impl App {
 
     /// Apply a message. Returns follow-up work, e.g. loading history after a scan.
     pub fn apply(&mut self, msg: Msg) -> Vec<Effect> {
+        let asking = self.question().is_some();
         let effects = self.apply_inner(msg);
+        self.after_change(asking, true);
         self.track_selection();
         effects
     }
@@ -7892,7 +8017,7 @@ mod tests {
                     .as_ref()
                     .map(|s| (s.scan, s.phase.clone(), s.picked)),
                 &app.views,
-                (&app.confirm, &app.find),
+                (&app.confirm, &app.find, &app.menu),
             )
         )
     }
@@ -8026,6 +8151,303 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// `busy_app(screen)` on a profile with writes on (`stage`) and the live
+    /// connection open, or as it is (`prod-cache-01`, read-only, no live connection).
+    fn menu_app(screen: Screen, writes: bool) -> App {
+        let mut app = busy_app(screen);
+        if writes {
+            let s = app.session.as_mut().unwrap();
+            s.profile.env = Env::Stage;
+            s.profile.read_only = Some(false);
+            views::testing::live_ready(&mut app);
+        }
+        app
+    }
+
+    /// [`fingerprint`] and the dialogs it leaves out (a bulk action, the database list).
+    fn menu_fp(app: &App) -> String {
+        format!("{} {:?} {:?}", fingerprint(app), app.bulk, app.dbs)
+    }
+
+    /// Every action key of the table is in its screen's menu (spec "Actions menu"),
+    /// and the menu lists only keys of the table, which
+    /// `every_key_in_the_table_is_handled_on_its_view` shows are handled there.
+    #[test]
+    fn the_menu_lists_every_action_key_and_only_keys_of_the_table() {
+        use super::super::keymap::{self, Group};
+        for screen in Screen::ALL {
+            let mut app = busy_app(screen);
+            assert!(app.handle_key(ch('.')).is_empty());
+            assert_eq!(app.menu.map(|m| m.screen), Some(screen));
+            let lines = app.menu_lines();
+            let shown: Vec<&str> = lines.iter().map(actions::MenuLine::token).collect();
+            for h in keymap::for_screen(screen) {
+                if h.group != Group::Nav {
+                    assert!(
+                        shown.contains(&keymap::first_key(h)),
+                        "{:?} on {screen:?} is not in its menu: {shown:?}",
+                        h.keys
+                    );
+                }
+            }
+            let table = tokens(screen);
+            for l in &lines {
+                // `w` is listed on Connections only, as the selected connection's.
+                let writes_here = screen == Screen::Connections && l.token() == "w";
+                assert!(
+                    l.key.group != Group::Nav || writes_here,
+                    "{:?} on {screen:?}",
+                    l.key.keys
+                );
+                assert!(table.contains(&l.token()), "{:?} on {screen:?}", l.token());
+                assert!(key_of(l.token()).is_some(), "{:?}", l.token());
+            }
+            // Nothing the menu shows is navigation or a key that works everywhere.
+            for t in ["?", ":", "ctrl-f", "q", "b", "0", "tab"] {
+                assert!(!shown.contains(&t), "{t} in the menu of {screen:?}");
+            }
+            assert_eq!(
+                shown.contains(&"w"),
+                screen == Screen::Connections,
+                "w in the menu of {screen:?}"
+            );
+        }
+    }
+
+    /// What each menu line says is what running it does, on every screen, in each of
+    /// these states: writes off (prod, read-only); writes on (`stage`); prod with
+    /// writes on; `skip_non_prod_confirm`; the commands the writes send recorded as
+    /// refused; writes on with the live connection closed.
+    #[test]
+    fn every_menu_label_matches_its_outcome_on_every_screen() {
+        let refused = [
+            "UNLINK",
+            "HDEL",
+            "HSET",
+            "EXPIRE",
+            "RENAMENX",
+            "CLIENT",
+            "CONFIG",
+            "SLOWLOG",
+            "XACK",
+            "XTRIM",
+            "XAUTOCLAIM",
+            "FT.DROPINDEX",
+            "FT.CREATE",
+            "PUBLISH",
+            "SET",
+        ];
+        type Tweak = fn(&mut App);
+        let states: [(&str, bool, Tweak); 6] = [
+            ("writes off", false, |_| {}),
+            ("writes on", true, |_| {}),
+            ("prod with writes on", true, |app| {
+                app.session.as_mut().unwrap().profile.env = Env::Prod;
+            }),
+            ("skip_non_prod_confirm", true, |app| {
+                app.settings = crate::write::Settings {
+                    skip_non_prod_confirm: true,
+                    ..crate::write::Settings::default()
+                };
+            }),
+            ("refused", true, |_| {}),
+            ("live connection closed", false, |app| {
+                let s = app.session.as_mut().unwrap();
+                s.profile.env = Env::Stage;
+                s.profile.read_only = Some(false);
+            }),
+        ];
+        for (name, writes, tweak) in states {
+            for screen in Screen::ALL {
+                let make = || {
+                    let mut app = menu_app(screen, writes);
+                    tweak(&mut app);
+                    if name == "refused" {
+                        let s = app.session.as_mut().unwrap();
+                        for c in refused {
+                            s.refusals.add(c);
+                        }
+                    }
+                    app
+                };
+                views::testing::check_menu_labels(&make, &format!("{screen:?}, {name}"));
+            }
+        }
+    }
+
+    /// The line's own key runs it from the menu; `esc` and `.` close it; any other
+    /// key does nothing while it is open.
+    #[test]
+    fn the_menu_takes_every_key() {
+        let mut app = busy_app(Screen::Patterns);
+        let before = fingerprint(&app);
+        app.handle_key(ch('.'));
+        for k in [
+            ch('?'),
+            ch(':'),
+            ch('q'),
+            ch('3'),
+            ch('w'),
+            key(KeyCode::Tab),
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        ] {
+            assert!(app.handle_key(k).is_empty(), "{k:?}");
+            assert!(app.menu.is_some() && !app.help && !app.find.open, "{k:?}");
+            assert!(!app.views.cmdline.open, "{k:?}");
+        }
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(fingerprint(&app), before);
+        app.handle_key(ch('.'));
+        app.handle_key(ch('.'));
+        assert_eq!(fingerprint(&app), before);
+        // `v`, a line of the screen group, runs by its own key.
+        app.handle_key(ch('.'));
+        app.handle_key(ch('v'));
+        assert!(app.menu.is_none());
+        assert_ne!(fingerprint(&app), before);
+    }
+
+    /// While a confirm sheet is open, no key but its answers reaches anything: not the
+    /// screen behind, nor `ctrl-f`, `:`, `?`, `.`, the digits, `w` or `b`. `enter` does
+    /// not answer a `y`/`n` question; `n` cancels and `y` goes on.
+    #[test]
+    fn a_sheet_takes_every_key_and_enter_never_says_yes() {
+        let others = [
+            key(KeyCode::Enter),
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            ch(':'),
+            ch('?'),
+            ch('.'),
+            ch('3'),
+            ch('w'),
+            ch('b'),
+            ch('v'),
+            ch('j'),
+            key(KeyCode::Tab),
+            key(KeyCode::Down),
+        ];
+        // The write gate (`d` on the key list), turning writes off-and-on (`w`), and
+        // Monitor's start: each opened by its key on a `stage` profile with writes on.
+        let cases: &[(&str, Screen, KeyEvent)] = &[
+            ("write gate", Screen::KeyList, ch('d')),
+            ("writes", Screen::Patterns, ch('w')),
+            ("monitor", Screen::Monitor, key(KeyCode::Enter)),
+        ];
+        for (what, screen, open) in cases {
+            let fresh = || {
+                let mut app = menu_app(*screen, true);
+                if *what == "write gate" {
+                    app.views.keys.rows = vec![views::testing::key_row()];
+                }
+                if *what == "writes" {
+                    // Writes on asks; turning them off does not: start from off, on
+                    // `stage` (the listed profile too) so it asks `y`/`n`.
+                    app.session.as_mut().unwrap().profile.read_only = Some(true);
+                    let id = app.session.as_ref().unwrap().id;
+                    for e in app.entries.iter_mut().filter(|e| e.id == id) {
+                        e.profile.env = Env::Stage;
+                        e.profile.read_only = Some(true);
+                    }
+                }
+                app.handle_key(*open);
+                assert!(
+                    crate::tui::ui::open_sheet(&app).is_some(),
+                    "{what}: no sheet: {:?}",
+                    app.notice
+                );
+                app
+            };
+            let mut app = fresh();
+            let before = menu_fp(&app);
+            for k in others {
+                assert!(app.handle_key(k).is_empty(), "{what}: {k:?}");
+                assert_eq!(menu_fp(&app), before, "{what}: {k:?} reached something");
+            }
+            assert!(crate::tui::ui::open_sheet(&app).is_some(), "{what}");
+            // `n` cancels, sending nothing.
+            assert!(
+                !app.handle_key(ch('n'))
+                    .iter()
+                    .any(|e| matches!(e, Effect::Live { .. } | Effect::SetWrites { .. })),
+                "{what}"
+            );
+            assert!(
+                crate::tui::ui::open_sheet(&app).is_none(),
+                "{what}: n left it open"
+            );
+            // `y` goes on.
+            let mut app = fresh();
+            let effects = app.handle_key(ch('y'));
+            assert!(
+                crate::tui::ui::open_sheet(&app).is_none(),
+                "{what}: y left it open"
+            );
+            assert!(!effects.is_empty(), "{what}: y did nothing");
+        }
+    }
+
+    /// The Actions menu on Patterns (`prod-cache-01`, read-only): the pattern's bulk
+    /// actions are off and say why.
+    #[test]
+    fn menu_on_patterns() {
+        let mut app = busy_app(Screen::Patterns);
+        app.handle_key(ch('.'));
+        for (w, h) in [(120, 36), (80, 24)] {
+            insta::assert_snapshot!(
+                format!("menu_patterns_{w}x{h}"),
+                views::testing::render(&app, w, h).backend()
+            );
+        }
+    }
+
+    /// `w` asks on the confirm sheet: on `prod` the name is typed.
+    #[test]
+    fn writes_on_sheet() {
+        let mut app = busy_app(Screen::Patterns);
+        app.handle_key(ch('w'));
+        assert!(app.confirm.is_some());
+        for (w, h) in [(120, 36), (80, 24)] {
+            insta::assert_snapshot!(
+                format!("sheet_writes_on_{w}x{h}"),
+                views::testing::render(&app, w, h).backend()
+            );
+        }
+    }
+
+    /// `.` is text in every input and form: it never opens the menu there.
+    #[test]
+    fn a_dot_is_typed_in_every_input() {
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        let opens: &[(&str, Screen, &[KeyEvent])] = &[
+            ("Patterns filter", Screen::Patterns, &[ch('/')]),
+            ("Connections filter", Screen::Connections, &[ch('/')]),
+            ("add flow", Screen::Connections, &[ch('+')]),
+            ("Find key", Screen::Patterns, &[ctrl_f]),
+            ("command line", Screen::Patterns, &[ch(':')]),
+            ("help", Screen::Patterns, &[ch('?')]),
+            ("key list filter", Screen::KeyList, &[ch('/')]),
+            ("new key form", Screen::KeyList, &[ch('+')]),
+            ("Pub/Sub publish", Screen::PubSub, &[ch('P')]),
+        ];
+        for (what, screen, keys) in opens {
+            let mut app = menu_app(*screen, true);
+            views::testing::live_ready(&mut app);
+            for k in *keys {
+                app.handle_key(*k);
+            }
+            type_str(&mut app, "x.z");
+            assert!(app.menu.is_none(), "{what}: . opened the menu");
+            // Forms and the command line keep their text out of `Debug`: look at the
+            // screen too.
+            let drawn = format!("{:?}", views::testing::render(&app, 120, 36).backend());
+            assert!(
+                fingerprint(&app).contains("x.z") || drawn.contains("x.z"),
+                "{what}: . was not typed"
+            );
         }
     }
 

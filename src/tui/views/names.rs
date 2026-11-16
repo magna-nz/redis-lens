@@ -182,21 +182,29 @@ impl NamesState {
 
     /// `m`: one more page. `Err` says why there is none to read.
     pub fn more(&mut self) -> Result<(), String> {
-        if !self.started() {
-            return Err("Key names are read once the live connection is open.".to_string());
-        }
-        if self.pending.is_some() {
-            return Err("Still reading key names…".to_string());
-        }
-        if self.done() && self.retry.is_none() {
-            return Err(format!(
-                "Every key name is read: {}.",
-                crate::format::grouped(self.names_read())
-            ));
+        if let Some(why) = self.more_block() {
+            return Err(why);
         }
         self.error = None;
         self.want = self.pages + 1;
         Ok(())
+    }
+
+    /// Why `m` reads no more names now: for `m` and the Actions menu.
+    pub fn more_block(&self) -> Option<String> {
+        if !self.started() {
+            return Some("Key names are read once the live connection is open.".to_string());
+        }
+        if self.pending.is_some() {
+            return Some("Still reading key names…".to_string());
+        }
+        if self.done() && self.retry.is_none() {
+            return Some(format!(
+                "Every key name is read: {}.",
+                crate::format::grouped(self.names_read())
+            ));
+        }
+        None
     }
 
     /// Every node was walked to the end, or left out.

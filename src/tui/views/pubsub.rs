@@ -30,7 +30,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::streams::form::{self, Field, Form, Step, write_failed, write_off};
 use super::streams::{list_move, off_text, plain};
-use super::{Act, Input, ViewState};
+use super::{Act, Ctx, InFlight, Input, Plan, ViewState};
 use crate::live::pubsub::{
     Counts, Reply, Request, ShardCounts, Subscription, TAIL_KEPT, TailMessage,
 };
@@ -346,15 +346,18 @@ impl PubSubState {
             .min(self.rows_len().saturating_sub(1));
     }
 
-    /// `P`: opens the publish form, on the selected channel: `SPUBLISH` on a shard
-    /// channel, `PUBLISH` otherwise.
-    fn open_publish(&mut self, act: &mut Act<'_>) {
-        let (channel, shard) = match self.selected() {
+    /// The channel `P` starts on, and whether it is a shard channel.
+    fn publish_to(&self) -> (String, bool) {
+        match self.selected() {
             Some(Selected::Channel(c)) => (c.name.clone(), false),
             Some(Selected::Shard(r)) => (r.name.clone(), true),
             None => (String::new(), false),
-        };
-        let sample = if shard {
+        }
+    }
+
+    /// The op `P` asks the write gate about before its form opens.
+    fn publish_sample(&self) -> WriteOp {
+        if self.publish_to().1 {
             WriteOp::SPublish {
                 channel: "c".into(),
                 message: Raw::from(""),
@@ -364,7 +367,14 @@ impl PubSubState {
                 channel: "c".into(),
                 message: Raw::from(""),
             }
-        };
+        }
+    }
+
+    /// `P`: opens the publish form, on the selected channel: `SPUBLISH` on a shard
+    /// channel, `PUBLISH` otherwise.
+    fn open_publish(&mut self, act: &mut Act<'_>) {
+        let (channel, shard) = self.publish_to();
+        let sample = self.publish_sample();
         if write_off(act, &sample) {
             return;
         }
@@ -784,6 +794,20 @@ impl ViewState for PubSubState {
             Some(Editing::Subscribe(t) | Editing::ShardSubscribe(t)) => push_text(t, text),
             Some(Editing::Filter) => push_text(&mut self.tail.filter, text),
             None => {}
+        }
+    }
+
+    fn plan(&self, token: &str, _ctx: &Ctx<'_>, _in_flight: InFlight<'_>) -> Option<Plan> {
+        match token {
+            "P" => Some(Plan::Form(self.publish_sample())),
+            "enter" if self.selected().is_none() => Some(Plan::Off(
+                "No channel selected: press + to type one.".into(),
+            )),
+            "S" => self.shards_off.clone().map(Plan::Off),
+            "/" if self.tail.id.is_none() => Some(Plan::Off(
+                "Nothing to filter yet: subscribe first (enter or +).".into(),
+            )),
+            _ => None,
         }
     }
 

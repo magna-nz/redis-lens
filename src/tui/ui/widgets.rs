@@ -610,6 +610,48 @@ pub fn dialog(frame: &mut Frame, area: Rect, w: u16, h: u16, title: &str, right:
     panel(frame, rect, title, right)
 }
 
+/// A box at `rect` over the screen, not dimming it: cleared, its border in the focus
+/// colour, `title` bold and `right` dim in the top border. Returns its inner area. The
+/// Actions menu and the confirm sheet draw in one.
+pub fn focus_box(frame: &mut Frame, rect: Rect, title: &str, right: &str) -> Rect {
+    let rect = rect.intersection(frame.area());
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    if rect.width < 4 || rect.height < 2 {
+        return Rect::default();
+    }
+    let on = style::focus();
+    let w = usize::from(rect.width);
+    put(
+        frame,
+        rect.x,
+        rect.y,
+        rect.width,
+        border_line(w, "┌", "┐", Title::new(title, right), style::title(), on),
+    );
+    let bottom = rect.y + rect.height - 1;
+    for row in rect.y + 1..bottom {
+        put_char(frame, rect.x, row, "│", on);
+        put_char(frame, rect.x + rect.width - 1, row, "│", on);
+    }
+    put(
+        frame,
+        rect.x,
+        bottom,
+        rect.width,
+        vec![
+            Span::styled("└", on),
+            Span::styled("─".repeat(w.saturating_sub(2)), on),
+            Span::styled("┘", on),
+        ],
+    );
+    Rect::new(
+        rect.x + 1,
+        rect.y + 1,
+        rect.width - 2,
+        rect.height.saturating_sub(2),
+    )
+}
+
 /// Render lines one per row from the top of `area`. `selected` gets the selection
 /// background across the whole row.
 pub fn rows(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, selected: Option<usize>) {

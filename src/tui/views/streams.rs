@@ -29,7 +29,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use self::form::{Field, Form, Step, write_failed, write_off};
 use super::value::ValueState;
-use super::{Act, Input, ViewState};
+use super::{Act, Ctx, InFlight, Input, Plan, ViewState};
 use crate::live::keys::KeyRow;
 use crate::live::streams::{
     ConsumerInfo, GroupInfo, MAX_STREAMS, Pending, PendingEntry, Refused, Reply, Request,
@@ -327,7 +327,7 @@ impl StreamsState {
     }
 
     /// The selected row of the details, when they have the focus.
-    fn detail_selected(&self) -> Option<DetailRow<'_>> {
+    pub fn detail_selected(&self) -> Option<DetailRow<'_>> {
         if self.focus != Focus::Detail {
             return None;
         }
@@ -377,26 +377,72 @@ impl StreamsState {
     }
 
     /// `c`: opens the claim form for the group of the selected details row.
+    /// What `c`, `A` and `-` act on, or what they say instead: for the keys and the
+    /// Actions menu. `c` and `-` give the op their gate check uses before the form,
+    /// `A` on a pending entry the `XACK` it sends; `A` on a group or consumer is a
+    /// read (`Ok(None)`).
+    fn stream_write_plan(&self, c: char) -> Result<Option<WriteOp>, &'static str> {
+        let Some(row) = self.selected() else {
+            return Err("No stream selected.");
+        };
+        let key = row.key.clone();
+        match c {
+            '-' => {
+                if row.info.is_none() {
+                    return Err(
+                        "The key is gone, or no longer a stream. a on Overview analyzes again and updates the list.",
+                    );
+                }
+                Ok(Some(WriteOp::XTrim {
+                    key,
+                    trim: Trim::MaxLen(0),
+                }))
+            }
+            'c' => match self.detail_selected() {
+                Some(
+                    DetailRow::Group(g) | DetailRow::Consumer(g, _) | DetailRow::Pending(g, _),
+                ) => Ok(Some(WriteOp::XAutoClaim {
+                    key,
+                    group: g.name.clone(),
+                    consumer: "c".into(),
+                    min_idle_ms: 0,
+                    count: CLAIM_COUNT,
+                })),
+                None => {
+                    Err("Press tab and select a group or consumer: c claims its pending entries.")
+                }
+            },
+            _ => match self.detail_selected() {
+                Some(DetailRow::Pending(g, e)) => Ok(Some(WriteOp::XAck {
+                    key,
+                    group: g.name.clone(),
+                    id: e.id.clone(),
+                })),
+                Some(DetailRow::Group(_) | DetailRow::Consumer(..)) => Ok(None),
+                None => {
+                    Err("Press tab and select a group or consumer: A lists its pending entries.")
+                }
+            },
+        }
+    }
+
     fn open_claim(&mut self, act: &mut Act<'_>) {
+        let sample = match self.stream_write_plan('c') {
+            Ok(Some(op)) => op,
+            Ok(None) => return,
+            Err(why) => {
+                act.info(why);
+                return;
+            }
+        };
         let Some(key) = self.selected().map(|r| r.key.clone()) else {
-            act.info("No stream selected.");
             return;
         };
         let (group, from, idle) = match self.detail_selected() {
             Some(DetailRow::Group(g)) => (g, None, CLAIM_IDLE_MS),
             Some(DetailRow::Consumer(g, c)) => (g, Some(c.name.clone()), c.idle_ms),
             Some(DetailRow::Pending(g, e)) => (g, Some(e.consumer.clone()), e.idle_ms),
-            None => {
-                act.info("Press tab and select a group or consumer: c claims its pending entries.");
-                return;
-            }
-        };
-        let sample = WriteOp::XAutoClaim {
-            key: key.clone(),
-            group: group.name.clone(),
-            consumer: "c".into(),
-            min_idle_ms: 0,
-            count: CLAIM_COUNT,
+            None => return,
         };
         if write_off(act, &sample) {
             return;
@@ -445,19 +491,21 @@ impl StreamsState {
 
     /// `-`: opens the trim form for the selected stream.
     fn open_trim(&mut self, act: &mut Act<'_>) {
+        let sample = match self.stream_write_plan('-') {
+            Ok(Some(op)) => op,
+            Ok(None) => return,
+            Err(why) => {
+                act.info(why);
+                return;
+            }
+        };
         let Some(row) = self.selected() else {
-            act.info("No stream selected.");
             return;
         };
         let Some(info) = &row.info else {
-            act.info("The key is gone, or no longer a stream. a on Overview analyzes again and updates the list.");
             return;
         };
         let key = row.key.clone();
-        let sample = WriteOp::XTrim {
-            key: key.clone(),
-            trim: Trim::MaxLen(0),
-        };
         if write_off(act, &sample) {
             return;
         }
@@ -523,30 +571,31 @@ impl StreamsState {
     /// `A`: on a pending entry, acknowledges it; on a group or consumer, lists its
     /// pending entries.
     fn ack_or_list(&mut self, act: &mut Act<'_>) {
-        let Some(key) = self.selected().map(|r| r.key.clone()) else {
-            act.info("No stream selected.");
-            return;
-        };
-        let (group, consumer) = match self.detail_selected() {
-            Some(DetailRow::Pending(g, e)) => {
-                let op = WriteOp::XAck {
-                    key: key.clone(),
-                    group: g.name.clone(),
-                    id: e.id.clone(),
+        match self.stream_write_plan('A') {
+            Ok(Some(op)) => {
+                let WriteOp::XAck { key, id, .. } = &op else {
+                    return;
                 };
                 let sent = Sent::Ack {
-                    key,
-                    id: e.id.clone(),
+                    key: key.clone(),
+                    id: id.clone(),
                 };
                 self.send_write(op, sent, act);
                 return;
             }
-            Some(DetailRow::Group(g)) => (g.name.clone(), None),
-            Some(DetailRow::Consumer(g, c)) => (g.name.clone(), Some(c.name.clone())),
-            None => {
-                act.info("Press tab and select a group or consumer: A lists its pending entries.");
+            Ok(None) => {}
+            Err(why) => {
+                act.info(why);
                 return;
             }
+        }
+        let Some(key) = self.selected().map(|r| r.key.clone()) else {
+            return;
+        };
+        let (group, consumer) = match self.detail_selected() {
+            Some(DetailRow::Group(g)) => (g.name.clone(), None),
+            Some(DetailRow::Consumer(g, c)) => (g.name.clone(), Some(c.name.clone())),
+            _ => return,
         };
         // Listing them is a read: it works on a read-only profile too.
         if self.read_pending(key, group, consumer, act) {
@@ -832,6 +881,30 @@ impl ViewState for StreamsState {
     fn on_paste(&mut self, text: &str, _act: &mut Act<'_>) {
         if let Some(f) = self.form.as_mut() {
             f.form_mut().paste(text);
+        }
+    }
+
+    fn plan(&self, token: &str, ctx: &Ctx<'_>, in_flight: InFlight<'_>) -> Option<Plan> {
+        if self.entries_open {
+            return match (token, self.entries.as_deref()) {
+                ("c" | "A" | "-", _) => Some(Plan::Off(
+                    "Writes act on the stream: esc back to the list first.".into(),
+                )),
+                (_, Some(entries)) => entries.plan(token, ctx, in_flight),
+                (_, None) => None,
+            };
+        }
+        match token {
+            "m" | "f" | "y" => Some(Plan::Off(
+                "Press enter to list the selected stream's entries first.".into(),
+            )),
+            "c" | "A" | "-" => Some(match self.stream_write_plan(token.chars().next()?) {
+                Ok(Some(op @ WriteOp::XAck { .. })) => Plan::Write(op),
+                Ok(Some(op)) => Plan::Form(op),
+                Ok(None) => Plan::Run(None),
+                Err(why) => Plan::Off(why.to_string()),
+            }),
+            _ => None,
         }
     }
 
@@ -2130,5 +2203,78 @@ mod tests {
             )
             .backend()
         );
+    }
+
+    /// The menu's labels are what its lines do: the list, a group row, a consumer
+    /// row, a pending entry, and the entries open; writes on and off.
+    #[test]
+    fn menu_labels_match_their_outcome_on_streams() {
+        use crate::tui::app::views::testing::check_menu_labels;
+        for (env, ro) in [
+            (Env::Local, None),
+            (Env::Prod, None),
+            (Env::Prod, Some(false)),
+        ] {
+            let w = format!("{env:?} {ro:?}");
+            check_menu_labels(
+                &|| {
+                    let (mut app, _) = loaded();
+                    set_profile(&mut app, env, ro);
+                    app
+                },
+                &format!("Streams list, {w}"),
+            );
+            check_menu_labels(
+                &|| {
+                    let (mut app, _) = loaded();
+                    set_profile(&mut app, env, ro);
+                    press(&mut app, KeyCode::Right);
+                    app
+                },
+                &format!("Streams group row, {w}"),
+            );
+            check_menu_labels(&|| on_consumer(env, ro), &format!("Streams consumer, {w}"));
+            check_menu_labels(&|| on_pending(env, ro), &format!("Streams pending, {w}"));
+            check_menu_labels(
+                &|| {
+                    let (mut app, _) = entries_open();
+                    set_profile(&mut app, env, ro);
+                    app
+                },
+                &format!("Streams entries, {w}"),
+            );
+        }
+    }
+
+    /// The headings name what is selected, and `A` says what it does there.
+    #[test]
+    fn menu_heads_name_the_group_consumer_or_entry() {
+        let (mut app, _) = loaded();
+        press(&mut app, KeyCode::Right);
+        let heads = app.menu_heads(Screen::Streams);
+        assert_eq!(heads[0].0, "GROUP");
+        assert_eq!(heads[1], ("STREAM", "orders".to_string()));
+        let a = app
+            .menu_lines()
+            .into_iter()
+            .find(|l| l.token() == "A")
+            .unwrap();
+        assert_eq!(a.label, "Pending entries");
+        let app = on_consumer(Env::Local, None);
+        assert_eq!(
+            app.menu_heads(Screen::Streams)[0],
+            ("CONSUMER", "b-1".to_string())
+        );
+        let app = on_pending(Env::Local, None);
+        assert_eq!(app.menu_heads(Screen::Streams)[0].0, "ENTRY");
+        let a = app
+            .menu_lines()
+            .into_iter()
+            .find(|l| l.token() == "A")
+            .unwrap();
+        assert_eq!(a.label, "Ack");
+        let (app, _) = entries_open();
+        assert_eq!(app.menu_heads(Screen::Streams)[0].0, "ENTRY");
+        assert_eq!(app.menu_heads(Screen::Streams)[1].0, "STREAM");
     }
 }

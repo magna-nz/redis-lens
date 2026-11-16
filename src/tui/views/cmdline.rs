@@ -2446,11 +2446,10 @@ mod tests {
         assert!(after.is_empty());
         let input = app.cmdline_input().unwrap();
         assert_eq!(input.label, "confirm");
+        // The one confirm sheet asks, under the panel.
         let all = text(&app, 120, 36);
-        assert!(
-            all.contains("KEYS is @dangerous and asks first: KEYS user:*"),
-            "{all}"
-        );
+        assert!(all.contains("KEYS is @dangerous and asks first."), "{all}");
+        assert!(all.contains("Sends   KEYS user:*"), "{all}");
         assert!(all.contains("Type prod-cache-01 and press enter"), "{all}");
         insta::assert_snapshot!(
             "confirm_prod_80x24",
@@ -2474,7 +2473,9 @@ mod tests {
         app.session.as_mut().unwrap().profile.env = Env::Stage;
         enter_with(&mut app, "KEYS *", Some(keys_info()));
         assert_eq!(app.cmdline_input().unwrap().label, "y/n");
-        assert!(text(&app, 120, 36).contains("Send it to prod-cache-01? y to send"));
+        let all = text(&app, 120, 36);
+        assert!(all.contains("Run this command?"), "{all}");
+        assert!(all.contains("y  Send    n  Cancel"), "{all}");
         assert!(reqs(&app.handle_key(ch('x'))).is_empty());
         assert!(reqs(&app.handle_key(ch('n'))).is_empty());
         assert!(text(&app, 120, 36).contains("Not sent: cancelled."));
@@ -2930,14 +2931,9 @@ mod tests {
         let mut app = opened();
         assert!(enter_with(&mut app, "3 KEYS user:*", Some(keys_info())).is_empty());
         let all = text(&app, 120, 36);
-        assert!(
-            all.contains("KEYS is @dangerous and asks first: KEYS user:* 3 times"),
-            "{all}"
-        );
-        assert!(
-            all.contains("Type prod-cache-01 and press enter to send it 3 times"),
-            "{all}"
-        );
+        assert!(all.contains("KEYS is @dangerous and asks first."), "{all}");
+        assert!(all.contains("Sends   KEYS user:*  (3 times)"), "{all}");
+        assert!(all.contains("Type prod-cache-01 and press enter"), "{all}");
         let mut e = type_text(&mut app, "prod-cache-01");
         e.extend(app.handle_key(key(KeyCode::Enter)));
         let mut next = reqs(&e);
@@ -2957,7 +2953,9 @@ mod tests {
         let mut app = opened();
         app.session.as_mut().unwrap().profile.env = Env::Local;
         enter_with(&mut app, "4 KEYS user:*", Some(keys_info()));
-        assert!(text(&app, 120, 36).contains("Send it 4 times to prod-cache-01?"));
+        let all = text(&app, 120, 36);
+        assert!(all.contains("Sends   KEYS user:*  (4 times)"), "{all}");
+        assert!(all.contains("y  Send    n  Cancel"), "{all}");
         assert!(reqs(&app.handle_key(ch('n'))).is_empty());
         assert!(last_body(&app) == Body::Note("Not sent: cancelled.".into()));
         assert!(!app.views.cmdline.repeating());
@@ -3319,5 +3317,90 @@ mod tests {
         assert_eq!(r.outs.last().unwrap().n, 8);
         let shown = entry_text(app.views.cmdline.entries.last().unwrap(), View::Text);
         assert!(shown[0].contains("replies were dropped"), "{:?}", shown[0]);
+    }
+
+    /// A write typed on the command line asks on the confirm sheet.
+    #[test]
+    fn a_command_line_write_sheet() {
+        let mut app = opened();
+        writable(&mut app, Env::Local);
+        enter_all(&mut app, "DEL k", Some(del_info()));
+        assert!(app.confirm.is_some());
+        for (w, h) in [(120, 36), (80, 24)] {
+            insta::assert_snapshot!(
+                format!("sheet_cmdline_write_{w}x{h}"),
+                testing::render(&app, w, h).backend()
+            );
+        }
+    }
+
+    /// A question a late reply opens closes the Actions menu, is drawn on top, and
+    /// takes no `y` for its grace period: the `y` meant for the menu's Copy line sends
+    /// nothing (review: `:DEL k`, enter, esc, `.`, the `COMMAND INFO` reply).
+    #[test]
+    fn a_reply_opened_question_closes_the_menu_and_waits_before_y() {
+        let mut app = opened();
+        writable(&mut app, Env::Local);
+        let mut e = type_text(&mut app, "DEL k");
+        e.extend(app.handle_key(key(KeyCode::Enter)));
+        let info = reqs(&e)
+            .into_iter()
+            .find_map(|(id, r)| matches!(r, Request::Info { .. }).then_some(id))
+            .expect("a COMMAND INFO");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.views.cmdline.open);
+        testing::show(&mut app, Screen::Patterns);
+        app.handle_key(ch('.'));
+        assert!(app.menu.is_some());
+        testing::reply_now(
+            &mut app,
+            info,
+            Ok(LiveReply::Command(Reply::Info(Some(del_info())))),
+        );
+        assert!(app.confirm.is_some(), "the write gate asks");
+        assert!(
+            app.menu.is_none() && !app.help,
+            "the question closed the menu"
+        );
+        assert!(app.in_grace());
+        let drawn = text(&app, 120, 36);
+        assert!(
+            drawn.contains("Run command?") && drawn.contains("wait…"),
+            "{drawn}"
+        );
+        assert!(!drawn.contains("Actions ─"), "{drawn}");
+        // `y` now sends nothing and leaves the question open.
+        assert!(writes(&app.handle_key(ch('y'))).is_empty());
+        assert!(app.confirm.is_some());
+        // After the grace period `y` answers it.
+        for _ in 0..crate::tui::app::GRACE_TICKS {
+            app.apply(Msg::Tick);
+        }
+        assert!(!app.in_grace());
+        assert!(!text(&app, 120, 36).contains("wait…"));
+        assert_eq!(writes(&app.handle_key(ch('y'))).len(), 1);
+    }
+
+    /// `n` and `esc` cancel a reply-opened question at once, grace period or not.
+    #[test]
+    fn a_reply_opened_question_cancels_at_once() {
+        for cancel in [ch('n'), key(KeyCode::Esc)] {
+            let mut app = opened();
+            writable(&mut app, Env::Local);
+            let mut e = type_text(&mut app, "DEL k");
+            e.extend(app.handle_key(key(KeyCode::Enter)));
+            let info = reqs(&e)
+                .into_iter()
+                .find_map(|(id, r)| matches!(r, Request::Info { .. }).then_some(id))
+                .unwrap();
+            testing::reply_now(
+                &mut app,
+                info,
+                Ok(LiveReply::Command(Reply::Info(Some(del_info())))),
+            );
+            assert!(app.in_grace());
+            assert!(writes(&app.handle_key(cancel)).is_empty());
+            assert!(app.confirm.is_none(), "{cancel:?} did not cancel");
+        }
     }
 }

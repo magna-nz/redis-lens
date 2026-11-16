@@ -37,4 +37,4 @@ expression: "buffer_lines(&render(&app, 120, 36)).join(\"\\n\")"
 │                                                                     │ connection is open.                            │
 │                                                                     │                                                │
 └─────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────┘
- ↑↓ Move   tab Next panel   y Copy   a Analyze   ctrl-s Save                          ctrl-f Find key  : Command  ? Help
+ ↑↓ Move   tab Next panel   y Copy   a Analyze   ctrl-s Save                        . Actions   ctrl-f Find key   ? Keys

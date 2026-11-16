@@ -1007,4 +1007,20 @@ mod tests {
             testing::render(&app, 120, 36).backend()
         );
     }
+
+    /// The menu's labels are what its lines do on Find results.
+    #[test]
+    fn menu_labels_match_their_outcome_on_find_results() {
+        crate::tui::app::views::testing::check_menu_labels(&results, "Find results");
+        crate::tui::app::views::testing::check_menu_labels(
+            &|| {
+                let mut app = results();
+                let s = app.session.as_mut().unwrap();
+                s.profile.env = crate::model::Env::Local;
+                s.profile.read_only = None;
+                app
+            },
+            "Find results, writes on",
+        );
+    }
 }
