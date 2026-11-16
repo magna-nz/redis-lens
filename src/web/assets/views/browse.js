@@ -20,6 +20,7 @@ import {
   notice, emptyState, connectFirst, analyzing, errorText, copyText, expiryText, fmtSignedBytes,
   openDialog, readOnlyNote, pills, patternName,
 } from '../ui.js';
+import { reasonLines, readOnlyLine } from '../keys.js';
 import * as streams from './streams.js';
 import * as search from './search.js';
 
@@ -451,6 +452,21 @@ export function requestPattern(name, node = null) {
   if (active) active.takePending();
 }
 
+/** What Browse holds already for the session and run of `state`: the tree's patterns
+ *  (from the analysis, or from the names read so far) and the keys of the list loaded.
+ *  Go to searches these; it reads nothing from the server. Empty for another session. */
+export function held(state) {
+  const c = state && state.conn;
+  const who = c ? `${c.name}|${c.docker}|${state.analysis ? state.analysis.run : 0}` : null;
+  if (!who || store.who !== who) return { patterns: [], keys: [] };
+  const patterns = [];
+  for (const r of (store.tree && store.tree.rows) || []) {
+    if (r.kind === 'pattern') patterns.push(r.pattern);
+    else if (r.kind === 'group') for (const ch of r.children) patterns.push(ch.pattern);
+  }
+  return { patterns, keys: store.list ? store.list.rows.slice() : [] };
+}
+
 // ---------------------------------------------------------------------------------------
 // The view: Keys, Streams and Search, as the TUI's Browse has them
 // ---------------------------------------------------------------------------------------
@@ -523,7 +539,7 @@ function mountKeys(root, ctx) {
 
   // ---------- the three cards ----------
   const patFilter = h('input', {
-    class: 'field mono', type: 'search', id: 'browse-pat-filter', placeholder: 'Filter patterns', autocomplete: 'off', spellcheck: false, value: store.filter,
+    class: 'field mono', type: 'search', id: 'browse-pat-filter', placeholder: 'Filter patterns', autocomplete: 'off', spellcheck: false, value: store.filter, 'data-act': 'filter',
     oninput: () => {
       store.filter = patFilter.value;
       drawRows();
@@ -533,14 +549,14 @@ function mountKeys(root, ctx) {
   const patSource = h('p', { class: 'muted small' });
   const patRows = h('ul', { class: 'list tree', 'aria-label': 'Key patterns' });
   const patFoot = h('div', { class: 'card-foot' });
-  const patCard = h('div', { class: 'card stack browse-col pats' },
+  const patCard = h('div', { class: 'card stack browse-col pats', 'data-pane': 'patterns' },
     h('div', { class: 'card-head' }, h('h2', { class: 'lbl', text: 'Key patterns' }), sortBox),
     patSource,
     h('div', null, h('label', { class: 'sr-only', htmlFor: 'browse-pat-filter', text: 'Filter the patterns' }), patFilter),
     patRows, patFoot);
 
-  const keysCard = h('div', { class: 'card stack browse-col keys' });
-  const valueCard = h('div', { class: 'card stack browse-col value', 'aria-live': 'polite', 'aria-busy': 'false' });
+  const keysCard = h('div', { class: 'card stack browse-col keys', 'data-pane': 'keys' });
+  const valueCard = h('div', { class: 'card stack browse-col value', 'aria-live': 'polite', 'aria-busy': 'false', 'data-pane': 'value' });
   // A bulk action over a pattern's keys: its dry run, question, progress and summary.
   const bulkBox = h('section', { class: 'card stack bulk', 'aria-label': 'Bulk action', hidden: true });
   view.append(bulkBox, h('div', { class: 'browse' }, patCard, keysCard, valueCard));
@@ -607,7 +623,7 @@ function mountKeys(root, ctx) {
     // The sort: from names only keys and name.
     if (t && t.sorts.length > 1) {
       const select = h('select', {
-        class: 'field', id: 'browse-sort',
+        class: 'field', id: 'browse-sort', 'data-act': 'sort',
         onchange: () => {
           store.sort = select.value;
           loadTree();
@@ -650,7 +666,7 @@ function mountKeys(root, ctx) {
       for (const e of n.missing) if (!n.refused.includes(e) && !n.skipped.includes(e)) notes.push(notice(`${e}: not connected, so its key names are not read.`));
     }
     const more = n && !n.done && !n.reading && t.source === 'names'
-      ? h('button', { type: 'button', class: 'btn', text: 'Read 1,000 more names', onclick: (e) => moreNames(e.currentTarget) })
+      ? h('button', { type: 'button', class: 'btn', text: 'Read 1,000 more names', 'data-act': 'more', onclick: (e) => moreNames(e.currentTarget) })
       : null;
     refill(patFoot, [
       h('p', { class: 'muted small', text: treeFoot(t, report) }),
@@ -681,7 +697,7 @@ function mountKeys(root, ctx) {
       if (r.kind === 'group') {
         const closed = store.closed.has(r.key) && !store.filter;
         out.push(h('li', null, h('button', {
-          type: 'button', class: 'row row-pat group', 'aria-expanded': closed ? 'false' : 'true',
+          type: 'button', class: 'row row-pat group', 'data-group': '', 'aria-expanded': closed ? 'false' : 'true', 'data-row': `g:${r.key}`,
           title: r.reason || '',
           onclick: () => {
             if (store.closed.has(r.key)) store.closed.delete(r.key);
@@ -707,7 +723,7 @@ function mountKeys(root, ctx) {
     const on = store.picked && store.picked.id === r.pattern.id && (!store.list || store.list.kind === 'pattern');
     const change = r.change ? ` · ${r.change.words}${typeof r.change.deltaBytes === 'number' && r.change.deltaBytes !== 0 ? ` ${fmtSignedBytes(r.change.deltaBytes)}` : ''}` : '';
     return h('li', null, h('button', {
-      type: 'button', class: `row row-pat${child ? ' child' : ''}${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null,
+      type: 'button', class: `row row-pat${child ? ' child' : ''}${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null, 'data-row': `p:${r.pattern.id}`,
       onclick: () => openPattern(r.pattern, r),
     },
     h('span', { class: 'name' },
@@ -824,7 +840,8 @@ function mountKeys(root, ctx) {
       h('h2', { class: 'mono key-title clip', text: title, title }),
       h('div', { class: 'row-actions' },
         store.finding !== null ? h('button', { type: 'button', class: 'btn quiet', text: 'Clear search', onclick: clearFind }) : null,
-        h('button', { type: 'button', class: 'btn', text: 'Add key', disabled: !!addOff, title: addOff || 'Add a key with its first value. An existing key is never overwritten.', onclick: () => addKeyDialog() })));
+        h('button', { type: 'button', class: 'btn', text: 'Add key', disabled: !!addOff, title: addOff || 'Add a key with its first value. An existing key is never overwritten.', 'data-act': 'key.add', onclick: () => addKeyDialog() })),
+      addOff ? whyLines([addOff]) : null);
     if (busy) {
       fill(keysCard, head, h('p', { class: 'muted', text: busy }));
       return;
@@ -839,7 +856,7 @@ function mountKeys(root, ctx) {
     }
     const row = l.kind === 'pattern' && store.picked ? rowOf(store.picked.id) : null;
     const filter = h('input', {
-      class: 'field mono', type: 'search', id: 'browse-key-filter', placeholder: 'Filter the loaded keys', autocomplete: 'off', spellcheck: false, value: store.listFilter,
+      class: 'field mono', type: 'search', id: 'browse-key-filter', placeholder: 'Filter the loaded keys', autocomplete: 'off', spellcheck: false, value: store.listFilter, 'data-act': 'filter',
       oninput: () => {
         store.listFilter = filter.value;
         store.listShown = CHUNK;
@@ -850,7 +867,7 @@ function mountKeys(root, ctx) {
     const showBox = h('div');
     drawKeyRows(rowsBox, showBox);
     const more = !l.done && !l.capped
-      ? h('button', { type: 'button', class: 'btn', text: `Load ${fmtGrouped(l.pageKeys)} more`, onclick: (e) => moreKeys(e.currentTarget) })
+      ? h('button', { type: 'button', class: 'btn', text: `Load ${fmtGrouped(l.pageKeys)} more`, 'data-act': 'more', onclick: (e) => moreKeys(e.currentTarget) })
       : null;
     const focused = keysCard.contains(document.activeElement) ? document.activeElement.id : null;
     fill(keysCard,
@@ -880,7 +897,7 @@ function mountKeys(root, ctx) {
       const on = store.valueId === r.id;
       const open = on && store.value && store.value.key && store.value.key.id === r.id;
       return h('li', null, h('button', {
-        type: 'button', class: `row row-key${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null,
+        type: 'button', class: `row row-key${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null, 'data-row': r.id,
         onclick: () => openValue(r),
       },
       h('span', { class: 'mono clip', text: r.name, title: r.name }),
@@ -920,13 +937,13 @@ function mountKeys(root, ctx) {
         }, h('span', { class: 'mono clip', text: k.name }), h('span', { class: 'mono right', text: fmtBytes(k.bytes) }), h('span', { class: 'mono right muted', text: k.ttl || DASH }))))));
     }
     const command = r.command
-      ? h('div', { class: 'command' }, h('code', { class: 'mono wrap-any', text: `$ ${r.command}` }), copyButton('Copy command', r.command, 'the command'))
+      ? h('div', { class: 'command' }, h('code', { class: 'mono wrap-any', text: `$ ${r.command}` }), copyButton('Copy command', r.command, 'the command', null, { act: 'copy.command' }))
       : h('p', { class: 'muted small', text: 'No command to list them: the pattern has characters that are not safe to paste in every shell.' });
     details.push(command);
     return h('div', { class: 'summary' },
       h('p', { text: parts.join(' · ') }),
       r.marked && r.reason ? notice(r.reason) : r.reason ? h('p', { class: 'muted small', text: r.reason }) : null,
-      h('div', { class: 'row-actions' }, copyButton('Copy pattern', r.pattern.copy, 'the pattern', 'The pattern has control characters, so it is not copied: a pasted copy would name other keys.')),
+      h('div', { class: 'row-actions' }, copyButton('Copy pattern', r.pattern.copy, 'the pattern', 'The pattern has control characters, so it is not copied: a pasted copy would name other keys.', { act: 'copy.pattern' })),
       bulkButtons(r.pattern),
       h('details', { class: 'advanced' }, h('summary', { text: 'About this pattern' }), h('div', { class: 'details-body' }, details)));
   }
@@ -1052,8 +1069,8 @@ function mountKeys(root, ctx) {
       h('p', { class: 'muted small', text: valueFacts(v, node) || DASH }),
       v.pattern ? h('p', { class: 'muted small' }, 'Pattern ', patternName(v.pattern.name, { literal: literalOf(v.pattern) })) : null,
       h('div', { class: 'row-actions' },
-        copyButton('Copy name', copyName, 'the key name', 'The name has control characters, so it is not copied: a pasted copy would name another key.'),
-        shown ? copyButton('Copy value', shown.copy, 'the value', shown.copyRefused || 'This value is not copied as text: show it as hex to copy it.') : null),
+        copyButton('Copy name', copyName, 'the key name', 'The name has control characters, so it is not copied: a pasted copy would name another key.', { act: 'copy.name' }),
+        shown ? copyButton('Copy value', shown.copy, 'the value', shown.copyRefused || 'This value is not copied as text: show it as hex to copy it.', { act: 'copy.value' }) : null),
       writeBar(v),
     ];
     const notes = [];
@@ -1073,7 +1090,7 @@ function mountKeys(root, ctx) {
     if (!v.gone && (foot || v.more)) {
       parts.push(h('div', { class: 'card-foot' },
         h('p', { class: 'muted small', text: v.gone ? '' : foot }),
-        v.more ? h('button', { type: 'button', class: 'btn', text: 'Load more', onclick: (e) => moreValue(e.currentTarget) }) : null,
+        v.more ? h('button', { type: 'button', class: 'btn', text: 'Load more', 'data-act': 'more', onclick: (e) => moreValue(e.currentTarget) }) : null,
         v.capped ? h('p', { class: 'muted small', text: `At most ${fmtGrouped(v.maxItems)} items are held.` }) : null));
     }
     fill(valueCard, parts);
@@ -1091,7 +1108,7 @@ function mountKeys(root, ctx) {
       const on = store.item && store.item.index === item.index;
       const cells = itemCells(v, item);
       return h('li', null, h('button', {
-        type: 'button', class: `row row-item cols-${cols.length}${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null,
+        type: 'button', class: `row row-item cols-${cols.length}${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null, 'data-row': String(item.index),
         onclick: () => pickItem(item, 0),
       }, cells.map((c, i) => h('span', { class: `mono clip${i ? ' muted' : ''}`, text: c, title: c }))));
     }));
@@ -1116,7 +1133,7 @@ function mountKeys(root, ctx) {
   function shownBox(shown, v) {
     const formats = shown.formats.length > 1
       ? h('div', { class: 'tabs', role: 'group', 'aria-label': 'Show the value as' }, shown.formats.map((f) => h('button', {
-        type: 'button', class: shown.format === f ? 'pill small on' : 'pill small', 'aria-pressed': shown.format === f ? 'true' : 'false', text: f === 'text' ? 'Text' : f === 'hex' ? 'Hex' : f,
+        type: 'button', class: shown.format === f ? 'pill small on' : 'pill small', 'aria-pressed': shown.format === f ? 'true' : 'false', text: f === 'text' ? 'Text' : f === 'hex' ? 'Hex' : f, 'data-act': 'format',
         onclick: () => pickFormat(f),
       })))
       : null;
@@ -1145,9 +1162,9 @@ function mountKeys(root, ctx) {
       m.missing.map((t) => notice(t)));
   }
 
-  function copyButton(label, value, what, refused = null) {
+  function copyButton(label, value, what, refused = null, { act = null } = {}) {
     return h('button', {
-      type: 'button', class: 'btn', text: label,
+      type: 'button', class: 'btn', text: label, 'data-act': act,
       onclick: async () => {
         if (value === null || value === undefined) {
           ctx.notify(refused || `There is nothing to copy for ${what}.`, 'info');
@@ -1180,10 +1197,10 @@ function mountKeys(root, ctx) {
   }
 
   /** A button for one write: off, saying why in its title, when it can't be sent. */
-  function writeButton(label, off, run, { primary = false, quiet = false, danger = false, aria = null } = {}) {
+  function writeButton(label, off, run, { primary = false, quiet = false, danger = false, aria = null, act = null } = {}) {
     const cls = primary ? 'btn primary' : quiet ? 'btn quiet' : 'btn';
     return h('button', {
-      type: 'button', class: danger ? `${cls} danger` : cls, text: label, disabled: !!off, title: off || null, 'aria-label': aria,
+      type: 'button', class: danger ? `${cls} danger` : cls, text: label, disabled: !!off, title: off || null, 'aria-label': aria, 'data-act': act,
       onclick: (e) => run(e.currentTarget),
     });
   }
@@ -1195,9 +1212,9 @@ function mountKeys(root, ctx) {
     const name = v.key ? v.key.name : '';
     const opt = (what) => (beside ? { quiet: true, aria: `${what} ${name}` } : {});
     return [
-      writeButton('Set expiry', keyOff(c, KEY_CMDS.ttl, v), () => ttlDialog(null), opt('Set the expiry of')),
-      writeButton('Rename', keyOff(c, KEY_CMDS.rename, v), () => renameDialog(), opt('Rename')),
-      writeButton('Delete key', keyOff(c, KEY_CMDS.delete, v), (b) => deleteKey(b), { ...opt('Delete'), danger: true }),
+      writeButton('Set expiry', keyOff(c, KEY_CMDS.ttl, v), () => ttlDialog(null), { ...opt('Set the expiry of'), act: 'key.ttl' }),
+      writeButton('Rename', keyOff(c, KEY_CMDS.rename, v), () => renameDialog(), { ...opt('Rename'), act: 'key.rename' }),
+      writeButton('Delete key', keyOff(c, KEY_CMDS.delete, v), (b) => deleteKey(b), { ...opt('Delete'), danger: true, act: 'key.delete' }),
     ];
   }
 
@@ -1207,19 +1224,24 @@ function mountKeys(root, ctx) {
     const c = conn();
     const e = EDITS[v.kind];
     const buttons = [];
-    if (e && e.edit && !e.item) buttons.push(writeButton(e.edit.label, editOff(v) || keyOff(c, e.edit.cmds, v), (b) => startEdit(b, null)));
-    if (e && e.add) buttons.push(writeButton(e.add.label, keyOff(c, e.add.cmds, v), () => startAdd()));
+    if (e && e.edit && !e.item) buttons.push(writeButton(e.edit.label, editOff(v) || keyOff(c, e.edit.cmds, v), (b) => startEdit(b, null), { act: 'value.edit' }));
+    if (e && e.add) buttons.push(writeButton(e.add.label, keyOff(c, e.add.cmds, v), () => startAdd(), { act: 'item.add' }));
     buttons.push(...keyButtons(v));
-    let why;
-    if (c && c.readOnly) {
-      why = [readOnlyNote(readOnlyText(c)), h('a', { href: '#/connections', class: 'small', text: 'Open Connections' })];
-    } else {
-      const seen = new Set();
-      why = buttons.filter((b) => b.disabled && b.title && !seen.has(b.title) && seen.add(b.title)).map((b) => notice(b.title, 'info'));
-    }
     return h('div', { class: 'stack-sm write-bar' },
       h('div', { class: 'row-actions', role: 'group', 'aria-label': 'Write to this key' }, buttons),
-      why);
+      whyLines(buttons.map((b) => (b.disabled ? b.title : null))));
+  }
+
+  /** Why the buttons of a bar that are off are off, as text under it (not only in their
+   *  titles): each reason once, and a read-only connection's as the one line that says
+   *  which key turns writes on (keys.js `reasonLines`). */
+  function whyLines(offs) {
+    const c = conn();
+    const lines = reasonLines(offs, c ? readOnlyText(c) : null);
+    if (!lines.length) return null;
+    return h('div', { class: 'bar-why' }, lines.map((t) => (t === readOnlyLine()
+      ? h('div', { class: 'line' }, readOnlyNote(t), h('a', { href: '#/connections', class: 'small', text: 'Open Connections' }))
+      : notice(t, 'info'))));
   }
 
   /** The writes of the selected field, element, member or entry, under the items. */
@@ -1233,16 +1255,17 @@ function mountKeys(root, ctx) {
     const buttons = [];
     if (e.edit) {
       const aria = v.kind === 'zset' ? `Edit the score of ${label}` : `Edit ${label}`;
-      buttons.push(writeButton(e.edit.label, editOff(v) || keyOff(c, e.edit.cmds, v), (b) => startEdit(b, item), { aria }));
+      buttons.push(writeButton(e.edit.label, editOff(v) || keyOff(c, e.edit.cmds, v), (b) => startEdit(b, item), { aria, act: 'item.edit' }));
     }
     if (e.fieldTtl) {
       const off = v.fieldTtls ? keyOff(c, e.fieldTtl.cmds, v) : v.fieldTtlsOff || 'Field TTLs need Redis 7.4 or later, or Valkey 9.0 or later.';
-      buttons.push(writeButton(e.fieldTtl.label, off, () => ttlDialog(item), { aria: `Set the TTL of ${label}` }));
+      buttons.push(writeButton(e.fieldTtl.label, off, () => ttlDialog(item), { aria: `Set the TTL of ${label}`, act: 'item.ttl' }));
     }
-    if (e.remove) buttons.push(writeButton(e.remove.label, keyOff(c, e.remove.cmds, v), (b) => removeItem(b, item), { aria: `Delete ${label}`, danger: true }));
+    if (e.remove) buttons.push(writeButton(e.remove.label, keyOff(c, e.remove.cmds, v), (b) => removeItem(b, item), { aria: `Delete ${label}`, danger: true, act: 'item.delete' }));
     return h('div', { class: 'item-actions', role: 'group', 'aria-label': `Write to the selected ${label}` },
       h('p', { class: 'small muted wrap-any' }, 'Selected: ', h('span', { class: 'mono', text: label })),
       h('div', { class: 'row-actions' }, buttons),
+      whyLines(buttons.map((b) => (b.disabled ? b.title : null))),
       e.noEdit ? h('p', { class: 'muted small', text: e.noEdit }) : null);
   }
 
@@ -1643,9 +1666,9 @@ function mountKeys(root, ctx) {
     return h('div', { class: 'stack-sm' },
       h('p', { class: 'lbl', text: 'Every key of the pattern' }),
       h('div', { class: 'row-actions' },
-        writeButton('Set a TTL on every key…', expire, () => bulkExpireDialog(pattern)),
-        writeButton('Delete every key…', remove, (b) => startBulk(b, pattern), { danger: true })),
-      c && c.readOnly ? null : h('p', { class: 'muted small', text: [expire || remove, 'A dry run counts the keys first: nothing is written until you confirm.'].filter(Boolean).join(' ') }));
+        writeButton('Set a TTL on every key…', expire, () => bulkExpireDialog(pattern), { act: 'pattern.bulkTtl' }),
+        writeButton('Delete every key…', remove, (b) => startBulk(b, pattern), { danger: true, act: 'pattern.bulkDelete' })),
+      c && c.readOnly ? whyLines([expire, remove]) : h('p', { class: 'muted small', text: [expire || remove, 'A dry run counts the keys first: nothing is written until you confirm.'].filter(Boolean).join(' ') }));
   }
 
   function bulkExpireDialog(pattern) {

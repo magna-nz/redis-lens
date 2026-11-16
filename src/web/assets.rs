@@ -35,6 +35,7 @@ assets!(
     "app.js",
     "api.js",
     "ui.js",
+    "keys.js",
     "mock.js",
     "mark.svg",
     "views/connections.js",
@@ -157,7 +158,7 @@ mod tests {
 
     #[test]
     fn every_file_on_the_list_has_a_content_type() {
-        assert_eq!(FILES.len(), 17);
+        assert_eq!(FILES.len(), 18);
         for (p, _) in FILES {
             assert!(content_type(p).is_some(), "{p}");
         }

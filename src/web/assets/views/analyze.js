@@ -185,7 +185,8 @@ export function mount(root, ctx, route) {
     progress,
     lastLine,
     pills(tabs().map((t) => ({ id: t.id, label: t.label, href: `#/analyze/${t.id}` })), tab, null, 'Analyze panels'));
-  const body = h('div', { class: 'stack-lg' });
+  // The panel's lists are one pane for the keys.
+  const body = h('div', { class: 'stack-lg', 'data-pane': 'panel' });
   view.append(body);
 
   function drawHead() {
@@ -193,13 +194,14 @@ export function mount(root, ctx, route) {
     status.textContent = statusText(a);
     const running = a.running;
     const start = (depth, primary) => h('button', {
-      type: 'button', class: primary ? 'btn primary' : 'btn', text: DEPTHS[depth], disabled: running,
+      type: 'button', class: primary ? 'btn primary' : 'btn', text: DEPTHS[depth], disabled: running, title: running ? 'An analysis is running: wait for it, or stop it.' : null,
+      'data-act': depth === 'quick' ? 'analyze' : null,
       onclick: () => ask(depth),
     });
     const r = a.report;
     refill(actions, [
       running ? h('button', { type: 'button', class: 'btn primary', text: a.status === 'stopping' ? 'Stopping…' : 'Stop', disabled: a.status === 'stopping', onclick: stop }) : null,
-      r && !running && !r.stopped ? h('button', { type: 'button', class: 'btn', text: 'Save as snapshot', onclick: (e) => save(e.currentTarget) }) : null,
+      r && !running && !r.stopped ? h('button', { type: 'button', class: 'btn', text: 'Save as snapshot', 'data-act': 'snapshot', onclick: (e) => save(e.currentTarget) }) : null,
       start('quick', !r && !running),
       start('deep', false),
     ]);
@@ -338,8 +340,8 @@ export function mount(root, ctx, route) {
   }
 
   const openKey = (k) => ctx.openKey(k);
-  const keyButton = (k) => h('button', { type: 'button', class: 'linkish mono clip', text: k.name, title: `Open ${k.name} on Browse`, onclick: () => openKey(k) });
-  const patternButton = (p, node = null) => h('button', { type: 'button', class: 'linkish mono clip', text: p.name, title: `List the keys of ${p.name} on Browse`, onclick: () => ctx.openPattern(p, node) });
+  const keyButton = (k) => h('button', { type: 'button', class: 'linkish mono clip', 'data-open': '', text: k.name, title: `Open ${k.name} on Browse`, onclick: () => openKey(k) });
+  const patternButton = (p, node = null) => h('button', { type: 'button', class: 'linkish mono clip', 'data-open': '', text: p.name, title: `List the keys of ${p.name} on Browse`, onclick: () => ctx.openPattern(p, node) });
   const nodeName = (i) => {
     const s = ctx.state();
     const n = s.conn && typeof i === 'number' ? s.conn.nodes[i] : null;
@@ -373,7 +375,7 @@ export function mount(root, ctx, route) {
           { label: 'Expires', cls: 'nowrap muted', cell: (r) => expiryText(r.key.ttl) || DASH },
           { label: 'Pattern', cls: 'keycell', cell: (r) => patternButton(r.pattern) },
           cluster ? { label: 'Node', cls: 'mono nowrap', cell: (r) => r.endpoint || nodeName(r.key.node) } : null,
-        ].filter(Boolean), rows, { caption: 'The biggest sampled keys', cls: 'big' }),
+        ].filter(Boolean), rows, { caption: 'The biggest sampled keys', cls: 'big', rowKey: (r, i) => r.key.id ?? `b:${i}` }),
         d.factsRead ? null : h('p', { class: 'muted small', text: 'Lengths and encodings are read for the listed keys when the panel opens.' }),
         d.notes.map((t) => notice(t))));
   }
@@ -396,7 +398,7 @@ export function mount(root, ctx, route) {
     const list = h('div', { class: 'card col wide' },
       h('h2', { class: 'lbl', text: 'Patterns by TTL risk' }),
       d.empty ? emptyState(d.empty) : h('ul', { class: 'list' }, d.rows.map((r, i) => h('li', null, h('button', {
-        type: 'button', class: `row row-exp${sel === r ? ' on' : ''}`, 'aria-current': sel === r ? 'true' : null,
+        type: 'button', class: `row row-exp${sel === r ? ' on' : ''}`, 'aria-current': sel === r ? 'true' : null, 'data-row': `x:${i}`,
         onclick: () => {
           store.picked.expiry = i;
           drawBody();
@@ -439,7 +441,7 @@ export function mount(root, ctx, route) {
       { label: 'Why', cls: 'nowrap', cell: (r) => (r.change ? r.change.words || DASH : DASH) },
       { label: '', cls: 'barcell', cell: (r) => meter(barPercent(Math.abs((r.change && (r.change.deltaBytes ?? r.change.deltaKeys)) || 0), max), r.change && r.change.alarming ? 'warn' : '') },
       trend ? { label: 'Trend', cls: 'mono nowrap', cell: (r) => (r.trend ? h('span', { title: r.trend.ratioPerDay === null ? '' : `${fmtPercent(Math.abs(r.trend.ratioPerDay))} a day`, text: sparkline(r.trend.values) }) : '') } : null,
-    ].filter(Boolean), d.rows, { caption: 'Patterns that changed', cls: 'changes' }) : emptyState(d.empty || 'No pattern changed.');
+    ].filter(Boolean), d.rows, { caption: 'Patterns that changed', cls: 'changes', rowKey: (r, i) => `c:${i}` }) : emptyState(d.empty || 'No pattern changed.');
   }
 
   function drawChanges(d) {
@@ -508,7 +510,7 @@ export function mount(root, ctx, route) {
         { label: 'Expires', cls: 'nowrap muted', cell: (r) => expiryText(r.key.ttl) || DASH },
         { label: 'Pattern', cls: 'keycell', cell: (r) => patternButton(r.pattern) },
         cluster ? { label: 'Node', cls: 'mono nowrap', cell: (r) => r.endpoint || nodeName(r.key.node) } : null,
-      ].filter(Boolean), d.rows, { caption: 'The most-read sampled keys', cls: 'hot' }),
+      ].filter(Boolean), d.rows, { caption: 'The most-read sampled keys', cls: 'hot', rowKey: (r, i) => r.key.id ?? `h:${i}` }),
       // The thresholds come only with rows; with none there is nothing to mark.
       d.empty || !d.rows.length ? null
         : h('p', { class: 'muted small', text: `▲ hot and big: an LFU counter of ${fmtGrouped(d.hotFreq)} or more and ${fmtBytes(d.hotBigBytes)} or more.` }));
@@ -561,7 +563,7 @@ export function mount(root, ctx, route) {
         { label: 'Share', cls: 'mono right nowrap', cell: (x) => fmtPercent(x.share) },
         { label: 'Heat', cls: 'barcell', cell: (x) => meter(barPercent(x.count, max)) },
         { label: 'Pattern', cls: 'keycell', cell: (x) => patternButton(x.pattern) },
-      ], r.rows, { caption: 'The keys the last Monitor run named most', cls: 'hot' }),
+      ], r.rows, { caption: 'The keys the last Monitor run named most', cls: 'hot', rowKey: (x, i) => `m:${i}` }),
       h('p', { class: 'muted small', text: m.text }),
       r.endpoint ? h('p', { class: 'muted small', text: `Monitor ran on ${r.endpoint}.` }) : null,
       r.unknownText ? h('p', { class: 'muted small', text: r.unknownText }) : null,
@@ -580,8 +582,8 @@ export function mount(root, ctx, route) {
         { label: 'Keys', cls: 'mono right', cell: (r) => fmtCount(r.keys) },
         { label: 'Memory', cls: 'mono right', cell: (r) => fmtBytes(r.memory) },
         { label: 'Sampled', cls: 'mono right', cell: (r) => fmtCount(r.sampledKeys) },
-        { label: 'Patterns', cls: 'right', cell: (r) => (r.status === 'failed' ? DASH : h('button', { type: 'button', class: 'btn quiet', text: 'Show', 'aria-label': `Show the patterns of ${r.endpoint}`, onclick: () => ctx.openPattern(null, r.index) })) },
-      ], d.rows, { caption: 'One row per shard', cls: 'shards' }),
+        { label: 'Patterns', cls: 'right', cell: (r) => (r.status === 'failed' ? DASH : h('button', { type: 'button', class: 'btn quiet', text: 'Show', 'data-open': '', 'aria-label': `Show the patterns of ${r.endpoint}`, onclick: () => ctx.openPattern(null, r.index) })) },
+      ], d.rows, { caption: 'One row per shard', cls: 'shards', rowKey: (r, i) => `n:${i}` }),
       d.rows.filter((r) => r.note).map((r) => notice(`${r.endpoint}: ${r.note}`)));
   }
 
@@ -600,17 +602,17 @@ export function mount(root, ctx, route) {
       store.slotsOrder = id;
       delete store.panels.slots;
       drawBody();
-    }, 'Order the hottest slots by');
+    }, 'Order the hottest slots by', { act: 'sort' });
     return h('div', { class: 'stack-lg' },
       h('div', { class: 'card stack' },
         h('div', { class: 'toolbar' }, h('h2', { class: 'lbl', text: 'Hottest slots' }), order,
-          h('button', { type: 'button', class: 'btn', text: 'Read again', onclick: () => drawBody(true) })),
+          h('button', { type: 'button', class: 'btn', text: 'Read again', 'data-act': 'refresh', onclick: () => drawBody(true) })),
         d.note ? notice(d.note, 'info') : null,
         d.empty || !d.hottest.length ? emptyState(d.empty || 'No slot has keys.') : table([
           { label: 'Slot', cls: 'mono right', cell: (r) => fig(r.slot, String) },
           { label: 'Node', cls: 'mono nowrap', cell: (r) => r.endpoint || DASH },
           ...cols([{ label: 'Sampled keys', cls: 'keycell', cell: (r) => (r.sampled.length ? h('span', { class: 'mono clip', text: r.sampled.map((k) => k.key.name).join(', ') }) : DASH) }]),
-        ], d.hottest, { caption: 'The hottest slots', cls: 'slots' })),
+        ], d.hottest, { caption: 'The hottest slots', cls: 'slots', rowKey: (r, i) => `s:${i}` })),
       h('div', { class: 'card stack' },
         h('h2', { class: 'lbl', text: 'Slot ranges' }),
         table([
@@ -630,7 +632,7 @@ export function mount(root, ctx, route) {
       return;
     }
     const a = ctx.state().analysis;
-    const saveButton = h('button', { type: 'button', class: 'btn primary', text: 'Save as snapshot', disabled: !list.canSave || a.running, onclick: (e) => save(e.currentTarget) });
+    const saveButton = h('button', { type: 'button', class: 'btn primary', text: 'Save as snapshot', disabled: !list.canSave || a.running, title: list.saveOff || null, 'data-act': 'snapshot', onclick: (e) => save(e.currentTarget) });
     fill(body, h('div', { class: 'card stack' },
       h('div', { class: 'toolbar' }, h('h2', { class: 'lbl', text: `Snapshots${list.profile ? ` of ${list.profile}` : ''} · ${list.snapshots.length}` }), saveButton),
       list.saveOff ? notice(list.saveOff, 'info') : list.saved ? notice('This analysis is saved.', 'ok') : null,
@@ -642,7 +644,7 @@ export function mount(root, ctx, route) {
         {
           label: 'Compare', cls: 'right',
           cell: (r) => (r.current || !a.report ? '' : h('button', {
-            type: 'button', class: 'btn quiet', text: 'Compare', 'aria-label': `Compare this analysis with the snapshot of ${r.utc || r.file}`,
+            type: 'button', class: 'btn quiet', text: 'Compare', 'data-open': '', 'aria-label': `Compare this analysis with the snapshot of ${r.utc || r.file}`,
             onclick: async () => {
               try {
                 store.compare = { a: r.file, b: 'current' };
@@ -654,7 +656,7 @@ export function mount(root, ctx, route) {
             },
           })),
         },
-      ], list.snapshots, { caption: 'Saved snapshots, newest first' }) : emptyState('No snapshot of this connection yet.')));
+      ], list.snapshots, { caption: 'Saved snapshots, newest first', rowKey: (r) => r.file }) : emptyState('No snapshot of this connection yet.')));
   }
 
   function histogram(labels, counts) {

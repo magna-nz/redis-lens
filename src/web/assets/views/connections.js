@@ -106,15 +106,15 @@ export function mount(root, ctx) {
   const view = h('section', { class: 'view', 'aria-labelledby': 'conns-title' });
   root.append(view);
 
-  const addButton = h('button', { type: 'button', class: 'btn primary', text: 'Add a connection', onclick: () => addDialog(ctx, load) });
+  const addButton = h('button', { type: 'button', class: 'btn primary', text: 'Add a connection', 'data-act': 'conn.add', onclick: () => addDialog(ctx, load) });
   const head = h('div', { class: 'view-head' },
     h('div', null,
       h('h1', { class: 'title', id: 'conns-title', text: 'Connections' }),
       h('p', { class: 'subtitle', text: 'Connecting reads the server’s own figures and no key.' })),
     addButton);
-  const savedBox = h('div', null, h('div', { class: 'card' }, emptyState('Reading the saved connections…')));
-  const dockerBox = h('div', null, h('p', { class: 'muted', text: 'Looking for Redis and Valkey containers in Docker…' }));
-  const lookAgain = h('button', { type: 'button', class: 'btn quiet', text: 'Look again', onclick: () => drawDocker(true) });
+  const savedBox = h('div', { 'data-pane': 'saved' }, h('div', { class: 'card' }, emptyState('Reading the saved connections…')));
+  const dockerBox = h('div', { 'data-pane': 'docker' }, h('p', { class: 'muted', text: 'Looking for Redis and Valkey containers in Docker…' }));
+  const lookAgain = h('button', { type: 'button', class: 'btn quiet', text: 'Look again', 'data-act': 'refresh', onclick: () => drawDocker(true) });
   const host = (typeof window !== 'undefined' && window.location && window.location.host) || '127.0.0.1';
   view.append(head, savedBox,
     h('div', { class: 'section-head' }, h('h2', { class: 'lbl', text: 'Found in Docker' }), lookAgain),
@@ -175,9 +175,10 @@ export function mount(root, ctx) {
 
     const main = mine && status !== 'failed'
       ? h('button', { type: 'button', class: 'btn main-action', text: status === 'connecting' ? 'Cancel' : 'Disconnect', onclick: () => disconnect() })
-      : h('button', { type: 'button', class: 'btn primary', text: status === 'failed' ? 'Connect again' : 'Connect', onclick: () => connect(p, main) });
+      : h('button', { type: 'button', class: 'btn primary', text: status === 'failed' ? 'Connect again' : 'Connect', 'data-open': '', onclick: () => connect(p, main) });
 
-    return h('article', { class: here ? 'card conn-card on' : 'card conn-card', 'aria-label': p.name },
+    // A card is a row of the list the keys move in: enter connects (never disconnects).
+    return h('article', { class: here ? 'card conn-card on' : 'card conn-card', 'aria-label': p.name, 'data-row': `${p.docker ? 'docker' : 'saved'}:${p.name}` },
       h('div', { class: 'conn-top' }, h('h3', { class: 'mono conn-name', text: p.name }), envBadge(p.env)),
       h('span', { class: 'mono conn-address', text: address }),
       h('div', { class: 'conn-meta' },
@@ -208,8 +209,8 @@ export function mount(root, ctx) {
           })) : null,
         p.docker ? null : h('div', { class: 'conn-more' },
           h('button', { type: 'button', class: 'btn quiet', text: 'Test', 'aria-label': `Test ${p.name}`, onclick: () => testDialog(ctx, p) }),
-          h('button', { type: 'button', class: 'btn quiet', text: 'Edit', 'aria-label': `Edit ${p.name}`, onclick: () => editDialog(ctx, p, load) }),
-          h('button', { type: 'button', class: 'btn quiet danger', text: 'Remove', 'aria-label': `Remove ${p.name}`, onclick: () => remove(p) }))));
+          h('button', { type: 'button', class: 'btn quiet', text: 'Edit', 'aria-label': `Edit ${p.name}`, 'data-act': 'conn.edit', onclick: () => editDialog(ctx, p, load) }),
+          h('button', { type: 'button', class: 'btn quiet danger', text: 'Remove', 'aria-label': `Remove ${p.name}`, 'data-act': 'conn.remove', onclick: () => remove(p) }))));
   }
 
   function connect(p, button) {

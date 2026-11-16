@@ -124,7 +124,7 @@ export function mount(root, ctx, { head, body: area }) {
   let alive = true;
   const timers = [];
   const subtitle = head.subtitle;
-  const readAgain = h('button', { type: 'button', class: 'btn', text: 'Read again', onclick: () => load(true) });
+  const readAgain = h('button', { type: 'button', class: 'btn', text: 'Read again', 'data-act': 'refresh', onclick: () => load(true) });
   head.actions.append(readAgain);
   const box = h('div', { class: 'stack-lg', 'aria-live': 'polite' });
   area.append(box);
@@ -202,7 +202,7 @@ export function mount(root, ctx, { head, body: area }) {
       fill(box, h('div', { class: 'card stack' },
         h('h2', { class: 'lbl', text: a.running || l.analysisRunning ? 'Analyzing' : 'No analysis yet' }),
         emptyState(a.running || l.analysisRunning ? 'The list fills in once the analysis is done.' : l.text,
-          a.running || l.analysisRunning ? null : h('button', { type: 'button', class: 'btn primary', text: 'Analyze', onclick: () => ctx.analyze('quick') }))));
+          a.running || l.analysisRunning ? null : h('button', { type: 'button', class: 'btn primary', text: 'Analyze', 'data-act': 'analyze', onclick: () => ctx.analyze('quick') }))));
       return;
     }
     if (l.status === 'none') {
@@ -234,13 +234,13 @@ export function mount(root, ctx, { head, body: area }) {
       draw();
       if (hadEntries) entriesClosed();
     };
-    return h('div', { class: 'card stack browse-col stream-list' },
+    return h('div', { class: 'card stack browse-col stream-list', 'data-pane': 'streams' },
       h('div', { class: 'card-head' }, h('h2', { class: 'lbl', text: `Streams · ${l.rows.length}` })),
       l.note ? h('p', { class: 'muted small', text: l.note }) : null,
       table([
         {
           label: 'Stream', cls: 'keycell', cell: (r) => h('button', {
-            type: 'button', class: 'linkish mono clip', id: `stream-${r.key.id}`, text: r.key.name, 'aria-pressed': picked && r.key.id === picked.key.id ? 'true' : 'false',
+            type: 'button', class: 'linkish mono clip', id: `stream-${r.key.id}`, text: r.key.name, 'aria-pressed': picked && r.key.id === picked.key.id ? 'true' : 'false', 'data-row': r.key.id,
             title: r.gone ? r.text : `Show ${r.key.name}`, onclick: () => pick(r),
           }),
         },
@@ -258,7 +258,7 @@ export function mount(root, ctx, { head, body: area }) {
 
   function detailCard(r) {
     if (r.gone) {
-      return h('div', { class: 'card stack browse-col stream-detail' },
+      return h('div', { class: 'card stack browse-col stream-detail', 'data-pane': 'stream' },
         h('h2', { class: 'key-title mono wrap-any', text: r.key.name }), notice(r.text || 'The key is gone, or no longer a stream.'));
     }
     const facts = [
@@ -270,7 +270,7 @@ export function mount(root, ctx, { head, body: area }) {
       ['Entries added', countText(r.entriesAdded)],
       r.endpoint || typeof r.node === 'number' ? ['Node', nodeName(r)] : null,
     ].filter(Boolean);
-    return h('div', { class: 'card stack browse-col stream-detail' },
+    return h('div', { class: 'card stack browse-col stream-detail', 'data-pane': 'stream' },
       h('div', { class: 'value-head' }, h('h2', { class: 'key-title mono wrap-any', text: r.key.name }),
         h('button', { type: 'button', class: 'btn quiet', text: 'Open on Keys', title: `Open ${r.key.name} on Browse › Keys`, onclick: () => ctx.openKey(r.key) })),
       h('dl', { class: 'facts' }, facts.map(([k, v]) => h('div', null, h('dt', { text: k }), h('dd', { class: 'mono', text: v })))),
@@ -288,7 +288,7 @@ export function mount(root, ctx, { head, body: area }) {
     return h('section', { class: 'item-actions stack-sm', 'aria-label': `Group ${g.name.name}` },
       h('div', { class: 'toolbar' },
         h('h4', { class: 'mono strong wrap-any', text: g.name.name }),
-        h('button', { type: 'button', class: 'btn quiet', text: 'Pending entries', 'aria-label': `List the pending entries of ${g.name.name}`, onclick: () => listPending(r, g, null) })),
+        h('button', { type: 'button', class: 'btn quiet', text: 'Pending entries', 'aria-label': `List the pending entries of ${g.name.name}`, 'data-act': 'stream.pending', onclick: () => listPending(r, g, null) })),
       h('p', { class: 'muted small', text: groupLine(g) }),
       readers === null ? h('p', { class: 'muted small', text: 'XINFO CONSUMERS is not available for this user.' })
         : readers.length ? table([
@@ -299,14 +299,14 @@ export function mount(root, ctx, { head, body: area }) {
           {
             label: '', cls: 'nowrap', cell: (c) => [
               c.pending ? h('button', {
-                type: 'button', class: 'btn quiet', text: 'Pending', 'aria-label': `List the pending entries of ${c.name.name}`, onclick: () => listPending(r, g, c),
+                type: 'button', class: 'btn quiet', text: 'Pending', 'data-open': '', 'aria-label': `List the pending entries of ${c.name.name}`, 'data-act': 'stream.pending', onclick: () => listPending(r, g, c),
               }) : null,
               writesOff() || !g.pending ? null : h('button', {
-                type: 'button', class: 'btn quiet', text: 'Claim', 'aria-label': `Claim pending entries of ${g.name.name} from ${c.name.name} (XAUTOCLAIM)`, onclick: () => openClaim(r, g, { name: c.name, idleMs: c.idleMs }),
+                type: 'button', class: 'btn quiet', text: 'Claim', 'aria-label': `Claim pending entries of ${g.name.name} from ${c.name.name} (XAUTOCLAIM)`, 'data-act': 'stream.claim', onclick: () => openClaim(r, g, { name: c.name, idleMs: c.idleMs }),
               }),
             ],
           },
-        ], readers, { caption: `The consumers of ${g.name.name}` })
+        ], readers, { caption: `The consumers of ${g.name.name}`, rowKey: (c) => `c:${g.name.id}:${c.name.id}` })
           : h('p', { class: 'muted small', text: 'No consumers.' }),
       readers && readers.some((c) => c.stuck) ? h('p', { class: 'muted small', text: '▲ stuck: holds pending entries and idle 30 minutes or more.' }) : null,
       writesOff() || !g.pending ? null : claimForm(r, g));
@@ -361,14 +361,14 @@ export function mount(root, ctx, { head, body: area }) {
         writesOff() ? null : {
           label: '', cls: 'nowrap', cell: (e) => [
             h('button', {
-              type: 'button', class: 'btn quiet', text: 'Ack', 'aria-label': `Acknowledge ${e.id} (XACK)`, onclick: (ev) => ack(r, p, e, ev.currentTarget),
+              type: 'button', class: 'btn quiet', text: 'Ack', 'aria-label': `Acknowledge ${e.id} (XACK)`, 'data-act': 'stream.ack', onclick: (ev) => ack(r, p, e, ev.currentTarget),
             }),
             group && group.pending ? h('button', {
-              type: 'button', class: 'btn quiet', text: 'Claim', 'aria-label': `Claim pending entries of ${group.name.name} from ${e.consumer.name} (XAUTOCLAIM)`, onclick: () => openClaim(r, group, { name: e.consumer, idleMs: e.idleMs }),
+              type: 'button', class: 'btn quiet', text: 'Claim', 'aria-label': `Claim pending entries of ${group.name.name} from ${e.consumer.name} (XAUTOCLAIM)`, 'data-act': 'stream.claim', onclick: () => openClaim(r, group, { name: e.consumer, idleMs: e.idleMs }),
             }) : null,
           ],
         },
-      ].filter(Boolean), p.entries, { caption: 'Pending entries' }) : h('p', { class: 'muted', text: 'Nothing is pending.' }),
+      ].filter(Boolean), p.entries, { caption: 'Pending entries', rowKey: (e) => `e:${e.id}` }) : h('p', { class: 'muted', text: 'Nothing is pending.' }),
       typeof p.max === 'number' && p.entries.length >= p.max ? h('p', { class: 'muted small', text: `The first ${fmtGrouped(p.max)} pending entries.` }) : null);
   }
 
@@ -441,7 +441,7 @@ export function mount(root, ctx, { head, body: area }) {
         if (!ev.currentTarget.open && store.claim && store.claim.group === g.name.id) store.claim = null;
       },
     },
-      h('summary', { text: 'Claim pending entries (XAUTOCLAIM)' }),
+      h('summary', { text: 'Claim pending entries (XAUTOCLAIM)', 'data-act': 'stream.claim' }),
       h('form', {
         class: 'form', autocomplete: 'off',
         onsubmit: async (ev) => {
@@ -474,7 +474,7 @@ export function mount(root, ctx, { head, body: area }) {
     const error = h('p', { class: 'form-error', role: 'alert' });
     const button = h('button', { type: 'submit', class: 'btn danger', text: 'Trim' });
     return h('details', { class: 'advanced' },
-      h('summary', { text: 'Trim the stream (XTRIM)' }),
+      h('summary', { text: 'Trim the stream (XTRIM)', 'data-act': 'stream.trim' }),
       h('form', {
         class: 'form', autocomplete: 'off',
         onsubmit: async (ev) => {
@@ -537,7 +537,7 @@ export function mount(root, ctx, { head, body: area }) {
         h('span', { class: 'mono small nowrap', text: it.name ?? '' }), h('span', { class: 'mono small wrap-any', text: entryText(it) })))) : h('p', { class: 'muted', text: 'The stream has no entries.' }),
       v.notice ? h('p', { class: 'muted small', text: v.notice }) : null,
       h('p', { class: 'muted small' }, 'Each entry on one line; ', h('button', { type: 'button', class: 'linkish', text: 'Open on Keys', title: `Open ${r.key.name} on Browse › Keys`, onclick: () => ctx.openKey(r.key) }), ' shows an entry\'s fields whole, in a format.'),
-      v.more && !(typeof (v.length ?? r.length) === 'number' && v.items.length >= (v.length ?? r.length)) ? h('button', { type: 'button', class: 'btn', text: 'Show more', disabled: e.reading, onclick: () => openEntries(r, true) }) : null);
+      v.more && !(typeof (v.length ?? r.length) === 'number' && v.items.length >= (v.length ?? r.length)) ? h('button', { type: 'button', class: 'btn', text: 'Show more', disabled: e.reading, 'data-act': 'more', onclick: () => openEntries(r, true) }) : null);
   }
 
   // ---------- following the session ----------

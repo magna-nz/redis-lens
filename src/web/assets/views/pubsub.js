@@ -99,16 +99,16 @@ export function mount(root, ctx) {
   const timers = [];
   const offs = [];
 
-  const left = h('div', { class: 'card tight col narrow' });
-  const right = h('div', { class: 'card stack col wide' });
+  const left = h('div', { class: 'card tight col narrow', 'data-pane': 'channels' });
+  const right = h('div', { class: 'card stack col wide', 'data-pane': 'tail' });
   view.append(
     h('div', { class: 'view-head' },
       h('h1', { class: 'title', id: 'pubsub-title', text: 'Pub/Sub' })),
     h('div', { class: 'cols' }, left, right));
 
   // ---------- Channels ----------
-  const target = h('input', { class: 'field mono', type: 'text', id: 'sub-target', placeholder: 'orders.* or a channel', autocomplete: 'off', spellcheck: false });
-  const shard = h('input', { type: 'checkbox', id: 'sub-shard' });
+  const target = h('input', { class: 'field mono', type: 'text', id: 'sub-target', placeholder: 'orders.* or a channel', autocomplete: 'off', spellcheck: false, 'data-act': 'sub.add' });
+  const shard = h('input', { type: 'checkbox', id: 'sub-shard', 'data-act': 'sub.shard' });
   const shardRow = h('div', { class: 'check', hidden: true }, shard, h('label', { htmlFor: 'sub-shard' }, 'Shard channel', h('span', { class: 'hint', text: 'SSUBSCRIBE, on the node that owns the channel’s slot.' })));
   const subError = h('p', { class: 'field-error', role: 'alert' });
   const listBox = h('div', null, h('p', { class: 'muted', text: 'Reading the channels…' }));
@@ -168,7 +168,7 @@ export function mount(root, ctx) {
       const node = c.shard && c.node !== null ? nodeName(c.node) : null;
       return h('li', null, h('button', {
         type: 'button', class: on ? 'row row-channel on' : 'row row-channel', 'aria-pressed': on ? 'true' : 'false',
-        'data-channel': `${c.shard ? 's' : 'c'}:${c.name}`,
+        'data-channel': `${c.shard ? 's' : 'c'}:${c.name}`, 'data-row': `${c.shard ? 's' : 'c'}:${c.name}`,
         onclick: () => subscribe(c.name, c.shard),
       },
       h('span', { class: 'mono name clip', text: c.name }),
@@ -270,11 +270,13 @@ export function mount(root, ctx) {
   function publishBox() {
     if (conn.readOnly) return readOnlyNote('Publishing is a write, and this connection is read-only. Turn writes on in Connections.');
     const sub = tail.sub;
+    // `P` comes to the message when the channel is filled in already, else to the channel.
+    const named = !!sub && sub.kind !== 'pattern';
     const channel = h('input', {
       class: 'field mono chan', type: 'text', id: 'pub-channel', placeholder: 'Channel', autocomplete: 'off', spellcheck: false,
-      value: sub && sub.kind !== 'pattern' ? sub.name : '',
+      value: named ? sub.name : '', 'data-act': named ? null : 'publish',
     });
-    const message = h('input', { class: 'field mono', type: 'text', id: 'pub-message', placeholder: 'Message to publish', autocomplete: 'off', spellcheck: false });
+    const message = h('input', { class: 'field mono', type: 'text', id: 'pub-message', placeholder: 'Message to publish', autocomplete: 'off', spellcheck: false, 'data-act': named ? 'publish' : null });
     const send = h('button', { type: 'submit', class: 'btn primary', text: 'Publish' });
     return h('form', {
       class: 'publish',
@@ -313,14 +315,14 @@ export function mount(root, ctx) {
       return;
     }
     const filter = h('input', {
-      class: 'field mono grow', type: 'text', id: 'tail-filter', placeholder: 'Filter messages', autocomplete: 'off', spellcheck: false, value: tail.filter,
+      class: 'field mono grow', type: 'text', id: 'tail-filter', placeholder: 'Filter messages', autocomplete: 'off', spellcheck: false, value: tail.filter, 'data-act': 'filter',
       oninput: () => {
         tail.filter = filter.value;
         drawMessages();
       },
     });
     pauseButton = h('button', {
-      type: 'button', class: 'btn', text: 'Pause',
+      type: 'button', class: 'btn', text: 'Pause', 'data-act': 'pause',
       onclick: () => {
         if (tail.buffer.paused) tail.buffer.resume();
         else tail.buffer.pause();

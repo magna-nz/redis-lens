@@ -96,14 +96,14 @@ export function mount(root, ctx, { head, body: area }) {
   follow(state);
   let alive = true;
   const conn = state.conn;
-  const readAgain = h('button', { type: 'button', class: 'btn', text: 'Read again', onclick: () => load(true) });
+  const readAgain = h('button', { type: 'button', class: 'btn', text: 'Read again', 'data-act': 'refresh', onclick: () => load(true) });
   head.actions.append(readAgain);
   const box = h('div', { class: 'stack-lg', 'aria-live': 'polite' });
   area.append(box);
   // The query box lives across draws, so what is typed stays while the list is read again.
   const queryBox = h('input', {
     class: 'field mono grow', type: 'search', id: 'search-query', autocomplete: 'off', spellcheck: false, autocapitalize: 'off',
-    maxlength: String(MAX_QUERY), placeholder: '* (every document)',
+    maxlength: String(MAX_QUERY), placeholder: '* (every document)', 'data-act': 'filter',
   });
 
   let seq = 0;
@@ -168,14 +168,14 @@ export function mount(root, ctx, { head, body: area }) {
   }
 
   function listCard(l, picked) {
-    return h('div', { class: 'card stack browse-col search-list' },
+    return h('div', { class: 'card stack browse-col search-list', 'data-pane': 'indexes' },
       h('div', { class: 'card-head' }, h('h2', { class: 'lbl', text: `Indexes · ${l.indexes.length}` })),
       l.firstOf ? h('p', { class: 'muted small', text: l.firstOf }) : null,
       l.notes.map((n) => h('p', { class: 'muted small', text: n })),
       l.indexes.length ? table([
         {
           label: 'Index', cls: 'keycell', cell: (i) => h('button', {
-            type: 'button', class: 'linkish mono clip', id: `index-${i.name.id}`, text: i.name.name, 'aria-pressed': picked && i.name.id === picked.name.id ? 'true' : 'false',
+            type: 'button', class: 'linkish mono clip', id: `index-${i.name.id}`, text: i.name.name, 'aria-pressed': picked && i.name.id === picked.name.id ? 'true' : 'false', 'data-row': i.name.id,
             onclick: () => {
               store.picked = i.name.id;
               draw();
@@ -201,9 +201,9 @@ export function mount(root, ctx, { head, body: area }) {
       ['Indexed', i.progressText || (typeof i.progress === 'number' ? fmtPercent(i.progress) : DASH)],
       ['Failures', typeof i.failures === 'number' ? fmtGrouped(i.failures) : DASH],
     ];
-    return h('div', { class: 'card stack browse-col search-detail' },
+    return h('div', { class: 'card stack browse-col search-detail', 'data-pane': 'index' },
       h('div', { class: 'value-head' }, h('h2', { class: 'key-title mono wrap-any', text: i.name.name }),
-        writesOff() ? null : h('button', { type: 'button', class: 'btn danger', text: 'Drop index', 'aria-label': `Drop the index ${i.name.name} (FT.DROPINDEX, the documents stay)`, onclick: (ev) => drop(i, ev.currentTarget) })),
+        writesOff() ? null : h('button', { type: 'button', class: 'btn danger', text: 'Drop index', 'aria-label': `Drop the index ${i.name.name} (FT.DROPINDEX, the documents stay)`, 'data-act': 'search.drop', onclick: (ev) => drop(i, ev.currentTarget) })),
       i.infoText ? notice(i.infoText, 'info') : h('dl', { class: 'facts' }, facts.map(([k, v]) => h('div', null, h('dt', { text: k }), h('dd', { class: 'mono', text: v })))),
       i.building ? notice('Still indexing: queries may miss documents until it is done.', 'info') : null,
       i.leftOut ? h('p', { class: 'muted small', text: i.leftOut }) : null,
@@ -223,9 +223,9 @@ export function mount(root, ctx, { head, body: area }) {
       if (ev && ev.preventDefault) ev.preventDefault();
       await query(i, cmd);
     };
-    const button = (cmd, label, primary = false) => {
+    const button = (cmd, label, { primary = false, act = null } = {}) => {
       const off = commandOff(l, cmd);
-      return h('button', { type: cmd === 'search' ? 'submit' : 'button', class: primary ? 'btn primary' : 'btn', text: label, disabled: !!off, title: off || `Send ${COMMANDS[cmd]}`, onclick: cmd === 'search' ? null : run(cmd) });
+      return h('button', { type: cmd === 'search' ? 'submit' : 'button', class: primary ? 'btn primary' : 'btn', text: label, disabled: !!off, title: off || `Send ${COMMANDS[cmd]}`, 'data-act': act, onclick: cmd === 'search' ? null : run(cmd) });
     };
     const offLines = ['search', 'explain', 'profile'].map((c) => l.cmdOff[c]).filter(Boolean);
     const r = store.results;
@@ -233,7 +233,7 @@ export function mount(root, ctx, { head, body: area }) {
       h('h2', { class: 'lbl', id: 'search-q-title' }, 'Query ', h('span', { class: 'as-is mono', text: i.name.name })),
       h('form', { class: 'toolbar', autocomplete: 'off', onsubmit: run('search') },
         h('label', { class: 'sr-only', htmlFor: 'search-query', text: 'Query (FT.SEARCH)' }), queryBox,
-        button('search', 'Search', true), button('explain', 'Explain'), button('profile', 'Profile')),
+        button('search', 'Search', { primary: true }), button('explain', 'Explain', { act: 'search.explain' }), button('profile', 'Profile', { act: 'search.profile' })),
       h('p', { class: 'muted small', text: `FT.SEARCH ${i.name.name} <query> LIMIT 0 50. Explain and Profile use the query last run${l.lastQuery !== null ? `: ${l.lastQuery}` : ''}.` }),
       offLines.map((t) => notice(t)),
       l.busy ? h('p', { class: 'muted', role: 'status', text: `${l.busy} is running…` }) : null,
@@ -298,14 +298,14 @@ export function mount(root, ctx, { head, body: area }) {
 
   function resultsBox(r) {
     const steps = pageSteps(r);
-    return h('section', { class: 'stack-sm', 'aria-label': 'Results' },
+    return h('section', { class: 'stack-sm', 'aria-label': 'Results', 'data-pane': 'results' },
       h('div', { class: 'toolbar' },
         h('h3', { class: 'lbl' }, `${COMMANDS[r.cmd]} `, h('span', { class: 'as-is mono', text: r.query })),
         h('span', { class: 'muted small', text: resultsLine(r) })),
       r.docs.length ? h('ul', { class: 'list' }, r.docs.map((d) => h('li', { class: 'item-actions' },
         h('div', { class: 'toolbar' },
           h('span', { class: 'muted small mono', text: `${d.index + 1}.` }),
-          h('button', { type: 'button', class: 'linkish mono clip', text: d.key.name, title: `Open ${d.key.name} on Browse › Keys`, onclick: () => ctx.openKey(d.key) }),
+          h('button', { type: 'button', class: 'linkish mono clip', text: d.key.name, title: `Open ${d.key.name} on Browse › Keys`, 'data-row': String(d.index), onclick: () => ctx.openKey(d.key) }),
           h('span', { class: 'muted small', text: plural(d.fieldCount, 'field', 'fields') })),
         d.fields.length ? h('dl', { class: 'facts' }, d.fields.map((f, k) => h('div', null,
           h('dt', { class: 'mono', text: f.name }),
@@ -331,7 +331,7 @@ export function mount(root, ctx, { head, body: area }) {
     const s = f.shown;
     formatSeq += 1;
     const id = `search-fmt-${formatSeq}`;
-    const select = h('select', { class: 'field', id, onchange: () => openField(f.at.r, f.at.d, f.at.k, select.value) },
+    const select = h('select', { class: 'field', id, 'data-act': 'format', onchange: () => openField(f.at.r, f.at.d, f.at.k, select.value) },
       s.formats.map((x) => h('option', { value: x.toLowerCase(), selected: x === s.format, text: x })));
     return h('section', { class: 'value-box', 'aria-label': `${f.name} of ${f.key.name}` },
       h('div', { class: 'value-label toolbar' },
@@ -368,7 +368,7 @@ export function mount(root, ctx, { head, body: area }) {
     const error = h('p', { class: 'form-error', role: 'alert' });
     const button = h('button', { type: 'submit', class: 'btn', text: 'Create' });
     return h('details', { class: 'advanced' },
-      h('summary', { text: 'Create an index (FT.CREATE)' }),
+      h('summary', { text: 'Create an index (FT.CREATE)', 'data-act': 'search.create' }),
       h('form', {
         class: 'form', autocomplete: 'off',
         onsubmit: async (ev) => {
