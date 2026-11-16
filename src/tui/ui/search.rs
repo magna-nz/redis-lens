@@ -343,10 +343,10 @@ fn query_text(q: &str) -> String {
 fn results_keys(state: &SearchState) -> String {
     let mut parts = vec!["/ query", "enter open"];
     if state.off_reason(Cmd::Explain).is_none() {
-        parts.push("e explain");
+        parts.push("x explain");
     }
     if state.off_reason(Cmd::Profile).is_none() {
-        parts.push("P profile");
+        parts.push("X profile");
     }
     parts.join(" · ")
 }

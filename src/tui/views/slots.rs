@@ -35,7 +35,7 @@ pub const REFUSED: &str = "The server refused CLUSTER SLOT-STATS for this user."
 /// The note in the title when no CPU or network figure is above 0.
 pub const NEEDS_ENABLED: &str = "CPU and network need cluster-slot-stats-enabled yes";
 
-/// How the hottest slots are ordered; `o` cycles it.
+/// How the hottest slots are ordered; `s` cycles it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Order {
     #[default]
@@ -412,7 +412,7 @@ impl ViewState for SlotsState {
             self.sel = next;
             return true;
         }
-        if plain(&key) == Some('o') {
+        if plain(&key) == Some('s') {
             self.order = self.order.next();
             self.rank();
             return true;

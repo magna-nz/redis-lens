@@ -315,7 +315,7 @@ pub fn need_report(frame: &mut Frame, area: Rect, app: &App, title: &str, needs:
             // The engine's estimate, the same one the dialog and Overview show.
             let q = estimate_for(Depth::Quick, app);
             lines.push(Line::from(vec![
-                Span::styled("   r", style::focus()),
+                Span::styled("   a", style::focus()),
                 Span::styled(
                     format!(
                         "  Analyze: {} keys, about {} read-only commands, {}",
@@ -972,7 +972,7 @@ mod tests {
             let est = estimate_for(Depth::Quick, &app);
             assert!(
                 text.contains(&format!(
-                    "r  Analyze: {} keys, about {} read-only commands, {}",
+                    "a  Analyze: {} keys, about {} read-only commands, {}",
                     format::grouped(est.keys),
                     format::count(est.commands),
                     about_time(&est)

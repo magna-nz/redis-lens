@@ -116,7 +116,7 @@ impl SortBy {
         }
     }
 
-    /// The next sort for `o`: memory, keys, avg size, no-TTL %, name, then memory
+    /// The next sort for `s`: memory, keys, avg size, no-TTL %, name, then memory
     /// again. Without sizes memory and avg size are skipped: keys, no-TTL %, name.
     pub fn next(self, sizes: bool) -> Self {
         match (self.effective(sizes), sizes) {

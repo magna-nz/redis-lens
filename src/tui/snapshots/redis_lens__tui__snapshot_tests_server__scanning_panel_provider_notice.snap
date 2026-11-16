@@ -4,7 +4,7 @@ expression: t.backend()
 ---
 " prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys · ▲ no sizes                               ⠋ analyzing 12% "
 "  1  Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                               0 Connections "
-"┌─ Now ──────────────────────────────────────────────────────────────────────────────────── INFO every 2 s · p pauses ─┐"
+"┌─ Now ──────────────────────────────────────────────────────────────────────────────── INFO every 2 s · space pauses ─┐"
 "│ Waiting for the live connection…                                                                                     │"
 "├─ Keys ─────────────────────────────────────────────────────────────────────────────────── about 20K commands in all ─┤"
 "│ 7.92M keys · 15G used                                                                                                │"
@@ -37,4 +37,4 @@ expression: t.backend()
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" esc Stop   p Pause   +- Interval                                                     ctrl-f Find key  : Command  ? Help"
+" esc Stop   space Pause   <> Interval                                                 ctrl-f Find key  : Command  ? Help"

@@ -25,4 +25,4 @@ expression: t.backend()
 "│ WHERE THE MEMORY IS                                                          │"
 "│   session:{uuid}     ███████▎░░░░░░░░  46%     6.1G                          │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   enter Go there   r Analyze keys   v More      ctrl-f Find key  ? Help"
+" ↑↓ Move   enter Go there   a Analyze keys   v More      ctrl-f Find key  ? Help"

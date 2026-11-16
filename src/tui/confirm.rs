@@ -28,7 +28,7 @@ pub enum ConfirmFor {
     },
     /// `w` on Connections: turning writes on for entry `id`.
     WritesOn { id: ConnId },
-    /// `x` or `D` on Patterns, after the dry run (`super::bulk`): `summary` says what
+    /// `t` or `d` on Patterns (`T` or `D` on its key list), after the dry run (`super::bulk`): `summary` says what
     /// it found, as lines safe to draw.
     Bulk { op: WriteOp, summary: Vec<String> },
 }
@@ -981,7 +981,7 @@ mod tests {
         assert!(app.confirm.is_none());
         assert_eq!(app.patterns.filter, "w");
         let mut app = App::new(crate::tui::fixtures::profiles());
-        app.handle_key(ch('1'));
+        crate::tui::app::views::testing::area(&mut app, '1');
         assert!(app.handle_key(ch('w')).is_empty());
         assert!(app.confirm.is_none());
         assert!(app.notice.as_ref().unwrap().text.contains("Connect first"));

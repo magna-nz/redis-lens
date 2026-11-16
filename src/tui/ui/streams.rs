@@ -139,7 +139,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &StreamsState, ctx: &Ctx<'_>) 
                         .to_string(),
                     style::fg(),
                 ),
-                (" r analyzes.".to_string(), style::dim()),
+                (" a analyzes.".to_string(), style::dim()),
             ],
             None => vec![(" Reading the streams with XINFO…".to_string(), style::dim())],
         };
@@ -520,7 +520,7 @@ fn detail_pane(frame: &mut Frame, inner: Rect, state: &StreamsState, node: Optio
     let Some(info) = &sel.info else {
         let mut lines = vec![];
         for l in wrap_words(
-            " The key is gone, or no longer a stream. r analyzes again to update the list.",
+            " The key is gone, or no longer a stream. a analyzes again to update the list.",
             w,
         ) {
             lines.push(Line::from(Span::styled(l, style::dim())));

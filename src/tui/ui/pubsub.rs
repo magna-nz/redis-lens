@@ -444,7 +444,7 @@ fn draw_tail(frame: &mut Frame, inner: Rect, t: &Tail) {
             notes.push(dim_line(" Waiting for messages…".into(), w));
         }
         TailStatus::Stopped if t.listed() == 0 => notes.push(dim_line(
-            " The tail is stopped. enter or s subscribes again.".into(),
+            " The tail is stopped. enter or + subscribes again.".into(),
             w,
         )),
         _ => {}
@@ -615,7 +615,7 @@ fn totals(frame: &mut Frame, inner: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
     lines.extend(paragraph(
         vec![Span::raw(" ")],
         " ",
-        "Counts read no payloads. enter or s starts a live tail, S a shard one.",
+        "Counts read no payloads. enter or + starts a live tail, S a shard one.",
         style::dim(),
         w,
     ));

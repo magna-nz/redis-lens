@@ -37,4 +37,4 @@ expression: t.backend()
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   tab Next panel   y Copy   r Analyze   s Snapshot                           ctrl-f Find key  : Command  ? Help"
+" ↑↓ Move   tab Next panel   y Copy   a Analyze   ctrl-s Save                          ctrl-f Find key  : Command  ? Help"

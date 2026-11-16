@@ -4,7 +4,7 @@ expression: "testing::render(&app, 80, 24).backend()"
 ---
 " myapp-redis-1  LOCAL   w  writes on   15G / 24G · 7.92M keys  ● analyzed 14:02 "
 "  1  Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub       0 Connections "
-"┌─ Now ──────────────────────────────────────────── INFO every 2 s · p pauses ─┐"
+"┌─ Now ──────────────────────────────────────── INFO every 2 s · space pauses ─┐"
 "│ Waiting for the server…                                                      │"
 "├─ Keys ─────────────────────────────────── 100,000 sampled keys at 14:02 UTC ─┤"
 "│ 7.92M keys · 15G used                                                        │"

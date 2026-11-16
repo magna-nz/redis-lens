@@ -103,11 +103,11 @@ fn now_titles(ctx: &Ctx<'_>, app: &App) -> (String, String) {
     let right = if state.overview.poll.off.is_some() {
         "off".to_string()
     } else if state.paused {
-        "INFO paused · p resumes".to_string()
+        "INFO paused · space resumes".to_string()
     } else if cluster {
         format!("[ ] picks a node · INFO every {every}")
     } else {
-        format!("INFO every {every} · p pauses")
+        format!("INFO every {every} · space pauses")
     };
     (left, right)
 }
@@ -612,7 +612,7 @@ fn keys_lines(app: &App, s: &Session, w: usize, h: usize) -> (Vec<Line<'static>>
             ""
         };
         let again = if w >= WIDE {
-            " · r analyzes again"
+            " · a analyzes again"
         } else {
             ""
         };
@@ -668,7 +668,7 @@ fn keys_lines(app: &App, s: &Session, w: usize, h: usize) -> (Vec<Line<'static>>
         let e = estimate_for(Depth::Quick, app);
         let mut prompt = vec![Line::from(fit(
             vec![
-                Span::styled("   r", style::focus()),
+                Span::styled("   a", style::focus()),
                 Span::styled(analyze_text(&e), style::fg()),
             ],
             w,
@@ -1126,7 +1126,7 @@ mod tests {
     #[test]
     fn the_analyze_dialog() {
         let mut app = overview_app(false);
-        app.handle_key(key(KeyCode::Char('r')));
+        app.handle_key(key(KeyCode::Char('a')));
         insta::assert_snapshot!("analyze_80x24", snap(&app, 80, 24));
         app.handle_key(key(KeyCode::Down));
         insta::assert_snapshot!("analyze_deep_120x36", snap(&app, 120, 36));
@@ -1153,7 +1153,7 @@ mod tests {
             for (w, h) in [(1, 1), (0, 0), (20, 5), (40, 12), (200, 3), (3, 40)] {
                 testing::render(&app, w, h);
             }
-            app.handle_key(key(KeyCode::Char('r')));
+            app.handle_key(key(KeyCode::Char('a')));
             for (w, h) in [(1, 1), (0, 0), (20, 5), (40, 12), (200, 3), (3, 40)] {
                 testing::render(&app, w, h);
             }
@@ -1235,7 +1235,7 @@ mod tests {
     /// [`just_connected`] with a Quick analysis 4,100 keys in.
     fn analyzing() -> App {
         let mut app = just_connected(Some(3));
-        app.handle_key(key(KeyCode::Char('r')));
+        app.handle_key(key(KeyCode::Char('a')));
         let effects = app.handle_key(key(KeyCode::Enter));
         let [Effect::Connect { id, scan, .. }] = effects[..] else {
             panic!("expected a connect, got {effects:?}");
@@ -1497,7 +1497,7 @@ mod tests {
         no_heading_without_rows(&t);
         insta::assert_snapshot!("cluster_analyzed_80x24", t);
         // The dialog splits the sample across the shards that answered.
-        app.handle_key(key(KeyCode::Char('r')));
+        app.handle_key(key(KeyCode::Char('a')));
         let t = text_of(&app, 80, 24);
         assert!(t.contains("across 3 shards"), "{t}");
     }
@@ -1529,7 +1529,7 @@ mod tests {
         assert_eq!((got.keys, got.commands), (want.keys, want.commands));
         assert_eq!(got.duration, want.duration);
         let mut app = app;
-        app.handle_key(key(KeyCode::Char('r')));
+        app.handle_key(key(KeyCode::Char('a')));
         let t = text_of(&app, 80, 24);
         let line = format!("about {} commands", crate::format::count(want.commands));
         assert!(t.contains(&line), "{line}:\n{t}");

@@ -3,14 +3,17 @@
 //! `ui/keys.rs`; its live requests are in `src/live/keys.rs`.
 //!
 //! The list loads [`PAGE_KEYS`](crate::live::keys::PAGE_KEYS) keys of the pattern when
-//! it opens and as many more with each `n`. Only keys that infer to the pattern are
-//! listed. `/` filters the loaded keys by name, `t` by type, `o` sorts them, `y` copies the selected
-//! key name, `esc` clears the filter and then goes back to Patterns. `enter` on a key is
-//! left to `App`, which opens the selected key's detail ([`super::value`]). See
-//! [`super`] for the interface `App` calls.
+//! it opens and as many more with each `m`. Only keys that infer to the pattern are
+//! listed. `/` filters the loaded keys by name, `ctrl-t` by type, `s` sorts them, `y`
+//! copies the selected key name and `Y` its pattern, `esc` clears the filter and then
+//! goes back to Patterns. `enter` on a key is left to `App`, which opens the selected
+//! key's detail ([`super::value`]), and so are `T` and `D`, the bulk actions of the
+//! pattern. See [`super`] for the interface `App` calls.
 //!
-//! `N` (P3) adds a key from a form ([`Form::new_key`]) through the write gate; it never
+//! `+` (P3) adds a key from a form ([`Form::new_key`]) through the write gate; it never
 //! overwrites one. Once added, `App` lists it and opens its detail ([`KeysState::opened`]).
+//! `t`, `d` and `R` set the selected key's TTL, delete it and rename it: the writes `T`,
+//! `D` and `R` send from its value, by name, without reading the value.
 //!
 //! The same list shows a find (`ctrl-f`, [`KeysState::open_find`]): the keys of the
 //! whole server whose names match a glob, every key `SCAN` returns kept, with the same
@@ -22,7 +25,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::value::{Form, FormKey};
+use super::value::{Form, FormKey, Nav};
 use super::{Act, Ctx, Input, ViewState};
 use crate::live::keys::{KeyRow, Page, Reply, Request};
 use crate::live::write::Reply as WriteReply;
@@ -32,7 +35,7 @@ use crate::tui::app::Screen;
 use crate::tui::clipboard::CopyText;
 use crate::write::{Decision, NewKey, WriteOp};
 
-/// How the loaded keys are ordered. `o` cycles through the ones that have data.
+/// How the loaded keys are ordered. `s` cycles through the ones that have data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeySort {
     /// `MEMORY USAGE`, largest first. Skipped without sizes.
@@ -176,6 +179,15 @@ impl TypeFilter {
     }
 }
 
+/// A write of the key list, sent and not answered yet.
+#[derive(Debug, Clone, PartialEq)]
+enum Writing {
+    /// `+`: the new key's row.
+    NewKey(KeyRow),
+    /// `t`, `d` or `R` on the selected key.
+    Key(WriteOp),
+}
+
 #[derive(Debug, Default)]
 pub struct KeysState {
     /// The pattern whose keys are listed, as `PatternStats::pattern`. `None` for a find.
@@ -192,7 +204,7 @@ pub struct KeysState {
     carry: Vec<String>,
     /// The `SCAN` came back to 0 and every key found is loaded.
     pub done: bool,
-    /// Pages answered so far. Only the first is loaded on its own; `n` loads the rest,
+    /// Pages answered so far. Only the first is loaded on its own; `m` loads the rest,
     /// even when a page found no key of the pattern.
     pub pages: u64,
     /// The page request in flight.
@@ -221,12 +233,17 @@ pub struct KeysState {
     pub sel: usize,
     /// The tick when the selection last changed, for the scrolling name.
     pub sel_since: u64,
-    /// The `N` form, while it is open.
+    /// The `+`, `t` or `R` form, while it is open.
     pub form: Option<Form>,
-    /// The `N` write sent and not answered yet: its request, and the key's row.
-    writing: Option<(ReqId, KeyRow)>,
-    /// A key `N` added, for `App` to list and open (`key_edits.rs`).
+    /// The key the `t` or `R` form is for.
+    form_key: Option<String>,
+    /// The write sent and not answered yet: its request, and what it was.
+    writing: Option<(ReqId, Writing)>,
+    /// A key `+` added, for `App` to list and open (`key_edits.rs`).
     pub opened: Option<KeyRow>,
+    /// What `t`, `d` and `R` did, for `App` to tell the key's value if it is open
+    /// (`key_edits.rs`).
+    pub nav: Vec<Nav>,
     /// On a cluster, the nodes the walk reads, one at a time, in slot order (indices
     /// into the session's nodes): every connected node, or the one Patterns is narrowed
     /// to (spec "Cluster live views (P4)", Key list). Empty on a standalone server.
@@ -237,7 +254,7 @@ pub struct KeysState {
     at: usize,
     /// Nodes walked to the end.
     pub nodes_done: usize,
-    /// Keys loaded since the page was asked for (`n` or the first): a node that ends
+    /// Keys loaded since the page was asked for (`m` or the first): a node that ends
     /// before a page is full goes on to the next node.
     page_rows: usize,
     /// The node each loaded key came from, by key (cluster only).
@@ -543,7 +560,7 @@ impl KeysState {
         }
     }
 
-    /// A key `N` added: listed, and selected when the filter shows it.
+    /// A key `+` added: listed, and selected when the filter shows it.
     pub fn add_row(&mut self, row: KeyRow) {
         let key = row.key.clone();
         if self.seen.insert(key.clone()) {
@@ -554,7 +571,7 @@ impl KeysState {
         }
     }
 
-    /// `N`: the form for a new key, when the gate would let one through.
+    /// `+`: the form for a new key, when the gate would let one through.
     fn start_new_key(&mut self, act: &mut Act<'_>) {
         if self.find.is_none() && self.pattern.is_none() {
             return;
@@ -592,15 +609,25 @@ impl KeysState {
             FormKey::Typing => {}
             FormKey::Cancel => {
                 self.form = None;
+                self.form_key = None;
                 act.info(CANCELLED);
             }
-            FormKey::Send => match form.op("") {
+            FormKey::Send => match form.op(self.form_key.as_deref().unwrap_or("")) {
                 Err((at, why)) => {
                     form.at = at;
                     form.error = Some(why);
                 }
                 Ok(op) => {
                     self.form = None;
+                    if self.form_key.take().is_some() {
+                        // `t` or `R`: a write by the key's name.
+                        if form_unchanged_rename(&op) {
+                            act.info("Not changed, so nothing was sent.");
+                            return;
+                        }
+                        self.send_key_write(op, act);
+                        return;
+                    }
                     let WriteOp::NewKey { key, value } = &op else {
                         return;
                     };
@@ -626,19 +653,172 @@ impl KeysState {
                         freq: None,
                     };
                     if let Some(id) = act.write(op) {
-                        self.writing = Some((id, row));
+                        self.writing = Some((id, Writing::NewKey(row)));
                     }
                 }
             },
         }
     }
 
-    /// The answer to `N`'s write.
+    /// True when the selected key's writes may start: the gate would not refuse
+    /// `probe`, the live connection is open and no other write of the list waits for
+    /// its answer. Otherwise says why.
+    fn may_write(&self, probe: &WriteOp, act: &mut Act<'_>) -> bool {
+        if let Decision::Refuse(why) = act.write_decision(probe) {
+            act.error(why);
+            return false;
+        }
+        if !act.live_ready() {
+            act.error("Not sent: the live connection is not open.");
+            return false;
+        }
+        if self
+            .writing
+            .as_ref()
+            .is_some_and(|(id, _)| act.in_flight(*id))
+        {
+            act.info("The last write has not answered yet.");
+            return false;
+        }
+        true
+    }
+
+    /// `t`, `d` or `R` (`c`) on the selected key: the same writes as `T`, `D` and `R`
+    /// on its value, through the same gate and question, sent by name. Nothing of the
+    /// key is read first.
+    fn key_write(&mut self, c: char, act: &mut Act<'_>) {
+        let Some(key) = self.selected().map(|r| r.key.clone()) else {
+            act.info("No key selected.");
+            return;
+        };
+        let probe = match c {
+            't' => WriteOp::KeyTtl {
+                key: key.clone(),
+                ttl: crate::write::Ttl::Seconds(60),
+            },
+            'd' => WriteOp::Unlink { key: key.clone() },
+            _ => WriteOp::Rename {
+                key: key.clone(),
+                new: format!("{key}:"),
+            },
+        };
+        if !self.may_write(&probe, act) {
+            return;
+        }
+        match c {
+            't' => self.form = Some(Form::key_ttl(&key)),
+            'd' => {
+                self.send_key_write(probe, act);
+                return;
+            }
+            _ => self.form = Some(Form::rename(&key)),
+        }
+        self.form_key = Some(key);
+    }
+
+    fn send_key_write(&mut self, op: WriteOp, act: &mut Act<'_>) {
+        if let Some(id) = act.write(op.clone()) {
+            self.writing = Some((id, Writing::Key(op)));
+        }
+    }
+
+    /// The answer to `t`, `d` or `R`, in the words the key's value uses for them.
+    fn key_written(
+        &mut self,
+        op: WriteOp,
+        result: Result<LiveReply, LiveError>,
+        act: &mut Act<'_>,
+    ) {
+        let n = match result {
+            Ok(LiveReply::Write(WriteReply::Int(n))) => Some(n),
+            Ok(LiveReply::Write(_)) => None,
+            Ok(_) => return,
+            Err(LiveError::Failed(s)) if s == CANCELLED => return,
+            // RENAMENX on a key that has gone: the row goes, as after a delete.
+            Err(LiveError::Failed(s)) if s.ends_with("the key no longer exists") => {
+                if let WriteOp::Rename { key, .. }
+                | WriteOp::KeyTtl { key, .. }
+                | WriteOp::Unlink { key } = &op
+                {
+                    self.key_gone(key, act);
+                }
+                return;
+            }
+            Err(e) => {
+                act.error(format!("Not written: {e}."));
+                return;
+            }
+        };
+        match op {
+            WriteOp::Unlink { key } => {
+                if n == Some(0) {
+                    act.info("The key no longer exists.");
+                } else {
+                    act.info(format!("Deleted {}.", crate::value::escape(&key)));
+                }
+                self.drop_key(&key);
+                self.nav.push(Nav::Deleted(key));
+            }
+            WriteOp::Rename { key, new } => {
+                if n == Some(0) {
+                    act.error(format!(
+                        "Not renamed: {} exists already, and RENAMENX never overwrites a key.",
+                        crate::value::escape(&new)
+                    ));
+                    return;
+                }
+                self.rename_key(&key, &new);
+                act.info(format!("Renamed to {}.", crate::value::escape(&new)));
+                self.nav.push(Nav::Renamed { old: key, new });
+            }
+            WriteOp::KeyTtl { key, ttl } => {
+                use crate::write::Ttl as WriteTtl;
+                let row_ttl = match (ttl, n) {
+                    (WriteTtl::Persist, Some(0)) => {
+                        act.info("The key had no TTL.");
+                        return;
+                    }
+                    (WriteTtl::Seconds(_), Some(0)) => {
+                        self.key_gone(&key, act);
+                        return;
+                    }
+                    (WriteTtl::Seconds(s), _) => {
+                        act.info(format!(
+                            "TTL set to {}.",
+                            crate::format::duration(std::time::Duration::from_secs(s))
+                        ));
+                        Ttl::Expires(std::time::Duration::from_secs(s))
+                    }
+                    (WriteTtl::Persist, _) => {
+                        act.info("TTL removed: the key no longer expires.");
+                        Ttl::Persistent
+                    }
+                };
+                for r in self.rows.iter_mut().filter(|r| r.key == key) {
+                    r.ttl = row_ttl;
+                }
+                if let Some(r) = self.rows.iter().find(|r| r.key == key) {
+                    self.nav.push(Nav::Row(r.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A write from the list found its key gone: the row goes, and an open value of
+    /// that key closes, as after `d`.
+    fn key_gone(&mut self, key: &str, act: &mut Act<'_>) {
+        act.info("The key no longer exists.");
+        self.drop_key(key);
+        self.nav.push(Nav::Deleted(key.to_string()));
+    }
+
+    /// The answer to `+`'s write.
     fn written(&mut self, row: KeyRow, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
         let name = crate::value::escape(&row.key);
         match result {
             Ok(LiveReply::Write(WriteReply::Exists)) => act.error(format!(
-                "Not added: {name} exists already, and N never overwrites a key."
+                "Not added: {name} exists already, and + never overwrites a key."
             )),
             Ok(LiveReply::Write(WriteReply::Changed)) => act.error(format!(
                 "Not added: {name} was written by someone else meanwhile."
@@ -675,6 +855,11 @@ impl KeysState {
         self.sel = 0;
         self.sel_since = tick;
     }
+}
+
+/// True for a `t` or `R` form left as it started: a rename to the same name.
+fn form_unchanged_rename(op: &WriteOp) -> bool {
+    matches!(op, WriteOp::Rename { key, new } if key == new)
 }
 
 /// A plain character key, without ctrl or alt.
@@ -771,7 +956,7 @@ impl ViewState for KeysState {
                 self.filtering = true;
                 true
             }
-            (_, Some('o')) => {
+            (_, Some('s')) => {
                 let keep = self.selected().map(|r| r.key.clone());
                 self.sort = self
                     .sort
@@ -781,14 +966,14 @@ impl ViewState for KeysState {
                 act.info(format!("Keys sorted by {}.", self.sort.label()));
                 true
             }
-            (_, Some('t')) => {
+            (KeyCode::Char('t'), None) if key.modifiers == KeyModifiers::CONTROL => {
                 let keep = self.selected().map(|r| r.key.clone());
                 self.type_filter = self.type_filter.next();
                 self.reselect(keep, tick);
                 act.info(format!("Showing {} keys.", self.type_filter.label()));
                 true
             }
-            (_, Some('n')) => {
+            (_, Some('m')) => {
                 if self.loading.is_some_and(|id| act.in_flight(id)) {
                     act.info("Still loading keys…");
                 } else if self.done {
@@ -814,8 +999,27 @@ impl ViewState for KeysState {
                 }
                 true
             }
-            (_, Some('N')) if act.screen == Screen::KeyList => {
+            // The parent of a key is its pattern: the list's, or for a find's result the
+            // one its name infers to.
+            (_, Some('Y')) => {
+                match self.selected() {
+                    Some(r) => {
+                        let p = match (&self.find, &self.pattern) {
+                            (None, Some(p)) => p.clone(),
+                            _ => crate::pattern::pattern_for_key(&r.key),
+                        };
+                        act.copy(CopyText::pattern(&p));
+                    }
+                    None => act.info("Nothing selected to copy."),
+                }
+                true
+            }
+            (_, Some('+')) if act.screen == Screen::KeyList => {
                 self.start_new_key(act);
+                true
+            }
+            (_, Some(c @ ('t' | 'd' | 'R'))) if act.screen == Screen::KeyList => {
+                self.key_write(c, act);
                 true
             }
             _ => false,
@@ -823,8 +1027,11 @@ impl ViewState for KeysState {
     }
 
     fn on_reply(&mut self, id: ReqId, result: Result<LiveReply, LiveError>, act: &mut Act<'_>) {
-        if let Some((_, row)) = self.writing.take_if(|(w, _)| *w == id) {
-            self.written(row, result, act);
+        if let Some((_, w)) = self.writing.take_if(|(w, _)| *w == id) {
+            match w {
+                Writing::NewKey(row) => self.written(row, result, act),
+                Writing::Key(op) => self.key_written(op, result, act),
+            }
             return;
         }
         if self.loading != Some(id) {
@@ -884,6 +1091,10 @@ mod tests {
     use crate::tui::app::{App, Effect, Screen};
     use crate::tui::tree::{Root, Row};
 
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
     fn ch(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
@@ -892,7 +1103,7 @@ mod tests {
     fn open(pattern: &str) -> (App, Vec<Effect>) {
         let mut app = testing::scanned();
         let mut out = testing::live_ready(&mut app);
-        out.extend(app.handle_key(ch('2')));
+        out.extend(crate::tui::app::views::testing::area(&mut app, '2'));
         let at = {
             let data = app.pattern_data().expect("patterns");
             let name = |i: usize| data.patterns[i].pattern.as_str();
@@ -1054,11 +1265,11 @@ mod tests {
     }
 
     #[test]
-    fn t_cycles_the_types_and_sends_nothing() {
+    fn ctrl_t_cycles_the_types_and_sends_nothing() {
         let mut app = mixed();
         let mut seen = Vec::new();
         for _ in 0..8 {
-            let effects = app.handle_key(ch('t'));
+            let effects = app.handle_key(ctrl('t'));
             assert!(testing::requests(&effects).is_empty());
             seen.push(app.views.keys.type_filter.label());
         }
@@ -1074,13 +1285,13 @@ mod tests {
     #[test]
     fn the_type_filter_combines_with_the_name_filter() {
         let mut app = mixed();
-        app.handle_key(ch('t'));
+        app.handle_key(ctrl('t'));
         assert_eq!(type_of(&app), [KeyType::String; 2]);
-        app.handle_key(ch('t'));
+        app.handle_key(ctrl('t'));
         assert_eq!(app.views.keys.visible().len(), 9);
         // other takes JSON and unknown types.
         for _ in 0..5 {
-            app.handle_key(ch('t'));
+            app.handle_key(ctrl('t'));
         }
         assert_eq!(app.views.keys.type_filter, TypeFilter::Other);
         let mut other = type_of(&app);
@@ -1088,7 +1299,7 @@ mod tests {
         assert_eq!(other, [KeyType::Json, KeyType::Other]);
         // Back to strings, then a name filter on top.
         for _ in 0..2 {
-            app.handle_key(ch('t'));
+            app.handle_key(ctrl('t'));
         }
         assert_eq!(app.views.keys.type_filter, TypeFilter::String);
         app.handle_key(ch('/'));
@@ -1104,10 +1315,11 @@ mod tests {
         let mut app = mixed();
         app.handle_key(ch('/'));
         app.handle_key(ch('t'));
+        app.handle_key(ctrl('t'));
         assert_eq!(app.views.keys.type_filter, TypeFilter::All);
         assert_eq!(app.views.keys.filter, "t");
         app.handle_key(key(KeyCode::Esc));
-        app.handle_key(ch('t'));
+        app.handle_key(ctrl('t'));
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen(), Screen::KeyList);
         assert_eq!(app.views.keys.type_filter, TypeFilter::All);
@@ -1120,7 +1332,7 @@ mod tests {
     fn left_and_h_clear_the_filters_first_like_esc() {
         for back in [key(KeyCode::Left), ch('h')] {
             let mut app = mixed();
-            app.handle_key(ch('t'));
+            app.handle_key(ctrl('t'));
             app.handle_key(ch('/'));
             app.handle_key(ch('1'));
             app.handle_key(key(KeyCode::Enter));
@@ -1140,19 +1352,19 @@ mod tests {
     #[test]
     fn key_list_with_a_type_filter_80x24() {
         let mut app = mixed();
-        app.handle_key(ch('t'));
+        app.handle_key(ctrl('t'));
         insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
     }
 
     #[test]
     fn key_list_with_a_type_and_nothing_of_it_80x24() {
         let mut app = loaded();
-        app.handle_key(ch('t'));
+        app.handle_key(ctrl('t'));
         insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
     }
 
     #[test]
-    fn a_page_with_no_key_of_the_pattern_waits_for_n() {
+    fn a_page_with_no_key_of_the_pattern_waits_for_m() {
         let (mut app, effects) = open("user:{id}:cart");
         let (id, _) = page_request(&effects);
         testing::reply(&mut app, id, page(Vec::new(), 77));
@@ -1163,20 +1375,20 @@ mod tests {
             ));
             assert!(testing::requests(&effects).is_empty(), "tick {i}");
         }
-        let (_, req) = page_request(&app.handle_key(ch('n')));
+        let (_, req) = page_request(&app.handle_key(ch('m')));
         assert!(matches!(req, Request::Page { cursor: 77, .. }));
     }
 
     #[test]
-    fn n_loads_the_next_page_until_the_walk_is_done() {
+    fn m_loads_the_next_page_until_the_walk_is_done() {
         let mut app = loaded();
-        let (id, req) = page_request(&app.handle_key(ch('n')));
+        let (id, req) = page_request(&app.handle_key(ch('m')));
         let Request::Page { cursor, .. } = req else {
             unreachable!()
         };
         assert_eq!(cursor, 4_242);
         // A second n while it loads sends nothing.
-        assert!(testing::requests(&app.handle_key(ch('n'))).is_empty());
+        assert!(testing::requests(&app.handle_key(ch('m'))).is_empty());
         assert_eq!(notice(&app), "Still loading keys…");
         // Duplicates SCAN returned again are dropped.
         let more = vec![
@@ -1186,7 +1398,7 @@ mod tests {
         testing::reply(&mut app, id, page(more, 0));
         assert_eq!(app.views.keys.rows.len(), 10);
         assert!(app.views.keys.done);
-        assert!(testing::requests(&app.handle_key(ch('n'))).is_empty());
+        assert!(testing::requests(&app.handle_key(ch('m'))).is_empty());
         assert_eq!(notice(&app), "All 10 matching keys are loaded.");
     }
 
@@ -1196,9 +1408,9 @@ mod tests {
         let first = |app: &App| app.views.keys.selected().map(|r| r.key.clone());
         // By size, largest first.
         assert_eq!(first(&app).as_deref(), Some("user:10402:cart"));
-        app.handle_key(ch('o'));
+        app.handle_key(ch('s'));
         assert_eq!(notice(&app), "Keys sorted by length.");
-        app.handle_key(ch('o'));
+        app.handle_key(ch('s'));
         app.handle_key(key(KeyCode::Home));
         // By TTL: keys without one first, then the longest.
         assert_eq!(first(&app).as_deref(), Some("user:10388:cart"));
@@ -1346,9 +1558,9 @@ mod tests {
     }
 
     #[test]
-    fn n_adds_a_key_and_opens_it() {
+    fn plus_adds_a_key_and_opens_it() {
         let mut app = writable();
-        app.handle_key(ch('N'));
+        app.handle_key(ch('+'));
         let form = app.views.keys.form.as_ref().expect("the form");
         assert_eq!(form.fields[0].text, "user:");
         type_text(&mut app, "1:cart");
@@ -1394,7 +1606,7 @@ mod tests {
     #[test]
     fn a_new_string_keys_length_is_its_bytes() {
         let mut app = writable();
-        app.handle_key(ch('N'));
+        app.handle_key(ch('+'));
         type_text(&mut app, "1:name");
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(ch('s'));
@@ -1420,9 +1632,9 @@ mod tests {
     }
 
     #[test]
-    fn n_never_overwrites_and_checks_what_is_typed() {
+    fn plus_never_overwrites_and_checks_what_is_typed() {
         let mut app = writable();
-        app.handle_key(ch('N'));
+        app.handle_key(ch('+'));
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         // No name: the form stays open and says why.
         app.handle_key(key(KeyCode::Enter));
@@ -1454,23 +1666,23 @@ mod tests {
         assert_eq!(app.screen(), Screen::KeyList);
         assert_eq!(
             notice(&app),
-            "Not added: user:10293:cart exists already, and N never overwrites a key."
+            "Not added: user:10293:cart exists already, and + never overwrites a key."
         );
         // esc cancels.
-        app.handle_key(ch('N'));
+        app.handle_key(ch('+'));
         app.handle_key(key(KeyCode::Esc));
         assert!(app.views.keys.form.is_none());
         assert_eq!(app.screen(), Screen::KeyList);
     }
 
     #[test]
-    fn n_sends_nothing_on_a_read_only_profile() {
+    fn plus_sends_nothing_on_a_read_only_profile() {
         for (env, ro) in [(Env::Prod, None), (Env::Local, Some(true))] {
             let mut app = loaded();
             let s = app.session.as_mut().unwrap();
             s.profile.env = env;
             s.profile.read_only = ro;
-            let mut effects = app.handle_key(ch('N'));
+            let mut effects = app.handle_key(ch('+'));
             assert!(app.views.keys.form.is_none());
             assert!(notice(&app).contains("read-only"), "{}", notice(&app));
             for c in "user:1\thy\n\nprod-cache-01\n".chars() {
@@ -1482,18 +1694,18 @@ mod tests {
                 effects.extend(app.handle_key(k));
             }
             effects.extend(app.handle_paste("x".into()));
-            effects.extend(app.handle_key(ch('N')));
+            effects.extend(app.handle_key(ch('+')));
             effects.extend(app.handle_key(key(KeyCode::Enter)));
             assert!(writes(&effects).is_empty(), "{effects:?}");
         }
     }
 
     #[test]
-    fn n_on_prod_with_writes_on_asks() {
+    fn plus_on_prod_with_writes_on_asks() {
         let mut app = writable();
         app.session.as_mut().unwrap().profile.env = Env::Prod;
         app.session.as_mut().unwrap().profile.read_only = Some(false);
-        app.handle_key(ch('N'));
+        app.handle_key(ch('+'));
         type_text(&mut app, "9");
         app.handle_key(key(KeyCode::Enter));
         app.handle_key(key(KeyCode::Enter));
@@ -1504,9 +1716,217 @@ mod tests {
     }
 
     #[test]
+    fn capital_y_copies_the_pattern() {
+        let mut app = loaded();
+        let copied: Vec<String> = app
+            .handle_key(ch('Y'))
+            .into_iter()
+            .filter_map(|e| match e {
+                Effect::Copy(t) => Some(t.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copied, ["user:{id}:cart"]);
+    }
+
+    fn selected_key(app: &App) -> String {
+        app.views
+            .keys
+            .selected()
+            .expect("a selected key")
+            .key
+            .clone()
+    }
+
+    /// `R`, `t` and `d` on the key list act on the selected key with the same writes
+    /// the key's value sends (`RENAMENX`, `EXPIRE`, `UNLINK`), through the same gate,
+    /// and update its row.
+    #[test]
+    fn r_t_and_d_on_the_key_list_write_the_selected_key_and_update_its_row() {
+        let mut app = writable();
+        let old = selected_key(&app);
+        // R: rename, the form filled with the name; the same name sends nothing.
+        assert!(writes(&app.handle_key(ch('R'))).is_empty());
+        assert!(app.views.keys.form.is_some());
+        assert!(writes(&app.handle_key(key(KeyCode::Enter))).is_empty());
+        app.handle_key(ch('R'));
+        app.handle_key(ctrl('u'));
+        type_text(&mut app, "user:1:cart");
+        let w = writes(&app.handle_key(key(KeyCode::Enter)));
+        assert_eq!(
+            w.iter().map(|(_, op)| op.clone()).collect::<Vec<_>>(),
+            [WriteOp::Rename {
+                key: old.clone(),
+                new: "user:1:cart".into()
+            }]
+        );
+        testing::reply(&mut app, w[0].0, Ok(LiveReply::Write(WReply::Int(1))));
+        assert!(app.views.keys.rows.iter().any(|r| r.key == "user:1:cart"));
+        assert!(!app.views.keys.rows.iter().any(|r| r.key == old));
+        assert_eq!(selected_key(&app), "user:1:cart");
+
+        // t: the key's TTL.
+        app.handle_key(ch('t'));
+        app.handle_key(ctrl('u'));
+        type_text(&mut app, "90");
+        let w = writes(&app.handle_key(key(KeyCode::Enter)));
+        assert_eq!(
+            w.iter().map(|(_, op)| op.clone()).collect::<Vec<_>>(),
+            [WriteOp::KeyTtl {
+                key: "user:1:cart".into(),
+                ttl: crate::write::Ttl::Seconds(90)
+            }]
+        );
+        testing::reply(&mut app, w[0].0, Ok(LiveReply::Write(WReply::Int(1))));
+        let row = app
+            .views
+            .keys
+            .rows
+            .iter()
+            .find(|r| r.key == "user:1:cart")
+            .unwrap();
+        assert_eq!(row.ttl, Ttl::Expires(Duration::from_secs(90)));
+
+        // d: asks first (a delete), then UNLINK, and the row goes.
+        assert!(writes(&app.handle_key(ch('d'))).is_empty());
+        assert!(app.confirm.is_some());
+        let w = writes(&app.handle_key(ch('y')));
+        assert_eq!(
+            w.iter().map(|(_, op)| op.clone()).collect::<Vec<_>>(),
+            [WriteOp::Unlink {
+                key: "user:1:cart".into()
+            }]
+        );
+        testing::reply(&mut app, w[0].0, Ok(LiveReply::Write(WReply::Int(1))));
+        assert!(!app.views.keys.rows.iter().any(|r| r.key == "user:1:cart"));
+        assert_eq!(app.screen(), Screen::KeyList);
+    }
+
+    /// `t` or `R` on a key that has gone meanwhile: its row goes, as after `d`.
+    #[test]
+    fn t_and_r_on_a_key_that_has_gone_drop_its_row() {
+        let mut app = writable();
+        let gone = selected_key(&app);
+        app.handle_key(ch('t'));
+        app.handle_key(ctrl('u'));
+        type_text(&mut app, "90");
+        let w = writes(&app.handle_key(key(KeyCode::Enter)));
+        testing::reply(&mut app, w[0].0, Ok(LiveReply::Write(WReply::Int(0))));
+        assert_eq!(notice(&app), "The key no longer exists.");
+        assert!(!app.views.keys.rows.iter().any(|r| r.key == gone));
+
+        let gone = selected_key(&app);
+        app.handle_key(ch('R'));
+        app.handle_key(ctrl('u'));
+        type_text(&mut app, "user:1:cart");
+        let w = writes(&app.handle_key(key(KeyCode::Enter)));
+        testing::reply(
+            &mut app,
+            w[0].0,
+            Err(LiveError::Failed(
+                "RENAMENX failed: the key no longer exists".into(),
+            )),
+        );
+        assert_eq!(notice(&app), "The key no longer exists.");
+        assert!(!app.views.keys.rows.iter().any(|r| r.key == gone));
+        assert!(!app.views.keys.rows.iter().any(|r| r.key == "user:1:cart"));
+    }
+
+    /// A rename to a name that exists changes nothing; `n` on the delete question
+    /// sends nothing.
+    #[test]
+    fn a_taken_name_and_a_cancelled_delete_leave_the_row() {
+        let mut app = writable();
+        let old = selected_key(&app);
+        app.handle_key(ch('R'));
+        app.handle_key(ctrl('u'));
+        type_text(&mut app, "user:10311:cart");
+        let w = writes(&app.handle_key(key(KeyCode::Enter)));
+        testing::reply(&mut app, w[0].0, Ok(LiveReply::Write(WReply::Int(0))));
+        assert!(notice(&app).contains("exists already"), "{}", notice(&app));
+        assert_eq!(selected_key(&app), old);
+        app.handle_key(ch('d'));
+        assert!(writes(&app.handle_key(ch('n'))).is_empty());
+        assert!(app.views.keys.rows.iter().any(|r| r.key == old));
+    }
+
+    /// The value of the key open under the list follows a write made from the list.
+    #[test]
+    fn the_open_value_follows_a_write_from_the_key_list() {
+        let mut app = writable();
+        let old = selected_key(&app);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen(), Screen::KeyDetail);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::KeyList);
+        app.handle_key(ch('R'));
+        app.handle_key(ctrl('u'));
+        type_text(&mut app, "user:1:cart");
+        let w = writes(&app.handle_key(key(KeyCode::Enter)));
+        testing::reply(&mut app, w[0].0, Ok(LiveReply::Write(WReply::Int(1))));
+        assert_eq!(app.views.value.row.as_ref().unwrap().key, "user:1:cart");
+        assert_ne!(old, "user:1:cart");
+        app.handle_key(ch('t'));
+        app.handle_key(ctrl('u'));
+        type_text(&mut app, "60");
+        let w = writes(&app.handle_key(key(KeyCode::Enter)));
+        testing::reply(&mut app, w[0].0, Ok(LiveReply::Write(WReply::Int(1))));
+        assert_eq!(
+            app.views.value.row.as_ref().unwrap().ttl,
+            Ttl::Expires(Duration::from_secs(60))
+        );
+        app.handle_key(ch('d'));
+        let w = writes(&app.handle_key(ch('y')));
+        testing::reply(&mut app, w[0].0, Ok(LiveReply::Write(WReply::Int(1))));
+        assert!(app.views.value.row.is_none());
+        assert!(!app.patterns.detail_open);
+    }
+
+    /// On a read-only profile `t`, `d` and `R` say why and send nothing, whatever
+    /// follows; a prod profile with writes on asks first.
+    #[test]
+    fn t_d_and_r_send_nothing_on_a_read_only_profile() {
+        for (env, ro) in [(Env::Prod, None), (Env::Local, Some(true))] {
+            for k in ['t', 'd', 'R'] {
+                // Each key from a fresh key list, staying on it: no key below leaves it.
+                let mut app = loaded();
+                let s = app.session.as_mut().unwrap();
+                s.profile.env = env;
+                s.profile.read_only = ro;
+                let mut effects = app.handle_key(ch(k));
+                assert_eq!(app.screen(), Screen::KeyList, "{k}");
+                assert!(
+                    app.views.keys.form.is_none() && app.confirm.is_none(),
+                    "{k}"
+                );
+                assert!(notice(&app).contains("read-only"), "{k}: {}", notice(&app));
+                assert!(writes(&effects).is_empty(), "{k}: {effects:?}");
+                for e in [ch('y'), key(KeyCode::Enter)] {
+                    effects.extend(app.handle_key(e));
+                }
+                assert!(writes(&effects).is_empty(), "{k}: {effects:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn t_on_prod_with_writes_on_asks_first() {
+        let mut app = writable();
+        let s = app.session.as_mut().unwrap();
+        s.profile.env = Env::Prod;
+        s.profile.read_only = Some(false);
+        app.handle_key(ch('t'));
+        app.handle_key(ctrl('u'));
+        type_text(&mut app, "90");
+        assert!(writes(&app.handle_key(key(KeyCode::Enter))).is_empty());
+        assert!(app.confirm.is_some());
+        assert_eq!(writes(&app.handle_key(ch('y'))).len(), 1);
+    }
+
+    #[test]
     fn the_new_key_form_80x24() {
         let mut app = writable();
-        app.handle_key(ch('N'));
+        app.handle_key(ch('+'));
         type_text(&mut app, "1:cart");
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(ch('h'));

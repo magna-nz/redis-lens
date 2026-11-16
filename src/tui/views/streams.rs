@@ -2,13 +2,13 @@
 //! `ui/streams.rs`; its live requests are in `src/live/streams.rs`.
 //!
 //! Lists the streams the last scan found and polls `XINFO` for them every 5 s while the
-//! view is shown (`p` pauses). The poll reads entry IDs only. See [`super`] for the
+//! view is shown (`space` pauses). The poll reads entry IDs only. See [`super`] for the
 //! interface `App` calls.
 //!
 //! `enter` lists the selected stream's entries, one level deeper: a
 //! [`ValueState`](super::value::ValueState), the key detail's own state, reads them in
 //! pages of 100 with `XREVRANGE` (the key detail's `LiveRequest::Value`, no command of
-//! its own) and `ui/value.rs` draws them, so `↑↓`, `tab`, `n`, `f` and `y` work as on
+//! its own) and `ui/value.rs` draws them, so `↑↓`, `tab`, `m`, `f` and `y` work as on
 //! the key detail. `esc` goes back to the list. While the entries are shown the `XINFO`
 //! poll stops; back on the list it reads at once when a poll is due.
 //!
@@ -19,7 +19,7 @@
 //! - `A` on a group or consumer lists its pending entries (`XPENDING`, the first 100)
 //!   under it, a read that works on a read-only profile too; on one of them, it
 //!   acknowledges it (`XACK`).
-//! - `X` trims the selected stream (`XTRIM MAXLEN ~ n` or `MINID ~ id`), from a form.
+//! - `-` trims the selected stream (`XTRIM MAXLEN ~ n` or `MINID ~ id`), from a form.
 //!
 //! After each, the stream (and its pending list, when open) is read again.
 
@@ -50,7 +50,7 @@ pub const POLL: Duration = Duration::from_secs(5);
 /// Rows of the group and consumer list in the details panel that fit at once.
 const DETAIL_PAGE: usize = 5;
 
-/// What `r`, `p` and the list keys act on.
+/// What `r`, `space` and the list keys act on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Focus {
     #[default]
@@ -92,7 +92,7 @@ pub enum StreamForm {
         group: String,
         form: Form,
     },
-    /// `X`: trim `key`.
+    /// `-`: trim `key`.
     Trim { key: String, form: Form },
 }
 
@@ -247,7 +247,7 @@ pub struct StreamsState {
     pub pending_list: Option<(String, Pending)>,
     /// The `XPENDING` read in flight.
     pending_read: Option<ReqId>,
-    /// The form open, if any (`c`, `X`).
+    /// The form open, if any (`c`, `-`).
     pub form: Option<StreamForm>,
     /// The write in flight, if any.
     write: Option<(ReqId, Sent)>,
@@ -353,7 +353,7 @@ impl StreamsState {
             return;
         };
         let Some(info) = &row.info else {
-            act.info("The key is gone, or no longer a stream. r on Overview analyzes again and updates the list.");
+            act.info("The key is gone, or no longer a stream. a on Overview analyzes again and updates the list.");
             return;
         };
         let key_row = stream_row(&row.key, info);
@@ -443,14 +443,14 @@ impl StreamsState {
         });
     }
 
-    /// `X`: opens the trim form for the selected stream.
+    /// `-`: opens the trim form for the selected stream.
     fn open_trim(&mut self, act: &mut Act<'_>) {
         let Some(row) = self.selected() else {
             act.info("No stream selected.");
             return;
         };
         let Some(info) = &row.info else {
-            act.info("The key is gone, or no longer a stream. r on Overview analyzes again and updates the list.");
+            act.info("The key is gone, or no longer a stream. a on Overview analyzes again and updates the list.");
             return;
         };
         let key = row.key.clone();
@@ -845,7 +845,7 @@ impl ViewState for StreamsState {
                 self.entries_open = false;
                 return true;
             }
-            if let (KeyCode::Char('p'), true) = (key.code, plain(&key)) {
+            if let (KeyCode::Char(' '), true) = (key.code, plain(&key)) {
                 // Pausing still works; the poll waits for the list anyway.
                 self.paused = !self.paused;
                 act.info(if self.paused {
@@ -865,7 +865,7 @@ impl ViewState for StreamsState {
                 self.open_entries(act);
                 true
             }
-            KeyCode::Char('n' | 'f' | 'y') if plain(&key) => {
+            KeyCode::Char('m' | 'f' | 'y') if plain(&key) => {
                 act.info("Press enter to list the selected stream's entries first.");
                 true
             }
@@ -877,14 +877,14 @@ impl ViewState for StreamsState {
                 self.ack_or_list(act);
                 true
             }
-            KeyCode::Char('X') if plain(&key) => {
+            KeyCode::Char('-') if plain(&key) => {
                 self.open_trim(act);
                 true
             }
-            KeyCode::Char('p') if plain(&key) => {
+            KeyCode::Char(' ') if plain(&key) => {
                 self.paused = !self.paused;
                 if self.paused {
-                    act.info("Polling paused. Press p to resume, r to refresh once.");
+                    act.info("Polling paused. Press space to resume, r to refresh once.");
                 } else {
                     act.info("Polling resumed.");
                     // Read at once rather than after the rest of the interval.
@@ -1250,9 +1250,9 @@ mod tests {
     }
 
     #[test]
-    fn p_pauses_and_resumes_polling() {
+    fn space_pauses_and_resumes_polling() {
         let (mut app, t0) = loaded();
-        app.handle_key(key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Char(' ')));
         assert!(app.views.streams.paused);
         assert_eq!(tick(&mut app, t0, 60_000), None);
         // `r` still reads once.
@@ -1262,7 +1262,7 @@ mod tests {
         };
         answer(&mut app, id);
         // Resuming reads at once.
-        app.handle_key(key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Char(' ')));
         assert!(!app.views.streams.paused);
         assert!(tick(&mut app, t0, 60_100).is_some());
     }
@@ -1310,7 +1310,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('0')));
         assert_eq!(tick(&mut app, t0, 60_000), None);
         // Back on screen it reads at once.
-        let effects = app.handle_key(key(KeyCode::Char('2')));
+        let effects = crate::tui::app::views::testing::area(&mut app, '2');
         assert_eq!(testing::requests(&effects).len(), 1);
     }
 
@@ -1442,7 +1442,7 @@ mod tests {
         app.handle_key(key(KeyCode::Right));
         app.handle_key(key(KeyCode::End));
         insta::assert_snapshot!("details_80x24", testing::render(&app, 80, 24).backend());
-        app.handle_key(key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Char(' ')));
         insta::assert_snapshot!("paused_120x36", testing::render(&app, 120, 36).backend());
     }
 
@@ -1466,6 +1466,9 @@ mod tests {
 
     fn ch(c: char) -> crossterm::event::KeyEvent {
         key(KeyCode::Char(c))
+    }
+    fn ctrl(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char(c), crossterm::event::KeyModifiers::CONTROL)
     }
 
     fn value_requests(effects: &[Effect]) -> Vec<(ReqId, ValueRequest)> {
@@ -1564,14 +1567,40 @@ mod tests {
         (app, t0)
     }
 
+    /// With a stream's entries open, the list's write keys (`c`, `A`, `-`) and the key
+    /// detail's (`e`, `+`, `t`, `T`, `R`, `d`, `D`) send nothing and open nothing, even
+    /// with writes on and `skip_non_prod_confirm` set.
+    #[test]
+    fn no_write_key_acts_inside_the_entries() {
+        for k in ['c', 'A', '-', 'e', '+', 't', 'T', 'R', 'd', 'D', 'X'] {
+            let (mut app, _) = entries_open();
+            let s = app.session.as_mut().unwrap();
+            s.profile.env = crate::model::Env::Local;
+            s.profile.read_only = None;
+            app.settings.skip_non_prod_confirm = true;
+            let mut effects = app.handle_key(ch(k));
+            assert!(app.views.streams.form.is_none(), "{k}");
+            assert!(app.confirm.is_none(), "{k}");
+            effects.extend(app.handle_key(key(KeyCode::Enter)));
+            effects.extend(app.handle_key(ch('y')));
+            assert!(
+                !testing::requests(&effects)
+                    .iter()
+                    .any(|(_, r)| matches!(r, crate::live::LiveRequest::Write(_))),
+                "{k}: {effects:?}"
+            );
+            assert!(app.views.streams.entries_open, "{k}");
+        }
+    }
+
     #[test]
     fn enter_lists_the_entries_newest_first_and_n_loads_more() {
         let (mut app, t0) = entries_open();
         let s = &app.views.streams;
         assert!(s.entries_open);
         assert_eq!(s.shown_entries().unwrap().loaded(), 3);
-        // n reads the next 100, before the last ID read.
-        let effects = app.handle_key(ch('n'));
+        // m reads the next 100, before the last ID read.
+        let effects = app.handle_key(ch('m'));
         let [(id, req)] = &value_requests(&effects)[..] else {
             panic!("{effects:?}");
         };
@@ -1583,7 +1612,7 @@ mod tests {
             entries_page(vec![entry("1700000600000-0", &[("a", "b")])], None, false),
         );
         assert_eq!(app.views.streams.shown_entries().unwrap().loaded(), 4);
-        app.handle_key(ch('n'));
+        app.handle_key(ch('m'));
         assert_eq!(notice(&app), "All 4 items are loaded.");
         // No XINFO poll while the entries are shown.
         assert_eq!(tick(&mut app, t0, 60_000), None);
@@ -1610,7 +1639,7 @@ mod tests {
     fn entries_stay_open_across_views_and_r_reads_them_again() {
         let (mut app, _) = entries_open();
         app.handle_key(ch('0'));
-        let effects = app.handle_key(ch('2'));
+        let effects = crate::tui::app::views::testing::area(&mut app, '2');
         // Shown again: nothing asked, no XINFO either.
         assert!(testing::requests(&effects).is_empty(), "{effects:?}");
         assert!(app.views.streams.entries_open);
@@ -1633,10 +1662,10 @@ mod tests {
         assert!(!app.views.streams.entries_open);
         assert_eq!(
             notice(&app),
-            "The key is gone, or no longer a stream. r on Overview analyzes again and updates the list."
+            "The key is gone, or no longer a stream. a on Overview analyzes again and updates the list."
         );
         // n, f and y on the list say what to do first.
-        app.handle_key(ch('n'));
+        app.handle_key(ch('m'));
         assert_eq!(
             notice(&app),
             "Press enter to list the selected stream's entries first."
@@ -1667,7 +1696,7 @@ mod tests {
             crate::tui::app::views::value::Focus::Value
         );
         // p still pauses, and esc goes back: to the items, then out of the entries.
-        app.handle_key(ch('p'));
+        app.handle_key(ch(' '));
         assert!(app.views.streams.paused);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(
@@ -1755,8 +1784,8 @@ mod tests {
         let debug = format!("{effects:?} {:?} {:?}", app.views, app.session);
         assert!(!crate::value::leaks(&debug, MARK), "{debug}");
         // A snapshot file, saved from Patterns.
-        app.handle_key(ch('3'));
-        let effects = app.handle_key(ch('s'));
+        crate::tui::app::views::testing::area(&mut app, '3');
+        let effects = app.handle_key(ctrl('s'));
         let [Effect::SaveSnapshot(report)] = &effects[..] else {
             panic!("{effects:?}");
         };
@@ -1971,10 +2000,10 @@ mod tests {
     }
 
     #[test]
-    fn x_trims_after_asking_and_types_the_key_on_prod() {
+    fn minus_trims_after_asking_and_types_the_key_on_prod() {
         let (mut app, _) = loaded();
         set_profile(&mut app, Env::Local, None);
-        app.handle_key(ch('X'));
+        app.handle_key(ch('-'));
         press(&mut app, KeyCode::Tab);
         type_text(&mut app, "1000");
         insta::assert_snapshot!("trim_form_80x24", testing::render(&app, 80, 24).backend());
@@ -1994,7 +2023,7 @@ mod tests {
         assert_eq!(notice(&app), "Trimmed 4 entries.");
 
         set_profile(&mut app, Env::Prod, Some(false));
-        app.handle_key(ch('X'));
+        app.handle_key(ch('-'));
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Tab);
         type_text(&mut app, "1700000000000");
@@ -2017,8 +2046,8 @@ mod tests {
     #[test]
     fn no_stream_write_reaches_a_read_only_profile() {
         for (env, ro) in READ_ONLY {
-            // c and X: off before the form opens.
-            for k in ['c', 'X'] {
+            // c and -: off before the form opens.
+            for k in ['c', '-'] {
                 let mut app = on_consumer(env, ro);
                 let mut e = app.handle_key(ch(k));
                 assert!(app.views.streams.form.is_none() && app.confirm.is_none());
@@ -2040,7 +2069,7 @@ mod tests {
     fn the_form_takes_every_key_and_esc_closes_it() {
         let (mut app, _) = loaded();
         set_profile(&mut app, Env::Local, None);
-        app.handle_key(ch('X'));
+        app.handle_key(ch('-'));
         press(&mut app, KeyCode::Tab);
         // Digits and q are text here, not views or quitting.
         type_text(&mut app, "12q");
@@ -2053,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn before_an_analysis_the_list_says_so_and_r_analyzes() {
+    fn before_an_analysis_the_list_says_so_and_a_analyzes() {
         use crate::tui::fixtures;
         let mut app = App::new(fixtures::profiles());
         let effects = app.handle_key(key(KeyCode::Enter));
@@ -2082,10 +2111,13 @@ mod tests {
             screen.contains("Streams are found by an analysis"),
             "{screen}"
         );
-        assert!(screen.contains("r analyzes."), "{screen}");
+        assert!(screen.contains("a analyzes."), "{screen}");
         assert!(app.analyze.is_none());
-        app.handle_key(key(KeyCode::Char('r')));
-        assert!(app.analyze.is_some(), "r opens the analyze dialog");
+        // `r` has nothing to refresh before an analysis; `a` analyzes.
+        assert!(app.handle_key(key(KeyCode::Char('r'))).is_empty());
+        assert!(app.analyze.is_none());
+        app.handle_key(key(KeyCode::Char('a')));
+        assert!(app.analyze.is_some(), "a opens the analyze dialog");
         insta::assert_snapshot!(
             "streams_before_an_analysis_120x36",
             testing::render(

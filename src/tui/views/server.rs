@@ -4,7 +4,7 @@
 //! See [`super`] for the interface `App` calls.
 //!
 //! Each panel polls only while it is on screen (spec "Shared command budget"): `on_show`
-//! asks at once, `on_tick` asks again when the panel's interval has passed, and `p`
+//! asks at once, `on_tick` asks again when the panel's interval has passed, and `space`
 //! pauses all three. `r` asks now. A permission the server refuses, or a command it
 //! does not know, turns that one panel off with fixed text ([`Poll::off`]); any other
 //! failure leaves the last data on screen with a line saying the poll failed.
@@ -21,11 +21,11 @@
 //! keys ([`Monitor::ranking`]), placed by the key specs the Slow log learns too (one
 //! cache, [`SlowLog`]); commands not in it are asked with `COMMAND INFO`.
 //!
-//! Writes (P3), each through [`Act::write`], the one gate, all `@dangerous`: `K` on a
-//! group's connections kills the selected one (`CLIENT KILL ID`), but not the
-//! connection redis-lens reads the list with ([`is_own`]); `c` on the Slow log opens a
+//! Writes (P3), each through [`Act::write`], the one gate, all `@dangerous`: `d` on a
+//! group's connections ends the selected one (`CLIENT KILL ID`), but not the
+//! connection redis-lens reads the list with ([`is_own`]); `e` on the Slow log opens a
 //! form for `slowlog-log-slower-than` and `slowlog-max-len` (`CONFIG SET`, one setting
-//! per write); `R` sends `SLOWLOG RESET`. The panel reads again after each.
+//! per write); `D` sends `SLOWLOG RESET`. The panel reads again after each.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv6Addr};
@@ -351,10 +351,10 @@ impl ServerState {
         }))
     }
 
-    /// `K`: kills the selected connection of the open group.
+    /// `d`: ends the selected connection of the open group; on a group row it says how.
     fn kill(&mut self, act: &mut Act<'_>) {
         if self.clients.drill.is_none() {
-            act.info("Press enter to list the group's connections, then K kills the selected one.");
+            act.info("Press enter to list the group's connections, then d ends the selected one.");
             return;
         }
         let Some(c) = self.clients.selected_conn() else {
@@ -371,7 +371,7 @@ impl ServerState {
         self.send_write(WriteOp::ClientKill { id }, Sent::Kill(id), act);
     }
 
-    /// `c` on the Slow log: opens the settings form.
+    /// `e` on the Slow log: opens the settings form.
     fn open_slowlog_form(&mut self, act: &mut Act<'_>) {
         let sample = WriteOp::SlowlogConfig(SlowlogSetting::Threshold(0));
         if write_off(act, &sample) {
@@ -654,15 +654,16 @@ impl ViewState for ServerState {
             return self.monitor_key(key, act);
         }
         match (panel, key.code) {
-            (_, KeyCode::Char('p')) => {
+            (_, KeyCode::Char(' ')) => {
                 self.paused = !self.paused;
                 if self.paused {
-                    // On Overview `r` analyzes the keys; on Clients and Slow log it
-                    // still reads the panel once.
+                    // On Clients and Slow log `r` still reads the panel once.
                     act.info(match panel {
-                        Panel::Overview => "Live figures paused. p resumes.",
-                        Panel::Clients => "Polling paused. r reads the clients once, p resumes.",
-                        _ => "Polling paused. r reads the slow log once, p resumes.",
+                        Panel::Overview => "Live figures paused. space resumes.",
+                        Panel::Clients => {
+                            "Polling paused. r reads the clients once, space resumes."
+                        }
+                        _ => "Polling paused. r reads the slow log once, space resumes.",
                     });
                 } else {
                     act.info("Polling resumed.");
@@ -672,23 +673,23 @@ impl ViewState for ServerState {
                 }
                 true
             }
-            (Panel::Overview, KeyCode::Char('+')) => {
+            (Panel::Overview, KeyCode::Char('>')) => {
                 self.change_interval(true, act);
                 true
             }
-            (Panel::Overview, KeyCode::Char('-')) => {
+            (Panel::Overview, KeyCode::Char('<')) => {
                 self.change_interval(false, act);
                 true
             }
-            (Panel::Clients, KeyCode::Char('K')) => {
+            (Panel::Clients, KeyCode::Char('d')) => {
                 self.kill(act);
                 true
             }
-            (Panel::SlowLog, KeyCode::Char('c')) => {
+            (Panel::SlowLog, KeyCode::Char('e')) => {
                 self.open_slowlog_form(act);
                 true
             }
-            (Panel::SlowLog, KeyCode::Char('R')) => {
+            (Panel::SlowLog, KeyCode::Char('D')) => {
                 self.send_write(WriteOp::SlowlogReset, Sent::Reset, act);
                 true
             }
@@ -2037,27 +2038,27 @@ mod tests {
         let t0 = Instant::now();
         let (mut app, _) = app_at(t0, Screen::Overview);
         assert_eq!(state(&app).interval(), secs(2));
-        app.handle_key(ch('+'));
+        app.handle_key(ch('>'));
         assert_eq!(state(&app).interval(), secs(1));
-        app.handle_key(ch('+'));
+        app.handle_key(ch('>'));
         assert_eq!(state(&app).interval(), secs(1));
         for _ in 0..20 {
-            app.handle_key(ch('-'));
+            app.handle_key(ch('<'));
         }
         assert_eq!(state(&app).interval(), secs(60));
-        app.handle_key(ch('-'));
+        app.handle_key(ch('<'));
         assert_eq!(state(&app).interval(), secs(60));
-        app.handle_key(ch('+'));
+        app.handle_key(ch('>'));
         assert!(state(&app).interval() < secs(60));
         // They do nothing on the other panels.
         testing::show(&mut app, Screen::Clients);
         let before = state(&app).interval();
-        app.handle_key(ch('-'));
+        app.handle_key(ch('<'));
         assert_eq!(state(&app).interval(), before);
     }
 
     #[test]
-    fn p_pauses_polling_and_resuming_fetches_at_once() {
+    fn space_pauses_polling_and_resuming_fetches_at_once() {
         let t0 = Instant::now();
         let (mut app, out) = app_at(t0, Screen::Overview);
         let (id, _) = only_request(&out);
@@ -2069,36 +2070,39 @@ mod tests {
                 sample: Box::new(sample(0)),
             },
         );
-        assert!(app.handle_key(ch('p')).is_empty());
+        assert!(app.handle_key(ch(' ')).is_empty());
         assert!(state(&app).paused);
         assert!(testing::requests(&app.apply(Msg::TickAt(t0 + secs(20)))).is_empty());
-        // `r` on Overview analyzes the keys: it asks first, and fetches nothing.
+        // `a` on Overview analyzes the keys: it asks first, and fetches nothing; `r`
+        // has nothing to refresh there.
         assert!(testing::requests(&app.handle_key(ch('r'))).is_empty());
+        assert!(app.analyze.is_none());
+        assert!(testing::requests(&app.handle_key(ch('a'))).is_empty());
         assert!(app.analyze.is_some());
         app.handle_key(key(KeyCode::Esc));
         // Resuming asks at once when nothing is out.
-        let out = app.handle_key(ch('p'));
+        let out = app.handle_key(ch(' '));
         assert!(!state(&app).paused);
         assert_eq!(only_request(&out).1, Request::Info);
     }
 
-    /// The notice `p` gives says what is true on its screen: on Overview `r` analyzes the
-    /// keys, so only `p` brings the figures back; on Clients and Slow log `r` reads once.
+    /// The notice `space` gives says what is true on its screen: on Overview only
+    /// `space` brings the figures back; on Clients and Slow log `r` reads once.
     #[test]
     fn the_pause_notice_says_what_r_does_on_each_screen() {
         for (screen, text) in [
-            (Screen::Overview, "Live figures paused. p resumes."),
+            (Screen::Overview, "Live figures paused. space resumes."),
             (
                 Screen::Clients,
-                "Polling paused. r reads the clients once, p resumes.",
+                "Polling paused. r reads the clients once, space resumes.",
             ),
             (
                 Screen::SlowLog,
-                "Polling paused. r reads the slow log once, p resumes.",
+                "Polling paused. r reads the slow log once, space resumes.",
             ),
         ] {
             let (mut app, _) = app_at(Instant::now(), screen);
-            app.handle_key(ch('p'));
+            app.handle_key(ch(' '));
             assert!(state(&app).paused, "{screen:?}");
             assert_eq!(app.notice.as_ref().unwrap().text, text, "{screen:?}");
         }
@@ -2117,7 +2121,7 @@ mod tests {
                 sample: Box::new(sample(0)),
             },
         );
-        app.handle_key(ch('p'));
+        app.handle_key(ch(' '));
         let out = testing::show(&mut app, Screen::Clients);
         assert_eq!(only_request(&out).1, Request::Clients);
         // Back on the Overview, which has data: no new INFO. (The Slow log, passed on
@@ -2720,9 +2724,9 @@ mod tests {
         let t0 = Instant::now();
         let (mut app, _) = app_at(t0, Screen::Overview);
         feed_overview(&mut app, t0, 4);
-        // The next poll goes out, then `p` pauses before it is answered.
+        // The next poll goes out, then `space` pauses before it is answered.
         app.apply(Msg::TickAt(t0 + secs(8)));
-        app.handle_key(ch('p'));
+        app.handle_key(ch(' '));
         let id = app_pending_info(&app);
         testing::reply(&mut app, id, Err(LiveError::Failed("INFO failed".into())));
         insta::assert_snapshot!(testing::render(&app, 80, 24).backend());
@@ -2966,13 +2970,18 @@ mod tests {
     }
 
     #[test]
-    fn k_kills_the_selected_connection_after_asking_and_reads_again() {
+    fn d_ends_the_selected_connection_after_asking_and_reads_again() {
         let mut app = on_clients(Env::Local, None);
-        // On the groups, K says how to get to a connection.
-        assert!(writes(&app.handle_key(ch('K'))).is_empty());
+        // On a group row `d` ends nothing, even with no question to ask: it says how to
+        // get to a connection.
+        app.settings.skip_non_prod_confirm = true;
+        let mut e = app.handle_key(ch('d'));
+        e.extend(app.handle_key(ch('y')));
+        assert!(writes(&e).is_empty() && app.confirm.is_none());
         assert!(notice(&app).contains("Press enter"), "{}", notice(&app));
+        app.settings.skip_non_prod_confirm = false;
         open_conn(&mut app, "redis-py 5.0.1", 2);
-        let e = app.handle_key(ch('K'));
+        let e = app.handle_key(ch('d'));
         assert!(writes(&e).is_empty());
         let c = app.confirm.as_ref().expect("a question");
         assert_eq!(c.expect, Expect::YesNo);
@@ -2986,10 +2995,10 @@ mod tests {
     }
 
     #[test]
-    fn k_on_prod_asks_for_the_profile_name() {
+    fn d_on_prod_asks_for_the_profile_name() {
         let mut app = on_clients(Env::Prod, Some(false));
         open_conn(&mut app, "redis-py 5.0.1", 3);
-        app.handle_key(ch('K'));
+        app.handle_key(ch('d'));
         assert_eq!(
             app.confirm.as_ref().unwrap().expect,
             Expect::Type("prod-cache-01".into())
@@ -3002,13 +3011,13 @@ mod tests {
     }
 
     #[test]
-    fn k_refuses_redis_lens_own_connection() {
+    fn d_refuses_redis_lens_own_connection() {
         let mut app = on_clients(Env::Local, None);
         // Connection 7 ran the CLIENT LIST itself.
         assert!(is_own(&fleet()[6]));
         assert!(!is_own(&fleet()[0]), "idle 0, but another command");
         open_conn(&mut app, "127.0.0.0/24", 7);
-        let e = app.handle_key(ch('K'));
+        let e = app.handle_key(ch('d'));
         assert!(writes(&e).is_empty());
         assert!(app.confirm.is_none());
         assert!(notice(&app).contains("redis-lens's own connection"));
@@ -3018,11 +3027,11 @@ mod tests {
     fn a_failed_or_cancelled_kill_says_why_and_reads_nothing() {
         let mut app = on_clients(Env::Local, None);
         open_conn(&mut app, "redis-py 5.0.1", 2);
-        app.handle_key(ch('K'));
+        app.handle_key(ch('d'));
         let e = app.handle_key(ch('n'));
         assert!(writes(&e).is_empty() && testing::requests(&e).is_empty());
         assert_eq!(notice(&app), crate::live::CANCELLED);
-        app.handle_key(ch('K'));
+        app.handle_key(ch('d'));
         let e = app.handle_key(ch('y'));
         let (id, _) = testing::requests(&e)[0].clone();
         let e = testing::reply(
@@ -3039,7 +3048,7 @@ mod tests {
     #[test]
     fn c_on_the_slow_log_sets_the_threshold_then_the_length() {
         let mut app = on_slow_log(Env::Local, None);
-        app.handle_key(ch('c'));
+        app.handle_key(ch('e'));
         let f = state(&app).form.as_ref().expect("the form");
         assert_eq!(f.value("threshold µs"), "10000");
         assert_eq!(f.value("max length"), "128");
@@ -3127,7 +3136,7 @@ mod tests {
     #[test]
     fn dangerous_slow_log_writes_ask_for_the_profile_name_on_prod() {
         let mut app = on_slow_log(Env::Prod, Some(false));
-        app.handle_key(ch('R'));
+        app.handle_key(ch('D'));
         assert_eq!(
             app.confirm.as_ref().unwrap().expect,
             Expect::Type("prod-cache-01".into())
@@ -3143,7 +3152,7 @@ mod tests {
             [(_, Request::SlowLog { .. })]
         ));
 
-        app.handle_key(ch('c'));
+        app.handle_key(ch('e'));
         press(&mut app, KeyCode::Tab);
         type_text(&mut app, "0");
         press(&mut app, KeyCode::Enter);
@@ -3154,9 +3163,9 @@ mod tests {
     }
 
     #[test]
-    fn r_resets_the_slow_log_after_y_outside_prod() {
+    fn capital_d_resets_the_slow_log_after_y_outside_prod() {
         let mut app = on_slow_log(Env::Stage, Some(false));
-        let e = app.handle_key(ch('R'));
+        let e = app.handle_key(ch('D'));
         assert!(writes(&e).is_empty());
         assert_eq!(app.confirm.as_ref().unwrap().expect, Expect::YesNo);
         assert_eq!(
@@ -3170,13 +3179,13 @@ mod tests {
         for (env, ro) in READ_ONLY {
             let mut app = on_clients(env, ro);
             open_conn(&mut app, "redis-py 5.0.1", 2);
-            let mut e = app.handle_key(ch('K'));
+            let mut e = app.handle_key(ch('d'));
             assert!(app.confirm.is_none());
             assert!(notice(&app).contains("read-only"), "{}", notice(&app));
             e.extend(answer_anything(&mut app));
             assert!(writes(&e).is_empty(), "K {env:?} {ro:?}");
 
-            for k in ['c', 'R'] {
+            for k in ['e', 'D'] {
                 let mut app = on_slow_log(env, ro);
                 let mut e = app.handle_key(ch(k));
                 assert!(app.confirm.is_none() && state(&app).form.is_none());
@@ -3210,6 +3219,9 @@ mod monitor_tests {
 
     fn ch(c: char) -> KeyEvent {
         key(KeyCode::Char(c))
+    }
+    fn ctrl(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char(c), crossterm::event::KeyModifiers::CONTROL)
     }
 
     fn ids(app: &App) -> (u64, u64) {
@@ -3402,8 +3414,8 @@ mod monitor_tests {
         assert_eq!(app.views.server.monitor.stopped, Some(Stop::Closed));
 
         let (mut app, _) = running(Instant::now());
-        app.handle_key(ch('2'));
-        app.handle_key(ch('r'));
+        crate::tui::app::views::testing::area(&mut app, '2');
+        app.handle_key(ch('a'));
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.views.server.monitor.stopped, Some(Stop::Rescan));
     }
@@ -3492,8 +3504,8 @@ mod monitor_tests {
         let debug = format!("{out:?} {:?} {:?}", app.views, app.notice);
         assert!(!value::leaks(&debug, MARK), "{debug}");
         // `s` from Patterns saves the scan only.
-        app.handle_key(ch('2'));
-        let effects = app.handle_key(ch('s'));
+        crate::tui::app::views::testing::area(&mut app, '2');
+        let effects = app.handle_key(ctrl('s'));
         let [Effect::SaveSnapshot(report)] = &effects[..] else {
             panic!("{effects:?}");
         };
@@ -3568,7 +3580,7 @@ mod monitor_tests {
             all.contains("from Monitor, 12 s, 10 lines, at 13:04 UTC"),
             "{all}"
         );
-        let effects = app.handle_key(ch('s'));
+        let effects = app.handle_key(ctrl('s'));
         let [Effect::SaveSnapshot(report)] = &effects[..] else {
             panic!("{effects:?}");
         };
@@ -3710,8 +3722,8 @@ mod monitor_tests {
         app.handle_key(ch('k'));
         app.handle_key(ch('k'));
         assert!(text(&app, 120, 36).contains("CONFIG SET requirepass ***"));
-        app.handle_key(ch('2'));
-        let effects = app.handle_key(ch('s'));
+        crate::tui::app::views::testing::area(&mut app, '2');
+        let effects = app.handle_key(ctrl('s'));
         let [Effect::SaveSnapshot(report)] = &effects[..] else {
             panic!("{effects:?}");
         };

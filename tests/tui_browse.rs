@@ -88,7 +88,7 @@ async fn connect_only(port: u16, admin: &mut MultiplexedConnection) -> HashMap<S
     commandstats(admin).await
 }
 
-/// Connects, reads names on Browse with `more` presses of `n`, and returns what the
+/// Connects, reads names on Browse with `more` presses of `m`, and returns what the
 /// tree showed and what the server saw.
 async fn browse(
     port: u16,
@@ -177,7 +177,7 @@ async fn a_small_keyspace_is_read_whole_and_counted_exactly() {
 }
 
 #[tokio::test]
-async fn a_large_keyspace_is_estimated_and_n_reads_one_page_more() {
+async fn a_large_keyspace_is_estimated_and_m_reads_one_page_more() {
     for valkey in [false, true] {
         let what = if valkey { "valkey" } else { "redis" };
         let server = if valkey {
@@ -221,7 +221,7 @@ async fn a_large_keyspace_is_estimated_and_n_reads_one_page_more() {
             );
         }
 
-        // `n`: one SCAN more.
+        // `m`: one SCAN more.
         let (more, stats) = browse(server.port, &mut admin, 1).await;
         assert_eq!(more.error, None, "{what}");
         assert_eq!(more.pages, 9, "{what}");

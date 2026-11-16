@@ -343,7 +343,7 @@ mod tests {
         }
         // In the Pub/Sub subscribe input `b` is text.
         let (mut app, _) = testing::app_on(Screen::PubSub);
-        app.handle_key(ch('s'));
+        app.handle_key(ch('+'));
         let effects = app.handle_key(ch('b'));
         assert!(app.dbs.is_none());
         assert!(effects.is_empty());
@@ -427,7 +427,7 @@ mod tests {
             testing::live_ready(app);
         };
         connected(&mut app);
-        app.handle_key(ch('r'));
+        app.handle_key(ch('a'));
         app.handle_key(key(KeyCode::Enter));
         connected(&mut app);
         assert!(app.handle_key(ch('b')).is_empty());
@@ -509,9 +509,9 @@ mod tests {
             target: crate::conn::ScanTarget::Primary,
         });
         testing::live_ready(&mut app);
-        app.handle_key(ch('1'));
+        crate::tui::app::views::testing::area(&mut app, '1');
         let text = format!("{:?}", testing::render(&app, 120, 36).backend());
-        assert!(text.contains("r  Analyze: 10,000 keys"), "{text}");
+        assert!(text.contains("a  Analyze: 10,000 keys"), "{text}");
         assert!(!text.contains("analyzing"), "{text}");
         assert!(text.contains("● connected"), "{text}");
     }
@@ -524,8 +524,8 @@ mod tests {
         let effects = app.handle_key(key(KeyCode::Enter));
         let (scan, _) = connect_of(&effects);
         finish(&mut app, scan);
-        app.handle_key(ch('1'));
-        app.handle_key(ch('r'));
+        crate::tui::app::views::testing::area(&mut app, '1');
+        app.handle_key(ch('a'));
         let effects = app.handle_key(key(KeyCode::Enter));
         assert_eq!(connect_of(&effects).1.db, 3);
     }
@@ -676,7 +676,7 @@ mod tests {
             let mut app = testing::scanned();
             testing::live_ready(&mut app);
             testing::show(&mut app, Screen::PubSub);
-            app.handle_key(ch('s'));
+            app.handle_key(ch('+'));
             for c in to.chars() {
                 app.handle_key(ch(c));
             }
@@ -730,7 +730,7 @@ mod tests {
         let mut app = testing::scanned();
         testing::live_ready(&mut app);
         testing::show(&mut app, Screen::PubSub);
-        app.handle_key(ch('s'));
+        app.handle_key(ch('+'));
         for c in "news".chars() {
             app.handle_key(ch(c));
         }

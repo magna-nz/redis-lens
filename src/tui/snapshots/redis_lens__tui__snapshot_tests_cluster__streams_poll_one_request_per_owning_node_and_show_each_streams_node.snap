@@ -25,4 +25,4 @@ expression: t.backend()
 "│                                        │                                     │"
 "│ 4 streams · enter lists entries        │ → groups · enter entries            │"
 "└────────────────────────────────────────┴─────────────────────────────────────┘"
-" ↑↓ Move   → Details   enter Entries   p Pause           ctrl-f Find key  ? Help"
+" ↑↓ Move   → Details   enter Entries   tab Next panel    ctrl-f Find key  ? Help"
