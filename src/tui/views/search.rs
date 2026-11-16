@@ -9,11 +9,12 @@
 //!   index is selected, and `tab` moves between the indexes and the results.
 //! - `enter` on a result opens its fields one level deeper, in the key detail's own
 //!   [`ValueState`]: `↑↓`, `tab`, `f` and `y` work as there. `esc` goes back.
-//! - `e` shows `FT.EXPLAIN` and `P` runs `FT.PROFILE`, one level deeper too, both for
+//! - `x` shows `FT.EXPLAIN` and `X` runs `FT.PROFILE`, one level deeper too, both for
 //!   the query last run (the one `/` starts from), on the selected index.
 //!
-//! Writes (P3), through [`Act::write`], the one gate: `C` opens a form for an index
-//! (name, `ON HASH` or `JSON`, prefixes, fields) and sends `FT.CREATE`; `D` drops the
+//! Writes (P3), through [`Act::write`], the one gate, from the index list only (one level deeper they say so and do
+//! nothing): `+` opens a form for an index
+//! (name, `ON HASH` or `JSON`, prefixes, fields) and sends `FT.CREATE`; `d` drops the
 //! selected index with `FT.DROPINDEX`, never with `DD`, so its documents stay. The list
 //! is read again after each. See [`super`] for the interface `App` calls. Results
 //! are held as [`Raw`](crate::value::Raw) and explain and profile text as [`Text`], so
@@ -72,8 +73,8 @@ impl Cmd {
     fn key(self) -> &'static str {
         match self {
             Self::Search => "/",
-            Self::Explain => "e",
-            Self::Profile => "P",
+            Self::Explain => "x",
+            Self::Profile => "X",
         }
     }
 }
@@ -122,6 +123,11 @@ pub enum Deeper {
     },
 }
 
+/// `+` one level deeper: index writes act on the index list only.
+pub const CREATE_FROM_DEEPER: &str = "+ creates an index: esc back to the index list first.";
+/// `d` one level deeper: it never drops the index of the result on show.
+pub const DROP_FROM_DEEPER: &str = "d drops an index: esc back to the index list first.";
+
 /// The indexes, the schema of the selected one, and its queries.
 #[derive(Debug, Default)]
 pub struct SearchState {
@@ -143,7 +149,7 @@ pub struct SearchState {
     tried: bool,
     /// The query input, while it is open.
     pub input: Option<String>,
-    /// The query last run: what `/` starts from, and what `e` and `P` use.
+    /// The query last run: what `/` starts from, and what `x` and `X` use.
     pub last_query: Option<String>,
     /// The results of the query last run (`FT.SEARCH` or `FT.PROFILE`).
     pub results: Option<QueryRun>,
@@ -161,7 +167,7 @@ pub struct SearchState {
     pub cmd_off: Vec<(Cmd, String)>,
     /// The results' previews, kept between frames. `Debug` shows only counts.
     pub memo: crate::value::Memo,
-    /// The create form (`C`), while it is open.
+    /// The create form (`+`), while it is open.
     pub create: Option<Form>,
     /// The write in flight: its id, the index, and whether it creates (or drops).
     write: Option<(ReqId, String, bool)>,
@@ -463,7 +469,7 @@ impl SearchState {
         true
     }
 
-    /// `e` or `P`: the query last run, on the selected index.
+    /// `x` or `X`: the query last run, on the selected index.
     fn run_on_last(&mut self, cmd: Cmd, act: &mut Act<'_>) {
         match self.last_query.clone() {
             Some(q) => {
@@ -725,15 +731,26 @@ impl ViewState for SearchState {
         if self.input.is_some() {
             return self.input_key(key, act);
         }
+        // The index writes act on the index list only: one level deeper (a result, an
+        // explain or a profile) they say where they live and do nothing else.
+        match (key.code, plain(&key)) {
+            (KeyCode::Char('+'), true) if self.deeper.is_some() => {
+                act.info(CREATE_FROM_DEEPER);
+                return true;
+            }
+            (KeyCode::Char('d'), true) if self.deeper.is_some() => {
+                act.info(DROP_FROM_DEEPER);
+                return true;
+            }
+            _ => {}
+        }
         // Keys that work the same one level deeper: they go back first.
         match (key.code, plain(&key)) {
-            (KeyCode::Char('C'), true) => {
-                self.deeper = None;
+            (KeyCode::Char('+'), true) => {
                 self.open_create(act);
                 return true;
             }
-            (KeyCode::Char('D'), true) => {
-                self.deeper = None;
+            (KeyCode::Char('d'), true) => {
                 self.drop_index(act);
                 return true;
             }
@@ -746,11 +763,11 @@ impl ViewState for SearchState {
                 }
                 return true;
             }
-            (KeyCode::Char('e'), true) => {
+            (KeyCode::Char('x'), true) => {
                 self.run_on_last(Cmd::Explain, act);
                 return true;
             }
-            (KeyCode::Char('P'), true) => {
+            (KeyCode::Char('X'), true) => {
                 self.run_on_last(Cmd::Profile, act);
                 return true;
             }
@@ -762,8 +779,9 @@ impl ViewState for SearchState {
         }
         match self.deeper.as_mut() {
             Some(Deeper::Document(doc)) => {
-                // Everything is loaded: `n` has nothing to do here.
-                if matches!(key.code, KeyCode::Char('n')) {
+                // Everything is loaded: `m` has nothing to do here, and the edit
+                // keys are the key detail's only.
+                if matches!(key.code, KeyCode::Char('m')) {
                     return false;
                 }
                 return doc.on_key(key, act);
@@ -1112,6 +1130,9 @@ mod tests {
     fn ch(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
+    fn ctrl(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char(c), crossterm::event::KeyModifiers::CONTROL)
+    }
 
     fn type_text(app: &mut App, s: &str) {
         for c in s.chars() {
@@ -1327,7 +1348,7 @@ mod tests {
         assert!(text(&app, 120, 36).contains("shown as MessagePack"));
         // n has nothing to load here.
         let before = format!("{:?}", app.views.search);
-        app.handle_key(ch('n'));
+        app.handle_key(ch('m'));
         assert_eq!(format!("{:?}", app.views.search), before);
         app.handle_key(key(KeyCode::Esc));
         assert!(app.views.search.deeper.is_none());
@@ -1347,15 +1368,15 @@ mod tests {
     }
 
     #[test]
-    fn e_explains_the_query_last_run() {
+    fn x_explains_the_query_last_run() {
         let mut app = loaded(true);
-        app.handle_key(ch('e'));
+        app.handle_key(ch('x'));
         assert_eq!(
             notice(&app),
-            "Run a query with / first: e uses the query last run."
+            "Run a query with / first: x uses the query last run."
         );
         let mut app = with_results();
-        let (id, req) = one(&app.handle_key(ch('e')));
+        let (id, req) = one(&app.handle_key(ch('x')));
         assert_eq!(
             req,
             Request::Explain {
@@ -1377,13 +1398,13 @@ mod tests {
         assert!(app.views.search.deeper.is_none());
     }
 
-    /// One query at a time: `e` or `P` while one runs says so and sends nothing, and the
+    /// One query at a time: `x` or `X` while one runs says so and sends nothing, and the
     /// running query's answer is still shown.
     #[test]
     fn a_second_query_waits_for_the_first() {
         let mut app = with_results();
-        let (id, _) = one(&app.handle_key(ch('e')));
-        for k in ['e', 'P'] {
+        let (id, _) = one(&app.handle_key(ch('x')));
+        for k in ['x', 'X'] {
             let effects = app.handle_key(ch(k));
             assert!(testing::requests(&effects).is_empty(), "{k}: {effects:?}");
             assert_eq!(
@@ -1394,7 +1415,7 @@ mod tests {
         let t = live_search::parse_explain(&redis::Value::BulkString(b"UNION {\n}\n".to_vec()));
         testing::reply(&mut app, id, Ok(LiveReply::Search(Reply::Explain(t))));
         assert!(!app.views.search.is_running());
-        let (_, req) = one(&app.handle_key(ch('P')));
+        let (_, req) = one(&app.handle_key(ch('X')));
         assert!(matches!(req, Request::Profile { .. }), "{req:?}");
     }
 
@@ -1448,9 +1469,9 @@ mod tests {
     }
 
     #[test]
-    fn p_profiles_the_query_and_shows_its_results_too() {
+    fn capital_x_profiles_the_query_and_shows_its_results_too() {
         let mut app = with_results();
-        let (id, req) = one(&app.handle_key(ch('P')));
+        let (id, req) = one(&app.handle_key(ch('X')));
         assert_eq!(
             req,
             Request::Profile {
@@ -1491,7 +1512,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .flavor = ServerFlavor::Valkey;
-        for (k, cmd) in [('e', "FT.EXPLAIN"), ('P', "FT.PROFILE")] {
+        for (k, cmd) in [('x', "FT.EXPLAIN"), ('X', "FT.PROFILE")] {
             let (id, _) = one(&app.handle_key(ch(k)));
             testing::reply(&mut app, id, Err(LiveError::Unsupported(cmd.into())));
             let all = text(&app, 80, 24);
@@ -1516,7 +1537,7 @@ mod tests {
         let all = text(&app, 80, 24);
         assert!(all.contains("/ query · enter open"), "{all}");
         assert!(
-            !all.contains("e explain") && !all.contains("P profile"),
+            !all.contains("x explain") && !all.contains("X profile"),
             "{all}"
         );
         insta::assert_snapshot!(
@@ -1526,7 +1547,7 @@ mod tests {
         // r asks again.
         app.handle_key(ch('r'));
         assert!(app.views.search.cmd_off.is_empty());
-        assert_eq!(search_requests(&app.handle_key(ch('e'))).len(), 1);
+        assert_eq!(search_requests(&app.handle_key(ch('x'))).len(), 1);
     }
 
     #[test]
@@ -1656,7 +1677,7 @@ mod tests {
         }
         assert!(effects.iter().any(|e| matches!(e, Effect::Copy(_))));
         // A profile that echoes the data.
-        let (pid, _) = one(&app.handle_key(ch('P')));
+        let (pid, _) = one(&app.handle_key(ch('X')));
         let profile = live_search::Text::new([format!("Term: {MARK}")]);
         let reply = Ok(LiveReply::Search(Reply::Profile {
             results: Results::default(),
@@ -1667,8 +1688,8 @@ mod tests {
         assert!(text(&app, 120, 36).contains(MARK));
         let debug = format!("{effects:?} {:?} {:?}", app.views, app.session);
         assert!(!crate::value::leaks(&debug, MARK), "{debug}");
-        app.handle_key(ch('3'));
-        let effects = app.handle_key(ch('s'));
+        crate::tui::app::views::testing::area(&mut app, '3');
+        let effects = app.handle_key(ctrl('s'));
         let [Effect::SaveSnapshot(report)] = &effects[..] else {
             panic!("{effects:?}");
         };
@@ -1759,10 +1780,10 @@ mod tests {
     }
 
     #[test]
-    fn c_creates_an_index_at_once_outside_prod_and_reads_the_list_again() {
+    fn plus_creates_an_index_at_once_outside_prod_and_reads_the_list_again() {
         let mut app = loaded(true);
         set_profile(&mut app, Env::Local, None);
-        app.handle_key(ch('C'));
+        app.handle_key(ch('+'));
         type_text(&mut app, "idx:orders");
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Right);
@@ -1800,7 +1821,7 @@ mod tests {
         let mut app = loaded(true);
         set_profile(&mut app, Env::Local, None);
         app.handle_key(ch('j'));
-        assert!(writes(&app.handle_key(ch('D'))).is_empty());
+        assert!(writes(&app.handle_key(ch('d'))).is_empty());
         let c = app.confirm.as_ref().expect("a question");
         assert_eq!(c.expect, Expect::YesNo);
         assert!(
@@ -1825,13 +1846,13 @@ mod tests {
 
         // On prod: the index's name is typed; create asks y/n.
         set_profile(&mut app, Env::Prod, Some(false));
-        app.handle_key(ch('D'));
+        app.handle_key(ch('d'));
         assert_eq!(
             app.confirm.as_ref().unwrap().expect,
             Expect::Type("idx:sessions".into())
         );
         press(&mut app, KeyCode::Esc);
-        app.handle_key(ch('C'));
+        app.handle_key(ch('+'));
         type_text(&mut app, "i");
         press(&mut app, KeyCode::Up);
         type_text(&mut app, "t TAG");
@@ -1840,12 +1861,65 @@ mod tests {
         assert_eq!(app.confirm.as_ref().unwrap().expect, Expect::YesNo);
     }
 
+    /// One level deeper (a result, an explain or a profile) `d` and `+` never drop or
+    /// create an index: they say where they work and send nothing, also with
+    /// `skip_non_prod_confirm` on, and the deeper level stays open.
+    #[test]
+    fn d_and_plus_one_level_deeper_do_nothing_but_say_where_they_work() {
+        type Open = fn(&mut App);
+        let deeper: [(&str, Open); 3] = [
+            ("a result", |app| {
+                app.handle_key(key(KeyCode::Enter));
+            }),
+            ("an explain", |app| {
+                let (id, _) = one(&app.handle_key(ch('x')));
+                let t =
+                    live_search::parse_explain(&redis::Value::BulkString(b"UNION {\n}\n".to_vec()));
+                testing::reply(app, id, Ok(LiveReply::Search(Reply::Explain(t))));
+            }),
+            ("a profile", |app| {
+                let (id, _) = one(&app.handle_key(ch('X')));
+                let (results, profile) = live_search::parse_profile(&profile_value()).unwrap();
+                testing::reply(
+                    app,
+                    id,
+                    Ok(LiveReply::Search(Reply::Profile { results, profile })),
+                );
+            }),
+        ];
+        for skip in [false, true] {
+            for (what, open) in &deeper {
+                let mut app = with_results();
+                set_profile(&mut app, Env::Local, None);
+                app.settings.skip_non_prod_confirm = skip;
+                open(&mut app);
+                assert!(app.views.search.deeper.is_some(), "{what}");
+                for (k, says) in [('d', DROP_FROM_DEEPER), ('+', CREATE_FROM_DEEPER)] {
+                    let e = app.handle_key(ch(k));
+                    assert!(writes(&e).is_empty(), "{k} in {what}: {e:?}");
+                    assert!(app.confirm.is_none(), "{k} in {what}");
+                    assert!(app.views.search.create.is_none(), "{k} in {what}");
+                    assert_eq!(notice(&app), says, "{k} in {what}");
+                    assert!(app.views.search.deeper.is_some(), "{k} in {what}");
+                }
+                // Back on the index list, `d` asks about the selected index (or, with
+                // the setting on, drops it).
+                app.handle_key(key(KeyCode::Esc));
+                let e = app.handle_key(ch('d'));
+                assert!(
+                    app.confirm.is_some() || !writes(&e).is_empty(),
+                    "{what}: d on the list"
+                );
+            }
+        }
+    }
+
     #[test]
     fn without_the_module_create_and_drop_say_why() {
         let (mut app, id) = shown();
         answer(&mut app, id, Err(LiveError::Unsupported("FT._LIST".into())));
         set_profile(&mut app, Env::Local, None);
-        for k in ['C', 'D'] {
+        for k in ['+', 'd'] {
             let e = app.handle_key(ch(k));
             assert!(writes(&e).is_empty() && app.confirm.is_none());
             assert!(app.views.search.create.is_none());
@@ -1856,7 +1930,7 @@ mod tests {
     #[test]
     fn no_index_is_created_or_dropped_on_a_read_only_profile() {
         for (env, ro) in READ_ONLY {
-            for k in ['C', 'D'] {
+            for k in ['+', 'd'] {
                 let mut app = loaded(true);
                 set_profile(&mut app, env, ro);
                 let mut e = app.handle_key(ch(k));

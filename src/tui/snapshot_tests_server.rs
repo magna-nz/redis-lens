@@ -232,8 +232,8 @@ fn connecting_and_scanning_panels_show_the_provider_notice() {
         })
     };
     connected(&mut app, perms.clone());
-    // `r`, `enter`: a Quick analysis, so the Keys section shows its progress.
-    app.handle_key(ch('r'));
+    // `a`, `enter`: a Quick analysis, so the Keys section shows its progress.
+    app.handle_key(ch('a'));
     app.handle_key(key(KeyCode::Enter));
     connected(&mut app, perms);
     app.apply(Msg::ScanProgress {

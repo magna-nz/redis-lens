@@ -1,11 +1,9 @@
 ---
 source: src/tui/app.rs
-assertion_line: 8986
 expression: t.backend()
 ---
-" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Keys  ·  Streams  ·  Search                 Search is off: no search module "
+" prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys   ● analyzed 14:02 "
+" 1    2  Browse › Keys · Streams · Search   3   4   5                         0 "
 "┌─ Search ───────────────────────── off ─┬─ Details ───────────────────────────┐"
 "│                                        │                                     │"
 "│ FT._LIST is not available: no search   │                                     │"
@@ -25,5 +23,6 @@ expression: t.backend()
 "│                                        │                                     │"
 "│                                        │                                     │"
 "│                                        │                                     │"
+"│                                        │                                     │"
 "└────────────────────────────────────────┴─────────────────────────────────────┘"
-" ↑↓ Move   → Details   / Query   enter Open              ctrl-f Find key  ? Help"
+" tab Next panel   0 Connections               ctrl-f Find key  : Command  ? Help"

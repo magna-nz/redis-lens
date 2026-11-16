@@ -93,7 +93,7 @@ async fn page(
     }
 }
 
-/// Every page of `pattern`, as `n` loads them.
+/// Every page of `pattern`, as `m` loads them.
 async fn all_pages(c: &mut MultiplexedConnection, pattern: &str) -> Vec<Page> {
     let mut out = Vec::new();
     let (mut cursor, mut carry) = (0, Vec::new());
@@ -158,7 +158,7 @@ async fn the_glob_also_matches_another_patterns_keys_which_are_left_out() {
 }
 
 #[tokio::test]
-async fn n_loads_a_thousand_keys_at_a_time_until_every_key_is_listed() {
+async fn m_loads_a_thousand_keys_at_a_time_until_every_key_is_listed() {
     const KEYS: usize = 2_500;
     for valkey in [false, true] {
         let server = common::server_with(valkey, &[]).await;

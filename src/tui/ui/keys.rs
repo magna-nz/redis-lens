@@ -27,8 +27,8 @@ use crate::value::escape;
 
 use super::patterns::wrap_words;
 use super::widgets::{
-    Pane, Title, fit, marquee_spans, pad_l, pad_r, rows, scroll_offset, split_at, split_frame,
-    trunc,
+    Pane, Title, fit, gutter_area, list, marquee_spans, pad_l, pad_r, rows, scroll_offset,
+    split_at, split_frame, trunc,
 };
 use super::{spinner, style};
 
@@ -82,7 +82,7 @@ impl Cols {
     }
 
     fn new(inner: usize, more: bool, lfu: bool, node: bool) -> Self {
-        let all = inner >= WIDE || more;
+        let all = inner >= super::widgets::after_gutter(WIDE) || more;
         let mut c = Self {
             key: 0,
             ty: all,
@@ -159,14 +159,15 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Title::new(&right_title, &right_right),
         Pane::Left,
     );
+    // The columns start after the marker gutter.
     let c = Cols::new(
-        usize::from(left.width),
+        usize::from(gutter_area(left).width),
         ctx.more,
         state.lfu,
         state.by_node(),
     );
     let sort = state.sort.effective(state.sizes, state.freq);
-    rows(frame, left, vec![header(&c, sort)], None);
+    rows(frame, gutter_area(left), vec![header(&c, sort)], None);
     let body = Rect {
         y: left.y + 1,
         height: left.height.saturating_sub(2),
@@ -191,7 +192,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                 key_row(row, &c, state, node, (i == sel).then_some(ticks))
             })
             .collect();
-        rows(frame, body, lines, Some(sel - off));
+        list(frame, body, lines, Some(sel - off));
     }
     let bottom = Rect {
         y: left.y + left.height.saturating_sub(1),
@@ -413,7 +414,7 @@ fn empty_lines(state: &KeysState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>>
     } else if let (Some(glob), true) = (&state.find, state.pages > 0 && !state.is_loading()) {
         (
             format!(
-                " No key matches {} in the part read so far. n scans further.",
+                " No key matches {} in the part read so far. m scans further.",
                 escape(glob)
             ),
             style::dim(),
@@ -425,7 +426,7 @@ fn empty_lines(state: &KeysState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>>
         )
     } else if state.pages > 0 && !state.is_loading() {
         (
-            " No key of this pattern in the part read so far. n reads further.".to_string(),
+            " No key of this pattern in the part read so far. m reads further.".to_string(),
             style::dim(),
         )
     } else if !ctx.live_ready() {
@@ -445,7 +446,7 @@ fn empty_lines(state: &KeysState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>>
         .collect()
 }
 
-/// The list's bottom line: how far it got, and `n`.
+/// The list's bottom line: how far it got, and `m`.
 fn status(state: &KeysState, est: Option<(u64, bool)>, tick: u64) -> String {
     let n = format::grouped(state.rows.len() as u64);
     let of = match est {
@@ -461,18 +462,18 @@ fn status(state: &KeysState, est: Option<(u64, bool)>, tick: u64) -> String {
         };
     }
     if state.find.is_some() && !state.is_loading() && state.rows.is_empty() && state.pages > 0 {
-        return " No key matched yet. n scans further.".to_string();
+        return " No key matched yet. m scans further.".to_string();
     }
     if state.done {
         format!(" All {n} keys loaded.")
     } else if state.is_loading() {
         format!(" {} {n}{of} loaded, loading more…", spinner(tick))
     } else if state.rows.is_empty() && state.pages > 0 {
-        " No keys found yet. n reads further.".to_string()
+        " No keys found yet. m reads further.".to_string()
     } else if state.rows.is_empty() {
         " No keys loaded yet.".to_string()
     } else {
-        format!(" {n}{of} loaded. n loads 1,000 more.")
+        format!(" {n}{of} loaded. m loads 1,000 more.")
     }
 }
 

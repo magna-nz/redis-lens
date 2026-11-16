@@ -245,7 +245,7 @@ pub enum Ttl {
     Persist,
 }
 
-/// What `N` creates: a new key of one type with its first item.
+/// What `+` on the key list creates: a new key of one type with its first item.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NewKey {
     String(Raw),

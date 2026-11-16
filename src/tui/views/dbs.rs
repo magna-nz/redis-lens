@@ -12,7 +12,7 @@ pub const OFF_NOT_READY: &str =
 pub const OFF_SCANNING: &str = "An analysis is running: wait for it to finish, then press b.";
 pub const OFF_NOT_CONNECTED: &str = "Not connected: connect first (0 Connections, then enter).";
 pub const OFF_CLOSED: &str =
-    "The live connection is closed: analyze again first (r on Overview, Browse or Analyze).";
+    "The live connection is closed: analyze again first (a on Overview, Browse or Analyze).";
 
 /// Shown in the list when `INFO` was refused (`NOPERM`). Never the server's text.
 pub const DENIED: &str =

@@ -16,8 +16,8 @@ use super::analysis::{
     Col, MARK, Tier, head_row, left_width, need_report, notice, paragraph, pick_cols, title_right,
 };
 use super::widgets::{
-    Pane, Title, bar, fit, marquee_spans, pad_l, pad_r, pattern_spans, rows, scroll_offset,
-    split_frame, trunc,
+    Pane, Title, bar, fit, gutter_area, list, marquee_spans, pad_l, pad_r, pattern_spans, rows,
+    scroll_offset, split_frame, trunc,
 };
 use super::{mark_previous, style};
 
@@ -140,13 +140,19 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Pane::Left,
     );
     let cols = columns(nodes.is_some());
-    let (keep, kw) = pick_cols(&cols, usize::from(left.width), WIDE_AT, more);
+    // The columns start after the marker gutter.
+    let (keep, kw) = pick_cols(
+        &cols,
+        usize::from(gutter_area(left).width),
+        super::widgets::after_gutter(WIDE_AT),
+        more,
+    );
     let right_aligned: Vec<usize> = (0..cols.len())
         .filter(|&i| matches!(cols[i].head, "FREQ" | "SIZE"))
         .collect();
     rows(
         frame,
-        left,
+        gutter_area(left),
         vec![head_row(&cols, &keep, kw, &right_aligned)],
         None,
     );
@@ -167,7 +173,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             hot_row(&cols, &keep, k, kw, node, scroll)
         })
         .collect();
-    rows(frame, body, lines, Some(sel - off));
+    list(frame, body, lines, Some(sel - off));
     if let Some(k) = selected {
         detail_lines(frame, detail, k, node_of(k, nodes));
     }
@@ -337,11 +343,17 @@ fn monitor_ranking(frame: &mut Frame, area: Rect, app: &App, hot: &MonitorHot) {
         Title::new("From Monitor", ""),
         Pane::Left,
     );
-    let w = usize::from(left.width);
-    let (keep, kw) = pick_cols(&MONITOR_COLS, w, WIDE_AT, more);
+    // The columns start after the marker gutter.
+    let w = usize::from(gutter_area(left).width);
+    let (keep, kw) = pick_cols(
+        &MONITOR_COLS,
+        w,
+        super::widgets::after_gutter(WIDE_AT),
+        more,
+    );
     rows(
         frame,
-        left,
+        gutter_area(left),
         vec![head_row(&MONITOR_COLS, &keep, kw, &[1, 2])],
         None,
     );
@@ -388,7 +400,7 @@ fn monitor_ranking(frame: &mut Frame, area: Rect, app: &App, hot: &MonitorHot) {
             style::dim(),
         )));
     }
-    rows(frame, body, lines, (!keys.is_empty()).then(|| sel - off));
+    list(frame, body, lines, (!keys.is_empty()).then(|| sel - off));
 
     let dw = usize::from(detail.width);
     let mut dl = Vec::new();
@@ -473,7 +485,7 @@ mod tests {
                 s.contains("Hot keys ranks the keys read most often."),
                 "{s}"
             );
-            assert!(s.contains("r  Analyze: "), "{s}");
+            assert!(s.contains("a  Analyze: "), "{s}");
             insta::assert_snapshot!(format!("hot_keys_no_analysis_{w}x{h}"), s);
         }
     }

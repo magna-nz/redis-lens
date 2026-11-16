@@ -27,8 +27,8 @@ use crate::value::escape;
 use super::patterns::wrap_words;
 use super::style;
 use super::widgets::{
-    Pane, Title, char_width, fit, pad_l, pad_r, panel, rows, scroll_offset, split_frame, trunc,
-    width,
+    Pane, Title, char_width, fit, gutter_area, list, list_below, pad_l, pad_r, panel, rows,
+    scroll_offset, split_frame, trunc, width,
 };
 
 const LEN_W: usize = 6;
@@ -139,7 +139,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &StreamsState, ctx: &Ctx<'_>) 
                         .to_string(),
                     style::fg(),
                 ),
-                (" r analyzes.".to_string(), style::dim()),
+                (" a analyzes.".to_string(), style::dim()),
             ],
             None => vec![(" Reading the streams with XINFO…".to_string(), style::dim())],
         };
@@ -194,9 +194,15 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &StreamsState, ctx: &Ctx<'_>) 
         focus,
     );
     let w = usize::from(left.width);
-    let c = Cols::new(w, ctx.more, entries.is_some(), ctx.session.is_cluster());
+    // The columns start after the marker gutter.
+    let c = Cols::new(
+        usize::from(gutter_area(left).width),
+        ctx.more,
+        entries.is_some(),
+        ctx.session.is_cluster(),
+    );
 
-    rows(frame, left, vec![header(&c)], None);
+    rows(frame, gutter_area(left), vec![header(&c)], None);
     let body = Rect {
         y: left.y + 1,
         height: left.height.saturating_sub(2),
@@ -221,7 +227,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &StreamsState, ctx: &Ctx<'_>) 
             }
         })
         .collect();
-    rows(frame, body, lines, Some(sel - off));
+    list(frame, body, lines, Some(sel - off));
     // The bottom line: a failed refresh, else where the list comes from.
     let bottom = Rect {
         y: left.y + left.height.saturating_sub(1),
@@ -318,7 +324,7 @@ impl Cols {
                 id: false,
             };
         }
-        let all = inner >= WIDE_LIST || more;
+        let all = inner >= super::widgets::after_gutter(WIDE_LIST) || more;
         let mut c = Self {
             key: 0,
             only_keys,
@@ -327,7 +333,7 @@ impl Cols {
             age: all,
             groups: all,
             pend: all,
-            id: inner >= WIDE,
+            id: inner >= super::widgets::after_gutter(WIDE),
         };
         for step in 0..6 {
             if inner >= c.fixed() + KEY_MIN {
@@ -514,7 +520,7 @@ fn detail_pane(frame: &mut Frame, inner: Rect, state: &StreamsState, node: Optio
     let Some(info) = &sel.info else {
         let mut lines = vec![];
         for l in wrap_words(
-            " The key is gone, or no longer a stream. r analyzes again to update the list.",
+            " The key is gone, or no longer a stream. a analyzes again to update the list.",
             w,
         ) {
             lines.push(Line::from(Span::styled(l, style::dim())));
@@ -572,7 +578,8 @@ fn detail_pane(frame: &mut Frame, inner: Rect, state: &StreamsState, node: Optio
     if lines.len() > 2 {
         lines.push(Line::default());
     }
-    let nw = name_width(w, wide);
+    // The table's columns start after the marker gutter.
+    let nw = name_width(usize::from(gutter_area(inner).width), wide);
     let mut head = vec![
         Span::styled(pad_r(" GROUP / CONSUMER", nw), style::hd()),
         Span::styled(format!(" {}", pad_l("PEND", PEND_W)), style::hd()),
@@ -617,7 +624,8 @@ fn detail_pane(frame: &mut Frame, inner: Rect, state: &StreamsState, node: Optio
     let selected = focused
         .then(|| state.detail_sel.checked_sub(off).map(|i| i + top))
         .flatten();
-    rows(frame, inner, lines, selected);
+    // The facts across the pane, the table (from its head) behind the gutter.
+    list_below(frame, inner, lines, top - 1, selected);
     let hint = if focused {
         " ↑↓ groups and consumers · ← back"
     } else {
@@ -806,7 +814,7 @@ pub(super) fn draw_form(
     for (i, f) in form.fields.iter().enumerate() {
         let focused = i == form.focus;
         let mut spans = vec![
-            Span::styled(if focused { " › " } else { "   " }, style::amber()),
+            Span::styled(if focused { " › " } else { "   " }, style::focus()),
             Span::styled(
                 pad_r(f.label, lw),
                 if focused { style::fgb() } else { style::dim() },
@@ -827,7 +835,7 @@ pub(super) fn draw_form(
             let room = inner.saturating_sub(3 + lw + 2 + 1);
             spans.push(Span::styled(tail(&escape(&f.text), room), style::fgb()));
             if focused {
-                spans.push(Span::styled("▏", style::amber()));
+                spans.push(Span::styled("▏", style::focus()));
             }
         }
         lines.push(Line::from(spans));

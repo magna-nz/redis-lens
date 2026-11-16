@@ -93,13 +93,14 @@ pub(super) fn list_width(total: u16) -> u16 {
     super::widgets::split_at(total, ratio)
 }
 
-/// The key list beside a value: its keys, the open one bright, the others dim; SIZE
-/// and EXPIRES when there is room.
-fn key_column(frame: &mut Frame, area: Rect, app: &App) {
+/// The key list beside a value: its keys after the selection gutter, the open one
+/// bright with `›`, the others dim; SIZE and EXPIRES when there is room.
+fn key_column(frame: &mut Frame, full: Rect, app: &App) {
     let keys = &app.views.keys;
     let open = app.views.value.row.as_ref().map(|r| r.key.as_str());
+    let area = super::widgets::gutter_area(full);
     let w = usize::from(area.width);
-    let wide = w >= 34;
+    let wide = w >= super::widgets::after_gutter(34);
     let kw = if wide { w.saturating_sub(15) } else { w };
     let mut head = vec![Span::styled(pad_r(" KEY", kw), style::hd())];
     if wide {
@@ -108,9 +109,9 @@ fn key_column(frame: &mut Frame, area: Rect, app: &App) {
     }
     rows(frame, area, vec![Line::from(head)], None);
     let body = Rect {
-        y: area.y + 1,
-        height: area.height.saturating_sub(1),
-        ..area
+        y: full.y + 1,
+        height: full.height.saturating_sub(1),
+        ..full
     };
     let visible = keys.visible();
     let sel = keys.sel.min(visible.len().saturating_sub(1));
@@ -121,11 +122,8 @@ fn key_column(frame: &mut Frame, area: Rect, app: &App) {
         .take(usize::from(body.height))
         .map(|&i| {
             let r = &keys.rows[i];
-            let st = if Some(r.key.as_str()) == open {
-                style::fgb()
-            } else {
-                style::dim()
-            };
+            let is_open = Some(r.key.as_str()) == open;
+            let st = if is_open { style::fgb() } else { style::dim() };
             let mut spans = vec![Span::styled(
                 pad_r(&format!(" {}", value::escape(&r.key)), kw),
                 st,
@@ -135,7 +133,9 @@ fn key_column(frame: &mut Frame, area: Rect, app: &App) {
                 spans.push(Span::styled(format!("{} ", pad_l(&size, 6)), st));
                 spans.push(Span::styled(pad_l(&super::keys::ttl_text(r.ttl), 7), st));
             }
-            Line::from(fit(spans, w))
+            let mut line = super::widgets::marker(is_open).to_vec();
+            line.extend(fit(spans, w));
+            Line::from(line)
         })
         .collect();
     rows(frame, body, lines, None);
@@ -264,11 +264,11 @@ pub fn draw_form(frame: &mut Frame, area: Rect, form: &Form) {
                 format!(" {}", pad_r(f.label, label_w)),
                 if active { style::key() } else { style::dim() },
             ),
-            Span::styled(if active { "› " } else { "  " }, style::amber()),
+            Span::styled(if active { "› " } else { "  " }, style::focus()),
             Span::styled(text, if active { style::fgb() } else { style::fg() }),
         ];
         if active && !f.is_choice() {
-            spans.push(Span::styled("▏", style::amber()));
+            spans.push(Span::styled("▏", style::focus()));
         }
         lines.push(Line::from(fit(spans, inner)));
     }
@@ -507,7 +507,7 @@ fn msg_lines(state: &ValueState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>> 
         let why = why.as_deref().unwrap_or("it was closed");
         (
             format!(
-                " ✗ The live connection is closed: {why}. r on Overview analyzes again and reopens it."
+                " ✗ The live connection is closed: {why}. a on Overview analyzes again and reopens it."
             ),
             style::warn(),
         )
@@ -628,14 +628,18 @@ fn collection(frame: &mut Frame, area: Rect, state: &ValueState, items: &Items) 
     let n = items.len();
     let body_h = list_h.saturating_sub(1);
     let off = scroll_offset(sel, body_h);
-    let (head, cells) = list_rows(state, items, iw, off, body_h);
-    let mut lines = vec![Line::from(fit(head, iw))];
+    // The 2-cell marker gutter (a space and `›`) marks the item whose value shows
+    // below, even while the keys are on the value. The rows and the header leave one
+    // cell for the mark already, so the gutter takes one more.
+    let (head, cells) = list_rows(state, items, iw.saturating_sub(1), off, body_h);
+    let mut head_spans = vec![Span::raw(" ")];
+    head_spans.extend(head);
+    let mut lines = vec![Line::from(fit(head_spans, iw))];
     if n == 0 {
         lines.push(Line::from(Span::styled(" No items.", style::dim())));
     }
     for (i, cell) in cells.into_iter().enumerate() {
-        let mark = if off + i == sel { "›" } else { " " };
-        let mut spans = vec![Span::styled(mark, style::amber())];
+        let mut spans = super::widgets::marker(off + i == sel).to_vec();
         spans.extend(cell);
         lines.push(Line::from(fit(spans, iw)));
     }
@@ -704,7 +708,7 @@ fn divider_line(state: &ValueState, w: usize) -> Line<'static> {
             style::dim(),
         ))
     } else if !state.done() && !state.is_loading() && state.pages > 0 {
-        Some(("n loads more".to_string(), style::dim()))
+        Some(("m loads more".to_string(), style::dim()))
     } else {
         None
     };

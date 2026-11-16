@@ -110,16 +110,19 @@ pub fn draw(frame: &mut Frame, area: Rect, l: &DbList) {
     let shown = l.rows.len().min(room);
     let offset = scroll_offset(l.sel, shown).min(l.rows.len().saturating_sub(shown));
 
+    // The rows start after the marker gutter.
+    let gw = usize::from(super::widgets::GUTTER);
     let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
         format!(
-            " {}{}{}",
-            pad_r("Database", inner.saturating_sub(2 * num_w + 1)),
+            "{} {}{}{}",
+            " ".repeat(gw),
+            pad_r("Database", inner.saturating_sub(2 * num_w + 1 + gw)),
             pad_l("Keys", num_w),
             pad_l("Expires", num_w)
         ),
         style::hd(),
     ))];
-    for r in l.rows.iter().skip(offset).take(shown) {
+    for (i, r) in l.rows.iter().enumerate().skip(offset).take(shown) {
         let name = if r.db == l.current {
             format!("db {} (current)", r.db)
         } else {
@@ -131,15 +134,17 @@ pub fn draw(frame: &mut Frame, area: Rect, l: &DbList) {
             None if matches!(l.stage, Stage::Loading(_)) => ("…".to_string(), "…".to_string()),
             None => ("—".to_string(), "—".to_string()),
         };
-        lines.push(Line::from(Span::styled(
+        let mut spans = super::widgets::marker(i == l.sel).to_vec();
+        spans.push(Span::styled(
             format!(
                 " {}{}{}",
-                pad_r(&name, inner.saturating_sub(2 * num_w + 1)),
+                pad_r(&name, inner.saturating_sub(2 * num_w + 1 + gw)),
                 pad_l(&keys, num_w),
                 pad_l(&expires, num_w)
             ),
             style::fg(),
-        )));
+        ));
+        lines.push(Line::from(spans));
     }
     let sel_line = l.sel.checked_sub(offset).map(|i| i + 1);
     let rows_end = lines.len();

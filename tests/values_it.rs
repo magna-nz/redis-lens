@@ -112,7 +112,7 @@ fn as_page(r: Reply) -> Page {
     }
 }
 
-/// Every page of `key` read as `kind`, as `n` loads them: the first with `TYPE`.
+/// Every page of `key` read as `kind`, as `m` loads them: the first with `TYPE`.
 async fn all_pages(
     c: &mut MultiplexedConnection,
     budget: &Budget,

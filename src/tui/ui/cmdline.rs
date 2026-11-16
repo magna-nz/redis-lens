@@ -54,7 +54,7 @@ pub fn draw(frame: &mut Frame, body: Rect, state: &CmdlineState, ctx: &Ctx<'_>) 
         right.push_str(" · pipeline");
     }
     right.push_str(&format!(" · {access}"));
-    let inner = amber_panel(frame, area, ": Command line", &right);
+    let inner = focus_panel(frame, area, ": Command line", &right);
     let helper_rows = if inner.height >= HELPER_ROWS + 2 {
         HELPER_ROWS
     } else {
@@ -83,25 +83,26 @@ pub fn draw(frame: &mut Frame, body: Rect, state: &CmdlineState, ctx: &Ctx<'_>) 
     rows(frame, help_area, lines, None);
 }
 
-/// A bordered panel like [`super::widgets::panel`] with an amber border, so it is clear
-/// that the keys now type text. The `:` in the title says so without the colour.
-fn amber_panel(frame: &mut Frame, area: Rect, title: &str, right: &str) -> Rect {
+/// A bordered panel like [`super::widgets::panel`] with its border in the focus colour,
+/// so it is clear that the keys now type text. The `:` in the title says so without the
+/// colour.
+fn focus_panel(frame: &mut Frame, area: Rect, title: &str, right: &str) -> Rect {
     let avail = usize::from(area.width).saturating_sub(4);
     let title = trunc(title, avail.saturating_sub(4).max(1));
     let room = avail.saturating_sub(width(&title) + 4);
     let mut block = Block::bordered()
-        .border_style(style::amber())
+        .border_style(style::focus())
         .title_top(Line::from(vec![
-            Span::styled("─ ", style::amber()),
+            Span::styled("─ ", style::focus()),
             Span::styled(title, style::title()),
-            Span::styled(" ", style::amber()),
+            Span::styled(" ", style::focus()),
         ]));
     if !right.is_empty() && room > 4 {
         block = block.title_top(
             Line::from(vec![
-                Span::styled(" ", style::amber()),
+                Span::styled(" ", style::focus()),
                 Span::styled(trunc(right, room - 3), style::dim()),
-                Span::styled(" ─", style::amber()),
+                Span::styled(" ─", style::focus()),
             ])
             .right_aligned(),
         );
@@ -155,7 +156,7 @@ fn entry_rows(e: &Entry, w: usize, tick: u64, view: View) -> Vec<Line<'static>> 
         let mut first = true;
         for chunk in wrap(line, w.saturating_sub(2)) {
             out.push(Line::from(vec![
-                Span::styled(if first { " ›" } else { "  " }, style::amber()),
+                Span::styled(if first { " ›" } else { "  " }, style::focus()),
                 Span::styled(format!(" {chunk}"), style::fgb()),
             ]));
             first = false;

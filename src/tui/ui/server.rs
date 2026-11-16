@@ -25,7 +25,10 @@ use crate::tui::app::views::{Ctx, LiveState};
 use crate::value::escape;
 
 use super::analysis::{Col, MARK, Tier, head_row_at, notice, paragraph, pick_flex};
-use super::widgets::{Section, Title, fit, pad_l, pad_r, rows, scroll_offset, sections, trunc};
+use super::widgets::{
+    Section, Title, after_gutter, fit, gutter_area, list_below, pad_l, pad_r, rows, scroll_offset,
+    sections, trunc,
+};
 use super::{style, utc_time};
 
 /// Draws the screen `ctx.screen` of this view into `area`, the body between the
@@ -292,9 +295,10 @@ fn groups(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
             },
         ],
     );
-    let w = usize::from(inner[0].width);
+    // The columns start after the marker gutter.
+    let w = usize::from(gutter_area(inner[0]).width);
     let cols = group_columns();
-    let (keep, gw) = pick_flex(&cols, G_GROUP, w, WIDE_AT, ctx.more);
+    let (keep, gw) = pick_flex(&cols, G_GROUP, w, after_gutter(WIDE_AT), ctx.more);
     let head = head_row_at(
         &cols,
         &keep,
@@ -317,7 +321,7 @@ fn groups(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
         top.push(Line::from(Span::styled(" No connections.", style::dim())));
     }
     let selected = (!c.groups.is_empty()).then(|| sel - off + pre);
-    rows(frame, inner[0], top, selected);
+    list_below(frame, inner[0], top, pre - 1, selected);
 
     let dw = usize::from(inner[1].width);
     let mut dl = Vec::new();
@@ -445,9 +449,10 @@ fn connections(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>
             },
         ],
     );
-    let w = usize::from(inner[0].width);
+    // The columns start after the marker gutter.
+    let w = usize::from(gutter_area(inner[0]).width);
     let cols = conn_columns();
-    let (keep, aw) = pick_flex(&cols, C_ADDR, w, WIDE_AT, ctx.more);
+    let (keep, aw) = pick_flex(&cols, C_ADDR, w, after_gutter(WIDE_AT), ctx.more);
     let head = head_row_at(&cols, &keep, C_ADDR, aw, &[C_ID, C_IDLE, C_AGE, C_MEM]);
     let mut lines = with_head(trouble(&c.poll, ctx), head);
     let pre = lines.len();
@@ -492,7 +497,7 @@ fn connections(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>
         )));
     }
     let selected = (!conns.is_empty()).then(|| sel - off + pre);
-    rows(frame, inner[0], lines, selected);
+    list_below(frame, inner[0], lines, pre - 1, selected);
 
     let dw = usize::from(inner[1].width);
     let mut dl = Vec::new();
@@ -612,7 +617,9 @@ fn slow_log(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
     );
     let w = usize::from(inner[0].width);
     let cols = slow_columns();
-    let (keep, kw) = pick_flex(&cols, L_KEYS, w, WIDE_AT, ctx.more);
+    // The columns start after the marker gutter.
+    let lw = usize::from(gutter_area(inner[0]).width);
+    let (keep, kw) = pick_flex(&cols, L_KEYS, lw, after_gutter(WIDE_AT), ctx.more);
 
     let mut status: Vec<Span<'static>> = vec![Span::raw(" ")];
     match (&s.config, &s.config_note) {
@@ -660,7 +667,7 @@ fn slow_log(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
         )));
     }
     let selected = (!s.entries.is_empty()).then(|| sel - off + pre);
-    rows(frame, inner[0], lines, selected);
+    list_below(frame, inner[0], lines, pre - 1, selected);
     entry_lines(frame, inner[1], s);
 }
 
@@ -859,7 +866,9 @@ fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
         )
     };
     let cols = monitor_columns();
-    let (keep, cw) = pick_flex(&cols, M_COMMAND, w, WIDE_AT, ctx.more);
+    // The columns start after the marker gutter.
+    let lw = usize::from(gutter_area(inner[0]).width);
+    let (keep, cw) = pick_flex(&cols, M_COMMAND, lw, after_gutter(WIDE_AT), ctx.more);
     let head = head_row_at(&cols, &keep, M_COMMAND, cw, &[]);
     let mut lines = vec![status, head];
     let pre = lines.len();
@@ -880,7 +889,7 @@ fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
                 _ => Span::styled(escape(&e.command_line()), style::fg()),
             });
         }
-        Line::from(fit(spans, usize::from(inner[0].width)))
+        Line::from(fit(spans, lw))
     }));
     let selected = (!m.lines.is_empty()).then(|| sel - off + pre);
     if m.lines.is_empty() && (m.running() || m.stopped.is_some()) {
@@ -891,7 +900,7 @@ fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
         };
         lines.push(text(t.to_string(), style::dim()));
     }
-    rows(frame, inner[0], lines, selected);
+    list_below(frame, inner[0], lines, pre - 1, selected);
     line_lines(frame, inner[1], m.selected());
 }
 

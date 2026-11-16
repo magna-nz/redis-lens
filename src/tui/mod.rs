@@ -1598,7 +1598,7 @@ async fn connect_and_scan_with(
     if !started {
         return;
     }
-    // A connect reads no key: only `r` analyzes.
+    // A connect reads no key: only `a` analyzes.
     let Some(limit) = sample else {
         let reads = server_reads(&mut targets, &perms, &budget).await;
         if let Some((node, slow, clients)) = reads {
@@ -1765,7 +1765,7 @@ pub struct BrowseForTests {
 
 /// Connects `profile` without an analysis exactly as the TUI does, goes to Browse ›
 /// Keys, and carries out what the app asks of the live connection until the key names
-/// it reads first are in; then presses `n` `more` times, each time until its page is
+/// it reads first are in; then presses `m` `more` times, each time until its page is
 /// in. Returns what the tree shows. The live connection is closed again at the end.
 #[doc(hidden)]
 pub async fn run_browse_for_tests(
@@ -1839,7 +1839,7 @@ pub async fn run_browse_for_tests(
         }
         if left > 0 && !names.done() && names.error.is_none() {
             left -= 1;
-            let effects = app.handle_key(press(KeyCode::Char('n')));
+            let effects = app.handle_key(press(KeyCode::Char('m')));
             carry_out(effects, &mut requests);
             continue;
         }
@@ -1860,6 +1860,165 @@ pub async fn run_browse_for_tests(
         requests,
         error: names.error.clone(),
     };
+    drop(lock(&slot).take());
+    out
+}
+
+/// What [`run_key_list_for_tests`] saw after each key it pressed on a pattern's key
+/// list.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct KeyListStep {
+    /// The selected key before the key was pressed.
+    pub selected: Option<String>,
+    /// The notice afterwards, if any.
+    pub notice: Option<String>,
+    /// Whether a question (the confirm dialog) is open afterwards.
+    pub asking: bool,
+    /// The key list's rows afterwards.
+    pub rows: Vec<String>,
+    /// What the app asked of the live connection for this key, as `Debug` text.
+    pub requests: Vec<String>,
+}
+
+/// Connects `profile` without an analysis exactly as the TUI does, goes to Browse ›
+/// Keys, opens `pattern`'s key list once the key names are read, waits for its first
+/// page, then presses `keys` one by one. After each it carries out what the app asks
+/// of the live connection, waits for every answer, and records a [`KeyListStep`]. The
+/// writes go through the app's own gate and the runtime's live connection, as in the
+/// TUI. The live connection is closed again at the end.
+#[doc(hidden)]
+pub async fn run_key_list_for_tests(
+    profile: Profile,
+    credentials: Option<Credentials>,
+    pattern: &str,
+    keys: Vec<crossterm::event::KeyEvent>,
+) -> Vec<KeyListStep> {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::HashSet;
+    let press = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+    let mut app = App::new(vec![profile.clone()]);
+    let effects = app.handle_key(press(KeyCode::Enter));
+    let (id, scan) = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::Connect { id, scan, .. } => Some((*id, *scan)),
+            _ => None,
+        })
+        .expect("enter connects");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let slot: LiveSlot = Arc::new(Mutex::new(Some(LiveSession::new(id, scan))));
+    connect_and_scan(
+        Run { id, scan },
+        profile,
+        SecretSource::Container(credentials),
+        None,
+        StopFlag::new(),
+        tx,
+        Arc::clone(&slot),
+    )
+    .await;
+    let mut pending: HashSet<live::ReqId> = HashSet::new();
+    let carry_out =
+        |effects: Vec<Effect>, pending: &mut HashSet<live::ReqId>, log: &mut Vec<String>| {
+            for e in effects {
+                if let Effect::Live {
+                    req_id, to, req, ..
+                } = e
+                {
+                    log.push(format!("{req:?}"));
+                    pending.insert(req_id);
+                    let guard = lock(&slot);
+                    let handle = guard.as_ref().and_then(|s| s.handle.as_ref());
+                    assert!(
+                        handle.is_some_and(|h| h.send_to(req_id, to, req)),
+                        "the live connection is open"
+                    );
+                }
+            }
+        };
+    let mut log = Vec::new();
+    // One message: applied, and what it asks for carried out. `false` once the channel
+    // has closed.
+    macro_rules! next {
+        () => {{
+            let incoming = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                .await
+                .expect("the app gets an answer in time");
+            match incoming {
+                Some(Incoming::Msg(m)) => {
+                    if let Msg::Live { req_id, .. } = &*m {
+                        pending.remove(req_id);
+                    }
+                    let connected = matches!(*m, Msg::Connected { .. });
+                    let effects = app.apply(*m);
+                    carry_out(effects, &mut pending, &mut log);
+                    Some(connected)
+                }
+                _ => None,
+            }
+        }};
+    }
+    // Connect, then Browse, then the names read first.
+    loop {
+        match next!() {
+            Some(true) => {
+                let effects = app.handle_key(press(KeyCode::Char('2')));
+                carry_out(effects, &mut pending, &mut log);
+            }
+            Some(false) => {}
+            None => panic!("the connect ended before the names were read"),
+        }
+        let names = &app.patterns.names;
+        if app.screen() == app::Screen::Patterns && names.started() && !names.is_reading() {
+            break;
+        }
+    }
+    // The pattern's row, then its key list and its first page.
+    let at = {
+        let data = app.pattern_data().expect("the names tree");
+        let name = |i: usize| data.patterns[i].pattern.as_str();
+        app.pattern_rows()
+            .iter()
+            .position(|r| match r {
+                tree::Row::Pattern { idx, .. } => name(*idx) == pattern,
+                tree::Row::Group { root } => matches!(
+                    app.patterns.tree.roots[*root],
+                    tree::Root::Single(i) if name(i) == pattern
+                ),
+            })
+            .unwrap_or_else(|| panic!("no row for {pattern}"))
+    };
+    app.patterns.sel = at;
+    let effects = app.handle_key(press(KeyCode::Enter));
+    carry_out(effects, &mut pending, &mut log);
+    assert_eq!(
+        app.screen(),
+        app::Screen::KeyList,
+        "enter opens the key list"
+    );
+    while !pending.is_empty() {
+        next!().expect("the first page arrives");
+    }
+    let mut out = Vec::new();
+    for key in keys {
+        let selected = app.views.keys.selected().map(|r| r.key.clone());
+        let mut requests = Vec::new();
+        let effects = app.handle_key(key);
+        carry_out(effects, &mut pending, &mut requests);
+        while !pending.is_empty() {
+            let before = log.len();
+            next!().expect("an answer to every request");
+            requests.extend(log.drain(before..));
+        }
+        out.push(KeyListStep {
+            selected,
+            notice: app.notice.as_ref().map(|n| n.text.clone()),
+            asking: app.confirm.is_some(),
+            rows: app.views.keys.rows.iter().map(|r| r.key.clone()).collect(),
+            requests,
+        });
+    }
     drop(lock(&slot).take());
     out
 }

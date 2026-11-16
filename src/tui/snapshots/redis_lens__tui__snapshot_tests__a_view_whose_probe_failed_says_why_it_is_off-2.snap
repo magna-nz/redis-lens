@@ -1,11 +1,9 @@
 ---
 source: src/tui/snapshot_tests.rs
-assertion_line: 1894
 expression: "render(&app, 80, 24).backend()"
 ---
-" prod-cache-01   PROD   read-only   15G / 24G · 7.92M keys     ● analyzed 14:02 "
-"  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    "
-"    Keys  ·  Streams  ·  Search                 Search is off: no search module "
+" prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys   ● analyzed 14:02 "
+" 1    2  Browse › Keys · Streams · Search   3   4   5                         0 "
 "┌─ Search ───────────────────────── off ─┬─ Details ───────────────────────────┐"
 "│                                        │                                     │"
 "│ FT._LIST is not available: no Search   │                                     │"
@@ -25,5 +23,6 @@ expression: "render(&app, 80, 24).backend()"
 "│                                        │                                     │"
 "│                                        │                                     │"
 "│                                        │                                     │"
+"│                                        │                                     │"
 "└────────────────────────────────────────┴─────────────────────────────────────┘"
-" ↑↓ Move   → Details   / Query   enter Open              ctrl-f Find key  ? Help"
+" tab Next panel   0 Connections               ctrl-f Find key  : Command  ? Help"

@@ -1,17 +1,15 @@
 ---
 source: src/tui/snapshot_tests_cluster.rs
-assertion_line: 238
 expression: snap
 ---
 80x24:
- prod-cache-01   PROD   read-only   cluster · 3 shards · 1 unreach…  ● analyzed 
-  0 Connections  │  1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub    
-    Big keys  ·  Expiry  ·  Changes  ·  Hot keys  ·  Nodes  ·  Slots            
+ prod-cache-01  PROD   w  read-only   cluster · 3 shards · 1 unrea…  ● analyzed 
+ 1   2    3  Analyze › Nodes · 5 of 6   4   5                                 0 
 ┌─ Nodes ──────────────────────────────────── 3 shards · 1 failed · 1 partial ─┐
-│ SLOTS             NODE             ROLE     STATE          KEYS  MEMORY      │
-│ 0-5460            10.0.1.11:6379   primary  ✓ analyzed    3.17M    5.9G      │
-│ 5461-10922        10.0.1.12:6379   primary  ▲ partial     2.77M    5.2G      │
-│ 10923-16383       10.0.1.13:6379   primary  ✗ failed          —       —      │
+│   SLOTS             NODE             ROLE     STATE          KEYS  MEMORY    │
+│ › 0-5460            10.0.1.11:6379   primary  ✓ analyzed    3.17M    5.9G    │
+│   5461-10922        10.0.1.12:6379   primary  ▲ partial     2.77M    5.2G    │
+│   10923-16383       10.0.1.13:6379   primary  ✗ failed          —       —    │
 ├─ 10.0.1.11:6379 ──────────────────────────────────────── primary · analyzed ─┤
 │ Node    a1f3c9e27b4d6e8f0a2c4e6b8d0f1a3c5e7b9d21                             │
 │ Slots   0-5460 (5,461 slots)                                                 │
@@ -26,18 +24,18 @@ expression: snap
 │                                                                              │
 │                                                                              │
 │                                                                              │
+│                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
  ↑↓ Move   enter This node only   tab Next panel         ctrl-f Find key  ? Help
 
 60x20:
- prod-cache-01   PROD   read-only   15G / 24G    ● analyzed 
-  0  │  1   2   3 Analyze   4   5                           
-  Big keys · Expiry · Changes · Hot keys · Nodes · Slots    
+ prod-cache-01  PROD   w  read-only   15G / 24G  ● analyzed 
+ 1   2    3  Analyze › Nodes · 5 of 6   4   5             0 
 ┌─ Nodes ──────────────── 3 shards · 1 failed · 1 partial ─┐
-│ SLOTS             NODE             ROLE     STATE        │
-│ 0-5460            10.0.1.11:6379   primary  ✓ analyzed   │
-│ 5461-10922        10.0.1.12:6379   primary  ▲ partial    │
-│ 10923-16383       10.0.1.13:6379   primary  ✗ failed     │
+│   SLOTS            NODE             ROLE     STATE       │
+│ › 0-5460           10.0.1.11:6379   primary  ✓ analyzed  │
+│   5461-10922       10.0.1.12:6379   primary  ▲ partial   │
+│   10923-16383      10.0.1.13:6379   primary  ✗ failed    │
 ├─ 10.0.1.11:6379 ──────────────────── primary · analyzed ─┤
 │ Node    a1f3c9e27b4d6e8f0a2c4e6b8d0f1a3c5e7b9d21         │
 │ Slots   0-5460 (5,461 slots)                             │
@@ -46,6 +44,7 @@ expression: snap
 │                                                          │
 │ enter shows only this node's patterns in Browse; esc     │
 │ there shows all again.                                   │
+│                                                          │
 │                                                          │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
