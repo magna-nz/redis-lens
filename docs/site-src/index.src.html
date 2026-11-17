@@ -289,12 +289,14 @@ redis-lens --terminal              # the TUI, no dashboard</code></pre></div></d
 <div class="prose">
 <h3>Try the demo in 30 seconds</h3>
 <p>You need Docker and a Rust toolchain. From a clone of the repository, <code>make demo</code> starts a Redis 7.4 on port 6390 (ACL users <code>lens</code> and <code>lens-limited</code>, from <code>demo/users.acl</code>) and a Valkey 8.1 on port 6391 (no auth), both with an LFU eviction policy so hot keys show up.</p>
-<p>It seeds them with a keyspace that has planted problems: about 31% of <code>user:{id}:cart</code> never expire, the biggest <code>cache:search:{hash}</code> results never expire, a <code>tmp:import:{ulid}</code> job that never cleans up, one very large <code>queue:emails</code> list, and a hot <code>feature:checkout-v2</code> key. It saves three connections (<code>demo-redis</code>, <code>demo-redis-limited</code>, <code>demo-valkey</code>), puts the demo passwords in your keychain, and opens the TUI.</p>
+<p>It seeds them with a keyspace that has planted problems: about 31% of <code>user:{id}:cart</code> never expire, the biggest <code>cache:search:{hash}</code> results never expire, a <code>tmp:import:{ulid}</code> job that never cleans up, one very large <code>queue:emails</code> list, and a hot <code>feature:checkout-v2</code> key. It saves four connections (<code>demo-redis</code>, <code>demo-redis-limited</code>, <code>demo-admin</code>, <code>demo-valkey</code>), puts the demo passwords in your keychain, and opens the TUI. <code>demo-admin</code> is the one that can write, so use it to try edits, deletes and bulk actions.</p>
+<p><code>make demo-traffic</code> keeps both servers busy while you look around: sessions and carts written and updated, reads, deletes, a queue, a stream, Pub/Sub messages and the odd slow command. Server, Pub/Sub, Monitor, Clients and the slow log all have something to show. Ctrl-c stops it.</p>
 <p data-only="dashboard">The TUI that <code>make demo</code> opens also serves the dashboard: press <kbd>ctrl-o</kbd>.</p>
 <p><code>demo-redis-limited</code> can only run <code>SCAN</code>, <code>TYPE</code>, <code>TTL</code> and <code>PTTL</code>, so it shows how redis-lens degrades without <code>MEMORY USAGE</code>. <code>make demo-down</code> stops the servers and deletes the data.</p>
 </div>
 <div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">make demo        # start, seed, save the connections, open the TUI
 make demo-up     # start and seed only
+make demo-traffic # keep the servers busy (ctrl-c stops it)
 make demo-down   # stop the demo and delete its data</code></pre></div></div>
 </div>
 </div>
