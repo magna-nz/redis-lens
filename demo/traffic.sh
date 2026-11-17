@@ -63,8 +63,8 @@ gen() {
         [ $((RANDOM % 10)) -ge 3 ] && echo "EXPIRE user:$id:cart 604800"
         ;;
       3) echo "HGETALL user:$id:cart" ;;
-      4) # a rate limiter
-        ip="203.0.$((RANDOM % 4)).$((RANDOM % 250 + 1))"
+      4) # a rate limiter, keyed by made-up addresses from the documentation range
+        ip="203.0.113.$((RANDOM % 250 + 1))" # 203.0.113.0/24 is reserved for documentation (TEST-NET-3)
         echo "INCR rl:$ip:login"
         echo "EXPIRE rl:$ip:login 60"
         ;;
