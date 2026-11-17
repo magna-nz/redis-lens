@@ -40,39 +40,6 @@ See what's in your Redis or Valkey, from your terminal or a web page on your own
 - **Use it in a browser:** `ctrl-o` opens the dashboard, with every screen the terminal has and the same rules: read-only production, writes through the gate, passwords only in the keychain.
   The connection, its access, the database and the node are switched from the bar at the top.
 
-## Keys
-
-The same letters mean the same thing on every screen, in the terminal and in the browser (where a few are terminal-only, the table says so).
-Lower case acts on the selected row, upper case on what it belongs to: with a field selected `d` deletes the field and `D` the key; with a key selected `d` deletes the key and `D` every key of its pattern.
-
-| Key | Does |
-|---|---|
-| `1`–`5`, `0` | Overview, Browse, Analyze, Server, Pub/Sub, Connections. The current area's digit again goes to its next panel |
-| `tab` `shift-tab` | Every area and its panels in turn, wrapping (terminal; the browser keeps them for focus) |
-| `↑↓` `j` `k`, `PgUp` `PgDn`, `Home` `End` | Move |
-| `→` `l` `enter` / `←` `h` `esc` | Open, or go back |
-| `/` | Filter the list |
-| `s`, `m` | Sort, more rows |
-| `v` | More columns (terminal) |
-| `a` | Analyze the keys: Quick (10,000) or Deep (100,000) |
-| `r` | Read again now |
-| `space` | Pause or resume what is live |
-| `y` / `Y` | Copy the row / its parent (a key name / its pattern) |
-| `e` `+` `R` `f` | Edit, add, rename the key, show the value in another format |
-| `t` / `T` | Set a TTL on the row / on its parent |
-| `d` / `D` | Delete the row / its parent |
-| `w` | Writes on or off for the connection |
-| `b`, `[` `]` | The database list; the previous or next node on a cluster |
-| `.` | Actions of the selected row and the screen, with their keys (terminal; in the browser each button shows its key) |
-| `ctrl-k` | Go to a pattern, a loaded key, a screen or an action |
-| `ctrl-f` | Find keys on the whole server (terminal) |
-| `:` | Command line |
-| `?` | The keys of this screen |
-| `ctrl-s` | Save a snapshot of the analysis |
-| `ctrl-o`, `q` | Open the dashboard, quit (terminal) |
-
-Every key, screen by screen, is in the [key reference](https://magna-nz.github.io/redis-lens/#keys) and in `?`.
-
 ## Install
 
 ```sh
