@@ -97,7 +97,7 @@ redis-lens --dashboard  # only the dashboard, opened in your browser
 redis-lens --terminal   # only the terminal UI, no dashboard
 ```
 
-From a clone, `make demo` starts a seeded Redis and Valkey in Docker to try it on.
+From a clone, `make demo` starts a seeded Redis and Valkey in Docker to try it on, and `make demo-traffic` keeps them busy with reads, writes and updates so the live screens move. Use the `demo-admin` connection to try edits and deletes.
 
 ## Contributing
 

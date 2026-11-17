@@ -1,6 +1,6 @@
 DEMO := docker compose -f demo/compose.yml
 
-.PHONY: help build test it test-page coverage lint fmt demo-up demo-seed demo-profiles demo demo-down gif dashboard-gif site
+.PHONY: help build test it test-page coverage lint fmt demo-up demo-seed demo-profiles demo demo-traffic demo-down gif dashboard-gif site
 
 help:
 	@echo "make build          build a release binary"
@@ -10,6 +10,7 @@ help:
 	@echo "make lint           fmt check and clippy"
 	@echo "make demo-up        start and seed the demo Redis (6390) and Valkey (6391)"
 	@echo "make demo           demo-up, save the demo connections, open the TUI"
+	@echo "make demo-traffic   keep the demo servers busy with reads, writes and updates (ctrl-c stops it; RATE=40 for more)"
 	@echo "make demo-down      stop the demo and delete its data"
 	@echo "make gif            record docs/demo.gif from demo/gif-steps.json with temporary connections (needs the demo up, python3 and agg)"
 	@echo "make dashboard-gif  record docs/dashboard.gif from a running dashboard (SIGNIN=<link or file>; needs Chrome, Node 22+ and ffmpeg)"
@@ -48,14 +49,22 @@ demo-up:
 	$(DEMO) up -d --wait redis valkey
 	$(DEMO) run --rm seed
 
-# Saves two connections. The demo password goes to your OS keychain, not the config file.
+# Saves the demo connections. The demo passwords go to your OS keychain, not the config file.
+# demo-redis reads only (the demo `lens` user); demo-admin can write, so use it to try edits,
+# deletes and bulk actions; demo-valkey has no auth.
 demo-profiles:
 	printf 'lens-demo-only' | cargo run --quiet -- conn add demo-redis --url redis://lens@127.0.0.1:6390 --env local --password-stdin --force
 	printf 'limited-demo-only' | cargo run --quiet -- conn add demo-redis-limited --url redis://lens-limited@127.0.0.1:6390 --env stage --password-stdin --force
+	printf 'admin-demo-only' | cargo run --quiet -- conn add demo-admin --url redis://admin@127.0.0.1:6390 --env local --password-stdin --force
 	cargo run --quiet -- conn add demo-valkey --url redis://127.0.0.1:6391 --env local --force
 
 demo: demo-up demo-profiles
 	cargo run --release
+
+# Reads, writes, updates and deletes against the demo servers, so the live screens move
+# (Server, Pub/Sub, Monitor, Clients, the slow log, hot keys). Ctrl-c stops it. Needs Docker.
+demo-traffic:
+	demo/traffic.sh $(or $(TARGET),both)
 
 demo-down:
 	$(DEMO) down -v

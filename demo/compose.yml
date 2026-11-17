@@ -2,7 +2,8 @@
 # with a keyspace that has a few planted problems for redis-lens to find.
 #
 #   make demo-up     start and seed
-#   make demo        start, seed, save the two connections, open the TUI
+#   make demo        start, seed, save the demo connections, open the TUI
+#   make demo-traffic  keep them busy: reads, writes and updates (ctrl-c stops it)
 #   make demo-down   stop and delete everything
 #
 # The passwords in users.acl are for this demo only.
