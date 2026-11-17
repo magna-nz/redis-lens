@@ -1,0 +1,24 @@
+---
+source: src/tui/ui/overview.rs
+expression: text
+---
+" prod-cache-01  PROD   w  read-only   prod-cache-01.internal:6380 · 15G / 24G · 7.92M keys         ● analyzed 14:02 UTC "
+"  1  Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                               0 Connections "
+"┌─ Now ──────────────────────────────────────────────────────────────────────────────── INFO every 2 s · space pauses ─┐"
+"│ ops/s         100 ·▄▄▄                 clients        10 ▁█▅▁                 hit rate      90% ·▄▄▄                 │"
+"│ evicted     0.5/s ·▄▄▄                 expired     5.0/s ·▄▄▄                 frag ratio   1.10 ▄▄▄▄                 │"
+"│ memory       982K ███████████████▏░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ of 3.8M                               │"
+"│ Redis 7.4.2 · up 16m 46s · primary, 1 replica · RDB ok · AOF off · policy allkeys-lfu                                │"
+"└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
+"┌─ Things to look at ───────────────────────── 5 of 8 findings ─┐ ┌─ Where the memory is ─────── 100,000 sampled keys ─┐"
+"│ FINDING                                             WHERE     │ │ 7.92M keys · 31% have a TTL · 13G of data, 2.1G    │"
+"│ › ▲ 12% of cache:search:{hash} keys never expire w… Expiry    │ │ overhead                                           │"
+"│   ▲ 31% of user:{id}:cart keys never expire while … Expiry    │ │                                                    │"
+"│   ● 76% of memory never expires: 6.9G of 9.0G.      Expiry    │ │   session:{uuid}     ██████▉░░░░░░░░  46%     6.1G │"
+"│   ● tmp:import:{ulid} never expires.                Expiry    │ │   cache:search:{has… ██▌░░░░░░░░░░░░  16%     2.2G │"
+"│   ● queue:emails never expires.                     Expiry    │ │   cache:product:{id} █▋░░░░░░░░░░░░░  10%     1.4G │"
+"└───────────────────────────────────────────────────────────────┘ │   user:{id}:cart     █▍░░░░░░░░░░░░░   9%     1.2G │"
+"┌─ Notes ─────────────────────────────────────────── 5 reasons ─┐ │   tmp:import:{ulid}  ▊░░░░░░░░░░░░░░   5%     737M │"
+"│ … 5 more reasons and 1 note: v shows them                     │ │   6 other patterns   ██░░░░░░░░░░░░░  13%     1.7G │"
+"└───────────────────────────────────────────────────────────────┘ └────────────────────────────────────────────────────┘"
+" ✓ Analysis done: 100,000 keys. 8 things to look at on 1 Overview.                                                      "
