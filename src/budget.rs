@@ -152,7 +152,12 @@ mod tests {
             }
             let took = t0.elapsed();
             let min = Duration::from_secs_f64(f64::from(n) / f64::from(rate));
-            assert!(took >= min, "rate {rate}: {took:?} < {min:?}");
+            // The paused clock moves in whole milliseconds from an arbitrary start, so the
+            // measured time can fall up to a millisecond short of the exact figure.
+            assert!(
+                took + Duration::from_millis(1) >= min,
+                "rate {rate}: {took:?} < {min:?}"
+            );
             // And it does not wait far longer than needed.
             assert!(took <= min + Duration::from_millis(1), "{took:?}");
             assert_eq!(b.taken(), u64::from(n));
