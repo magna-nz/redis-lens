@@ -68,6 +68,8 @@ struct Cols {
     lfu: bool,
     /// The NODE column after the key (a cluster).
     node: bool,
+    /// The three panes' list: a name too long is cut in the middle.
+    middle: bool,
 }
 
 impl Cols {
@@ -81,8 +83,10 @@ impl Cols {
             + if self.lfu { LFU_W + 1 } else { 0 }
     }
 
-    fn new(inner: usize, more: bool, lfu: bool, node: bool) -> Self {
-        let all = inner >= super::widgets::after_gutter(WIDE) || more;
+    /// `all`: show every optional column that fits (`v`, or the focused list of the
+    /// three panes), whatever the width.
+    fn new(inner: usize, all: bool, lfu: bool, node: bool) -> Self {
+        let all = inner >= super::widgets::after_gutter(WIDE) || all;
         let mut c = Self {
             key: 0,
             ty: all,
@@ -90,6 +94,7 @@ impl Cols {
             len: all,
             lfu: all && lfu,
             node: node && all,
+            middle: false,
         };
         for step in 0..5 {
             if inner >= c.fixed() + KEY_MIN {
@@ -106,7 +111,54 @@ impl Cols {
         c.key = inner.saturating_sub(c.fixed()).max(8);
         c
     }
+
+    /// The focused key list of the three panes, `inner` cells after the gutter: KEY,
+    /// SIZE, EXPIRES and TYPE; on a cluster NODE next; then STORED AS, LENGTH and LFU
+    /// together. Each joins only while the name keeps [`NAME_KEEP`] cells; with `v`
+    /// every one that fits beside the shortest name, as in two panes.
+    fn three(inner: usize, more: bool, lfu: bool, node: bool) -> Self {
+        if more {
+            return Self {
+                middle: true,
+                ..Self::new(inner, true, lfu, node)
+            };
+        }
+        let mut c = Self {
+            key: 0,
+            ty: true,
+            enc: false,
+            len: false,
+            lfu: false,
+            node: false,
+            middle: true,
+        };
+        if inner < c.fixed() + KEY_MIN {
+            c.ty = false;
+        }
+        let keeps = |c: &Self| inner >= c.fixed() + NAME_KEEP;
+        if node {
+            c.node = true;
+            if !keeps(&c) {
+                c.node = false;
+            }
+        }
+        let with_rest = Self {
+            enc: true,
+            len: true,
+            lfu,
+            ..c
+        };
+        if c.ty && keeps(&with_rest) {
+            c = with_rest;
+        }
+        c.key = inner.saturating_sub(c.fixed()).max(8);
+        c
+    }
 }
+
+/// The name cells the focused key list of the three panes keeps before an optional
+/// column joins.
+const NAME_KEEP: usize = 28;
 
 /// The announced address of node `i` of the session, for a NODE column or a detail
 /// line; `—` when unknown.
@@ -136,21 +188,93 @@ fn estimate(app: &App, pattern: &str) -> Option<(u64, bool)> {
     Some((p.est_keys, exact))
 }
 
+/// The key list pane's title and its right part: `‹ pattern` (or `‹ Find: glob`), the
+/// sort, filters and how far the walk is.
+pub(super) fn list_titles(app: &App) -> (String, String) {
+    let state = &app.views.keys;
+    let right = app
+        .ctx()
+        .map(|ctx| title_right(state, &ctx, state.visible().len()))
+        .unwrap_or_default();
+    (format!("‹ {}", state.heading()), right)
+}
+
+/// The selected key's pane title: its name and type, or `Keys` with none.
+pub(super) fn key_titles(state: &KeysState) -> (String, String) {
+    match state.selected() {
+        Some(r) => (escape(&r.key), r.key_type.as_str().to_string()),
+        None => ("Keys".to_string(), String::new()),
+    }
+}
+
+/// The width a key list pane (from its divider to the next) needs to show the columns
+/// it shows at 120 columns in two panes: every optional column, the key column at
+/// least [`KEY_MIN`].
+pub fn list_need(lfu: bool, node: bool) -> u16 {
+    let c = Cols {
+        key: 0,
+        ty: true,
+        enc: true,
+        len: true,
+        lfu,
+        node,
+        middle: true,
+    };
+    // The name keeps its cells; the divider, the gutter.
+    u16::try_from(c.fixed() + NAME_KEEP + 1 + usize::from(super::widgets::GUTTER))
+        .unwrap_or(u16::MAX)
+}
+
+/// The column headers a key list pane `w` wide shows, for tests of the widths.
+#[cfg(test)]
+pub(super) fn shown_columns(w: u16, three: bool, lfu: bool, node: bool) -> Vec<&'static str> {
+    shown_columns_v(w, three, false, lfu, node)
+}
+
+/// [`shown_columns`] with `v`.
+#[cfg(test)]
+pub(super) fn shown_columns_v(
+    w: u16,
+    three: bool,
+    more: bool,
+    lfu: bool,
+    node: bool,
+) -> Vec<&'static str> {
+    let inner = usize::from(w.saturating_sub(1)).saturating_sub(2);
+    let c = if three {
+        Cols::three(inner, more, lfu, node)
+    } else {
+        Cols::new(inner, more, lfu, node)
+    };
+    let mut out = vec!["KEY"];
+    for (on, name) in [
+        (c.node, "NODE"),
+        (true, "SIZE"),
+        (true, "EXPIRES"),
+        (c.ty, "TYPE"),
+        (c.enc, "STORED AS"),
+        (c.len, "LENGTH"),
+        (c.lfu, "LFU"),
+    ] {
+        if on {
+            out.push(name);
+        }
+    }
+    out
+}
+
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let Some(ctx) = app.ctx() else {
         return;
     };
+    if area.width >= super::browse::THREE_PANES {
+        super::browse::draw(frame, area, app, super::browse::Focus::Keys);
+        return;
+    }
     let state = &app.views.keys;
     let pattern = state.pattern.clone().unwrap_or_default();
-    let visible = state.visible();
-    let sel = state.sel.min(visible.len().saturating_sub(1));
-    let row = state.selected();
-    let left_title = format!("‹ {}", state.heading());
-    let left_right = title_right(state, &ctx, visible.len());
-    let (right_title, right_right) = match row {
-        Some(r) => (escape(&r.key), r.key_type.as_str().to_string()),
-        None => ("Keys".to_string(), String::new()),
-    };
+    let (left_title, left_right) = list_titles(app);
+    let (right_title, right_right) = key_titles(state);
     let (left, right) = split_frame(
         frame,
         area,
@@ -159,13 +283,37 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Title::new(&right_title, &right_right),
         Pane::Left,
     );
+    list_pane(frame, left, app, &ctx, false);
+    detail(frame, right, state, &ctx, &pattern);
+    if let Some(form) = &state.form {
+        super::value::draw_form(frame, area, form);
+    }
+}
+
+/// The selected key's facts, as the right pane beside the key list shows them.
+pub(super) fn key_detail(frame: &mut Frame, inner: Rect, app: &App, ctx: &Ctx<'_>) {
+    let state = &app.views.keys;
+    let pattern = state.pattern.clone().unwrap_or_default();
+    detail(frame, inner, state, ctx, &pattern);
+}
+
+/// The key list with the keys in `left`: the column header, the rows with the
+/// selection, and the bottom line. `all`: every optional column that fits.
+///
+/// `three`: the focused list of the three panes ([`Cols::three`]); else the two-pane
+/// list, every column with `v`.
+pub(super) fn list_pane(frame: &mut Frame, left: Rect, app: &App, ctx: &Ctx<'_>, three: bool) {
+    let state = &app.views.keys;
+    let pattern = state.pattern.clone().unwrap_or_default();
+    let visible = state.visible();
+    let sel = state.sel.min(visible.len().saturating_sub(1));
     // The columns start after the marker gutter.
-    let c = Cols::new(
-        usize::from(gutter_area(left).width),
-        ctx.more,
-        state.lfu,
-        state.by_node(),
-    );
+    let inner = usize::from(gutter_area(left).width);
+    let c = if three {
+        Cols::three(inner, ctx.more, state.lfu, state.by_node())
+    } else {
+        Cols::new(inner, ctx.more, state.lfu, state.by_node())
+    };
     let sort = state.sort.effective(state.sizes, state.freq);
     rows(frame, gutter_area(left), vec![header(&c, sort)], None);
     let body = Rect {
@@ -175,7 +323,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     };
     let lw = usize::from(left.width);
     if visible.is_empty() {
-        rows(frame, body, empty_lines(state, &ctx, lw), None);
+        rows(frame, body, empty_lines(state, ctx, lw), None);
     } else {
         let off = scroll_offset(sel, usize::from(body.height));
         let ticks = ctx.tick.saturating_sub(state.sel_since);
@@ -188,7 +336,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                 let row = &state.rows[r];
                 let node = c
                     .node
-                    .then(|| node_name(&ctx, state.row_node.get(&row.key).copied()));
+                    .then(|| node_name(ctx, state.row_node.get(&row.key).copied()));
                 key_row(row, &c, state, node, (i == sel).then_some(ticks))
             })
             .collect();
@@ -214,10 +362,19 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         ))],
         None,
     );
-    detail(frame, right, state, &ctx, &pattern);
-    if let Some(form) = &state.form {
-        super::value::draw_form(frame, area, form);
-    }
+}
+
+/// The key list's bottom line on its own, for the narrow list beside a value: how far
+/// the walk got, and `m`.
+pub(super) fn status_line(app: &App, ctx: &Ctx<'_>) -> String {
+    let state = &app.views.keys;
+    let pattern = state.pattern.clone().unwrap_or_default();
+    let est = state
+        .find
+        .is_none()
+        .then(|| estimate(app, &pattern))
+        .flatten();
+    status(state, est, ctx.tick)
 }
 
 fn title_right(state: &KeysState, ctx: &Ctx<'_>, shown: usize) -> String {
@@ -318,11 +475,26 @@ fn key_row(
     scroll: Option<u64>,
 ) -> Line<'static> {
     let dash = || "—".to_string();
-    let text = vec![Span::styled(format!(" {}", escape(&r.key)), style::fg())];
+    let name = escape(&r.key);
     let w = c.key.saturating_sub(1);
     let mut spans = match scroll {
-        Some(ticks) => marquee_spans(text, w, ticks),
-        None => fit(text, w),
+        Some(ticks) => marquee_spans(
+            vec![Span::styled(format!(" {name}"), style::fg())],
+            w,
+            ticks,
+        ),
+        // Keys of one pattern share their start: keep the end too.
+        None if c.middle => fit(
+            vec![Span::styled(
+                format!(
+                    " {}",
+                    super::widgets::trunc_middle(&name, w.saturating_sub(1))
+                ),
+                style::fg(),
+            )],
+            w,
+        ),
+        None => fit(vec![Span::styled(format!(" {name}"), style::fg())], w),
     };
     let used: usize = spans
         .iter()
@@ -529,7 +701,8 @@ fn detail(frame: &mut Frame, inner: Rect, state: &KeysState, ctx: &Ctx<'_>, patt
             lines.push(Line::from(Span::styled(format!(" {expires}"), style::fg())));
         }
         if state.by_node() {
-            lines.push(Line::from(fit(
+            // An address is never cut: on a narrow pane it goes to the next line whole.
+            lines.extend(super::widgets::wrap_spans(
                 vec![Span::styled(
                     format!(
                         " on node {}",
@@ -538,7 +711,8 @@ fn detail(frame: &mut Frame, inner: Rect, state: &KeysState, ctx: &Ctx<'_>, patt
                     style::dim(),
                 )],
                 w,
-            )));
+                1,
+            ));
         }
         let enc = r.encoding.as_deref().unwrap_or("");
         if let Some(past) = past_compact_encoding(r.key_type).filter(|p| *p == enc) {

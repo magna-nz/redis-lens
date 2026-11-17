@@ -477,21 +477,15 @@ impl App {
     }
 
     /// The keys the app holds already whose name holds `q`: the key list's, the open
-    /// value's, the analysis's big and hot keys. Each once, by where it opens best. Not
-    /// the key list's or the value's while they were read on another database than the
-    /// session's ([`App::list_db`]).
+    /// value's, the analysis's big and hot keys. Each once, by where it opens best. A
+    /// database switch (`b`) clears the key list and the value, so none of these is of
+    /// another database.
     fn key_hits(&self, q: &str) -> Vec<Hit> {
-        let db = self.session.as_ref().map(|s| s.profile.db);
-        let other_db = |d: Option<u32>| d.is_some_and(|d| Some(d) != db);
         let mut keys: Vec<(&str, KeyType, Option<u64>, KeyFrom)> = Vec::new();
-        if !other_db(self.list_db) {
-            for r in &self.views.keys.rows {
-                keys.push((&r.key, r.key_type, r.bytes, KeyFrom::List));
-            }
+        for r in &self.views.keys.rows {
+            keys.push((&r.key, r.key_type, r.bytes, KeyFrom::List));
         }
-        if let Some(r) = &self.views.value.row
-            && !other_db(self.value_db)
-        {
+        if let Some(r) = &self.views.value.row {
             keys.push((&r.key, r.key_type, r.bytes, KeyFrom::Value));
         }
         if let Some(r) = self.report() {
@@ -2068,9 +2062,9 @@ mod tests {
 
     // -- A database switch -----------------------------------------------------------
 
-    /// After `b` switched the database, the key list and the open value still hold
-    /// what was read on the old one (the views are not reset on a switch): Go to lists
-    /// none of those keys until they are read again.
+    /// After `b` switched the database, the key list and the open value of the old one
+    /// are gone (spec "Databases"): Go to lists none of those keys until they are read
+    /// again.
     #[test]
     fn after_a_database_switch_go_to_lists_no_key_of_the_old_one() {
         use crate::live::LiveReply;
@@ -2112,9 +2106,9 @@ mod tests {
         app.handle_key(ch('j'));
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.session.as_ref().unwrap().profile.db, 3);
-        // Still held by the views: a matter of the key list, not of Go to.
-        assert_eq!(app.views.keys.rows.len(), 3);
-        assert!(app.views.value.row.is_some());
+        // The switch cleared them.
+        assert!(app.views.keys.rows.is_empty());
+        assert!(app.views.value.row.is_none());
         assert!(held(&app).is_empty(), "{:?}", held(&app));
     }
 

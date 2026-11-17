@@ -15,7 +15,7 @@ use super::views::dbs::{
     DENIED, DbList, NO_PROFILE, OFF_CLOSED, OFF_CLUSTER, OFF_NOT_CONNECTED, OFF_NOT_READY,
     OFF_SCANNING, UNREAD,
 };
-use super::{App, Effect, Phase, plain_char};
+use super::{App, Effect, Phase, Screen, plain_char};
 use crate::conn::ScanTarget;
 use crate::live::dbs::{Reply, Request};
 use crate::live::{Dest, LiveError, LiveReply, LiveRequest, ReqId};
@@ -179,10 +179,19 @@ impl App {
             return effects;
         }
         self.db_resub = tail;
-        // The key list and the open value stay as they were: what they hold was read
-        // on the old database.
-        self.list_db.get_or_insert(old);
-        self.value_db.get_or_insert(old);
+        // The key list and the open value were read on the old database: they go, and
+        // a Browse focus on them goes back to Patterns, so no pane shows another
+        // database's keys.
+        let mut effects = effects;
+        if matches!(self.screen(), Screen::KeyList | Screen::KeyDetail) {
+            effects.extend(self.switch(Screen::Patterns));
+        }
+        self.views.keys = Default::default();
+        self.views.value.close();
+        // So does Browse › Streams' list: the next poll reads the new database's.
+        self.views.streams = Default::default();
+        self.patterns.keys_open = false;
+        self.patterns.detail_open = false;
         self.set_info(format!(
             "Switched to db {db} for this session. The saved profile is unchanged."
         ));
@@ -518,6 +527,58 @@ mod tests {
         assert!(text.contains("a  Analyze: 10,000 keys"), "{text}");
         assert!(!text.contains("analyzing"), "{text}");
         assert!(text.contains("● connected"), "{text}");
+    }
+
+    /// A switch clears the key list and the open value (they were read on the old
+    /// database), and a Browse focus on them goes back to Patterns: no pane shows keys
+    /// of another database, at any width.
+    #[test]
+    fn a_switch_clears_the_key_list_and_the_value_and_browse_goes_back_to_patterns() {
+        for start in [Screen::KeyDetail, Screen::KeyList] {
+            let mut app = ready();
+            testing::show(&mut app, Screen::KeyDetail);
+            if start == Screen::KeyList {
+                app.handle_key(key(KeyCode::Esc));
+            }
+            assert_eq!(app.screen(), start);
+            assert!(app.views.value.row.is_some());
+            opened(&mut app);
+            app.handle_key(ch('j'));
+            let effects = app.handle_key(key(KeyCode::Enter));
+            connect_of(&effects);
+            assert_eq!(app.session.as_ref().unwrap().profile.db, 3);
+            assert_eq!(app.screen(), Screen::Patterns, "{start:?}");
+            assert!(app.views.keys.rows.is_empty());
+            assert!(app.views.keys.pattern.is_none());
+            assert!(app.views.value.row.is_none());
+            for (w, h) in [(80, 24), (120, 36), (160, 45)] {
+                let text = format!("{:?}", testing::render(&app, w, h).backend());
+                assert!(!text.contains("user:10293:cart"), "{w}: {text}");
+            }
+        }
+        // Switched from another area: Browse › Keys opens on Patterns, not on the
+        // cleared key list.
+        let mut app = ready();
+        testing::show(&mut app, Screen::KeyDetail);
+        crate::tui::app::views::testing::area(&mut app, '1');
+        opened(&mut app);
+        app.handle_key(ch('j'));
+        app.handle_key(key(KeyCode::Enter));
+        crate::tui::app::views::testing::area(&mut app, '2');
+        assert_eq!(app.screen(), Screen::Patterns);
+        assert!(app.views.keys.rows.is_empty() && app.views.value.row.is_none());
+
+        // Browse › Streams' list of the old database goes too.
+        let mut app = ready();
+        app.views.streams.loaded = true;
+        app.views.streams.found = 3;
+        app.views.streams.sel = 2;
+        opened(&mut app);
+        app.handle_key(ch('j'));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.views.streams.loaded);
+        assert_eq!((app.views.streams.found, app.views.streams.sel), (0, 0));
+        assert!(app.views.streams.rows.is_empty());
     }
 
     #[test]

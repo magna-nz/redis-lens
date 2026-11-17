@@ -12,7 +12,7 @@ use crate::tui::app::App;
 
 use super::analysis::{Col, MARK, Tier, head_row, need_report, notice, paragraph, pick_cols};
 use super::widgets::{
-    self, Section, Title, fit, gutter_area, pad_l, pad_r, rows, scroll_offset, sections, trunc,
+    self, Section, Title, fit, gutter_area, pad_l, pad_r, rows, scroll_offset, trunc,
 };
 use super::{mark_previous, server_label, style};
 
@@ -181,21 +181,21 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let list_rows = u16::try_from(nodes.len() + 1)
         .unwrap_or(u16::MAX)
         .min(usable.saturating_sub(DETAIL_ROWS).max(3));
-    let inner = sections(
+    let nodes_right = mark_previous(app, &summary(nodes));
+    // From 120 columns the node's details are to the right, at full height.
+    let (list, detail) = widgets::list_and_details(
         frame,
         area,
-        &[
-            Section {
-                title: Title::new("Nodes", &mark_previous(app, &summary(nodes))),
-                rows: Some(list_rows),
-            },
-            Section {
-                title: Title::new(&node_title, &node_right),
-                rows: None,
-            },
-        ],
+        Section {
+            title: Title::new("Nodes", &nodes_right),
+            rows: Some(list_rows),
+        },
+        Section {
+            title: Title::new(&node_title, &node_right),
+            rows: None,
+        },
+        0,
     );
-    let (list, detail) = (inner[0], inner[1]);
     // The columns start after the marker gutter.
     let iw = usize::from(gutter_area(list).width);
     let cols = columns(endpoint_width(iw + usize::from(widgets::GUTTER)));
@@ -220,7 +220,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         .map(|n| node_row(n, &cols, &keep, slots_w))
         .collect();
     widgets::list(frame, body, lines, Some(sel - off));
-    detail_lines(frame, detail, n, report.sampled_keys);
+    let side = widgets::side_split(area.width).is_some();
+    detail_lines(frame, detail, n, report.sampled_keys, side);
 }
 
 fn node_row(n: &NodeReport, cols: &[Col], keep: &[usize], slots_w: usize) -> Line<'static> {
@@ -284,7 +285,9 @@ fn kv(label: &str, value: Vec<Span<'static>>) -> Vec<Span<'static>> {
     spans
 }
 
-fn detail_lines(frame: &mut Frame, inner: Rect, n: &NodeReport, analyzed: u64) {
+/// The selected node's details. `wrap`: each fact broken over lines (the details to
+/// the right of the list, at full height) rather than cut at the width.
+fn detail_lines(frame: &mut Frame, inner: Rect, n: &NodeReport, analyzed: u64, wrap: bool) {
     let w = usize::from(inner.width);
     let mut lines: Vec<Vec<Span<'static>>> =
         vec![kv("Node", vec![Span::styled(n.id.clone(), style::fg())])];
@@ -357,7 +360,14 @@ fn detail_lines(frame: &mut Frame, inner: Rect, n: &NodeReport, analyzed: u64) {
         }
         lines.push(kv("Sample", v));
     }
-    let mut out: Vec<Line<'static>> = lines.into_iter().map(|l| Line::from(fit(l, w))).collect();
+    let mut out: Vec<Line<'static>> = if wrap {
+        lines
+            .into_iter()
+            .flat_map(|l| widgets::wrap_spans(l, w, 9))
+            .collect()
+    } else {
+        lines.into_iter().map(|l| Line::from(fit(l, w))).collect()
+    };
     out.push(Line::default());
     out.extend(paragraph(
         vec![Span::raw(" ")],

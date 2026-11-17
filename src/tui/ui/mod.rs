@@ -25,6 +25,7 @@ use super::keymap;
 
 mod actions;
 mod analysis;
+mod browse;
 mod bulk;
 mod cmdline;
 mod confirm;
@@ -114,26 +115,45 @@ pub fn list_rows(area: Rect, app: &App) -> usize {
     // bottom one; the first section never gets more than the body less two borders.
     let first = |rows: usize| rows.min(h.saturating_sub(2));
     let below = |sections: usize, fixed: usize| h.saturating_sub(sections + 1 + fixed);
+    // From 120 columns Nodes, Clients, Slow log (and Monitor when a line is longer than
+    // its row) have their details to the right: the list has the full height, less the
+    // frame's two borders and the lines above its rows.
+    let side = widgets::side_split(body.width).is_some();
+    let trouble = || {
+        app.ctx()
+            .is_some_and(|ctx| server::trouble(&app.views.server.clients.poll, &ctx).is_some())
+    };
     match screen {
+        Screen::Nodes if side => h.saturating_sub(3),
+        Screen::Clients if side => {
+            let facts = if app.views.server.clients.drill.is_some() {
+                usize::from(server::CONN_FACTS_SIDE)
+            } else {
+                0
+            };
+            h.saturating_sub(3 + facts + usize::from(trouble()))
+        }
+        Screen::SlowLog if side => h.saturating_sub(4),
+        Screen::Monitor
+            if app
+                .ctx()
+                .is_some_and(|ctx| server::monitor_side(body, &app.views.server.monitor, &ctx)) =>
+        {
+            h.saturating_sub(4)
+        }
         Screen::Patterns | Screen::KeyList | Screen::Streams | Screen::Search => browse_rows(area),
-        Screen::KeyDetail => value_item_rows(h),
-        Screen::Overview
-        | Screen::BigKeys
-        | Screen::Ttl
-        | Screen::Diff
-        | Screen::HotKeys
-        | Screen::PubSub => h.saturating_sub(3),
+        Screen::KeyDetail => value_item_rows(h, value::facts_rows(app, body.width)),
+        // The finding rows the last frame drew, at every width.
+        Screen::Overview => app.overview.drawn_rows.get(),
+        Screen::BigKeys | Screen::Ttl | Screen::Diff | Screen::HotKeys | Screen::PubSub => {
+            h.saturating_sub(3)
+        }
         // The list section takes what it needs up to what leaves the details theirs.
         Screen::Connections => first(below(2, CONNECTIONS_DETAIL).max(4)).saturating_sub(1),
         Screen::Nodes => first(below(2, NODES_DETAIL).max(3)).saturating_sub(1),
         // The list takes what the details leave, less its header and, when the poll is
         // in trouble, the line saying so.
-        Screen::Clients => {
-            let trouble = app
-                .ctx()
-                .is_some_and(|ctx| server::trouble(&app.views.server.clients.poll, &ctx).is_some());
-            below(2, CLIENTS_DETAIL).saturating_sub(1 + usize::from(trouble))
-        }
+        Screen::Clients => below(2, CLIENTS_DETAIL).saturating_sub(1 + usize::from(trouble())),
         // A status line, then the header.
         Screen::SlowLog => below(2, SLOW_LOG_DETAIL).saturating_sub(2),
         Screen::Monitor => below(2, MONITOR_DETAIL).saturating_sub(2),
@@ -148,10 +168,11 @@ pub fn list_rows(area: Rect, app: &App) -> usize {
 }
 
 /// Item rows a key's value lists on a body `h` rows tall: the right pane less the facts
-/// line and the blank under it, of which the item list takes two fifths (at least three
-/// rows) with its header (`ui/value.rs`).
-fn value_item_rows(h: usize) -> usize {
-    let pane = h.saturating_sub(2).saturating_sub(2);
+/// (`facts` lines: one, or more where they wrap from 120 columns) and the blank under
+/// them, of which the item list takes two fifths (at least three rows) with its header
+/// (`ui/value.rs`).
+fn value_item_rows(h: usize, facts: usize) -> usize {
+    let pane = h.saturating_sub(2).saturating_sub(facts + 1);
     (pane * 2 / 5).max(3).min(pane).saturating_sub(1)
 }
 

@@ -59,6 +59,9 @@ pub mod ui;
 pub(crate) mod fixtures;
 #[cfg(test)]
 mod snapshot_tests;
+/// Browse › Keys in three panes from 120 columns: snapshots and the layout's checks.
+#[cfg(test)]
+mod snapshot_tests_browse;
 /// Snapshots of cluster scans: Nodes, Patterns narrowed to a node, the Hot keys node
 /// column, and the cluster summary.
 #[cfg(test)]

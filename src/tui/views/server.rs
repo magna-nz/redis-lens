@@ -2857,6 +2857,81 @@ mod tests {
         insta::assert_snapshot!(testing::render(&app, 120, 36).backend());
     }
 
+    #[test]
+    fn clients_drill_down_160x45() {
+        let mut app = clients_app();
+        for _ in 0..4 {
+            app.handle_key(ch('j'));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        insta::assert_snapshot!(testing::render(&app, 160, 45).backend());
+    }
+
+    #[test]
+    fn the_clients_drill_down_keys_are_the_same_at_120_and_at_80_columns() {
+        for (w, h) in [(80, 24), (120, 36), (160, 45)] {
+            let mut app = clients_app();
+            let _ = testing::render(&app, w, h);
+            let mut sent = Vec::new();
+            for _ in 0..4 {
+                sent.extend(app.handle_key(ch('j')));
+            }
+            sent.extend(app.handle_key(key(KeyCode::Enter)));
+            let opened = state(&app).clients.drill.clone().expect("a group open");
+            assert_eq!(
+                Some(&opened),
+                state(&app).clients.groups.get(4).map(|g| &g.key),
+                "{w}x{h}"
+            );
+            let t = text_of_render(&app, w, h);
+            if w >= 120 {
+                // The groups stay on the left, the opened one's connections on the right.
+                assert!(t.contains("Connections of 10.0.1.0/24"), "{w}x{h}:\n{t}");
+                assert!(
+                    t.contains("GROUP") && t.contains("ADDRESS"),
+                    "{w}x{h}:\n{t}"
+                );
+            } else {
+                assert!(
+                    !t.contains("GROUP") && t.contains("ADDRESS"),
+                    "{w}x{h}:\n{t}"
+                );
+            }
+            sent.extend(app.handle_key(ch('j')));
+            assert_eq!(state(&app).clients.conn_sel, 1, "{w}x{h}");
+            sent.extend(app.handle_key(ch('k')));
+            assert_eq!(state(&app).clients.conn_sel, 0, "{w}x{h}");
+            // Moving and opening read nothing.
+            assert!(testing::requests(&sent).is_empty(), "{w}x{h}: {sent:?}");
+            app.handle_key(key(KeyCode::Esc));
+            assert!(state(&app).clients.drill.is_none(), "{w}x{h}");
+            assert_eq!(state(&app).clients.sel, 4, "{w}x{h}");
+            assert_eq!(app.screen(), Screen::Clients, "{w}x{h}");
+        }
+    }
+
+    /// The text of the screen at `w`x`h`, one line per row.
+    fn text_of_render(app: &App, w: u16, h: u16) -> String {
+        let t = testing::render(app, w, h);
+        let b = t.backend().buffer();
+        let mut out = String::new();
+        for y in 0..b.area.height {
+            for x in 0..b.area.width {
+                out.push_str(b[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn slow_log_160x45() {
+        let app = slow_app();
+        let t = text_of_render(&app, 160, 45);
+        assert!(t.contains("─┬─ Entry "), "{t}");
+        insta::assert_snapshot!(testing::render(&app, 160, 45).backend());
+    }
+
     fn slow_entries() -> Vec<SlowEntry> {
         let mut hg = entry(7, "HGETALL", &["cart:1002"], 45_300);
         hg.whole_key_read = true;
@@ -2951,7 +3026,17 @@ mod tests {
             };
             answer(&mut app, id, reply);
             app.handle_key(key(KeyCode::Enter));
-            for (w, h) in [(80, 24), (40, 12), (20, 6), (10, 3), (1, 1), (200, 60)] {
+            for (w, h) in [
+                (80, 24),
+                (40, 12),
+                (20, 6),
+                (10, 3),
+                (1, 1),
+                (120, 10),
+                (200, 60),
+                (1100, 30),
+                (u16::MAX, 6),
+            ] {
                 let _ = testing::render(&app, w, h);
             }
         }
@@ -3788,6 +3873,40 @@ mod monitor_tests {
         let mut app = with_lines();
         app.handle_key(ch('k'));
         insta::assert_snapshot!(testing::render(&app, 120, 36).backend());
+    }
+
+    #[test]
+    fn from_120_columns_a_run_puts_the_line_to_the_right_and_it_never_flips() {
+        // Before a run: the Line section under the log.
+        let t0 = Instant::now();
+        let app = on_monitor(t0, false);
+        let t = text(&app, 120, 36);
+        assert!(t.contains("├─ Line "), "{t}");
+        // A run with short lines: to the right, from the start.
+        let (mut app, run) = running(t0);
+        lines(&mut app, run, sample_lines()[1..4].to_vec());
+        let t = text(&app, 120, 36);
+        assert!(t.contains("─┬─ Line "), "{t}");
+        assert!(!t.contains("├─ Line "), "{t}");
+        let area = ratatui::layout::Rect::new(0, 0, 120, 36);
+        let rows = crate::tui::ui::list_rows(area, &app);
+        // A long line arriving mid-run changes neither the layout nor the page size.
+        lines(&mut app, run, sample_lines()[9..].to_vec());
+        let t = text(&app, 120, 36);
+        assert!(t.contains("─┬─ Line "), "{t}");
+        assert_eq!(crate::tui::ui::list_rows(area, &app), rows);
+        app.handle_key(key(KeyCode::End));
+        let t = text(&app, 120, 36);
+        assert!(t.contains("more arguments not kept"), "{t}");
+        insta::assert_snapshot!(
+            "monitor_long_line_160x45",
+            testing::render(&app, 160, 45).backend()
+        );
+        // Below 120 the line is under the log, as before.
+        assert!(text(&app, 100, 30).contains("├─ Line "));
+        for (w, h) in [(120, 10), (120, 3), (120, 1), (121, 2), (200, 60), (60, 16)] {
+            let _ = testing::render(&app, w, h);
+        }
     }
 
     #[test]

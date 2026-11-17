@@ -149,10 +149,16 @@ fn nodes_healthy_three_shards() {
         assert_eq!(column_of(&lines, 4, first), at, "{col}");
     }
     assert_eq!(colour_of(&t, "✓ analyzed"), TEAL);
-    // The detail section is the selected (first) node's, under the list in the same frame.
+    // The detail pane is the selected (first) node's: from 120 columns to the right of
+    // the list in the same frame, under it below 120.
+    assert!(lines[2].contains("┬─ 10.0.1.11:6379 "), "{lines:#?}");
+    let narrow = render(&app, 100, 30);
     assert!(
-        lines.iter().any(|l| l.starts_with("├─ 10.0.1.11:6379 ")),
-        "{lines:#?}"
+        buffer_lines(&narrow)
+            .iter()
+            .any(|l| l.starts_with("├─ 10.0.1.11:6379 ")),
+        "{:#?}",
+        buffer_lines(&narrow)
     );
     insta::assert_snapshot!(t.backend());
 }
@@ -215,7 +221,8 @@ fn nodes_with_replicas_scanned() {
     assert!(lines[5].contains("10.0.1.22:6379") && lines[5].contains("replica"));
     // The shard whose replica could not be used: its primary, with the reason.
     assert!(lines[6].contains("10.0.1.13:6379") && lines[6].contains("primary"));
-    assert!(text(&t).contains("▲ replica not used: 10.0.1.23:6379: timed out"));
+    // The reason in full where the details pane is wide enough for it on one line.
+    assert!(text(&render(&app, 200, 50)).contains("▲ replica not used: 10.0.1.23:6379: timed out"));
     // Not degraded: the summary in the header is dim.
     assert_eq!(colour_of(&t, REPLICAS), DIM);
     // A replica's detail names its primary.
@@ -499,7 +506,16 @@ fn every_cluster_screen_at_every_size_does_not_panic() {
             if screen == Screen::Nodes {
                 app.handle_key(key(KeyCode::Enter));
             }
-            for (w, h) in [(60, 20), (61, 21), (80, 24), (40, 10), (1, 1), (200, 60)] {
+            for (w, h) in [
+                (60, 20),
+                (61, 21),
+                (80, 24),
+                (40, 10),
+                (1, 1),
+                (200, 60),
+                (1100, 30),
+                (u16::MAX, 6),
+            ] {
                 render(app, w, h);
             }
         }
@@ -1201,6 +1217,85 @@ fn the_key_list_of_a_pattern_narrowed_to_a_node_reads_only_that_node() {
     assert!(text(&render(&app, 120, 36)).contains("1 of 1 nodes"));
 }
 
+/// Selects the pattern row named `name` on Patterns.
+fn select_pattern(app: &mut App, name: &str) {
+    let n = app.pattern_rows().len();
+    for i in 0..n {
+        app.patterns.sel = i;
+        if app.selected_single_pattern().as_deref() == Some(name) {
+            return;
+        }
+    }
+    panic!("no pattern row {name}");
+}
+
+/// A key list read on one node is not shown under the all-node Patterns once the
+/// narrowing is gone, and the reverse: the list beside a pattern is only the one
+/// `enter` would show for it now.
+#[test]
+fn a_key_list_of_another_walk_is_never_shown_beside_the_pattern() {
+    // Narrowed to node 1, open a pattern and load a key; esc, esc un-narrows.
+    let (mut app, _) = live_cluster();
+    show(&mut app, Screen::Nodes);
+    press(&mut app, "j");
+    app.handle_key(key(KeyCode::Enter));
+    let rows = app.pattern_rows();
+    app.patterns.sel = rows
+        .iter()
+        .position(|r| matches!(r, crate::tui::tree::Row::Pattern { .. }))
+        .expect("a pattern row");
+    let name = app.selected_single_pattern().expect("a pattern");
+    let effects = app.handle_key(key(KeyCode::Enter));
+    let p = pages(&effects);
+    answer(
+        &mut app,
+        p[0].0,
+        page_reply(vec![key_row("user:9:cart")], 0),
+    );
+    assert!(text(&render(&app, 120, 36)).contains("user:9:cart"));
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.screen(), Screen::Patterns);
+    // Beside the narrowed pattern its own list still shows.
+    assert!(app.keys_hold(&name));
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.patterns.node.is_none(), "un-narrowed");
+    select_pattern(&mut app, &name);
+    assert!(!app.keys_hold(&name));
+    for (w, h) in [(120, 36), (160, 45)] {
+        let t = text(&render(&app, w, h));
+        assert!(!t.contains("user:9:cart"), "{w}x{h}:\n{t}");
+    }
+
+    // The reverse: opened on every node, then narrowed to node 1.
+    let (mut app, _) = live_cluster();
+    show(&mut app, Screen::Patterns);
+    let rows = app.pattern_rows();
+    app.patterns.sel = rows
+        .iter()
+        .position(|r| matches!(r, crate::tui::tree::Row::Pattern { .. }))
+        .expect("a pattern row");
+    let name = app.selected_single_pattern().expect("a pattern");
+    let effects = app.handle_key(key(KeyCode::Enter));
+    let p = pages(&effects);
+    answer(
+        &mut app,
+        p[0].0,
+        page_reply(vec![key_row("user:1:cart")], 0),
+    );
+    assert!(text(&render(&app, 120, 36)).contains("user:1:cart"));
+    app.handle_key(key(KeyCode::Esc));
+    show(&mut app, Screen::Nodes);
+    press(&mut app, "j");
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.patterns.node.is_some(), "narrowed");
+    select_pattern(&mut app, &name);
+    assert!(!app.keys_hold(&name));
+    for (w, h) in [(120, 36), (160, 45)] {
+        let t = text(&render(&app, w, h));
+        assert!(!t.contains("user:1:cart"), "{w}x{h}:\n{t}");
+    }
+}
+
 /// The find pages among `effects`: id, where it goes, and its cursor.
 fn find_pages(effects: &[Effect]) -> Vec<(crate::live::ReqId, Dest, u64)> {
     sent(effects)
@@ -1277,7 +1372,7 @@ fn a_find_leaves_out_a_node_without_a_connection() {
     assert!(find_pages(&effects).is_empty(), "{effects:?}");
     assert!(app.views.keys.done);
     assert_eq!(app.views.keys.missing, [2]);
-    let wide = text(&render(&app, 120, 36));
+    let wide = text(&render(&app, 200, 50));
     assert!(wide.contains("2 of 3 nodes"), "{wide}");
     assert!(wide.contains(NODE_3_NOT_CONNECTED), "{wide}");
 }
@@ -1296,8 +1391,9 @@ fn the_key_detail_reads_the_slot_owner_and_names_it() {
     for (_, to, req) in &reads {
         assert_eq!(*to, Dest::key("foo"), "{req:?}");
     }
+    // At 120 the value's facts wrap: the node is named whole.
     let all = text(&render(&app, 120, 36));
-    assert!(all.contains("10.0.1.13:6379"), "{all}");
+    assert!(all.contains("on node 10.0.1.13:6379"), "{all}");
 }
 
 #[test]

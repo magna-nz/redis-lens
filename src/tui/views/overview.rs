@@ -232,6 +232,8 @@ pub struct OverviewState {
     /// The running analysis was started with `r` (the only way one starts): its report
     /// announces itself in the notice line.
     pub announce: bool,
+    /// Finding rows the last frame drew: what PgUp and PgDn move by (`ui::list_rows`).
+    pub drawn_rows: std::cell::Cell<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +251,10 @@ pub const IDLE_CLIENTS_MIN: usize = 10;
 pub struct Finding {
     pub severity: Severity,
     pub text: String,
+    /// What to do about it, in the words of the recommendation it comes from; empty
+    /// for what the server says on its own. Overview explains the selected finding
+    /// with it.
+    pub hint: String,
     /// Where `enter` goes: Analyze › Big keys, Expiry or Changes, Server › Slow log or
     /// Clients.
     pub to: Screen,
@@ -304,6 +310,7 @@ fn slow_finding(slow: &[SlowEntry]) -> Option<Finding> {
     };
     Some(Finding {
         severity: Severity::Note,
+        hint: String::new(),
         text: format!(
             "{name} took {} at {}.",
             micros_text(e.micros),
@@ -340,6 +347,7 @@ fn idle_finding(conns: &[ClientConn]) -> Option<Finding> {
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))?;
     (n >= IDLE_CLIENTS_MIN).then(|| Finding {
         severity: Severity::Info,
+        hint: String::new(),
         text: format!(
             "{} connections from {host} idle for over an hour.",
             format::grouped(n as u64)
@@ -376,6 +384,7 @@ pub(crate) fn server_findings_of(
         let what = if n == 1 { "big key" } else { "big keys" };
         out.push(Finding {
             severity: Severity::Warn,
+            hint: String::new(),
             text: format!(
                 "{} {what}, counted by the server (INFO keysizes).",
                 format::grouped(n)
@@ -436,6 +445,7 @@ pub(crate) fn analysis_findings_of(
             severity: rec.severity,
             to: rec_target(&rec, diff.is_some()),
             text: rec.text,
+            hint: rec.hint,
         })
         .collect();
     out.extend(slow_finding(slow));
