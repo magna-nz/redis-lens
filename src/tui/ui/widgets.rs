@@ -875,22 +875,35 @@ pub fn dialog(frame: &mut Frame, area: Rect, w: u16, h: u16, title: &str, right:
 pub fn focus_box(frame: &mut Frame, rect: Rect, title: &str, right: &str) -> Rect {
     let rect = rect.intersection(frame.area());
     frame.render_widget(ratatui::widgets::Clear, rect);
+    titled_box(frame, rect, Title::new(title, right), true)
+}
+
+/// A closed box at `rect` with `t` in its top border, drawn over what is there (nothing
+/// cleared). `focused`: the box has the keys, its border in the focus colour and its
+/// title bold in it; else the normal border and a dim title. Returns its inner area,
+/// empty when `rect` is too small for a box.
+pub fn titled_box(frame: &mut Frame, rect: Rect, t: Title<'_>, focused: bool) -> Rect {
+    let rect = rect.intersection(frame.area());
     if rect.width < 4 || rect.height < 2 {
         return Rect::default();
     }
-    let on = style::focus();
+    let (title_st, line) = if focused {
+        (style::title(), style::focus())
+    } else {
+        (style::dim(), style::border())
+    };
     let w = usize::from(rect.width);
     put(
         frame,
         rect.x,
         rect.y,
         rect.width,
-        border_line(w, "┌", "┐", Title::new(title, right), style::title(), on),
+        border_line(w, "┌", "┐", t, title_st, line),
     );
     let bottom = rect.y + rect.height - 1;
     for row in rect.y + 1..bottom {
-        put_char(frame, rect.x, row, "│", on);
-        put_char(frame, rect.x + rect.width - 1, row, "│", on);
+        put_char(frame, rect.x, row, "│", line);
+        put_char(frame, rect.x + rect.width - 1, row, "│", line);
     }
     put(
         frame,
@@ -898,9 +911,9 @@ pub fn focus_box(frame: &mut Frame, rect: Rect, title: &str, right: &str) -> Rec
         bottom,
         rect.width,
         vec![
-            Span::styled("└", on),
-            Span::styled("─".repeat(w.saturating_sub(2)), on),
-            Span::styled("┘", on),
+            Span::styled("└", line),
+            Span::styled("─".repeat(w.saturating_sub(2)), line),
+            Span::styled("┘", line),
         ],
     );
     Rect::new(
