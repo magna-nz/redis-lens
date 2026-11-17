@@ -28,7 +28,7 @@ redis-lens writes to a server only through the one write gate ([Write permission
 
 ## Views
 
-The TUI has a home screen and five areas, switched with `0` to `5` ([Navigation](#navigation)): 0 Connections (the home screen), 1 Overview, 2 Browse, 3 Analyze, 4 Server and 5 Pub/Sub. `6` does nothing. Three areas have panels, shown after the area's name in the area row, switched with `tab` and `shift-tab`:
+The TUI has a home screen and five areas, switched with `0` to `5` ([Navigation](#navigation)): 0 Connections (the home screen), 1 Overview, 2 Browse, 3 Analyze, 4 Server and 5 Pub/Sub. `6` does nothing. `tab` and `shift-tab` go through every area and panel in one ring ([Navigation](#navigation)). Three areas have panels, shown after the area's name in the area row:
 - 2 Browse: Keys · Streams · Search;
 - 3 Analyze: Big keys · Expiry · Changes · Hot keys, plus Nodes · Slots only on a cluster;
 - 4 Server: Clients · Slow log · Monitor.
@@ -192,7 +192,7 @@ From 120 columns Browse › Keys is one frame of up to three panes, side by side
   A field or member that `HSCAN` or `SSCAN` returns twice is listed once.
 - **Field TTLs** are read only on Redis 7.4 and later and Valkey 9.0 and later, from the version read on connect. On older servers the TTL column and the Field TTL row are hidden and `HTTL` is never sent. When `HTTL` is refused or unknown, field TTLs are off for the rest of the session, with a note.
 - **Layout:** a collection lists its items (field, value and TTL for a hash; index and element; member; member and score; entry ID and its fields), each value shortened to one line. Below a divider, the selected item's value is shown in full. Its header gives the name, the format, the size and "auto-detected" or "shown as <format>", and "decompressed from gzip" (or zlib, LZ4, zstd), "truncated at 1 MiB" or the renderer's own note when they apply. A stream entry lists each field name with its value. A string or a JSON document shows just its value.
-- **Focus:** `→` (`l`) moves from the items into the value below the divider, and `←` (`h`, `esc`) back to the items; `tab` only switches panels. The move keys move the selection, or scroll the value when it has the focus. A string or a document always scrolls.
+- **Focus:** `→` (`l`) moves from the items into the value below the divider, and `←` (`h`, `esc`) back to the items; `tab` only goes through the [ring of areas and panels](#navigation). The move keys move the selection, or scroll the value when it has the focus. A string or a document always scrolls.
 - **Formats:** `f` shows the value in the next format (text, hex, JSON, MessagePack, PHP, Pickle, Protobuf, Java, then text again), starting from the detected one, and says so ("Shown as hex."). A format that doesn't fit the bytes falls back, with a note. It holds for every item of the key until another key is opened. Detection is in [Values](#values).
 - **Copy:** `y` copies the selected value in the format shown. Text with control characters, a newline included, is not copied: "The value has control characters, so it is not copied: press f for hex, then y." A stream entry has several fields, so it is not copied.
 - **Refusals** (rule 3): a read the server refuses is turned off, and the panel says so in redis-lens's own words ("Can't read the value: the server refused HSCAN for this user."), never with the server's text or the username. `m` does not send it again. A refused `STRLEN` only leaves the length out. Any other failure shows its reason, and `m` tries again. `r` does nothing here.
@@ -263,6 +263,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous area or panel once a connect starts |
 | `enter` | Connect: reads the server's own figures, no keys |
 | `+` | Add a connection |
 | `/` | Filter the profiles by name or tag |
@@ -277,6 +278,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous area or panel once a connect starts |
 | `enter` | Go to the selected finding's panel |
 | `esc` | Stop the analysis and keep what it has sampled |
 | `space` | Pause or resume the live figures |
@@ -290,7 +292,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `tab` `shift-tab` | Next or previous panel or area, in one ring |
 | `→` `l` `enter` | Open a pattern's keys, or expand a group and go in |
 | `←` `h` | Collapse a group, or go up to it |
 | `/` | Filter patterns by name |
@@ -311,7 +313,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `tab` `shift-tab` | Next or previous panel or area, in one ring |
 | `→` `l` `enter` | Show the selected key's value |
 | `←` `h` `esc` | Clear the filters first, then go back |
 | `/` | Filter the loaded keys by name |
@@ -334,7 +336,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection, or scroll the value |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `tab` `shift-tab` | Next or previous panel or area, in one ring |
 | `→` `l` | Move into the value pane |
 | `←` `h` `esc` | Back to the items, then to the key list |
 | `f` | Show the value as text, hex, JSON, MessagePack, PHP, Pickle, Protobuf or Java |
@@ -356,7 +358,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection, or scroll the value |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `tab` `shift-tab` | Next or previous panel or area, in one ring |
 | `→` `l` | Into the right pane: the details or an entry's value |
 | `←` `h` | Back to the left pane, or close the entries or result |
 | `enter` | List the selected stream's entries |
@@ -378,7 +380,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection, or scroll the text |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `tab` `shift-tab` | Next or previous panel or area, in one ring |
 | `→` `l` | Into the right pane: the details or a result's value |
 | `←` `h` | Back to the left pane, or close the entries or result |
 | `/` | Run a query on the selected index |
@@ -400,7 +402,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `tab` `shift-tab` | Next or previous panel or area, in one ring |
 | `y` | Copy the selected key name to the clipboard |
 | `a` | Analyze again (Quick or Deep); old results stay |
 | `ctrl-s` | Save a snapshot of the analysis |
@@ -412,7 +414,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `tab` `shift-tab` | Next or previous panel or area, in one ring |
 | `y` | Copy the selected pattern to the clipboard |
 | `Y` | Copy a redis-cli --scan command for the pattern |
 | `a` | Analyze again (Quick or Deep); old results stay |
@@ -425,7 +427,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `tab` `shift-tab` | Next or previous panel or area, in one ring |
 | `y` | Copy the selected pattern to the clipboard |
 | `Y` | Copy a redis-cli --scan command for the pattern |
 | `a` | Analyze again (Quick or Deep); old results stay |
@@ -438,7 +440,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `tab` `shift-tab` | Next or previous panel or area, in one ring |
 | `y` | Copy the selected key name to the clipboard |
 | `Y` | Copy a redis-cli --scan command for the pattern |
 | `a` | Analyze again (Quick or Deep); old results stay |
@@ -451,7 +453,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `tab` `shift-tab` | Next or previous panel or area, in one ring |
 | `enter` | Only this node's patterns in Browse › Keys |
 | `a` | Analyze again (Quick or Deep); old results stay |
 | `ctrl-s` | Save a snapshot of the analysis |
@@ -463,7 +465,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move through the hottest slots |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `tab` `shift-tab` | Next or previous panel or area, in one ring |
 | `s` | Sort the hottest slots by keys, CPU, net in or out |
 | `r` | Read the slot stats again on every node |
 
@@ -474,7 +476,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `tab` `shift-tab` | Next or previous panel or area, in one ring |
 | `enter` | List the selected group's connections |
 | `esc` | Back to the groups |
 | `space` | Pause or resume polling |
@@ -489,7 +491,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `tab` `shift-tab` | Next or previous panel or area, in one ring |
 | `space` | Pause or resume polling |
 | `r` | Refresh this panel now |
 | `y` | Copy the selected command line, masked |
@@ -504,7 +506,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Scroll the lines |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous panel, nothing else |
+| `tab` `shift-tab` | Next or previous panel or area, in one ring |
 | `enter` | Start MONITOR (asks; stops at 30 s or 10,000 lines) |
 | `esc` | Stop MONITOR now |
 | `y` | Copy the selected command line, masked |
@@ -517,6 +519,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
+| `tab` `shift-tab` | Next or previous area or panel once a connect starts |
 | `enter` | Subscribe to the selected channel |
 | `+` | Subscribe to a channel or pattern |
 | `S` | Subscribe to a shard channel (SSUBSCRIBE) |
@@ -547,7 +550,7 @@ The footer shows 3 to 5 of these keys for the screen on show, chosen by its stat
 ### Keys overlay
 
 `?` opens the keys overlay over the dimmed screen, titled "Keys · <screen>" (as the footer's `? Keys` names it; it used to be called Help), with a search line at the top ("type to find any action or screen…").
-- With nothing typed it lists HERE, the keys of the screen it was opened on, then EVERYWHERE, the keys that work on every screen.
+- With nothing typed it lists HERE, the keys of the screen it was opened on, then EVERYWHERE, the keys that work on every screen. When they do not all fit, its last line says how many more there are, "↓ n more: type to search".
 - Typing searches every screen and every action of every screen, ignoring case; every typed word must match. Screens come first ("Go to Server › Slow log"), then actions in screen order, each with where it is on the right (`e on Slow log`, `v everywhere`), then the keys that work everywhere. An action shared by several screens is listed once. The move keys are left out, and Nodes and Slots only show on a cluster.
 - `↑↓` pick a line, Backspace edits, `esc` clears the search and, with none, closes; `?` with nothing typed closes too. Every other key is typed into the search, `q` included; ctrl-c still quits.
 - `enter` runs the picked line as if its key had been pressed on its screen: it goes to that screen first (to the key list or a key's value only when one is open), then presses the key there, through every check that key meets. A write still goes through the [write gate](#write-permissions) and its question. When the screen can't be reached (no key open, or Nodes off a cluster) nothing is pressed. A screen's line just goes there.
@@ -893,7 +896,8 @@ Phase 1 is built: [Navigation](#navigation), the [Shared command budget](#shared
 ### Navigation
 
 - **Areas:** `0` Connections (the home screen), `1` Overview, `2` Browse, `3` Analyze, `4` Server, `5` Pub/Sub. `6` and any other digit do nothing. Before connecting, `1` to `5` still switch, and the body says "Connect first: open 0 Connections, pick a connection and press enter." An area keeps the panel and the level it was left at.
-- **Panels:** `tab` and `shift-tab` switch to the next or previous panel of the area on screen, at the level it was left at, and do nothing else: they never move between panes. Browse has Keys · Streams · Search; Analyze has Big keys · Expiry · Changes · Hot keys, and Nodes · Slots only on a cluster (off a cluster they are not in the cycle, the area row or the `?` search); Server has Clients · Slow log · Monitor.
+- **Panels:** Browse has Keys · Streams · Search; Analyze has Big keys · Expiry · Changes · Hot keys, and Nodes · Slots only on a cluster (off a cluster they are not in the ring, the area row or the `?` search); Server has Clients · Slow log · Monitor. The current area's digit pressed again moves to its next panel, round the end within the area.
+- **`tab` ring:** `tab` goes to the next stop of one ring through every area and panel, `shift-tab` to the previous one, wrapping at both ends: Overview → Browse › Keys → Streams → Search → Analyze › Big keys → Expiry → Changes → Hot keys → (Nodes → Slots, on a cluster only) → Server › Clients → Slow log → Monitor → Pub/Sub → Connections → Overview again. This is the area row's order, `0 Connections` at its right last. `tab` on an area's last panel goes to the next area's first panel, and `shift-tab` on its first panel to the previous area's last panel. A panel that is off stays in the ring and shows why. Entering a stop is the same switch as its digit or the digit again: a panel shows the level it was left at (Browse › Keys its key list or value when left open), it reads what that switch reads and nothing more, and Monitor is never started by it. Until a connection has been started, the ring is Connections alone, so `tab` does nothing; once one has been started (while it connects, once connected, and after a failed connect, as for the area row and the digit keys) the ring is full. `tab` and `shift-tab` do nothing else: they never move between panes, and wherever a text input, form, prompt, dialog, the Actions menu, Go to, the confirm sheet or the command line takes the keys, `tab` is theirs.
 - **Deeper and back:** `→` `l` `enter` go one level deeper or into the right pane: on Browse › Keys a group expands, a pattern lists its keys, a key shows its value, and on a value `→` moves into the value; on Streams and Search `→` moves into the right pane (`enter` lists a stream's entries or opens a result). `←` `h` go back: collapse a group or go up to it, from a key's value to the key list, from the key list to the patterns, from a right pane to the left one, and on a stream's entries or a Search result back to the list. `esc` clears a filter first, then goes back as `←` does (on Browse › Keys it leaves a node narrowing instead of collapsing). On a screen where `esc` has nothing else to do it stops a running analysis and keeps what it sampled ([Analysis](#analysis)).
 - **`v`** shows more columns and details on the area on screen, or fewer again: one setting per area, off by default, kept while the app runs, across connects too. What it adds is said with each screen.
 - **Footer and `?`:** the footer shows the 3 to 5 keys that matter on the screen and `. Actions   ^K Go to   ? Keys` at the right ([Keys](#keys)); `.` lists the actions of the selection and the screen with their keys and state ([Actions menu](#actions-menu)); `ctrl-k` goes to a pattern, a loaded key, a screen or an action ([Go to](#go-to)); `?` lists the rest and finds any action ([Keys overlay](#keys-overlay)). Command names are left out of titles; `v` and `?` show them.
@@ -906,7 +910,7 @@ Phase 1 is built: [Navigation](#navigation), the [Shared command budget](#shared
   - **Dialogs** (`?`, "Analyze the keys?", a bulk action's dry run, the database list) draw centred over the screen, and [Go to](#go-to) near its top, which is dimmed behind them, all but the footer, which says what the dialog wants.
   - **The confirm sheet** is the one question every write and costly read asks: see [The confirm sheet](#the-confirm-sheet). The [Actions menu](#actions-menu) (`.`) sits at the bottom-right of the body.
   - Every state keeps a word or a glyph (`✓` `▲` `✗` `●` `○`), never colour alone, so the light theme and `NO_COLOR` still read.
-- **Area row:** `1 Overview   2 Browse › Keys · Streams · Search   3 Analyze   4 Server   5 Pub/Sub` with `0 Connections` at the right. The area on screen is bold with its digit as a key cap, and its panels follow its name after `›`: the current panel bold in the focus colour, the others dim. The other areas are dim; before connecting areas 1 to 5 are faint. Search is dimmed when its probe (`FT._LIST`) was refused or found no module. When the row is short, `0 Connections` shows only `0` first, then the other areas show only their digit, then the panels show only the current one and its place, such as `Expiry · 2 of 4`; the area on screen keeps its name (Connections too, while it is on screen). On Browse a short note sits at the right, before `0 Connections`: "names only, no analysis yet", "names only until the analysis has results", or "Search is off: no search module"; it is left out when it does not fit beside the panels.
+- **Area row:** `1 Overview   2 Browse › Keys · Streams · Search   3 Analyze   4 Server   5 Pub/Sub` with `0 Connections` at the right: the order `tab` goes in. The area on screen is bold with its digit as a key cap, and its panels follow its name after `›`: the current panel bold in the focus colour, the others dim. The other areas are dim; before connecting areas 1 to 5 are faint. Search is dimmed when its probe (`FT._LIST`) was refused or found no module. When the row is short, `0 Connections` shows only `0` first, then the other areas show only their digit, then the panels show only the current one and its place, such as `Expiry · 2 of 4`; the area on screen keeps its name (Connections too, while it is on screen). On Browse a short note sits at the right, before `0 Connections`: "names only, no analysis yet", "names only until the analysis has results", or "Search is off: no search module"; it is left out when it does not fit beside the panels.
 - **Header (context bar):** one line. Before connecting: `redis-lens <version>   not connected`, and "pick a connection, then enter" at the right. Once connected, the profile's name (never a username or password), its environment badge, the ` w ` key cap and the write state; then ` b ` and the database (`db 3`), on a cluster the `[ ]` key cap and the picked node (`node 10.0.1.11:6379 · 1 of 3`), and the facts, dim and joined by ` · `: the keychain hint while a keychain read is slow, the cluster summary or the address, `standalone`, the replica the session reads, the server and version, memory used against the limit (`15G / 24G`, or `15G used`), the key count and `▲ no sizes` when `MEMORY USAGE` is denied. As many as fit show, kept in this order of importance when the line is short: the database when it is not 0, the keychain hint and the cluster summary (both cut with `…` rather than dropped), memory, the key count, `standalone`, the node, the replica, then `▲ no sizes`. After those, three parts show only when they fit, in this order, each only while the ones before it did: the address, database 0, then the server and version. So the version goes first as the line narrows, then database 0, then the address; the version or database 0 never shows without the address. Between the name, the badge and the ` w ` key cap there is one space. The status sits at the right:
   - `⠋ connecting…`;
   - `● connected 14:02 UTC`: connected, no analysis yet;

@@ -37,4 +37,4 @@ expression: t.backend()
 "│                                                                         │                                            │"
 "│ Estimated from 100,000 sampled keys of 7.92M. v shows more columns.     │                                            │"
 "└─ sample explains 98% of dataset.bytes 14G · exact keys 7,920,000 · 64…──┴────────────────────────────────────────────┘"
-" ↑↓ Move   → Open   / Filter   s Sort   tab Next panel                                     . Actions   ^K Go to   ? Keys"
+" ↑↓ Move   → Open   / Filter   s Sort   tab Next                                           . Actions   ^K Go to   ? Keys"

@@ -1368,6 +1368,45 @@ mod tests {
         }
     }
 
+    /// `→` pressed again and again on Search, on the list and with a result open, never
+    /// leaves Search. `tab` and `shift-tab` go round the ring and back, and the result is
+    /// still open; inside the `/` query input `tab` stays in the input.
+    #[test]
+    fn right_never_leaves_search_tab_keeps_the_result_and_the_query_input_keeps_tab() {
+        let mut app = with_results();
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Right));
+            assert_eq!(app.screen(), Screen::Search);
+        }
+        let mut app = with_results();
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.views.search.deeper.is_some());
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Right));
+            assert_eq!(app.screen(), Screen::Search);
+            assert!(app.views.search.deeper.is_some());
+        }
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.screen(), Screen::BigKeys);
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.screen(), Screen::Search);
+        assert!(app.views.search.deeper.is_some());
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.screen(), Screen::Streams);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.screen(), Screen::Search);
+        assert!(app.views.search.deeper.is_some());
+        // The query input takes tab.
+        let mut app = with_results();
+        app.handle_key(ch('/'));
+        assert!(app.view_input().is_some());
+        for k in [KeyCode::Tab, KeyCode::BackTab] {
+            app.handle_key(key(k));
+            assert_eq!(app.screen(), Screen::Search, "{k:?}");
+            assert!(app.view_input().is_some(), "{k:?}");
+        }
+    }
+
     #[test]
     fn enter_opens_a_result_and_f_y_esc_work_on_its_fields() {
         let mut app = with_results();

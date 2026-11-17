@@ -48,7 +48,7 @@ Lower case acts on the selected row, upper case on what it belongs to: with a fi
 | Key | Does |
 |---|---|
 | `1`–`5`, `0` | Overview, Browse, Analyze, Server, Pub/Sub, Connections. The current area's digit again goes to its next panel |
-| `tab` `shift-tab` | Next or previous panel (terminal; the browser keeps them for focus) |
+| `tab` `shift-tab` | Every area and its panels in turn, wrapping (terminal; the browser keeps them for focus) |
 | `↑↓` `j` `k`, `PgUp` `PgDn`, `Home` `End` | Move |
 | `→` `l` `enter` / `←` `h` `esc` | Open, or go back |
 | `/` | Filter the list |

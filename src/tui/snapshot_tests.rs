@@ -2096,7 +2096,7 @@ fn streams_before_an_analysis_offer_a_analyze_in_the_footer() {
     let mut app = connected_without_analysis(Screen::Streams);
     let lines = buffer_lines(&render(&app, 80, 24));
     assert!(
-        lines[23].starts_with(" a Analyze   tab Next panel"),
+        lines[23].starts_with(" a Analyze   tab Next "),
         "{}",
         lines[23]
     );

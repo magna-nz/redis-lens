@@ -2887,6 +2887,29 @@ mod tests {
         assert_eq!(app.screen(), Screen::KeyDetail);
     }
 
+    /// `→` and `l` pressed again and again on a key's value move into the value pane and
+    /// stay there: they never leave Browse. A form opened with `+` keeps `tab` and
+    /// `shift-tab` (its fields), so they do not go round the ring.
+    #[test]
+    fn right_on_a_value_never_leaves_browse_and_a_form_keeps_tab() {
+        let mut app = hash_app();
+        assert_eq!(app.screen(), Screen::KeyDetail);
+        for k in [key(KeyCode::Right), ch('l')] {
+            for _ in 0..5 {
+                app.handle_key(k);
+                assert_eq!(app.screen(), Screen::KeyDetail);
+            }
+        }
+        assert_eq!(app.views.value.focus, Focus::Value);
+        app.handle_key(ch('+'));
+        assert!(app.views.value.form.is_some(), "{}", notice(&app));
+        for k in [KeyCode::Tab, KeyCode::BackTab, KeyCode::Tab, KeyCode::Tab] {
+            app.handle_key(key(k));
+            assert_eq!(app.screen(), Screen::KeyDetail, "{k:?}");
+            assert!(app.views.value.form.is_some(), "{k:?}");
+        }
+    }
+
     #[test]
     fn plus_adds_without_overwriting() {
         let k = |s: &str| s.to_string();

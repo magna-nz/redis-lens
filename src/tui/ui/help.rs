@@ -88,6 +88,17 @@ pub fn draw_for(
         lines.push(Line::raw(""));
         lines.push(heading("EVERYWHERE", inner));
         lines.extend(keymap::global().iter().map(|h| entry(h, inner)));
+        // Rows that do not fit are said, not cut silently: the last line that fits says
+        // how many more there are, and the search finds every one of them.
+        let room = usize::from(area.height.saturating_sub(2));
+        if room > 0 && lines.len() > room {
+            let more = lines.len() - (room - 1);
+            lines.truncate(room - 1);
+            lines.push(Line::from(Span::styled(
+                trunc(&format!("↓ {more} more: type to search"), inner),
+                style::dim(),
+            )));
+        }
     } else if hits.is_empty() {
         lines.push(Line::from(Span::styled(
             trunc("Nothing matches. Backspace edits, esc clears.", inner),
@@ -184,6 +195,23 @@ mod tests {
     #[test]
     fn filtered_120x36() {
         insta::assert_snapshot!(render(Screen::Overview, "slow", 120, 36).backend());
+    }
+
+    /// Keys that do not fit are counted on the last line, never cut without a word.
+    #[test]
+    fn rows_that_do_not_fit_are_said() {
+        let text = |s, w, h| format!("{:?}", render(s, "", w, h).backend().buffer());
+        // Connections at 80x24: 26 lines in 22 rows, so the last row says 5 more.
+        assert!(text(Screen::Connections, 80, 24).contains("↓ 5 more: type to search"));
+        for s in [Screen::Connections, Screen::Overview, Screen::Patterns] {
+            assert!(
+                text(s, 80, 24).contains("more: type to search"),
+                "{}",
+                s.title()
+            );
+            // Everything fits: no line about more.
+            assert!(!text(s, 80, 60).contains("more: type to search"));
+        }
     }
 
     #[test]

@@ -916,7 +916,7 @@ pub mod testing {
     }
 
     /// Goes to `screen` with keys, as a user would: its area's digit (unless the area is
-    /// on screen already), then `tab` to the panel; for the key list, `enter` on the first pattern row of Browse › Keys. For
+    /// on screen already), then the digit again to the panel; for the key list, `enter` on the first pattern row of Browse › Keys. For
     /// the key detail, `enter` on the key list's selected key; when no key is loaded,
     /// [`key_row`] is put into the list first.
     pub fn show(app: &mut App, screen: Screen) -> Vec<Effect> {
@@ -959,11 +959,17 @@ pub mod testing {
             app.patterns.sel = first;
             out.extend(app.handle_key(key(KeyCode::Enter)));
         }
+        // The area's digit again moves to its next panel and stays in the area (`tab`
+        // would go on to the next area past its last panel, and does nothing before
+        // connecting).
         for _ in 0..app.panels_of(screen.area()).len() {
             if app.screen() == screen {
                 break;
             }
-            out.extend(app.handle_key(key(KeyCode::Tab)));
+            out.extend(app.handle_key(KeyEvent::new(
+                KeyCode::Char(screen.area().digit()),
+                KeyModifiers::NONE,
+            )));
         }
         assert_eq!(app.screen(), screen);
         out

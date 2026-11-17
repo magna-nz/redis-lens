@@ -402,13 +402,24 @@ const ENDS: KeyHelp = k(
     "Jump to the first or last row",
     false,
 );
+/// `tab` on a panel: one ring through every area and panel (`App::tab_ring_key`).
 const PANEL: KeyHelp = k(
     Verb::Panel,
     "tab shift-tab",
     "tab",
-    "Next panel",
-    "Next or previous panel, nothing else",
+    "Next",
+    "Next or previous panel or area, in one ring",
     true,
+);
+/// `tab` on an area without panels (Connections, Overview, Pub/Sub): the same ring.
+/// Never in a footer.
+const AREA_TAB: KeyHelp = k(
+    Verb::Panel,
+    "tab shift-tab",
+    "tab",
+    "Next",
+    "Next or previous area or panel once a connect starts",
+    false,
 );
 const COPY_PATTERN: KeyHelp = k(
     Verb::Copy,
@@ -482,10 +493,11 @@ const BULK_TTL_HELP: &str = "Set a TTL on every key of the pattern (writes)";
 /// `D` on the key list and `d` on Patterns: the bulk delete of a pattern.
 const BULK_DELETE_HELP: &str = "Delete every key of the pattern (writes)";
 
-static CONNECTIONS: [KeyHelp; 8] = [
+static CONNECTIONS: [KeyHelp; 9] = [
     MOVE,
     PAGE,
     ENDS,
+    AREA_TAB,
     k(
         Verb::Open,
         "enter",
@@ -514,7 +526,7 @@ static CONNECTIONS: [KeyHelp; 8] = [
     ),
 ];
 
-static OVERVIEW: [KeyHelp; 9] = [
+static OVERVIEW: [KeyHelp; 10] = [
     k(
         Verb::Analyze,
         "a",
@@ -526,6 +538,7 @@ static OVERVIEW: [KeyHelp; 9] = [
     MOVE,
     PAGE,
     ENDS,
+    AREA_TAB,
     k(
         Verb::Open,
         "enter",
@@ -1083,10 +1096,11 @@ static STREAMS: [KeyHelp; 17] = [
     .in_group(Group::Row),
 ];
 
-static PUBSUB: [KeyHelp; 13] = [
+static PUBSUB: [KeyHelp; 14] = [
     MOVE,
     PAGE,
     ENDS,
+    AREA_TAB,
     k(
         Verb::Open,
         "enter",
@@ -1776,11 +1790,11 @@ mod tests {
         // Browse footers show how to reach Streams and Search.
         assert_eq!(
             names(Screen::Patterns, connected),
-            ["Move", "Open", "Filter", "Analyze", "Next panel"]
+            ["Move", "Open", "Filter", "Analyze", "Next"]
         );
         assert_eq!(
             names(Screen::Patterns, analyzed),
-            ["Move", "Open", "Filter", "Sort", "Next panel"]
+            ["Move", "Open", "Filter", "Sort", "Next"]
         );
         assert_eq!(
             names(
@@ -1851,26 +1865,26 @@ mod tests {
         );
         assert_eq!(
             names(Screen::Ttl, analyzed),
-            ["Move", "Next panel", "Copy", "Analyze", "Save"]
+            ["Move", "Next", "Copy", "Analyze", "Save"]
         );
-        assert_eq!(names(Screen::Ttl, connected), ["Analyze", "Next panel"]);
+        assert_eq!(names(Screen::Ttl, connected), ["Analyze", "Next"]);
         // Before an analysis there are no streams yet: `a` analyzes.
-        assert_eq!(names(Screen::Streams, connected), ["Analyze", "Next panel"]);
+        assert_eq!(names(Screen::Streams, connected), ["Analyze", "Next"]);
         assert_eq!(
             names(Screen::Streams, analyzed),
-            ["Move", "Details", "Entries", "Next panel"]
+            ["Move", "Details", "Entries", "Next"]
         );
         assert_eq!(
             names(Screen::Search, connected),
-            ["Move", "Details", "Query", "Open", "Next panel"]
+            ["Move", "Details", "Query", "Open", "Next"]
         );
         assert_eq!(
             names(Screen::Nodes, analyzed),
-            ["Move", "This node only", "Next panel"]
+            ["Move", "This node only", "Next"]
         );
         assert_eq!(
             names(Screen::Search, FooterCtx::default()),
-            ["Next panel", "Connections"]
+            ["Next", "Connections"]
         );
         assert_eq!(names(Screen::PubSub, FooterCtx::default()), ["Connections"]);
         assert_eq!(
@@ -2084,13 +2098,34 @@ mod tests {
         assert!(!bound(Screen::Connections, "a"));
     }
 
-    /// `tab` is in the table exactly where it does something: on the screens of an
-    /// area with panels, where it switches panels and nothing else.
+    /// `tab` is in the table on every screen, as it goes through the ring of every
+    /// area and panel: the panel row on an area with panels, the area row (never in a
+    /// footer) on the others.
     #[test]
-    fn tab_is_listed_on_every_panel_and_only_there() {
+    fn tab_is_listed_on_every_screen() {
         for s in Screen::ALL {
-            let listed = for_screen(s).iter().any(|h| h.keys == "tab shift-tab");
-            assert_eq!(listed, s.area().has_panels(), "{}", s.title());
+            let rows: Vec<_> = for_screen(s)
+                .iter()
+                .filter(|h| h.keys == "tab shift-tab")
+                .collect();
+            assert_eq!(rows.len(), 1, "{}", s.title());
+            let want = if s.area().has_panels() {
+                PANEL
+            } else {
+                AREA_TAB
+            };
+            assert_eq!(*rows[0], want, "{}", s.title());
+            assert_eq!(rows[0].label, "Next", "{}", s.title());
+            // No footer of an area without panels shows it.
+            if !s.area().has_panels() {
+                for c in contexts() {
+                    assert!(
+                        footer(s, c).iter().all(|(k, _)| *k != "tab"),
+                        "{} {c:?}",
+                        s.title()
+                    );
+                }
+            }
         }
     }
 
