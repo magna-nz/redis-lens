@@ -2,17 +2,23 @@
 //! light one for light terminals (`[settings] theme = "light"`), and none at all when
 //! `NO_COLOR` is set and not empty (<https://no-color.org>).
 //!
-//! The style functions (`dim()`, `warn()` …) read one process-wide mode, set once at TUI
+//! The style functions (`dim()`, `warning()` …) read one process-wide mode, set once at TUI
 //! start by [`init`]. Each is a thin wrapper over a pure `role(Role, Mode)` that the
 //! tests call with an explicit mode, so they never touch the global. Nothing in the UI
 //! tells a state by colour alone: every state has its words (`read-only`, `✗ failed`,
 //! `PROD`), so the colourless mode only has to keep selection, badges and the active tab
 //! apart, with reverse video and bold.
 //!
-//! Roles: focus (blue) marks where the keys go: the focused pane, the current panel, the
-//! `›` marker, the input cursor and key hints. Amber is for warnings, `▲` notes,
-//! `read-only`, notices and progress; red for PROD, `writes on` and errors; teal for
-//! what is fine; the placeholder colour for the `{id}` parts of a pattern.
+//! Roles, by meaning rather than by colour (`docs/ui-redesign.md` section 4):
+//!
+//! - **focus** (blue): where the keys go: the focused pane, the current panel, the `›`
+//!   marker, the input cursor and key hints;
+//! - **placeholder** (violet): the `{id}` parts of a pattern;
+//! - **warning** (amber): `▲` findings and the sentence after them, `read-only`, `never`
+//!   in an expiry column, a restriction or a degraded state, work in progress;
+//! - **danger** (red): the PROD badge, `writes on`, `✗` and errors, destructive actions;
+//! - **ok** (teal): `●` connected, `✓` analyzed, live;
+//! - **data** (a quieter blue): bars, meters, heat bars and sparklines: quantities.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -29,7 +35,9 @@ pub const DIM: Color = Color::Rgb(0x6d, 0x78, 0x89);
 pub const FAINT: Color = Color::Rgb(0x2b, 0x34, 0x41);
 pub const BORDER: Color = Color::Rgb(0x3a, 0x46, 0x58);
 pub const SEL: Color = Color::Rgb(0x23, 0x30, 0x44);
+/// Warning: `▲` findings, `read-only`, `never` in an expiry column.
 pub const AMBER: Color = Color::Rgb(0xe8, 0xb4, 0x5c);
+/// Danger: PROD, `writes on`, errors, destructive actions.
 pub const RED: Color = Color::Rgb(0xf0, 0x76, 0x62);
 pub const TEAL: Color = Color::Rgb(0x5f, 0xc6, 0xb4);
 /// Focus: the focused pane's border and title, the current panel, the `›` marker, the
@@ -37,6 +45,8 @@ pub const TEAL: Color = Color::Rgb(0x5f, 0xc6, 0xb4);
 pub const FOCUS: Color = Color::Rgb(0x6c, 0xb6, 0xff);
 /// `{placeholders}` in patterns.
 pub const PH: Color = Color::Rgb(0xb7, 0x9c, 0xf5);
+/// Data: bars, meters and sparklines.
+pub const DATA: Color = Color::Rgb(0x4f, 0x8f, 0xd6);
 
 /// What a colour is for. `bg` is the text colour on a filled badge, not a background
 /// that is painted.
@@ -49,11 +59,15 @@ pub struct Palette {
     pub faint: Color,
     pub border: Color,
     pub sel: Color,
-    pub amber: Color,
-    pub red: Color,
+    /// The warning colour (amber).
+    pub warning: Color,
+    /// The danger colour (red).
+    pub danger: Color,
     pub teal: Color,
     pub focus: Color,
     pub ph: Color,
+    /// Bars, meters and sparklines.
+    pub data: Color,
 }
 
 pub const DARK_PALETTE: Palette = Palette {
@@ -64,11 +78,12 @@ pub const DARK_PALETTE: Palette = Palette {
     faint: FAINT,
     border: BORDER,
     sel: SEL,
-    amber: AMBER,
-    red: RED,
+    warning: AMBER,
+    danger: RED,
     teal: TEAL,
     focus: FOCUS,
     ph: PH,
+    data: DATA,
 };
 
 /// The same roles for a light terminal: dark text, and accents dark enough to read on
@@ -81,11 +96,12 @@ pub const LIGHT_PALETTE: Palette = Palette {
     faint: Color::Rgb(0xd9, 0xde, 0xe6),
     border: Color::Rgb(0xb4, 0xbc, 0xc8),
     sel: Color::Rgb(0xdd, 0xe6, 0xf5),
-    amber: Color::Rgb(0x8f, 0x5e, 0x00),
-    red: Color::Rgb(0xc0, 0x39, 0x2b),
+    warning: Color::Rgb(0x8f, 0x5e, 0x00),
+    danger: Color::Rgb(0xc0, 0x39, 0x2b),
     teal: Color::Rgb(0x0f, 0x76, 0x6e),
     focus: Color::Rgb(0x0b, 0x5c, 0xad),
     ph: Color::Rgb(0x6f, 0x42, 0xc1),
+    data: Color::Rgb(0x2e, 0x6d, 0xb5),
 };
 
 /// How the screen is drawn.
@@ -154,7 +170,32 @@ pub fn init(theme: Theme, no_color: bool) {
 
 /// The mode in use.
 pub fn mode() -> Mode {
+    #[cfg(test)]
+    if let Some(m) = TEST_MODE.get() {
+        return m;
+    }
     Mode::from_u8(MODE.load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A mode for this test's thread only, so a test can draw without colour while the
+    /// others, on their own threads, keep the default.
+    static TEST_MODE: std::cell::Cell<Option<Mode>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with the style functions in `m` on this thread only. Tests only.
+#[cfg(test)]
+pub fn with_mode<R>(m: Mode, f: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_MODE.set(None);
+        }
+    }
+    TEST_MODE.set(Some(m));
+    let _reset = Reset;
+    f()
 }
 
 /// The roles a style is asked for by.
@@ -164,9 +205,13 @@ pub enum Role {
     Fgb,
     Dim,
     Hd,
-    Warn,
+    /// Red: PROD, `writes on`, `✗` and errors, destructive actions.
+    Danger,
     Ok,
-    Amber,
+    /// Amber: `▲` findings and notes, `read-only`, `never`, restrictions.
+    Warning,
+    /// Bars, meters, heat bars and sparklines.
+    Data,
     Ph,
     Phb,
     Track,
@@ -189,8 +234,8 @@ pub fn role(role: Role, mode: Mode) -> Style {
         // No colour: weight and reverse video only. A state's words stay on screen.
         let plain = Style::new();
         return match role {
-            Role::Fg | Role::Ok | Role::Amber | Role::Ph | Role::Cmd => plain,
-            Role::Fgb | Role::Hd | Role::Warn | Role::Phb | Role::Title | Role::Focus => {
+            Role::Fg | Role::Ok | Role::Warning | Role::Data | Role::Ph | Role::Cmd => plain,
+            Role::Fgb | Role::Hd | Role::Danger | Role::Phb | Role::Title | Role::Focus => {
                 plain.add_modifier(bold)
             }
             Role::Dim | Role::Tab | Role::Border | Role::Track => plain.add_modifier(Modifier::DIM),
@@ -203,9 +248,10 @@ pub fn role(role: Role, mode: Mode) -> Style {
         Role::Fgb => Style::new().fg(p.hi).add_modifier(bold),
         Role::Dim | Role::Tab => Style::new().fg(p.dim),
         Role::Hd => Style::new().fg(p.dim).add_modifier(bold),
-        Role::Warn => Style::new().fg(p.red),
+        Role::Danger => Style::new().fg(p.danger),
         Role::Ok => Style::new().fg(p.teal),
-        Role::Amber => Style::new().fg(p.amber),
+        Role::Warning => Style::new().fg(p.warning),
+        Role::Data => Style::new().fg(p.data),
         Role::Ph => Style::new().fg(p.ph),
         Role::Phb => Style::new().fg(p.ph).add_modifier(bold),
         Role::Track => Style::new().fg(p.faint),
@@ -213,7 +259,7 @@ pub fn role(role: Role, mode: Mode) -> Style {
         Role::Sel => Style::new().bg(p.sel),
         Role::Border => Style::new().fg(p.border),
         Role::Title => Style::new().fg(p.focus).add_modifier(bold),
-        Role::Brand => Style::new().bg(p.amber).fg(p.bg).add_modifier(bold),
+        Role::Brand => Style::new().bg(p.warning).fg(p.bg).add_modifier(bold),
         Role::TabOn => Style::new().bg(p.sel).fg(p.focus).add_modifier(bold),
         Role::Key => Style::new().bg(p.faint).fg(p.hi),
         Role::Focus => Style::new().fg(p.focus),
@@ -228,8 +274,8 @@ pub fn env_badge_in(env: Env, mode: Mode) -> Style {
         return s.add_modifier(Modifier::REVERSED);
     };
     match env {
-        Env::Prod => s.bg(p.red).fg(p.bg),
-        Env::Stage => s.bg(p.amber).fg(p.bg),
+        Env::Prod => s.bg(p.danger).fg(p.bg),
+        Env::Stage => s.bg(p.warning).fg(p.bg),
         Env::Local => s.bg(p.teal).fg(p.bg),
         Env::Other => s.bg(p.faint).fg(p.hi),
     }
@@ -248,14 +294,22 @@ pub fn dim() -> Style {
 pub fn hd() -> Style {
     role(Role::Hd, mode())
 }
-pub fn warn() -> Style {
-    role(Role::Warn, mode())
+/// Danger: the PROD badge, `writes on`, `✗` and errors, destructive actions.
+pub fn danger() -> Style {
+    role(Role::Danger, mode())
 }
+/// `●` connected, `✓` analyzed, live.
 pub fn ok() -> Style {
     role(Role::Ok, mode())
 }
-pub fn amber() -> Style {
-    role(Role::Amber, mode())
+/// Warning: `▲` findings and their sentences, `read-only`, `never` in an expiry
+/// column, restrictions and degraded states.
+pub fn warning() -> Style {
+    role(Role::Warning, mode())
+}
+/// Data: bars, meters, heat bars and sparklines.
+pub fn data() -> Style {
+    role(Role::Data, mode())
 }
 /// `{placeholders}` in patterns.
 pub fn ph() -> Style {
@@ -326,14 +380,15 @@ pub fn env_badge(env: Env) -> Style {
 mod tests {
     use super::*;
 
-    const ROLES: [Role; 19] = [
+    const ROLES: [Role; 20] = [
         Role::Fg,
         Role::Fgb,
         Role::Dim,
         Role::Hd,
-        Role::Warn,
+        Role::Danger,
         Role::Ok,
-        Role::Amber,
+        Role::Warning,
+        Role::Data,
         Role::Ph,
         Role::Phb,
         Role::Track,
@@ -355,9 +410,10 @@ mod tests {
         assert_eq!(Mode::default(), Mode::Dark);
         assert_eq!(mode(), Mode::Dark);
         assert_eq!(role(Role::Dim, Mode::Dark).fg, Some(DIM));
-        assert_eq!(role(Role::Warn, Mode::Dark).fg, Some(RED));
+        assert_eq!(role(Role::Danger, Mode::Dark).fg, Some(RED));
         assert_eq!(role(Role::Ok, Mode::Dark).fg, Some(TEAL));
-        assert_eq!(role(Role::Amber, Mode::Dark).fg, Some(AMBER));
+        assert_eq!(role(Role::Warning, Mode::Dark).fg, Some(AMBER));
+        assert_eq!(role(Role::Data, Mode::Dark).fg, Some(DATA));
         assert_eq!(role(Role::Sel, Mode::Dark).bg, Some(SEL));
         assert_eq!(env_badge_in(Env::Prod, Mode::Dark).bg, Some(RED));
         assert_eq!(env_badge_in(Env::Prod, Mode::Dark).fg, Some(BG));
@@ -388,7 +444,103 @@ mod tests {
     }
 
     fn mode_amber(m: Mode) -> Color {
-        m.palette().unwrap().amber
+        m.palette().unwrap().warning
+    }
+
+    /// The six roles of `docs/ui-redesign.md` section 4, pinned in each palette and
+    /// without colour: (role, dark, light, mono modifiers).
+    #[test]
+    fn the_six_roles_have_the_colours_of_the_brief() {
+        let rgb = |r, g, b| Some(Color::Rgb(r, g, b));
+        let table = [
+            (
+                Role::Focus,
+                rgb(0x6c, 0xb6, 0xff),
+                rgb(0x0b, 0x5c, 0xad),
+                Modifier::BOLD,
+            ),
+            (
+                Role::Ph,
+                rgb(0xb7, 0x9c, 0xf5),
+                rgb(0x6f, 0x42, 0xc1),
+                Modifier::empty(),
+            ),
+            (
+                Role::Warning,
+                rgb(0xe8, 0xb4, 0x5c),
+                rgb(0x8f, 0x5e, 0x00),
+                Modifier::empty(),
+            ),
+            (
+                Role::Danger,
+                rgb(0xf0, 0x76, 0x62),
+                rgb(0xc0, 0x39, 0x2b),
+                Modifier::BOLD,
+            ),
+            (
+                Role::Ok,
+                rgb(0x5f, 0xc6, 0xb4),
+                rgb(0x0f, 0x76, 0x6e),
+                Modifier::empty(),
+            ),
+            (
+                Role::Data,
+                rgb(0x4f, 0x8f, 0xd6),
+                rgb(0x2e, 0x6d, 0xb5),
+                Modifier::empty(),
+            ),
+        ];
+        for (r, dark, light, mono) in table {
+            assert_eq!(role(r, Mode::Dark), Style::new().fg(dark.unwrap()), "{r:?}");
+            assert_eq!(
+                role(r, Mode::Light),
+                Style::new().fg(light.unwrap()),
+                "{r:?}"
+            );
+            assert_eq!(
+                role(r, Mode::Mono),
+                Style::new().add_modifier(mono),
+                "{r:?}"
+            );
+        }
+        // The helpers are the roles.
+        assert_eq!(warning(), role(Role::Warning, Mode::Dark));
+        assert_eq!(danger(), role(Role::Danger, Mode::Dark));
+        assert_eq!(data(), role(Role::Data, Mode::Dark));
+        // Six different colours in each palette: no role borrows another's.
+        for m in [Mode::Dark, Mode::Light] {
+            let fgs: Vec<_> = table.iter().map(|t| role(t.0, m).fg).collect();
+            for (i, a) in fgs.iter().enumerate() {
+                assert!(!fgs[i + 1..].contains(a), "{m:?}: {a:?} twice");
+            }
+        }
+        // PROD's badge is the danger colour, STAGE's the warning colour.
+        for m in [Mode::Dark, Mode::Light] {
+            let p = m.palette().unwrap();
+            assert_eq!(env_badge_in(Env::Prod, m).bg, Some(p.danger));
+            assert_eq!(env_badge_in(Env::Stage, m).bg, Some(p.warning));
+        }
+    }
+
+    /// Warning, danger and data read on the page and on the selected row, in both
+    /// palettes. Text needs 4.5:1 on the page and 4:1 on the selection, as the other
+    /// accents; data is drawn as bars, a graphic, so 3:1 (WCAG 1.4.11) on the selection.
+    #[test]
+    fn warning_danger_and_data_are_readable_in_both_palettes() {
+        for p in [DARK_PALETTE, LIGHT_PALETTE] {
+            for (name, c, on_sel) in [
+                ("warning", p.warning, 4.0),
+                ("danger", p.danger, 4.0),
+                ("data", p.data, 3.0),
+            ] {
+                // `bg` is the page's colour in both palettes.
+                assert!(contrast(c, p.bg) >= 4.5, "{name} on the page: {p:?}");
+                assert!(
+                    contrast(c, p.sel) >= on_sel,
+                    "{name} on the selection: {p:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -440,8 +592,9 @@ mod tests {
             ("fg", p.fg),
             ("hi", p.hi),
             ("dim", p.dim),
-            ("amber", p.amber),
-            ("red", p.red),
+            ("warning", p.warning),
+            ("danger", p.danger),
+            ("data", p.data),
             ("teal", p.teal),
             ("focus", p.focus),
             ("ph", p.ph),
@@ -449,10 +602,10 @@ mod tests {
             assert!(contrast(c, p.bg) >= 4.5, "{name} on white");
         }
         // Text on the selected row, and badges' white text on their fills.
-        for c in [p.fg, p.hi, p.amber, p.dim, p.focus, p.ph] {
+        for c in [p.fg, p.hi, p.warning, p.dim, p.focus, p.ph] {
             assert!(contrast(c, p.sel) >= 4.0, "{c:?} on the selection");
         }
-        for fill in [p.red, p.amber, p.teal] {
+        for fill in [p.danger, p.warning, p.teal] {
             assert!(contrast(p.bg, fill) >= 4.5, "{fill:?}");
         }
         assert!(contrast(p.hi, p.faint) >= 4.5);
@@ -493,7 +646,7 @@ mod tests {
         assert!(role(Role::Key, m).add_modifier.contains(Modifier::REVERSED));
         assert_eq!(role(Role::Fg, m), Style::new());
         // Errors are bold, and their words (✗ failed) are the UI's own.
-        assert!(role(Role::Warn, m).add_modifier.contains(Modifier::BOLD));
+        assert!(role(Role::Danger, m).add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

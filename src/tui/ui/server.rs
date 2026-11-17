@@ -51,7 +51,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
 /// did, and the caller returns.
 fn gate(frame: &mut Frame, area: Rect, title: &str, poll: &Poll, ctx: &Ctx<'_>) -> bool {
     if let Some(off) = &poll.off {
-        let line = Line::from(Span::styled(format!(" ▲ {off}"), style::amber()));
+        let line = Line::from(Span::styled(format!(" ▲ {off}"), style::warning()));
         let right = with_node(ctx.node_title(), "off".to_string());
         notice(frame, area, title, &right, vec![line]);
         return true;
@@ -65,14 +65,14 @@ fn gate(frame: &mut Frame, area: Rect, title: &str, poll: &Poll, ctx: &Ctx<'_>) 
                 " ▲ {}",
                 why.as_deref().unwrap_or("The live connection is closed.")
             ),
-            style::amber(),
+            style::warning(),
         )),
         LiveState::Waiting => Line::from(Span::styled(
             " Waiting for the live connection…",
             style::dim(),
         )),
         LiveState::Ready => match &poll.failed {
-            Some(f) => Line::from(Span::styled(format!(" ▲ {f}"), style::amber())),
+            Some(f) => Line::from(Span::styled(format!(" ▲ {f}"), style::warning())),
             None => Line::from(Span::styled(" Waiting for the server…", style::dim())),
         },
     };
@@ -92,7 +92,7 @@ pub(super) fn trouble(poll: &Poll, ctx: &Ctx<'_>) -> Option<Line<'static>> {
     };
     Some(Line::from(Span::styled(
         format!(" ▲ {text} Showing the last data."),
-        style::amber(),
+        style::warning(),
     )))
 }
 
@@ -156,7 +156,7 @@ pub(super) fn metric_text(m: Metric, o: &Overview) -> (String, Style) {
                 Some(max) => {
                     let ratio = v / max as f64;
                     let st = if ratio >= 0.9 {
-                        style::warn()
+                        style::warning()
                     } else {
                         style::fgb()
                     };
@@ -172,7 +172,7 @@ pub(super) fn metric_text(m: Metric, o: &Overview) -> (String, Style) {
         Metric::Clients => plain(format::count(v as u64)),
         Metric::Blocked => {
             let st = if v > 0.0 {
-                style::amber()
+                style::warning()
             } else {
                 style::fgb()
             };
@@ -181,7 +181,7 @@ pub(super) fn metric_text(m: Metric, o: &Overview) -> (String, Style) {
         Metric::NetIn | Metric::NetOut => plain(format!("{}/s", format::bytes(v as u64))),
         Metric::Evicted => {
             let st = if v > 0.0 {
-                style::amber()
+                style::warning()
             } else {
                 style::fgb()
             };
@@ -191,7 +191,7 @@ pub(super) fn metric_text(m: Metric, o: &Overview) -> (String, Style) {
         Metric::CpuUser | Metric::CpuSys => plain(format!("{v:.1}%")),
         Metric::Fragmentation => {
             let st = if v > 1.5 {
-                style::amber()
+                style::warning()
             } else {
                 style::fgb()
             };
@@ -317,7 +317,7 @@ fn groups(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
         }
         if g.flagged() {
             dl.extend(paragraph(
-                vec![Span::styled(format!(" {MARK} "), style::amber())],
+                vec![Span::styled(format!(" {MARK} "), style::warning())],
                 "   ",
                 &format!(
                     "{} of them {} been idle for {} or more. Idle clients hold memory and a connection each.",
@@ -325,7 +325,7 @@ fn groups(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
                     if g.idle_conns == 1 { "has" } else { "have" },
                     idle_hours()
                 ),
-                style::amber(),
+                style::warning(),
                 dw,
             ));
         }
@@ -480,7 +480,7 @@ fn group_line(g: &Group, cols: &[Col], keep: &[usize], gw: usize) -> Line<'stati
         let w = if i == G_GROUP { gw - 1 } else { cols[i].w };
         spans.push(match i {
             G_GROUP => Span::styled(pad_r(&trunc(g.key.label(), w), w), style::fg()),
-            G_MARK => Span::styled(if g.flagged() { MARK } else { " " }, style::amber()),
+            G_MARK => Span::styled(if g.flagged() { MARK } else { " " }, style::warning()),
             G_CONNS => Span::styled(
                 pad_l(&format::count(g.connections() as u64), w),
                 style::fgb(),
@@ -488,7 +488,7 @@ fn group_line(g: &Group, cols: &[Col], keep: &[usize], gw: usize) -> Line<'stati
             G_IDLE => Span::styled(
                 pad_l(&age(g.longest_idle), w),
                 if g.flagged() {
-                    style::amber()
+                    style::warning()
                 } else {
                     style::fg()
                 },
@@ -617,7 +617,7 @@ fn conn_table<'c>(
                         cw,
                     ),
                     if idle_long {
-                        style::amber()
+                        style::warning()
                     } else {
                         style::fg()
                     },
@@ -659,7 +659,7 @@ fn conn_facts(frame: &mut Frame, inner: Rect, cn: Option<&ClientConn>) {
                 Span::styled(
                     age(cn.idle),
                     if cn.idle >= IDLE_FLAG_SECS {
-                        style::amber()
+                        style::warning()
                     } else {
                         style::fg()
                     },
@@ -774,7 +774,7 @@ fn slow_log(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
             ),
             style::dim(),
         )),
-        (None, Some(note)) => status.push(Span::styled(note.clone(), style::amber())),
+        (None, Some(note)) => status.push(Span::styled(note.clone(), style::warning())),
         (None, None) => {}
     }
     let status = trouble(&s.poll, ctx).unwrap_or_else(|| Line::from(fit(status, w)));
@@ -792,7 +792,7 @@ fn slow_log(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
             spans.push(Span::raw(" "));
             let cw = if i == L_KEYS { kw - 1 } else { cols[i].w };
             spans.push(match i {
-                L_MARK => Span::styled(if note { MARK } else { " " }, style::amber()),
+                L_MARK => Span::styled(if note { MARK } else { " " }, style::warning()),
                 L_TIME => Span::styled(pad_r(&utc_time(e.unix), cw), style::dim()),
                 L_DUR => Span::styled(pad_l(&micros(e.micros), cw), style::fgb()),
                 L_CMD => Span::styled(pad_r(&trunc(&e.command, cw), cw), style::cmd()),
@@ -893,10 +893,10 @@ fn entry_lines(frame: &mut Frame, inner: Rect, s: &SlowLog, wrap: bool) {
     }
     if let Some(n) = note_of(e) {
         lines.extend(paragraph(
-            vec![Span::styled(format!(" {MARK} "), style::amber())],
+            vec![Span::styled(format!(" {MARK} "), style::warning())],
             "   ",
             n.text(),
-            style::amber(),
+            style::warning(),
             w,
         ));
     }
@@ -1053,14 +1053,14 @@ fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
     let w = usize::from(inner[0].width);
     let text = |t: String, st: Style| Line::from(fit(vec![Span::styled(t, st)], w));
     let status = if let Some(why) = crate::conn::monitor_unsupported(ctx.profile()) {
-        text(format!(" {MARK} {why}"), style::amber())
+        text(format!(" {MARK} {why}"), style::warning())
     } else if let Some(stop) = &m.stopped {
         let st = if matches!(
             stop,
             crate::tui::app::views::server::Stop::Failed(_)
                 | crate::tui::app::views::server::Stop::Lost
         ) {
-            style::amber()
+            style::danger()
         } else {
             style::dim()
         };

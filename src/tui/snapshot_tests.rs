@@ -923,38 +923,52 @@ fn colour_at(t: &Terminal<TestBackend>, row_text: &str, cell_text: &str, from: u
 
 #[test]
 fn change_and_verdict_colours() {
-    use crate::tui::ui::style::{AMBER, DIM, RED, TEAL};
+    use crate::tui::ui::style::{AMBER, DIM, FG, RED, TEAL};
     let mut app = scanned_with_history(true);
     // The Δ column is one of the `v` columns on Browse.
     app.handle_key(ch('v'));
     let t = render(&app, 120, 36);
-    // Δ column: new is red, +232M amber, a shrink teal, unchanged dim. (With `v` the
-    // name column is narrow: the long names are cut.)
-    assert_eq!(colour_at(&t, "tmp:import:", "+", 40), RED);
-    assert_eq!(colour_at(&t, "queue:emails", "+", 40), AMBER);
+    // Δ column: new is a warning (it has the `▲`), +232M plain, a shrink teal,
+    // unchanged dim. Nothing is red: a change is no failure. (With `v` the name column
+    // is narrow: the long names are cut.)
+    assert_eq!(colour_at(&t, "tmp:import:", "+", 40), AMBER);
+    assert_eq!(colour_at(&t, "queue:emails", "+", 40), FG);
     assert_eq!(colour_at(&t, "rl:{ip}:{id}", "-", 40), TEAL);
     assert_eq!(colour_at(&t, "lock:{var}", "·", 40), DIM);
     go(&mut app, '2');
     let t = render(&app, 120, 36);
-    // The mark of a row worth a look: red for a pattern that never expires and grows,
-    // amber where some keys never expire; stable and ok rows have none and are dim.
-    assert_eq!(colour_at(&t, "user:{id}:profile", "▲", 40), RED);
+    // The mark of a row worth a look is a warning, for a pattern that never expires and
+    // grows as for one where some keys never expire; stable and ok rows have none and
+    // are dim.
+    assert_eq!(colour_at(&t, "user:{id}:profile", "▲", 40), AMBER);
     assert_eq!(colour_at(&t, "user:{id}:cart", "▲", 40), AMBER);
     assert_eq!(colour_at(&t, "feature:{var}", "n", 40), DIM);
     assert_eq!(colour_at(&t, "session:{uuid}", "k", 40), DIM);
-    // The selected (riskiest) pattern's histogram has a red "none" bucket.
+    // The selected (riskiest) pattern's histogram has its flagged "none" bucket in the
+    // warning colour.
     let lines = buffer_lines(&t);
     let y = lines.iter().position(|l| l.contains("none <1m")).unwrap() as u16 + 1;
     let x = (70..120u16)
         .find(|&x| t.backend().buffer()[(x, y)].symbol() == "█")
         .expect("a bar under the labels");
-    assert_eq!(t.backend().buffer()[(x, y)].fg, RED);
+    assert_eq!(t.backend().buffer()[(x, y)].fg, AMBER);
     go(&mut app, '3');
     let t = render(&app, 120, 36);
-    // Changes: growth of 300M or more is red, smaller growth amber, shrink teal.
-    assert_eq!(colour_at(&t, "cache:search:", "+", 30), RED);
-    assert_eq!(colour_at(&t, "queue:emails", "+", 30), AMBER);
+    // Changes: growth of 300M or more is a warning, smaller growth plain, shrink teal.
+    assert_eq!(colour_at(&t, "cache:search:", "+", 30), AMBER);
+    assert_eq!(colour_at(&t, "queue:emails", "+", 30), FG);
     assert_eq!(colour_at(&t, "rl:{ip}:{id}", "-", 30), TEAL);
+    for row in ["tmp:import:", "queue:emails", "rl:{ip}:{id}"] {
+        let y = buffer_lines(&t)
+            .iter()
+            .position(|l| l.contains(row))
+            .unwrap() as u16;
+        let buf = t.backend().buffer();
+        assert!(
+            (0..buf.area.width).all(|x| buf[(x, y)].fg != RED),
+            "{row} has no red"
+        );
+    }
 }
 
 #[test]
@@ -1504,7 +1518,7 @@ fn help_over_patterns_80x24() {
     press(&mut app, "j?");
     let t = render(&app, 80, 24);
     let text = buffer_lines(&t).join("\n");
-    assert!(text.contains("Help · Browse › Keys"));
+    assert!(text.contains("Keys · Browse › Keys"));
     assert!(text.contains("esc closes"));
     insta::assert_snapshot!(t.backend());
 }
@@ -1515,7 +1529,7 @@ fn help_over_connections_120x36() {
     press(&mut app, "0?");
     let t = render(&app, 120, 36);
     let text = buffer_lines(&t).join("\n");
-    assert!(text.contains("Help · Connections"));
+    assert!(text.contains("Keys · Connections"));
     assert!(text.contains("Look for Docker containers again"));
     insta::assert_snapshot!(t.backend());
 }
@@ -1531,7 +1545,7 @@ fn help_overlay_on_every_view_and_size_does_not_panic() {
         for (w, h) in [(80, 24), (40, 12), (20, 5), (1, 1), (200, 60)] {
             render(&app, w, h);
         }
-        let title = format!("Help · {}", screen.title());
+        let title = format!("Keys · {}", screen.title());
         assert!(
             buffer_lines(&render(&app, 80, 24))
                 .join("\n")
@@ -2093,3 +2107,7 @@ fn streams_before_an_analysis_offer_a_analyze_in_the_footer() {
     assert!(effects.is_empty(), "{effects:?}");
     assert!(app.analyze.is_some(), "a opens Analyze the keys?");
 }
+
+/// Colour by meaning: cell styles that snapshots cannot see.
+#[path = "snapshot_tests_colours.rs"]
+mod colours;

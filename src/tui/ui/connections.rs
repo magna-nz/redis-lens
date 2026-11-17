@@ -58,9 +58,9 @@ const LABEL: usize = 11;
 /// The ACCESS column: `read-only` (amber) or `writes on` (red).
 fn access_cell(p: &Profile) -> (&'static str, ratatui::style::Style) {
     if p.is_read_only() {
-        ("read-only", style::amber())
+        ("read-only", style::warning())
     } else {
-        ("writes on", style::warn())
+        ("writes on", style::danger())
     }
 }
 
@@ -238,10 +238,10 @@ fn first_run_panel(frame: &mut Frame, area: Rect, app: &App) {
 fn status(e: &ConnEntry) -> (&'static str, ratatui::style::Style) {
     match e.status {
         ConnStatus::NotOpen => ("○ not open", style::dim()),
-        ConnStatus::Connecting => ("● connecting…", style::amber()),
+        ConnStatus::Connecting => ("● connecting…", style::warning()),
         ConnStatus::Connected => ("● connected", style::ok()),
-        ConnStatus::Limited => ("▲ limited", style::amber()),
-        ConnStatus::Failed => ("✗ failed", style::warn()),
+        ConnStatus::Limited => ("▲ limited", style::warning()),
+        ConnStatus::Failed => ("✗ failed", style::danger()),
     }
 }
 
@@ -451,7 +451,7 @@ fn sign_in_sentence(docker: Option<DiscoveredAuth>, auth: Auth) -> &'static str 
 /// What the permission check came to, in words and a glyph, for the Checks row.
 fn checks_sentence(app: &App, e: &ConnEntry) -> (String, ratatui::style::Style) {
     if let Some(err) = &e.error {
-        return (format!("✗ {err}"), style::warn());
+        return (format!("✗ {err}"), style::danger());
     }
     match e.status {
         ConnStatus::Connecting => {
@@ -465,7 +465,7 @@ fn checks_sentence(app: &App, e: &ConnEntry) -> (String, ratatui::style::Style) 
                     spinner(app.tick)
                 ),
             };
-            return (text, style::amber());
+            return (text, style::warning());
         }
         ConnStatus::Limited => {
             let memory = e.perms.as_ref().is_some_and(|p| !p.allowed(PERM_MEMORY));
@@ -485,7 +485,7 @@ fn checks_sentence(app: &App, e: &ConnEntry) -> (String, ratatui::style::Style) 
             } else {
                 "▲ Limited: some checks were refused, so the panels that need them are off. v lists each check."
             };
-            return (text.to_string(), style::amber());
+            return (text.to_string(), style::warning());
         }
         ConnStatus::Connected => {
             // A view probe that failed turns its view off but leaves the analysis whole.
@@ -506,7 +506,7 @@ fn checks_sentence(app: &App, e: &ConnEntry) -> (String, ratatui::style::Style) 
     // Before connecting, say what the provider takes away; once connected the
     // permission check is what counts.
     if let Some(n) = provider::notice(e.profile.provider) {
-        return (format!("▲ {n}"), style::amber());
+        return (format!("▲ {n}"), style::warning());
     }
     let text = if e.just_saved {
         "Saved. They run when you connect: redis-lens asks what this user may do before it reads anything."
@@ -567,7 +567,7 @@ fn entry_detail(frame: &mut Frame, inner: Rect, app: &App, e: &ConnEntry) {
                 .and_then(|r| r.nodes.as_deref());
             address.push_str(&format!(" · {} · {summary}", server_label(s)));
             if cluster_degraded(summary, nodes) {
-                address_style = style::amber();
+                address_style = style::warning();
             }
         }
         (Some(s), _)
@@ -598,9 +598,9 @@ fn entry_detail(frame: &mut Frame, inner: Rect, app: &App, e: &ConnEntry) {
         "Access",
         &access_sentence(p, e.perms.as_ref()),
         if p.is_read_only() {
-            style::amber()
+            style::warning()
         } else {
-            style::warn()
+            style::danger()
         },
     );
     if !p.tags.is_empty() {
@@ -651,7 +651,7 @@ fn add_panel(frame: &mut Frame, inner: Rect, app: &App, add: Option<&AddState>) 
             let err = add.error.clone().unwrap_or(e);
             let lines = vec![
                 Line::default(),
-                Line::from(Span::styled(format!(" ✗ {err}"), style::warn())),
+                Line::from(Span::styled(format!(" ✗ {err}"), style::danger())),
                 Line::from(Span::styled(
                     " Accepted: redis://user:pass@host:port, rediss://… for TLS, or host:port,password=…,ssl=True",
                     style::dim(),
@@ -681,7 +681,7 @@ fn add_panel(frame: &mut Frame, inner: Rect, app: &App, add: Option<&AddState>) 
                 )),
             ];
             if let Some(err) = add.and_then(|a| a.error.clone()) {
-                lines[5] = Line::from(Span::styled(format!(" ✗ {err}"), style::warn()));
+                lines[5] = Line::from(Span::styled(format!(" ✗ {err}"), style::danger()));
             }
             rows(frame, inner, lines, None);
         }
@@ -722,11 +722,11 @@ fn perm_lines(r: &PermissionReport, w: usize, max: usize) -> Vec<Vec<Span<'stati
             // A view probe's NOPERM text names the user: say what it means instead.
             Some(PermStatus::Denied(_)) if !PERM_LABELS.contains(&label) => (
                 "✗ ",
-                style::warn(),
+                style::danger(),
                 "refused, view off".to_string(),
-                style::warn(),
+                style::danger(),
             ),
-            Some(PermStatus::Denied(m)) => ("✗ ", style::warn(), m.clone(), style::warn()),
+            Some(PermStatus::Denied(m)) => ("✗ ", style::danger(), m.clone(), style::danger()),
             Some(PermStatus::Skipped(m)) => ("– ", style::dim(), m.clone(), style::dim()),
             None => ("– ", style::dim(), String::new(), style::dim()),
         };
@@ -830,9 +830,12 @@ fn parsed_panel(frame: &mut Frame, inner: Rect, app: &App, add: &AddState, p: &P
     let name = app.add_name(p);
 
     let password = if has_password || typed {
-        ("••••••  → OS keychain".to_string(), style::amber())
+        ("••••••  → OS keychain".to_string(), style::fg())
     } else if needs_password {
-        ("needed: press enter to type it".to_string(), style::amber())
+        (
+            "needed: press enter to type it".to_string(),
+            style::warning(),
+        )
     } else {
         ("none".to_string(), style::dim())
     };
@@ -842,7 +845,7 @@ fn parsed_panel(frame: &mut Frame, inner: Rect, app: &App, add: &AddState, p: &P
         (Some(_), None) => "password (default user)".to_string(),
     };
     let env_style = if p.env_guess == Env::Prod {
-        style::warn()
+        style::danger()
     } else {
         style::fg()
     };
@@ -884,7 +887,7 @@ fn parsed_panel(frame: &mut Frame, inner: Rect, app: &App, add: &AddState, p: &P
         .collect();
 
     let hint = if let Some(err) = &add.error {
-        (format!("✗ {err}"), style::warn())
+        (format!("✗ {err}"), style::danger())
     } else if add.saving {
         ("Saving…".to_string(), style::dim())
     } else if add.password.is_some() {
@@ -893,35 +896,35 @@ fn parsed_panel(frame: &mut Frame, inner: Rect, app: &App, add: &AddState, p: &P
                 "▲ Type the password for {}, then press enter. It goes to the OS keychain.",
                 user.as_deref().unwrap_or("the default user")
             ),
-            style::amber(),
+            style::warning(),
         )
     } else if needs_password {
         (
             "▲ The URL names a user but no password. Press enter to type it.".to_string(),
-            style::amber(),
+            style::warning(),
         )
     } else if p.azure.is_some() && p.credentials.is_none() {
         (
             "▲ Azure cache with no key. Entra ID sign-in comes in v0.2; add password=<access key> for now."
                 .to_string(),
-            style::amber(),
+            style::warning(),
         )
     } else if p.azure.is_some() {
         (
             "▲ Azure access key found. It goes to the OS keychain, never the config file."
                 .to_string(),
-            style::amber(),
+            style::warning(),
         )
     } else if p.env_guess == Env::Prod {
         (
             "▲ Looks like production, so this profile will be read-only.".to_string(),
-            style::amber(),
+            style::warning(),
         )
     } else if !p.endpoint.tls && p.env_guess != Env::Local {
         (
             "▲ TLS is off for a remote host. Use rediss:// or ssl=True if the server supports it."
                 .to_string(),
-            style::amber(),
+            style::warning(),
         )
     } else {
         (

@@ -5,11 +5,14 @@ Usage: demo/record.py <out.cast> <steps.json> -- <command...>
 
 steps.json is a list of [seconds_to_wait, "keys"]. Keys use names in braces:
 {enter} {esc} {up} {down} {left} {right} {tab}, and {paste:TEXT} sends TEXT as a
-bracketed paste. Everything else is typed as-is.
+bracketed paste. Everything else is typed as-is (control keys as JSON escapes, such
+as "\u000b" for ctrl-k). After the last step it records one more second, then ends the
+program, so a recording that does not quit ends on the last screen shown.
 
 Render the cast with `agg out.cast out.gif`.
 """
 
+import codecs
 import fcntl
 import json
 import os
@@ -58,6 +61,8 @@ def main() -> None:
 
     start = time.monotonic()
     events = []
+    # A read can end in the middle of a UTF-8 character; decode across reads.
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
     def pump(until: float) -> bool:
         while True:
@@ -72,7 +77,9 @@ def main() -> None:
                     return False
                 if not data:
                     return False
-                events.append([round(time.monotonic() - start, 4), "o", data.decode("utf-8", "replace")])
+                text = decoder.decode(data)
+                if text:
+                    events.append([round(time.monotonic() - start, 4), "o", text])
 
     alive = True
     for wait, keys in steps:

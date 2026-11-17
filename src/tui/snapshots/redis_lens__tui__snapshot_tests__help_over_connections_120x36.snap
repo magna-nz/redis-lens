@@ -7,7 +7,7 @@ expression: t.backend()
 "┌─ Connections ──────────────────────────────────────────────────────────────────────────────── 3 saved · 1 in Docker ─┐"
 "│   NAME                   ENV     ADDRESS                                  ACCESS     STATUS        SIGN-IN    MEMORY │"
 "│ SAVED                                                                                                                │"
-"│ › prod-cache-01       ┌─ Help · Connections ──────────────────────────────────── esc closes ─┐ed   keychain      15G │"
+"│ › prod-cache-01       ┌─ Keys · Connections ──────────────────────────────────── esc closes ─┐ed   keychain      15G │"
 "│   staging-cache       │ › type to find any action or screen…                                 │n    keychain        — │"
 "│   local-6379          │                                                                      │n    none            — │"
 "│ DOCKER · 1 Redis-compa│ HERE                                                                 │                       │"

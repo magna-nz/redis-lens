@@ -4,7 +4,7 @@ expression: t.backend()
 ---
 " prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys   ● analyzed 14:02 "
 " 1    2  Browse › Keys · Streams · Search   3   4   5                         0 "
-"┌─ P┌─ Help · Browse › Keys ────────────────────────────────── esc closes ─┐g ─┐"
+"┌─ P┌─ Keys · Browse › Keys ────────────────────────────────── esc closes ─┐g ─┐"
 "│   │ › type to find any action or screen…                                 │   │"
 "│   │                                                                      │   │"
 "│ › │ HERE                                                                 │   │"

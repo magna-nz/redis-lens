@@ -42,7 +42,7 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &PubSubState, ctx: &Ctx<'_>) 
     if let Some(off) = &state.off {
         let lines = vec![Line::from(Span::styled(
             format!(" ▲ {off}"),
-            style::amber(),
+            style::warning(),
         ))];
         notice(frame, area, TITLE, "off", lines);
         return;
@@ -183,7 +183,7 @@ fn list_lines(
                 let ratio = if max == 0 { 0.0 } else { n as f64 / max as f64 };
                 let (fill, track) = bar(ratio, BAR_W);
                 spans.push(Span::raw(" "));
-                spans.push(Span::styled(fill, style::ok()));
+                spans.push(Span::styled(fill, style::data()));
                 spans.push(Span::styled(track, style::track()));
             }
         }
@@ -213,7 +213,7 @@ fn list_lines(
     lines.push(Line::from(fit(shard_head, w)));
     if let Some(why) = &state.shards_off {
         lines.push(Line::from(fit(
-            vec![Span::styled(format!(" ▲ {why}"), style::amber())],
+            vec![Span::styled(format!(" ▲ {why}"), style::warning())],
             w,
         )));
         return (Line::from(head), lines, sel);
@@ -435,7 +435,7 @@ fn draw_tail(frame: &mut Frame, inner: Rect, t: &Tail) {
             for (i, l) in wrap(&text, w.saturating_sub(3)).into_iter().enumerate() {
                 let indent = if i == 0 { " " } else { "   " };
                 notes.push(Line::from(fit(
-                    vec![Span::styled(format!("{indent}{l}"), style::amber())],
+                    vec![Span::styled(format!("{indent}{l}"), style::warning())],
                     w,
                 )));
             }
@@ -598,7 +598,10 @@ fn totals(frame: &mut Frame, inner: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
     }
     for note in c.notes.iter().chain(&state.shards_notes) {
         lines.push(Line::from(fit(
-            vec![Span::styled(format!(" ▲ left out: {note}"), style::amber())],
+            vec![Span::styled(
+                format!(" ▲ left out: {note}"),
+                style::warning(),
+            )],
             w,
         )));
     }
@@ -606,7 +609,7 @@ fn totals(frame: &mut Frame, inner: Rect, state: &PubSubState, ctx: &Ctx<'_>) {
         lines.push(Line::from(fit(
             vec![Span::styled(
                 format!(" ▲ {e}; showing the previous reading."),
-                style::amber(),
+                style::warning(),
             )],
             w,
         )));

@@ -33,17 +33,17 @@ pub fn confirm_sheet(state: &CmdlineState, ctx: &Ctx<'_>) -> Option<super::sheet
         (
             "",
             format!("{} is @dangerous and asks first.", c.command),
-            style::amber(),
+            style::warning(),
         ),
         ("Sends", format!("{}{times}", c.line), style::fgb()),
         (
             "",
             "A command typed here can't be undone.".to_string(),
-            style::fg(),
+            style::danger(),
         ),
     ];
     if let Some(s) = &state.status {
-        lines.push(("", s.clone(), style::warn()));
+        lines.push(("", s.clone(), style::danger()));
     }
     Some(Sheet {
         title: "Run this command?".into(),
@@ -118,7 +118,7 @@ pub fn draw(frame: &mut Frame, body: Rect, state: &CmdlineState, ctx: &Ctx<'_>) 
         .into_iter()
         .take(usize::from(helper_rows))
         .map(|(text, warn)| {
-            let s = if warn { style::amber() } else { style::dim() };
+            let s = if warn { style::warning() } else { style::dim() };
             Line::from(Span::styled(format!(" {}", trunc(&text, w)), s))
         })
         .collect();
@@ -212,16 +212,16 @@ fn entry_rows(e: &Entry, w: usize, tick: u64, view: View) -> Vec<Line<'static>> 
     match &e.body {
         Body::Waiting => out.push(Line::from(vec![
             Span::raw(" "),
-            Span::styled(super::spinner(tick), style::amber()),
+            Span::styled(super::spinner(tick), style::warning()),
             Span::styled(" running…", style::dim()),
         ])),
         Body::Asking => plain(&mut out, "Waiting for your answer below.", style::dim()),
         // A command that was not sent says so with a glyph, not only with colour.
         Body::Note(why) if e.line.is_some() => {
-            plain(&mut out, &format!("✗ {why}"), style::amber());
+            plain(&mut out, &format!("✗ {why}"), style::danger());
         }
-        Body::Note(why) => plain(&mut out, why, style::amber()),
-        Body::Failed(why) => plain(&mut out, &format!("✗ (error) {why}"), style::warn()),
+        Body::Note(why) => plain(&mut out, why, style::warning()),
+        Body::Failed(why) => plain(&mut out, &format!("✗ (error) {why}"), style::danger()),
         Body::Out(o) => {
             // On a cluster: the node it ran on, then why it went there if that needs
             // saying (spec "Cluster live views (P4)", Command line).
@@ -229,9 +229,13 @@ fn entry_rows(e: &Entry, w: usize, tick: u64, view: View) -> Vec<Line<'static>> 
                 plain(&mut out, &format!("{node}>"), style::dim());
             }
             if let Some(why) = e.route_note {
-                plain(&mut out, why, style::amber());
+                plain(&mut out, why, style::warning());
             }
-            let s = if o.error { style::warn() } else { style::fg() };
+            let s = if o.error {
+                style::danger()
+            } else {
+                style::fg()
+            };
             for l in o.lines_in(view, e.pairs) {
                 plain(&mut out, l, s);
             }
@@ -242,25 +246,25 @@ fn entry_rows(e: &Entry, w: usize, tick: u64, view: View) -> Vec<Line<'static>> 
                 plain(&mut out, &format!("{node}>"), style::dim());
             }
             if let Some(why) = e.route_note {
-                plain(&mut out, why, style::amber());
+                plain(&mut out, why, style::warning());
             }
             if r.dropped > 0 {
                 plain(&mut out, &dropped_text(r), style::dim());
             }
             for (line, error) in numbered(r, view, e.pairs) {
-                let s = if error { style::warn() } else { style::fg() };
+                let s = if error { style::danger() } else { style::fg() };
                 plain(&mut out, &line, s);
             }
             let (text, tone) = runs_end(r);
             match tone {
                 Tone::Running => out.push(Line::from(vec![
                     Span::raw(" "),
-                    Span::styled(super::spinner(tick), style::amber()),
+                    Span::styled(super::spinner(tick), style::warning()),
                     Span::styled(format!(" {text}"), style::dim()),
                 ])),
                 Tone::Done => plain(&mut out, &text, style::dim()),
-                Tone::Stopped => plain(&mut out, &text, style::amber()),
-                Tone::Failed => plain(&mut out, &text, style::warn()),
+                Tone::Stopped => plain(&mut out, &text, style::warning()),
+                Tone::Failed => plain(&mut out, &text, style::danger()),
             }
         }
     }

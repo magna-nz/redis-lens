@@ -193,7 +193,7 @@ fn right_spans(h: &Hit, connected: bool) -> Vec<Span<'static>> {
         out.push(Span::styled(h.note.clone(), style::dim()));
     }
     if h.verdict.is_some_and(flagged) {
-        out.push(Span::styled("  ▲", style::amber()));
+        out.push(Span::styled("  ▲", style::warning()));
     }
     for (i, k) in h.keys.iter().enumerate() {
         if i > 0 || !out.is_empty() {
@@ -212,6 +212,9 @@ fn spans_w(spans: &[Span<'_>]) -> usize {
 fn hit_line(h: &Hit, selected: bool, w: usize, connected: bool) -> Line<'static> {
     let base = if h.off.is_some() || h.go == Go::Find {
         style::dim()
+    } else if matches!(&h.go, Go::Action(l) if l.key.destroys()) {
+        // An action that can lose data is named in the danger colour.
+        style::danger()
     } else {
         style::fg()
     };
@@ -289,7 +292,7 @@ fn keys_line(w: usize, say: Option<&str>) -> Line<'static> {
         out.push(Span::raw("   "));
         out.push(Span::styled(
             trunc(say, w.saturating_sub(used + 1)),
-            style::amber(),
+            style::warning(),
         ));
         return Line::from(out);
     }
@@ -385,7 +388,7 @@ pub fn draw(frame: &mut Frame, body: Rect, app: &App) {
                 let note = match s {
                     Section::Keys => Some(("already loaded".to_string(), style::dim())),
                     Section::Actions if moved => {
-                        Some((go_to::ACTIONS_MOVED_HEAD.to_string(), style::amber()))
+                        Some((go_to::ACTIONS_MOVED_HEAD.to_string(), style::warning()))
                     }
                     Section::Actions if !g.on.is_empty() => {
                         Some((format!("on {}", g.on), style::dim()))

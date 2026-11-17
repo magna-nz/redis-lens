@@ -30,36 +30,43 @@ BARS = set("█▉▊▋▌▍▎▏▁▂▃▄▅▆▇")
 AREAS = {0: "0 Connections", 1: "1 Overview", 2: "2 Browse", 3: "3 Analyze", 4: "4 Server", 5: "5 Pub/Sub"}
 
 # name: (snapshot stem, area, active panel or None, selected (line, pane) list, footer kind, edits)
+# Line numbers are those of the snapshot file; empty rows of tall screens are trimmed after marking.
 SCREENS = {
-    "connections": ("ui__connections__tests__connections_80x24", 0, None, [(5, 0)], "keys", []),
-    "overview-before": ("ui__overview__tests__before_80x24", 1, None, [], "keys", []),
-    "overview-dialog": ("ui__overview__tests__dialog_80x24", 1, None, [(9, 1)], "notice", []),
-    "overview-analyzing": ("ui__overview__tests__analyzing_80x24", 1, None, [(15, 0)], "keys", []),
-    "overview-after": ("ui__overview__tests__analyzed_80x24", 1, None, [(11, 0)], "ok", []),
-    "overview-cluster": ("ui__overview__tests__cluster_80x24", 1, None, [(9, 0)], "keys", []),
-    "browse-names": ("app__tests__browse_names_only_80x24", 2, "Keys", [(5, 0)], "keys", []),
-    "browse-patterns": ("snapshot_tests__patterns_80x24", 2, "Keys", [(14, 0)], "keys", []),
-    "browse-keylist": ("app__views__keys__tests__key_list_80x24", 2, "Keys", [(5, 0)], "keys", []),
-    "browse-find-prompt": ("app__find__tests__find_prompt_80x24", 2, "Keys", [(5, 0)], "notice", []),
-    "browse-find": ("app__find__tests__find_results_80x24", 2, "Keys", [(5, 0)], "keys", []),
-    "browse-value": ("app__views__value__tests__hash_80x24", 2, "Keys", [(7, 1)], "keys", []),
-    "browse-binary": ("app__views__value__tests__binary_80x24", 2, "Keys", [(7, 1)], "keys", []),
-    "browse-streams": ("app__views__streams__tests__list_80x24", 2, "Streams", [(5, 0)], "keys", []),
-    "browse-search": ("app__views__search__tests__results_80x24", 2, "Search", [(5, 0)], "keys", []),
-    "analyze-bigkeys": ("app__views__analysis__tests__big_keys_80x24", 3, "Big keys", [(5, 0)], "keys", []),
-    "analyze-expiry": ("ui__ttl__tests__expiry_merged_80x24", 3, "Expiry", [(5, 0)], "keys", []),
-    "analyze-changes": ("snapshot_tests__diff_view_with_trend", 3, "Changes", [(6, 0)], "keys", ["crop"]),
-    "analyze-hot": ("snapshot_tests__hot_keys_view", 3, "Hot keys", [(6, 0)], "keys", ["crop"]),
-    "analyze-slots": ("app__views__slots__tests__snapshots__populated_on_redis_80x24", 3, "Slots", [(10, 0)], "keys", []),
-    "server-clients": ("app__views__server__tests__clients_80x24", 4, "Clients", [(5, 0)], "keys", []),
-    "server-slowlog": ("app__views__server__tests__slow_log_80x24", 4, "Slow log", [(7, 0)], "keys", []),
-    "server-monitor": ("app__views__server__monitor_tests__monitor_running_80x24", 4, "Monitor", [(15, 0)], "notice", ["monitor"]),
-    "pubsub-tail": ("app__views__pubsub__tests__tail_80x24", 5, None, [(4, 0)], "keys", []),
-    "cmdline-panel": ("app__views__cmdline__tests__panel_80x24", 2, "Keys", [(5, 0)], "notice", []),
-    "cmdline-confirm": ("app__views__cmdline__tests__confirm_prod_80x24", 2, "Keys", [(5, 0)], "notice", []),
-    "help-overview": ("ui__help__tests__overview_80x24", None, None, [], "none", []),
-    "help-filtered": ("ui__help__tests__filtered_80x24", None, None, [(8, 0)], "none", []),
-    "gate-delete": ("app__confirm__tests__delete_key_prod_80x24", 2, "Keys", [], "keys", []),
+    "connections": ("app__dashboard_tests__connections_with_the_dashboard_120x36", 0, None, [(5, 0)], "keys", []),
+    "overview-before": ("ui__overview__tests__before_120x36", 1, None, [], "keys", []),
+    "overview-dialog": ("ui__overview__tests__dialog_deep_120x36", 1, None, [(16, 1)], "notice", []),
+    "overview-analyzing": ("ui__overview__tests__analyzing_120x36", 1, None, [(9, 0)], "keys", []),
+    "overview-after": ("ui__overview__tests__analyzed_120x36", 1, None, [(9, 0)], "ok", []),
+    "overview-cluster": ("ui__overview__tests__cluster_120x36", 1, None, [(9, 0)], "keys", []),
+    "browse-names": ("snapshot_tests_browse__browse_three_names_only_120x36", 2, "Keys", [(4, 1)], "keys", []),
+    "browse-patterns": ("snapshot_tests_browse__browse_three_focus_patterns_opened_120x36", 2, "Keys", [(9, 0)], "keys", []),
+    "browse-keylist": ("snapshot_tests_browse__browse_three_focus_keys_120x36", 2, "Keys", [(4, 1)], "keys", []),
+    "browse-value": ("snapshot_tests_browse__browse_three_focus_value_120x36", 2, "Keys", [(7, 2)], "keys", []),
+    "browse-actions": ("snapshot_tests_browse__browse_three_actions_menu_120x36", 2, "Keys", [(16, 2)], "notice", []),
+    "browse-find-prompt": ("app__find__tests__find_prompt_120x36", 2, "Keys", [(4, 0)], "notice", []),
+    "browse-find": ("app__find__tests__find_results_120x36", 2, "Keys", [(4, 1)], "keys", []),
+    "browse-binary": ("app__views__value__tests__binary_120x36", 2, "Keys", [(7, 2)], "keys", []),
+    "browse-streams": ("app__views__streams__tests__list_120x36", 2, "Streams", [(4, 0)], "keys", []),
+    "browse-search": ("app__views__search__tests__results_120x36", 2, "Search", [(5, 1)], "keys", []),
+    "goto-slow": ("app__goto__tests__goto_slow_120x36", 1, None, [(10, 1)], "keys", []),
+    "goto-cart": ("app__goto__tests__goto_cart_120x36", 1, None, [(7, 1)], "keys", []),
+    "menu-value": ("app__views__value__tests__menu_value_hash_writes_on_120x36", 2, "Keys", [(18, 2)], "notice", []),
+    "analyze-bigkeys": ("app__views__analysis__tests__big_keys_120x36", 3, "Big keys", [(5, 0)], "keys", []),
+    "analyze-expiry": ("ui__ttl__tests__expiry_merged_120x36", 3, "Expiry", [(4, 0)], "keys", []),
+    "analyze-changes": ("snapshot_tests__diff_view_with_trend", 3, "Changes", [(5, 0)], "keys", []),
+    "analyze-hot": ("snapshot_tests__hot_keys_view", 3, "Hot keys", [(5, 0)], "keys", []),
+    "analyze-slots": ("app__views__slots__tests__snapshots__populated_on_redis_80x24", 3, "Slots", [(9, 0)], "keys", []),
+    "server-clients": ("app__views__server__tests__clients_120x36_second_group_selected", 4, "Clients", [(5, 0)], "keys", []),
+    "server-slowlog": ("app__views__server__tests__slow_log_120x36_with_a_note", 4, "Slow log", [(7, 0)], "keys", []),
+    "server-monitor": ("app__views__server__monitor_tests__monitor_running_120x36", 4, "Monitor", [(13, 0)], "notice", ["monitor"]),
+    "pubsub-tail": ("app__views__pubsub__tests__tail_120x36", 5, None, [(4, 0)], "keys", []),
+    "cmdline-panel": ("app__views__cmdline__tests__panel_120x36", 2, "Keys", [], "notice", []),
+    "cmdline-confirm": ("app__views__cmdline__tests__confirm_prod_80x24", 2, "Keys", [], "notice", []),
+    "help-overview": ("ui__help__tests__overview_120x36", None, None, [], "none", []),
+    "help-filtered": ("ui__help__tests__filtered_120x36", None, None, [(14, 0)], "none", []),
+    "sheet-cmdline": ("app__views__cmdline__tests__sheet_cmdline_write_120x36", 2, "Keys", [], "keys", []),
+    "gate-writes": ("app__tests__sheet_writes_on_120x36", 2, "Keys", [], "keys", []),
+    "gate-delete": ("app__views__value__tests__sheet_delete_prod_120x36", 2, "Keys", [], "keys", []),
     "gate-bulk": ("app__bulk__tests__bulk_expire_question_prod_80x24", 2, "Keys", [], "keys", []),
     "dbs": ("app__dbs__tests__the_list_open_80x24", 2, "Keys", [(11, 1)], "keys", []),
 }
@@ -88,8 +95,8 @@ def blank_body(line):
 
 
 def crop(lines):
-    """Collapse long runs of empty body rows (tall 120x36 screens) to two."""
-    out, run = [], 0
+    """The indexes of the rows to keep: long runs of empty body rows (tall screens) collapse to two."""
+    keep, run = [], 0
     for i, line in enumerate(lines):
         if 3 <= i < len(lines) - 2 and blank_body(line):
             run += 1
@@ -97,8 +104,8 @@ def crop(lines):
                 continue
         else:
             run = 0
-        out.append(line)
-    return out
+        keep.append(i)
+    return keep
 
 
 def classes_for(lines, area, panel, sels, footer):
@@ -144,8 +151,29 @@ def classes_for(lines, area, panel, sels, footer):
             mark(i, m.start(), m.end(), "o")
         for m in re.finditer(r"\$ redis-cli[^│]*", line):
             mark(i, m.start(), m.end(), "a")
+        # Colour roles as the terminal draws them (spec.md, Theme and NO_COLOR).
+        # Warning: a ▲ and the sentence it starts (not a flagged row of a table, whose ▲ alone is marked).
+        for m in re.finditer(r"▲ ([^│]*)", line):
+            rest = re.split(r" {3,}", m.group(1))[0]  # stop before a column such as WHERE
+            if rest.strip() and not re.match(r"\d\d:\d\d", rest) and re.match(r"\S+ \S+", rest):
+                end = m.start(1) + len(rest.rstrip())
+                mark(i, m.start(1), end, "w")
+        # Warning: `never` in an expiry column, and `asks first`.
+        for m in re.finditer(r"(?<=  )never(?=\s*(│|$| (hash|list|set|zset|string|stream)\b))", line):
+            mark(i, m.start(), m.end(), "w")
+        for m in re.finditer(r"\basks first\b", line):
+            mark(i, m.start(), m.end(), "w")
+        # Danger: what can lose data, in the Actions menu, Go to and the confirm sheet.
+        for m in re.finditer(r"(?:│|›) {1,3}(?:› )?\S{1,6} +(Delete key|Delete all|Delete|End|Reset|Drop|Trim)\b", line):
+            mark(i, m.start(1), m.end(1), "e")
+        for m in re.finditer(r"This can't be undone\.", line):
+            mark(i, m.start(), m.end(), "e")
+        # Placeholder: the {parts} of an inferred pattern.
+        for m in re.finditer(r"\{(id|uuid|ulid|hash|ip|var|num|date)\}", line):
+            mark(i, m.start(), m.end(), "ph")
 
     if area is not None:
+        # Line 0 is the context bar: profile, environment, access, database, address, state.
         top = lines[0]
         mark(0, 0, len(top), "top")
         m = re.match(r" (\S+)", top)
@@ -155,26 +183,29 @@ def classes_for(lines, area, panel, sels, footer):
             k = top.find(f" {word} ")
             if k >= 0:
                 mark(0, k, k + len(word) + 2, badge)
+        for m in re.finditer(r"(?<=  )[wb](?=  )", top):
+            mark(0, m.start(), m.end(), "k")
         for m in re.finditer(r"● (connected|analyzed)[^│]*$", top):
             mark(0, m.start(), m.end(), "o")
         for m in re.finditer(r"[⠇⠋] analyzing \d+%", top):
             mark(0, m.start(), m.end(), "a")
-        tabs = lines[1]
-        name = AREAS[area]
-        k = tabs.find(name)
-        if k >= 0:
-            mark(1, k - 1, k + len(name) + 1, "tab")
+        # Line 1 is the area row; the open area shows its panels inline ("2  Browse › Keys · Streams · Search").
+        row = lines[1]
+        m = re.search(rf"(?:^| ){area}  \S.*?(?=   |$)", row)
+        if m:
+            a = m.start() + (1 if row[m.start()] == " " else 0)
+            mark(1, a - 1, m.end() + 1, "tab")
+            if panel:
+                k = row.find("›", a, m.end())
+                for p in re.finditer(r"[^·›]+", row[k + 1 : m.end()] if k >= 0 else ""):
+                    name = p.group(0).strip()
+                    if name and name != panel and not name.startswith(panel + " "):
+                        s = k + 1 + p.start() + p.group(0).index(name)
+                        mark(1, s, s + len(name), "d")
         if area != 0:
-            for j in range(len(tabs)):
-                if "tab" not in cls[1][j] and tabs[j] != "│":
+            for j in range(len(row)):
+                if "tab" not in cls[1][j]:
                     cls[1][j].add("d")
-        if panel:
-            sub = lines[2]
-            k = sub.find(panel)
-            if k >= 0:
-                mark(2, k - 1, k + len(panel) + 1, "tab")
-            for m in re.finditer(r"names only[^│]*$", sub):
-                mark(2, m.start(), m.end(), "d")
 
     for (i, pane) in sels:
         line = lines[i]
@@ -202,7 +233,7 @@ def classes_for(lines, area, panel, sels, footer):
     return cls
 
 
-ORDER = ["top", "sel", "tab", "badge-e", "badge-w", "b", "bar", "t", "strong", "k", "e", "w", "o", "a", "d"]
+ORDER = ["top", "sel", "tab", "badge-e", "badge-w", "b", "bar", "t", "strong", "k", "e", "w", "o", "a", "ph", "d"]
 
 
 def render(lines, cls):
@@ -234,12 +265,12 @@ def term(name):
         # The fixture's SET value reads like a secret; show an ordinary value instead.
         old, new = "SET rate:1.2.3.4 hunter2-monitor-secret EX 60", "SET rate:1.2.3.4 41 EX 60"
         lines = [l.replace(old, new + " " * (len(old) - len(new))) for l in lines]
-    if "crop" in edits:
-        lines = crop(lines)
     for l in lines:
         if "hunter2" in l or "secret" in l.lower():
             raise SystemExit(f"{name}: credential-looking text left in: {l}")
     cls = classes_for(lines, area, panel, sels, footer)
+    keep = crop(lines)
+    lines, cls = [lines[i] for i in keep], [cls[i] for i in keep]
     wide = " term-wide" if width > 100 else ""
     src = os.path.relpath(find_snapshot(stem), ROOT)
     return (
@@ -269,7 +300,7 @@ def keys_cell(s):
 def key_tables():
     spec = open(os.path.join(ROOT, "spec.md"), encoding="utf-8").read().splitlines()
     start = spec.index("### Keys")
-    end = spec.index("### Help")
+    end = spec.index("### Keys overlay")
     out, title, rows = [], None, []
 
     def flush():

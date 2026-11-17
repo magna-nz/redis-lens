@@ -21,16 +21,22 @@
 //     and ffmpeg. No npm packages.
 //   - Optional: REDIS_LENS_DEMO_PASSWORD, the password of the demo's `lens` ACL user. With
 //     it, four made-up application clients connect to 127.0.0.1:6390 for the recording and
-//     send read-only commands, so Clients, Monitor and the charts have something to show.
+//     send read-only commands, so the live figures and Server's chart have something to show.
 //
 // What it changes, all on the demo server and the dashboard, and put back where it can be:
 //   - before recording it disconnects the dashboard, and afterwards connects again to what
 //     was connected (or stays disconnected);
 //   - it sends `LRANGE queue:emails 0 -1` once, so the slow log has an entry to show;
-//   - while recording it subscribes to `orders.*`, publishes a few made-up orders and runs
-//     MONITOR for a few seconds, through the dashboard.
+//   - while recording it analyzes the keys (Quick: reads only) and runs one read-only
+//     command on the command line. It sends no write: it opens a value and never presses a
+//     write's key or button.
 //
-// Options: --connection NAME, --width CSS_PX (default 1120), --height CSS_PX (default 780),
+// The recording, driven with the keyboard where the dashboard has a key: the connection
+// menu, Overview and `a`, Browse (`2`, then a pattern, its keys and a value with the arrow
+// keys and `j`), Go to (`ctrl-k`, `slow`, Enter) and the Slow log, the command-line drawer
+// (`:`, Esc), the keys sheet (`?`) and the light theme.
+//
+// Options: --connection NAME, --width CSS_PX (default 1280), --height CSS_PX (default 800),
 // --gif-width PX (default 960), --fps N (default 12), --keep-frames DIR.
 
 import { spawn, execFileSync } from 'node:child_process';
@@ -53,8 +59,8 @@ const opt = (name, fallback) => {
 };
 const signinFile = opt('--signin-file', null);
 const connection = opt('--connection', 'demo-admin');
-const width = Number(opt('--width', '1120'));
-const height = Number(opt('--height', '780'));
+const width = Number(opt('--width', '1280'));
+const height = Number(opt('--height', '800'));
 const gifWidth = Number(opt('--gif-width', '960'));
 const fps = Number(opt('--fps', '12'));
 const keepFrames = opt('--keep-frames', null);
@@ -73,7 +79,7 @@ const token = signIn.slice(signIn.indexOf('#token=') + 7);
 /** Every message this script prints goes through here, so the token never does. */
 const say = (...parts) => console.log(parts.join(' ').split(token).join('<token>'));
 
-// ---------- the dashboard's API, for setting up and for the publisher ----------
+// ---------- the dashboard's API, for setting up ----------
 
 async function api(method, route, body) {
   const headers = { Authorization: `Bearer ${token}` };
@@ -330,13 +336,29 @@ async function main() {
       await sleep(perChar + Math.round(Math.random() * 20));
     }
   }
-  async function enter() {
-    const base = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 };
-    await send('Input.dispatchKeyEvent', { type: 'keyDown', ...base, text: '\r' });
-    await send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+  const CTRL = 2;
+  const NAMED = { Enter: [13, 'Enter', '\r'], Escape: [27, 'Escape'], Tab: [9, 'Tab'], ArrowDown: [40, 'ArrowDown'], ArrowUp: [38, 'ArrowUp'], ArrowRight: [39, 'ArrowRight'], ArrowLeft: [37, 'ArrowLeft'] };
+  /** One key press, as the keyboard sends it (a named key, or one character; CTRL for ctrl). */
+  async function press(k, modifiers = 0) {
+    let params;
+    if (NAMED[k]) {
+      const [vk, code, text] = NAMED[k];
+      params = { key: k, code, windowsVirtualKeyCode: vk, text };
+    } else {
+      const up = k.toUpperCase();
+      params = { key: k, text: modifiers ? undefined : k, windowsVirtualKeyCode: up.charCodeAt(0), code: /[a-z]/i.test(k) ? `Key${up}` : undefined };
+    }
+    await send('Input.dispatchKeyEvent', { type: params.text ? 'keyDown' : 'rawKeyDown', modifiers, ...params });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', modifiers, ...params, text: undefined });
+  }
+  /** Types into whatever has the focus, one key event per character. */
+  async function typeKeys(text, perChar = 60) {
+    for (const ch of text) {
+      await press(ch);
+      await sleep(perChar);
+    }
   }
 
-  let publisher = null;
   try {
     await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
     await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: 'dark' }, { name: 'prefers-reduced-motion', value: 'no-preference' }] });
@@ -354,85 +376,100 @@ async function main() {
     const t0 = Date.now();
     const mark = (what) => say(`${((Date.now() - t0) / 1000).toFixed(1).padStart(5)} s  ${what}`);
 
-    // Connections, then connect.
+    // Connections, then connect from the connection menu in the top bar.
     mark('Connections');
-    await sleep(1500);
-    await click(`.conn-card[aria-label="${connection}"] .btn.primary`);
-    await waitFor('.tiles');
+    await sleep(1400);
+    await click('#conn-btn');
+    await waitFor('#conn-menu .menu-item');
+    mark('Connection menu');
+    await sleep(1300);
+    await click(`#conn-menu .menu-item[data-key="saved:${connection}"]`);
+    await waitFor('.tile');
     mark('Overview');
-    await sleep(2800);
+    await sleep(2400);
 
-    // Server: Clients, Slow log, Monitor.
-    await click('a.navb[data-nav=server]');
-    mark('Server › Clients');
-    await sleep(2100);
-    await click('a, button', 'Slow log');
-    mark('Server › Slow log');
-    await sleep(2300);
-    await click('a, button', 'Monitor');
-    await sleep(400);
-    await click('button.btn.primary', 'Watch commands for 30 seconds');
-    await waitFor('dialog[open] button[type=submit]');
-    mark('Monitor asks first');
-    await sleep(1100);
-    await click('dialog[open] button[type=submit]');
-    mark('Monitor running');
+    // a: analyze. The question opens on Cancel; Tab moves to Analyze, Enter starts it.
+    await press('a');
+    await waitFor('dialog[open] button[data-ask=analyze]');
+    mark('Analyze the keys?');
+    await sleep(1500);
+    await press('Tab');
+    await sleep(350);
+    await press('Enter');
+    for (let i = 0; i < 60; i += 1) {
+      const busy = await evaluate("!!document.querySelector('dialog[open]') || !/sampled/.test(document.body.innerText)");
+      if (!busy) break;
+      await sleep(250);
+    }
+    mark('Analyzed');
     await sleep(2600);
-    await click('button.btn.primary', 'Stop');
+
+    // 2: Browse. A pattern, its keys and a value, side by side, from the keyboard.
+    await press('2');
+    await waitFor('.row-pat');
+    mark('Browse');
+    await sleep(1300);
+    await click('.row-pat', 'user:{id}:cart');
+    await waitFor('.row-key');
+    mark('A pattern\'s keys');
+    await sleep(1200);
+    await press('ArrowRight');
     await sleep(500);
-
-    // Pub/Sub: subscribe to a pattern, then messages arrive.
-    await click('a.navb[data-nav=pubsub]');
-    mark('Pub/Sub');
-    await sleep(300);
-    await click('#sub-target');
-    await typeText('orders.*');
-    await sleep(250);
-    await click('button[type=submit]', 'Subscribe');
-    await waitFor('.box.log.tail');
-    const orders = [
-      ['orders.eu', '{"id":10482,"total":59.90,"items":3}'],
-      ['orders.us', '{"id":10483,"total":12.50,"items":1}'],
-      ['orders.eu', '{"id":10484,"total":230.00,"items":7}'],
-      ['orders.apac', '{"id":10485,"total":41.75,"items":2}'],
-      ['orders.us', '{"id":10486,"total":88.10,"items":4}'],
-      ['orders.eu', '{"id":10487,"total":19.99,"items":1}'],
-      ['orders.us', '{"id":10488,"total":64.00,"items":3}'],
-    ];
-    let n = 0;
-    publisher = setInterval(() => {
-      const [channel, message] = orders[n % orders.length];
-      n += 1;
-      api('POST', '/api/pubsub/publish', { channel, message, shard: false }).catch(() => {});
-    }, 450);
-    mark('Pub/Sub tail');
-    await sleep(2700);
-    clearInterval(publisher);
-    publisher = null;
-
-    // The command line: a sorted set's top members, as text and then as a table.
-    await click('#cmd-toggle');
-    await sleep(300);
-    if (!(await evaluate("document.activeElement && document.activeElement.id === 'cmd-input'"))) await click('#cmd-input');
-    const feed = keys.find((k) => /^user:\d+:feed$/.test(k));
-    await typeText(feed ? `ZRANGE ${feed} 0 5 REV WITHSCORES` : 'SCAN 0 MATCH user:* COUNT 10', 28);
-    await sleep(200);
-    await enter();
-    mark('Command line');
-    await sleep(1600);
-    await click('.cmd .pill', 'Table');
-    mark('Table');
-    await sleep(2000);
-    await click('.cmd button.btn', 'Close');
-    await evaluate("window.scrollTo({ top: 0, behavior: 'smooth' }); document.getElementById('main').scrollTo({ top: 0, behavior: 'smooth' }); true");
+    await press('j');
+    await sleep(700);
+    await press('ArrowRight');
+    await waitFor('.row-item');
+    mark('A key\'s value');
+    await sleep(1000);
+    await press('ArrowRight');
     await sleep(600);
+    await press('j');
+    await sleep(2200);
 
-    // Light theme and back.
+    // ctrl-k: Go to, "slow", Enter.
+    await press('k', CTRL);
+    await waitFor('dialog[open] .goto-input');
+    mark('Go to');
+    await sleep(900);
+    await typeKeys('slow', 160);
+    await sleep(1300);
+    await press('Enter');
+    mark('Server › Slow log');
+    await sleep(1600);
+    await click('table.slow tbody tr:nth-child(2)');
+    await sleep(2000);
+
+    // ':' the command-line drawer: one read-only command, then Esc closes it.
+    await press(':');
+    await waitFor('#cmdline:not([hidden])');
+    await sleep(500);
+    const feed = keys.find((k) => /^user:\d+:feed$/.test(k));
+    await typeText(feed ? `ZRANGE ${feed} 0 4 REV WITHSCORES` : 'DBSIZE', 30);
+    await sleep(300);
+    await press('Enter');
+    mark('Command line');
+    await sleep(1500);
+    await click('.cmd-drawer .pill', 'Table');
+    await sleep(1800);
+    // Esc closes the drawer from anywhere inside it; the click left the focus on the pill.
+    await evaluate("document.getElementById('cmd-input').focus(); true");
+    await press('Escape');
+    await sleep(300);
+    if (!(await evaluate("document.getElementById('cmdline').hidden"))) say('the command line did not close on Esc');
+    await sleep(800);
+
+    // ?: the keys of this screen.
+    await press('?');
+    await waitFor('dialog[open] .sheet-rows');
+    mark('Keys sheet');
+    await sleep(2600);
+    await press('Escape');
+    await sleep(700);
+
+    // The light theme, to end on.
     await click('#theme-toggle');
     mark('Light theme');
-    await sleep(2000);
-    await click('#theme-toggle');
-    await sleep(1000);
+    await sleep(2600);
     mark('end');
     recording = false;
     await send('Page.stopScreencast');
@@ -453,10 +490,9 @@ async function main() {
     execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', path.join(work, 'frames.txt'), '-vf', filters, '-loop', '0', out], { stdio: 'inherit' });
     say(`wrote ${out}: ${frameList.length} frames captured, ${(statSync(out).size / 1e6).toFixed(2)} MB`);
   } finally {
-    if (publisher) clearInterval(publisher);
     stops.forEach((stop) => stop());
     await chrome.close();
-    // Put the dashboard back: the tail and Monitor end with the connection.
+    // Put the dashboard back (nothing here starts a tail or Monitor; these are no-ops then).
     await api('DELETE', '/api/server/monitor').catch(() => {});
     await api('DELETE', '/api/pubsub/subscribe').catch(() => {});
     await api('POST', '/api/polling', { paused: !!polling.paused, interval_secs: polling.interval_secs || 2 }).catch(() => {});

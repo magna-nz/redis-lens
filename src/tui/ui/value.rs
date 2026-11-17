@@ -98,7 +98,7 @@ pub(super) fn open_key_pane(
             head.extend(
                 wrap(&n, w)
                     .into_iter()
-                    .map(|l| Line::from(fit(vec![Span::styled(l, style::amber())], w))),
+                    .map(|l| Line::from(fit(vec![Span::styled(l, style::warning())], w))),
             );
         }
         head.push(Line::default());
@@ -427,7 +427,10 @@ pub fn draw_form(frame: &mut Frame, area: Rect, form: &Form) {
     }
     if let Some(e) = &form.error {
         for l in wrap(&format!(" ✗ {e}"), inner) {
-            lines.push(Line::from(fit(vec![Span::styled(l, style::warn())], inner)));
+            lines.push(Line::from(fit(
+                vec![Span::styled(l, style::danger())],
+                inner,
+            )));
         }
     }
     let last = form.at + 1 >= form.fields.len();
@@ -634,7 +637,7 @@ fn draw_value_body_wrapped(
                      redis-lens reads documents of at most {max}."
                 ),
             };
-            rows(frame, inner, msg(text, style::amber()), None);
+            rows(frame, inner, msg(text, style::warning()), None);
         }
         Items::String { value, .. } => {
             value_pane(frame, inner, state, "value".into(), value, Vec::new());
@@ -659,16 +662,16 @@ fn draw_value_body_wrapped(
 /// What the pane says before anything is read.
 fn msg_lines(state: &ValueState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>> {
     let (text, st) = if let Some(e) = &state.error {
-        (format!(" ✗ {e}"), style::warn())
+        (format!(" ✗ {e}"), style::danger())
     } else if state.gone {
-        (" The key no longer exists.".to_string(), style::amber())
+        (" The key no longer exists.".to_string(), style::warning())
     } else if let LiveState::Closed(why) = ctx.live() {
         let why = why.as_deref().unwrap_or("it was closed");
         (
             format!(
                 " ✗ The live connection is closed: {why}. a on Overview analyzes again and reopens it."
             ),
-            style::warn(),
+            style::danger(),
         )
     } else if !ctx.live_ready() {
         (
@@ -852,14 +855,14 @@ fn collection(frame: &mut Frame, area: Rect, state: &ValueState, items: &Items) 
 /// The divider between the list and the value, with what the list can't say itself.
 fn divider_line(state: &ValueState, w: usize) -> Line<'static> {
     let note = if let Some(e) = &state.error {
-        Some((format!("✗ {e}"), style::warn()))
+        Some((format!("✗ {e}"), style::danger()))
     } else if state.capped {
         Some((
             format!(
                 "at most {} items are held",
                 format::grouped(MAX_ITEMS as u64)
             ),
-            style::amber(),
+            style::warning(),
         ))
     } else if matches!(state.items, Some(Items::Vector(_))) {
         Some((
@@ -1055,7 +1058,7 @@ fn module_pane(frame: &mut Frame, area: Rect, state: &ValueState, m: &Module, wr
     if let Some(why) = &m.unavailable {
         let lines: Vec<Line<'static>> = wrap(&format!(" {why}"), w)
             .into_iter()
-            .map(|l| Line::from(fit(vec![Span::styled(l, style::amber())], w)))
+            .map(|l| Line::from(fit(vec![Span::styled(l, style::warning())], w)))
             .collect();
         state.drawn.set(lines.len(), usize::from(area.height));
         rows(frame, area, lines, None);
@@ -1117,7 +1120,7 @@ fn module_pane(frame: &mut Frame, area: Rect, state: &ValueState, m: &Module, wr
     }
     for note in &m.missing {
         for l in wrap(&format!(" ▲ {note}"), w) {
-            body.push(Line::from(fit(vec![Span::styled(l, style::amber())], w)));
+            body.push(Line::from(fit(vec![Span::styled(l, style::warning())], w)));
         }
     }
     let section = |body: &mut Vec<Line<'static>>, text: String| {
@@ -1141,7 +1144,7 @@ fn module_pane(frame: &mut Frame, area: Rect, state: &ValueState, m: &Module, wr
             body.push(Line::from(fit(
                 vec![Span::styled(
                     format!(" {}", spark(&m.samples, w.saturating_sub(2))),
-                    style::ok(),
+                    style::data(),
                 )],
                 w,
             )));

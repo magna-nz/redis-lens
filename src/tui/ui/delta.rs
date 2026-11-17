@@ -7,7 +7,7 @@ use crate::format;
 
 use super::style;
 
-/// Growth of at least this many bytes is shown in red.
+/// Growth of at least this many bytes is flagged with `▲`, in the warning colour.
 pub const BIG_GROWTH: i64 = 300 * 1024 * 1024;
 
 /// The change of one pattern, or the sum over a group's children.
@@ -62,15 +62,16 @@ impl Change {
         self.new || (self.bytes && self.value >= BIG_GROWTH)
     }
 
-    /// Red for new patterns and growth of at least 300M, amber for other growth,
-    /// teal for shrinkage, dim when unchanged.
+    /// The warning colour for new patterns and growth of at least 300M (the rows with
+    /// a `▲`), plain for other growth, teal for shrinkage, dim when unchanged. Nothing
+    /// here is a failure, so nothing is red.
     pub fn style(self) -> Style {
         if self.is_alarming() {
-            style::warn()
+            style::warning()
         } else if self.unchanged || self.value == 0 {
             style::dim()
         } else if self.value > 0 {
-            style::amber()
+            style::fg()
         } else {
             style::ok()
         }
@@ -131,19 +132,16 @@ mod tests {
     fn text_and_colours() {
         let c = change(640 * MB, true, false, false);
         assert_eq!(c.text(), "+640M");
-        assert_eq!(c.style(), style::warn());
-        assert_eq!(change(200 * MB, true, false, false).style(), style::amber());
+        assert_eq!(c.style(), style::warning());
+        assert_eq!(change(200 * MB, true, false, false).style(), style::fg());
         assert_eq!(change(-12 * MB, true, false, false).text(), "-12M");
         assert_eq!(change(-12 * MB, true, false, false).style(), style::ok());
-        assert_eq!(change(MB, true, true, false).style(), style::warn());
+        assert_eq!(change(MB, true, true, false).style(), style::warning());
         assert_eq!(change(50_000, true, false, true).style(), style::dim());
         assert_eq!(change(0, true, false, true).text(), "·");
         assert_eq!(change(1_500, false, false, false).text(), "+1.5K");
         // Without sizes there is no byte threshold.
-        assert_eq!(
-            change(400 * MB, false, false, false).style(),
-            style::amber()
-        );
+        assert_eq!(change(400 * MB, false, false, false).style(), style::fg());
     }
 
     #[test]

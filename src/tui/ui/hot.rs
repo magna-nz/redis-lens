@@ -202,9 +202,9 @@ fn hot_row(
             "FREQ" => spans.push(Span::styled(pad_l(&freq.to_string(), w), style::fgb())),
             "SIZE" => {
                 let size = k.bytes.map_or_else(dash, format::bytes);
-                // Hot and big: the mark, then the size, in red.
+                // Hot and big: the mark, then the size, as a warning.
                 let (text, st) = if big {
-                    (format!("{MARK} {size}"), style::warn())
+                    (format!("{MARK} {size}"), style::warning())
                 } else {
                     (size, style::fg())
                 };
@@ -212,7 +212,7 @@ fn hot_row(
             }
             "HEAT" => {
                 let (fill, track) = bar(f64::from(freq) / 255.0, w);
-                spans.push(Span::styled(fill, style::warn()));
+                spans.push(Span::styled(fill, style::data()));
                 spans.push(Span::styled(track, style::track()));
             }
             "TYPE" => spans.push(Span::styled(pad_r(k.key_type.as_str(), w), style::dim())),
@@ -253,7 +253,7 @@ fn detail_lines(frame: &mut Frame, inner: Rect, k: &KeySample, node: Option<Stri
             Span::styled(
                 size,
                 if is_hot_big(k) {
-                    style::warn()
+                    style::warning()
                 } else {
                     style::fgb()
                 },
@@ -278,10 +278,10 @@ fn detail_lines(frame: &mut Frame, inner: Rect, k: &KeySample, node: Option<Stri
             k.bytes.map_or_else(String::new, format::bytes)
         );
         lines.extend(paragraph(
-            vec![Span::styled(format!(" {MARK} "), style::warn())],
+            vec![Span::styled(format!(" {MARK} "), style::warning())],
             "   ",
             &note,
-            style::warn(),
+            style::warning(),
             w,
         ));
     } else {
@@ -435,13 +435,13 @@ fn monitor_ranking(frame: &mut Frame, area: Rect, app: &App, hot: &MonitorHot) {
         };
         dl.push(Line::default());
         dl.extend(paragraph(
-            vec![Span::styled(format!(" {MARK} "), style::amber())],
+            vec![Span::styled(format!(" {MARK} "), style::warning())],
             "   ",
             &format!(
                 "{} {lines} {verb} a command whose keys are unknown.",
                 format::grouped(n)
             ),
-            style::amber(),
+            style::warning(),
             dw,
         ));
         if let Some(why) = &hot.keys_note {

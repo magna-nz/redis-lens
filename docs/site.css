@@ -49,11 +49,12 @@
   --t-strong: #ffffff;
   --t-border: #60646e;
   --t-dim: #7b7f88;
-  --t-warn: #e8b34b;
-  --t-err: #f2665b;
-  --t-ok: #5cc87a;
-  --t-accent: #7cc4f5;
-  --t-bar: #6fb2e8;
+  --t-warn: #e8b45c;
+  --t-err: #f07662;
+  --t-ok: #5fc6b4;
+  --t-accent: #6cb6ff;
+  --t-bar: #4f8fd6;
+  --t-ph: #b79cf5;
   --t-sel: #263142;
   --t-top: #17191d;
 }
@@ -441,11 +442,13 @@ pre.term .e { color: var(--t-err); }
 pre.term .o { color: var(--t-ok); }
 pre.term .a { color: var(--t-accent); }
 pre.term .bar { color: var(--t-bar); }
+pre.term .ph { color: var(--t-ph); }
 pre.term .k { color: var(--t-strong); font-weight: 600; }
 pre.term .strong { color: var(--t-strong); font-weight: 600; }
 pre.term .top { background: var(--t-top); }
 pre.term .sel { background: var(--t-sel); color: var(--t-strong); }
 pre.term .tab { background: #3a2020; color: #ffffff; font-weight: 600; }
+pre.term .tab.d { color: #c7a3a3; font-weight: 400; }
 pre.term .badge-e { background: var(--t-err); color: #160606; font-weight: 600; }
 pre.term .badge-w { background: var(--t-warn); color: #1a1205; font-weight: 600; }
 

@@ -38,24 +38,32 @@
 <div class="nav-group"><div class="nav-label">Use it</div><ul>
 <li data-only="terminal"><a href="#tui">The TUI</a><ul class="sub-nav">
 <li><a href="#tui-layout">Screen layout</a></li>
+<li><a href="#tui-grammar">How the keys work</a></li>
 <li><a href="#tui-connections">0 Connections</a></li>
 <li><a href="#tui-overview">1 Overview</a></li>
 <li><a href="#tui-browse">2 Browse</a></li>
+<li><a href="#tui-browse-panes">Browse in three panes</a></li>
 <li><a href="#tui-values">Values and formats</a></li>
 <li><a href="#tui-analyze">3 Analyze</a></li>
 <li><a href="#tui-server">4 Server</a></li>
 <li><a href="#tui-pubsub">5 Pub/Sub</a></li>
+<li><a href="#tui-goto">Go to (ctrl-k)</a></li>
+<li><a href="#tui-actions">The . Actions menu</a></li>
+<li><a href="#tui-sheet">The confirm sheet</a></li>
 <li><a href="#tui-cmdline">The : command line</a></li>
-<li><a href="#tui-help">The ? help</a></li>
+<li><a href="#tui-help">The ? keys overlay</a></li>
 <li><a href="#tui-more">Database, copy, theme</a></li>
 </ul></li>
 <li data-only="dashboard"><a href="#dashboard">The dashboard</a><ul class="sub-nav">
 <li><a href="#dash-start">Starting and stopping</a></li>
 <li><a href="#dash-access">Who can open it</a></li>
 <li><a href="#dash-rules">The same rules</a></li>
+<li><a href="#dash-chrome">Top bar and rail</a></li>
+<li><a href="#dash-keys">Keys and Go to</a></li>
 <li><a href="#dash-connections">Connections</a></li>
 <li><a href="#dash-overview">Overview</a></li>
 <li><a href="#dash-browse">Browse › Keys</a></li>
+<li><a href="#dash-browse-address">Browse in the address</a></li>
 <li><a href="#dash-edits">Edits and bulk actions</a></li>
 <li><a href="#dash-streams">Browse › Streams</a></li>
 <li><a href="#dash-search">Browse › Search</a></li>
@@ -141,19 +149,19 @@
 <h1>redis-lens</h1>
 <p class="lede">redis-lens lists your keys and shows their values, finds the keys and key patterns that use the most memory, and shows live server stats, connected clients, the slow log and Pub/Sub messages. You can also run commands and edit keys from it.</p>
 <div class="badges"><span>Redis 6.2 and later</span><span>Valkey 8</span><span>standalone, cluster, Sentinel</span><span>macOS · Linux · Windows</span><span>MIT</span></div>
-<p data-only="terminal">To see what uses the memory, press <kbd>r</kbd>. redis-lens samples the keys with <code>SCAN</code>, groups them into patterns such as <code>user:{id}:cart</code>, and lists each pattern's key count, memory, average size and how many keys have no TTL. A pattern that looks wrong, such as keys that never expire or one very large list, is marked <code>▲</code> with the reason.</p>
-<p data-only="dashboard">redis-lens runs in the terminal, and the same program serves a web dashboard on <code>127.0.0.1</code>. The dashboard has every screen of the TUI: Connections, Overview, Browse (keys and their values, streams, Search), Analyze, Server (clients, the slow log, <code>MONITOR</code>), Pub/Sub and a command line, with the same edits and bulk actions. It follows the same rules as the terminal; see <a href="#dashboard">The dashboard</a>.</p>
-<p data-only="terminal">To find a key, press <kbd>ctrl-f</kbd> on any screen and type part of its name or a pattern. Other screens show the server (stats, clients, the slow log, <code>MONITOR</code>), streams and consumer groups, Pub/Sub, Search indexes, and a <code>:</code> command line. Snapshots, diffs, trends and <code>--check</code> rules run the same analysis from cron or CI.</p>
+<p data-only="terminal">To see what uses the memory, press <kbd>a</kbd>. redis-lens samples the keys with <code>SCAN</code>, groups them into patterns such as <code>user:{id}:cart</code>, and lists each pattern's key count, memory, average size and how many keys have no TTL. A pattern that looks wrong, such as keys that never expire or one very large list, is marked <code>▲</code> with the reason.</p>
+<p data-only="dashboard">redis-lens runs in the terminal, and the same program serves a web dashboard on <code>127.0.0.1</code>. The dashboard has every screen of the TUI: Connections, Overview, Browse (keys and their values, streams, Search), Analyze, Server (clients, the slow log, <code>MONITOR</code>), Pub/Sub and a command line, with the same edits and bulk actions, and the same keys where a browser allows them. It follows the same rules as the terminal; see <a href="#dashboard">The dashboard</a>.</p>
+<p data-only="terminal">To get somewhere, press <kbd>ctrl-k</kbd> (Go to) and type a few letters of a pattern, a loaded key or a screen; typing reads nothing from the server. <kbd>ctrl-f</kbd> finds any key on the server by part of its name or a pattern. <kbd>.</kbd> lists what each key does on the selected row, which actions are off and why, and the command a write sends. Other screens show the server (stats, clients, the slow log, <code>MONITOR</code>), streams and consumer groups, Pub/Sub, Search indexes, and a <code>:</code> command line. Snapshots, diffs, trends and <code>--check</code> rules run the same analysis from cron or CI.</p>
 <h3>Why it is safe on production</h3>
 <ul>
-<li><strong>It reads nothing on connect.</strong> Connecting reads the server's own figures (<code>INFO</code>, <code>DBSIZE</code>, <code>MEMORY STATS</code>) and no key. Keys are sampled only when you press <kbd>r</kbd>.</li>
+<li><strong>It reads nothing on connect.</strong> Connecting reads the server's own figures (<code>INFO</code>, <code>DBSIZE</code>, <code>MEMORY STATS</code>) and no key. Keys are sampled only when you press <kbd>a</kbd>.</li>
 <li><strong><code>SCAN</code>, never <code>KEYS</code>,</strong> with per-key commands pipelined in batches, under a command budget that every view shares (5,000 commands a second by default).</li>
 <li><strong>Production profiles are read-only.</strong> A write is sent only when the server's ACL, the profile and a confirmation all allow it, through one write gate in the code.</li>
 <li><strong>Credentials live in the OS keychain</strong>, never in the config file, logs, error messages, snapshots or on screen.</li>
 <li><strong>A missing permission turns one feature off</strong> and says why. It never aborts a scan.</li>
 </ul>
-<figure data-only="terminal"><img class="gif" src="demo.gif" width="1175" height="784" decoding="async" alt="redis-lens opening the demo Redis, analyzing the keys, browsing the key patterns and their verdicts, opening a pattern's keys and a value, then the Analyze and Server panels" loading="lazy"><figcaption>The demo keyspace from <code>make demo</code>. Every screen below is drawn from the app's own snapshot tests.</figcaption></figure>
-<figure data-only="dashboard"><img class="gif" src="dashboard.gif" width="960" height="669" loading="lazy" decoding="async" alt="The redis-lens dashboard in a browser: connecting to a demo Redis, the Overview, the Server clients, slow log and Monitor, a Pub/Sub tail with messages arriving, the command line showing a table, and the light theme"><figcaption>The dashboard against the demo servers from <code>make demo</code>. The screenshots below are from the same demo servers.</figcaption></figure>
+<figure data-only="terminal"><img class="gif" src="demo.gif" width="1175" height="784" decoding="async" alt="redis-lens in the terminal: connecting to the demo Redis, Overview, analyzing the keys, Browse with patterns, a pattern's keys and a value side by side, the Actions menu, Go to opening the Slow log, and the keys sheet" loading="lazy"><figcaption>The demo keyspace from <code>make demo</code>. Every screen below is drawn from the app's own snapshot tests.</figcaption></figure>
+<figure data-only="dashboard"><img class="gif" src="dashboard.gif" width="960" height="600" loading="lazy" decoding="async" alt="The redis-lens dashboard in a browser: connecting from the connection menu, Overview, Browse with a pattern, its keys and a value side by side, Go to opening the Slow log, the command line drawer, the keys sheet and the light theme"><figcaption>The dashboard against the demo servers from <code>make demo</code>, driven from the keyboard. The screenshots below are from the same demo servers.</figcaption></figure>
 </div>
 <div class="rail">
 <div class="codeblock"><div class="cb-head"><span class="cb-title">install</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">brew install magna-nz/tap/redis-lens</code></pre></div>
@@ -168,7 +176,7 @@ redis-lens conn add staging \
   --url redis://lens-ro@staging.internal:6379 \
   --env stage --ask-password
 
-# open the TUI: pick it, enter, then r to analyze
+# open the TUI: pick it, enter, then a to analyze
 redis-lens</code></pre></div>
 <div class="codeblock"><div class="cb-head"><span class="cb-title">what it answers</span><span class="cb-lang">text</span></div><pre><code>PATTERN               KEYS  MEMORY  NO TTL
 session:{uuid}       1.84M    6.1G      0%
@@ -250,11 +258,11 @@ redis-lens conn test prod-cache   # connect and run the permission check</code><
 <div class="row" data-only="terminal">
 <div class="prose">
 <h3>3. Open the TUI and analyze</h3>
-<p>Run <code>redis-lens</code> with no arguments. Pick a connection and press <kbd>enter</kbd>: you land on <strong>1 Overview</strong> with the server's live figures and what the server says on its own, with no key read. Press <kbd>r</kbd> and choose <strong>Quick</strong> (10,000 keys) or <strong>Deep</strong> (100,000 keys). The dialog shows how many commands each sends and how long it takes at the profile's budget. <kbd>esc</kbd> stops an analysis and keeps what it has.</p>
-<p>Then <kbd>2</kbd> browses the patterns, <kbd>3</kbd> shows Big keys, Expiry, Changes and Hot keys, and <kbd>?</kbd> lists every key and finds any action.</p>
+<p>Run <code>redis-lens</code> with no arguments. Pick a connection and press <kbd>enter</kbd>: you land on <strong>1 Overview</strong> with the server's live figures and what the server says on its own, with no key read. Press <kbd>a</kbd> and choose <strong>Quick</strong> (10,000 keys) or <strong>Deep</strong> (100,000 keys). The dialog shows how many commands each sends and how long it takes at the profile's budget. <kbd>esc</kbd> stops an analysis and keeps what it has.</p>
+<p>Then <kbd>2</kbd> browses the patterns, with a pattern's keys and a key's value beside them, <kbd>3</kbd> shows Big keys, Expiry, Changes and Hot keys, <kbd>ctrl-k</kbd> goes to any pattern, loaded key or screen by name, <kbd>.</kbd> lists the actions of the selected row, and <kbd>?</kbd> lists every key and finds any action.</p>
 </div>
 <div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">redis-lens
-# enter connects, r analyzes, ? shows every key, q quits
+# enter connects, a analyzes, ? lists the keys, q quits
 
 # or without the TUI
 redis-lens scan prod-cache --sample 20000</code></pre></div></div>
@@ -265,7 +273,7 @@ redis-lens scan prod-cache --sample 20000</code></pre></div></div>
 <h3>3. Open the dashboard</h3>
 <p><code>redis-lens --dashboard</code> serves the dashboard alone. It prints <code>Dashboard:</code> and a sign-in link, opens your browser on it (not with <code>--no-open</code>), and runs until <kbd>ctrl-c</kbd>.</p>
 <p>Plain <code>redis-lens</code> starts the TUI and serves the dashboard beside it on <code>127.0.0.1:7379</code>. The Connections screen shows the address; <kbd>ctrl-o</kbd> opens it in your browser, signed in. Quitting the TUI stops the dashboard.</p>
-<p>In the page, <strong>Connections</strong> lists the saved connections and the containers found in Docker. <strong>Add a connection</strong> saves a new one, with the password going to the OS keychain. <strong>Connect</strong> reads the server's own figures, no key, and opens the Overview. Browse, Analyze, Server, Pub/Sub and Command line are in the side bar; <strong>Analyze 10,000 keys</strong> on Analyze samples the keys.</p>
+<p>In the page, <strong>Connections</strong> lists the saved connections and the containers found in Docker. <strong>Add a connection</strong> saves a new one, with the password going to the OS keychain. <strong>Connect</strong>, or picking the connection from the menu at the left of the top bar, reads the server's own figures, no key, and opens the Overview. Browse, Analyze, Server, Pub/Sub, Connections and Command line are in the rail on the left, with their keys (<kbd>1</kbd>–<kbd>5</kbd>, <kbd>0</kbd>, <kbd>:</kbd>); <strong>Analyze</strong> (<kbd>a</kbd>) on Overview asks Quick or Deep, then samples the keys.</p>
 </div>
 <div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">shell</span><span class="cb-lang">bash</span></div><pre><code class="language-bash">redis-lens --dashboard             # the dashboard only
 redis-lens --dashboard --no-open   # print the link, open no browser
@@ -299,21 +307,65 @@ make demo-down   # stop the demo and delete its data</code></pre></div></div>
 <div class="eyebrow">Use it</div>
 <h2>The TUI <a class="anchor" href="#tui" aria-label="Link to this section">#</a></h2>
 <p class="lede">A home screen and five areas, switched with <kbd>0</kbd> to <kbd>5</kbd>.</p>
-<p><strong>0 Connections</strong> is the home screen. Once connected: <strong>1 Overview</strong>, <strong>2 Browse</strong> (Keys · Streams · Search), <strong>3 Analyze</strong> (Big keys · Expiry · Changes · Hot keys, plus Nodes · Slots on a cluster), <strong>4 Server</strong> (Clients · Slow log · Monitor) and <strong>5 Pub/Sub</strong>. <kbd>tab</kbd> and <kbd>shift-tab</kbd> switch panels and do nothing else; <kbd>→</kbd> and <kbd>←</kbd> go deeper and back. Every screen below is the app's own rendering, taken from its insta snapshot tests, with colour added.</p>
+<p><strong>0 Connections</strong> is the home screen. Once connected: <strong>1 Overview</strong>, <strong>2 Browse</strong> (Keys · Streams · Search), <strong>3 Analyze</strong> (Big keys · Expiry · Changes · Hot keys, plus Nodes · Slots on a cluster), <strong>4 Server</strong> (Clients · Slow log · Monitor) and <strong>5 Pub/Sub</strong>. An area's panels follow its name in the area row (<code>2 Browse › Keys · Streams · Search</code>). <kbd>tab</kbd> and <kbd>shift-tab</kbd> switch panels and do nothing else, and the area's digit again goes to its next panel; <kbd>→</kbd> and <kbd>←</kbd> go deeper and back. Every screen below is the app's own rendering, taken from its insta snapshot tests, with colour added.</p>
 </div>
 </div>
 
 <div class="sub" id="tui-layout">
 <div class="row row-wide"><div class="prose">
 <h3>Screen layout</h3>
-<p>From the top: the <strong>header</strong> (profile, environment badge, write state, memory, keys, and the status at the right: <code>● connected</code>, <code>⠋ analyzing 41%</code>, <code>● analyzed 14:02 UTC</code>), the <strong>tab row</strong>, the <strong>sub-tab row</strong> on areas with panels, the <strong>body</strong> and the <strong>footer</strong>, which shows the 3 to 5 keys that matter on that screen and <code>: Command  ? Help</code> at the right.</p>
+<p>From the top, every screen has two chrome rows, then the body and the footer:</p>
+<ul>
+<li>The <strong>context bar</strong>: the profile's name, its environment badge, the <kbd>w</kbd> key cap and the write state, the <kbd>b</kbd> key cap and the database, then the address, server, memory and key count as they fit, and the status at the right: <code>● connected</code>, <code>⠋ analyzing 41%</code>, <code>● analyzed 14:02 UTC</code>.</li>
+<li>The <strong>area row</strong>: <code>1 Overview   2 Browse › Keys · Streams · Search   3 Analyze   4 Server   5 Pub/Sub</code> with <code>0 Connections</code> at the right. The area on screen is bold, with its panels after <code>›</code> and the current one bold. On Browse a short note can sit at the right, such as "names only, no analysis yet".</li>
+<li>The <strong>footer</strong>: the 3 to 5 keys that matter on that screen, and <code>. Actions   ^K Go to   ? Keys</code> at the right. While a dialog, the Actions menu, Go to or a question is open it says what that wants instead.</li>
+</ul>
 <ul>
 <li>The body is one frame: a list on the left and the selected row's details on the right, or, where the list needs the full width (Connections, Nodes, Clients, Slow log, Monitor, Slots), the details below it.</li>
 <li><kbd>v</kbd> shows more columns and details, or fewer again. Narrow terminals never wrap: names are shortened with <code>…</code> and optional columns hide first. 80×24 and 120×36 both work.</li>
+<li>Each colour means one thing. Blue (focus) marks where the keys go: the focused pane's border, the current panel, the <code>›</code> on the selected row. Blue of a darker shade (data) draws bars, meters and sparklines. Amber (warning) is every <code>▲</code> and the sentence it starts, <code>never</code> in an expiry column, <code>read-only</code> and <code>asks first</code>. Red (danger) is the PROD badge, <code>writes on</code>, errors and the actions that can lose data, such as Delete. Purple marks the <code>{placeholders}</code> of a pattern, and teal (ok) <code>● connected</code> and <code>● analyzed</code>.</li>
 <li>Every state keeps a word or a glyph (<code>✓</code> <code>▲</code> <code>✗</code> <code>●</code> <code>○</code>), never colour alone, so a light theme and <code>NO_COLOR</code> still read.</li>
 <li>Times are UTC. The write state reads <code>read-only</code> (amber), <code>writes on</code> (red), or a red <code>WRITES ON</code> badge on a <code>prod</code> profile with writes on.</li>
 </ul>
 </div></div>
+</div>
+
+<div class="sub" id="tui-grammar">
+<div class="row">
+<div class="prose">
+<h3>How the keys work</h3>
+<p>A letter means the same thing on every screen. <strong>Lower case acts on the selected row; upper case acts on what the row belongs to.</strong> On a key list, <kbd>d</kbd> deletes the selected key and <kbd>D</kbd> every key of its pattern; in a value, <kbd>t</kbd> sets the selected hash field's TTL and <kbd>T</kbd> the key's; <kbd>y</kbd> copies the row and <kbd>Y</kbd> its parent (on a pattern, the scan command).</p>
+<ul>
+<li><kbd>a</kbd> analyzes the keys. <kbd>r</kbd> only reads the panel on screen again.</li>
+<li><kbd>s</kbd> sorts, <kbd>m</kbd> loads more rows, <kbd>/</kbd> filters, <kbd>space</kbd> pauses what is live, <kbd>v</kbd> shows more columns.</li>
+<li><kbd>+</kbd> adds, <kbd>e</kbd> edits, <kbd>t</kbd> <kbd>T</kbd> set a TTL, <kbd>d</kbd> <kbd>D</kbd> delete, <kbd>R</kbd> renames. These are writes: they go through the <a href="#safety-gate">write gate</a>.</li>
+<li><kbd>w</kbd> turns writes on or off and <kbd>b</kbd> switches the database, from any screen. <kbd>ctrl-s</kbd> saves a snapshot of the analysis.</li>
+<li><kbd>.</kbd> lists the actions of the selected row (<a href="#tui-actions">Actions menu</a>), <kbd>ctrl-k</kbd> goes anywhere by name (<a href="#tui-goto">Go to</a>), <kbd>?</kbd> lists every key and finds any action (<a href="#tui-help">keys overlay</a>).</li>
+</ul>
+<p>The footer shows only keys that do something now: no write key on a read-only profile, and no <kbd>m</kbd> once a list is read to the end. <kbd>ctrl-f</kbd> and <kbd>:</kbd> are not in the footer; they work on every screen, and <kbd>?</kbd> finds them.</p>
+</div>
+<div class="rail">
+<div class="codeblock"><div class="cb-head"><span class="cb-title">keys that changed after 0.1.0</span><span class="cb-lang">text</span></div><pre><code>analyze             r    → a
+pause               p    → space
+sort                o    → s
+more rows           n    → m
+save a snapshot     s    → ctrl-s
+Overview interval   + -  → &lt; &gt;
+type filter         t    → ctrl-t
+end a client        K    → d
+slow log settings   c    → e
+slow log reset      R    → D
+trim a stream       X    → -
+subscribe           s    → +
+clear the tail      c    → ctrl-l
+explain, profile    e P  → x X
+create, drop index  C D  → + d
+add a connection    a    → +
+bulk TTL, delete    x D  → t d
+add a key           N    → +
+key TTL in a value  t    → T</code></pre></div>
+</div>
+</div>
 </div>
 
 <div class="sub" id="tui-connections">
@@ -322,12 +374,12 @@ make demo-down   # stop the demo and delete its data</code></pre></div></div>
 <p>Saved profiles and the Redis or Valkey containers found in Docker, in one frame: the list on top, the selected entry's details below. Each row shows the name, environment badge, address, access (<code>read-only</code> or <code>writes on</code>) and status (<code>○ not open</code>, <code>● connecting…</code>, <code>● connected</code>, <code>▲ limited</code>, <code>✗ failed</code>). From 100 cells wide, SIGN-IN and MEMORY join them.</p>
 <p>The details say what the entry means in words: the address with TLS, the database and, once connected, the server, version and topology; where the password lives; why writes are on or off; tags or Sentinel; and the permission check in one sentence (<kbd>v</kbd> lists each check).</p>
 <ul>
-<li><kbd>enter</kbd> connects and lands on Overview. <kbd>a</kbd> adds a connection by pasting a connection string; the parsed result is previewed with the password masked before anything is saved (<kbd>enter</kbd> saves, <kbd>esc</kbd> cancels, <kbd>ctrl-u</kbd> clears the field).</li>
-<li><kbd>w</kbd> turns writes on or off for the selected profile and saves it to the config file. Turning writes on asks first: on <code>prod</code> you type the profile name.</li>
+<li><kbd>enter</kbd> connects and lands on Overview. <kbd>+</kbd> adds a connection by pasting a connection string; the parsed result is previewed with the password masked before anything is saved (<kbd>enter</kbd> saves, <kbd>esc</kbd> cancels, <kbd>ctrl-u</kbd> clears the field).</li>
+<li><kbd>w</kbd> turns writes on or off for the selected profile and saves it to the config file. On every other screen it does the same for the connected profile. Turning writes on asks first: on <code>prod</code> you type the profile name.</li>
 <li><kbd>/</kbd> filters by name or tag; <kbd>r</kbd> looks for Docker containers again.</li>
 </ul>
 <div class="screens">
-<figure class="screen" data-label="Connections"><!--TERM:connections--><figcaption>Three saved profiles and one container. <code>prod-cache-01</code> is read-only because it is a production profile.</figcaption></figure>
+<figure class="screen" data-label="Connections"><!--TERM:connections--><figcaption>Three saved profiles and one container. <code>prod-cache-01</code> is read-only because it is a production profile. The line under the frame gives the dashboard's address.</figcaption></figure>
 </div>
 </div></div>
 </div>
@@ -335,13 +387,13 @@ make demo-down   # stop the demo and delete its data</code></pre></div></div>
 <div class="sub" id="tui-overview">
 <div class="row row-wide"><div class="prose">
 <h3>1 Overview</h3>
-<p>The first screen after a connect, in two sections. <strong>Now</strong> polls <code>INFO</code> every 2 s while it is on screen: ops/s, clients, memory (of the limit), hit rate, evicted/s and expired/s, each with a sparkline, and a line with the version, uptime, role, persistence and <code>maxmemory-policy</code>. <kbd>p</kbd> pauses it and <kbd>+</kbd> <kbd>-</kbd> step the interval from 1 to 60 s.</p>
-<p><strong>Keys</strong> starts with what the server says on its own, before any key is read: big keys counted by <code>INFO keysizes</code> (Redis 8), the slowest slow-log entry (by command name and duration only), and many idle connections from one address. Each finding has a WHERE column; <kbd>enter</kbd> goes there. After an analysis it shows THINGS TO LOOK AT, WHERE THE MEMORY IS, and from 100 columns a FREED BY TTL line.</p>
+<p>The first screen after a connect, in two sections. <strong>Now</strong> polls <code>INFO</code> every 2 s while it is on screen: ops/s, clients, memory (of the limit), hit rate, evicted/s and expired/s, each with a sparkline, and a line with the version, uptime, role, persistence and <code>maxmemory-policy</code>. <kbd>space</kbd> pauses it and <kbd>&lt;</kbd> <kbd>&gt;</kbd> step the interval from 1 to 60 s (<kbd>&gt;</kbd> polls more often).</p>
+<p><strong>Keys</strong> starts with what the server says on its own, before any key is read: big keys counted by <code>INFO keysizes</code> (Redis 8), the slowest slow-log entry (by command name and duration only), and many idle connections from one address. Each finding has a WHERE column; <kbd>enter</kbd> goes there. After an analysis it shows the things to look at and where the memory is. From 120 columns the frame splits under "Now" into two panes: <strong>Things to look at</strong> on the left, with the selected finding below the list, and <strong>Where the memory is</strong> on the right, with every top pattern that fits, the memory freed by TTL and the slowest entries the slow log already holds.</p>
 <div class="screens">
-<figure class="screen" data-label="Connected"><!--TERM:overview-before--><figcaption>Connected, no key read yet. The <code>r</code> line gives the analysis's cost before you start it.</figcaption></figure>
-<figure class="screen" data-label="Analyze the keys?"><!--TERM:overview-dialog--><figcaption><kbd>r</kbd> asks first: Quick or Deep, each with its commands and time at this profile's limit.</figcaption></figure>
+<figure class="screen" data-label="Connected"><!--TERM:overview-before--><figcaption>Connected, no key read yet. The <code>a</code> line gives the analysis's cost before you start it.</figcaption></figure>
+<figure class="screen" data-label="Analyze the keys?"><!--TERM:overview-dialog--><figcaption><kbd>a</kbd> asks first: Quick or Deep, each with its commands and time at this profile's limit.</figcaption></figure>
 <figure class="screen" data-label="Analyzing"><!--TERM:overview-analyzing--><figcaption>While an analysis runs, Browse and Analyze fill in as it goes. <kbd>esc</kbd> stops it and keeps what it has.</figcaption></figure>
-<figure class="screen" data-label="After an analysis"><!--TERM:overview-after--><figcaption>THINGS TO LOOK AT, each with the panel <kbd>enter</kbd> opens.</figcaption></figure>
+<figure class="screen" data-label="After an analysis"><!--TERM:overview-after--><figcaption>Things to look at, each with the panel <kbd>enter</kbd> opens, and where the memory is, with the memory freed by TTL and the slowest slow-log entries.</figcaption></figure>
 <figure class="screen" data-label="Cluster"><!--TERM:overview-cluster--><figcaption>On a cluster, one row per shard, the figures of the picked node (<kbd>[</kbd> <kbd>]</kbd> pick another), and the server's figures summed over the shards.</figcaption></figure>
 </div>
 </div></div>
@@ -350,21 +402,36 @@ make demo-down   # stop the demo and delete its data</code></pre></div></div>
 <div class="sub" id="tui-browse">
 <div class="row row-wide"><div class="prose">
 <h3>2 Browse</h3>
-<p><strong>Keys</strong> is the pattern tree on the left and the selected row's details on the right. Before an analysis it reads key names only: one <code>SCAN COUNT 1000</code> per page through the budget, 8 pages on its own and <kbd>n</kbd> for more, with counts estimated from <code>DBSIZE</code>. Nothing else about a key is read until you open it. After an analysis the tree has KEYS, MEMORY and the <code>▲</code> mark (TYPE and a share bar on wider terminals, average size, NO TTL and the change since the last snapshot with <kbd>v</kbd>), sorted with <kbd>o</kbd>, filtered with <kbd>/</kbd>.</p>
-<p><kbd>→</kbd> on a pattern lists its keys (<code>SCAN MATCH</code>, 1,000 at a time) with size, length, expiry, encoding and LFU counter, pipelined so no value is read. <kbd>→</kbd> on a key shows its value. <kbd>←</kbd> goes back one step each time.</p>
-<p><strong>Find key.</strong> <kbd>ctrl-f</kbd> works on every screen and is always in the footer. Type part of a name (<code>28648</code> finds <code>user:28648:feed</code>) or a pattern (<code>user:*:cart</code>) and press <kbd>enter</kbd>: the whole server is searched with <code>SCAN MATCH</code>, 1,000 keys a call through the budget, never <code>KEYS</code>, on every node of a cluster. The matches are listed like a pattern's keys, <kbd>n</kbd> loads 1,000 more, <kbd>→</kbd> opens a value, and <kbd>esc</kbd> takes you back to where you pressed <kbd>ctrl-f</kbd>. It only reads, so it works on read-only profiles and before an analysis.</p>
+<p><strong>Keys</strong> is the pattern tree on the left and the selected row's details on the right. Before an analysis it reads key names only: one <code>SCAN COUNT 1000</code> per page through the budget, 8 pages on its own and <kbd>m</kbd> for more, with counts estimated from <code>DBSIZE</code>. Nothing else about a key is read until you open it. After an analysis the tree has KEYS, MEMORY and the <code>▲</code> mark (TYPE and a share bar on wider terminals, average size, NO TTL and the change since the last snapshot with <kbd>v</kbd>), sorted with <kbd>s</kbd>, filtered with <kbd>/</kbd>.</p>
+<p><kbd>→</kbd> on a pattern lists its keys (<code>SCAN MATCH</code>, 1,000 at a time) with size, length, expiry, encoding and LFU counter, pipelined so no value is read. <kbd>→</kbd> on a key shows its value. <kbd>←</kbd> goes back one step each time. From 120 columns the patterns, the key list and the value sit side by side: see <a href="#tui-browse-panes">Browse in three panes</a>.</p>
+<p><strong>Find key.</strong> <kbd>ctrl-f</kbd> works on every screen, and Go to's last KEYS row runs the same find. Type part of a name (<code>28648</code> finds <code>user:28648:feed</code>) or a pattern (<code>user:*:cart</code>) and press <kbd>enter</kbd>: the whole server is searched with <code>SCAN MATCH</code>, 1,000 keys a call through the budget, never <code>KEYS</code>, on every node of a cluster. The matches are listed like a pattern's keys, <kbd>m</kbd> loads 1,000 more, <kbd>→</kbd> opens a value, and <kbd>esc</kbd> takes you back to where you pressed <kbd>ctrl-f</kbd>. It only reads, so it works on read-only profiles and before an analysis.</p>
 <div class="screens">
-<figure class="screen" data-label="Names only"><!--TERM:browse-names--><figcaption>Before an analysis: patterns from key names, with estimated counts.</figcaption></figure>
-<figure class="screen" data-label="After an analysis"><!--TERM:browse-patterns--><figcaption>After an analysis: memory per pattern, the <code>▲</code> mark, and the reason in a sentence.</figcaption></figure>
-<figure class="screen" data-label="A pattern's keys"><!--TERM:browse-keylist--><figcaption><kbd>→</kbd> on a pattern lists its keys. Keys the glob matched that infer to another pattern are left out and counted.</figcaption></figure>
+<figure class="screen" data-label="After an analysis"><!--TERM:browse-patterns--><figcaption>After an analysis: memory per pattern, a share bar and the <code>▲</code> mark. The selected pattern's keys are held, so they show at the right.</figcaption></figure>
+<figure class="screen" data-label="Names only"><!--TERM:browse-names--><figcaption>Before an analysis: patterns from key names, with estimated counts. The area row says so at the right.</figcaption></figure>
 <figure class="screen" data-label="Find key"><!--TERM:browse-find-prompt--><figcaption><kbd>ctrl-f</kbd> from any screen: a name, or a pattern with <code>*</code> <code>?</code> <code>[ ]</code>.</figcaption></figure>
-<figure class="screen" data-label="Find results"><!--TERM:browse-find--><figcaption>The keys of the whole server whose names contain <code>cart</code>, with the same columns as a pattern's keys.</figcaption></figure>
-<figure class="screen" data-label="A key's value"><!--TERM:browse-value--><figcaption><kbd>→</kbd> on a key opens its value, read in pages. The selected field's value is shown in full below the divider.</figcaption></figure>
+<figure class="screen" data-label="Find results"><!--TERM:browse-find--><figcaption>The keys of the whole server whose names contain <code>cart</code>, with the same columns as a pattern's keys. The key pane is titled <code>Find: *cart*</code>.</figcaption></figure>
 <figure class="screen" data-label="Streams"><!--TERM:browse-streams--><figcaption>Streams found by the analysis, with verdicts: stuck, lagging, no readers, unbounded.</figcaption></figure>
-<figure class="screen" data-label="Search"><!--TERM:browse-search--><figcaption>Search indexes (Redis Search or valkey-search), queries with <kbd>/</kbd>, <code>FT.EXPLAIN</code> with <kbd>e</kbd> and <code>FT.PROFILE</code> with <kbd>P</kbd>.</figcaption></figure>
+<figure class="screen" data-label="Search"><!--TERM:browse-search--><figcaption>Search indexes (Redis Search or valkey-search), queries with <kbd>/</kbd>, <code>FT.EXPLAIN</code> with <kbd>x</kbd> and <code>FT.PROFILE</code> with <kbd>X</kbd>.</figcaption></figure>
 </div>
-<p><strong>Streams</strong> lists the streams an analysis found, from <code>XINFO STREAM</code>, <code>XINFO GROUPS</code> and <code>XINFO CONSUMERS</code>: length, the age of the oldest entry, groups, lag, pending entries and consumers. A consumer that holds pending entries and has been idle 30 minutes is <em>stuck</em>; a group 1,000 entries behind is <em>lagging</em>. <kbd>enter</kbd> lists the entries, newest first.</p>
-<p><strong>Search</strong> lists the indexes from <code>FT._LIST</code> and <code>FT.INFO</code> with their schema; <kbd>/</kbd> runs <code>FT.SEARCH … LIMIT 0 50</code> on the selected index and <kbd>enter</kbd> opens a result. Without a search module the panel says so and is dimmed.</p>
+<p><strong>Streams</strong> lists the streams an analysis found, from <code>XINFO STREAM</code>, <code>XINFO GROUPS</code> and <code>XINFO CONSUMERS</code>: length, the age of the oldest entry, groups, lag, pending entries and consumers. A consumer that holds pending entries and has been idle 30 minutes is <em>stuck</em>; a group 1,000 entries behind is <em>lagging</em>. <kbd>enter</kbd> lists the entries, newest first. With writes on, <kbd>c</kbd> claims pending entries, <kbd>A</kbd> acknowledges one and <kbd>-</kbd> trims the stream.</p>
+<p><strong>Search</strong> lists the indexes from <code>FT._LIST</code> and <code>FT.INFO</code> with their schema; <kbd>/</kbd> runs <code>FT.SEARCH … LIMIT 0 50</code> on the selected index and <kbd>enter</kbd> opens a result. With writes on, <kbd>+</kbd> creates an index and <kbd>d</kbd> drops one (its documents stay). Without a search module the panel says so and is dimmed.</p>
+</div></div>
+</div>
+
+<div class="sub" id="tui-browse-panes">
+<div class="row row-wide"><div class="prose">
+<h3>Browse in three panes</h3>
+<p>From 120 columns, Browse › Keys is one frame of up to three panes side by side: the patterns, the open pattern's keys and the open key's value. Which pane has the keys decides the widths; the keys themselves are the same as below 120 columns, and moving a selection reads nothing.</p>
+<ul>
+<li><strong>Focus on Patterns:</strong> the pattern tree, wide, and the selected row's summary at the right. When the selected pattern's keys are already held, they show there instead.</li>
+<li><strong>Focus on the key list:</strong> the patterns narrow (name, memory and <code>▲</code>), the key list with KEY, SIZE, EXPIRES and TYPE, and the selected key's facts.</li>
+<li><strong>Focus on the value:</strong> the patterns and the key list narrow, and the value pane gets the rest of the width.</li>
+<li><code>›</code> marks the selection of the pane that has the keys. The other panes mark their open row with a dim <code>▸</code>. Each pane keeps its own bottom line.</li>
+</ul>
+<div class="screens">
+<figure class="screen" data-label="A pattern's keys"><!--TERM:browse-keylist--><figcaption><kbd>→</kbd> on a pattern lists its keys in the middle pane; the open pattern is marked <code>▸</code>.</figcaption></figure>
+<figure class="screen" data-label="A key's value"><!--TERM:browse-value--><figcaption><kbd>→</kbd> on a key opens its value, read in pages. The selected field's value is shown in full below the divider.</figcaption></figure>
+</div>
 </div></div>
 </div>
 
@@ -380,7 +447,7 @@ make demo-down   # stop the demo and delete its data</code></pre></div></div>
 <tr><td>Key types read</td><td>string, hash, list, set, sorted set, stream, JSON, vector set; <span class="new">New</span> TimeSeries (with a sparkline), Bloom, Cuckoo, Count-Min Sketch, Top-K and t-digest, and arrays (Redis 8.8 and later)</td></tr>
 </tbody></table></div>
 <p>Everything from the server drawn on screen (values, field names, members, key names) shows control characters and escape sequences as escapes (<code>\x1b</code>), never raw, so a value can't drive your terminal. Values are shown on screen and never saved: see <a href="#safety-values">Values and the screen</a>.</p>
-<p>With writes on, the value pane edits: <kbd>e</kbd> edits the selected field or value (small values in a prompt, others in <code>$VISUAL</code> or <code>$EDITOR</code>), <kbd>+</kbd> adds, <kbd>t</kbd> sets or removes the TTL, <kbd>R</kbd> renames with <code>RENAMENX</code>, <kbd>d</kbd> deletes a field or element, and <kbd>D</kbd> deletes the key with <code>UNLINK</code>. A string or list edit is sent with <code>WATCH</code> and <code>MULTI</code>, so it fails instead of overwriting a value that changed since it was loaded.</p>
+<p>With writes on, the value pane edits, lower case on the selected item and upper case on the key: <kbd>e</kbd> edits the selected field or value (small values in a prompt, others in <code>$VISUAL</code> or <code>$EDITOR</code>), <kbd>+</kbd> adds, <kbd>t</kbd> sets or removes the selected hash field's TTL and <kbd>T</kbd> the key's, <kbd>R</kbd> renames the key with <code>RENAMENX</code>, <kbd>d</kbd> deletes a field or element, and <kbd>D</kbd> deletes the key with <code>UNLINK</code>. A string or list edit is sent with <code>WATCH</code> and <code>MULTI</code>, so it fails instead of overwriting a value that changed since it was loaded.</p>
 </div>
 <div class="rail">
 <div class="codeblock"><div class="cb-head"><span class="cb-title">a value's header</span><span class="cb-lang">text</span></div><pre><code>sku:44812 · JSON · 23 bytes · auto-detected
@@ -398,7 +465,7 @@ na\x1b[2Jme · hex · 6 bytes · auto-detected</code></pre></div>
 <div class="sub" id="tui-analyze">
 <div class="row row-wide"><div class="prose">
 <h3>3 Analyze</h3>
-<p>The panels show the last analysis. Before one, each says what it needs a sample for and gives the same <kbd>r</kbd> estimate as Overview. While another runs they keep the previous report, marked.</p>
+<p>The panels show the last analysis. Before one, each says what it needs a sample for and gives the same <kbd>a</kbd> estimate as Overview. While another runs they keep the previous report, marked.</p>
 <ul>
 <li><strong>Big keys</strong>: the 50 biggest sampled keys across every pattern, with type, TTL and, read live for those 50 only, length and encoding. The right pane lists THINGS TO LOOK AT.</li>
 <li><strong>Expiry</strong>: patterns ranked by TTL risk (<em>some never expire</em>, <em>never expires, growing</em>, <em>never expires, stable</em>, <em>short-lived</em>, <em>ok</em>), each pattern's EXPIRES IN histogram, and the memory the TTLs free within 1 h, 1 d, 7 d and 30 d across all patterns.</li>
@@ -410,9 +477,9 @@ na\x1b[2Jme · hex · 6 bytes · auto-detected</code></pre></div>
 <div class="screens">
 <figure class="screen" data-label="Big keys"><!--TERM:analyze-bigkeys--><figcaption>The biggest sampled keys, with the recommendations for the selected one.</figcaption></figure>
 <figure class="screen" data-label="Expiry"><!--TERM:analyze-expiry--><figcaption>Riskiest first, and the memory freed by TTL across all patterns.</figcaption></figure>
-<figure class="screen" data-label="Changes"><!--TERM:analyze-changes--><figcaption>At 120 columns, with WHY and TREND. Empty rows of the tall screen are trimmed here.</figcaption></figure>
-<figure class="screen" data-label="Hot keys"><!--TERM:analyze-hot--><figcaption>Ranked by LFU counter. <code>queue:emails</code> is both hot and 612M. Empty rows trimmed.</figcaption></figure>
-<figure class="screen" data-label="Slots"><!--TERM:analyze-slots--><figcaption>Slot ranges and the hottest slots on a cluster; <kbd>o</kbd> orders by keys, CPU, net in or net out.</figcaption></figure>
+<figure class="screen" data-label="Changes"><!--TERM:analyze-changes--><figcaption>At 120 columns, with WHY and TREND.</figcaption></figure>
+<figure class="screen" data-label="Hot keys"><!--TERM:analyze-hot--><figcaption>Ranked by LFU counter. <code>queue:emails</code> is both hot and 612M.</figcaption></figure>
+<figure class="screen" data-label="Slots"><!--TERM:analyze-slots--><figcaption>Slot ranges and the hottest slots on a cluster, at 80 columns; <kbd>s</kbd> sorts by keys, CPU, net in or net out.</figcaption></figure>
 </div>
 </div></div>
 </div>
@@ -421,14 +488,14 @@ na\x1b[2Jme · hex · 6 bytes · auto-detected</code></pre></div>
 <div class="row row-wide"><div class="prose">
 <h3>4 Server</h3>
 <ul>
-<li><strong>Clients</strong>: <code>CLIENT LIST</code> every 5 s, grouped by library (<code>lib-name</code>, Redis 7.2 and later) and by address (/24, /64), with connections, oldest age, longest idle, the most common last command and memory. Groups idle for an hour are flagged; <kbd>enter</kbd> lists a group's connections and, with writes on, <kbd>K</kbd> kills one. The <code>user=</code> field is dropped when the reply is read.</li>
-<li><strong>Slow log</strong>: <code>SLOWLOG GET 128</code> every 10 s, with key names from <code>COMMAND INFO</code> key specs (never <code>COMMAND GETKEYS</code>, which would send the arguments back), the arguments with credentials masked, and notes on <code>KEYS</code>, <code>FLUSHALL</code> and whole-key reads. With writes on, <kbd>c</kbd> changes the threshold and length and <kbd>R</kbd> resets it.</li>
+<li><strong>Clients</strong>: <code>CLIENT LIST</code> every 5 s, grouped by library (<code>lib-name</code>, Redis 7.2 and later) and by address (/24, /64), with connections, oldest age, longest idle, the most common last command and memory. Groups idle for an hour are flagged; <kbd>enter</kbd> lists a group's connections and, with writes on, <kbd>d</kbd> ends one (<code>CLIENT KILL</code>, which asks first). The <code>user=</code> field is dropped when the reply is read.</li>
+<li><strong>Slow log</strong>: <code>SLOWLOG GET 128</code> every 10 s, with key names from <code>COMMAND INFO</code> key specs (never <code>COMMAND GETKEYS</code>, which would send the arguments back), the arguments with credentials masked, and notes on <code>KEYS</code>, <code>FLUSHALL</code> and whole-key reads. With writes on, <kbd>e</kbd> changes the threshold and length and <kbd>D</kbd> resets it.</li>
 <li><strong>Monitor</strong>: <code>MONITOR</code> on its own connection, only after you confirm (on <code>prod</code> you type the profile name, even on a read-only profile, because it slows the server). It stops after 30 s or 10,000 lines, or on <kbd>esc</kbd>. Credentials are masked as each line arrives, and the lines stay in memory for the session only.</li>
 <li><span class="new">New</span> <kbd>y</kbd> copies the selected Slow log or Monitor line, as shown, credentials masked.</li>
 </ul>
 <div class="screens">
-<figure class="screen" data-label="Clients"><!--TERM:server-clients--><figcaption>Clients grouped by library and by address.</figcaption></figure>
-<figure class="screen" data-label="Slow log"><!--TERM:server-slowlog--><figcaption>A <code>KEYS</code> that took 1.25 s, with the reason it is marked.</figcaption></figure>
+<figure class="screen" data-label="Clients"><!--TERM:server-clients--><figcaption>Clients grouped by library and by address, the second group selected.</figcaption></figure>
+<figure class="screen" data-label="Slow log"><!--TERM:server-slowlog--><figcaption>A slow <code>HGETALL</code>, with the reason it is marked: a whole-key read of a probably big key.</figcaption></figure>
 <figure class="screen" data-label="Monitor"><!--TERM:server-monitor--><figcaption>A running <code>MONITOR</code>: <code>AUTH</code> and <code>CONFIG SET requirepass</code> are masked, and escape sequences are drawn as text.</figcaption></figure>
 </div>
 </div></div>
@@ -437,9 +504,63 @@ na\x1b[2Jme · hex · 6 bytes · auto-detected</code></pre></div>
 <div class="sub" id="tui-pubsub">
 <div class="row row-wide"><div class="prose">
 <h3>5 Pub/Sub</h3>
-<p>Channels from <code>PUBSUB CHANNELS</code> with subscriber counts from <code>NUMSUB</code>, polled every 5 s; payloads are not read for the counts. Shard channels (Redis 7.0 and Valkey) have their own list. <kbd>enter</kbd> subscribes to the selected channel and <kbd>s</kbd> to a channel or pattern you type, on a RESP3 connection of its own; subscribing is not a write, so read-only profiles can. The last 2,000 messages stay in memory, newest at the bottom: <kbd>space</kbd> pauses, <kbd>c</kbd> clears, <kbd>/</kbd> filters. With writes on, <kbd>P</kbd> publishes.</p>
+<p>Channels from <code>PUBSUB CHANNELS</code> with subscriber counts from <code>NUMSUB</code>, polled every 5 s; payloads are not read for the counts. Shard channels (Redis 7.0 and Valkey) have their own list. <kbd>enter</kbd> subscribes to the selected channel, <kbd>+</kbd> to a channel or pattern you type and <kbd>S</kbd> to a shard channel, on a RESP3 connection of its own; subscribing is not a write, so read-only profiles can. The last 2,000 messages stay in memory, newest at the bottom: <kbd>space</kbd> pauses, <kbd>ctrl-l</kbd> clears, <kbd>/</kbd> filters. With writes on, <kbd>P</kbd> publishes.</p>
 <div class="screens">
 <figure class="screen" data-label="Live tail"><!--TERM:pubsub-tail--><figcaption>A live tail of <code>orders:eu</code>. Messages are shown, never saved.</figcaption></figure>
+</div>
+</div></div>
+</div>
+
+<div class="sub" id="tui-goto">
+<div class="row row-wide"><div class="prose">
+<h3>Go to (<kbd>ctrl-k</kbd>)</h3>
+<p><kbd>ctrl-k</kbd> opens one box from any screen, before connecting too. Type a few letters and pick a row; <strong>typing reads nothing from the server</strong>. The rows come from what redis-lens already holds, in four groups:</p>
+<ul>
+<li><strong>PATTERNS</strong>: the patterns of the analysis, or of the key names read so far. <kbd>enter</kbd> selects the pattern on Browse › Keys and opens its keys.</li>
+<li><strong>KEYS</strong>: the keys already loaded (a key list, the open value, Big keys and Hot keys), then <code>Find every key matching *text*</code>, which runs <a href="#tui-browse">Find key</a> only when you pick it.</li>
+<li><strong>SCREENS</strong>: every area and panel, with the keys that reach it from here. A panel that is off is listed with its reason.</li>
+<li><strong>ACTIONS</strong>: the Actions menu's lines for the screen on show. A line that writes is never run from Go to: it opens the Actions menu with that line picked, so the write still goes through the write gate.</li>
+</ul>
+<p>The row picked as you type is a screen whose name starts with the text, else the first pattern, else the first loaded key; never an action or the Find row. So <code>slow</code> then <kbd>enter</kbd> opens Server › Slow log, and <code>d</code> then <kbd>enter</kbd> deletes nothing. Text that starts with <code>:</code> offers to put the rest on the <a href="#tui-cmdline">command line</a>, masked as the command line masks it, without running it. <kbd>↑↓</kbd> pick, <kbd>tab</kbd> jumps to the next group, <kbd>esc</kbd> clears and closes.</p>
+<div class="screens">
+<figure class="screen" data-label="slow"><!--TERM:goto-slow--><figcaption><code>slow</code> picks Server › Slow log. The Find row is listed but not picked.</figcaption></figure>
+<figure class="screen" data-label="cart"><!--TERM:goto-cart--><figcaption><code>cart</code>: the pattern first, then the loaded keys and the Find row.</figcaption></figure>
+</div>
+</div></div>
+</div>
+
+<div class="sub" id="tui-actions">
+<div class="row row-wide"><div class="prose">
+<h3>The <code>.</code> Actions menu</h3>
+<p><kbd>.</kbd> opens the actions of the focused pane, on every screen, at the bottom right of the body. It reads nothing from the server. The lines come in groups, each headed by what it acts on: the selected row (KEY, FIELD, PATTERN, CLIENT and so on, with its name), then its parent, then the screen.</p>
+<p>Each line shows its key, the action, and at the right one of:</p>
+<ul>
+<li>the command a write sends now without asking (<code>HDEL</code>), or what its form sends (<code>HSET</code>, <code>EXPIRE / PERSIST</code>);</li>
+<li><code>asks first</code>, when the write gate, a bulk action or Monitor will ask;</li>
+<li><code>off: &lt;reason&gt;</code>, dim, when pressing the key would do nothing (<code>off: read-only</code>, <code>off: no analysis yet</code>).</li>
+</ul>
+<p><kbd>↑↓</kbd> pick a line, <kbd>enter</kbd> or the line's own key runs it, <kbd>esc</kbd> or <kbd>.</kbd> close. Running a line presses its key on the screen behind, through the same checks. The menu closes when what it was opened on changes under it, and says so.</p>
+<div class="screens">
+<figure class="screen" data-label="Read-only"><!--TERM:browse-actions--><figcaption>On a key of a read-only production profile: the reads run, every write is off and says why.</figcaption></figure>
+<figure class="screen" data-label="Writes on"><!--TERM:menu-value--><figcaption>On a hash field with writes on: the command each write sends, and <code>asks first</code> on the deletes.</figcaption></figure>
+</div>
+</div></div>
+</div>
+
+<div class="sub" id="tui-sheet">
+<div class="row row-wide"><div class="prose">
+<h3>The confirm sheet</h3>
+<p>Every question that guards a write is one sheet, docked to the bottom of the body, full width, above the footer. The screen behind it is not dimmed, so the row it acts on stays in view. It is used for the write gate's questions, turning writes on, a bulk action's final question, starting Monitor and the command line's questions.</p>
+<ul>
+<li>The top border holds the question and, at the right, the profile and its environment. Below it: what it acts on, <code>Sends</code> and the exact command (credentials masked), and whether it can be undone.</li>
+<li>The answer: <kbd>y</kbd> and <kbd>n</kbd> (or <kbd>esc</kbd>); on <code>prod</code>, type the name and press <kbd>enter</kbd>. <kbd>enter</kbd> never answers a <kbd>y</kbd>/<kbd>n</kbd> question.</li>
+<li>Every key goes to the sheet first; nothing reaches the screen behind it. Opening it closes the Actions menu, Go to and the keys overlay.</li>
+<li>A question that a server reply opened, not your own key, takes no answer for half a second, so a key typed for something else can't answer it.</li>
+</ul>
+<div class="screens">
+<figure class="screen" data-label="Delete on prod"><!--TERM:gate-delete--><figcaption>Deleting a key on a production profile with writes on: type the key name.</figcaption></figure>
+<figure class="screen" data-label="y or n"><!--TERM:sheet-cmdline--><figcaption>A <code>DEL</code> typed on the command line of a local profile: <kbd>y</kbd> sends it, <kbd>n</kbd> cancels.</figcaption></figure>
+<figure class="screen" data-label="Writes on"><!--TERM:gate-writes--><figcaption>Turning writes on for a production profile: type its name.</figcaption></figure>
 </div>
 </div></div>
 </div>
@@ -463,10 +584,10 @@ na\x1b[2Jme · hex · 6 bytes · auto-detected</code></pre></div>
 
 <div class="sub" id="tui-help">
 <div class="row row-wide"><div class="prose">
-<h3>The <code>?</code> help</h3>
-<p><kbd>?</kbd> opens the help over the dimmed screen. With nothing typed it lists HERE, the keys of the screen it was opened on, then EVERYWHERE. Typing searches every screen and every action of every screen; <kbd>enter</kbd> goes to that screen and presses the key there, through every check that key meets, so a write still asks first. The footer, the help and the <a href="#keys">key reference</a> all come from one table in the code.</p>
+<h3>The <code>?</code> keys overlay</h3>
+<p><kbd>?</kbd> (<code>? Keys</code> in the footer) opens the keys overlay over the dimmed screen, titled "Keys · " and the screen's name. With nothing typed it lists HERE, the keys of the screen it was opened on, then EVERYWHERE. Typing searches every screen and every action of every screen; <kbd>enter</kbd> goes to that screen and presses the key there, through every check that key meets, so a write still asks first. The footer, the keys overlay, the <a href="#tui-actions">Actions menu</a>, <a href="#tui-goto">Go to</a>'s actions and the <a href="#keys">key reference</a> all come from one table in the code.</p>
 <div class="screens">
-<figure class="screen" data-label="Help on Overview"><!--TERM:help-overview--><figcaption>The keys of the screen it was opened on, then the ones that work everywhere.</figcaption></figure>
+<figure class="screen" data-label="Keys on Overview"><!--TERM:help-overview--><figcaption>The keys of the screen it was opened on, then the ones that work everywhere.</figcaption></figure>
 <figure class="screen" data-label="Searching"><!--TERM:help-filtered--><figcaption>Typing <code>slow</code> finds the screen and every action on it.</figcaption></figure>
 </div>
 </div></div>
@@ -478,7 +599,7 @@ na\x1b[2Jme · hex · 6 bytes · auto-detected</code></pre></div>
 <h3>Database switch, copy and theme</h3>
 <p><strong>Database switch.</strong> <kbd>b</kbd> lists the databases from <code>INFO keyspace</code> with their keys and expires. <kbd>enter</kbd> switches for the session (it connects again and reads the new database's figures, never sampling keys); <kbd>s</kbd> switches and saves it as the profile's <code>db</code>, after asking. A cluster only has database 0.</p>
 <p><strong>Copy.</strong> <kbd>y</kbd> copies the selected pattern, key name or value; <kbd>Y</kbd> copies a <code>redis-cli --scan --pattern "…"</code> command for the pattern, offered only when every character of the glob is safe inside double quotes in every common shell. Copying uses the OSC 52 terminal sequence, so it works over SSH; terminals without it (macOS Terminal.app, for one) ignore it. Text with control characters is never copied, and credentials, connection strings and profiles can't reach the clipboard.</p>
-<p><strong>Theme.</strong> <code>[settings] theme = "light"</code> in the config file picks a palette for light terminals. When <code>NO_COLOR</code> is set and not empty, no colour is drawn at all: selection and badges use reverse video and bold, and every state keeps its words.</p>
+<p><strong>Theme.</strong> <code>[settings] theme = "light"</code> in the config file picks a palette for light terminals. When <code>NO_COLOR</code> is set and not empty, no colour is drawn at all: selection and badges use reverse video and bold, danger is bold, and every state keeps its words or glyph. The light palette has the same colour roles.</p>
 </div>
 <div class="rail">
 <div class="codeblock"><div class="cb-head"><span class="cb-title">config.toml</span><span class="cb-lang">toml</span></div><pre><code class="language-toml">[settings]
@@ -511,9 +632,14 @@ skip_non_prod_confirm = true   # no y/n on non-prod writes</code></pre></div>
 tab        next panel of the area
 → ←        deeper / back
 v          more columns, or fewer
-r          analyze (Quick or Deep)
+a          analyze (Quick or Deep)
+r          refresh the panel
+.          actions of the selected row
+ctrl-k     go to a pattern, key or screen
+ctrl-f     find keys on the whole server
 :          command line
-?          help: type to find any action
+?          every key; type to find one
+w          writes on or off
 b          switch the database
 q          quit</code></pre></div>
 </div>
@@ -598,6 +724,40 @@ dashboard_port = 8080  # the port, when it starts</code></pre></div>
 </div>
 </div>
 
+<div class="sub" id="dash-chrome">
+<div class="row">
+<div class="prose">
+<h3>The top bar and the rail</h3>
+<p>The <strong>top bar</strong> is the dashboard's context bar. From the left:</p>
+<ul>
+<li>the <strong>connection button</strong>: a status dot, the connection's name and its environment badge. It opens a menu of the saved connections and the Docker containers found (name, environment and masked address); a click connects, and "Manage connections" opens Connections;</li>
+<li>the <strong>access button</strong>, Read-only or Writes on (<kbd>w</kbd>), which switches the writes of the connected profile through the write gate and its question;</li>
+<li>the <strong>database</strong>, <code>db N</code> (<kbd>b</kbd>), which reads the database list only when it is opened; on a cluster, the <strong>node select</strong> (<kbd>[</kbd> <kbd>]</kbd>), which picks the node for the live figures, Server, Pub/Sub and Search;</li>
+<li>the <strong>Go to</strong> box (<kbd>ctrl-k</kbd>), <strong>Live</strong> with its interval (<kbd>space</kbd> pauses), the <strong>?</strong> button for the keys sheet, and the theme.</li>
+</ul>
+<p>The <strong>rail</strong> on the left lists Overview, Browse, Analyze, Server and Pub/Sub with their digits, then Connections (<kbd>0</kbd>) and Command line (<kbd>:</kbd>). The command line is a drawer docked to the bottom of the window, over the current screen; Escape closes it.</p>
+</div>
+<div class="rail"></div>
+</div>
+</div>
+
+<div class="sub" id="dash-keys">
+<div class="row row-wide"><div class="prose">
+<h3>Keys and Go to</h3>
+<p>The dashboard uses the terminal's keys where a browser allows them, with the same grammar: lower case acts on the selected row, upper case on what it belongs to. Every button that has a key shows it. Keys never act while you type in a field, or while a dialog, a menu or the command line drawer is open; Tab and Shift-Tab stay the browser's.</p>
+<ul>
+<li><strong>Everywhere:</strong> <kbd>1</kbd>–<kbd>5</kbd> and <kbd>0</kbd> switch screens (the current one's digit again goes to its next panel), <kbd>ctrl-k</kbd> (<kbd>cmd-k</kbd> on a Mac) opens Go to, <kbd>/</kbd> filters the focused list or else opens Go to, <kbd>?</kbd> the keys sheet, <kbd>:</kbd> the command line, <kbd>w</kbd> writes, <kbd>b</kbd> the database, <kbd>space</kbd> pauses what is live, <kbd>ctrl-s</kbd> saves a snapshot where a Save button is shown.</li>
+<li><strong>Lists:</strong> <kbd>j</kbd> <kbd>k</kbd> (or the arrows) move, <kbd>enter</kbd> <kbd>→</kbd> <kbd>l</kbd> open the row or go to the pane on its right, <kbd>←</kbd> <kbd>h</kbd> <kbd>Esc</kbd> go back. Moving the selection reads nothing.</li>
+<li><strong>Not bound:</strong> <kbd>ctrl-t</kbd> and <kbd>ctrl-l</kbd>, which belong to the browser, and the terminal keys with no dashboard action: ending a client, and the Slow log's threshold and reset. There is no <kbd>.</kbd> menu; each button shows its key instead.</li>
+</ul>
+<p><strong>Go to</strong> opens a centred box over the page. Its results come from the patterns and keys already on the page, the screens and this screen's actions, in that order, and typing reads nothing from the server. The row picked as you type is a screen or action whose name starts with the text, else the first pattern, else the first loaded key; the "Find every key matching" row is picked only when nothing else matched, so <code>slow</code> then Enter opens the Slow log. Text that starts with <code>/</code> finds keys; text that starts with <code>:</code> puts the rest in the command line drawer, masked, without running it.</p>
+<div class="screens">
+<figure class="screen" data-label="Go to"><img class="shot" src="img/dashboard-goto.png" width="1280" height="800" loading="lazy" decoding="async" alt="Go to open over Browse with cart typed: under Patterns, user:{id}:cart picked; under Keys, six user:...:cart keys already loaded; then the row Find every key matching *cart*, and the keys to pick, go, jump to the next group and close"><figcaption><code>cart</code>: the pattern is picked, then the loaded keys, then Find.</figcaption></figure>
+<figure class="screen" data-label="Keys sheet"><img class="shot" src="img/dashboard-keys.png" width="1280" height="800" loading="lazy" decoding="async" alt="The keys sheet over Browse, titled Keys · Browse › Keys, with a filter box, then This pane: Keys (add a key, set the key's expiry, set a TTL on every key of the pattern, delete the key, delete every key of the pattern, rename) with the command each sends, then This screen, with the value's and the patterns' keys"><figcaption>The <kbd>?</kbd> sheet: the keys of this pane, this screen and everywhere, with what each write sends.</figcaption></figure>
+</div>
+</div></div>
+</div>
+
 <div class="sub" id="dash-connections">
 <div class="row row-wide"><div class="prose">
 <h3>Connections</h3>
@@ -610,24 +770,41 @@ dashboard_port = 8080  # the port, when it starts</code></pre></div>
 <div class="sub" id="dash-overview">
 <div class="row row-wide"><div class="prose">
 <h3>Overview</h3>
-<p>What the TUI's Overview shows before an analysis: memory, keys, commands per second and clients, polled while the page is open; the server, its version, topology, persistence and figures; a row per shard and a node picker on a cluster; the provider notice; the permission checks; and Things to look at, from the server's own figures by the TUI's rules. After an <a href="#dash-analyze">analysis</a>, Things to look at include its findings too.</p>
-<figure class="shot-figure"><img class="shot" src="img/dashboard-overview.png" width="1280" height="964" loading="lazy" decoding="async" alt="The dashboard's Overview for demo-admin, a local Redis 7.4.12: memory 185M of 768M, 50K keys, about 50 commands a second and 5 clients with small bar charts, the server's figures, Things to look at naming a slow EVAL, and the permission checks"><figcaption>Connected to the demo Redis. No key has been read.</figcaption></figure>
+<p>One facts line (version, topology, uptime, role and replicas, persistence, policy), the analysis's age and one <strong>Analyze</strong> button (<kbd>a</kbd>), which asks Quick or Deep with each one's estimate. Then six tiles: memory, commands per second, clients, hit rate, evicted and expired per second, and fragmentation, polled while the page is open.</p>
+<p>Under them, two columns. <strong>Things to look at</strong> lists the server's findings and the analysis's, warnings first, each ending in a link to the screen it is about; the selected one is explained under the list. <strong>Where the memory is</strong> shows the patterns with the most memory after an analysis (each opens Browse), the prompt to analyze before one, and its progress during one; then <strong>Freed by TTL</strong>. The other figures are under <strong>More figures</strong>. On a cluster the shard table stays, and the node is picked in the top bar.</p>
+<figure class="shot-figure"><img class="shot" src="img/dashboard-overview.png" width="1280" height="800" loading="lazy" decoding="async" alt="The dashboard's Overview for demo-admin, a local Redis 7.4.12 with writes on: tiles for memory 86M of 768M, 43 commands a second, 5 clients, a 100% hit rate, evicted and expired, and fragmentation; Things to look at with 8 findings, a slow EVAL first, then keys and memory that never expire, each linked to its screen; Where the memory is, with tmp:import:{ulid} at 40% and user:{id}:cart at 26%; and Freed by TTL"><figcaption>After a Quick analysis of the demo Redis.</figcaption></figure>
 </div></div>
 </div>
 
 <div class="sub" id="dash-browse">
 <div class="row row-wide"><div class="prose">
 <h3>Browse › Keys</h3>
-<p>Browse has the TUI's three panels, Keys, Streams and Search, each at its own address. <strong>Keys</strong> is the pattern tree beside the picked pattern's keys, with the open key's value below. Before an analysis the tree comes from key names only: <code>SCAN</code>, 1,000 names a call, more on request. After one it has memory, the <code>▲</code> mark and its reason, and can be sorted and filtered. On a cluster it can be narrowed to one shard.</p>
+<p>Browse has the TUI's three panels, Keys, Streams and Search, each at its own address. <strong>Keys</strong> is three panes side by side: the patterns, the open pattern's keys and the open key's value, each filling the height and scrolling inside itself, with a breadcrumb above them (<code>Patterns › user:{id}:cart › user:63081:cart</code>). On a narrower window two panes show, and under 780px one. A pane fills only when its parent row is opened (Enter, <kbd>→</kbd>, <kbd>l</kbd> or a click); moving the selection reads nothing. Before an analysis the tree comes from key names only: <code>SCAN</code>, 1,000 names a call, more on request. After one it has memory, the <code>▲</code> mark and its reason, and can be sorted and filtered. On a cluster it can be narrowed to one shard.</p>
 <ul>
-<li><strong>A pattern</strong> lists its keys with type, size and expiry, read with <code>SCAN MATCH</code> and pipelined so no value is read. A list stops at 50,000 keys.</li>
+<li><strong>A pattern</strong> lists its keys with type, size, length and expiry, read with <code>SCAN MATCH</code> and pipelined so no value is read. A list stops at 50,000 keys. <strong>About</strong> opens the pattern's figures, its example keys, the scan command and the bulk actions over the panes.</li>
 <li><strong>A key</strong> opens its value, of any type, in pages as in the TUI (at most 10,000 items). An item opens whole in any of the TUI's formats: text, hex, JSON, MessagePack, PHP, Pickle, Protobuf or Java. Key names are shown escaped.</li>
-<li><strong>Find a key</strong>, the box in the top bar, works from every screen. Text finds names that contain it; <code>*</code> <code>?</code> <code>[ ]</code> make a pattern, used as typed (at most 8 <code>*</code>). It reads with <code>SCAN</code>, never <code>KEYS</code>.</li>
-<li><strong>Copy name</strong> and <strong>Copy value</strong> put the text on the browser's clipboard; text with control characters is copied only as hex.</li>
-<li><strong>Database</strong> switches the database for the dashboard's session only; the saved profile is unchanged. It is off on a cluster.</li>
+<li><strong>Find a key</strong> from every screen: in Go to, pick "Find every key matching", or start the text with <code>/</code>. Text finds names that contain it; <code>*</code> <code>?</code> <code>[ ]</code> make a pattern, used as typed (at most 8 <code>*</code>). It reads with <code>SCAN</code>, never <code>KEYS</code>.</li>
+<li><strong>Copy name</strong> (<kbd>Y</kbd>) and <strong>Copy value</strong> (<kbd>y</kbd>) put the text on the browser's clipboard; text with control characters is copied only as hex.</li>
+<li>The <strong>database</strong> in the top bar (<kbd>b</kbd>) switches the database for the dashboard's session only; the saved profile is unchanged. It is off on a cluster.</li>
 </ul>
-<figure class="shot-figure"><img class="shot" src="img/dashboard-browse.png" width="1280" height="1628" loading="lazy" decoding="async" alt="Browse, Keys panel on the demo Redis: the pattern tree from an analysis with memory per pattern and warning marks on cache:search:{hash} and user:{id}:cart, a Find for user:28648:profile with one match, and below it that hash's value: fields name, bio and email, the email field selected and shown as text, with the buttons Copy name, Copy value, Add field, Set expiry, Rename, Delete key, Edit value, Field TTL and Delete field"><figcaption>A key found by name, with its value open. The format pills show the field another way.</figcaption></figure>
+<figure class="shot-figure"><img class="shot" src="img/dashboard-browse.png" width="1280" height="800" loading="lazy" decoding="async" alt="Browse, Keys panel on the demo Redis in three panes: the patterns from an analysis with user:{id}:cart selected and marked; its keys, about 7.9K, with type, size and length, and the warning that 31% never expire; and the value of user:63081:cart, a hash of 6 fields, with Copy name, Copy value, Add field, Set expiry, Rename and Delete key, each with its key, the field sku:1639 selected with Edit value, Field TTL and Delete field, and the Show as format pills"><figcaption>A pattern, its keys and a value side by side. Each button shows its key.</figcaption></figure>
 </div></div>
+</div>
+
+<div class="sub" id="dash-browse-address">
+<div class="row">
+<div class="prose">
+<h3>Browse in the address</h3>
+<p>What Browse shows is in the page's address: <code>#/browse?p=&lt;pattern&gt;&amp;k=&lt;key&gt;&amp;find=&lt;text&gt;&amp;node=&lt;n&gt;&amp;sort=&lt;s&gt;</code>. The pattern and the key are written as the hex of their names' bytes, so a binary name travels whole. The address holds nothing else: no connection, credential or value.</p>
+<ul>
+<li><strong>Back and Forward</strong> undo and redo a drill-down: opening a pattern or a key, Find, Clear search and the jumps from Overview, Analyze, Streams, Search and Go to are each a step. Moving the selection, filtering and scrolling are not. Going back up reads nothing.</li>
+<li><strong>A reload or a copied link</strong> shows what the address names with exactly the reads a click would make. It never connects: with no connection Browse asks you to connect first, and on another connection a pattern or key it lacks is "not found here".</li>
+<li><strong>Another connection or database.</strong> A history step from another connection, another database or before a reconnect is passed over, and a line above the panes says so.</li>
+</ul>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">address</span><span class="cb-lang">text</span></div><pre><code>#/browse?p=757365723a7b69647d3a63617274&amp;k=757365723a36333038313a63617274&amp;sort=memory</code></pre></div>
+<p class="rail-note"><code>p</code> is <code>user:{id}:cart</code> and <code>k</code> is <code>user:63081:cart</code>, as hex.</p></div>
+</div>
 </div>
 
 <div class="sub" id="dash-edits">
@@ -671,7 +848,7 @@ dashboard_port = 8080  # the port, when it starts</code></pre></div>
 <div class="sub" id="dash-analyze">
 <div class="row row-wide"><div class="prose">
 <h3>Analyze</h3>
-<p><strong>Analyze 10,000 keys</strong> (Quick) and <strong>Analyze 100,000 keys</strong> (Deep) first show the TUI's estimate of commands and time, then run with progress. <strong>Stop</strong> keeps what was sampled, marked stopped; a stop before any key changes nothing. The panels then show:</p>
+<p><strong>Analyze 10,000 keys</strong> (Quick, <kbd>a</kbd>) and <strong>Analyze 100,000 keys</strong> (Deep) first show the TUI's estimate of commands and time, then run with progress. <strong>Stop</strong> keeps what was sampled, marked stopped; a stop before any key changes nothing. The panels then show:</p>
 <ul>
 <li><strong>Big keys</strong>: Things to look at, and the 50 biggest sampled keys with type, share, size, length, encoding, expiry and pattern. A key or a pattern opens on Browse.</li>
 <li><strong>Expiry</strong>: the memory that expiry frees, and the patterns by TTL risk.</li>
@@ -680,7 +857,7 @@ dashboard_port = 8080  # the port, when it starts</code></pre></div>
 <li><strong>Nodes</strong> and <strong>Slots</strong>, on a cluster only.</li>
 </ul>
 <p>Overview's Things to look at include the analysis. An analysis that fails says why in redis-lens's words, and the connection stays open with any earlier report. What each panel computes is in <a href="#analysis">Analysis</a>.</p>
-<figure class="shot-figure"><img class="shot" src="img/dashboard-analyze.png" width="1280" height="1100" loading="lazy" decoding="async" alt="Analyze, Big keys panel after a Quick analysis of 10,000 keys of the demo Redis: Things to look at, such as hashes past their compact encoding, 32% of user:{id}:cart keys never expiring and 37% of memory never expiring, then a table of the biggest sampled keys, tmp:import keys of about 20K each, with type, share, size, length, encoding, expiry and pattern"><figcaption>Big keys after a Quick analysis of the demo Redis.</figcaption></figure>
+<figure class="shot-figure"><img class="shot" src="img/dashboard-analyze.png" width="1280" height="800" loading="lazy" decoding="async" alt="Analyze, Big keys panel after a Quick analysis of 10,000 keys of the demo Redis: Save as snapshot (ctrl-s), Analyze 10,000 keys (a) and Analyze 100,000 keys; Things to look at, such as user:{id}:cart and user:{id}:profile hashes past their compact encoding, 31% of user:{id}:cart keys never expiring and 80% of memory never expiring; then the biggest sampled keys, queue:audit and tmp:import keys, with type, share, size, length, encoding, expiry and pattern"><figcaption>Big keys after a Quick analysis of the demo Redis.</figcaption></figure>
 </div></div>
 </div>
 
@@ -704,9 +881,9 @@ dashboard_port = 8080  # the port, when it starts</code></pre></div>
 <li><strong>Monitor</strong> always asks first, with the connection's name typed on <code>prod</code>, and says its limits before it starts: 30 seconds or 10,000 lines. Lines are shown, never saved. When the analysis has no hot keys, <a href="#dash-analyze">Analyze › Hot keys</a> ranks the keys of the last run.</li>
 </ul>
 <div class="screens">
-<figure class="screen" data-label="Clients"><img class="shot" src="img/dashboard-clients.png" width="1280" height="846" loading="lazy" decoding="async" alt="Server, Clients panel: clients by library (ioredis 5.4.1 with 2 connections, go-redis, redis-py and redis-rs with 1 each) and by address, each with the oldest age, longest idle, most common command and memory"><figcaption>Clients grouped by library and by address.</figcaption></figure>
-<figure class="screen" data-label="Slow log"><img class="shot" src="img/dashboard-slowlog.png" width="1280" height="800" loading="lazy" decoding="async" alt="Server, Slow log panel: LRANGE queue:emails 0 -1 twice, 11 and 15 ms, marked as a slow whole-key read, and the seeding EVAL at 1.31 s"><figcaption>A whole-key read, marked with the reason.</figcaption></figure>
-<figure class="screen" data-label="Monitor"><img class="shot" src="img/dashboard-monitor.png" width="1280" height="800" loading="lazy" decoding="async" alt="Server, Monitor panel while running: a Stop button with 27 seconds left, 197 lines kept, and a list of timestamped commands such as STRLEN, PTTL and TYPE from the demo clients"><figcaption>A Monitor run, after its question was answered. It stops by itself after 30 s.</figcaption></figure>
+<figure class="screen" data-label="Clients"><img class="shot" src="img/dashboard-clients.png" width="1280" height="800" loading="lazy" decoding="async" alt="Server, Clients panel: the list by library (ioredis 5.4.1 with 2 connections, go-redis 9.7.0, redis-py 5.2.0 and redis-rs 1.8.1 with 1 each) and by address (172.20.0.0/24 with 5), and at the right the ioredis group's two connections with address, name, library, age, idle, last command, database and memory"><figcaption>Clients grouped by library and by address, with the picked group's connections beside them.</figcaption></figure>
+<figure class="screen" data-label="Slow log"><img class="shot" src="img/dashboard-slowlog.png" width="1280" height="800" loading="lazy" decoding="async" alt="Server, Slow log panel: four LRANGE queue:emails reads of 11 to 15 ms, marked, and the seeding EVAL at 1.31 s; at the right the picked entry: when, how long, the arguments LRANGE queue:emails 0 -1, the client, the key as a link to Browse, and the note that a slow whole-key read means the key is probably big"><figcaption>A whole-key read, with its entry and the reason it is marked.</figcaption></figure>
+<figure class="screen" data-label="Monitor"><img class="shot" src="img/dashboard-monitor.png" width="1280" height="800" loading="lazy" decoding="async" alt="Server, Monitor panel while running: a Stop button with 27 seconds left, 169 lines, and timestamped commands such as TYPE, STRLEN, PTTL and TTL from the demo clients, with a sign-in shown as AUTH *** ***"><figcaption>A Monitor run, after its question was answered. It stops by itself after 30 s.</figcaption></figure>
 </div>
 </div></div>
 </div>
@@ -722,14 +899,14 @@ dashboard_port = 8080  # the port, when it starts</code></pre></div>
 <div class="sub" id="dash-cmdline">
 <div class="row row-wide"><div class="prose">
 <h3>Command line</h3>
-<p><strong>Command line</strong> in the side bar opens the TUI's command line under the current screen, with its rules. Readonly commands are sent; writes go through the write gate; <code>KEYS</code> and other <code>@dangerous</code> commands ask first; scripts, blocking commands and commands that would take over the connection are refused with a note.</p>
+<p><strong>Command line</strong> in the rail, or <kbd>:</kbd>, opens the TUI's command line as a drawer at the bottom of the window, over the current screen, with its rules. Escape closes it. Readonly commands are sent; writes go through the write gate; <code>KEYS</code> and other <code>@dangerous</code> commands ask first; scripts, blocking commands and commands that would take over the connection are refused with a note.</p>
 <ul>
 <li>The reply shows as text, a table, JSON or raw.</li>
 <li>A leading count repeats a command, at most 100 times; <strong>Pipeline</strong> sends a readonly repeat in pipelines.</li>
 <li><kbd>tab</kbd> completes command names and subcommands, and the command's help shows under the line.</li>
 <li>One line runs at a time. A line holds at most 8,192 characters, and a reply at most 4 MiB; the rest is dropped and the page says so.</li>
 </ul>
-<figure class="shot-figure"><img class="shot" src="img/dashboard-cmdline.png" width="1280" height="800" loading="lazy" decoding="async" alt="The command line under the Slow log: ZRANGE of a user feed with REV WITHSCORES shown as a table of six members and scores, the Text, Table, JSON, Raw and Pipeline buttons, and the help line for the next command"><figcaption>A sorted set as a table.</figcaption></figure>
+<figure class="shot-figure"><img class="shot" src="img/dashboard-cmdline.png" width="1280" height="800" loading="lazy" decoding="async" alt="The command line drawer open over the Slow log: ZRANGE of a user feed with REV WITHSCORES shown as a table of five members and scores, the Text, Table, JSON, Raw and Pipeline buttons, Clear and Close, and the keys of the drawer under the input"><figcaption>A sorted set as a table, in the drawer over the Slow log.</figcaption></figure>
 </div></div>
 </div>
 
@@ -737,7 +914,7 @@ dashboard_port = 8080  # the port, when it starts</code></pre></div>
 <div class="row row-wide"><div class="prose">
 <h3>Light theme</h3>
 <p>The button at the right of the top bar switches between the dark and the light theme. The browser remembers the choice.</p>
-<figure class="shot-figure"><img class="shot" src="img/dashboard-light.png" width="1280" height="964" loading="lazy" decoding="async" alt="The Overview in the light theme: the same tiles, server figures, Things to look at and permission checks on a white background"><figcaption>The Overview in the light theme.</figcaption></figure>
+<figure class="shot-figure"><img class="shot" src="img/dashboard-light.png" width="1280" height="800" loading="lazy" decoding="async" alt="The Overview in the light theme: the same top bar, tiles, Things to look at and Where the memory is on a white background"><figcaption>The Overview in the light theme.</figcaption></figure>
 </div></div>
 </div>
 
@@ -990,7 +1167,7 @@ redis-lens scan orders-cluster
 <li><strong>Export</strong> writes the saved profiles as TOML, to a file (mode 0600, never over an existing one without <code>--force</code>) or standard output. It never reads the keychain, so it holds no credential.</li>
 <li><strong>Import</strong> adds every profile of a file, all or none. It stores nothing in the keychain, drops <code>read_only = false</code> so an import can't turn writes on, deletes stale keychain entries under an imported name unless the profile is the same place, and lists the profiles that need <code>conn add &lt;name&gt; --force …</code> to store credentials. A token command asks first.</li>
 <li><strong>Tags</strong>: <code>--tag</code> on <code>conn add</code>, <code>--tag</code>/<code>--untag</code> on <code>conn set</code>. <code>/</code> on Connections filters by name or tag.</li>
-<li><strong>Writes</strong>: <code>conn set &lt;name&gt; --writes on|off</code>, <code>conn add --writes on|off</code>, <span data-only="terminal">or <kbd>w</kbd> in the TUI</span><span data-only="dashboard">or Edit, then Allow writes, in the dashboard</span>. Turning writes on for a <code>prod</code> profile needs the profile name: typed on the terminal, or given with <code>--confirm &lt;name&gt;</code>; <code>--yes</code> never replaces it.</li>
+<li><strong>Writes</strong>: <code>conn set &lt;name&gt; --writes on|off</code>, <code>conn add --writes on|off</code>, <span data-only="terminal">or <kbd>w</kbd> in the TUI</span><span data-only="dashboard">or, in the dashboard, the access button in the top bar (<kbd>w</kbd>) or Edit on Connections</span>. Turning writes on for a <code>prod</code> profile needs the profile name: typed on the terminal, or given with <code>--confirm &lt;name&gt;</code>; <code>--yes</code> never replaces it.</li>
 </ul>
 </div>
 <div class="rail">
@@ -1053,7 +1230,7 @@ redis-lens conn set prod-cache --writes on --confirm prod-cache
 
 # off never asks
 redis-lens conn set prod-cache --writes off</code></pre></div>
-<p class="rail-note" data-only="terminal">Or <kbd>w</kbd> on 0 Connections. Only <code>read_only</code> changes in the config file.</p>
+<p class="rail-note" data-only="terminal">Or <kbd>w</kbd> in the TUI: on 0 Connections for the selected profile, on any other screen for the connected one. Only <code>read_only</code> changes in the config file.</p>
 <p class="rail-note" data-only="dashboard">In the dashboard: Edit on the connection, then Allow writes. On <code>prod</code> it asks for the name.</p>
 </div>
 </div>
@@ -1099,7 +1276,7 @@ flowchart LR
 <p>Every command any view sends (scans, polls, key lists, values, the command line, writes) goes through one limiter per connected profile, per node on a cluster. Each command or batch books the next slot before it is sent, so idle time never builds a burst. The default is 5,000 commands a second, 1,000 on ElastiCache Serverless, and no limit for <code>local</code> profiles; <code>--max-rate N</code> overrides it on the command line (<code>0</code> means no limit).</p>
 <ul>
 <li>The keyspace is walked with <code>SCAN cursor COUNT n</code>. <strong>Never <code>KEYS</code>.</strong> Per-key commands are pipelined in batches.</li>
-<li>Polling views poll only while on screen, and <kbd>p</kbd> pauses them.</li>
+<li>Polling views poll only while on screen, and <kbd>space</kbd> pauses them.</li>
 <li>Values are always read in pages. redis-lens never sends <code>KEYS</code>, <code>HGETALL</code>, <code>SMEMBERS</code>, <code>LRANGE 0 -1</code> or another whole-key read on its own; you can still type them on the command line.</li>
 <li>An analysis is opt-in, its cost is shown before it starts, and <kbd>esc</kbd> stops it within one batch.</li>
 </ul>
@@ -1175,7 +1352,7 @@ flowchart LR
 <div class="row">
 <div class="prose">
 <h3>How a scan works</h3>
-<p>A scan is what <code>redis-lens scan</code>, <code>diff</code>, <code>compare</code> and <code>--check</code> run, and what <kbd>r</kbd> runs in the TUI. The TUI never scans on connect.</p>
+<p>A scan is what <code>redis-lens scan</code>, <code>diff</code>, <code>compare</code> and <code>--check</code> run, and what <kbd>a</kbd> runs in the TUI. The TUI never scans on connect.</p>
 <ol>
 <li>Read the server's figures, each from the budget: <code>INFO server</code>, <code>INFO memory</code>, <code>DBSIZE</code>, <code>INFO keyspace</code>, <code>INFO keysizes</code> (when the server has it) and <code>MEMORY STATS</code>.</li>
 <li>Walk the keyspace with <code>SCAN cursor COUNT n [MATCH glob]</code>, deduplicating what it returns.</li>
@@ -1323,7 +1500,7 @@ feature:pricing-rules├─  → feature:{var}
 <div class="row">
 <div class="prose">
 <h3>Saving snapshots</h3>
-<p><kbd>s</kbd> in the TUI, or <code>redis-lens scan --save</code>, writes the report as JSON to <code>&lt;data dir&gt;/redis-lens/snapshots/&lt;name&gt;-&lt;hash&gt;/&lt;YYYYMMDDTHHMMSSZ&gt;.json</code> (the data dir is <code>~/Library/Application Support</code> on macOS). <code>&lt;name&gt;</code> is the profile name lower-cased and made safe; <code>&lt;hash&gt;</code> is 12 hex digits of a hash of the exact name, so names that differ only in case keep separate histories.</p>
+<p><kbd>ctrl-s</kbd> in the TUI, or <code>redis-lens scan --save</code>, writes the report as JSON to <code>&lt;data dir&gt;/redis-lens/snapshots/&lt;name&gt;-&lt;hash&gt;/&lt;YYYYMMDDTHHMMSSZ&gt;.json</code> (the data dir is <code>~/Library/Application Support</code> on macOS). <code>&lt;name&gt;</code> is the profile name lower-cased and made safe; <code>&lt;hash&gt;</code> is 12 hex digits of a hash of the exact name, so names that differ only in case keep separate histories.</p>
 <p data-only="dashboard">In the dashboard, <strong>Save as snapshot</strong> on Analyze writes the same file; see <a href="#dash-snapshots">Snapshots</a>.</p>
 <p>A snapshot holds patterns, the server context, the 50 biggest sampled keys (names, types, sizes, TTLs) and example key names, never values or credentials. The TUI never saves partial results or an analysis stopped early.</p>
 <p><code>--keep N</code> keeps the newest N snapshots and <code>--keep-days D</code> those from the last D days; both together keep one only while both allow it. The newest is never deleted, and retention touches only files it would have written. <code>snapshots list</code> and <code>snapshots prune</code> manage them; <code>prune</code> only lists until you add <code>--yes</code>.</p>
@@ -1446,7 +1623,7 @@ redis-lens scan prod-cache --json &gt; report.json</code></pre></div></div>
 <div class="row">
 <div class="prose">
 <h3><code>redis-lens expire</code></h3>
-<p>Sets a TTL on every key of a pattern that has none, the command-line form of <kbd>x</kbd> in Browse. Without <code>--apply</code> it is a dry run that counts the keys. With <code>--apply</code> it sends <code>EXPIRE key seconds NX</code> (Redis 7.0 and later) in pipelines of 500 within the budget, and logs every key it sent to a file. A <code>prod</code> profile needs <code>--confirm</code> with the exact pattern; other profiles ask <code>y</code>/<code>n</code>, or need <code>--yes</code> without a terminal. It always connects to the profile's own endpoint, never a replica, and on a cluster runs per primary.</p>
+<p>Sets a TTL on every key of a pattern that has none, the command-line form of <kbd>t</kbd> on a pattern in Browse. Without <code>--apply</code> it is a dry run that counts the keys. With <code>--apply</code> it sends <code>EXPIRE key seconds NX</code> (Redis 7.0 and later) in pipelines of 500 within the budget, and logs every key it sent to a file. A <code>prod</code> profile needs <code>--confirm</code> with the exact pattern; other profiles ask <code>y</code>/<code>n</code>, or need <code>--yes</code> without a terminal. It always connects to the profile's own endpoint, never a replica, and on a cluster runs per primary.</p>
 <p>A read-only profile refuses <code>expire</code> with exit code 2, dry run included.</p>
 </div>
 <div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">expire</span><span class="cb-lang">bash</span></div><pre><code class="language-bash"># dry run: how many keys of the pattern have no TTL

@@ -2,7 +2,7 @@
 source: src/tui/ui/help.rs
 expression: "render(Screen::Connections, \"\", 80, 24).backend()"
 ---
-"    ┌─ Help · Connections ──────────────────────────────────── esc closes ─┐    "
+"    ┌─ Keys · Connections ──────────────────────────────────── esc closes ─┐    "
 "    │ › type to find any action or screen…                                 │    "
 "    │                                                                      │    "
 "    │ HERE                                                                 │    "

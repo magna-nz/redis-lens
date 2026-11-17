@@ -65,10 +65,13 @@ pub fn age(ms: u64) -> String {
     }
 }
 
+/// A stream's verdict: every finding (stuck, lagging, no readers, unbounded) is a
+/// warning; none of them is a failure of redis-lens or the server.
 fn verdict_style(v: Verdict) -> Style {
     match v {
-        Verdict::Stuck | Verdict::Lagging => style::warn(),
-        Verdict::NoReaders | Verdict::Unbounded => style::amber(),
+        Verdict::Stuck | Verdict::Lagging | Verdict::NoReaders | Verdict::Unbounded => {
+            style::warning()
+        }
         Verdict::Ok => style::ok(),
     }
 }
@@ -125,7 +128,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &StreamsState, ctx: &Ctx<'_>) 
             area,
             TITLE,
             "off",
-            &[(format!(" ▲ {off}"), style::amber())],
+            &[(format!(" ▲ {off}"), style::warning())],
         );
         return;
     }
@@ -237,7 +240,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &StreamsState, ctx: &Ctx<'_>) 
     let note = match &state.error {
         Some(e) => Span::styled(
             format!(" ▲ {e}; showing the previous reading."),
-            style::amber(),
+            style::warning(),
         ),
         None if state.found > state.rows.len() => Span::styled(
             format!(" first {} of {} streams", state.rows.len(), state.found),
@@ -467,7 +470,7 @@ fn list_row(r: &StreamRow, c: &Cols, node: Option<String>) -> Line<'static> {
         lag.map_or_else(dash, format::count),
         LAG_W,
         if lag.is_some_and(|n| n >= crate::live::streams::LAGGING_LAG) {
-            style::warn()
+            style::warning()
         } else {
             style::fg()
         },
@@ -572,7 +575,7 @@ fn detail_pane(frame: &mut Frame, inner: Rect, state: &StreamsState, node: Optio
     }
     if let Some(why) = state.shown_pending().and_then(|p| p.error.as_ref()) {
         for l in wrap_words(&format!(" ▲ Pending entries: {why}."), w) {
-            lines.push(Line::from(Span::styled(l, style::amber())));
+            lines.push(Line::from(Span::styled(l, style::warning())));
         }
     }
     if lines.len() > 2 {
@@ -674,7 +677,7 @@ fn detail_line(row: &DetailRow<'_>, nw: usize, wide: bool) -> Line<'static> {
         ]),
         DetailRow::Consumer(_, c) => {
             let idle_st = if c.pending > 0 && c.idle_ms >= crate::live::streams::STUCK_IDLE_MS {
-                style::warn()
+                style::warning()
             } else {
                 style::fg()
             };
@@ -703,7 +706,7 @@ fn group_spans(g: &GroupInfo, nw: usize, wide: bool) -> Vec<Span<'static>> {
         Lag::Unknown | Lag::Unsupported => "—".to_string(),
     };
     let lag_st = match g.lag {
-        Lag::Known(n) if n >= crate::live::streams::LAGGING_LAG => style::warn(),
+        Lag::Known(n) if n >= crate::live::streams::LAGGING_LAG => style::warning(),
         _ => style::fg(),
     };
     let mut spans = vec![
@@ -862,7 +865,10 @@ pub(super) fn draw_form(
         }
         Err(why) => {
             for part in wrap(&format!("▲ {why}"), inner) {
-                lines.push(Line::from(Span::styled(format!(" {part}"), style::amber())));
+                lines.push(Line::from(Span::styled(
+                    format!(" {part}"),
+                    style::warning(),
+                )));
             }
         }
     }

@@ -12,34 +12,68 @@
   <p><a href="https://magna-nz.github.io/redis-lens/"><strong>Documentation</strong></a></p>
 </div>
 
-redis-lens lists your keys and shows their values, finds the keys and key patterns that use the most memory, and shows live server stats, connected clients, the slow log and Pub/Sub messages.
-You can also run commands and edit keys from it.
+redis-lens is a keyboard-first terminal UI for Redis and Valkey.
+The same program serves the same screens as a web dashboard on 127.0.0.1, and both use one set of keys.
 
-It runs in the terminal, and the same program serves a web dashboard on 127.0.0.1 that only you can open.
-The dashboard has every screen the terminal has: connections, browsing and editing keys and values, bulk actions, Streams, Search, the analysis, the server, Pub/Sub and the command line.
-
-Connections marked as production are read-only unless you turn writes on.
+- Key patterns such as `user:{id}:cart`, their keys and the open value sit side by side.
+- `ctrl-k` (Go to) reaches any pattern, loaded key, screen or action from a few typed letters. Typing reads nothing from the server.
+- `.` (Actions) lists what each key does on the selected row, which actions are off and why, and the command a write sends.
+- `a` samples the keys and shows what uses the memory, what never expires, and the big and hot keys.
+- Production connections are read-only until you turn writes on with `w`. Every write goes through one gate; on production each one asks first.
 
 <div align="center">
-  <img src="docs/demo.gif" alt="redis-lens in the terminal: browsing key patterns and a value, then the Server panel and the command line" width="900">
+  <img src="docs/demo.gif" alt="redis-lens in the terminal: connecting to the demo Redis, Overview, analyzing the keys, Browse with patterns, a pattern's keys and a value side by side, the Actions menu, Go to opening the Slow log, and the keys sheet" width="900">
   <p><em>In the terminal</em></p>
-  <img src="docs/dashboard.gif" alt="The redis-lens dashboard in a browser: connecting, the Overview, the Server clients, slow log and Monitor, a Pub/Sub tail, the command line, and the light theme" width="900">
+  <img src="docs/dashboard.gif" alt="The redis-lens dashboard in a browser: connecting from the connection menu, Overview, Browse with a pattern, its keys and a value side by side, Go to opening the Slow log, the command line drawer, the keys sheet and the light theme" width="900">
   <p><em>In the browser</em></p>
 </div>
 
 ## What you can do
 
-- **Find any key:** `ctrl-f` from any screen searches the whole server by name or pattern.
+- **Find any key:** `ctrl-f` from any screen (in the browser, `/` in Go to) searches the whole server by name or pattern with `SCAN`.
 - **Browse keys and values:** every Redis type, plus JSON, streams and module types, decoded as JSON, MessagePack, hex and more.
-- **See what uses memory:** keys grouped into patterns like `user:{id}:cart`, with big keys, hot keys and keys that never expire.
-- **Watch the server:** live stats, clients, the slow log, `MONITOR` and Pub/Sub.
-- **Run commands:** a command line with completion and help, and replies as text, a table or JSON.
-- **Edit data:** add, edit, expire and delete keys. Production profiles are read-only unless you allow writes.
+- **See what uses memory:** `a` groups the keys into patterns, with big keys, hot keys and keys that never expire. Overview lists what to look at.
+- **Watch the server:** live figures, clients, the slow log, `MONITOR` and Pub/Sub.
+- **Run commands:** `:` opens a command line with completion and help, and replies as text, a table or JSON.
+- **Edit data:** add, edit, expire, rename and delete keys, fields and elements, and expire or delete every key of a pattern after a dry run.
 - **Connect to anything:** ACL users, TLS, cluster, Sentinel, SSH tunnels, cloud IAM sign-in and Docker discovery.
   Passwords stay in the OS keychain.
 - **Check it in CI:** save snapshots, compare them over time, and fail a build on rules you set.
-- **Use it in a browser:** a web dashboard on your own computer with every screen the terminal has: connections, keys and values (with edits and bulk actions), Streams, Search, the analysis, the server, Pub/Sub and the command line.
-  It follows the same rules as the terminal: read-only production, writes asked about, passwords only in the keychain.
+- **Use it in a browser:** `ctrl-o` opens the dashboard, with every screen the terminal has and the same rules: read-only production, writes through the gate, passwords only in the keychain.
+  The connection, its access, the database and the node are switched from the bar at the top.
+
+## Keys
+
+The same letters mean the same thing on every screen, in the terminal and in the browser (where a few are terminal-only, the table says so).
+Lower case acts on the selected row, upper case on what it belongs to: with a field selected `d` deletes the field and `D` the key; with a key selected `d` deletes the key and `D` every key of its pattern.
+
+| Key | Does |
+|---|---|
+| `1`–`5`, `0` | Overview, Browse, Analyze, Server, Pub/Sub, Connections. The current area's digit again goes to its next panel |
+| `tab` `shift-tab` | Next or previous panel (terminal; the browser keeps them for focus) |
+| `↑↓` `j` `k`, `PgUp` `PgDn`, `Home` `End` | Move |
+| `→` `l` `enter` / `←` `h` `esc` | Open, or go back |
+| `/` | Filter the list |
+| `s`, `m` | Sort, more rows |
+| `v` | More columns (terminal) |
+| `a` | Analyze the keys: Quick (10,000) or Deep (100,000) |
+| `r` | Read again now |
+| `space` | Pause or resume what is live |
+| `y` / `Y` | Copy the row / its parent (a key name / its pattern) |
+| `e` `+` `R` `f` | Edit, add, rename the key, show the value in another format |
+| `t` / `T` | Set a TTL on the row / on its parent |
+| `d` / `D` | Delete the row / its parent |
+| `w` | Writes on or off for the connection |
+| `b`, `[` `]` | The database list; the previous or next node on a cluster |
+| `.` | Actions of the selected row and the screen, with their keys (terminal; in the browser each button shows its key) |
+| `ctrl-k` | Go to a pattern, a loaded key, a screen or an action |
+| `ctrl-f` | Find keys on the whole server (terminal) |
+| `:` | Command line |
+| `?` | The keys of this screen |
+| `ctrl-s` | Save a snapshot of the analysis |
+| `ctrl-o`, `q` | Open the dashboard, quit (terminal) |
+
+Every key, screen by screen, is in the [key reference](https://magna-nz.github.io/redis-lens/#keys) and in `?`.
 
 ## Install
 
@@ -60,7 +94,7 @@ Or download a binary for macOS, Linux or Windows from [GitHub Releases](https://
 
 ```sh
 redis-lens conn add local --url redis://localhost:6379
-redis-lens              # the terminal UI; press ? for every key, ctrl-o to open the dashboard
+redis-lens              # the terminal UI: enter connects, a analyzes, ? lists the keys, ctrl-o opens the dashboard
 redis-lens --dashboard  # only the dashboard, opened in your browser
 redis-lens --terminal   # only the terminal UI, no dashboard
 ```

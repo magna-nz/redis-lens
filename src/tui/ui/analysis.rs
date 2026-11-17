@@ -246,12 +246,12 @@ pub fn plain_status(v: TtlVerdict) -> &'static str {
     }
 }
 
-/// The style of the `▲` mark of a TTL verdict: red for a pattern that never expires and
-/// grows, amber where some keys never expire. `None` for a row that needs no mark.
+/// The style of the `▲` mark of a TTL verdict: the warning colour for a pattern that
+/// never expires and grows, and where some keys never expire (a finding, not a failure).
+/// `None` for a row that needs no mark.
 pub fn verdict_mark(v: TtlVerdict) -> Option<ratatui::style::Style> {
     match v {
-        TtlVerdict::PersistentGrowing => Some(style::warn()),
-        TtlVerdict::MixedLikelyBug => Some(style::amber()),
+        TtlVerdict::PersistentGrowing | TtlVerdict::MixedLikelyBug => Some(style::warning()),
         _ => None,
     }
 }
@@ -358,7 +358,7 @@ pub fn need_report(frame: &mut Frame, area: Rect, app: &App, title: &str, needs:
                 Line::default(),
                 Line::from(vec![
                     Span::raw(" "),
-                    Span::styled(spinner(app.tick), style::amber()),
+                    Span::styled(spinner(app.tick), style::warning()),
                     Span::styled(text, style::dim()),
                 ]),
             ];
@@ -368,7 +368,7 @@ pub fn need_report(frame: &mut Frame, area: Rect, app: &App, title: &str, needs:
             let inner = one_section(frame, area, title, &s.profile.name);
             let lines = vec![
                 Line::default(),
-                Line::from(Span::styled(format!(" ✗ {e}"), style::warn())),
+                Line::from(Span::styled(format!(" ✗ {e}"), style::danger())),
                 Line::from(Span::styled(
                     " Press 0 to go back to Connections and try again.",
                     style::dim(),
@@ -394,14 +394,14 @@ pub fn need_report(frame: &mut Frame, area: Rect, app: &App, title: &str, needs:
                 Line::default(),
                 Line::from(vec![
                     Span::raw(" "),
-                    Span::styled(spinner(app.tick), style::amber()),
+                    Span::styled(spinner(app.tick), style::warning()),
                     Span::styled(" Sampled ", style::dim()),
                     Span::styled(counts, style::fgb()),
                     Span::styled(" keys", style::dim()),
                 ]),
                 Line::from(vec![
                     Span::raw("   "),
-                    Span::styled(fill, style::amber()),
+                    Span::styled(fill, style::data()),
                     Span::styled(track, style::track()),
                 ]),
             ];
@@ -592,7 +592,7 @@ fn big_row(
             1 => {
                 // The mark is for keys at or over the big-key limit.
                 let (text, st) = if big {
-                    (format!("{} {size}", MARK), style::warn())
+                    (format!("{} {size}", MARK), style::warning())
                 } else {
                     (size.clone(), style::fgb())
                 };
@@ -600,8 +600,9 @@ fn big_row(
             }
             2 => spans.push(Span::styled(pad_r(k.key_type.as_str(), w), style::dim())),
             3 => {
+                // `never` in the TTL column is a warning.
                 let st = match k.ttl {
-                    Ttl::Persistent => style::dim(),
+                    Ttl::Persistent => style::warning(),
                     Ttl::Expires(_) => style::fg(),
                 };
                 spans.push(Span::styled(pad_l(&ttl_text(k.ttl), w), st));
@@ -645,8 +646,7 @@ fn key_lines(
 
 fn rec_lines(r: &Recommendation, w: usize) -> Vec<Line<'static>> {
     let (mark, mark_style) = match r.severity {
-        Severity::Warn => (MARK, style::warn()),
-        Severity::Note => (MARK, style::amber()),
+        Severity::Warn | Severity::Note => (MARK, style::warning()),
         Severity::Info => ("●", style::dim()),
     };
     let text = if r.hint.is_empty() {
@@ -686,19 +686,19 @@ fn big_detail(
     let mut notes: Vec<Line<'static>> = Vec::new();
     if let Some(e) = &state.error {
         notes.extend(paragraph(
-            vec![Span::styled(" ✗ ", style::warn())],
+            vec![Span::styled(" ✗ ", style::danger())],
             "   ",
             e,
-            style::warn(),
+            style::danger(),
             w,
         ));
     }
     for e in &state.refused {
         notes.extend(paragraph(
-            vec![Span::styled(format!(" {MARK} "), style::amber())],
+            vec![Span::styled(format!(" {MARK} "), style::warning())],
             "   ",
             &format!("Without it, some rules are skipped: {e}."),
-            style::amber(),
+            style::warning(),
             w,
         ));
     }
@@ -762,12 +762,14 @@ pub fn forecast_bars(e: &Expiry, w: usize, short: bool) -> Vec<Line<'static>> {
             v as f64 / e.total as f64
         };
         let (fill, track) = bar(ratio, bar_w);
+        // A quantity in the data colour; the memory that never expires in the warning
+        // colour when more than a quarter of it does (as the dashboard draws it).
         let fill_style = if never && e.never_share() > NEVER_EXPIRES_SHARE {
-            style::warn()
+            style::warning()
         } else if never {
-            style::amber()
+            style::dim()
         } else {
-            style::ok()
+            style::data()
         };
         Line::from(fit(
             vec![
@@ -894,14 +896,14 @@ mod tests {
             "some never expire"
         );
         assert_eq!(plain_status(TtlVerdict::Ok), "ok");
-        // The worst is red, the next amber, the rest unmarked.
+        // Both findings are warnings (amber), the rest unmarked.
         assert_eq!(
             verdict_mark(TtlVerdict::PersistentGrowing),
-            Some(style::warn())
+            Some(style::warning())
         );
         assert_eq!(
             verdict_mark(TtlVerdict::MixedLikelyBug),
-            Some(style::amber())
+            Some(style::warning())
         );
         for v in [
             TtlVerdict::PersistentStable,

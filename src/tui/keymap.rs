@@ -151,6 +151,13 @@ pub struct KeyHelp {
 }
 
 impl KeyHelp {
+    /// Whether running it can lose data: the delete keys (`d` `D`: Delete, Delete key,
+    /// Delete all, End a connection, Reset the slow log, Drop an index) and Trim on a
+    /// stream. The Actions menu and Go to draw these in the danger colour.
+    pub fn destroys(&self) -> bool {
+        matches!(self.verb, Verb::Delete | Verb::DeleteParent) || self.label == "Trim"
+    }
+
     /// The same row in menu group `g`.
     const fn in_group(self, g: Group) -> Self {
         KeyHelp { group: g, ..self }

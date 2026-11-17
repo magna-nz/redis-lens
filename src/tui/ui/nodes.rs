@@ -88,8 +88,8 @@ fn role(r: NodeRole) -> &'static str {
 pub fn status(s: NodeStatus) -> (&'static str, Style) {
     match s {
         NodeStatus::Scanned => ("✓ analyzed", style::ok()),
-        NodeStatus::Partial => ("▲ partial", style::amber()),
-        NodeStatus::Failed => ("✗ failed", style::warn()),
+        NodeStatus::Partial => ("▲ partial", style::warning()),
+        NodeStatus::Failed => ("✗ failed", style::danger()),
     }
 }
 
@@ -274,8 +274,8 @@ fn node_row(n: &NodeReport, cols: &[Col], keep: &[usize], slots_w: usize) -> Lin
 /// A failed node's note is red, a partial one's or a replica fallback's amber.
 fn note_style(n: &NodeReport) -> Style {
     match n.status {
-        NodeStatus::Failed => style::warn(),
-        _ => style::amber(),
+        NodeStatus::Failed => style::danger(),
+        _ => style::warning(),
     }
 }
 
@@ -355,7 +355,7 @@ fn detail_lines(frame: &mut Frame, inner: Rect, n: &NodeReport, analyzed: u64, w
         if !n.sizes_available {
             v.push(Span::styled(
                 " · no sizes: MEMORY USAGE denied",
-                style::warn(),
+                style::warning(),
             ));
         }
         lines.push(kv("Sample", v));

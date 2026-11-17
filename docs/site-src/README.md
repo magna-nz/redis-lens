@@ -14,6 +14,9 @@ Run both from the repository root. They need Python 3 and nothing else.
 - `build.py` replaces `<!--TERM:name-->` with a terminal screen drawn from the app's insta
   snapshot files (`src/**/snapshots/`), and `<!--KEYTABLES-->` with the key tables of
   `spec.md`'s "### Keys" section. A snapshot or key change shows up on the next build.
+  Runs of more than two empty body rows (tall 120x36 screens) are trimmed to two; the size
+  label keeps the snapshot's size. Line 0 of a snapshot is the context bar and line 1 the
+  area row, with the open area's panels inline.
   `build.py <repo root> <template> <output>` builds from other paths.
 - `check_links.py` checks that every `#anchor` resolves, ids are unique, local files exist,
   nothing is loaded from another host but Google Fonts and mermaid (images always local),

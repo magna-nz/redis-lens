@@ -507,8 +507,9 @@ fn key_row(
             style::dim(),
         ));
     }
+    // `never` in the EXPIRES column is a warning (as on the dashboard).
     let ttl_style = match r.ttl {
-        Ttl::Persistent => style::dim(),
+        Ttl::Persistent => style::warning(),
         Ttl::Expires(_) => style::fg(),
     };
     let size = if sizes_off(state) {
@@ -531,7 +532,7 @@ fn key_row(
         let past = past_compact_encoding(r.key_type) == Some(enc.as_str());
         spans.push(Span::styled(
             pad_r(&trunc(&enc, ENC_W - 1), ENC_W),
-            if past { style::amber() } else { style::dim() },
+            if past { style::warning() } else { style::dim() },
         ));
     }
     if c.len {
@@ -554,12 +555,12 @@ fn key_row(
 /// What the list says while it has no rows.
 fn empty_lines(state: &KeysState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>> {
     let (text, st) = if let Some(e) = &state.error {
-        (format!(" ✗ {e}"), style::warn())
+        (format!(" ✗ {e}"), style::danger())
     } else if let LiveState::Closed(why) = ctx.live() {
         let why = why.as_deref().unwrap_or("it was closed");
         (
             format!(" ✗ The live connection is closed: {why}. Connect again to reopen it."),
-            style::warn(),
+            style::danger(),
         )
     } else if !state.filter.is_empty() && !state.rows.is_empty() {
         (
@@ -726,7 +727,7 @@ fn detail(frame: &mut Frame, inner: Rect, state: &KeysState, ctx: &Ctx<'_>, patt
                 &format!(
                     " ▲ Stored as a {past}: past the compact size, so it takes more memory per {per}."
                 ),
-                style::amber(),
+                style::warning(),
             );
         }
         lines.push(Line::default());
@@ -758,7 +759,7 @@ fn detail(frame: &mut Frame, inner: Rect, state: &KeysState, ctx: &Ctx<'_>, patt
         ));
     }
     for e in off_notes(state) {
-        notes.push((e, style::amber()));
+        notes.push((e, style::warning()));
     }
     for &i in &state.missing {
         if let Some(n) = ctx.session.nodes.get(i) {
@@ -768,12 +769,12 @@ fn detail(frame: &mut Frame, inner: Rect, state: &KeysState, ctx: &Ctx<'_>, patt
                     crate::live::nodes::not_connected(&n.endpoint)
                         .replace("so nothing is sent to it", "so its keys are not listed")
                 ),
-                style::amber(),
+                style::warning(),
             ));
         }
     }
     if let (Some(e), false) = (&state.error, state.rows.is_empty()) {
-        notes.push((format!(" ✗ {e}"), style::warn()));
+        notes.push((format!(" ✗ {e}"), style::danger()));
     }
     for (text, st) in notes {
         lines.push(Line::default());

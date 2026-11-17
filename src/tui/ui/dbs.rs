@@ -74,10 +74,10 @@ pub fn draw(frame: &mut Frame, area: Rect, l: &DbList) {
     let mut below: Vec<Line<'static>> = Vec::new();
     let mut texts: Vec<(String, Style)> = Vec::new();
     if let Stage::Unread(why) = &l.stage {
-        texts.push(((*why).to_string(), style::amber()));
+        texts.push(((*why).to_string(), style::warning()));
     }
     if let Some(note) = l.note {
-        texts.push((note.to_string(), style::amber()));
+        texts.push((note.to_string(), style::warning()));
     }
     if let Some(db) = l.ask {
         let name = l
