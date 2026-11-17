@@ -58,7 +58,7 @@ Fit: how well it works in a TUI (✓ good, ~ workable, ✗ poor). Effort: S = da
 | Live overview: CPU, memory, ops/s, clients, network, keys | **Have, better** | A | ✓ | M | Overview's "Now": six figures with sparklines (twelve with `v`), through the budget, pausable. Adds hit rate, evictions and expired keys, which Redis Insight leaves out. |
 | Per-shard overview on cluster | **Have** | A | ✓ | M | Phase 4: one row per shard on Overview, from a per-shard poll. |
 | Slow Log viewer | **Have** | A | ✓ | S | Arguments shown masked; `NOPERM` degrades; threshold edit and reset through the write gate; `y` copies the masked command line (Phase 5). |
-| `CLIENT LIST` view | **Have** | A | ✓ | S | Grouped by library and by address; `K` kills a connection through the write gate. |
+| `CLIENT LIST` view | **Have** | A | ✓ | S | Grouped by library and by address; `d` ends a connection through the write gate. |
 | Profiler (`MONITOR`) | **Have** | A | ~ | M | Server › Monitor, time-limited, asks first, credentials masked as lines arrive; `y` copies a masked line (Phase 5). Server-side `HOTKEYS` is not built: not confirmed on any image. |
 
 ### Browser (key level)
@@ -66,7 +66,7 @@ Fit: how well it works in a TUI (✓ good, ~ workable, ✗ poor). Effort: S = da
 | Redis Insight feature | redis-lens | Tier | Fit | Effort | Notes |
 |---|---|---|---|---|---|
 | Tree view by namespace | **Have, better** | – | ✓ | – | Our pattern inference finds `{uuid}`, `{id}` and the rest, not just a delimiter. |
-| Filter by name and type | **Have** | A | ✓ | S | `/` filters by name and `t` by type (Phase 4). |
+| Filter by name and type | **Have** | A | ✓ | S | `/` filters by name and `ctrl-t` by type (Phase 4). |
 | Key list for a pattern, with size and TTL | **Have** | A | ✓ | M | `→` on a pattern runs a budgeted, paged `SCAN MATCH`, with type, TTL, size, encoding and length. |
 | Key details: type, TTL, encoding, length | **Have** | A | ✓ | S | In a key's value: facts line with length, size, expiry, encoding and LFU counter. |
 | View values for each type | **Have** | **B** | ✓ | M | Strings, hashes, lists, sets, sorted sets, streams, JSON and vector sets, paged and capped; arrays and the module types in Phase 5. |
@@ -104,7 +104,7 @@ Fit: how well it works in a TUI (✓ good, ~ workable, ✗ poor). Effort: S = da
 | Redis Insight feature | redis-lens | Tier | Fit | Effort | Notes |
 |---|---|---|---|---|---|
 | Bulk delete by filter, with a count preview and a file of deleted keys | **Have** | C | ✓ | M | Dry run first, `UNLINK` in pipelines of 500 within the budget, the deleted key names appended to a file, a confirmation each time (the pattern typed on `prod`). |
-| Bulk expire | **Have** | C | ✓ | M | `x` on a pattern and `redis-lens expire` (a dry run, then `--apply`). A read-only profile refuses `expire`, dry run included. |
+| Bulk expire | **Have** | C | ✓ | M | `t` on a pattern and `redis-lens expire` (a dry run, then `--apply`). A read-only profile refuses `expire`, dry run included. |
 
 ### Pub/Sub and Streams
 
@@ -113,7 +113,7 @@ Fit: how well it works in a TUI (✓ good, ~ workable, ✗ poor). Effort: S = da
 | Subscribe and pattern-subscribe, live message list | **Have** | B | ✓ | M | The Pub/Sub live tail, with sharded Pub/Sub on a cluster. |
 | Publish | **Have** | C | ✓ | S | `P`, through the write gate. |
 | Stream consumer groups: lag, pending, consumers | **Have** | A | ✓ | M | Browse › Streams: groups, lag, pending, consumers, and untrimmed streams. |
-| Acknowledge and claim | **Have** | C | ~ | S | `A`, `c` and `X` on Streams, through the write gate. |
+| Acknowledge and claim | **Have** | C | ~ | S | `A`, `c` and `-` (trim) on Streams, through the write gate. |
 
 ### Search, AI and the rest
 
@@ -121,7 +121,7 @@ Fit: how well it works in a TUI (✓ good, ~ workable, ✗ poor). Effort: S = da
 |---|---|---|---|---|---|
 | Search index list and details | **Have** | A | ✓ | S | Hidden when the module is missing. |
 | Query editor, Explain and Profile | **Have** | B | ~ | M | Browse › Search. |
-| Create and drop an index | **Have** | C | ~ | M | `C` and `D` on Search, through the write gate. |
+| Create and drop an index | **Have** | C | ~ | M | `+` and `d` on Search, through the write gate. |
 | Redis Copilot (AI) | Missing | – | ✗ | – | **Skip.** It sends schemas and keys to Redis and OpenAI and needs a Redis Cloud sign-in. That conflicts with rule 1 and "safe on prod". |
 | RDI pipeline management | Missing | – | ✗ | – | **Skip.** A separate product's management API. |
 | Tutorials, guides, What's New | Missing | – | ✗ | – | **Skip.** The `?` help overlay covers us. |

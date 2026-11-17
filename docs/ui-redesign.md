@@ -182,3 +182,23 @@ Analyze and database dialogs are choices, not confirms, and stay centred.
 - Compact density: 28px rows, 30px buttons and fields.
 - `?` opens a sheet of the keys for the current screen, built from the same table as the
   buttons' key hints.
+
+## As built
+
+Where what was built differs from the brief above (`spec.md` has the details):
+
+- **Context bar (1).** The terminal's right side is the status only (`● analyzed 14:02 UTC`); the
+  live interval is in Overview's "Now" title, not in the bar. The dashboard's top bar also holds
+  the theme switch, and the database is a button that opens the list rather than a select.
+- **Key grammar (5).** The dashboard does not bind `ctrl-t` and `ctrl-l` (the browser's), `q`, or
+  the terminal keys that have no dashboard action: `d` on Clients, and `e` and `D` on the Slow log.
+- **Actions menu (7).** Three groups, not two: the selected row, its parent, then the screen's
+  actions that are not navigation. The dashboard has no `.` menu; each button shows its key.
+- **Go to (8).** The row picked as you type is never an action or the Find row: a screen whose
+  name starts with the text comes first, then the first pattern, then the first loaded key. An
+  action that writes is never run from Go to: it opens the Actions menu with that line picked.
+  The input is masked after a leading `:` as the command line masks it. In the dashboard, text
+  that starts with `/` finds keys.
+- **Browse (9).** With the focus on Patterns, the right pane shows the selected row's summary, or
+  that pattern's keys when they are already held. The dashboard's address also holds the node
+  and the sort, and a narrower window shows two panes (under about 1,060px) or one (under 780px).

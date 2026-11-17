@@ -1431,7 +1431,7 @@ Example, `GET /api/overview`. Reply: HTTP 200 (`$.perms` cut to the first 3 of 4
 
 ### `POST /api/polling`
 
-The body is `{"paused": bool, "interval_secs": N}`, either or both: `p` and `+` `-` on the
+The body is `{"paused": bool, "interval_secs": N}`, either or both: `space` and `<` `>` on the
 TUI's Overview. `interval_secs` is one of 1, 2, 3, 5, 10, 15, 30 and 60 (anything else is
 422); it starts at 2. Paused, no `INFO` is sent for the live figures. The polling is the
 dashboard's, for every tab, and lasts across connections. The reply is the polling as
@@ -5438,7 +5438,7 @@ Example, `POST /api/confirm/<id> {}`. Reply: HTTP 409
 
 ### `POST /api/keys/add`
 
-The TUI's `N`: a key with its first item, only when it does not exist. A string is
+The TUI's `+` on a key list: a key with its first item, only when it does not exist. A string is
 `SET … NX`. The other types go in `MULTI`/`EXEC` after `WATCH` and `EXISTS`, so a key
 written by someone else meanwhile is not overwritten.
 
@@ -5544,7 +5544,7 @@ Example, `POST /api/keys/add {"list":999,"name":"taken:1","type":"string","value
 ### Bulk actions
 
 A bulk expire or delete over **one pattern's keys** (Browse › Keys, a pattern row): the
-TUI's `x` and `D` on a pattern. There is no bulk action over a Find result. It is the
+TUI's `t` and `d` on a pattern. There is no bulk action over a Find result. It is the
 TUI's run, step for step:
 
 1. `POST /api/bulk` checks it can run, then starts the **dry run**. The dry run walks the
@@ -6610,7 +6610,7 @@ Example, a user without `XINFO`, `GET /api/streams`. Reply: HTTP 200
 ### `GET /api/streams/pending?key=&group=[&consumer=]`
 
 A group's pending entries, `XPENDING <key> <group> - + 100 [<consumer>]` (the TUI's
-`p`, at most 100), on the stream's owner, with the stream's row read again. `key`,
+`A`, "Pending entries", at most 100), on the stream's owner, with the stream's row read again. `key`,
 `group` and `consumer` are the ids of the list. The stream and the group must be in the
 list (404 `"That stream is not in the list: read the streams again, or analyze again to
 update it."`, `"That group is not one of the stream's: read the streams again."`).
@@ -7246,7 +7246,7 @@ Example, `GET /api/search/field?run=1&doc=2&field=0`. Reply: HTTP 200
 
 ### `POST /api/search/create`, `POST /api/search/drop`
 
-The TUI's `C` and `D`, through the write gate, on the picked node: the node whose list
+The TUI's `+` and `d` on Search, through the write gate, on the picked node: the node whose list
 the index was checked against. Another node picked before the write is decided, or before
 its question is answered, refuses it with 409 `"Not sent: the connection changed since the
 question was asked."`, and nothing is sent to either node.

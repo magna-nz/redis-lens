@@ -88,15 +88,16 @@ gif: build
 # Records docs/dashboard.gif from a running dashboard in headless Chrome (no npm packages).
 # Needs:
 #   - the demo servers (make demo-up) and a dashboard serving them: `redis-lens --dashboard
-#     --no-open > /tmp/dash.out` (or the TUI's), with a saved local connection that has every
+#     --no-open > dash.out` in a directory only you can read (or the TUI's), with a saved local connection that has every
 #     permission and writes on, named demo-admin (the `admin` user in demo/users.acl):
 #     redis-lens conn add demo-admin --url redis://admin@127.0.0.1:6390 --env local --ask-password
-#   - SIGNIN: a file holding the sign-in link (such as /tmp/dash.out), or the link itself.
+#   - SIGNIN: a file holding the sign-in link (such as that dash.out), or the link itself.
 #     Prefer the file: a link given on the command line can be read by other users of the
 #     computer while it runs. The script never prints or saves the token.
 #   - Google Chrome or Chromium (CHROME=/path to pick one), Node 22 or newer and ffmpeg.
 # The demo `lens` user's password lets four made-up read-only clients show up in Clients and
-# Monitor. See the top of demo/record-dashboard.mjs for what the recording changes.
+# the live figures (Server's chart). See the top of demo/record-dashboard.mjs for what the
+# recording changes.
 dashboard-gif:
 	@test -n "$(SIGNIN)" || { echo "Set SIGNIN to the dashboard's sign-in link or a file holding it."; exit 2; }
 	@if [ -f "$(SIGNIN)" ]; then \

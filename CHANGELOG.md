@@ -10,6 +10,65 @@ section headed only `## [Unreleased]` is not used. Before you tag, give the chan
 version heading, `## [X.Y.Z]` or `## [X.Y.Z] - YYYY-MM-DD` (see
 [docs/releasing.md](docs/releasing.md)).
 
+## [Unreleased]
+
+### Added
+
+- **Go to (`ctrl-k`):** one box on every screen that goes to a pattern, a key already loaded, a screen or an
+  action from a few typed letters. Typing reads nothing from the server; `Find every key matching …` runs a
+  find only when you pick it, and text that starts with `:` goes to the command line, masked. The dashboard has
+  it too (`ctrl-k`, `cmd-k`, or `/` when no list has focus).
+- **The Actions menu (`.`):** the actions of the selected row, its parent and the screen, each with its key and
+  the command a write sends, `asks first`, or `off:` and the reason.
+- **The confirm sheet:** every question that guards a write is one sheet at the bottom of the screen, with the
+  exact command it sends, so the row it acts on stays in view. A question opened by a server reply takes no
+  answer for half a second.
+- **Browse in three panes** from 120 columns: patterns, the open pattern's keys and the open key's value side by
+  side. The dashboard shows the same three panes, and its address holds the open pattern, key, find and sort,
+  so Back, Forward, reload and a copied link work.
+- **Key list actions:** `t`, `d` and `R` on the selected key, `T` and `D` on every key of its pattern, and `Y`
+  copies the pattern.
+- **Dashboard top bar:** the connection menu, the access button (`w`), the database (`b`), the node on a
+  cluster, Go to, Live and its interval, the keys sheet (`?`) and the theme. The command line is a drawer at
+  the bottom of the window. The dashboard has the terminal's keys where the browser allows them.
+
+### Changed
+
+- **One key grammar:** a letter means the same thing on every screen; lower case acts on the selected row,
+  upper case on what it belongs to. `a` analyzes and `r` only refreshes. `w` works on every screen.
+- **The screen's chrome:** a one-line context bar, then an area row that shows the open area's panels after its
+  name (`2 Browse › Keys · Streams · Search`). The footer ends in `. Actions   ^K Go to   ? Keys`.
+- **Colours mean one thing each** in the terminal: blue for focus, a darker blue for bars, meters and
+  sparklines, amber for warnings (`▲` and its sentence, `never` in an expiry column, `read-only`), red for
+  danger (the PROD badge, `writes on`, errors, actions that can lose data). Before, bars were amber and
+  warnings red.
+- **The `?` overlay is called Keys** (`Keys · <screen>`), as the footer calls it.
+- **Overview from 120 columns:** "Things to look at" and "Where the memory is" side by side, under the live
+  figures.
+- Keys that moved:
+
+  | Action | 0.1.0 | Now |
+  |---|---|---|
+  | Analyze the keys | `r` | `a` (`r` only refreshes) |
+  | Pause or resume what is live | `p` | `space` |
+  | Sort | `o` | `s` |
+  | Load more rows | `n` | `m` |
+  | Save a snapshot | `s` | `ctrl-s` |
+  | Overview's poll interval | `+` `-` | `<` `>` |
+  | Key list: show one type | `t` | `ctrl-t` |
+  | Key list: add a key | `N` | `+` |
+  | Pattern: TTL on every key, delete every key | `x`, `D` | `t`, `d` |
+  | A value: the key's TTL | `t` | `T` (`t` is the field's TTL) |
+  | Clients: end a connection | `K` | `d` |
+  | Slow log: threshold, reset | `c`, `R` | `e`, `D` |
+  | Streams: trim | `X` | `-` |
+  | Streams before an analysis: analyze | `r` | `a` |
+  | Pub/Sub: subscribe, clear the tail | `s`, `c` | `+`, `ctrl-l` |
+  | Search: explain, profile | `e`, `P` | `x`, `X` |
+  | Search: create, drop an index | `C`, `D` | `+`, `d` |
+  | Connections: add | `a` | `+` |
+  | Turn writes on or off | `w` on Connections | `w` on every screen |
+
 ## [0.1.0] - 2026-11-16
 
 The first release.
