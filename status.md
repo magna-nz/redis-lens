@@ -28,6 +28,8 @@ Merging: the owner asked for each PR to be merged once reviewed and green. Auto 
 
 For the owner to decide: the grammar puts some destructive actions on lower-case keys and changes a few old habits. `d` on the key list deletes the selected key and `D` there starts the pattern's bulk delete; `t` on a hash field in the value pane is now the field's TTL (`T` is the key's); `d` on Clients ends the selected connection. Each still goes through the gate (read-only sends nothing, production asks for the typed name, a bulk action always does its dry run), but with `skip_non_prod_confirm` a single lower-case key deletes a key on a non-production profile.
 
+Later: Tab and Shift-Tab go through every area's panels in one ring (branch claude/tab-ring).
+
 Known and left: the local Docker sometimes fails to publish a test container's port (`PortNotExposed` at `tests/common/mod.rs:126`) when several suites run at once, and CI's Redis 6.2 job once failed `ssh_cluster_it` with a connection reset; both pass on a rerun. At widths where a name column only just fitted, a list can drop a column 2 cells sooner than before (the gutter); the dashboard's Overview and Analyze colour a placeholder in a literal key name such as `cfg:{id}` (their rows carry no `literal` flag). In the dashboard, cancelling a bulk action's dry run shows the "Bulk action cancelled. Nothing was sent." toast twice.
 
 ## Overnight run (2026-11-10): approvals and plan

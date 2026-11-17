@@ -307,7 +307,7 @@ make demo-down   # stop the demo and delete its data</code></pre></div></div>
 <div class="eyebrow">Use it</div>
 <h2>The TUI <a class="anchor" href="#tui" aria-label="Link to this section">#</a></h2>
 <p class="lede">A home screen and five areas, switched with <kbd>0</kbd> to <kbd>5</kbd>.</p>
-<p><strong>0 Connections</strong> is the home screen. Once connected: <strong>1 Overview</strong>, <strong>2 Browse</strong> (Keys · Streams · Search), <strong>3 Analyze</strong> (Big keys · Expiry · Changes · Hot keys, plus Nodes · Slots on a cluster), <strong>4 Server</strong> (Clients · Slow log · Monitor) and <strong>5 Pub/Sub</strong>. An area's panels follow its name in the area row (<code>2 Browse › Keys · Streams · Search</code>). <kbd>tab</kbd> and <kbd>shift-tab</kbd> switch panels and do nothing else, and the area's digit again goes to its next panel; <kbd>→</kbd> and <kbd>←</kbd> go deeper and back. Every screen below is the app's own rendering, taken from its insta snapshot tests, with colour added.</p>
+<p><strong>0 Connections</strong> is the home screen. Once connected: <strong>1 Overview</strong>, <strong>2 Browse</strong> (Keys · Streams · Search), <strong>3 Analyze</strong> (Big keys · Expiry · Changes · Hot keys, plus Nodes · Slots on a cluster), <strong>4 Server</strong> (Clients · Slow log · Monitor) and <strong>5 Pub/Sub</strong>. An area's panels follow its name in the area row (<code>2 Browse › Keys · Streams · Search</code>). <kbd>tab</kbd> and <kbd>shift-tab</kbd> go through every area and its panels in turn, in one ring that wraps, and the area's digit again goes to its next panel; <kbd>→</kbd> and <kbd>←</kbd> go deeper and back. Every screen below is the app's own rendering, taken from its insta snapshot tests, with colour added.</p>
 </div>
 </div>
 
@@ -629,7 +629,7 @@ skip_non_prod_confirm = true   # no y/n on non-prod writes</code></pre></div>
 <div class="rail">
 <div class="codeblock"><div class="cb-head"><span class="cb-title">getting around</span><span class="cb-lang">text</span></div><pre><code>0          Connections, the home screen
 1 2 3 4 5  Overview Browse Analyze Server Pub/Sub
-tab        next panel of the area
+tab        next area or panel, in one ring
 → ←        deeper / back
 v          more columns, or fewer
 a          analyze (Quick or Deep)

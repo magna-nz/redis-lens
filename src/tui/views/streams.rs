@@ -1666,6 +1666,23 @@ mod tests {
         }
     }
 
+    /// `→` pressed again and again on Streams, on the list and with a stream's entries
+    /// open, moves between its panes and never leaves Streams.
+    #[test]
+    fn right_on_streams_never_leaves_streams() {
+        let (mut app, _) = loaded();
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Right));
+            assert_eq!(app.screen(), Screen::Streams);
+        }
+        let (mut app, _) = entries_open();
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Right));
+            assert_eq!(app.screen(), Screen::Streams);
+            assert!(app.views.streams.entries_open);
+        }
+    }
+
     #[test]
     fn enter_lists_the_entries_newest_first_and_n_loads_more() {
         let (mut app, t0) = entries_open();

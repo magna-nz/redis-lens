@@ -25,4 +25,4 @@ expression: small
 "│                                             │ 30 d  █▋░░░░░░░     2.4G   18% │"
 "│                                             │ never ███████▍░      11G   82% │"
 "└─────────────────────────────────────────────┴────────────────────────────────┘"
-" ↑↓ Move   tab Next panel   y Copy   a Analyze   ctrl-s Save              ? Keys"
+" ↑↓ Move   tab Next   y Copy   a Analyze   ctrl-s Save         ^K Go to   ? Keys"

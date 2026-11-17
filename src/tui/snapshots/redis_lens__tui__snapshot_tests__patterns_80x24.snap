@@ -25,4 +25,4 @@ expression: t.backend()
 "│                                        │                                     │"
 "│ from 100,000 sampled keys · v more     │                                     │"
 "└────────────────────────────────────────┴─────────────────────────────────────┘"
-" ↑↓ Move   → Open   / Filter   s Sort   tab Next panel         ^K Go to   ? Keys"
+" ↑↓ Move   → Open   / Filter   s Sort   tab Next               ^K Go to   ? Keys"

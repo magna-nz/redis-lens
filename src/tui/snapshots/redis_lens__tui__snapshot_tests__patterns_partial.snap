@@ -37,4 +37,4 @@ expression: t.backend()
 "│                                                                         │                                            │"
 "│ partial: 3,200 of 100,000 sampled so far                                │                                            │"
 "└─────────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────┘"
-" ↑↓ Move   → Open   / Filter   a Analyze   tab Next panel                                  . Actions   ^K Go to   ? Keys"
+" ↑↓ Move   → Open   / Filter   a Analyze   tab Next                                        . Actions   ^K Go to   ? Keys"

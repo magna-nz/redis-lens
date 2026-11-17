@@ -37,4 +37,4 @@ expression: t.backend()
 "│                                                                       │                                              │"
 "│                                                                       │                                              │"
 "└───────────────────────────────────────────────────────────────────────┴──────────────────────────────────────────────┘"
-" ↑↓ Move   enter This node only   tab Next panel                                           . Actions   ^K Go to   ? Keys"
+" ↑↓ Move   enter This node only   tab Next                                                 . Actions   ^K Go to   ? Keys"
