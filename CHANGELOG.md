@@ -12,6 +12,11 @@ version heading, `## [X.Y.Z]` or `## [X.Y.Z] - YYYY-MM-DD` (see
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-17
+
+A redesign of the terminal UI and the web dashboard around one set of keys, with Go to, an Actions menu and
+Browse in three panes. Several keys moved: see the table under Changed.
+
 ### Added
 
 - **Go to (`ctrl-k`):** one box on every screen that goes to a pattern, a key already loaded, a screen or an
@@ -28,6 +33,10 @@ version heading, `## [X.Y.Z]` or `## [X.Y.Z] - YYYY-MM-DD` (see
   so Back, Forward, reload and a copied link work.
 - **Key list actions:** `t`, `d` and `R` on the selected key, `T` and `D` on every key of its pattern, and `Y`
   copies the pattern.
+- **`^O Dashboard` in the footer** while the web dashboard runs, so it is easy to find. It is not shown with
+  `--terminal`, with the dashboard disabled, or when it could not start.
+- **`make demo-traffic`** keeps the demo servers busy with reads, writes and updates, so the live screens move,
+  and `make demo` also saves a `demo-admin` connection that can write.
 - **Dashboard top bar:** the connection menu, the access button (`w`), the database (`b`), the node on a
   cluster, Go to, Live and its interval, the keys sheet (`?`) and the theme. The command line is a drawer at
   the bottom of the window. The dashboard has the terminal's keys where the browser allows them.
@@ -43,12 +52,16 @@ version heading, `## [X.Y.Z]` or `## [X.Y.Z] - YYYY-MM-DD` (see
   danger (the PROD badge, `writes on`, errors, actions that can lose data). Before, bars were amber and
   warnings red.
 - **The `?` overlay is called Keys** (`Keys · <screen>`), as the footer calls it.
-- **Overview from 120 columns:** "Things to look at" and "Where the memory is" side by side, under the live
-  figures.
+- **Tab goes through every area and panel** in one ring (terminal): Overview, Browse's panels, Analyze's, Server's,
+  Pub/Sub and Connections, wrapping, and `shift-tab` goes back. Before, it moved only within the current area.
+- **Overview from 120 columns:** each block is its own box, with a blank row between them: the findings, the
+  explained finding, the off reasons, memory by pattern, what expiry frees and the slowest slow-log commands.
+  On a short terminal the blank rows close first, and an off reason is never hidden without a count.
 - Keys that moved:
 
-  | Action | 0.1.0 | Now |
+  | Action | 0.1.0 | 1.0.0 |
   |---|---|---|
+  | `tab`, `shift-tab` | the current area's panels | every area and its panels, in one ring |
   | Analyze the keys | `r` | `a` (`r` only refreshes) |
   | Pause or resume what is live | `p` | `space` |
   | Sort | `o` | `s` |

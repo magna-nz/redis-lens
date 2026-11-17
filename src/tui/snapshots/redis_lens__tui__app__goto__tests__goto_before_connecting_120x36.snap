@@ -2,7 +2,7 @@
 source: src/tui/goto.rs
 expression: "testing::render(app, w, h).backend()"
 ---
-" redis-lens 0.1.0   not connected                                                         pick a connection, then enter "
+" redis-lens 1.0.0   not connected                                                         pick a connection, then enter "
 " 1 Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub                                                0  Connections "
 "┌─ Connections ──────────────────────────────────────────────────────────────────────────────── 3 saved · 0 in Docker ─┐"
 "│   NAME        ┌─ Go to ──────────────────────────────────────────────────────────────────────────────┐N-IN    MEMORY │"

@@ -1,6 +1,6 @@
 [package]
 name = "redis-lens"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A terminal UI for Redis and Valkey: browse keys and values, find what uses the memory, watch the server and run commands."

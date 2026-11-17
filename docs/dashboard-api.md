@@ -274,7 +274,7 @@ Example, `event: state (first on the stream, not connected)`. Event (`$.polling.
   "error": null,
   "features": {
     "entra_id": false,
-    "version": "0.1.0"
+    "version": "1.0.0"
   },
   "live": "waiting",
   "live_error": null,
@@ -461,7 +461,7 @@ Example, `GET /api/state`. Reply: HTTP 200 (`$.polling.intervals` cut to the fir
   "error": null,
   "features": {
     "entra_id": false,
-    "version": "0.1.0"
+    "version": "1.0.0"
   },
   "live": "waiting",
   "live_error": null,
@@ -524,7 +524,7 @@ Example, `GET /api/state (after connecting)`. Event (`$.polling.intervals` cut t
   "error": null,
   "features": {
     "entra_id": false,
-    "version": "0.1.0"
+    "version": "1.0.0"
   },
   "live": "ready",
   "live_error": null,
@@ -607,7 +607,7 @@ Example, `GET /api/state (a connect to a server that wants a password, without o
   "error": "the server asks for a password, and this connection has none: add the connection again with its password",
   "features": {
     "entra_id": false,
-    "version": "0.1.0"
+    "version": "1.0.0"
   },
   "live": "closed",
   "live_error": null,
@@ -1015,7 +1015,7 @@ Example, `GET /api/state (after removing the connected profile)`. Reply: HTTP 20
   "error": null,
   "features": {
     "entra_id": false,
-    "version": "0.1.0"
+    "version": "1.0.0"
   },
   "live": "waiting",
   "live_error": null,
@@ -1206,7 +1206,7 @@ Example, `POST /api/connect {"name":"cache"}`. Reply: HTTP 202 (`$.polling.inter
   "error": null,
   "features": {
     "entra_id": false,
-    "version": "0.1.0"
+    "version": "1.0.0"
   },
   "live": "waiting",
   "live_error": null,
@@ -1260,7 +1260,7 @@ Example, `POST /api/disconnect`. Reply: HTTP 200 (`$.polling.intervals` cut to t
   "error": null,
   "features": {
     "entra_id": false,
-    "version": "0.1.0"
+    "version": "1.0.0"
   },
   "live": "waiting",
   "live_error": null,
@@ -2364,7 +2364,7 @@ Example, `GET /api/state`. Reply: HTTP 200 (`$.polling.intervals` cut to the fir
   "error": null,
   "features": {
     "entra_id": false,
-    "version": "0.1.0"
+    "version": "1.0.0"
   },
   "live": "ready",
   "live_error": null,
