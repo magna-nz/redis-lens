@@ -12,14 +12,12 @@
   <p><a href="https://magna-nz.github.io/redis-lens/"><strong>Documentation</strong></a></p>
 </div>
 
-redis-lens is a keyboard-first terminal UI for Redis and Valkey.
-The same program serves the same screens as a web dashboard on 127.0.0.1, and both use one set of keys.
+See what's in your Redis or Valkey, from your terminal or a web page on your own machine.
 
-- Key patterns such as `user:{id}:cart`, their keys and the open value sit side by side.
-- `ctrl-k` (Go to) reaches any pattern, loaded key, screen or action from a few typed letters. Typing reads nothing from the server.
-- `.` (Actions) lists what each key does on the selected row, which actions are off and why, and the command a write sends.
-- `a` samples the keys and shows what uses the memory, what never expires, and the big and hot keys.
-- Production connections are read-only until you turn writes on with `w`. Every write goes through one gate; on production each one asks first.
+- **Browse** key patterns, keys and values side by side
+- **Find** what uses the memory and what never expires
+- **Watch** live stats, clients, the slow log and Pub/Sub
+- **Stay safe:** production is read-only until you turn writes on
 
 <div align="center">
   <img src="docs/demo.gif" alt="redis-lens in the terminal: connecting to the demo Redis, Overview, analyzing the keys, Browse with patterns, a pattern's keys and a value side by side, the Actions menu, Go to opening the Slow log, and the keys sheet" width="900">
