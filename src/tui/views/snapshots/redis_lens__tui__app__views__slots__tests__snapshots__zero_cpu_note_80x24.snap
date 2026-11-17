@@ -25,4 +25,4 @@ expression: render(&app)
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ↑↓ Move   tab Next panel   s Sort   r Refresh     . Actions   ^K Go to   ? Keys"
+" ↑↓ Move   tab Next   s Sort   r Refresh           . Actions   ^K Go to   ? Keys"

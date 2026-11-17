@@ -872,7 +872,8 @@ fn area_spans(app: &App, fit: AreaFit) -> Vec<Span<'static>> {
         style::track()
     };
     let mut out = vec![Span::raw(" ")];
-    for a in Area::ALL.into_iter().filter(|a| *a != Area::Connections) {
+    // In `tab`'s order; `0 Connections`, its last stop, is drawn at the right.
+    for a in Area::RING.into_iter().filter(|a| *a != Area::Connections) {
         if out.len() > 1 {
             out.push(Span::raw("   "));
         }

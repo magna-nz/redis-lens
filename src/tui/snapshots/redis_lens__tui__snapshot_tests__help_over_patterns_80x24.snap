@@ -11,7 +11,7 @@ expression: t.backend()
 "│   │ ↑↓ j k         Move the selection                                    │   │"
 "│   │ PgUp PgDn      Move one page                                         │   │"
 "│   │ Home End g G   Jump to the first or last row                         │   │"
-"│   │ tab shift-tab  Next or previous panel, nothing else                  │   │"
+"│   │ tab shift-tab  Next or previous panel or area, in one ring           │   │"
 "│   │ → l enter      Open a pattern's keys, or expand a group and go in    │   │"
 "│   │ ← h            Collapse a group, or go up to it                      │d  │"
 "│   │ /              Filter patterns by name                               │   │"
