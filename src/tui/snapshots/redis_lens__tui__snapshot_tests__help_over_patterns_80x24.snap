@@ -23,6 +23,6 @@ expression: t.backend()
 "│   │ a              Analyze again (Quick or Deep); old results stay       │1m │"
 "│   │ ctrl-s         Save a snapshot of the analysis                       │0s │"
 "│   │ t              Set a TTL on every key of the pattern (writes)        │   │"
-"│ fr│ d              Delete every key of the pattern (writes)              │   │"
+"│ fr│ ↓ 15 more: type to search                                            │   │"
 "└───└──────────────────────────────────────────────────────────────────────┘───┘"
 " esc Close  or start typing to search                                           "

@@ -418,7 +418,7 @@ const AREA_TAB: KeyHelp = k(
     "tab shift-tab",
     "tab",
     "Next",
-    "Next or previous area or panel, once connected",
+    "Next or previous area or panel once a connect starts",
     false,
 );
 const COPY_PATTERN: KeyHelp = k(

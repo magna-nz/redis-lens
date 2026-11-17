@@ -244,7 +244,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous area or panel, once connected |
+| `tab` `shift-tab` | Next or previous area or panel once a connect starts |
 | `enter` | Connect: reads the server's own figures, no keys |
 | `+` | Add a connection |
 | `/` | Filter the profiles by name or tag |
@@ -259,7 +259,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous area or panel, once connected |
+| `tab` `shift-tab` | Next or previous area or panel once a connect starts |
 | `enter` | Go to the selected finding's panel |
 | `esc` | Stop the analysis and keep what it has sampled |
 | `space` | Pause or resume the live figures |
@@ -500,7 +500,7 @@ A panel of 3 Analyze, after Hot keys, shown only on a cluster.
 | `↑↓` `j` `k` | Move the selection |
 | `PgUp` `PgDn` | Move one page |
 | `Home` `End` `g` `G` | Jump to the first or last row |
-| `tab` `shift-tab` | Next or previous area or panel, once connected |
+| `tab` `shift-tab` | Next or previous area or panel once a connect starts |
 | `enter` | Subscribe to the selected channel |
 | `+` | Subscribe to a channel or pattern |
 | `S` | Subscribe to a shard channel (SSUBSCRIBE) |
@@ -531,7 +531,7 @@ The footer shows 3 to 5 of these keys for the screen on show, chosen by its stat
 ### Keys overlay
 
 `?` opens the keys overlay over the dimmed screen, titled "Keys · <screen>" (as the footer's `? Keys` names it; it used to be called Help), with a search line at the top ("type to find any action or screen…").
-- With nothing typed it lists HERE, the keys of the screen it was opened on, then EVERYWHERE, the keys that work on every screen.
+- With nothing typed it lists HERE, the keys of the screen it was opened on, then EVERYWHERE, the keys that work on every screen. When they do not all fit, its last line says how many more there are, "↓ n more: type to search".
 - Typing searches every screen and every action of every screen, ignoring case; every typed word must match. Screens come first ("Go to Server › Slow log"), then actions in screen order, each with where it is on the right (`e on Slow log`, `v everywhere`), then the keys that work everywhere. An action shared by several screens is listed once. The move keys are left out, and Nodes and Slots only show on a cluster.
 - `↑↓` pick a line, Backspace edits, `esc` clears the search and, with none, closes; `?` with nothing typed closes too. Every other key is typed into the search, `q` included; ctrl-c still quits.
 - `enter` runs the picked line as if its key had been pressed on its screen: it goes to that screen first (to the key list or a key's value only when one is open), then presses the key there, through every check that key meets. A write still goes through the [write gate](#write-permissions) and its question. When the screen can't be reached (no key open, or Nodes off a cluster) nothing is pressed. A screen's line just goes there.
@@ -878,7 +878,7 @@ Phase 1 is built: [Navigation](#navigation), the [Shared command budget](#shared
 
 - **Areas:** `0` Connections (the home screen), `1` Overview, `2` Browse, `3` Analyze, `4` Server, `5` Pub/Sub. `6` and any other digit do nothing. Before connecting, `1` to `5` still switch, and the body says "Connect first: open 0 Connections, pick a connection and press enter." An area keeps the panel and the level it was left at.
 - **Panels:** Browse has Keys · Streams · Search; Analyze has Big keys · Expiry · Changes · Hot keys, and Nodes · Slots only on a cluster (off a cluster they are not in the ring, the area row or the `?` search); Server has Clients · Slow log · Monitor. The current area's digit pressed again moves to its next panel, round the end within the area.
-- **`tab` ring:** `tab` goes to the next stop of one ring through every area and panel, `shift-tab` to the previous one, wrapping at both ends: Overview → Browse › Keys → Streams → Search → Analyze › Big keys → Expiry → Changes → Hot keys → (Nodes → Slots, on a cluster only) → Server › Clients → Slow log → Monitor → Pub/Sub → Connections → Overview again. This is the area row's order, `0 Connections` at its right last. `tab` on an area's last panel goes to the next area's first panel, and `shift-tab` on its first panel to the previous area's last panel. A panel that is off stays in the ring and shows why. Entering a stop is the same switch as its digit or the digit again: a panel shows the level it was left at (Browse › Keys its key list or value when left open), it reads what that switch reads and nothing more, and Monitor is never started by it. Before connecting the ring is Connections alone, so `tab` does nothing. `tab` and `shift-tab` do nothing else: they never move between panes, and wherever a text input, form, prompt, dialog, the Actions menu, Go to, the confirm sheet or the command line takes the keys, `tab` is theirs.
+- **`tab` ring:** `tab` goes to the next stop of one ring through every area and panel, `shift-tab` to the previous one, wrapping at both ends: Overview → Browse › Keys → Streams → Search → Analyze › Big keys → Expiry → Changes → Hot keys → (Nodes → Slots, on a cluster only) → Server › Clients → Slow log → Monitor → Pub/Sub → Connections → Overview again. This is the area row's order, `0 Connections` at its right last. `tab` on an area's last panel goes to the next area's first panel, and `shift-tab` on its first panel to the previous area's last panel. A panel that is off stays in the ring and shows why. Entering a stop is the same switch as its digit or the digit again: a panel shows the level it was left at (Browse › Keys its key list or value when left open), it reads what that switch reads and nothing more, and Monitor is never started by it. Until a connection has been started, the ring is Connections alone, so `tab` does nothing; once one has been started (while it connects, once connected, and after a failed connect, as for the area row and the digit keys) the ring is full. `tab` and `shift-tab` do nothing else: they never move between panes, and wherever a text input, form, prompt, dialog, the Actions menu, Go to, the confirm sheet or the command line takes the keys, `tab` is theirs.
 - **Deeper and back:** `→` `l` `enter` go one level deeper or into the right pane: on Browse › Keys a group expands, a pattern lists its keys, a key shows its value, and on a value `→` moves into the value; on Streams and Search `→` moves into the right pane (`enter` lists a stream's entries or opens a result). `←` `h` go back: collapse a group or go up to it, from a key's value to the key list, from the key list to the patterns, from a right pane to the left one, and on a stream's entries or a Search result back to the list. `esc` clears a filter first, then goes back as `←` does (on Browse › Keys it leaves a node narrowing instead of collapsing). On a screen where `esc` has nothing else to do it stops a running analysis and keeps what it sampled ([Analysis](#analysis)).
 - **`v`** shows more columns and details on the area on screen, or fewer again: one setting per area, off by default, kept while the app runs, across connects too. What it adds is said with each screen.
 - **Footer and `?`:** the footer shows the 3 to 5 keys that matter on the screen and `. Actions   ^K Go to   ? Keys` at the right ([Keys](#keys)); `.` lists the actions of the selection and the screen with their keys and state ([Actions menu](#actions-menu)); `ctrl-k` goes to a pattern, a loaded key, a screen or an action ([Go to](#go-to)); `?` lists the rest and finds any action ([Keys overlay](#keys-overlay)). Command names are left out of titles; `v` and `?` show them.

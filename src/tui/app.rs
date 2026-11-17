@@ -169,10 +169,10 @@ pub type Stop = (Area, Option<Panel>);
 
 /// Every stop of the `tab` ring in order (spec "Navigation"): each area of
 /// [`Area::RING`], and on an area with panels each of its panels instead. Panels that
-/// are off are stops too; Nodes and Slots only on a cluster (`cluster`). Before
-/// connecting (`connected` false) only Connections.
-pub fn tab_ring(cluster: bool, connected: bool) -> Vec<Stop> {
-    if !connected {
+/// are off are stops too; Nodes and Slots only on a cluster (`cluster`). Until a
+/// connection has been started (`session` false: no session yet) only Connections.
+pub fn tab_ring(cluster: bool, session: bool) -> Vec<Stop> {
+    if !session {
         return vec![(Area::Connections, None)];
     }
     Area::RING
@@ -187,15 +187,15 @@ pub fn tab_ring(cluster: bool, connected: bool) -> Vec<Stop> {
 /// Where `tab` (`forward`) or `shift-tab` goes from `area` showing `panel` (`None` on
 /// an area without panels): the next or previous stop of [`tab_ring`], wrapping at
 /// both ends. `None` when it goes nowhere: the ring has one stop, or the screen on
-/// show is not a stop (an area before connecting).
+/// show is not a stop (an area other than Connections without a session).
 pub fn tab_target(
     area: Area,
     panel: Option<Panel>,
     cluster: bool,
-    connected: bool,
+    session: bool,
     forward: bool,
 ) -> Option<Stop> {
-    let ring = tab_ring(cluster, connected);
+    let ring = tab_ring(cluster, session);
     let i = ring.iter().position(|s| *s == (area, panel))?;
     let n = ring.len();
     let j = if forward {
@@ -5200,7 +5200,7 @@ mod tests {
         crate::tui::app::views::testing::area(&mut app, '1');
         assert!(app.handle_key(ch('6')).is_empty());
         assert_eq!(app.screen(), Screen::Overview);
-        // Before connecting tab and shift-tab go nowhere, on any area.
+        // With no connection started (no session) tab and shift-tab go nowhere, on any area.
         for a in Area::ALL {
             crate::tui::app::views::testing::area(&mut app, a.digit());
             let before = app.screen();
@@ -5405,7 +5405,7 @@ mod tests {
             .collect();
         row.push(Area::Connections);
         assert_eq!(Area::RING.to_vec(), row);
-        // Before connecting the ring is Connections alone.
+        // Until a connection has been started the ring is Connections alone.
         for cluster in [false, true] {
             assert_eq!(tab_ring(cluster, false), [(Area::Connections, None)]);
         }
@@ -5526,7 +5526,7 @@ mod tests {
     }
 
     #[test]
-    fn before_connecting_tab_goes_nowhere() {
+    fn without_a_session_tab_goes_nowhere() {
         for cluster in [false, true] {
             for (a, p) in every_place() {
                 for fwd in [true, false] {
@@ -5534,27 +5534,75 @@ mod tests {
                 }
             }
         }
-        // Connections before connecting: tab does nothing and says nothing.
+        // Connections with no connection started: tab does nothing and says nothing.
         let mut app = App::new(fixtures::profiles());
         for k in [KeyCode::Tab, KeyCode::BackTab] {
             assert!(app.handle_key(key(k)).is_empty());
             assert_eq!(app.screen(), Screen::Connections);
             assert!(app.notice.is_none());
         }
+        // Once a connection has been started the ring is full: while it connects, and
+        // after it failed.
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Connect { id, scan, .. }] = effects[..] else {
+            panic!("expected a connect, got {effects:?}");
+        };
+        app.handle_key(ch('0'));
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.screen(), Screen::Overview);
+        app.apply(Msg::ScanFailed {
+            id,
+            scan,
+            error: "Connection refused".into(),
+        });
+        assert!(matches!(
+            app.session.as_ref().unwrap().phase,
+            Phase::Failed(_)
+        ));
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.screen(), Screen::Connections);
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.screen(), Screen::PubSub);
     }
 
-    /// Going round the ring with `tab` once sends exactly what pressing the digits to
-    /// the same screens sends (a new area's digit, or the area's digit again): the same
-    /// switches, no request more. Monitor is entered, never started.
-    fn tab_reads_what_the_digits_read(mut a: App, mut b: App) {
-        crate::tui::app::views::testing::area(&mut a, '1');
-        crate::tui::app::views::testing::area(&mut b, '1');
+    /// One lap of the ring with `tab` (`forward`) or `shift-tab` on `a`, from where `a`
+    /// and `b` both are, sends exactly what the old keys send on `b` for the same
+    /// screens: a new area's digit (its kept panel set to the one the ring enters), the
+    /// area's digit again forward, or the old same-area `shift-tab` (`cycle_panel`)
+    /// backward. The same switches, no request more. Monitor is entered, never started.
+    fn tab_lap_reads_what_the_old_keys_read(a: &mut App, b: &mut App, forward: bool) {
+        assert_eq!(a.screen(), b.screen());
         assert_eq!(format!("{:?}", a.views), format!("{:?}", b.views));
-        let n = tab_ring(a.is_cluster(), true).len();
+        let start = a.screen();
+        let ring = tab_ring(a.is_cluster(), true);
+        let n = ring.len();
+        let at = |app: &App| (app.area, app.screen().panel());
+        let i0 = ring.iter().position(|s| *s == at(a)).unwrap();
         let mut seen = Vec::new();
         for _ in 0..n {
-            let ea = a.handle_key(key(KeyCode::Tab));
-            let eb = b.handle_key(ch(a.area.digit()));
+            let ea = if forward {
+                a.handle_key(key(KeyCode::Tab))
+            } else {
+                a.handle_key(key(KeyCode::BackTab))
+            };
+            let (area, panel) = at(a);
+            let eb = if area == b.area && !forward {
+                let e = b.cycle_panel(true);
+                b.after_change(false, false);
+                b.track_selection();
+                e
+            } else {
+                if area != b.area
+                    && let Some(p) = panel
+                {
+                    match area {
+                        Area::Browse => b.browse_panel = p,
+                        Area::Analyze => b.analyze_panel = p,
+                        _ => b.server_panel = p,
+                    }
+                }
+                b.handle_key(ch(area.digit()))
+            };
             assert_eq!(b.screen(), a.screen());
             assert_eq!(format!("{ea:?}"), format!("{eb:?}"), "{:?}", a.screen());
             assert!(
@@ -5562,18 +5610,20 @@ mod tests {
                 "{:?}",
                 a.screen()
             );
-            seen.push(a.screen());
+            seen.push(at(a));
         }
-        assert_eq!(a.screen(), Screen::Overview);
-        assert!(seen.contains(&Screen::Monitor));
+        assert_eq!(a.screen(), start);
+        assert!(seen.contains(&(Area::Server, Some(Panel::Monitor))));
         assert!(!a.views.server.monitor.running());
         assert!(a.views.server.monitor.prompt.is_none());
-        let want: Vec<Screen> = tab_ring(a.is_cluster(), true)
-            .into_iter()
-            .cycle()
-            .skip(1)
-            .take(n)
-            .map(|(area, p)| p.map_or(a.screen_of_area(area), |p| p.top()))
+        let want: Vec<Stop> = (1..=n)
+            .map(|k| {
+                if forward {
+                    ring[(i0 + k) % n]
+                } else {
+                    ring[(i0 + n * 2 - k) % n]
+                }
+            })
             .collect();
         assert_eq!(seen, want);
     }
@@ -5585,14 +5635,37 @@ mod tests {
             views::testing::live_ready(&mut app);
             app
         };
-        tab_reads_what_the_digits_read(live(), live());
         let cluster = || {
             let (mut app, _) = cluster_scanned(fixtures::cluster_report());
             views::testing::live_ready(&mut app);
             assert!(app.is_cluster());
             app
         };
-        tab_reads_what_the_digits_read(cluster(), cluster());
+        let fixtures: [fn() -> App; 2] = [live, cluster];
+        for make in fixtures {
+            for forward in [true, false] {
+                // From Overview.
+                let (mut a, mut b) = (make(), make());
+                views::testing::area(&mut a, '1');
+                views::testing::area(&mut b, '1');
+                tab_lap_reads_what_the_old_keys_read(&mut a, &mut b, forward);
+                // From Browse at the key list's level: the lap comes back to it.
+                let (mut a, mut b) = (make(), make());
+                show(&mut a, Screen::KeyList);
+                show(&mut b, Screen::KeyList);
+                tab_lap_reads_what_the_old_keys_read(&mut a, &mut b, forward);
+                assert_eq!(a.screen(), Screen::KeyList);
+                // From Browse with `v` on.
+                let (mut a, mut b) = (make(), make());
+                show(&mut a, Screen::Patterns);
+                show(&mut b, Screen::Patterns);
+                a.handle_key(ch('v'));
+                b.handle_key(ch('v'));
+                assert!(a.more_here());
+                tab_lap_reads_what_the_old_keys_read(&mut a, &mut b, forward);
+                assert!(a.more_here());
+            }
+        }
     }
 
     /// Entering Browse › Keys from the ring keeps the level the area was left at, as its

@@ -13,7 +13,7 @@ expression: t.backend()
 "│ DOCKER · 1 Redis-compa│ ↑↓ j k         Move the selection                                    │                       │"
 "│   myapp-redis-1       │ PgUp PgDn      Move one page                                         │n    none            — │"
 "│   + Add a connection  │ Home End g G   Jump to the first or last row                         │                       │"
-"│                       │ tab shift-tab  Next or previous area or panel, once connected        │                       │"
+"│                       │ tab shift-tab  Next or previous area or panel once a connect starts  │                       │"
 "├─ prod-cache-01 ───────│ enter          Connect: reads the server's own figures, no keys      │──────── PROD · saved ─┤"
 "│ Address   prod-cache-0│ +              Add a connection                                      │                       │"
 "│ Sign-in   password or │ /              Filter the profiles by name or tag                    │                       │"
