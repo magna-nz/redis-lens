@@ -2824,6 +2824,7 @@ impl App {
             not_read,
             off: self.view_off(),
             drill,
+            dashboard: self.dashboard_url().is_some(),
             tail: screen == Screen::PubSub && v.pubsub.tail.id.is_some(),
             list: on_value && value.has_list(),
             edit: on_value && value.edit_target().is_ok(),
@@ -10797,6 +10798,44 @@ mod dashboard_tests {
         // Too short a screen keeps every row for the list.
         let small = text(&testing::render(&home(on()), 80, 12));
         assert!(!small.contains("ctrl-o opens it"), "{small}");
+    }
+
+    #[test]
+    fn the_footer_names_ctrl_o_only_while_the_dashboard_runs() {
+        let footer = |app: &App, w, h| {
+            let t = text(&testing::render(app, w, h));
+            t.lines().last().unwrap_or_default().to_string()
+        };
+        for screen in [
+            Screen::Connections,
+            Screen::Overview,
+            Screen::Patterns,
+            Screen::Clients,
+        ] {
+            let mut app = testing::app_on(screen).0;
+            for link in [
+                DashboardLink::Terminal,
+                DashboardLink::Disabled,
+                port_in_use(),
+            ] {
+                app.set_dashboard(link);
+                app.notice = None; // a notice replaces the footer line
+                for (w, h) in [(80, 24), (120, 36)] {
+                    let last = footer(&app, w, h);
+                    assert!(!last.contains("^O"), "{screen:?} {w}x{h}: {last}");
+                }
+            }
+            app.set_dashboard(on());
+            app.notice = None;
+            let last = footer(&app, 120, 36);
+            assert!(last.contains("^O Dashboard"), "{screen:?}: {last}");
+            // The hint is for a key that works: ctrl-o opens it from here.
+            let effects = app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+            assert!(
+                matches!(effects[..], [Effect::OpenDashboard]),
+                "{screen:?}: {effects:?}"
+            );
+        }
     }
 
     #[test]
