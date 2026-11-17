@@ -2,8 +2,8 @@
 
 Where the build stands. Update this file in the same PR as the work it describes. What the tool should do is in [spec.md](spec.md).
 
-**Current milestone:** the first release, v0.1.0 (`claude/release-0.1.0`). The web dashboard is done: phases 1 to 4 merged as #26, #28, #29 and #30 ([Web dashboard](#web-dashboard-2026-11-15)). On main: Redis Insight parity phases 1 to 5 (#15 to #23), the TUI redesign (#21), the shorter README (#24), Find key (#25) and the release pipeline with the switch to MIT (#27).
-**Last updated:** 2026-11-17 (UI redesign: the docs chunk is done on `claude/redesign-docs`, which holds both tracks; see [UI redesign](#ui-redesign-2026-11-17))
+**Current milestone:** v1.0.0 (`claude/release-1.0.0`): the redesigned terminal UI and web dashboard, one set of keys in both ([UI redesign](#ui-redesign-2026-11-17)). v0.1.0 was released on 2026-11-16. The tag `v1.0.0` is pushed after the release PR is merged.
+**Last updated:** 2026-11-17 (the UI redesign merged as #33 to #49; Tab ring #47, Overview boxes #48, the dashboard hint in the footer #51; the 1.0.0 release PR)
 
 ## UI redesign (2026-11-17)
 
