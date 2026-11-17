@@ -268,10 +268,10 @@ const DATABASES_KEY: KeyHelp = k(
 const DASHBOARD_KEY: KeyHelp = k(
     Verb::Dashboard,
     "ctrl-o",
-    "ctrl-o",
+    "^O",
     "Dashboard",
     "Open the web dashboard in your browser",
-    false,
+    true,
 );
 
 /// `w` from every screen: on Connections for the selected profile, elsewhere for the
@@ -1361,6 +1361,9 @@ pub struct FooterCtx {
     /// One level down inside the screen: a group's connections on Clients, a stream's
     /// entries, a Search result. The footer shows the way back.
     pub drill: bool,
+    /// The web dashboard is running, so `ctrl-o` has something to open (it is off with
+    /// `--terminal`, or when its port was taken).
+    pub dashboard: bool,
     /// Pub/Sub: a live tail is open.
     pub tail: bool,
     /// A key's value has a list of items (`→` moves into the value pane).
@@ -1466,8 +1469,19 @@ pub fn footer(screen: Screen, c: FooterCtx) -> Vec<(&'static str, &'static str)>
 /// connecting too. `ctrl-f` and `:` are not there: they still work, and `?` and Go to
 /// list them.
 pub fn footer_right() -> Vec<(&'static str, &'static str)> {
-    [".", "ctrl-k", "?"]
-        .iter()
+    footer_right_for(false)
+}
+
+/// [`footer_right`], with `^O Dashboard` first while the web dashboard runs: it is the
+/// one key a newcomer has no other way to find, so it is shown, and it is the first to
+/// go when the footer is tight.
+pub fn footer_right_for(dashboard: bool) -> Vec<(&'static str, &'static str)> {
+    let keys: &[&str] = if dashboard {
+        &["ctrl-o", ".", "ctrl-k", "?"]
+    } else {
+        &[".", "ctrl-k", "?"]
+    };
+    keys.iter()
         .map(|k| find_key(Screen::Connections, k))
         .collect()
 }
@@ -1476,18 +1490,19 @@ pub fn footer_right() -> Vec<(&'static str, &'static str)> {
 pub type Hint = (&'static str, &'static str);
 
 /// The footer as drawn `w` columns wide: [`footer`] and [`footer_right`], four columns
-/// apart at least. When they do not all fit, `. Actions` goes first, then `^K Go to`
+/// apart at least. When they do not all fit, `^O Dashboard` (shown only while the
+/// dashboard runs) goes first, then `. Actions`, then `^K Go to`
 /// (`?` lists both), then the screen's keys from the end, so its first, most important
 /// ones stay, and its way back (`esc`) last of all; `?` stays while anything fits.
 /// From 100 columns on nothing is left out.
 pub fn footer_fit(screen: Screen, c: FooterCtx, w: usize) -> (Vec<Hint>, Vec<Hint>) {
     let mut left = footer(screen, c);
-    let mut right = footer_right();
+    let mut right = footer_right_for(c.dashboard);
     let fits = |l: &[(&str, &str)], r: &[(&str, &str)]| {
         let rw = footer_right_width(r);
         footer_width(l) + if rw == 0 { 0 } else { 4 + rw } <= w
     };
-    for drop in [".", "^K"] {
+    for drop in ["^O", ".", "^K"] {
         if !fits(&left, &right) {
             right.retain(|(k, _)| *k != drop);
         }
@@ -1714,6 +1729,8 @@ mod tests {
                     item: on(11),
                     more: on(12),
                     empty: on(13),
+                    // The left side does not depend on it: its own test covers it.
+                    dashboard: false,
                 }
             })
             .collect()
@@ -2125,6 +2142,61 @@ mod tests {
                         s.title()
                     );
                 }
+            }
+        }
+    }
+
+    /// `^O Dashboard` is named in the footer only while the dashboard runs, comes first on
+    /// the right, and is the first thing dropped when the footer is tight: nothing else
+    /// moves for it.
+    #[test]
+    fn the_dashboard_hint_shows_only_while_it_runs_and_goes_first() {
+        let on = FooterCtx {
+            ready: true,
+            dashboard: true,
+            ..FooterCtx::default()
+        };
+        let off = FooterCtx {
+            dashboard: false,
+            ..on
+        };
+        assert_eq!(footer_right_for(true)[0], ("^O", "Dashboard"));
+        assert_eq!(footer_right_for(false), footer_right());
+        for v in Screen::ALL {
+            assert!(
+                footer_fit(v, on, 200).1.contains(&("^O", "Dashboard")),
+                "{}",
+                v.title()
+            );
+            assert!(
+                !footer_fit(v, off, 200).1.iter().any(|(k, _)| *k == "^O"),
+                "{}",
+                v.title()
+            );
+        }
+        let left = footer(Screen::KeyList, on);
+        let full = footer_width(&left) + 4 + footer_right_width(&footer_right_for(true));
+        assert_eq!(
+            footer_fit(Screen::KeyList, on, full),
+            (left.clone(), footer_right_for(true))
+        );
+        // One column short: `^O Dashboard` goes, and the rest is as it was.
+        assert_eq!(
+            footer_fit(Screen::KeyList, on, full - 1),
+            (left, footer_right())
+        );
+        // At any width, the way back and `?` are not lost for it.
+        for v in Screen::ALL {
+            for w in [60, 80, 100, 120] {
+                let (l, r) = footer_fit(v, on, w);
+                assert!(footer_width(&l) + 4 + footer_right_width(&r) <= w || r.is_empty());
+                let (l_off, _) = footer_fit(v, off, w);
+                assert_eq!(
+                    l,
+                    l_off,
+                    "{} at {w}: `^O` must not cost a screen key",
+                    v.title()
+                );
             }
         }
     }
