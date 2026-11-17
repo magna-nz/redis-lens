@@ -28,17 +28,19 @@ use crate::tui::app::{App, Phase, Session};
 
 use super::widgets::{
     Section, Title, bar, dialog, fit, pad_l, pad_r, rows, scroll_offset, sections, trunc,
+    wrap_spans,
 };
 use super::{CONNECT_FIRST, hh_mm, server, server_label, spinner, style};
 
 /// The six figures "Now" shows; `v` shows all of [`Metric::ALL`].
+/// The grid's six: memory is not among them, it is the bar line under the grid.
 const SHORT: [Metric; 6] = [
     Metric::Ops,
     Metric::Clients,
-    Metric::Memory,
     Metric::HitRate,
     Metric::Evicted,
     Metric::Expired,
+    Metric::Fragmentation,
 ];
 
 const LABEL_W: usize = 10;
@@ -47,6 +49,17 @@ const VALUE_W: usize = 7;
 const TOP_PATTERNS: usize = 3;
 /// From this width on, "Keys" also shows what TTLs free.
 const WIDE: usize = 100;
+/// From this body width on, Overview draws two panes under "Now": the findings at the
+/// left, the memory at the right.
+pub const TWO_PANES: u16 = 120;
+/// The panes' rows at the least (borders included); with fewer, one column.
+const PANES_MIN_H: u16 = 8;
+/// The left pane's share of the width.
+const THINGS_SHARE: f64 = 0.55;
+/// Slow-log entries "SLOWEST IN THE SLOW LOG" names at most.
+const SLOWEST: usize = 3;
+/// Figures "Now" puts on a row when it is this wide; narrower, two.
+const GRID_3_AT: usize = 72;
 
 /// Draws Overview into `area`, the body between the area row and the footer.
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
@@ -67,6 +80,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let now = now_lines(&ctx, app, w);
     let now_rows = u16::try_from(now.len()).unwrap_or(u16::MAX);
     let (now_left, now_right) = now_titles(&ctx, app);
+    // From 120 columns, two panes under "Now", when there is room for them.
+    if area.width >= TWO_PANES
+        && two_pane_state(ctx.session)
+        && area.height >= now_rows.saturating_add(2 + PANES_MIN_H)
+    {
+        two_panes(frame, area, app, ctx.session, now, (&now_left, &now_right));
+        return;
+    }
     // The frame's top border, the divider and the bottom border.
     let keys_h = usize::from(area.height.saturating_sub(3).saturating_sub(now_rows));
     let (keys, keys_right) = keys_lines(app, ctx.session, w, keys_h);
@@ -141,28 +162,32 @@ fn now_lines(ctx: &Ctx<'_>, app: &App, w: usize) -> Vec<Line<'static>> {
         if let Some(t) = server::trouble(&o.poll, ctx) {
             lines.push(Line::from(fit(t.spans, w)));
         }
-        let list: &[Metric] = if ctx.more { &Metric::ALL } else { &SHORT };
-        let col = w / 2;
-        for pair in list.chunks(2) {
+        // With `v` every figure the poll reads, memory still only as the bar.
+        let all: Vec<Metric> = Metric::ALL
+            .into_iter()
+            .filter(|m| *m != Metric::Memory)
+            .collect();
+        let list: &[Metric] = if ctx.more { &all } else { &SHORT };
+        // Three figures a row (a 3 × 2 grid of the six) where they fit, else two.
+        let per_row = if w >= GRID_3_AT { 3 } else { 2 };
+        let col = w / per_row;
+        for row in list.chunks(per_row) {
             let mut spans = Vec::new();
-            for m in pair {
-                let (text, st, of) = figure(*m, o);
-                let of = of.map(|of| format!(" of {of}")).unwrap_or_default();
-                let spark_w = col
-                    .saturating_sub(1 + LABEL_W + VALUE_W + 3 + super::widgets::width(&of))
-                    .min(HISTORY);
+            for m in row {
+                let (text, st, _) = figure(*m, o);
+                let spark_w = col.saturating_sub(1 + LABEL_W + VALUE_W + 3).min(HISTORY);
                 let cell = vec![
                     Span::styled(format!(" {}", pad_r(label(*m), LABEL_W)), style::dim()),
                     Span::styled(pad_l(&text, VALUE_W), st),
                     Span::raw(" "),
                     Span::styled(sparkline(&o.history, *m, spark_w), style::ok()),
-                    Span::styled(of, style::dim()),
                 ];
                 // Cut or padded to its column.
                 spans.extend(fit(cell, col));
             }
             lines.push(Line::from(fit(spans, w)));
         }
+        lines.extend(memory_bar(o, w));
         if let Some(l) = server_line(ctx.session, o.last.as_ref(), w) {
             lines.push(l);
         }
@@ -183,6 +208,7 @@ fn label(m: Metric) -> &'static str {
         Metric::HitRate => "hit rate",
         Metric::Evicted => "evicted",
         Metric::Expired => "expired",
+        Metric::Fragmentation => "frag ratio",
         other => other.label(),
     }
 }
@@ -214,6 +240,37 @@ fn figure(
         text
     };
     (text, st, None)
+}
+
+/// `memory    15G ████████░░░░ of 24G`: the memory in use against the limit, or
+/// `no limit`. Nothing before the first `INFO`.
+fn memory_bar(o: &crate::tui::app::views::server::Overview, w: usize) -> Option<Line<'static>> {
+    let used = o
+        .now()
+        .and_then(|p| p.used_memory)
+        .or(o.last.as_ref().and_then(|l| l.used_memory))?;
+    let (text, st, of) = figure(Metric::Memory, o);
+    let mut spans = vec![
+        Span::styled(format!(" {}", pad_r("memory", LABEL_W)), style::dim()),
+        Span::styled(pad_l(&text, VALUE_W), st),
+        Span::raw(" "),
+    ];
+    match (
+        of,
+        o.last.as_ref().and_then(|l| l.maxmemory).filter(|m| *m > 0),
+    ) {
+        (Some(of), Some(max)) => {
+            let tail = format!(" of {of}");
+            let room =
+                w.saturating_sub(1 + LABEL_W + VALUE_W + 1 + super::widgets::width(&tail) + 1);
+            let (fill, track) = bar(used as f64 / max as f64, room.min(60));
+            spans.push(Span::styled(fill, style::amber()));
+            spans.push(Span::styled(track, style::track()));
+            spans.push(Span::styled(tail, style::dim()));
+        }
+        _ => spans.push(Span::styled("no limit (maxmemory 0)", style::dim())),
+    }
+    Some(Line::from(fit(spans, w)))
 }
 
 /// `Redis 7.4.2 · up 41 d · primary, 2 replicas · RDB ok · AOF off · allkeys-lfu`:
@@ -396,6 +453,17 @@ impl Block {
 /// rows left over then go to the blocks in order, and a block's cut rows keep its
 /// selected one on screen.
 fn fit_blocks(prefix: Vec<Line<'static>>, blocks: Vec<Block>, h: usize) -> Vec<Line<'static>> {
+    fit_blocks_sel(prefix, blocks, h).0
+}
+
+/// [`fit_blocks`], and the rows drawn of the block with a selection (the findings),
+/// 0 when it is not drawn: what PgUp and PgDn move by on Overview.
+fn fit_blocks_sel(
+    prefix: Vec<Line<'static>>,
+    blocks: Vec<Block>,
+    h: usize,
+) -> (Vec<Line<'static>>, usize) {
+    let mut sel_rows = 0;
     let mut left = h.saturating_sub(prefix.len());
     let mut shown: Vec<(Block, usize)> = Vec::new();
     for b in blocks.into_iter().filter(|b| !b.rows.is_empty()) {
@@ -419,21 +487,30 @@ fn fit_blocks(prefix: Vec<Line<'static>>, blocks: Vec<Block>, h: usize) -> Vec<L
             out.push(Line::default());
         }
         out.extend(b.head);
+        if b.sel.is_some() {
+            sel_rows = n;
+        }
         let from = b.sel.map_or(0, |s| scroll_offset(s, n));
         out.extend(b.rows.into_iter().skip(from).take(n));
     }
-    out
+    (out, sel_rows)
 }
 
 /// `7.92M keys · 31% have a TTL · 13G of data, 2.1G overhead`, leaving out the parts
 /// the server did not give; or why the figures are missing.
 fn headline(s: &Session, w: usize) -> Line<'static> {
+    let spans = headline_spans(s);
+    if spans.is_empty() {
+        return Line::default();
+    }
+    Line::from(fit(spans, w))
+}
+
+/// The headline's spans, uncut; none when there is nothing to say yet.
+fn headline_spans(s: &Session) -> Vec<Span<'static>> {
     let figures = s.figures.as_ref();
     if let Some(why) = figures.and_then(|f| f.failed) {
-        return Line::from(Span::styled(
-            trunc(&format!(" ▲ {why}."), w),
-            style::amber(),
-        ));
+        return vec![Span::styled(format!(" ▲ {why}."), style::amber())];
     }
     let mut parts: Vec<String> = Vec::new();
     match figures.and_then(|f| f.server.as_ref()) {
@@ -460,7 +537,7 @@ fn headline(s: &Session, w: usize) -> Line<'static> {
                 parts.push(format!("{} keys", format::count(info.total_keys)));
                 parts.push(format!("{} used", format::bytes(info.used_memory)));
             }
-            None => return Line::default(),
+            None => return Vec::new(),
         },
     }
     let mut spans = vec![Span::styled(format!(" {}", parts[0]), style::fgb())];
@@ -468,7 +545,7 @@ fn headline(s: &Session, w: usize) -> Line<'static> {
         spans.push(Span::styled(" · ", style::dim()));
         spans.push(Span::styled(p.clone(), style::fg()));
     }
-    Line::from(fit(spans, w))
+    spans
 }
 
 /// Where the WHERE column starts.
@@ -478,7 +555,23 @@ fn place_col(w: usize) -> usize {
 
 /// A block heading with `WHERE` over the findings' column.
 fn where_head(title: &str, note: &str, w: usize) -> Line<'static> {
-    let at = place_col(w);
+    where_head_at(title, note, w, place_col(w))
+}
+
+/// Where the WHERE column starts in the two panes: as far right as its longest value
+/// lets it, so the findings get the width.
+fn place_col_for(found: &[Finding], w: usize) -> usize {
+    let longest = found
+        .iter()
+        .map(|f| super::widgets::width(f.place()))
+        .max()
+        .unwrap_or(0)
+        .max("WHERE".len());
+    w.saturating_sub(longest + 2)
+}
+
+/// [`where_head`] with WHERE at column `at`.
+fn where_head_at(title: &str, note: &str, w: usize, at: usize) -> Line<'static> {
     let mut spans = vec![Span::styled(format!(" {title}"), style::hd())];
     if !note.is_empty() {
         spans.push(Span::styled(format!("  {note}"), style::dim()));
@@ -496,7 +589,19 @@ fn where_head(title: &str, note: &str, w: usize) -> Line<'static> {
 
 /// The findings as rows: `› ▲ text … Big keys`, `sel` marked.
 fn finding_rows(found: &[Finding], sel: usize, w: usize) -> Vec<Line<'static>> {
-    let at = place_col(w);
+    finding_rows_at(found, sel, w, place_col(w))
+}
+
+/// The cells before a finding's text: the cursor and the mark.
+const FINDING_LEAD: usize = 5;
+
+/// True when `f`'s sentence is shown whole in its row with WHERE at `at`.
+fn finding_fits(f: &Finding, at: usize) -> bool {
+    FINDING_LEAD + super::widgets::width(&f.text) <= at.saturating_sub(1)
+}
+
+/// [`finding_rows`] with WHERE at column `at`.
+fn finding_rows_at(found: &[Finding], sel: usize, w: usize, at: usize) -> Vec<Line<'static>> {
     let sel = sel.min(found.len().saturating_sub(1));
     found
         .iter()
@@ -556,6 +661,7 @@ fn analyze_text(e: &Estimate) -> String {
 
 /// The "Keys" lines for a section `h` rows tall, and the section's right title.
 fn keys_lines(app: &App, s: &Session, w: usize, h: usize) -> (Vec<Line<'static>>, String) {
+    app.overview.drawn_rows.set(0);
     let p = &s.profile;
     let mut lines = Vec::new();
     let notice = provider_rows(p, w);
@@ -596,13 +702,12 @@ fn keys_lines(app: &App, s: &Session, w: usize, h: usize) -> (Vec<Line<'static>>
         _ => {}
     }
     let prefix = vec![headline(s, w), Line::default()];
-    let cluster = s.is_cluster();
     let mut blocks = Vec::new();
     let right;
     if app.analysis_running() {
         let e = estimate_for(s.analysis.unwrap_or_default(), app);
         right = format!("about {} commands in all", format::count(e.commands));
-        blocks.push(analyzing_block(s, &e, w));
+        blocks.push(analyzing_block(s, &e, w, false));
         blocks.push(server_block(app, w, false));
     } else if shows_analysis(app) {
         let r = app.report().expect("shows_analysis has a report");
@@ -645,25 +750,13 @@ fn keys_lines(app: &App, s: &Session, w: usize, h: usize) -> (Vec<Line<'static>>
         let mut b = Block::new(Some(where_head("THINGS TO LOOK AT", "", w)), things);
         b.sel = (!found.is_empty()).then(|| app.overview.sel.min(found.len() - 1));
         blocks.push(b);
-        blocks.push(memory_block(r, w));
+        let widths = if w >= WIDE { (22, 26) } else { (18, 16) };
+        blocks.push(memory_block(r, w, TOP_PATTERNS, widths));
         if w >= WIDE {
             blocks.push(Block::new(None, vec![freed_line(r, w)]));
         }
     } else {
-        right = if cluster {
-            // The shards whose figures are in the sum: those that answered.
-            let answered = s
-                .figures
-                .as_ref()
-                .filter(|f| !f.nodes.is_empty())
-                .map_or(s.nodes.len(), |f| {
-                    f.nodes.iter().filter(|n| n.figures.is_some()).count()
-                });
-            let shards = if answered == 1 { "shard" } else { "shards" };
-            format!("summed over {answered} {shards} · no keys read")
-        } else {
-            "from INFO, MEMORY STATS, SLOWLOG · no keys read".to_string()
-        };
+        right = before_right(s);
         blocks.push(server_block(app, w, true));
         let e = estimate_for(Depth::Quick, app);
         let mut prompt = vec![Line::from(fit(
@@ -695,7 +788,30 @@ fn keys_lines(app: &App, s: &Session, w: usize, h: usize) -> (Vec<Line<'static>>
         ));
     }
     blocks.push(Block::new(None, notice));
-    (fit_blocks(prefix, blocks, h), right)
+    let (lines, sel_rows) = fit_blocks_sel(prefix, blocks, h);
+    app.overview
+        .drawn_rows
+        .set(sel_rows.min(findings(app).len()));
+    (lines, right)
+}
+
+/// The right title of what the server says before an analysis: where the figures
+/// come from, on a cluster how many shards answered.
+fn before_right(s: &Session) -> String {
+    if s.is_cluster() {
+        // The shards whose figures are in the sum: those that answered.
+        let answered = s
+            .figures
+            .as_ref()
+            .filter(|f| !f.nodes.is_empty())
+            .map_or(s.nodes.len(), |f| {
+                f.nodes.iter().filter(|n| n.figures.is_some()).count()
+            });
+        let shards = if answered == 1 { "shard" } else { "shards" };
+        format!("summed over {answered} {shards} · no keys read")
+    } else {
+        "from INFO, MEMORY STATS, SLOWLOG · no keys read".to_string()
+    }
 }
 
 /// The profile's provider notice as a row, if it has one.
@@ -733,10 +849,27 @@ fn server_block(app: &App, w: usize, note: bool) -> Block {
 
 /// "ANALYZING": how far the sample is, a bar and the time left, what it sends per key,
 /// and that `esc` stops it and keeps what it has.
-fn analyzing_block(s: &Session, e: &Estimate, w: usize) -> Block {
+/// `wrap`: its sentences broken over lines rather than cut (the narrower pane of the
+/// two at 120 columns).
+fn analyzing_block(s: &Session, e: &Estimate, w: usize, wrap: bool) -> Block {
     let pr = s.progress.unwrap_or_default();
     let target = if pr.target > 0 { pr.target } else { e.keys };
-    let head = if s.phase == Phase::Connecting {
+    let head = if wrap && s.phase != Phase::Connecting {
+        Line::from(fit(
+            vec![
+                Span::styled(" ANALYZING", style::hd()),
+                Span::styled(
+                    format!(
+                        "  sampling {} of {} keys",
+                        format::grouped(pr.sampled),
+                        format::grouped(target)
+                    ),
+                    style::dim(),
+                ),
+            ],
+            w,
+        ))
+    } else if s.phase == Phase::Connecting {
         Line::from(vec![
             Span::styled(" ANALYZING", style::hd()),
             Span::styled(
@@ -795,21 +928,47 @@ fn analyzing_block(s: &Session, e: &Estimate, w: usize) -> Block {
     } else {
         " Browse and Analyze fill in as it goes.  esc stops it and keeps what it has."
     };
-    Block::new(
-        Some(head),
+    let said = format!(" {cmds} for each sampled key, {rate}.");
+    let rows_ = if wrap {
+        // The narrower pane: the progress on lines of its own, the bar the pane's width
+        // and the time left under it, then the sentences wrapped.
+        let mut v = Vec::new();
+        if s.phase != Phase::Connecting {
+            let ratio = if target == 0 {
+                0.0
+            } else {
+                pr.sampled as f64 / target as f64
+            };
+            let pct = format!("  {:>3.0}%", (ratio * 100.0).min(100.0));
+            let (fill, track) = bar(ratio, w.saturating_sub(2 + pct.len() + 1).max(4));
+            v.push(Line::from(fit(
+                vec![
+                    Span::raw(" "),
+                    Span::styled(fill, style::amber()),
+                    Span::styled(track, style::track()),
+                    Span::styled(pct, style::dim()),
+                ],
+                w,
+            )));
+            if let Some(left) = time_left(e, pr.sampled, target) {
+                v.extend(wrap_lines(&format!(" {left}"), w, style::dim()));
+            }
+        }
+        v.extend(wrap_lines(&said, w, style::dim()));
+        v.extend(wrap_lines(&stop.replace("  ", " "), w, style::dim()));
+        v
+    } else {
         vec![
-            Line::from(Span::styled(
-                trunc(&format!(" {cmds} for each sampled key, {rate}."), w),
-                style::dim(),
-            )),
+            Line::from(Span::styled(trunc(&said, w), style::dim())),
             Line::from(Span::styled(trunc(stop, w), style::dim())),
-        ],
-    )
+        ]
+    };
+    Block::new(Some(head), rows_)
 }
 
 /// "WHERE THE MEMORY IS": the biggest patterns with their share, the rest on one row;
 /// shares of keys, and why, without sizes.
-fn memory_block(r: &ScanReport, w: usize) -> Block {
+fn memory_block(r: &ScanReport, w: usize, named_max: usize, widths: (usize, usize)) -> Block {
     let value = |p: &crate::model::PatternStats| {
         if r.sizes_available {
             p.est_bytes.unwrap_or(0)
@@ -818,7 +977,7 @@ fn memory_block(r: &ScanReport, w: usize) -> Block {
         }
     };
     let total: u64 = r.patterns.iter().map(value).fold(0, u64::saturating_add);
-    let (name_w, bar_w) = if w >= WIDE { (22, 26) } else { (18, 16) };
+    let (name_w, bar_w) = widths;
     let row = |name: String, v: u64| {
         let ratio = if total == 0 {
             0.0
@@ -844,13 +1003,15 @@ fn memory_block(r: &ScanReport, w: usize) -> Block {
             w,
         ))
     };
+    // At most `named_max` named; one row for the rest.
+    let named = r.patterns.len().min(named_max);
     let mut rows: Vec<Line<'static>> = r
         .patterns
         .iter()
-        .take(TOP_PATTERNS)
+        .take(named)
         .map(|p| row(p.pattern.clone(), value(p)))
         .collect();
-    let rest = &r.patterns[r.patterns.len().min(TOP_PATTERNS)..];
+    let rest = &r.patterns[named..];
     if !rest.is_empty() {
         let v = rest.iter().map(value).fold(0, u64::saturating_add);
         let name = match rest.len() {
@@ -905,6 +1066,467 @@ fn freed_line(r: &ScanReport, w: usize) -> Line<'static> {
         )),
     }
     Line::from(fit(spans, w))
+}
+
+// ---------------------------------------------------------------------------
+// Two panes (from 120 columns)
+// ---------------------------------------------------------------------------
+
+/// True when the two panes have something of their own to show: not while the first
+/// connect runs, nor after one that failed with nothing to show (those say so on one
+/// column, as at 80).
+fn two_pane_state(s: &Session) -> bool {
+    match &s.phase {
+        Phase::Connecting => s.analysis.is_some(),
+        Phase::Failed(_) => s.report.is_some(),
+        _ => true,
+    }
+}
+
+/// "Now" across the top, then "Things to look at" (the findings, the selected one
+/// explained under them, what is off) at the left and "Where the memory is" at the
+/// right, filling the rest of the height.
+fn two_panes(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    s: &Session,
+    now: Vec<Line<'static>>,
+    (now_left, now_right): (&str, &str),
+) {
+    let now_rows = u16::try_from(now.len()).unwrap_or(u16::MAX);
+    // "Now" in a frame of its own whose bottom border is the panes' top border.
+    let top = Rect {
+        height: now_rows + 2,
+        ..area
+    };
+    // No section has the keys there: the findings do.
+    let inner = super::widgets::sections_focused(
+        frame,
+        top,
+        &[Section {
+            title: Title::new(now_left, now_right),
+            rows: Some(now_rows),
+        }],
+        usize::MAX - 1,
+    );
+    rows(frame, inner[0], now, None);
+    let sep = area.y + now_rows + 1;
+    let bottom = Rect {
+        y: sep,
+        height: area.y + area.height - sep,
+        ..area
+    };
+    let left_w = super::widgets::split_at(area.width, THINGS_SHARE);
+    let (things_right, mem_right) = pane_rights(app, s);
+    let panes = super::widgets::frame_panes(
+        frame,
+        bottom,
+        &[left_w, area.width - left_w],
+        &[
+            Title::new("Things to look at", &things_right),
+            Title::new("Where the memory is", &mem_right),
+        ],
+        0,
+    );
+    // The panes' top border joins the frame of "Now": tees, not corners.
+    let tee = |frame: &mut Frame, x: u16, c: &str, st: Style| {
+        frame.render_widget(Span::styled(c.to_string(), st), Rect::new(x, sep, 1, 1));
+    };
+    tee(frame, area.x, "├", style::focus());
+    tee(frame, area.x + area.width - 1, "┤", style::border());
+    things_pane(frame, panes[0], app, s);
+    memory_pane(frame, panes[1], app, s);
+}
+
+/// The panes' right titles: how many findings and where from; the sample, or what an
+/// analysis costs.
+fn pane_rights(app: &App, s: &Session) -> (String, String) {
+    let n = findings(app).len();
+    let found = match n {
+        0 => String::new(),
+        1 => "1 finding".to_string(),
+        n => format!("{n} findings"),
+    };
+    if app.analysis_running() {
+        let e = estimate_for(s.analysis.unwrap_or_default(), app);
+        let left = join_parts(&[&found, "from the server"]);
+        return (
+            left,
+            format!("about {} commands in all", format::count(e.commands)),
+        );
+    }
+    if shows_analysis(app) {
+        let r = app.report().expect("shows_analysis has a report");
+        // The time is in the context bar ("analyzed 14:02 UTC"); the pane's title has
+        // room for the sample only, so a stopped run says so on the left.
+        let stopped = if stopped_early(s) {
+            "stopped early"
+        } else {
+            ""
+        };
+        return (
+            join_parts(&[&found, stopped]),
+            format!("{} sampled keys", format::grouped(r.sampled_keys)),
+        );
+    }
+    // The pane's title is short: on a cluster how many shards are summed, else that
+    // nothing is read key by key.
+    let right = if s.is_cluster() {
+        before_right(s)
+            .trim_end_matches(" · no keys read")
+            .to_string()
+    } else {
+        "no keys read".to_string()
+    };
+    (join_parts(&[&found, "from the server"]), right)
+}
+
+fn join_parts(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .filter(|p| !p.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The left pane: the findings with their WHERE column (`↑↓` moves, `enter` goes),
+/// a rule, the selected finding explained in the words the app has for it and what
+/// `enter` opens; at the bottom what is off and why.
+fn things_pane(frame: &mut Frame, inner: Rect, app: &App, s: &Session) {
+    let w = usize::from(inner.width);
+    let h = usize::from(inner.height);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let found = findings(app);
+    let sel = app.overview.sel.min(found.len().saturating_sub(1));
+    // The bottom: what is off, the provider's notice, a stopped analysis.
+    let mut tail: Vec<Line<'static>> = Vec::new();
+    if stopped_early(s)
+        && let Some(r) = app.report()
+    {
+        tail.extend(wrap_lines(
+            &format!(
+                " The analysis was stopped early: these come from {} keys only.",
+                format::grouped(r.sampled_keys)
+            ),
+            w,
+            style::dim(),
+        ));
+    }
+    let provider = provider_rows(&s.profile, w);
+    // At most a third of the pane (all of them with `v`); when some do not fit, the
+    // last line says how many and that `v` shows them.
+    let cap = if app.more_here() { h } else { h / 3 };
+    let reasons: Vec<Vec<Line<'static>>> = off_reasons(app)
+        .iter()
+        .map(|r| wrap_lines(&format!(" Off: {}", off_text(r)), w, style::dim()))
+        .collect();
+    let room = cap.saturating_sub(tail.len() + provider.len());
+    let all: usize = reasons.iter().map(Vec::len).sum();
+    if all <= room {
+        tail.extend(reasons.into_iter().flatten());
+    } else {
+        // Whole reasons while they leave a line for the count.
+        let mut used = 0;
+        let mut shown = 0;
+        for r in &reasons {
+            if used + r.len() + 1 > room {
+                break;
+            }
+            used += r.len();
+            shown += 1;
+        }
+        let n = reasons.len() - shown;
+        tail.extend(reasons.into_iter().take(shown).flatten());
+        if room > 0 {
+            let s_ = if n == 1 { "reason" } else { "reasons" };
+            tail.push(Line::from(Span::styled(
+                trunc(&format!(" … {n} more {s_}: v shows them"), w),
+                style::dim(),
+            )));
+        }
+    }
+    tail.extend(provider);
+    let tail_h = tail.len().min(h);
+    let tail: Vec<Line<'static>> = tail.into_iter().take(tail_h).collect();
+    // The list: its head and its rows, then a rule; the explanation gets the rest, at
+    // least four rows when there is room.
+    let body_h = h - tail_h;
+    let want = found.len().max(1);
+    let list_h = want.min(body_h.saturating_sub(1 + 1 + 4).max(1));
+    let at = place_col_for(&found, w);
+    let mut lines = vec![where_head_at("FINDING", "", w, at)];
+    if found.is_empty() {
+        let none = if shows_analysis(app) {
+            "   Nothing stands out in the sample."
+        } else {
+            "   Nothing stands out in what the server reports."
+        };
+        lines.push(Line::from(Span::styled(trunc(none, w), style::dim())));
+    } else {
+        let off = scroll_offset(sel, list_h);
+        let drawn = finding_rows_at(&found, sel, w, at)
+            .into_iter()
+            .skip(off)
+            .take(list_h.min(body_h.saturating_sub(1)));
+        let before = lines.len();
+        lines.extend(drawn);
+        app.overview.drawn_rows.set(lines.len() - before);
+    }
+    if found.is_empty() {
+        app.overview.drawn_rows.set(0);
+    }
+    if let Some(f) = found.get(sel) {
+        lines.push(Line::from(Span::styled("─".repeat(w), style::border())));
+        let (mark, st) = match f.severity {
+            Severity::Warn => ("▲", style::warn()),
+            Severity::Note => ("▲", style::amber()),
+            Severity::Info => ("●", style::dim()),
+        };
+        // The sentence again only when its row had to cut it.
+        let whole = finding_fits(f, at);
+        if !whole {
+            lines.extend(wrap_lines(&format!(" {mark} {}", f.text), w, st));
+        }
+        if !f.hint.is_empty() {
+            if !whole {
+                lines.push(Line::default());
+            }
+            lines.extend(wrap_lines(&format!(" {}", f.hint), w, style::fg()));
+        }
+        if !whole || !f.hint.is_empty() {
+            lines.push(Line::default());
+        }
+        let to = match f.to.panel() {
+            Some(p) => format!("{} › {}", f.to.area().title(), p.name()),
+            None => f.to.area().title().to_string(),
+        };
+        lines.push(Line::from(fit(
+            vec![
+                Span::styled(" enter", style::focus()),
+                Span::styled(format!(" opens {to}"), style::dim()),
+            ],
+            w,
+        )));
+    }
+    lines.truncate(body_h);
+    rows(frame, inner, lines, None);
+    let tail_area = Rect {
+        y: inner.y + inner.height - tail_h as u16,
+        height: tail_h as u16,
+        ..inner
+    };
+    rows(frame, tail_area, tail, None);
+}
+
+/// An "off" reason after the pane's "Off:": `Slow log is off: why` reads `Slow log:
+/// why`, so "off" is not said twice.
+fn off_text(r: &str) -> String {
+    for said in [" is off: ", " are off: "] {
+        if let Some((what, why)) = r.split_once(said) {
+            return format!("{what}: {why}");
+        }
+    }
+    r.to_string()
+}
+
+/// `text` wrapped to `w` in `st`, each line after the first indented under the first
+/// word after a leading mark.
+fn wrap_lines(text: &str, w: usize, st: Style) -> Vec<Line<'static>> {
+    super::patterns::wrap_words(text, w)
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, st)))
+        .collect()
+}
+
+/// The right pane: the server's headline, then before an analysis what one costs,
+/// while one runs its progress, and after it every top pattern that fits with its
+/// share and size, what TTLs free, and the slowest commands the slow log holds.
+fn memory_pane(frame: &mut Frame, inner: Rect, app: &App, s: &Session) {
+    let w = usize::from(inner.width);
+    let h = usize::from(inner.height);
+    let mut prefix = wrap_spans(headline_spans(s), w, 1);
+    prefix.push(Line::default());
+    let mut blocks: Vec<Block> = Vec::new();
+    if app.analysis_running() {
+        let e = estimate_for(s.analysis.unwrap_or_default(), app);
+        blocks.push(analyzing_block(s, &e, w, true));
+    } else if shows_analysis(app) {
+        let r = app.report().expect("shows_analysis has a report");
+        let freed = freed_block(r, w);
+        let slow = slow_block(&app.views.server.slow.entries, w);
+        // What the memory block may take: the rest less the blocks after it, which go
+        // (the slow log first) when they would leave it fewer than three rows.
+        let room = h.saturating_sub(prefix.len());
+        let need = |b: &Option<Block>| b.as_ref().map_or(0, |b| 1 + b.head.len() + b.rows.len());
+        let mut after = vec![freed, slow];
+        while room.saturating_sub(1 + after.iter().map(need).sum::<usize>()) < 3
+            && after.iter().any(Option::is_some)
+        {
+            if let Some(last) = after.iter_mut().rev().find(|b| b.is_some()) {
+                *last = None;
+            }
+        }
+        // Every pattern when they fit; else one row less, and one for the rest.
+        let top = room
+            .saturating_sub(1 + after.iter().map(need).sum::<usize>())
+            .max(1);
+        let named = if r.patterns.len() <= top {
+            top
+        } else {
+            top - 1
+        };
+        // The pane's title already says "Where the memory is": no heading again.
+        let mut patterns = memory_block(r, w, named, share_widths(w));
+        patterns.head.clear();
+        blocks.push(patterns);
+        blocks.extend(after.into_iter().flatten());
+    } else {
+        let e = estimate_for(Depth::Quick, app);
+        let mut prompt = wrap_spans(
+            vec![
+                Span::styled("   a", style::focus()),
+                Span::styled(analyze_text(&e), style::fg()),
+            ],
+            w,
+            6,
+        );
+        if let Some(last) = s.last_snapshot {
+            prompt.extend(wrap_spans(
+                vec![Span::styled(
+                    format!(
+                        "   Last analysis: {}, {} keys (a saved snapshot).",
+                        when_utc(last.taken_at_unix, app.wall_clock().or(s.connected_at_unix)),
+                        format::grouped(last.sampled_keys)
+                    ),
+                    style::dim(),
+                )],
+                w,
+                3,
+            ));
+        }
+        blocks.push(Block::new(
+            Some(Line::from(vec![
+                Span::styled(" WHAT USES THE MEMORY", style::hd()),
+                Span::styled("  needs a sample of the keys", style::dim()),
+            ])),
+            prompt,
+        ));
+    }
+    rows(frame, inner, fit_blocks(prefix, blocks, h), None);
+}
+
+/// "FREED BY TTL" as bars: the memory that expires within an hour, a day and a week,
+/// and that never does, of the sample's total; or why it is not known.
+fn freed_block(r: &ScanReport, w: usize) -> Option<Block> {
+    let head = Line::from(Span::styled(" FREED BY TTL", style::hd()));
+    let Some(e) = expiry(r) else {
+        return Some(Block::new(
+            Some(head),
+            wrap_spans(
+                vec![Span::styled(
+                    "   needs key sizes (MEMORY USAGE), which this analysis did not read",
+                    style::dim(),
+                )],
+                w,
+                3,
+            ),
+        ));
+    };
+    let rows_ = [
+        ("within 1 h", e.within[0]),
+        ("within 1 d", e.within[1]),
+        ("within 7 d", e.within[2]),
+        ("never", e.never),
+    ]
+    .into_iter()
+    .map(|(name, v)| share_row(name, v, e.total, &format::bytes(v), w, style::ok()))
+    .collect();
+    Some(Block::new(Some(head), rows_))
+}
+
+/// "SLOWEST IN THE SLOW LOG": the slowest entries the slow log already holds (read
+/// by the connect or the Slow log panel; nothing is read for it), their command and
+/// first key, never their arguments. `None` without entries.
+fn slow_block(entries: &[crate::live::server::SlowEntry], w: usize) -> Option<Block> {
+    if entries.is_empty() {
+        return None;
+    }
+    let mut by_time: Vec<&crate::live::server::SlowEntry> = entries.iter().collect();
+    by_time.sort_by_key(|e| std::cmp::Reverse((e.micros, e.unix)));
+    let rows_ = by_time
+        .into_iter()
+        .take(SLOWEST)
+        .map(|e| {
+            // Its duration, command name and time only: never its keys, arguments or
+            // client (spec: the slow finding is shown without its arguments or keys).
+            let name = if e.command.is_empty() {
+                "—".to_string()
+            } else {
+                e.command.clone()
+            };
+            Line::from(fit(
+                vec![
+                    Span::raw("   "),
+                    Span::styled(
+                        pad_l(&crate::tui::app::views::overview::micros_text(e.micros), 8),
+                        style::fgb(),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(pad_r(&trunc(&name, 14), 14), style::cmd()),
+                    Span::raw(" "),
+                    Span::styled(format!("{} UTC", hh_mm(e.unix)), style::dim()),
+                ],
+                w,
+            ))
+        })
+        .collect();
+    Some(Block::new(
+        Some(Line::from(Span::styled(
+            " SLOWEST IN THE SLOW LOG",
+            style::hd(),
+        ))),
+        rows_,
+    ))
+}
+
+/// `   name   ████░░░░  31%    4.2G`: a share of `total` as a bar, for a pane `w`
+/// wide.
+fn share_row(name: &str, v: u64, total: u64, size: &str, w: usize, bar_st: Style) -> Line<'static> {
+    let ratio = if total == 0 {
+        0.0
+    } else {
+        v as f64 / total as f64
+    };
+    let (name_w, bar_w) = share_widths(w);
+    let (fill, track) = bar(ratio, bar_w);
+    Line::from(fit(
+        vec![
+            Span::raw("   "),
+            Span::styled(pad_r(&trunc(name, name_w), name_w), style::fg()),
+            Span::raw(" "),
+            Span::styled(fill, bar_st),
+            Span::styled(track, style::track()),
+            Span::styled(pad_l(&format::percent(ratio), 5), style::fgb()),
+            Span::styled(pad_l(size, 9), style::fg()),
+        ],
+        w,
+    ))
+}
+
+/// The name and bar widths of a share row in a pane `w` wide: as on one column at 80
+/// and 120 (18 and 16, 22 and 26), and in a narrower pane what is left after the name.
+fn share_widths(w: usize) -> (usize, usize) {
+    if w >= WIDE {
+        (22, 26)
+    } else if w >= 60 {
+        (22, w.saturating_sub(3 + 22 + 1 + 5 + 9 + 1).clamp(6, 26))
+    } else {
+        (18, w.saturating_sub(3 + 18 + 1 + 5 + 9 + 1).clamp(4, 16))
+    }
 }
 
 /// Draws "Analyze the keys?" centred in `area`, over the dimmed screen: Quick and Deep
@@ -1107,6 +1729,7 @@ mod tests {
         let app = overview_app(false);
         insta::assert_snapshot!("before_80x24", snap(&app, 80, 24));
         insta::assert_snapshot!("before_120x36", snap(&app, 120, 36));
+        insta::assert_snapshot!("before_160x45", snap(&app, 160, 45));
     }
 
     #[test]
@@ -1114,6 +1737,7 @@ mod tests {
         let app = overview_app(true);
         insta::assert_snapshot!("after_80x24", snap(&app, 80, 24));
         insta::assert_snapshot!("after_120x36", snap(&app, 120, 36));
+        insta::assert_snapshot!("after_160x45", snap(&app, 160, 45));
     }
 
     #[test]
@@ -1289,8 +1913,12 @@ mod tests {
         ] {
             assert!(t.contains(want), "{want}:\n{t}");
         }
-        // Neither the slow command's arguments nor its key.
+        // Neither the slow command's arguments nor its key, at any width.
         assert!(!t.contains("secret-value"), "{t}");
+        for (w, h) in [(120, 36), (160, 45)] {
+            let wide = text_of(&app, w, h);
+            assert!(!wide.contains("secret-value"), "{w}x{h}:\n{wide}");
+        }
         no_heading_without_rows(&t);
         insta::assert_snapshot!("connected_80x24", t);
         let t = text_of(&app, 120, 36);
@@ -1328,17 +1956,36 @@ mod tests {
         });
         let reasons = ov::off_reasons(&app);
         assert_eq!(reasons.len(), 4, "{reasons:?}");
+        // Each reason whole on a line where the left pane is wide enough.
+        let wide = text_of(&app, 200, 50);
         let t = text_of(&app, 120, 36);
         for want in [
             "Big keys from the server need INFO keysizes",
             "MEMORY STATS is denied for this user.",
-            "Slow log is off:",
-            "Idle clients are off: the server refused CLIENT LIST",
+            "Off: Slow log: ",
+            "Off: Idle clients: the server refused CLIENT LIST",
         ] {
-            assert!(t.contains(want), "{want}:\n{t}");
+            assert!(wide.contains(want), "{want}:\n{wide}");
         }
+        // "off" is not said twice.
+        assert!(
+            !wide.contains("is off:") && !wide.contains("are off:"),
+            "{wide}"
+        );
         no_heading_without_rows(&t);
         insta::assert_snapshot!("refused_120x36", t);
+        // At a short height the reasons that do not fit are counted, and `v` shows
+        // them all.
+        let short = text_of(&app, 120, 22);
+        assert!(short.contains("more reason"), "{short}");
+        assert!(short.contains("v shows them"), "{short}");
+        let mut app = app;
+        app.handle_key(key(KeyCode::Char('v')));
+        let all = text_of(&app, 120, 22);
+        assert!(!all.contains("more reason"), "{all}");
+        for want in ["Off: Slow log: ", "Off: Idle clients: "] {
+            assert!(all.contains(want), "{want}:\n{all}");
+        }
         let t = text_of(&app, 80, 24);
         no_heading_without_rows(&t);
     }
@@ -1373,9 +2020,32 @@ mod tests {
         no_heading_without_rows(&t);
         insta::assert_snapshot!("analyzing_80x24", t);
         let t = text_of(&app, 120, 36);
-        assert!(t.contains("esc stops it and keeps what it has"), "{t}");
+        // The narrower right pane wraps the sentence instead of cutting it.
+        assert!(t.contains("esc stops"), "{t}");
+        assert!(t.contains("it and keeps what it has."), "{t}");
         no_heading_without_rows(&t);
         insta::assert_snapshot!("analyzing_120x36", t);
+    }
+
+    #[test]
+    fn the_findings_move_and_open_the_same_at_120_and_at_80_columns() {
+        for (w, h) in [(80, 24), (120, 36), (160, 45)] {
+            let mut app = just_connected(Some(3));
+            let _ = text_of(&app, w, h);
+            let effects = app.handle_key(key(KeyCode::Down));
+            assert!(
+                effects.is_empty(),
+                "{w}x{h}: a move sends nothing: {effects:?}"
+            );
+            let t = text_of(&app, w, h);
+            assert!(t.contains("› ▲ KEYS took 812 ms"), "{w}x{h}:\n{t}");
+            if w >= 120 {
+                // The selected finding explained, and where enter goes.
+                assert!(t.contains("enter opens Server › Slow log"), "{w}x{h}:\n{t}");
+            }
+            app.handle_key(key(KeyCode::Enter));
+            assert_eq!(app.screen(), Screen::SlowLog, "{w}x{h}");
+        }
     }
 
     #[test]
@@ -1400,8 +2070,23 @@ mod tests {
         no_heading_without_rows(&t);
         insta::assert_snapshot!("analyzed_80x24", t);
         let t = text_of(&app, 120, 36);
-        assert!(t.contains("FREED BY TTL  within 1 h"), "{t}");
-        assert!(t.contains("other patterns"), "{t}");
+        // Two panes: what TTLs free as bars, and every pattern that fits.
+        for want in [
+            "FREED BY TTL",
+            "within 1 h",
+            "within 7 d",
+            "never",
+            "lock:{var}",
+        ] {
+            assert!(t.contains(want), "{want}:\n{t}");
+        }
+        assert!(!t.contains("other patterns"), "{t}");
+        // The slowest entries by duration, command and time; never a key or argument.
+        assert!(t.contains("SLOWEST IN THE SLOW LOG"), "{t}");
+        for (w, h) in [(80, 24), (120, 36), (160, 45)] {
+            let any = text_of(&app, w, h);
+            assert!(!any.contains("secret-value"), "{w}x{h}:\n{any}");
+        }
         no_heading_without_rows(&t);
         insta::assert_snapshot!("analyzed_120x36", t);
 

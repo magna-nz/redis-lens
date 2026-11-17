@@ -184,7 +184,6 @@ impl App {
                 v.keys.open_find(glob, &nodes, act);
             })
             .map_or_else(Vec::new, |(_, e)| e);
-        self.list_db = None;
         if self.screen() == Screen::KeyList {
             // Already on the key list: `switch` would tell the view nothing.
             out.extend(self.on_active("show", |v, act| v.on_show(act)));
@@ -895,14 +894,14 @@ mod tests {
         let mut app = on(Screen::Overview);
         let (id, _) = find_request(&find(&mut app, "nope"));
         testing::reply(&mut app, id, page(Vec::new(), 0));
-        let all = text(&testing::render(&app, 120, 36));
+        let all = text(&testing::render(&app, 200, 50));
         assert!(all.contains("No key matches *nope*."), "{all}");
         assert!(all.contains("ctrl-f searches again"), "{all}");
         // A first page that found nothing yet: m scans further.
         let mut app = on(Screen::Overview);
         let (id, _) = find_request(&find(&mut app, "nope"));
         testing::reply(&mut app, id, page(Vec::new(), 55));
-        let all = text(&testing::render(&app, 120, 36));
+        let all = text(&testing::render(&app, 200, 50));
         assert!(
             all.contains("No key matched yet. m scans further."),
             "{all}"
@@ -929,7 +928,8 @@ mod tests {
         let mut app = on(Screen::Overview);
         let (id, _) = find_request(&find(&mut app, "cart"));
         testing::reply(&mut app, id, Err(LiveError::Denied("SCAN".into())));
-        let all = text(&testing::render(&app, 120, 36));
+        // Wide enough for the sentence on one line in the key list's pane.
+        let all = text(&testing::render(&app, 200, 50));
         assert!(
             all.contains("The server refused SCAN for this user, so keys can't be"),
             "{all}"
@@ -958,7 +958,7 @@ mod tests {
             id,
             page(vec![row("a\u{202e}b\u{1b}[2J", KeyType::String, 5, 1)], 0),
         );
-        let all = text(&testing::render(&app, 120, 36));
+        let all = text(&testing::render(&app, 200, 50));
         assert!(
             !all.contains('\u{202e}') && !all.contains('\u{1b}'),
             "{all}"

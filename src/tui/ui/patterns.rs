@@ -108,11 +108,23 @@ fn bottom_area(inner: Rect) -> Rect {
     }
 }
 
-pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(data) = app.pattern_data() else {
-        waiting(frame, area, app);
-        return;
-    };
+/// The Patterns rows as drawn: the data, the visible rows with their summaries,
+/// verdicts and changes, and the selected one.
+pub(super) struct Tree<'a> {
+    data: PatternData<'a>,
+    rows: Vec<Row>,
+    sel: usize,
+    summaries: Vec<(Summary, usize, Option<bool>)>,
+    verdicts: Vec<PatternVerdict>,
+    diff: Option<&'a ReportDiff>,
+    changes: Option<Vec<Option<Change>>>,
+    narrowed: bool,
+}
+
+/// The rows Browse › Keys shows now; `None` before there is any (connecting, waiting
+/// for the live connection).
+pub(super) fn tree(app: &App) -> Option<Tree<'_>> {
+    let data = app.pattern_data()?;
     let rows_ = app.pattern_rows();
     let sel = app.patterns.sel.min(rows_.len().saturating_sub(1));
     let patterns = data.patterns;
@@ -131,13 +143,60 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|r| row_verdict(app, patterns, diff, *r))
         .collect();
+    let changes: Option<Vec<Option<Change>>> = diff.map(|d| {
+        rows_
+            .iter()
+            .map(|r| row_change(app, patterns, d, *r))
+            .collect()
+    });
+    Some(Tree {
+        data,
+        rows: rows_,
+        sel,
+        summaries,
+        verdicts,
+        diff,
+        changes,
+        narrowed,
+    })
+}
+
+/// True when the pane right of Patterns shows the key list rather than the selected
+/// row's summary: from 120 columns, while the selected row is the pattern whose keys
+/// were last opened (and are still held). Moving the cursor away shows the summary
+/// again: nothing is read as the cursor moves.
+pub(super) fn keys_of_selected(app: &App) -> bool {
+    app.ctx().is_some()
+        && app
+            .selected_single_pattern()
+            .is_some_and(|p| app.keys_hold(&p))
+}
+
+pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(t) = tree(app) else {
+        waiting(frame, area, app);
+        return;
+    };
+    let data = t.data;
+    let sel = t.sel;
     let more = app.more_here();
-    let left_w = tree_width(area.width, more);
-    let (left_title, left_right) = tree_titles(app, data, summaries.len(), left_w);
-    let (right_title, right_right) = match summaries.get(sel) {
-        Some((s, _, _)) if data.names => (crate::value::escape(&s.label), String::new()),
-        Some((s, _, _)) => (crate::value::escape(&s.label), type_label(s).to_string()),
-        None => ("Details".to_string(), String::new()),
+    let three = area.width >= super::browse::THREE_PANES;
+    let left_w = if three {
+        super::browse::widths(area.width, super::browse::Focus::Patterns, more, 0).patterns
+    } else {
+        tree_width(area.width, more)
+    };
+    let (left_title, left_right) = tree_titles(app, data, t.summaries.len(), left_w);
+    // From 120 columns, the pattern whose keys were opened shows them at the right.
+    let keys_here = three && keys_of_selected(app);
+    let (right_title, right_right) = if keys_here {
+        super::keys::list_titles(app)
+    } else {
+        match t.summaries.get(sel) {
+            Some((s, _, _)) if data.names => (crate::value::escape(&s.label), String::new()),
+            Some((s, _, _)) => (crate::value::escape(&s.label), type_label(s).to_string()),
+            None => ("Details".to_string(), String::new()),
+        }
     };
     let (left, right) = split_frame(
         frame,
@@ -147,52 +206,134 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Title::new(&right_title, &right_right),
         Pane::Left,
     );
-    let changes: Option<Vec<Option<Change>>> = diff.map(|d| {
-        rows_
-            .iter()
-            .map(|r| row_change(app, patterns, d, *r))
-            .collect()
-    });
     if data.names {
-        names_table(frame, left, app, &summaries, sel);
-        names_detail(frame, right, app, summaries.get(sel));
+        names_table(frame, left, app, &t.summaries, Mark::Sel(sel));
     } else {
         // The columns start after the marker gutter.
         let c = cols(
             usize::from(gutter_area(left).width),
             more,
-            changes.is_some(),
+            t.changes.is_some(),
             data.sizes_available,
         );
-        table(
-            frame,
-            left,
-            app,
-            data,
-            &summaries,
-            changes.as_deref(),
-            &verdicts,
-            sel,
-            &c,
-        );
+        table(frame, left, app, &t, Mark::Sel(sel), &c);
         bottom_line(frame, left, app, data, &c);
-        match summaries.get(sel) {
-            Some((s, _, _)) => {
-                let v = verdicts.get(sel).copied().unwrap_or(PatternVerdict::Ok);
-                let stats = single_stats(app, patterns, rows_[sel]);
-                detail(frame, right, data, s, v, stats, diff, narrowed);
-            }
-            None => no_rows(frame, right, app, data, narrowed),
-        }
+    }
+    if keys_here {
+        super::value::key_column(frame, right, app, true);
+    } else {
+        summary(frame, right, app, &t);
     }
     // The server context of a finished report, on the frame's bottom border under the
     // list, so it takes no row.
-    if data.partial.is_none()
-        && !data.names
-        && !narrowed
+    strip(frame, area, left_w, app, &t);
+}
+
+/// The selected row's summary: what the right pane shows for it (before an analysis,
+/// what its names say; after one, its figures and why it is marked).
+pub(super) fn summary(frame: &mut Frame, right: Rect, app: &App, t: &Tree<'_>) {
+    let sel = t.sel;
+    if t.data.names {
+        names_detail(frame, right, app, t.summaries.get(sel));
+        return;
+    }
+    match t.summaries.get(sel) {
+        Some((s, _, _)) => {
+            let v = t.verdicts.get(sel).copied().unwrap_or(PatternVerdict::Ok);
+            let stats = single_stats(app, t.data.patterns, t.rows[sel]);
+            detail(frame, right, t.data, s, v, stats, t.diff, t.narrowed);
+        }
+        None => no_rows(frame, right, app, t.data, t.narrowed),
+    }
+}
+
+/// [`context_strip`] under a list `left_w` wide, for a finished report shown whole.
+pub(super) fn strip(frame: &mut Frame, area: Rect, left_w: u16, app: &App, t: &Tree<'_>) {
+    if t.data.partial.is_none()
+        && !t.data.names
+        && !t.narrowed
         && let Some(report) = app.session.as_ref().and_then(|s| s.report.as_ref())
     {
         context_strip(frame, area, left_w, report);
+    }
+}
+
+/// The titles of the Patterns pane `w` wide.
+pub(super) fn titles(app: &App, t: &Tree<'_>, w: u16) -> (String, String) {
+    tree_titles(app, t.data, t.summaries.len(), w)
+}
+
+/// The Patterns pane beside a pattern's keys (three panes, from 120 columns): PATTERN,
+/// MEMORY (KEYS without sizes), the share and `▲`; before an analysis PATTERN and
+/// KEYS. No selection: the pattern whose keys are listed keeps a dim `›`, and none
+/// does for a find's results, which belong to no pattern.
+///
+/// `parent`: false when the pane at its right does not come from the open pattern
+/// (a value opened from another list): then no row is marked.
+pub(super) fn narrow_pane(frame: &mut Frame, inner: Rect, app: &App, t: &Tree<'_>, parent: bool) {
+    let open = open_row(app, t).filter(|_| parent);
+    if t.data.names {
+        names_table(frame, inner, app, &t.summaries, Mark::Open(open));
+        return;
+    }
+    let c = narrow_cols(
+        usize::from(gutter_area(inner).width),
+        t.data.sizes_available,
+    );
+    table(frame, inner, app, t, Mark::Open(open), &c);
+    bottom_line(frame, inner, app, t.data, &c);
+}
+
+/// The row of the pattern whose keys are listed; `None` for a find, or when that
+/// pattern is not among the rows.
+fn open_row(app: &App, t: &Tree<'_>) -> Option<usize> {
+    let keys = &app.views.keys;
+    if keys.find.is_some() {
+        return None;
+    }
+    let want = keys.pattern.as_deref()?;
+    // Only the list `enter` would show for that pattern now: the same walk.
+    if !app.keys_hold(want) {
+        return None;
+    }
+    t.rows
+        .iter()
+        .position(|r| single_stats(app, t.data.patterns, *r).is_some_and(|p| p.pattern == want))
+}
+
+/// How a list marks its rows: the selection (the pane has the keys), or the row that
+/// is open (another pane has them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Sel(usize),
+    Open(Option<usize>),
+}
+
+impl Mark {
+    /// The row kept on screen.
+    fn anchor(self) -> usize {
+        match self {
+            Self::Sel(i) | Self::Open(Some(i)) => i,
+            Self::Open(None) => 0,
+        }
+    }
+
+    /// The selected row, which scrolls a long name.
+    fn sel(self) -> Option<usize> {
+        match self {
+            Self::Sel(i) => Some(i),
+            Self::Open(_) => None,
+        }
+    }
+
+    /// Draws `lines` (the rows from `off`) as a list in `body`.
+    fn draw(self, frame: &mut Frame, body: Rect, lines: Vec<Line<'static>>, off: usize) {
+        match self {
+            Self::Sel(i) => list(frame, body, lines, Some(i - off)),
+            Self::Open(o) => {
+                super::widgets::list_open(frame, body, lines, o.and_then(|i| i.checked_sub(off)))
+            }
+        }
     }
 }
 
@@ -221,18 +362,36 @@ fn tree_titles(app: &App, data: PatternData<'_>, shown: usize, left_w: u16) -> (
             None => m.to_string(),
         });
     }
+    // `┌─ title ─ right ─┬`: the corners, dashes and spaces take 7.
+    let room = usize::from(left_w).saturating_sub(7);
     let title = match app.narrowed_node() {
         Some((_, n)) => {
-            rest = format!("esc for all nodes · {rest}");
-            format!("Patterns · node {}", n.endpoint)
+            // The address is never cut: the words around it go first.
+            let addr = n.endpoint.to_string();
+            let title = [
+                format!("Patterns · node {addr}"),
+                format!("Patterns · {addr}"),
+                format!("node {addr}"),
+            ]
+            .into_iter()
+            .find(|t| width(t) <= room)
+            .unwrap_or(addr);
+            let esc = [
+                format!("esc for all nodes · {rest}"),
+                "esc for all nodes".to_string(),
+                "esc all nodes".to_string(),
+            ]
+            .into_iter()
+            .find(|r| width(&title) + 3 + width(r) <= room);
+            // With no room for it in the title, the bottom line says it.
+            rest = esc.unwrap_or_default();
+            title
         }
         None => "Patterns".to_string(),
     };
     let Some(status) = status else {
         return (title, rest);
     };
-    // `┌─ title ─ right ─┬`: the corners, dashes and spaces take 7.
-    let room = usize::from(left_w).saturating_sub(7);
     let full = format!("{status} · {rest}");
     if width(&title) + width(&full) <= room {
         (title, full)
@@ -334,7 +493,7 @@ fn names_table(
     inner: Rect,
     app: &App,
     summaries: &[(Summary, usize, Option<bool>)],
-    sel: usize,
+    mark: Mark,
 ) {
     let names = &app.patterns.names;
     let w = usize::from(inner.width);
@@ -382,15 +541,16 @@ fn names_table(
         rows(frame, body, para(&text, w, st), None);
     } else {
         let complete = names.complete();
-        let off = scroll_offset(sel, usize::from(body.height));
+        let off = scroll_offset(mark.anchor(), usize::from(body.height));
         let lines: Vec<Line<'static>> = summaries
             .iter()
             .enumerate()
             .skip(off)
             .take(usize::from(body.height))
             .map(|(i, (s, depth, open))| {
-                let scroll = (i == sel).then(|| app.sel_ticks());
-                let mut spans = name_cell(s, *depth, *open, name_w, scroll);
+                let scroll = (Some(i) == mark.sel()).then(|| app.sel_ticks());
+                let narrow = matches!(mark, Mark::Open(_));
+                let mut spans = name_cell(s, *depth, *open, name_w, scroll, narrow);
                 spans.push(Span::styled(
                     pad_l(&names_count(s, names, complete), NAMES_KEYS_W),
                     style::fg(),
@@ -398,7 +558,7 @@ fn names_table(
                 Line::from(spans)
             })
             .collect();
-        list(frame, body, lines, Some(sel - off));
+        mark.draw(frame, body, lines, off);
     }
     let (text, st) = names_bottom(app, names);
     rows(
@@ -752,23 +912,33 @@ fn row_summary(app: &App, patterns: &[PatternStats], row: Row) -> (Summary, usiz
 
 /// The columns of the analysed table. A hidden column is 0 or false.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Cols {
+pub(super) struct Cols {
     name: usize,
     ty: bool,
+    /// KEYS: always, but in the narrow pane beside a pattern's keys with sizes (MEMORY
+    /// stands for it there).
+    keys: bool,
     mem: bool,
     /// The share bar's cells (and its percentage); 0 when hidden.
     share: usize,
+    /// The share's percentage without its bar (the narrow pane).
+    pct: bool,
     avg: bool,
     no_ttl: bool,
     delta: bool,
     /// Wide enough for the long bottom line.
     wide: bool,
+    /// The narrow pane beside a pattern's keys: a 2-cell child indent and names cut in
+    /// the middle.
+    narrow: bool,
 }
 
 const TYPE_W: usize = 7;
 const NUM_W: usize = 6;
 /// MEMORY and NO TTL: their headers, with a sort arrow, are seven wide.
 const WIDE_NUM_W: usize = 7;
+/// MEMORY in the narrow pane beside a pattern's keys.
+const NARROW_MEM_W: usize = 5;
 const PCT_W: usize = 4;
 const DELTA_W: usize = 7;
 /// The `▲` mark: a space, the mark, a space.
@@ -779,14 +949,30 @@ const NAME_MIN: usize = 20;
 const WIDE: usize = 60;
 
 impl Cols {
+    /// MEMORY's width: in the narrow pane `MEM▼` and `6.1G` take five, so the names
+    /// keep the room.
+    fn mem_w(&self) -> usize {
+        if self.narrow {
+            NARROW_MEM_W
+        } else {
+            WIDE_NUM_W
+        }
+    }
+
     /// Everything but the pattern column.
     fn fixed(&self) -> usize {
-        let mut w = NUM_W + MARK_W;
+        let mut w = MARK_W;
+        if self.keys {
+            w += NUM_W;
+        }
+        if self.pct {
+            w += 1 + PCT_W;
+        }
         if self.ty {
             w += TYPE_W;
         }
         if self.mem {
-            w += 1 + WIDE_NUM_W;
+            w += 1 + self.mem_w();
         }
         if self.share > 0 {
             w += 1 + self.share + 1 + PCT_W;
@@ -813,6 +999,8 @@ fn cols(inner: usize, more: bool, delta: bool, sizes: bool) -> Cols {
     let mut c = Cols {
         name: 0,
         ty: wide || more,
+        keys: true,
+        pct: false,
         mem: sizes,
         share: if wide || more {
             if inner >= super::widgets::after_gutter(90) {
@@ -827,6 +1015,7 @@ fn cols(inner: usize, more: bool, delta: bool, sizes: bool) -> Cols {
         no_ttl: more,
         delta: more && delta,
         wide,
+        narrow: false,
     };
     let fits = |c: &Cols| inner >= c.fixed() + NAME_MIN;
     if !fits(&c) && c.share > 8 {
@@ -848,6 +1037,56 @@ fn cols(inner: usize, more: bool, delta: bool, sizes: bool) -> Cols {
     c
 }
 
+/// The columns of the narrow Patterns pane beside a pattern's keys, `inner` cells after
+/// the gutter: PATTERN, MEMORY (KEYS without sizes), the share's percentage and `▲`.
+fn narrow_cols(inner: usize, sizes: bool) -> Cols {
+    let mut c = Cols {
+        name: 0,
+        ty: false,
+        keys: !sizes,
+        mem: sizes,
+        share: 0,
+        pct: false,
+        avg: false,
+        no_ttl: false,
+        delta: false,
+        wide: false,
+        narrow: true,
+    };
+    c.name = inner.saturating_sub(c.fixed()).max(8);
+    c
+}
+
+/// The column headers the Patterns pane shows `w` wide (its width from the frame's
+/// edge to the divider), for tests of the widths: the two-pane form with `more`, or
+/// the narrow form beside a pattern's keys.
+#[cfg(test)]
+pub(super) fn shown_columns(w: u16, narrow: bool, more: bool, sizes: bool) -> Vec<&'static str> {
+    let inner = usize::from(w.saturating_sub(1)).saturating_sub(2);
+    let c = if narrow {
+        narrow_cols(inner, sizes)
+    } else {
+        cols(inner, more, true, sizes)
+    };
+    let mut out = vec!["PATTERN"];
+    for (on, name) in [
+        (c.ty, "TYPE"),
+        (c.keys, "KEYS"),
+        (c.mem, if c.narrow { "MEM" } else { "MEMORY" }),
+        (c.share > 0, "SHARE"),
+        (c.pct, "%"),
+        (c.avg, "AVG"),
+        (c.no_ttl, "NO TTL"),
+        (c.delta, "Δ"),
+    ] {
+        if on {
+            out.push(name);
+        }
+    }
+    out.push("▲");
+    out
+}
+
 /// A right-aligned header `w` wide, with the sort arrow when sorted by it.
 fn head_num(label: &str, w: usize, arrow: Option<&str>) -> String {
     match arrow {
@@ -860,18 +1099,11 @@ fn type_label(s: &Summary) -> &'static str {
     s.key_type.map_or("mixed", |t| t.as_str())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn table(
-    frame: &mut Frame,
-    inner: Rect,
-    app: &App,
-    data: PatternData<'_>,
-    summaries: &[(Summary, usize, Option<bool>)],
-    changes: Option<&[Option<Change>]>,
-    verdicts: &[PatternVerdict],
-    sel: usize,
-    c: &Cols,
-) {
+fn table(frame: &mut Frame, inner: Rect, app: &App, t: &Tree<'_>, mark: Mark, c: &Cols) {
+    let data = t.data;
+    let summaries = &t.summaries[..];
+    let changes = t.changes.as_deref();
+    let verdicts = &t.verdicts[..];
     let sizes = data.sizes_available;
     let sort = app.patterns.sort.effective(sizes);
     let arrow = |s: SortBy| (sort == s).then_some(if s.ascending() { "▲" } else { "▼" });
@@ -883,13 +1115,22 @@ fn table(
     if c.ty {
         head.push(Span::styled(pad_r("TYPE", TYPE_W), style::hd()));
     }
-    head.push(Span::styled(
-        head_num("KEYS", NUM_W, arrow(SortBy::Keys)),
-        style::hd(),
-    ));
+    if c.keys {
+        head.push(Span::styled(
+            head_num("KEYS", NUM_W, arrow(SortBy::Keys)),
+            style::hd(),
+        ));
+    }
     if c.mem {
         head.push(Span::styled(
-            format!(" {}", head_num("MEMORY", WIDE_NUM_W, arrow(SortBy::Memory))),
+            format!(
+                " {}",
+                head_num(
+                    if c.narrow { "MEM" } else { "MEMORY" },
+                    c.mem_w(),
+                    arrow(SortBy::Memory)
+                )
+            ),
             style::hd(),
         ));
     }
@@ -898,6 +1139,9 @@ fn table(
             format!(" {}", pad_r("SHARE", c.share + 1 + PCT_W)),
             style::hd(),
         ));
+    }
+    if c.pct {
+        head.push(Span::styled(format!(" {}", pad_l("%", PCT_W)), style::hd()));
     }
     if c.avg {
         head.push(Span::styled(
@@ -949,34 +1193,40 @@ fn table(
         );
         return;
     }
-    let off = scroll_offset(sel, usize::from(body.height));
+    let off = scroll_offset(mark.anchor(), usize::from(body.height));
     let lines: Vec<Line<'static>> = summaries
         .iter()
         .enumerate()
         .skip(off)
         .take(usize::from(body.height))
         .map(|(i, (s, depth, open))| {
-            let scroll = (i == sel).then(|| app.sel_ticks());
+            let scroll = (Some(i) == mark.sel()).then(|| app.sel_ticks());
             let ch = changes.and_then(|ch| ch.get(i).copied().flatten());
             let v = verdicts.get(i).copied().unwrap_or(PatternVerdict::Ok);
             analysed_row(s, *depth, *open, total, sizes, c, scroll, ch, v)
         })
         .collect();
-    list(frame, body, lines, Some(sel - off));
+    mark.draw(frame, body, lines, off);
 }
 
 /// The pattern cell: the indent and fold mark, then the name (the selected one
 /// scrolls when it is too long), `w` cells.
+///
+/// `narrow`: the pane beside a pattern's keys. A child is indented two cells under its
+/// group (a leaf has no fold-mark cells), and a name too long for it is cut in the
+/// middle, keeping its start and end.
 fn name_cell(
     s: &Summary,
     depth: usize,
     open: Option<bool>,
     w: usize,
     scroll: Option<u64>,
+    narrow: bool,
 ) -> Vec<Span<'static>> {
     let mark = match open {
         Some(true) => "▾ ",
         Some(false) => "▸ ",
+        None if narrow => "",
         None => "  ",
     };
     let (base, ph) = if open.is_some() {
@@ -986,13 +1236,21 @@ fn name_cell(
     };
     // The indent and the fold mark stay put; only the text after them scrolls.
     let lead = format!(" {}{mark}", "  ".repeat(depth));
-    let text_w = w.saturating_sub(1).saturating_sub(width(&lead));
+    // A cell kept free before the next column; the narrow pane's next column starts
+    // with its own space, so there the name may take it.
+    let text_w = w
+        .saturating_sub(usize::from(!narrow))
+        .saturating_sub(width(&lead));
     // A pattern keeps the literal parts of key names: control characters escaped.
-    let text = pattern_spans(&crate::value::escape(&s.label), base, ph);
+    let label = crate::value::escape(&s.label);
     let mut spans = vec![Span::styled(lead, style::dim())];
     spans.extend(match scroll {
-        Some(ticks) => marquee_spans(text, text_w, ticks),
-        None => fit(text, text_w),
+        Some(ticks) => marquee_spans(pattern_spans(&label, base, ph), text_w, ticks),
+        None if narrow => fit(
+            pattern_spans(&super::widgets::trunc_middle(&label, text_w), base, ph),
+            text_w,
+        ),
+        None => fit(pattern_spans(&label, base, ph), text_w),
     });
     let used: usize = spans.iter().map(|s| width(&s.content)).sum();
     spans.push(Span::raw(" ".repeat(w.saturating_sub(used))));
@@ -1011,33 +1269,41 @@ fn analysed_row(
     change: Option<Change>,
     v: PatternVerdict,
 ) -> Line<'static> {
-    let mut spans = name_cell(s, depth, open, c.name, scroll);
+    let mut spans = name_cell(s, depth, open, c.name, scroll, c.narrow);
     let dash = || "—".to_string();
     if c.ty {
         spans.push(Span::styled(pad_r(type_label(s), TYPE_W), style::dim()));
     }
-    spans.push(Span::styled(
-        pad_l(&format::count(s.est_keys), NUM_W),
-        style::fg(),
-    ));
-    if c.mem {
-        let mem = s.est_bytes.map_or_else(dash, format::bytes);
+    if c.keys {
         spans.push(Span::styled(
-            format!(" {}", pad_l(&mem, WIDE_NUM_W)),
+            pad_l(&format::count(s.est_keys), NUM_W),
             style::fg(),
         ));
     }
+    if c.mem {
+        let mem = s.est_bytes.map_or_else(dash, format::bytes);
+        spans.push(Span::styled(
+            format!(" {}", pad_l(&mem, c.mem_w())),
+            style::fg(),
+        ));
+    }
+    let weight = if sizes {
+        s.est_bytes.unwrap_or(0)
+    } else {
+        s.est_keys
+    };
+    let share = if total == 0 {
+        0.0
+    } else {
+        weight as f64 / total as f64
+    };
+    if c.pct {
+        spans.push(Span::styled(
+            format!(" {}", pad_l(&format::percent(share), PCT_W)),
+            style::dim(),
+        ));
+    }
     if c.share > 0 {
-        let weight = if sizes {
-            s.est_bytes.unwrap_or(0)
-        } else {
-            s.est_keys
-        };
-        let share = if total == 0 {
-            0.0
-        } else {
-            weight as f64 / total as f64
-        };
         let (fill, track) = bar(share, c.share);
         spans.push(Span::raw(" "));
         spans.push(Span::styled(fill, style::amber()));
@@ -1102,6 +1368,11 @@ fn bottom_line(frame: &mut Frame, inner: Rect, app: &App, data: PatternData<'_>,
                 " Estimated from {sampled} sampled keys of {}. v shows {v} columns.",
                 format::count(of)
             )
+        } else if c.narrow && app.narrowed_node().is_some() {
+            // The narrow pane's title may have no room for how to leave the node.
+            format!(" esc all nodes · {sampled} sampled")
+        } else if c.narrow && width(&format!(" from {sampled} sampled keys · v {v}")) > w {
+            format!(" from {sampled} sampled keys")
         } else {
             format!(" from {sampled} sampled keys · v {v}")
         }

@@ -1239,12 +1239,6 @@ pub struct App {
     pub menu: Option<actions::Menu>,
     /// The Go to box (`ctrl-k`), if open. While it is open every key goes to it.
     pub goto: Option<goto::GoTo>,
-    /// The database the key list's rows were read on, once a database switch (`b`)
-    /// left them from another one; `None` while they are the session's database's (or
-    /// read since). Go to lists no key of another database.
-    pub list_db: Option<u32>,
-    /// The same for the open value.
-    pub value_db: Option<u32>,
     /// A question that a reply (not the key being handled) opened ignores its answer
     /// keys until `tick` reaches this, so a key typed for something else can't answer
     /// it (spec "The confirm sheet").
@@ -1505,8 +1499,6 @@ impl App {
             confirm: None,
             menu: None,
             goto: None,
-            list_db: None,
-            value_db: None,
             grace_until: None,
             bulk: None,
             dbs: None,
@@ -3588,8 +3580,6 @@ impl App {
         // The previous session's view states and live requests go with it; nothing is
         // shown from them, so none is told it is hidden.
         self.views = Views::default();
-        self.list_db = None;
-        self.value_db = None;
         self.live_pending.clear();
         self.live_writes.clear();
         self.confirm = None;
@@ -3669,7 +3659,7 @@ impl App {
 
     /// The selected Patterns row's pattern when it is a single pattern (a group's child
     /// or a pattern of its own), not a group.
-    fn selected_single_pattern(&self) -> Option<String> {
+    pub(crate) fn selected_single_pattern(&self) -> Option<String> {
         let d = self.pattern_data()?;
         let idx = match self.selected_row()? {
             Row::Group { root } => match self.patterns.tree.roots.get(root)? {
@@ -3682,23 +3672,36 @@ impl App {
     }
 
     /// `enter` on a pattern: the key list of `pattern`, one level down.
-    fn open_keys(&mut self, pattern: String) -> Vec<Effect> {
-        // On a cluster narrowed to a node, the key list walks that node only (the node of
-        // the session's table with the same ID, or the same address).
-        let narrowed = self.narrowed_node().and_then(|(_, n)| {
+    /// The node of the session's table Patterns is narrowed to, if any (the node with
+    /// the same ID, or the same address): the one a pattern's key list walks.
+    pub(crate) fn narrowed_walk_node(&self) -> Option<usize> {
+        self.narrowed_node().and_then(|(_, n)| {
             self.session
                 .as_ref()?
                 .nodes
                 .iter()
                 .position(|i| (!n.id.is_empty() && i.id == n.id) || i.endpoint == n.endpoint)
-        });
+        })
+    }
+
+    /// True when the key list held is the one `enter` on `pattern` would show now,
+    /// under the current narrowing (`KeysState::holds`).
+    pub(crate) fn keys_hold(&self, pattern: &str) -> bool {
+        let nodes = self.session.as_ref().map_or(&[][..], |s| &s.nodes[..]);
+        self.views
+            .keys
+            .holds(pattern, nodes, self.narrowed_walk_node())
+    }
+
+    fn open_keys(&mut self, pattern: String) -> Vec<Effect> {
+        // On a cluster narrowed to a node, the key list walks that node only.
+        let narrowed = self.narrowed_walk_node();
         let mut out = self
             .with_views(Owner::Keys, "open", |v, act| {
                 let nodes = act.session.nodes.clone();
                 v.keys.open(pattern, &nodes, narrowed, act)
             })
             .map_or_else(Vec::new, |(_, e)| e);
-        self.list_db = None;
         out.extend(self.switch(Screen::KeyList));
         out
     }
@@ -3716,7 +3719,6 @@ impl App {
                 v.value.open(row, pattern, act)
             })
             .map_or_else(Vec::new, |(_, e)| e);
-        self.value_db = None;
         out.extend(self.switch(Screen::KeyDetail));
         out
     }

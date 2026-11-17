@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 
 use crate::format;
 use crate::live::monitor::{Entry, MAX_LINES, MAX_TIME};
-use crate::live::server::SlowEntry;
+use crate::live::server::{ClientConn, SlowEntry};
 use crate::snapshot::format_utc;
 use crate::tui::app::Screen;
 use crate::tui::app::views::server::{
@@ -26,8 +26,8 @@ use crate::value::escape;
 
 use super::analysis::{Col, MARK, Tier, head_row_at, notice, paragraph, pick_flex};
 use super::widgets::{
-    Section, Title, after_gutter, fit, gutter_area, list_below, pad_l, pad_r, rows, scroll_offset,
-    sections, trunc,
+    Section, Title, after_gutter, fit, gutter_area, list_and_details, list_below, list_open, pad_l,
+    pad_r, rows, scroll_offset, sections, side_split, trunc,
 };
 use super::{style, utc_time};
 
@@ -227,7 +227,9 @@ fn clients(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
     if gate(frame, area, "Clients", &c.poll, ctx) {
         return;
     }
-    if c.drill.is_some() {
+    if c.drill.is_some() && side_split(area.width).is_some() {
+        drilled_side(frame, area, state, ctx);
+    } else if c.drill.is_some() {
         connections(frame, area, state, ctx);
     } else {
         groups(frame, area, state, ctx);
@@ -281,64 +283,38 @@ fn groups(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
         ),
         None => ("Details".to_string(), String::new()),
     };
-    let inner = sections(
+    let (list, details) = list_and_details(
         frame,
         area,
-        &[
-            Section {
-                title: Title::new("Clients", &right),
-                rows: None,
-            },
-            Section {
-                title: Title::new(&dt, &dr),
-                rows: Some(DETAIL_ROWS),
-            },
-        ],
+        Section {
+            title: Title::new("Clients", &right),
+            rows: None,
+        },
+        Section {
+            title: Title::new(&dt, &dr),
+            rows: Some(DETAIL_ROWS),
+        },
+        0,
     );
-    // The columns start after the marker gutter.
-    let w = usize::from(gutter_area(inner[0]).width);
-    let cols = group_columns();
-    let (keep, gw) = pick_flex(&cols, G_GROUP, w, after_gutter(WIDE_AT), ctx.more);
-    let head = head_row_at(
-        &cols,
-        &keep,
-        G_GROUP,
-        gw,
-        &[G_CONNS, G_IDLE, G_OLDEST, G_MEM],
-    );
-    let mut top = with_head(trouble(&c.poll, ctx), head);
-    let pre = top.len();
-    let body_h = usize::from(inner[0].height).saturating_sub(pre);
-    let off = scroll_offset(sel, body_h);
-    top.extend(
-        c.groups
-            .iter()
-            .skip(off)
-            .take(body_h)
-            .map(|g| group_line(g, &cols, &keep, gw)),
-    );
-    if c.groups.is_empty() {
-        top.push(Line::from(Span::styled(" No connections.", style::dim())));
-    }
-    let selected = (!c.groups.is_empty()).then(|| sel - off + pre);
-    list_below(frame, inner[0], top, pre - 1, selected);
+    let side = side_split(area.width).is_some();
+    let (top, pre, selected) = group_table(list, c, trouble(&c.poll, ctx), ctx.more);
+    list_below(frame, list, top, pre - 1, selected);
 
-    let dw = usize::from(inner[1].width);
+    let dw = usize::from(details.width);
     let mut dl = Vec::new();
     if let Some(g) = g {
-        dl.push(Line::from(fit(
-            vec![Span::styled(
-                format!(
-                    " {} connections · oldest {} · longest idle {} · {}",
-                    g.connections(),
-                    age(g.oldest_age),
-                    age(g.longest_idle),
-                    format::bytes(g.mem)
-                ),
-                style::fg(),
-            )],
-            dw,
-        )));
+        let said = format!(
+            " {} connections · oldest {} · longest idle {} · {}",
+            g.connections(),
+            age(g.oldest_age),
+            age(g.longest_idle),
+            format::bytes(g.mem)
+        );
+        if side {
+            dl.extend(paragraph(Vec::new(), " ", &said, style::fg(), dw));
+        } else {
+            dl.push(Line::from(fit(vec![Span::styled(said, style::fg())], dw)));
+        }
         if g.flagged() {
             dl.extend(paragraph(
                 vec![Span::styled(format!(" {MARK} "), style::amber())],
@@ -358,7 +334,143 @@ fn groups(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
             style::dim(),
         )));
     }
-    rows(frame, inner[1], dl, None);
+    rows(frame, details, dl, None);
+}
+
+/// The groups table for a list `area`: its lines (the trouble line if any, the head,
+/// the rows that fit around the selection), how many lines come before the rows, and
+/// the selected row's line.
+fn group_table(
+    area: Rect,
+    c: &Clients,
+    trouble_line: Option<Line<'static>>,
+    more: bool,
+) -> (Vec<Line<'static>>, usize, Option<usize>) {
+    let sel = c.sel.min(c.groups.len().saturating_sub(1));
+    // The columns start after the marker gutter.
+    let w = usize::from(gutter_area(area).width);
+    let cols = group_columns();
+    let (keep, gw) = pick_flex(&cols, G_GROUP, w, after_gutter(WIDE_AT), more);
+    let head = head_row_at(
+        &cols,
+        &keep,
+        G_GROUP,
+        gw,
+        &[G_CONNS, G_IDLE, G_OLDEST, G_MEM],
+    );
+    let mut top = with_head(trouble_line, head);
+    let pre = top.len();
+    let body_h = usize::from(area.height).saturating_sub(pre);
+    let off = scroll_offset(sel, body_h);
+    top.extend(
+        c.groups
+            .iter()
+            .skip(off)
+            .take(body_h)
+            .map(|g| group_line(g, &cols, &keep, gw)),
+    );
+    if c.groups.is_empty() {
+        top.push(Line::from(Span::styled(" No connections.", style::dim())));
+    }
+    let selected = (!c.groups.is_empty()).then(|| sel - off + pre);
+    (top, pre, selected)
+}
+
+/// Rows a group's connections leave at the bottom of the right pane for the selected
+/// connection's facts, from [`SIDE_AT`](super::widgets::SIDE_AT) columns: a rule and
+/// three lines.
+pub(super) const CONN_FACTS_SIDE: u16 = 4;
+
+/// An opened group from [`SIDE_AT`](super::widgets::SIDE_AT) columns: the groups on
+/// the left, the opened one marked with a dim `›`; its connections on the right, which
+/// has the keys, and the selected connection's facts under them in the same pane.
+fn drilled_side(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
+    let c: &Clients = &state.clients;
+    let conns = c.open_conns();
+    let key = c.drill.as_ref();
+    let name = key.map_or("", |k| k.label());
+    let left_right = right_title(
+        state,
+        ctx,
+        &secs(CLIENTS_EVERY),
+        &format!("{} groups", c.groups.len()),
+    );
+    let right_left = format!("Connections of {name}");
+    let n = conns.len();
+    let right_right = format!("{n} connection{} · esc back", if n == 1 { "" } else { "s" });
+    // The opened (focused) connections get the larger share: about 40/60, the
+    // reverse of the groups view.
+    let lw = u16::try_from(u32::from(area.width) * 40 / 100).unwrap_or(area.width / 2);
+    let inner = super::widgets::frame_panes(
+        frame,
+        area,
+        &[lw, 1],
+        &[
+            Title::new("Clients", &left_right),
+            Title::new(&right_left, &right_right),
+        ],
+        1,
+    );
+    let (left, right) = (inner[0], inner[1]);
+    // The groups, the opened one marked but not selected: the keys are on the right.
+    let (mut top, pre, _) = group_table(left, c, None, false);
+    // The rows start where `group_table` scrolled them to; the opened group is marked
+    // only when it is among them.
+    let off = scroll_offset(
+        c.sel.min(c.groups.len().saturating_sub(1)),
+        usize::from(left.height).saturating_sub(pre),
+    );
+    let open = c
+        .groups
+        .iter()
+        .position(|g| Some(&g.key) == key)
+        .and_then(|i| i.checked_sub(off));
+    let rest = top.split_off(pre.min(top.len()));
+    rows(frame, gutter_area(left), top, None);
+    list_open(
+        frame,
+        Rect {
+            y: left.y + pre as u16,
+            height: left.height.saturating_sub(pre as u16),
+            ..left
+        },
+        rest,
+        open,
+    );
+    // The connections, then a rule and the selected one's facts.
+    let facts_h = CONN_FACTS_SIDE.min(right.height);
+    let list = Rect {
+        height: right.height - facts_h,
+        ..right
+    };
+    let facts = Rect {
+        y: list.y + list.height,
+        height: facts_h,
+        ..right
+    };
+    // AGE and LIBRARY / NAME stay beside the address whenever they fit.
+    let (lines, pre, selected, cn) = conn_table(list, c, trouble(&c.poll, ctx), ctx.more, 0);
+    list_below(frame, list, lines, pre - 1, selected);
+    if facts.height > 0 {
+        rows(
+            frame,
+            Rect { height: 1, ..facts },
+            vec![Line::from(Span::styled(
+                "─".repeat(usize::from(facts.width)),
+                style::border(),
+            ))],
+            None,
+        );
+        conn_facts(
+            frame,
+            Rect {
+                y: facts.y + 1,
+                height: facts.height - 1,
+                ..facts
+            },
+            cn,
+        );
+    }
 }
 
 fn group_line(g: &Group, cols: &[Col], keep: &[usize], gw: usize) -> Line<'static> {
@@ -449,14 +561,42 @@ fn connections(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>
             },
         ],
     );
+    let (lines, pre, selected, cn) = conn_table(
+        inner[0],
+        c,
+        trouble(&c.poll, ctx),
+        ctx.more,
+        after_gutter(WIDE_AT),
+    );
+    list_below(frame, inner[0], lines, pre - 1, selected);
+    conn_facts(frame, inner[1], cn);
+}
+
+/// An opened group's connections for a list `area`, as [`group_table`], and the
+/// selected connection.
+fn conn_table<'c>(
+    area: Rect,
+    c: &'c Clients,
+    trouble_line: Option<Line<'static>>,
+    more: bool,
+    wide_at: usize,
+) -> (
+    Vec<Line<'static>>,
+    usize,
+    Option<usize>,
+    Option<&'c ClientConn>,
+) {
+    let conns = c.open_conns();
+    let sel = c.conn_sel.min(conns.len().saturating_sub(1));
+    let cn = conns.get(sel).copied();
     // The columns start after the marker gutter.
-    let w = usize::from(gutter_area(inner[0]).width);
+    let w = usize::from(gutter_area(area).width);
     let cols = conn_columns();
-    let (keep, aw) = pick_flex(&cols, C_ADDR, w, after_gutter(WIDE_AT), ctx.more);
+    let (keep, aw) = pick_flex(&cols, C_ADDR, w, wide_at, more);
     let head = head_row_at(&cols, &keep, C_ADDR, aw, &[C_ID, C_IDLE, C_AGE, C_MEM]);
-    let mut lines = with_head(trouble(&c.poll, ctx), head);
+    let mut lines = with_head(trouble_line, head);
     let pre = lines.len();
-    let body_h = usize::from(inner[0].height).saturating_sub(pre);
+    let body_h = usize::from(area.height).saturating_sub(pre);
     let off = scroll_offset(sel, body_h);
     lines.extend(conns.iter().skip(off).take(body_h).map(|cn| {
         let idle_long = cn.idle >= IDLE_FLAG_SECS;
@@ -497,9 +637,13 @@ fn connections(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>
         )));
     }
     let selected = (!conns.is_empty()).then(|| sel - off + pre);
-    list_below(frame, inner[0], lines, pre - 1, selected);
+    (lines, pre, selected, cn)
+}
 
-    let dw = usize::from(inner[1].width);
+/// The selected connection's facts: its client, age and idle time, last command and
+/// memory.
+fn conn_facts(frame: &mut Frame, inner: Rect, cn: Option<&ClientConn>) {
+    let dw = usize::from(inner.width);
     let mut dl = Vec::new();
     if let Some(cn) = cn {
         let label = |t: &str| Span::styled(format!(" {}", pad_r(t, 9)), style::dim());
@@ -533,7 +677,7 @@ fn connections(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>
             dw,
         )));
     }
-    rows(frame, inner[1], dl, None);
+    rows(frame, inner, dl, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -598,23 +742,22 @@ fn slow_log(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
         &secs(SLOWLOG_EVERY),
         &format!("{} entries · UTC", s.entries.len()),
     );
-    let inner = sections(
+    let took = s.selected().map_or_else(String::new, |e| micros(e.micros));
+    let (list, entry) = list_and_details(
         frame,
         area,
-        &[
-            Section {
-                title: Title::new("Slow log", &right),
-                rows: None,
-            },
-            Section {
-                title: Title::new(
-                    "Entry",
-                    &s.selected().map_or_else(String::new, |e| micros(e.micros)),
-                ),
-                rows: Some(6),
-            },
-        ],
+        Section {
+            title: Title::new("Slow log", &right),
+            rows: None,
+        },
+        Section {
+            title: Title::new("Entry", &took),
+            rows: Some(super::SLOW_LOG_DETAIL as u16),
+        },
+        0,
     );
+    let side = side_split(area.width).is_some();
+    let inner = [list, entry];
     let w = usize::from(inner[0].width);
     let cols = slow_columns();
     // The columns start after the marker gutter.
@@ -668,10 +811,12 @@ fn slow_log(frame: &mut Frame, area: Rect, state: &ServerState, ctx: &Ctx<'_>) {
     }
     let selected = (!s.entries.is_empty()).then(|| sel - off + pre);
     list_below(frame, inner[0], lines, pre - 1, selected);
-    entry_lines(frame, inner[1], s);
+    entry_lines(frame, inner[1], s, side);
 }
 
-fn entry_lines(frame: &mut Frame, inner: Rect, s: &SlowLog) {
+/// The selected entry. `wrap`: its arguments, keys and client broken over lines (the
+/// details to the right of the list, at full height) rather than cut at the width.
+fn entry_lines(frame: &mut Frame, inner: Rect, s: &SlowLog, wrap: bool) {
     let w = usize::from(inner.width);
     let Some(e) = s.selected() else {
         return;
@@ -689,25 +834,63 @@ fn entry_lines(frame: &mut Frame, inner: Rect, s: &SlowLog) {
     } else {
         format!("{} ({})", e.client, e.client_name)
     };
-    let mut lines = vec![
-        Line::from(fit(
-            vec![
-                label("when"),
-                Span::styled(format_utc(e.unix), style::fg()),
-                Span::styled(" · ", style::dim()),
-                Span::styled(micros(e.micros), style::fgb()),
-                Span::styled(" · ", style::dim()),
-                Span::styled(e.command.clone(), style::cmd()),
-            ],
+    let when = vec![
+        label("when"),
+        Span::styled(format_utc(e.unix), style::fg()),
+        Span::styled(" · ", style::dim()),
+        Span::styled(micros(e.micros), style::fgb()),
+        Span::styled(" · ", style::dim()),
+        Span::styled(e.command.clone(), style::cmd()),
+    ];
+    let mut lines = if wrap {
+        super::widgets::wrap_spans(when, w, 8)
+    } else {
+        vec![Line::from(fit(when, w))]
+    };
+    if wrap {
+        let indent = " ".repeat(8);
+        let args = escape(&String::from_utf8_lossy(e.args.as_bytes()));
+        lines.extend(paragraph(
+            vec![label("args")],
+            &indent,
+            &args,
+            style::fg(),
             w,
-        )),
-        Line::from(fit(args_spans(label("args"), e), w)),
-        Line::from(fit(vec![label("keys"), Span::styled(keys, style::fg())], w)),
-        Line::from(fit(
+        ));
+        if e.args_cut > 0 {
+            lines.push(Line::from(Span::styled(
+                trunc(
+                    &format!("{indent}… {} more arguments", format::grouped(e.args_cut)),
+                    w,
+                ),
+                style::dim(),
+            )));
+        }
+        lines.extend(paragraph(
+            vec![label("keys")],
+            &indent,
+            &keys,
+            style::fg(),
+            w,
+        ));
+        lines.extend(paragraph(
+            vec![label("client")],
+            &indent,
+            &client,
+            style::fg(),
+            w,
+        ));
+    } else {
+        lines.push(Line::from(fit(args_spans(label("args"), e), w)));
+        lines.push(Line::from(fit(
+            vec![label("keys"), Span::styled(keys, style::fg())],
+            w,
+        )));
+        lines.push(Line::from(fit(
             vec![label("client"), Span::styled(client, style::fg())],
             w,
-        )),
-    ];
+        )));
+    }
     if let Some(n) = note_of(e) {
         lines.extend(paragraph(
             vec![Span::styled(format!(" {MARK} "), style::amber())],
@@ -830,21 +1013,43 @@ pub fn monitor_sheet(m: &Monitor, ctx: &Ctx<'_>) -> Option<super::sheet::Sheet> 
     })
 }
 
+/// True when Monitor draws the selected line to the right of the log, at full height,
+/// on a body `area`: from [`SIDE_AT`](super::widgets::SIDE_AT) columns, once a run has
+/// started, for as long as it runs or its lines are held. Decided by the run, never by
+/// a line, so a long line arriving mid-run does not flip the layout or the page size.
+/// Before a run the Line section stays under the log, as below 120 columns.
+pub(super) fn monitor_side(area: Rect, m: &Monitor, _ctx: &Ctx<'_>) -> bool {
+    side_split(area.width).is_some() && (m.running() || !m.lines.is_empty())
+}
+
 fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
-    let inner = sections(
-        frame,
-        area,
-        &[
-            Section {
-                title: Title::new("Monitor", &monitor_right(m, ctx)),
-                rows: None,
-            },
-            Section {
-                title: Title::new("Line", ""),
-                rows: Some(4),
-            },
-        ],
-    );
+    let right = monitor_right(m, ctx);
+    let side = monitor_side(area, m, ctx);
+    let inner = if side {
+        let lw = side_split(area.width).unwrap_or(area.width);
+        super::widgets::frame_panes(
+            frame,
+            area,
+            &[lw, 1],
+            &[Title::new("Monitor", &right), Title::new("Line", "")],
+            0,
+        )
+    } else {
+        sections(
+            frame,
+            area,
+            &[
+                Section {
+                    title: Title::new("Monitor", &right),
+                    rows: None,
+                },
+                Section {
+                    title: Title::new("Line", ""),
+                    rows: Some(super::MONITOR_DETAIL as u16),
+                },
+            ],
+        )
+    };
     let w = usize::from(inner[0].width);
     let text = |t: String, st: Style| Line::from(fit(vec![Span::styled(t, st)], w));
     let status = if let Some(why) = crate::conn::monitor_unsupported(ctx.profile()) {
@@ -909,27 +1114,37 @@ fn monitor(frame: &mut Frame, area: Rect, m: &Monitor, ctx: &Ctx<'_>) {
         lines.push(text(t.to_string(), style::dim()));
     }
     list_below(frame, inner[0], lines, pre - 1, selected);
-    line_lines(frame, inner[1], m.selected());
+    let cmd_rows = if side {
+        usize::from(inner[1].height).saturating_sub(1)
+    } else {
+        2
+    };
+    line_lines(frame, inner[1], m.selected(), cmd_rows);
 }
 
-/// The selected line in full, as far as two rows take it.
-fn line_lines(frame: &mut Frame, inner: Rect, e: Option<&Entry>) {
+/// The selected line in full, as far as `cmd_rows` rows under its first take it.
+fn line_lines(frame: &mut Frame, inner: Rect, e: Option<&Entry>, cmd_rows: usize) {
     let w = usize::from(inner.width);
     let Some(e) = e else {
         return;
     };
     let when = e.unix().map_or_else(|| "—".to_string(), format_utc);
-    let first = Line::from(fit(
-        vec![
-            Span::styled(" ", style::dim()),
-            Span::styled(when, style::fg()),
-            Span::styled(" · db ", style::dim()),
-            Span::styled(escape(&e.line.db), style::fg()),
-            Span::styled(" · client ", style::dim()),
-            Span::styled(escape(&e.line.client), style::fg()),
-        ],
-        w,
-    ));
+    let first = vec![
+        Span::styled(" ", style::dim()),
+        Span::styled(when, style::fg()),
+        Span::styled(" · db ", style::dim()),
+        Span::styled(escape(&e.line.db), style::fg()),
+        Span::styled(" · client ", style::dim()),
+        Span::styled(escape(&e.line.client), style::fg()),
+    ];
+    // To the right of the log (more than two rows for the command) the first line
+    // wraps too.
+    let mut lines = if cmd_rows > 2 {
+        super::widgets::wrap_spans(first, w, 1)
+    } else {
+        vec![Line::from(fit(first, w))]
+    };
+    let cmd_rows = cmd_rows.saturating_sub(lines.len() - 1);
     let mut cmd = escape(&e.command_line());
     if e.cut > 0 {
         cmd.push_str(&format!(
@@ -939,9 +1154,8 @@ fn line_lines(frame: &mut Frame, inner: Rect, e: Option<&Entry>) {
     }
     let room = w.saturating_sub(1).max(1);
     let chars: Vec<char> = cmd.chars().collect();
-    let mut lines = vec![first];
     let mut rest: &[char] = &chars;
-    for row in 0..2 {
+    for row in 0..cmd_rows {
         if rest.is_empty() {
             break;
         }
@@ -958,7 +1172,7 @@ fn line_lines(frame: &mut Frame, inner: Rect, e: Option<&Entry>) {
         take = take.max(1);
         let mut part: String = rest[..take].iter().collect();
         rest = &rest[take..];
-        if row == 1 && !rest.is_empty() {
+        if row + 1 == cmd_rows && !rest.is_empty() {
             part = trunc(&format!("{part}…"), room);
         }
         lines.push(Line::from(Span::styled(format!(" {part}"), style::fg())));

@@ -19,6 +19,43 @@ pub fn width(s: &str) -> usize {
 }
 
 /// At most `w` cells wide, ending in `…` when cut.
+/// `s` cut to `w` cells in the middle: its start and its end kept around one `…`
+/// (`cache:se…{hash}`), so names that share a prefix stay told apart. The start gets
+/// the larger half.
+pub fn trunc_middle(s: &str, w: usize) -> String {
+    if width(s) <= w {
+        return s.to_string();
+    }
+    if w <= 2 {
+        return trunc(s, w);
+    }
+    let room = w - 1;
+    let tail_w = room / 2;
+    let head_w = room - tail_w;
+    let mut head = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let cw = char_width(c);
+        if used + cw > head_w {
+            break;
+        }
+        head.push(c);
+        used += cw;
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0;
+    for c in s.chars().rev() {
+        let cw = char_width(c);
+        if used + cw > tail_w {
+            break;
+        }
+        tail.push(c);
+        used += cw;
+    }
+    tail.reverse();
+    format!("{head}…{}", tail.into_iter().collect::<String>())
+}
+
 pub fn trunc(s: &str, w: usize) -> String {
     if width(s) <= w {
         return s.to_string();
@@ -462,6 +499,228 @@ pub fn split_frame(
     let l = Rect::new(x + 1, y + 1, left_w.saturating_sub(1), h);
     let r = Rect::new(div + 1, y + 1, right_w.saturating_sub(2), h);
     (l, r)
+}
+
+/// One frame holding panes side by side, one shared divider between two: the
+/// generalisation of [`split_frame`] to any number of panes (Browse's three panes from
+/// 120 columns, a list with its details at the right).
+///
+/// `widths` are each pane's width counted from its left edge (the frame's border or its
+/// divider) to the next divider; the last pane takes what is left, its right border
+/// included. A pane of width 0 is left out (its divider too), and its inner area is
+/// empty. `focus` is the index of the pane that has the keys: its title bold in the
+/// focus colour, its border segments and both dividers beside it in the focus colour;
+/// the others keep the normal border and a dim title. Returns the inner area of each
+/// pane, in order.
+pub fn frame_panes(
+    frame: &mut Frame,
+    area: Rect,
+    widths: &[u16],
+    titles: &[Title<'_>],
+    focus: usize,
+) -> Vec<Rect> {
+    let n = widths.len().min(titles.len());
+    let mut out = vec![Rect::default(); n];
+    if n == 0 || area.width < 4 || area.height < 2 {
+        return out;
+    }
+    // The panes shown, as (index, x, width); the last takes the rest.
+    let mut shown: Vec<(usize, u16, u16)> = Vec::new();
+    let mut x = area.x;
+    let end = area.x + area.width;
+    for (i, &w) in widths.iter().enumerate().take(n) {
+        if w == 0 || x >= end.saturating_sub(2) {
+            continue;
+        }
+        let w = w.min(end - x);
+        shown.push((i, x, w));
+        x += w;
+    }
+    let Some(last) = shown.last_mut() else {
+        return out;
+    };
+    last.2 = end - last.1;
+    let (on, off) = (style::focus(), style::border());
+    let y = area.y;
+    let bottom = y + area.height - 1;
+    let k = shown.len();
+    for (j, &(i, px, pw)) in shown.iter().enumerate() {
+        let focused = i == focus;
+        let (title_st, line) = if focused {
+            (style::title(), on)
+        } else {
+            (style::dim(), off)
+        };
+        let start = if j == 0 { "┌" } else { "┬" };
+        let top = if j + 1 == k {
+            border_line(usize::from(pw), start, "┐", titles[i], title_st, line)
+        } else {
+            border_line(usize::from(pw) + 1, start, "┬", titles[i], title_st, line)
+        };
+        put(frame, px, y, pw, top);
+        // The bottom border under this pane.
+        let mut bot = vec![Span::styled(if j == 0 { "└" } else { "┴" }, line)];
+        let dashes = if j + 1 == k {
+            pw.saturating_sub(2)
+        } else {
+            pw.saturating_sub(1)
+        };
+        bot.push(Span::styled("─".repeat(usize::from(dashes)), line));
+        if j + 1 == k {
+            bot.push(Span::styled("┘", line));
+        }
+        put(frame, px, bottom, pw, bot);
+        if j == 0 {
+            for row in y + 1..bottom {
+                put_char(frame, px, row, "│", line);
+            }
+        }
+        if j + 1 == k {
+            for row in y + 1..bottom {
+                put_char(frame, px + pw - 1, row, "│", line);
+            }
+        }
+        let inner_w = if j + 1 == k {
+            pw.saturating_sub(2)
+        } else {
+            pw.saturating_sub(1)
+        };
+        out[i] = Rect::new(px + 1, y + 1, inner_w, area.height.saturating_sub(2));
+    }
+    // The dividers: each is the focused pane's when it is beside it.
+    for j in 1..k {
+        let (left, _, _) = shown[j - 1];
+        let (right, dx, _) = shown[j];
+        let st = if left == focus || right == focus {
+            on
+        } else {
+            off
+        };
+        put_char(frame, dx, y, "┬", st);
+        for row in y + 1..bottom {
+            put_char(frame, dx, row, "│", st);
+        }
+        put_char(frame, dx, bottom, "┴", st);
+    }
+    out
+}
+
+/// A list's rows in `area` as [`list`] draws them, in a pane that does not have the
+/// keys: no selection background, and the row that is open (the pattern whose keys
+/// are listed, the key whose value is shown) keeps a dim `▸` in the gutter, so the
+/// path reads left to right. `None`: no row is open.
+pub fn list_open(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, open: Option<usize>) {
+    let n = lines.len().min(usize::from(area.height));
+    for i in 0..n {
+        let r = Rect {
+            y: area.y + i as u16,
+            height: 1,
+            width: GUTTER.min(area.width),
+            ..area
+        };
+        let mark = if open == Some(i) { "▸" } else { " " };
+        let line = Line::from(vec![Span::raw(" "), Span::styled(mark, style::dim())]);
+        frame.render_widget(line, r);
+    }
+    rows(frame, gutter_area(area), lines, None);
+}
+
+/// `spans` broken at spaces into lines that fit `w` cells (by display width), each
+/// line after the first indented by `indent` cells. A word longer than a whole line
+/// is broken across lines (hard-wrapped), never cut.
+pub fn wrap_spans(spans: Vec<Span<'static>>, w: usize, indent: usize) -> Vec<Line<'static>> {
+    // One cell short of the pane, as `wrap_words` keeps it, so no line ends in `…`.
+    let w = w.saturating_sub(1).max(indent + 4);
+    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut used = 0usize;
+    let new_line = |lines: &mut Vec<Vec<Span<'static>>>, used: &mut usize| {
+        lines.push(vec![Span::raw(" ".repeat(indent))]);
+        *used = indent;
+    };
+    for sp in spans {
+        let st = sp.style;
+        // Words with the spaces in front of them, so a break drops those spaces.
+        let mut words: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for ch in sp.content.chars() {
+            if ch == ' ' && !cur.trim().is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            cur.push(ch);
+        }
+        if !cur.is_empty() {
+            words.push(cur);
+        }
+        for word in words {
+            let mut word = word;
+            if used + width(&word) > w && used > indent {
+                new_line(&mut lines, &mut used);
+                word = word.trim_start().to_string();
+            }
+            // What does not fit the line goes on the next, as many lines as it takes.
+            let mut part = String::new();
+            for c in word.chars() {
+                let cw = width(c.encode_utf8(&mut [0; 4]));
+                if used + width(&part) + cw > w && (used > indent || !part.is_empty()) {
+                    if !part.is_empty() {
+                        let done = std::mem::take(&mut part);
+                        lines
+                            .last_mut()
+                            .expect("one line")
+                            .push(Span::styled(done, st));
+                    }
+                    new_line(&mut lines, &mut used);
+                    if c == ' ' {
+                        continue;
+                    }
+                }
+                part.push(c);
+            }
+            used += width(&part);
+            lines
+                .last_mut()
+                .expect("one line")
+                .push(Span::styled(part, st));
+        }
+    }
+    lines.into_iter().map(Line::from).collect()
+}
+
+/// From this many columns a full-width list (Slow log, Clients, Nodes) has its details
+/// to its right, over the full height, rather than under it.
+pub const SIDE_AT: u16 = 120;
+
+/// The list's share of the width when its details are to its right, in percent.
+const SIDE_LIST_PCT: u16 = 60;
+
+/// The list's width, border included, when its details go to its right at `total`
+/// columns: about three fifths. Below [`SIDE_AT`], `None`: the details go under it.
+pub fn side_split(total: u16) -> Option<u16> {
+    // In u32: a terminal can be up to u16::MAX columns wide.
+    (total >= SIDE_AT).then(|| {
+        u16::try_from(u32::from(total) * u32::from(SIDE_LIST_PCT) / 100).unwrap_or(u16::MAX)
+    })
+}
+
+/// A list and its details in one frame: from [`SIDE_AT`] columns side by side, the
+/// list about 60% and the details the rest, both at full height; below it stacked as
+/// [`sections`] with `list` and `details` (their `rows` apply only there). `focus` is
+/// the pane with the keys (0 the list, 1 the details). Returns their inner areas.
+pub fn list_and_details(
+    frame: &mut Frame,
+    area: Rect,
+    list: Section<'_>,
+    details: Section<'_>,
+    focus: usize,
+) -> (Rect, Rect) {
+    let inner = match side_split(area.width) {
+        Some(lw) => frame_panes(frame, area, &[lw, 1], &[list.title, details.title], focus),
+        None => sections_focused(frame, area, &[list, details], focus),
+    };
+    (
+        inner.first().copied().unwrap_or_default(),
+        inner.get(1).copied().unwrap_or_default(),
+    )
 }
 
 /// One of the stacked sections of a [`sections`] frame.
@@ -1046,6 +1305,47 @@ mod tests {
              └──────────────────┘"
         );
         assert_eq!(inner, [Rect::new(1, 1, 18, 1), Rect::new(1, 3, 18, 3)]);
+    }
+
+    fn plain(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn wrap_spans_breaks_at_spaces_and_hard_wraps_a_long_word() {
+        let l = wrap_spans(
+            vec![Span::raw(
+                " Node    a1f3c9e27b4d6e8f0a2c4e6b8d0f1a3c5e7b9d1f",
+            )],
+            21,
+            9,
+        );
+        let t = plain(&l);
+        // Nothing lost: the ID is broken over lines, each line within 20 cells.
+        assert_eq!(
+            t.concat().replace(' ', ""),
+            "Nodea1f3c9e27b4d6e8f0a2c4e6b8d0f1a3c5e7b9d1f"
+        );
+        assert!(t.iter().all(|x| width(x) <= 20), "{t:?}");
+        assert!(t.len() >= 3, "{t:?}");
+        // Wide characters count two cells.
+        let l = wrap_spans(vec![Span::raw(" 漢字漢字漢字漢字漢字漢字")], 11, 1);
+        let t = plain(&l);
+        assert!(t.iter().all(|x| width(x) <= 10), "{t:?}");
+        assert_eq!(t.concat().replace(' ', ""), "漢字漢字漢字漢字漢字漢字");
+        // Words that fit move to the next line whole.
+        let t = plain(&wrap_spans(
+            vec![Span::raw(" on node 10.0.1.13:6379")],
+            18,
+            1,
+        ));
+        assert_eq!(t, [" on node", " 10.0.1.13:6379"]);
+        for w in 0..30 {
+            let _ = wrap_spans(vec![Span::raw("abc defghijklmnop q")], w, 3);
+        }
     }
 
     #[test]

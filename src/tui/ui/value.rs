@@ -39,13 +39,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let Some(ctx) = app.ctx() else {
         return;
     };
+    if area.width >= super::browse::THREE_PANES {
+        super::browse::draw(frame, area, app, super::browse::Focus::Value);
+        return;
+    }
     let state = &app.views.value;
     let keys = &app.views.keys;
     let left_title = format!("‹ {}", keys.heading());
-    let (title, right) = match &state.row {
-        Some(r) => (value::escape(&r.key), title_right(state, &ctx)),
-        None => ("Key".to_string(), String::new()),
-    };
+    let (title, right) = value_titles(state, &ctx);
     let (left, inner) = split_frame(
         frame,
         area,
@@ -54,11 +55,41 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Title::new(&title, &right),
         Pane::Right,
     );
-    key_column(frame, left, app);
+    key_column(frame, left, app, false);
+    open_key_pane(frame, inner, state, &ctx, false);
+    if let Some(form) = &state.form {
+        draw_form(frame, area, form);
+    }
+}
+
+/// The value pane's title: the key's name, and its type, loading and how much is
+/// loaded at the right.
+pub(super) fn value_titles(state: &ValueState, ctx: &Ctx<'_>) -> (String, String) {
+    match &state.row {
+        Some(r) => (value::escape(&r.key), title_right(state, ctx)),
+        None => ("Key".to_string(), String::new()),
+    }
+}
+
+/// The open key in `inner`: its facts line, what is off, then the items and the value.
+///
+/// `wrap_facts`: the facts wrap onto more lines instead of leaving parts out (the value
+/// pane of the three, from 120 columns).
+pub(super) fn open_key_pane(
+    frame: &mut Frame,
+    inner: Rect,
+    state: &ValueState,
+    ctx: &Ctx<'_>,
+    wrap_facts: bool,
+) {
     let w = usize::from(inner.width);
     let mut head: Vec<Line<'static>> = Vec::new();
     if state.row.is_some() {
-        head.push(Line::from(fit(facts(state, &ctx, w), w)));
+        if wrap_facts {
+            head.extend(facts_wrapped(state, ctx, w));
+        } else {
+            head.push(Line::from(fit(facts(state, ctx, w), w)));
+        }
         let mut notes: Vec<String> = state.refused.iter().map(|e| format!(" ▲ {e}.")).collect();
         if let (Some(Kind::Hash), Some(why)) = (&state.kind(), &state.httl_off) {
             notes.push(format!(" ▲ {why}"));
@@ -81,10 +112,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         height: inner.height - used,
         ..inner
     };
-    draw_value_body(frame, body, state, &ctx);
-    if let Some(form) = &state.form {
-        draw_form(frame, area, form);
-    }
+    draw_value_body_wrapped(frame, body, state, ctx, wrap_facts);
 }
 
 /// The key list's width on a key's value: 28 of 80 columns and 40 of 120.
@@ -95,12 +123,17 @@ pub(super) fn list_width(total: u16) -> u16 {
 
 /// The key list beside a value: its keys after the selection gutter, the open one
 /// bright with `›`, the others dim; SIZE and EXPIRES when there is room.
-fn key_column(frame: &mut Frame, full: Rect, app: &App) {
+///
+/// `three`: the narrow key list of the three panes (from 120 columns), which keeps
+/// the list's bottom line and draws the open key's `›` dim, as a pane without the keys
+/// does.
+pub(super) fn key_column(frame: &mut Frame, full: Rect, app: &App, three: bool) {
     let keys = &app.views.keys;
     let open = app.views.value.row.as_ref().map(|r| r.key.as_str());
     let area = super::widgets::gutter_area(full);
     let w = usize::from(area.width);
-    let wide = w >= super::widgets::after_gutter(34);
+    // The three panes' narrow list (34 wide) keeps SIZE and EXPIRES beside a name.
+    let wide = w >= super::widgets::after_gutter(34) || (three && w >= 30);
     let kw = if wide { w.saturating_sub(15) } else { w };
     let mut head = vec![Span::styled(pad_r(" KEY", kw), style::hd())];
     if wide {
@@ -108,11 +141,53 @@ fn key_column(frame: &mut Frame, full: Rect, app: &App) {
         head.push(Span::styled(pad_l("EXPIRES", 7), style::hd()));
     }
     rows(frame, area, vec![Line::from(head)], None);
+    let bottom_h = u16::from(three && full.height >= 3);
     let body = Rect {
         y: full.y + 1,
-        height: full.height.saturating_sub(1),
+        height: full.height.saturating_sub(1 + bottom_h),
         ..full
     };
+    if bottom_h > 0
+        && let Some(ctx) = app.ctx()
+    {
+        // A value opened from another list (Go to, another pattern): this list is not
+        // its parent, and says so rather than look like the path to it.
+        let text = if app.views.value.row.is_some() && !super::browse::value_in_list(app) {
+            " the open key is not in this list".to_string()
+        } else {
+            super::keys::status_line(app, &ctx)
+        };
+        let bottom = Rect {
+            y: full.y + full.height - 1,
+            height: 1,
+            ..full
+        };
+        let fw = usize::from(full.width);
+        rows(
+            frame,
+            bottom,
+            vec![Line::from(fit(vec![Span::styled(text, style::dim())], fw))],
+            None,
+        );
+    }
+    if keys.visible().is_empty() && three {
+        // A list emptied by a filter, or not read yet: say so rather than nothing.
+        let text = if keys.rows.is_empty() {
+            " No keys loaded yet."
+        } else {
+            " No loaded key matches the filter."
+        };
+        rows(
+            frame,
+            body,
+            vec![Line::from(Span::styled(
+                trunc(text, usize::from(full.width)),
+                style::dim(),
+            ))],
+            None,
+        );
+        return;
+    }
     let visible = keys.visible();
     let sel = keys.sel.min(visible.len().saturating_sub(1));
     let off = scroll_offset(sel, usize::from(body.height));
@@ -124,21 +199,93 @@ fn key_column(frame: &mut Frame, full: Rect, app: &App) {
             let r = &keys.rows[i];
             let is_open = Some(r.key.as_str()) == open;
             let st = if is_open { style::fgb() } else { style::dim() };
-            let mut spans = vec![Span::styled(
-                pad_r(&format!(" {}", value::escape(&r.key)), kw),
-                st,
-            )];
+            let name = value::escape(&r.key);
+            // In the three panes a name too long keeps its start and its end.
+            let name = if three {
+                super::widgets::trunc_middle(&name, kw.saturating_sub(1))
+            } else {
+                name
+            };
+            let mut spans = vec![Span::styled(pad_r(&format!(" {name}"), kw), st)];
             if wide {
                 let size = r.bytes.map_or_else(|| "—".to_string(), format::bytes);
                 spans.push(Span::styled(format!("{} ", pad_l(&size, 6)), st));
                 spans.push(Span::styled(pad_l(&super::keys::ttl_text(r.ttl), 7), st));
             }
             let mut line = super::widgets::marker(is_open).to_vec();
+            if three {
+                // A pane without the keys marks its open row `▸`, dim: `›` is the
+                // focused pane's selection only.
+                line[1] = Span::styled(if is_open { "▸" } else { " " }, style::dim());
+            }
             line.extend(fit(spans, w));
             Line::from(line)
         })
         .collect();
     rows(frame, body, lines, None);
+}
+
+/// Lines the open key's facts take on a body `body_w` wide: one below 120 columns,
+/// where they are cut; from 120 as many as they wrap onto in the value pane.
+pub(super) fn facts_rows(app: &App, body_w: u16) -> usize {
+    let Some(ctx) = app.ctx() else {
+        return 1;
+    };
+    if body_w < super::browse::THREE_PANES || app.views.value.row.is_none() {
+        return 1;
+    }
+    let right = super::browse::value_pane_width(app, body_w);
+    facts_wrapped(&app.views.value, &ctx, usize::from(right.saturating_sub(2))).len()
+}
+
+/// The facts line, wrapped over as many lines as it takes: nothing is dropped (the
+/// value pane of the three, from 120 columns).
+fn facts_wrapped(state: &ValueState, ctx: &Ctx<'_>, w: usize) -> Vec<Line<'static>> {
+    // `facts` joins every part when it has the room: the first span the length, size
+    // and expiry, the second the rest. Lines break between parts (` · `); a part too
+    // long for a line on its own wraps inside it.
+    let spans = facts(state, ctx, usize::MAX);
+    let mut parts: Vec<(String, ratatui::style::Style)> = Vec::new();
+    for sp in &spans {
+        for p in sp.content.split(" · ") {
+            let p = p.trim();
+            if !p.is_empty() {
+                parts.push((p.to_string(), sp.style));
+            }
+        }
+    }
+    let room = w.saturating_sub(1).max(8);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut line: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for (p, st) in parts {
+        let pw = width(&p);
+        let sep = if line.is_empty() { 1 } else { 3 };
+        if !line.is_empty() && used + sep + pw > room {
+            out.push(Line::from(std::mem::take(&mut line)));
+            used = 0;
+        }
+        if 1 + pw > room {
+            out.extend(super::widgets::wrap_spans(
+                vec![Span::styled(format!(" {p}"), st)],
+                w,
+                1,
+            ));
+            continue;
+        }
+        if line.is_empty() {
+            line.push(Span::styled(format!(" {p}"), st));
+            used = 1 + pw;
+        } else {
+            line.push(Span::styled(" · ", style::dim()));
+            line.push(Span::styled(p, st));
+            used += 3 + pw;
+        }
+    }
+    if !line.is_empty() {
+        out.push(Line::from(line));
+    }
+    out
 }
 
 /// The one line of facts above a value: its length, size and expiry; at wider widths
@@ -211,7 +358,7 @@ fn facts(state: &ValueState, ctx: &Ctx<'_>, w: usize) -> Vec<Span<'static>> {
         } else {
             format!("{rest} · {m}")
         };
-        if width(&first) + 3 + width(&next) >= w {
+        if width(&first).saturating_add(3).saturating_add(width(&next)) >= w {
             break;
         }
         rest = next;
@@ -433,6 +580,18 @@ pub fn title_right(state: &ValueState, ctx: &Ctx<'_>) -> String {
 /// a string or document, or why there is nothing to show. For the right pane of a
 /// key's value and the views that embed one (stream entries, a Search result).
 pub fn draw_value_body(frame: &mut Frame, inner: Rect, state: &ValueState, ctx: &Ctx<'_>) {
+    draw_value_body_wrapped(frame, inner, state, ctx, false);
+}
+
+/// [`draw_value_body`]; `wrap_rows`: a module's facts that do not fit their row go on to
+/// the next rather than being cut (the value pane of the three, from 120 columns).
+fn draw_value_body_wrapped(
+    frame: &mut Frame,
+    inner: Rect,
+    state: &ValueState,
+    ctx: &Ctx<'_>,
+    wrap_rows: bool,
+) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -492,7 +651,7 @@ pub fn draw_value_body(frame: &mut Frame, inner: Rect, state: &ValueState, ctx: 
             };
             value_pane(frame, inner, state, "document".into(), doc, notes);
         }
-        Items::Module(m) => module_pane(frame, inner, state, m),
+        Items::Module(m) => module_pane(frame, inner, state, m, wrap_rows),
         _ => collection(frame, inner, state, items),
     }
 }
@@ -891,7 +1050,7 @@ fn list_rows(
 /// type the last samples (a sparkline and the list), the top items or the quantiles.
 /// Scrolls like a value. When `*.INFO` was refused or is unknown, just the one line
 /// saying why. Every text from the server is escaped.
-fn module_pane(frame: &mut Frame, area: Rect, state: &ValueState, m: &Module) {
+fn module_pane(frame: &mut Frame, area: Rect, state: &ValueState, m: &Module, wrap_rows: bool) {
     let w = usize::from(area.width);
     if let Some(why) = &m.unavailable {
         let lines: Vec<Line<'static>> = wrap(&format!(" {why}"), w)
@@ -925,7 +1084,27 @@ fn module_pane(frame: &mut Frame, area: Rect, state: &ValueState, m: &Module) {
                 .and_then(|s| s.parse::<i64>().ok())
                 .and_then(utc_ms)
         {
-            shown = format!("{t} · {shown}");
+            let both = format!("{t} · {shown}");
+            if wrap_rows && width(&both) > vw {
+                // Too narrow for both: the epoch milliseconds go under the time, whole.
+                body.push(Line::from(fit(
+                    vec![
+                        Span::styled(format!(" {}", pad_r(&trunc(name, nw), nw)), style::dim()),
+                        Span::raw("  "),
+                        Span::styled(t, style::fg()),
+                    ],
+                    w,
+                )));
+                body.push(Line::from(fit(
+                    vec![
+                        Span::raw(" ".repeat(nw + 3)),
+                        Span::styled(format!("· {shown}"), style::fg()),
+                    ],
+                    w,
+                )));
+                continue;
+            }
+            shown = both;
         }
         body.push(Line::from(fit(
             vec![

@@ -2099,7 +2099,7 @@ mod tests {
         testing::reply(&mut app, id, page(Some("hash"), fields(), None));
         snap(&app, "hash");
         let all = text(&testing::render(&app, 120, 36));
-        // On the facts line, and a TTL column in the fields.
+        // On the facts (they wrap rather than drop a part), and a TTL column.
         assert!(all.contains("1 of 3 fields expire"), "{all}");
         assert!(all.contains("TTL"), "{all}");
         assert!(all.contains("2h 10m"), "{all}");
@@ -2150,7 +2150,9 @@ mod tests {
             all.contains("▲ Field TTLs off: the server refused"),
             "{all}"
         );
-        assert!(all.contains("for this user."), "{all}");
+        // The note wraps in the value pane; its end is on the next line.
+        assert!(all.contains("HTTL for this"), "{all}");
+        assert!(all.contains("  user."), "{all}");
         assert!(!all.contains("Field TTL  "), "{all}");
         let (_, req) = one_request(&app.handle_key(ch('m')));
         assert!(!req.field_ttls);
@@ -2268,7 +2270,7 @@ mod tests {
         let (mut app, id, _) = open(cart());
         testing::reply(&mut app, id, Err(LiveError::Denied("HSCAN".into())));
         snap(&app, "refused");
-        let all = text(&testing::render(&app, 120, 36));
+        let all = text(&testing::render(&app, 200, 50));
         assert!(
             all.contains("Can't read the value: the server refused HSCAN for this user."),
             "{all}"
@@ -2304,7 +2306,7 @@ mod tests {
             id,
             page(Some("custom-TYPE"), Items::NotRead, None),
         );
-        let all = text(&testing::render(&app, 120, 36));
+        let all = text(&testing::render(&app, 200, 50));
         assert!(
             all.contains("redis-lens does not read values of type custom-TYPE."),
             "{all}"
@@ -2316,12 +2318,12 @@ mod tests {
             id,
             page(Some("ReJSON-RL"), Items::JsonNotRead { size: None }, None),
         );
-        let all = text(&testing::render(&app, 120, 36));
+        let all = text(&testing::render(&app, 200, 50));
         assert!(all.contains("size is unknown"), "{all}");
         let (mut app, id, _) = open(row("vec:1", KeyType::Other, None, Some(80)));
         let items = Items::Vector(vec![Raw::from("e1"), Raw::from("e2")]);
         testing::reply(&mut app, id, page(Some("vectorset"), items, None));
-        let all = text(&testing::render(&app, 120, 36));
+        let all = text(&testing::render(&app, 200, 50));
         assert!(all.contains("vector sets can't be read in pages"), "{all}");
         app.handle_key(ch('m'));
         assert!(notice(&app).starts_with("Vector sets can't be read in pages"));
@@ -3646,7 +3648,7 @@ mod tests {
         let mut app = open_module("TSDB-TYPE", time_series());
         assert_eq!(app.views.value.kind(), Some(Kind::TimeSeries));
         snap(&app, "timeseries");
-        let all = text(&testing::render(&app, 120, 36));
+        let all = text(&testing::render(&app, 200, 50));
         assert!(
             all.contains("2023-11-14 22:13:20.000 · 1700000000000"),
             "{all}"
@@ -3719,7 +3721,7 @@ mod tests {
         };
         let app = open_module("TSDB-TYPE", m);
         snap(&app, "module_unavailable");
-        let all = text(&testing::render(&app, 120, 36));
+        let all = text(&testing::render(&app, 200, 50));
         assert!(all.contains("Time series not read: the server refused TS.INFO"));
         assert!(!all.contains('✗'), "not an error screen: {all}");
     }

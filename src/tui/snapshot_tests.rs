@@ -1013,6 +1013,48 @@ fn every_tab_at_60x20_and_200x60() {
 }
 
 #[test]
+fn every_screen_at_very_large_widths_does_not_panic() {
+    let mut apps = vec![App::new(vec![]), scanned(true), scanned(false)];
+    for app in &mut apps {
+        for screen in Screen::ALL {
+            if !show(app, screen) {
+                continue;
+            }
+            for (w, h) in [(500, 40), (1100, 30), (2000, 12), (u16::MAX, 6)] {
+                render(app, w, h);
+            }
+        }
+    }
+}
+
+#[test]
+fn every_screen_at_every_size_up_to_60x16_does_not_panic() {
+    // Browse's three panes with a key open are swept in snapshot_tests_browse.rs, the
+    // server panels with their data in views/server.rs.
+    // Every size for an analysed session; every third for the others, to keep it quick.
+    let mut apps = vec![
+        (scanned(true), 1),
+        (App::new(vec![]), 3),
+        (scanned(false), 3),
+    ];
+    for (app, step) in &mut apps {
+        for screen in Screen::ALL {
+            if !show(app, screen) {
+                continue;
+            }
+            for w in (0..=60).step_by(*step) {
+                for h in (0..=16).step_by(*step) {
+                    render(app, w, h);
+                }
+            }
+            for (w, h) in [(120, 10), (200, 60), (119, 16), (120, 16)] {
+                render(app, w, h);
+            }
+        }
+    }
+}
+
+#[test]
 fn small_terminals_do_not_panic() {
     let mut apps = vec![App::new(vec![]), scanned(true), scanned(false)];
     // History and hot keys, with and without sizes.

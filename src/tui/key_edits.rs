@@ -91,7 +91,6 @@ impl App {
                 v.value.open(row, pattern, act)
             })
             .map_or_else(Vec::new, |(_, e)| e);
-        self.value_db = None;
         out.extend(self.switch(Screen::KeyDetail));
         out
     }

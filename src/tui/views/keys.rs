@@ -279,18 +279,10 @@ impl KeysState {
         narrowed: Option<usize>,
         act: &mut Act<'_>,
     ) {
-        let all: Vec<usize> = match narrowed {
-            Some(i) if i < nodes.len() => vec![i],
-            _ => (0..nodes.len()).collect(),
-        };
-        let (walk, missing): (Vec<usize>, Vec<usize>) =
-            all.into_iter().partition(|&i| nodes[i].connected);
-        if self.pattern.as_deref() == Some(pattern.as_str())
-            && self.walk == walk
-            && self.missing == missing
-        {
+        if self.holds(&pattern, nodes, narrowed) {
             return;
         }
+        let (walk, missing) = Self::walk_for(nodes, narrowed);
         *self = Self {
             pattern: Some(pattern),
             sel_since: act.tick,
@@ -298,6 +290,35 @@ impl KeysState {
             missing,
             ..Self::default()
         };
+    }
+
+    /// The nodes a pattern's key list walks, and those it leaves out (no connection),
+    /// for the node table `nodes` and the node Patterns is narrowed to.
+    pub fn walk_for(
+        nodes: &[crate::live::nodes::NodeInfo],
+        narrowed: Option<usize>,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let all: Vec<usize> = match narrowed {
+            Some(i) if i < nodes.len() => vec![i],
+            _ => (0..nodes.len()).collect(),
+        };
+        all.into_iter().partition(|&i| nodes[i].connected)
+    }
+
+    /// True when the list held is the one [`KeysState::open`] would keep for `pattern`
+    /// under the narrowing `narrowed`: the same pattern, not a find, over the same walk
+    /// and the same nodes left out. Anything else is another list.
+    pub fn holds(
+        &self,
+        pattern: &str,
+        nodes: &[crate::live::nodes::NodeInfo],
+        narrowed: Option<usize>,
+    ) -> bool {
+        let (walk, missing) = Self::walk_for(nodes, narrowed);
+        self.find.is_none()
+            && self.pattern.as_deref() == Some(pattern)
+            && self.walk == walk
+            && self.missing == missing
     }
 
     /// `ctrl-f`: list the keys of the whole server that `glob` matches. `App` calls this,
@@ -1564,13 +1585,13 @@ mod tests {
             refused: vec![LiveError::Denied("MEMORY USAGE".into())],
         })));
         testing::reply(&mut app, id, reply);
-        let screen = format!("{:?}", testing::render(&app, 120, 36).backend());
-        // The right pane wraps the note: its words, in order, over two lines.
+        let screen = format!("{:?}", testing::render(&app, 200, 50).backend());
+        // The right pane says it in its words (at 200 columns on one line).
         assert!(
             screen.contains("▲ Column off: the server refused MEMORY"),
             "{screen}"
         );
-        assert!(screen.contains("  USAGE for this user."), "{screen}");
+        assert!(screen.contains("USAGE for this user."), "{screen}");
         assert!(screen.contains("2 keys could not be read"), "{screen}");
         // Sorting skips the size column it no longer has... once sizes are off.
         assert!(!screen.contains("NOPERM"), "{screen}");
