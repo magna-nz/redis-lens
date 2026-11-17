@@ -282,8 +282,8 @@ pub fn level(v: u64, max: u64) -> char {
 }
 
 /// A TTL histogram: one 5-cell column per bucket, a 3-character block bar scaled to
-/// the largest bucket, or `·` when empty. The "none" bucket uses `none_style`, the
-/// others teal.
+/// the largest bucket, or `·` when empty. The "none" bucket uses `none_style` (the
+/// warning colour when it is the flagged one), the others the data colour.
 pub fn ttl_hist_spans(hist: &[u64; 7], none_style: Style) -> Vec<Span<'static>> {
     let max = hist.iter().copied().max().unwrap_or(0);
     hist.iter()
@@ -292,7 +292,7 @@ pub fn ttl_hist_spans(hist: &[u64; 7], none_style: Style) -> Vec<Span<'static>> 
             if v == 0 {
                 Span::styled(pad_r("·", 5), style::track())
             } else {
-                let st = if i == 0 { none_style } else { style::ok() };
+                let st = if i == 0 { none_style } else { style::data() };
                 Span::styled(pad_r(&level(v, max).to_string().repeat(3), 5), st)
             }
         })
@@ -1130,7 +1130,7 @@ mod tests {
         assert_eq!(level(1, 100), '▁');
         assert_eq!(level(100, 100), '█');
         assert_eq!(level(0, 0), '▁');
-        let spans = ttl_hist_spans(&[0, 10, 0, 0, 0, 0, 5], style::warn());
+        let spans = ttl_hist_spans(&[0, 10, 0, 0, 0, 0, 5], style::warning());
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "·    ███  ·    ·    ·    ·    ▄▄▄  ");
     }

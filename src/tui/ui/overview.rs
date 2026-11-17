@@ -141,7 +141,7 @@ fn now_lines(ctx: &Ctx<'_>, app: &App, w: usize) -> Vec<Line<'static>> {
     if let Some(off) = &o.poll.off {
         return vec![Line::from(Span::styled(
             trunc(&format!(" ▲ {off}"), w),
-            style::amber(),
+            style::warning(),
         ))];
     }
     let mut lines = Vec::new();
@@ -180,7 +180,7 @@ fn now_lines(ctx: &Ctx<'_>, app: &App, w: usize) -> Vec<Line<'static>> {
                     Span::styled(format!(" {}", pad_r(label(*m), LABEL_W)), style::dim()),
                     Span::styled(pad_l(&text, VALUE_W), st),
                     Span::raw(" "),
-                    Span::styled(sparkline(&o.history, *m, spark_w), style::ok()),
+                    Span::styled(sparkline(&o.history, *m, spark_w), style::data()),
                 ];
                 // Cut or padded to its column.
                 spans.extend(fit(cell, col));
@@ -227,7 +227,7 @@ fn figure(
     {
         let max = last.and_then(|l| l.maxmemory).filter(|m| *m > 0);
         let st = match max {
-            Some(max) if used as f64 / max as f64 >= 0.9 => style::warn(),
+            Some(max) if used as f64 / max as f64 >= 0.9 => style::warning(),
             _ => style::fgb(),
         };
         return (format::bytes(used), st, max.map(format::bytes));
@@ -264,7 +264,7 @@ fn memory_bar(o: &crate::tui::app::views::server::Overview, w: usize) -> Option<
             let room =
                 w.saturating_sub(1 + LABEL_W + VALUE_W + 1 + super::widgets::width(&tail) + 1);
             let (fill, track) = bar(used as f64 / max as f64, room.min(60));
-            spans.push(Span::styled(fill, style::amber()));
+            spans.push(Span::styled(fill, style::data()));
             spans.push(Span::styled(track, style::track()));
             spans.push(Span::styled(tail, style::dim()));
         }
@@ -295,18 +295,18 @@ fn server_line(s: &Session, last: Option<&InfoSample>, w: usize) -> Option<Line<
     match i.role {
         Some(Role::Primary) => parts.push((format!("primary{replicas}"), style::fg())),
         Some(Role::Replica) => match i.link_up {
-            Some(false) => parts.push(("replica, link down".to_string(), style::warn())),
+            Some(false) => parts.push(("replica, link down".to_string(), style::danger())),
             _ => parts.push(("replica".to_string(), style::fg())),
         },
         None => {}
     }
     match i.rdb_ok {
-        Some(false) => parts.push(("RDB last save failed".to_string(), style::warn())),
+        Some(false) => parts.push(("RDB last save failed".to_string(), style::danger())),
         Some(true) => parts.push(("RDB ok".to_string(), style::fg())),
         None => {}
     }
     match (i.aof_on, i.aof_ok) {
-        (Some(true), Some(false)) => parts.push(("AOF write failed".to_string(), style::warn())),
+        (Some(true), Some(false)) => parts.push(("AOF write failed".to_string(), style::danger())),
         (Some(true), _) => parts.push(("AOF on".to_string(), style::fg())),
         (Some(false), _) => parts.push(("AOF off".to_string(), style::fg())),
         (None, _) => {}
@@ -400,8 +400,8 @@ fn shard_lines(s: &Session, app: &App, w: usize) -> Vec<Line<'static>> {
         let row = state.shards.rows.get(i);
         let known = figures.get(i).and_then(|f| f.figures.as_ref());
         match row {
-            _ if !n.connected => spans.push(Span::styled("✗ not connected", style::warn())),
-            Some(r) if r.failed => spans.push(Span::styled("✗ no answer", style::warn())),
+            _ if !n.connected => spans.push(Span::styled("✗ not connected", style::danger())),
+            Some(r) if r.failed => spans.push(Span::styled("✗ no answer", style::danger())),
             _ => {
                 let last = row.and_then(|r| r.last.as_ref());
                 let ops = last
@@ -510,7 +510,7 @@ fn headline(s: &Session, w: usize) -> Line<'static> {
 fn headline_spans(s: &Session) -> Vec<Span<'static>> {
     let figures = s.figures.as_ref();
     if let Some(why) = figures.and_then(|f| f.failed) {
-        return vec![Span::styled(format!(" ▲ {why}."), style::amber())];
+        return vec![Span::styled(format!(" ▲ {why}."), style::warning())];
     }
     let mut parts: Vec<String> = Vec::new();
     match figures.and_then(|f| f.server.as_ref()) {
@@ -608,8 +608,7 @@ fn finding_rows_at(found: &[Finding], sel: usize, w: usize, at: usize) -> Vec<Li
         .enumerate()
         .map(|(i, f)| {
             let (mark, st) = match f.severity {
-                Severity::Warn => ("▲", style::warn()),
-                Severity::Note => ("▲", style::amber()),
+                Severity::Warn | Severity::Note => ("▲", style::warning()),
                 Severity::Info => ("●", style::dim()),
             };
             let cursor = if i == sel { " › " } else { "   " };
@@ -670,7 +669,7 @@ fn keys_lines(app: &App, s: &Session, w: usize, h: usize) -> (Vec<Line<'static>>
         Phase::Connecting if s.analysis.is_none() => {
             lines.push(Line::from(vec![
                 Span::raw(" "),
-                Span::styled(spinner(app.tick), style::amber()),
+                Span::styled(spinner(app.tick), style::warning()),
                 Span::styled(
                     trunc(
                         &format!(
@@ -686,7 +685,7 @@ fn keys_lines(app: &App, s: &Session, w: usize, h: usize) -> (Vec<Line<'static>>
             if let Some(hint) = app.keychain_hint() {
                 lines.push(Line::from(Span::styled(
                     trunc(&format!(" {hint}"), w),
-                    style::amber(),
+                    style::warning(),
                 )));
             }
             let lines = fit_blocks(lines, vec![Block::new(None, notice)], h);
@@ -695,7 +694,7 @@ fn keys_lines(app: &App, s: &Session, w: usize, h: usize) -> (Vec<Line<'static>>
         Phase::Failed(e) if app.report().is_none() => {
             lines.push(Line::from(Span::styled(
                 trunc(&format!(" ✗ {e}"), w),
-                style::warn(),
+                style::danger(),
             )));
             return (lines, String::new());
         }
@@ -817,7 +816,7 @@ fn before_right(s: &Session) -> String {
 /// The profile's provider notice as a row, if it has one.
 fn provider_rows(p: &Profile, w: usize) -> Vec<Line<'static>> {
     crate::conn::provider::notice(p.provider)
-        .map(|n| Line::from(Span::styled(trunc(&format!(" ▲ {n}"), w), style::amber())))
+        .map(|n| Line::from(Span::styled(trunc(&format!(" ▲ {n}"), w), style::warning())))
         .into_iter()
         .collect()
 }
@@ -899,7 +898,7 @@ fn analyzing_block(s: &Session, e: &Estimate, w: usize, wrap: bool) -> Block {
             vec![
                 Span::styled(" ANALYZING", style::hd()),
                 Span::styled(text, style::dim()),
-                Span::styled(fill, style::amber()),
+                Span::styled(fill, style::data()),
                 Span::styled(track, style::track()),
                 Span::styled(format!("  {left}"), style::dim()),
             ],
@@ -944,7 +943,7 @@ fn analyzing_block(s: &Session, e: &Estimate, w: usize, wrap: bool) -> Block {
             v.push(Line::from(fit(
                 vec![
                     Span::raw(" "),
-                    Span::styled(fill, style::amber()),
+                    Span::styled(fill, style::data()),
                     Span::styled(track, style::track()),
                     Span::styled(pct, style::dim()),
                 ],
@@ -995,7 +994,7 @@ fn memory_block(r: &ScanReport, w: usize, named_max: usize, widths: (usize, usiz
                 Span::raw("   "),
                 Span::styled(pad_r(&trunc(&name, name_w), name_w), style::fg()),
                 Span::raw(" "),
-                Span::styled(fill, style::amber()),
+                Span::styled(fill, style::data()),
                 Span::styled(track, style::track()),
                 Span::styled(pad_l(&format::percent(ratio), 5), style::fgb()),
                 Span::styled(pad_l(&size, 9), style::fg()),
@@ -1282,8 +1281,7 @@ fn things_pane(frame: &mut Frame, inner: Rect, app: &App, s: &Session) {
     if let Some(f) = found.get(sel) {
         lines.push(Line::from(Span::styled("─".repeat(w), style::border())));
         let (mark, st) = match f.severity {
-            Severity::Warn => ("▲", style::warn()),
-            Severity::Note => ("▲", style::amber()),
+            Severity::Warn | Severity::Note => ("▲", style::warning()),
             Severity::Info => ("●", style::dim()),
         };
         // The sentence again only when its row had to cut it.
@@ -1443,7 +1441,15 @@ fn freed_block(r: &ScanReport, w: usize) -> Option<Block> {
         ("never", e.never),
     ]
     .into_iter()
-    .map(|(name, v)| share_row(name, v, e.total, &format::bytes(v), w, style::ok()))
+    // Quantities in the data colour; the memory that never expires in the warning colour.
+    .map(|(name, v)| {
+        let st = if name == "never" {
+            style::warning()
+        } else {
+            style::data()
+        };
+        share_row(name, v, e.total, &format::bytes(v), w, st)
+    })
     .collect();
     Some(Block::new(Some(head), rows_))
 }

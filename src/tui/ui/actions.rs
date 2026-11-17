@@ -33,7 +33,7 @@ fn right_of(l: &MenuLine) -> (String, ratatui::style::Style) {
     match &l.status {
         Status::Ready(Some(t)) | Status::Sends(t) => (t.clone(), style::dim()),
         Status::Ready(None) => (String::new(), style::dim()),
-        Status::Form { asks: true, .. } | Status::Asks => ("asks first".into(), style::amber()),
+        Status::Form { asks: true, .. } | Status::Asks => ("asks first".into(), style::warning()),
         Status::Form { sends, .. } => (sends.clone(), style::dim()),
         Status::Off(why) => (format!("off: {}", short_reason(why)), style::dim()),
     }
@@ -97,10 +97,15 @@ fn line_of(l: &MenuLine, selected: bool, cap: usize, w: usize) -> Line<'static> 
         if off { style::dim() } else { style::key() },
     ));
     spans.push(Span::raw(" ".repeat(pad + 1)));
-    spans.push(Span::styled(
-        name,
-        if off { style::dim() } else { style::fg() },
-    ));
+    // An action that can lose data is named in the danger colour.
+    let name_style = if off {
+        style::dim()
+    } else if l.key.destroys() {
+        style::danger()
+    } else {
+        style::fg()
+    };
+    spans.push(Span::styled(name, name_style));
     spans.push(Span::raw(" ".repeat(gap)));
     spans.push(Span::styled(right, rst));
     spans.push(Span::raw(" "));

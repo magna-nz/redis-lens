@@ -74,10 +74,10 @@ pub fn draw(frame: &mut Frame, area: Rect, st: &SlotsState, ctx: &Ctx<'_>) {
     let off = |frame: &mut Frame, why: String| {
         let w = usize::from(area.width.saturating_sub(2));
         let lines = paragraph(
-            vec![Span::styled(format!(" {MARK} "), style::amber())],
+            vec![Span::styled(format!(" {MARK} "), style::warning())],
             "   ",
             &why,
-            style::amber(),
+            style::warning(),
             w,
         );
         notice(frame, area, "Slots", "off", lines);
@@ -295,7 +295,7 @@ fn range_line(
                     let used = first_w + 1 + cw + 1;
                     spans.push(Span::styled(
                         trunc(&format!("✗ {why}"), width.saturating_sub(used).max(2)),
-                        style::warn(),
+                        style::danger(),
                     ));
                     break;
                 }

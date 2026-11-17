@@ -229,7 +229,7 @@ fn hist_cells(hist: &[u64; 7], widths: &[usize; 7], none_style: Style) -> Vec<Sp
             if v == 0 {
                 Span::styled(pad_r("·", w), style::track())
             } else {
-                let st = if i == 0 { none_style } else { style::ok() };
+                let st = if i == 0 { none_style } else { style::data() };
                 let bar = level(v, max).to_string().repeat(w.saturating_sub(2).max(1));
                 Span::styled(pad_r(&bar, w), st)
             }
@@ -300,7 +300,7 @@ fn detail_lines(
     hist.extend(hist_cells(
         &p.ttl_hist,
         &widths,
-        verdict_mark(v).unwrap_or_else(style::amber),
+        verdict_mark(v).unwrap_or_else(style::data),
     ));
     lines.push(Line::from(fit(trim_end(hist), w)));
     if more {

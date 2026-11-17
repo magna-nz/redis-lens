@@ -122,7 +122,7 @@ fn draw_view(frame: &mut Frame, area: Rect, state: &SearchState, ctx: &Ctx<'_>) 
             TITLE,
             &on_node(ctx, "failed"),
             &[
-                (format!(" ▲ {}.", sentence(e)), style::amber()),
+                (format!(" ▲ {}.", sentence(e)), style::warning()),
                 (" Press r to read again.".to_string(), style::dim()),
             ],
         );
@@ -315,7 +315,7 @@ fn index_list(frame: &mut Frame, inner: Rect, state: &SearchState, more: bool, d
     let note = match &state.error {
         Some(e) => Span::styled(
             format!(" ▲ {e}; showing the previous reading."),
-            style::amber(),
+            style::warning(),
         ),
         None if list.total > list.indexes.len() => Span::styled(
             format!(" first {} of {} indexes", list.indexes.len(), list.total),
@@ -406,7 +406,7 @@ fn results_pane(
                 w,
             )));
             for l in wrap_text(&format!(" ✗ {why}"), w) {
-                lines.push(Line::from(fit(vec![Span::styled(l, style::warn())], w)));
+                lines.push(Line::from(fit(vec![Span::styled(l, style::danger())], w)));
             }
             lines.push(Line::from(fit(
                 vec![Span::styled(
@@ -562,7 +562,7 @@ fn draw_deeper(
                 }
                 Outcome::Failed(why) => {
                     for l in wrap_text(&format!(" ✗ {why}"), w) {
-                        lines.push(Line::from(fit(vec![Span::styled(l, style::warn())], w)));
+                        lines.push(Line::from(fit(vec![Span::styled(l, style::danger())], w)));
                     }
                     state.text_drawn.set(0, 0);
                     rows(frame, inner, lines, None);
@@ -639,7 +639,7 @@ fn list_row(i: &IndexInfo, nw: usize, pw: usize, shown: [bool; 4]) -> Line<'stat
         spans.push(Span::styled(
             format!(" {}", pad_l(&text, INDEXED_W)),
             if building {
-                style::amber()
+                style::warning()
             } else {
                 style::ok()
             },
@@ -650,7 +650,7 @@ fn list_row(i: &IndexInfo, nw: usize, pw: usize, shown: [bool; 4]) -> Line<'stat
         spans.push(Span::styled(
             format!(" {}", pad_l(&n.map_or_else(dash, format::count), FAILS_W)),
             if n.is_some_and(|n| n > 0) {
-                style::warn()
+                style::danger()
             } else {
                 style::fg()
             },
@@ -732,7 +732,7 @@ fn detail_pane(frame: &mut Frame, inner: Rect, state: &SearchState, module: &str
                 text
             },
             if building {
-                style::amber()
+                style::warning()
             } else {
                 style::fgb()
             },
@@ -742,7 +742,7 @@ fn detail_pane(frame: &mut Frame, inner: Rect, state: &SearchState, module: &str
         facts.push(Span::styled(" · failures ", style::dim()));
         facts.push(Span::styled(
             format::grouped(n),
-            if n > 0 { style::warn() } else { style::fgb() },
+            if n > 0 { style::danger() } else { style::fgb() },
         ));
     }
     lines.push(Line::from(fit(facts, w)));

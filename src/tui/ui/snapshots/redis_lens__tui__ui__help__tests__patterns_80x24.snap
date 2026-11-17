@@ -2,7 +2,7 @@
 source: src/tui/ui/help.rs
 expression: "render(Screen::Patterns, \"\", 80, 24).backend()"
 ---
-"    ┌─ Help · Browse › Keys ────────────────────────────────── esc closes ─┐    "
+"    ┌─ Keys · Browse › Keys ────────────────────────────────── esc closes ─┐    "
 "    │ › type to find any action or screen…                                 │    "
 "    │                                                                      │    "
 "    │ HERE                                                                 │    "

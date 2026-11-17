@@ -420,7 +420,7 @@ fn waiting(frame: &mut Frame, area: Rect, app: &App) {
         None => para(CONNECT_FIRST, w, style::dim()),
         Some(s) => match &s.phase {
             Phase::Failed(e) => {
-                let mut l = para(&format!(" ✗ {e}"), w, style::warn());
+                let mut l = para(&format!(" ✗ {e}"), w, style::danger());
                 l.extend(para(
                     " Press 0 to go back to Connections and try again.",
                     w,
@@ -440,7 +440,7 @@ fn waiting(frame: &mut Frame, area: Rect, app: &App) {
                         why.as_deref().unwrap_or("it was closed")
                     ),
                     w,
-                    style::warn(),
+                    style::danger(),
                 ),
                 _ => para(
                     &format!(" {spin} Waiting for the live connection…"),
@@ -534,7 +534,7 @@ fn names_table(
             format!(" {} Reading key names with SCAN…", spinner(app.tick))
         };
         let st = if names.error.is_some() && app.patterns.filter.is_empty() {
-            style::amber()
+            style::warning()
         } else {
             style::dim()
         };
@@ -587,7 +587,7 @@ fn names_bottom(app: &App, names: &NamesState) -> (String, Style) {
     if let Some(e) = &names.error
         && names.names_read() > 0
     {
-        return (format!(" ▲ {e} n tries again."), style::amber());
+        return (format!(" ▲ {e} n tries again."), style::warning());
     }
     let nodes = names
         .nodes_done()
@@ -599,7 +599,7 @@ fn names_bottom(app: &App, names: &NamesState) -> (String, Style) {
     } else if names.done() {
         (
             format!(" {read} names read · some nodes left out"),
-            style::amber(),
+            style::warning(),
         )
     } else {
         (
@@ -680,7 +680,7 @@ fn names_detail(
                     n.endpoint
                 ),
                 w,
-                style::amber(),
+                style::warning(),
             ));
         }
     }
@@ -694,7 +694,7 @@ fn names_detail(
                     crate::tui::app::views::names::NODE_SKIPPED
                 ),
                 w,
-                style::amber(),
+                style::warning(),
             ));
         }
     }
@@ -703,7 +703,7 @@ fn names_detail(
         lines.extend(para(
             &format!(" ▲ {}", crate::tui::app::views::names::SCAN_REFUSED),
             w,
-            style::amber(),
+            style::warning(),
         ));
     }
     lines.push(Line::default());
@@ -730,7 +730,7 @@ pub(super) fn context_parts(report: &ScanReport) -> Vec<Vec<Span<'static>>> {
     if !bias_warnings(report).is_empty() {
         parts.push(vec![Span::styled(
             "▲ possible sampling bias (keysizes)",
-            style::warn(),
+            style::warning(),
         )]);
     }
     for gap in &ctx.missing {
@@ -785,7 +785,7 @@ pub(super) fn context_parts(report: &ScanReport) -> Vec<Vec<Span<'static>>> {
                     format::grouped(big),
                     plural(big, "key", "keys")
                 ),
-                style::amber(),
+                style::warning(),
             )]);
         }
     }
@@ -872,12 +872,10 @@ pub fn flagged(v: PatternVerdict) -> bool {
     !matches!(v, PatternVerdict::Ok | PatternVerdict::Persistent)
 }
 
-fn mark_style(v: PatternVerdict) -> Style {
-    if v.is_warning() {
-        style::warn()
-    } else {
-        style::amber()
-    }
+/// The `▲` of a flagged verdict and its sentence: a finding, so the warning colour,
+/// whichever verdict it is (none of them is a failure).
+fn mark_style(_v: PatternVerdict) -> Style {
+    style::warning()
 }
 
 /// The pattern a row stands for when it is one pattern (not a group).
@@ -1306,7 +1304,7 @@ fn analysed_row(
     if c.share > 0 {
         let (fill, track) = bar(share, c.share);
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(fill, style::amber()));
+        spans.push(Span::styled(fill, style::data()));
         spans.push(Span::styled(track, style::track()));
         spans.push(Span::styled(
             format!(" {}", pad_l(&format::percent(share), PCT_W)),
@@ -1316,7 +1314,7 @@ fn analysed_row(
     if c.avg {
         let avg = s.avg_bytes().map_or_else(dash, format::bytes);
         let st = match s.verdict {
-            Verdict::Large(_) => style::amber(),
+            Verdict::Large(_) => style::warning(),
             _ => style::fg(),
         };
         spans.push(Span::styled(format!(" {}", pad_l(&avg, NUM_W)), st));
@@ -1324,7 +1322,7 @@ fn analysed_row(
     if c.no_ttl {
         let pct = format::percent(s.no_ttl_ratio());
         let st = match s.verdict {
-            Verdict::MixedTtl(_) => style::warn(),
+            Verdict::MixedTtl(_) => style::warning(),
             _ if s.no_ttl == 0 || s.no_ttl == s.sampled_keys => style::dim(),
             _ => style::fg(),
         };
@@ -1520,10 +1518,11 @@ fn detail(
         )],
         w,
     )));
+    // The "none" bucket is the warning colour when it is what the row is flagged for.
     let none = if matches!(s.verdict, Verdict::MixedTtl(_)) {
-        style::warn()
+        style::warning()
     } else {
-        style::amber()
+        style::data()
     };
     let mut hist = vec![Span::raw(" ")];
     hist.extend(ttl_hist_spans(&s.ttl_hist, none));
@@ -1562,7 +1561,11 @@ fn detail(
             let (ttl, st) = match e.ttl {
                 Ttl::Persistent => (
                     "never".to_string(),
-                    if mixed { style::warn() } else { style::dim() },
+                    if mixed {
+                        style::warning()
+                    } else {
+                        style::dim()
+                    },
                 ),
                 Ttl::Expires(d) => (format::duration(d), style::fg()),
             };

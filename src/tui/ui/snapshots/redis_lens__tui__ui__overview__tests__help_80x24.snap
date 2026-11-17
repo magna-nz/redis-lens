@@ -4,7 +4,7 @@ expression: "snap(&app, 80, 24)"
 ---
 " prod-cache-01  PROD   w  read-only   15G / 24G · 7.92M keys   ● analyzed 14:02 "
 "  1  Overview   2 Browse   3 Analyze   4 Server   5 Pub/Sub       0 Connections "
-"┌─ N┌─ Help · Overview ─────────────────────────────────────── esc closes ─┐s ─┐"
+"┌─ N┌─ Keys · Overview ─────────────────────────────────────── esc closes ─┐s ─┐"
 "│ op│ › type to find any action or screen…                                 │   │"
 "│ ev│                                                                      │   │"
 "│ me│ HERE                                                                 │8M │"

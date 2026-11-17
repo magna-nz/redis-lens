@@ -89,7 +89,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             &mark_previous(app, ""),
             vec![Line::from(vec![
                 Span::raw(" "),
-                Span::styled(spinner(app.tick), style::amber()),
+                Span::styled(spinner(app.tick), style::warning()),
                 Span::styled(" Looking for an earlier snapshot…", style::dim()),
             ])],
         ),
@@ -115,7 +115,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             "Changes",
             &mark_previous(app, ""),
             vec![
-                line(format!(" ✗ Could not load snapshots: {e}"), style::warn()),
+                line(format!(" ✗ Could not load snapshots: {e}"), style::danger()),
                 line(
                     " The other panels still work; only the comparison is missing.".to_string(),
                     style::dim(),
@@ -250,11 +250,12 @@ fn percent_text(p: &PatternDiff, before: Option<u64>, after: Option<u64>) -> Str
     ratio_change(before, Some(after.unwrap_or(0))).map_or_else(|| "—".to_string(), signed_percent)
 }
 
+/// The bar of a change: a quantity, so the data colour, unless the row has a `▲`.
 fn grew_style(c: Change) -> Style {
     if c.is_alarming() {
-        style::warn()
+        style::warning()
     } else {
-        style::amber()
+        style::data()
     }
 }
 
@@ -283,7 +284,7 @@ fn diff_row(
         None => fit(spans, name),
     };
     let why_style = if p.cause == Cause::New {
-        style::warn()
+        style::warning()
     } else {
         style::dim()
     };
@@ -311,7 +312,7 @@ fn diff_row(
             )),
             TREND => {
                 let cells = spark.as_ref().map_or_else(String::new, |s| s.0.clone());
-                spans.push(Span::styled(pad_r(&cells, w), style::fg()));
+                spans.push(Span::styled(pad_r(&cells, w), style::data()));
             }
             BAR => {
                 let len = if c.unchanged || c.value == 0 || max == 0 {
@@ -323,7 +324,7 @@ fn diff_row(
                 let (neg, pos) = if c.value < 0 { (len, 0) } else { (0, len) };
                 spans.extend([
                     Span::raw(" ".repeat(HALF - neg)),
-                    Span::styled("█".repeat(neg), style::ok()),
+                    Span::styled("█".repeat(neg), style::data()),
                     Span::styled("│", style::border()),
                     Span::styled("█".repeat(pos), grew_style(c)),
                     Span::raw(" ".repeat(HALF - pos)),
@@ -357,12 +358,12 @@ fn compare_line(
     let (change, st) = if !available {
         (dash(), style::dim())
     } else if p.cause == Cause::New {
-        ("new".to_string(), style::warn())
+        ("new".to_string(), style::warning())
     } else if p.cause == Cause::Gone {
         ("gone".to_string(), style::ok())
     } else {
         match ratio_change(before, after) {
-            Some(r) if r > 0.05 => (signed_percent(r), style::amber()),
+            Some(r) if r > 0.05 => (signed_percent(r), style::fg()),
             Some(r) if r < -0.05 => (signed_percent(r), style::ok()),
             Some(r) => (signed_percent(r), style::dim()),
             None => (dash(), style::dim()),
@@ -431,7 +432,7 @@ fn trend_lines(t: &Trend, pattern: &str, w: usize) -> Vec<Line<'static>> {
                 None => format!("{abs} a day {over}"),
             };
             let st = match g.ratio_per_day {
-                Some(r) if r >= NOTABLE_GROWTH => style::amber(),
+                Some(r) if r >= NOTABLE_GROWTH => style::warning(),
                 Some(r) if r <= -NOTABLE_GROWTH => style::ok(),
                 _ => style::dim(),
             };
@@ -444,7 +445,7 @@ fn trend_lines(t: &Trend, pattern: &str, w: usize) -> Vec<Line<'static>> {
     };
     let mut lines = vec![Line::from(vec![
         Span::styled(" TREND ", style::hd()),
-        Span::styled(sparkline_for(t, pattern), style::fg()),
+        Span::styled(sparkline_for(t, pattern), style::data()),
     ])];
     lines.extend(paragraph(vec![Span::raw(" ")], " ", &text, st, w));
     lines

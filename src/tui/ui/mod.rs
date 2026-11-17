@@ -308,7 +308,7 @@ fn view_state(frame: &mut Frame, area: Rect, app: &App, screen: Screen) {
     if let Some(why) = ctx.off_reason() {
         let lines = vec![Line::from(Span::styled(
             format!(" ▲ {why}"),
-            style::amber(),
+            style::warning(),
         ))];
         notice_panels(frame, area, title, "off", lines);
         return;
@@ -372,7 +372,10 @@ pub fn mark_previous(app: &App, right: &str) -> String {
 fn provider_notice(lines: &mut Vec<Line<'static>>, p: &crate::model::Profile) {
     if let Some(n) = provider::notice(p.provider) {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled(format!(" ▲ {n}"), style::amber())));
+        lines.push(Line::from(Span::styled(
+            format!(" ▲ {n}"),
+            style::warning(),
+        )));
     }
 }
 
@@ -471,12 +474,15 @@ fn status(app: &App, s: &Session, clock: Clock) -> Vec<Span<'static>> {
     match &s.phase {
         // `esc` asked an analysis that is still connecting to stop.
         Phase::Connecting if s.analysis.is_some() && s.stopped => {
-            vec![Span::styled(format!("{spin} stopping…"), style::amber())]
+            vec![Span::styled(format!("{spin} stopping…"), style::warning())]
         }
         Phase::Connecting if s.analysis.is_some() && s.previous.is_some() => {
-            vec![Span::styled(format!("{spin} analyzing"), style::amber())]
+            vec![Span::styled(format!("{spin} analyzing"), style::warning())]
         }
-        Phase::Connecting => vec![Span::styled(format!("{spin} connecting…"), style::amber())],
+        Phase::Connecting => vec![Span::styled(
+            format!("{spin} connecting…"),
+            style::warning(),
+        )],
         Phase::Connected => vec![
             Span::styled("● ", style::ok()),
             Span::styled(
@@ -486,7 +492,7 @@ fn status(app: &App, s: &Session, clock: Clock) -> Vec<Span<'static>> {
         ],
         // `esc` asked it to stop: it ends after its current batch, keeping what it has.
         Phase::Scanning if s.stopped => {
-            vec![Span::styled(format!("{spin} stopping…"), style::amber())]
+            vec![Span::styled(format!("{spin} stopping…"), style::warning())]
         }
         Phase::Scanning => {
             let pr = s.progress.unwrap_or_default();
@@ -496,7 +502,7 @@ fn status(app: &App, s: &Session, clock: Clock) -> Vec<Span<'static>> {
                 .unwrap_or_default();
             vec![Span::styled(
                 format!("{spin} analyzing{pct}"),
-                style::amber(),
+                style::warning(),
             )]
         }
         Phase::Done => vec![
@@ -515,7 +521,7 @@ fn status(app: &App, s: &Session, clock: Clock) -> Vec<Span<'static>> {
                 style::dim(),
             ),
         ],
-        Phase::Failed(_) => vec![Span::styled("✗ failed", style::warn())],
+        Phase::Failed(_) => vec![Span::styled("✗ failed", style::danger())],
     }
 }
 
@@ -638,7 +644,15 @@ fn header_parts(app: &App, s: &Session) -> Vec<Part> {
         db_rank,
         vec![
             Span::styled(" b ", style::key()),
-            Span::styled(format!(" db {}", p.db), style::fg()),
+            // Any database but 0 is worth noticing: the warning colour.
+            Span::styled(
+                format!(" db {}", p.db),
+                if p.db == 0 {
+                    style::fg()
+                } else {
+                    style::warning()
+                },
+            ),
         ],
     )];
     if let Some(node) = s.node_title() {
@@ -657,13 +671,13 @@ fn header_parts(app: &App, s: &Session) -> Vec<Part> {
     // A connect waiting on the OS keychain says so first: during an analysis the old
     // results stay in the body, where the hint would otherwise go.
     if let Some(hint) = app.keychain_hint() {
-        parts.push(Part::fact(0, Span::styled(hint, style::amber())).cut());
+        parts.push(Part::fact(0, Span::styled(hint, style::warning())).cut());
     }
     match &cluster {
         Some(summary) => {
             let nodes = s.report.as_ref().and_then(|r| r.nodes.as_deref());
             let st = if cluster_degraded(summary, nodes) {
-                style::amber()
+                style::warning()
             } else {
                 style::dim()
             };
@@ -678,7 +692,7 @@ fn header_parts(app: &App, s: &Session) -> Vec<Part> {
     }
     if s.read_alone() {
         // A cluster node read alone on purpose: only its keys are seen.
-        parts.push(Part::fact(1, Span::styled("standalone", style::amber())));
+        parts.push(Part::fact(1, Span::styled("standalone", style::warning())));
     }
     match &s.target {
         Some(ScanTarget::Replica(ep)) => parts.push(Part::fact(
@@ -690,7 +704,7 @@ fn header_parts(app: &App, s: &Session) -> Vec<Part> {
         )),
         Some(ScanTarget::PrimaryFallback(_)) => parts.push(Part::fact(
             3,
-            Span::styled("primary (replica unreachable)", style::amber()),
+            Span::styled("primary (replica unreachable)", style::warning()),
         )),
         _ => {}
     }
@@ -718,7 +732,7 @@ fn header_parts(app: &App, s: &Session) -> Vec<Part> {
         ));
     }
     if sizes_unavailable(app, s) {
-        parts.push(Part::fact(4, Span::styled("▲ no sizes", style::warn())));
+        parts.push(Part::fact(4, Span::styled("▲ no sizes", style::danger())));
     }
     parts
 }
@@ -793,11 +807,11 @@ fn fit_parts(
 /// `WRITES ON` badge on a `prod` profile with writes on.
 fn write_state(p: &crate::model::Profile) -> Span<'static> {
     if p.is_read_only() {
-        Span::styled("read-only", style::amber())
+        Span::styled("read-only", style::warning())
     } else if p.env == crate::model::Env::Prod {
         Span::styled(" WRITES ON ", style::env_badge(crate::model::Env::Prod))
     } else {
-        Span::styled("writes on", style::warn())
+        Span::styled("writes on", style::danger())
     }
 }
 
@@ -1160,10 +1174,12 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
     } else if let Some(input) = app.view_input() {
         input_line(input.label, input.text, input.hint, w)
     } else if let Some(n) = &app.notice {
+        // An error notice is the danger colour; an info notice is plain text (it says
+        // what happened: "Copied the pattern", "Analysis done"), not a warning.
         let s = if n.error {
-            style::warn()
+            style::danger()
         } else {
-            style::amber()
+            style::fg()
         };
         Line::from(Span::styled(format!(" {}", n.text), s))
     } else {

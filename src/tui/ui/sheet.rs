@@ -58,6 +58,17 @@ const LABEL_W: usize = 9;
 /// Said on the answer line, and in the footer, while it waits.
 pub const WAIT: &str = "wait…";
 
+/// The style of the go key's word: the danger colour for a verb that loses data
+/// (`Delete`, the word the write gate puts on every destructive or bulk delete), plain
+/// for the others (`Send`, `Set TTLs`, `Start`, `Turn on`).
+pub fn verb_style(verb: &str) -> Style {
+    if verb == "Delete" {
+        style::danger()
+    } else {
+        style::fg()
+    }
+}
+
 impl Sheet {
     /// The footer while it is open: its answer keys, or only the cancel while it
     /// waits.
@@ -116,12 +127,15 @@ impl Sheet {
         if let Answer::Type { name, .. } = &self.answer {
             let ask = format!("Type {} and press enter", crate::value::escape(name));
             for part in wrap_hard(&ask, w.saturating_sub(2)) {
-                out.push(Line::from(Span::styled(format!(" {part}"), style::amber())));
+                out.push(Line::from(Span::styled(
+                    format!(" {part}"),
+                    style::warning(),
+                )));
             }
         }
         if self.wait {
             out.push(Line::from(vec![
-                Span::styled(format!(" {WAIT}"), style::amber()),
+                Span::styled(format!(" {WAIT}"), style::warning()),
                 Span::styled("   esc cancels", style::dim()),
             ]));
             return out;
@@ -130,7 +144,8 @@ impl Sheet {
             Answer::YesNo(verb) => out.push(Line::from(vec![
                 Span::raw(" "),
                 Span::styled(" y ", style::key()),
-                Span::styled(format!(" {verb}   "), style::fg()),
+                Span::styled(format!(" {verb}"), verb_style(verb)),
+                Span::raw("   "),
                 Span::styled(" n ", style::key()),
                 Span::styled(" Cancel", style::fg()),
             ])),

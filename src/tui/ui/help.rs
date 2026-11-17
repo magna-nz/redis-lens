@@ -132,7 +132,7 @@ pub fn draw_for(
         )));
     }
     let h = (lines.len() as u16).saturating_add(2);
-    let title = format!("Help · {}", screen.title());
+    let title = format!("Keys · {}", screen.title());
     // The way out sits in the top border, so it shows however many keys there are.
     let body = dialog(frame, area, w, h, &title, "esc closes");
     let body = Rect {

@@ -37,7 +37,7 @@ fn progress(done: u64, total: u64, w: usize) -> Line<'static> {
     let (fill, track) = bar(ratio, bw);
     Line::from(vec![
         Span::raw(" "),
-        Span::styled(fill, style::ok()),
+        Span::styled(fill, style::data()),
         Span::styled(track, style::track()),
         Span::styled(label, style::fgb()),
     ])
@@ -71,7 +71,7 @@ pub fn draw(frame: &mut Frame, area: Rect, b: &Bulk, tick: u64) {
                 Span::styled("▏", style::focus()),
             ]));
             if let Some(e) = error {
-                text(&mut lines, e, style::warn(), inner);
+                text(&mut lines, e, style::danger(), inner);
             }
         }
         Stage::Counting { count, .. } => {
@@ -143,7 +143,7 @@ pub fn draw(frame: &mut Frame, area: Rect, b: &Bulk, tick: u64) {
                 text(
                     &mut lines,
                     "Stopping after this batch…",
-                    style::amber(),
+                    style::warning(),
                     inner,
                 );
             }
@@ -151,7 +151,7 @@ pub fn draw(frame: &mut Frame, area: Rect, b: &Bulk, tick: u64) {
         Stage::Done(d) => {
             for (i, l) in d.lines.iter().enumerate() {
                 let s = if i == 0 && d.error {
-                    style::warn()
+                    style::danger()
                 } else if i == 0 {
                     style::ok()
                 } else {

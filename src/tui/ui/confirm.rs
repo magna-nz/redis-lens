@@ -42,7 +42,13 @@ pub fn sheet(c: &Confirm) -> Sheet {
         if let Some(cmd) = text.strip_prefix("Sends: ") {
             sends = Some(("Sends", cmd.to_string(), style::fgb()));
         } else if is_undo(&text) {
-            undo.push(("", text, style::fg()));
+            // "This can't be undone." is the danger colour; "… undoes it" is plain.
+            let st = if text.contains("can't be undone") {
+                style::danger()
+            } else {
+                style::fg()
+            };
+            undo.push(("", text, st));
         } else {
             lines.push(("", text, style::fg()));
         }
