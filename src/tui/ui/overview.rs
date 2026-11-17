@@ -8,6 +8,9 @@
 //! "Keys" is built from blocks (a heading and its rows) that are fitted to the height:
 //! a block is shown only with at least one of its rows, so a heading never stands
 //! alone, and the rows left over go to the blocks in order.
+//!
+//! From 120 columns each block is a box of its own instead, in two columns under
+//! "Now" ([`box_layout`] places them, [`draw_boxes`] draws them).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -49,12 +52,10 @@ const VALUE_W: usize = 7;
 const TOP_PATTERNS: usize = 3;
 /// From this width on, "Keys" also shows what TTLs free.
 const WIDE: usize = 100;
-/// From this body width on, Overview draws two panes under "Now": the findings at the
-/// left, the memory at the right.
-pub const TWO_PANES: u16 = 120;
-/// The panes' rows at the least (borders included); with fewer, one column.
-const PANES_MIN_H: u16 = 8;
-/// The left pane's share of the width.
+/// From this body width on, Overview draws its blocks in boxes under "Now", in two
+/// columns: the findings at the left, the memory at the right (see [`box_layout`]).
+pub const TWO_PANES: u16 = super::widgets::SIDE_AT;
+/// The left column's share of the width.
 const THINGS_SHARE: f64 = 0.55;
 /// Slow-log entries "SLOWEST IN THE SLOW LOG" names at most.
 const SLOWEST: usize = 3;
@@ -80,14 +81,20 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let now = now_lines(&ctx, app, w);
     let now_rows = u16::try_from(now.len()).unwrap_or(u16::MAX);
     let (now_left, now_right) = now_titles(&ctx, app);
-    // From 120 columns, two panes under "Now", when there is room for them.
+    // From 120 columns, boxes under "Now", when there is room for them.
     if area.width >= TWO_PANES
         && two_pane_state(ctx.session)
-        && area.height >= now_rows.saturating_add(2 + PANES_MIN_H)
+        && draw_boxes(frame, area, app, ctx.session, &now, (&now_left, &now_right))
     {
-        two_panes(frame, area, app, ctx.session, now, (&now_left, &now_right));
         return;
     }
+    // "Keys" keeps a row for the line that counts the reasons a part is off, taken from
+    // "Now" when the body is that short.
+    let now_rows = if keys_reasons(app, ctx.session) {
+        now_rows.min(area.height.saturating_sub(4))
+    } else {
+        now_rows
+    };
     // The frame's top border, the divider and the bottom border.
     let keys_h = usize::from(area.height.saturating_sub(3).saturating_sub(now_rows));
     let (keys, keys_right) = keys_lines(app, ctx.session, w, keys_h);
@@ -109,6 +116,17 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     );
     rows(frame, inner[0], now, None);
     rows(frame, inner[1], keys, None);
+}
+
+/// True when "Keys" on one column lists reasons that a part is off: "FROM THE SERVER"
+/// is shown (before an analysis and while one runs) and some part is off.
+fn keys_reasons(app: &App, s: &Session) -> bool {
+    let server_block = match &s.phase {
+        Phase::Connecting if s.analysis.is_none() => false,
+        Phase::Failed(_) if app.report().is_none() => false,
+        _ => app.analysis_running() || !shows_analysis(app),
+    };
+    server_block && !off_reasons(app).is_empty()
 }
 
 /// "Now" on its own, or on a cluster the picked node (`[` `]` pick another); on the
@@ -436,6 +454,9 @@ struct Block {
     rows: Vec<Line<'static>>,
     /// The selected row, kept on screen when the rows are cut.
     sel: Option<usize>,
+    /// How many of the last rows are reasons that a part is off: never cut without a
+    /// line that counts them.
+    reasons: usize,
 }
 
 impl Block {
@@ -444,6 +465,7 @@ impl Block {
             head: head.into_iter().collect(),
             rows,
             sel: None,
+            reasons: 0,
         }
     }
 }
@@ -456,42 +478,126 @@ fn fit_blocks(prefix: Vec<Line<'static>>, blocks: Vec<Block>, h: usize) -> Vec<L
     fit_blocks_sel(prefix, blocks, h).0
 }
 
-/// [`fit_blocks`], and the rows drawn of the block with a selection (the findings),
-/// 0 when it is not drawn: what PgUp and PgDn move by on Overview.
-fn fit_blocks_sel(
-    prefix: Vec<Line<'static>>,
-    blocks: Vec<Block>,
-    h: usize,
-) -> (Vec<Line<'static>>, usize) {
-    let mut sel_rows = 0;
-    let mut left = h.saturating_sub(prefix.len());
-    let mut shown: Vec<(Block, usize)> = Vec::new();
-    for b in blocks.into_iter().filter(|b| !b.rows.is_empty()) {
-        let sep = usize::from(!shown.is_empty());
-        let need = sep + b.head.len() + 1;
+/// How [`fit_blocks_sel`] lays the blocks out: the prefix lines kept, and per block
+/// whether its heading is shown and its rows (0: not shown).
+struct Plan {
+    prefix: usize,
+    heads: Vec<bool>,
+    rows: Vec<usize>,
+}
+
+/// The plan of `blocks` under `prefix` lines in `h` rows. `force`: the block (one with
+/// reasons) that is shown whatever it costs the others, with its heading, its selected
+/// row and a line that counts its reasons when there is room, else that line alone.
+fn plan_blocks(prefix: usize, blocks: &[Block], h: usize, force: Option<usize>) -> Plan {
+    let k = blocks.len();
+    let mut plan = Plan {
+        prefix: prefix.min(h),
+        heads: vec![true; k],
+        rows: vec![0; k],
+    };
+    let mut left = h.saturating_sub(prefix);
+    if let Some(f) = force {
+        let b = &blocks[f];
+        let finds = usize::from(b.rows.len() > b.reasons);
+        let least = b.rows.len().min(1 + finds);
+        let mut need = b.head.len() + least;
+        if need > h {
+            // The heading and the selected row go; the count line stays.
+            plan.heads[f] = false;
+            need = 1;
+        }
+        plan.prefix = prefix.min(h.saturating_sub(need));
+        left = h.saturating_sub(plan.prefix + need);
+        plan.rows[f] = if plan.heads[f] { least } else { 1 };
+    }
+    for (i, b) in blocks.iter().enumerate() {
+        if plan.rows[i] > 0 {
+            continue;
+        }
+        let shown_before = plan.rows[..i].iter().any(|&n| n > 0);
+        let sep = usize::from(shown_before);
+        // Showing the first block before the forced one puts a blank line above that.
+        let pushes = usize::from(!shown_before && force.is_some_and(|f| f > i));
+        let need = sep + pushes + b.head.len() + 1;
         if need > left {
             // Later blocks may be smaller; keep trying.
             continue;
         }
         left -= need;
-        shown.push((b, 1));
+        plan.rows[i] = 1;
     }
-    for (b, n) in &mut shown {
-        let more = (b.rows.len() - *n).min(left);
-        *n += more;
+    for (i, b) in blocks.iter().enumerate() {
+        if plan.rows[i] == 0 {
+            continue;
+        }
+        let more = b.rows.len().saturating_sub(plan.rows[i]).min(left);
+        plan.rows[i] += more;
         left -= more;
     }
-    let mut out = prefix;
-    for (i, (b, n)) in shown.into_iter().enumerate() {
-        if i > 0 {
+    plan
+}
+
+/// [`fit_blocks`], and the rows drawn of the block with a selection (the findings),
+/// 0 when it is not drawn: what PgUp and PgDn move by on Overview.
+///
+/// A block with reasons that a part is off never loses them silently: when its rows
+/// are cut, its last row counts the reasons that are not shown (`… 2 more reasons: v
+/// shows them`), and when it would not be shown at all it is shown first, at the cost
+/// of the other blocks and the prefix.
+fn fit_blocks_sel(
+    prefix: Vec<Line<'static>>,
+    blocks: Vec<Block>,
+    h: usize,
+) -> (Vec<Line<'static>>, usize) {
+    let blocks: Vec<Block> = blocks.into_iter().filter(|b| !b.rows.is_empty()).collect();
+    let mut plan = plan_blocks(prefix.len(), &blocks, h, None);
+    if let Some(f) = blocks.iter().position(|b| b.reasons > 0)
+        && plan.rows[f] == 0
+        && h > 0
+    {
+        plan = plan_blocks(prefix.len(), &blocks, h, Some(f));
+    }
+    let mut sel_rows = 0;
+    let mut out: Vec<Line<'static>> = prefix.into_iter().take(plan.prefix).collect();
+    let mut first = true;
+    for (i, b) in blocks.into_iter().enumerate() {
+        let n = plan.rows[i];
+        if n == 0 {
+            continue;
+        }
+        if !first {
             out.push(Line::default());
         }
-        out.extend(b.head);
-        if b.sel.is_some() {
-            sel_rows = n;
+        first = false;
+        if plan.heads[i] {
+            out.extend(b.head);
         }
-        let from = b.sel.map_or(0, |s| scroll_offset(s, n));
-        out.extend(b.rows.into_iter().skip(from).take(n));
+        let total = b.rows.len();
+        let finds = total - b.reasons;
+        // Cut with reasons out of view: the last row counts them.
+        let in_view = |n: usize| {
+            let from = b.sel.map_or(0, |s| scroll_offset(s, n));
+            (from..(from + n).min(total))
+                .filter(|&r| r >= finds)
+                .count()
+        };
+        let counted = b.reasons > 0 && in_view(n) < b.reasons;
+        let window = if counted { n - 1 } else { n };
+        let from = b.sel.map_or(0, |s| scroll_offset(s, window));
+        let shown = from..(from + window).min(total);
+        if b.sel.is_some() {
+            sel_rows = shown.clone().filter(|&r| r < finds).count();
+        }
+        let hidden = b.reasons - shown.clone().filter(|&r| r >= finds).count();
+        out.extend(b.rows.into_iter().skip(from).take(window));
+        if counted {
+            let s_ = if hidden == 1 { "reason" } else { "reasons" };
+            out.push(Line::from(Span::styled(
+                format!("   … {hidden} more {s_}: v shows them"),
+                style::dim(),
+            )));
+        }
     }
     (out, sel_rows)
 }
@@ -558,7 +664,7 @@ fn where_head(title: &str, note: &str, w: usize) -> Line<'static> {
     where_head_at(title, note, w, place_col(w))
 }
 
-/// Where the WHERE column starts in the two panes: as far right as its longest value
+/// Where the WHERE column starts in the boxes: as far right as its longest value
 /// lets it, so the findings get the width.
 fn place_col_for(found: &[Finding], w: usize) -> usize {
     let longest = found
@@ -590,14 +696,6 @@ fn where_head_at(title: &str, note: &str, w: usize, at: usize) -> Line<'static> 
 /// The findings as rows: `› ▲ text … Big keys`, `sel` marked.
 fn finding_rows(found: &[Finding], sel: usize, w: usize) -> Vec<Line<'static>> {
     finding_rows_at(found, sel, w, place_col(w))
-}
-
-/// The cells before a finding's text: the cursor and the mark.
-const FINDING_LEAD: usize = 5;
-
-/// True when `f`'s sentence is shown whole in its row with WHERE at `at`.
-fn finding_fits(f: &Finding, at: usize) -> bool {
-    FINDING_LEAD + super::widgets::width(&f.text) <= at.saturating_sub(1)
 }
 
 /// [`finding_rows`] with WHERE at column `at`.
@@ -833,6 +931,7 @@ fn server_block(app: &App, w: usize, note: bool) -> Block {
             style::dim(),
         )));
     }
+    let n = reasons.len();
     rows.extend(reasons);
     let mut b = Block::new(
         Some(where_head(
@@ -843,6 +942,7 @@ fn server_block(app: &App, w: usize, note: bool) -> Block {
         rows,
     );
     b.sel = (!found.is_empty()).then(|| app.overview.sel.min(found.len() - 1));
+    b.reasons = n;
     b
 }
 
@@ -1059,19 +1159,16 @@ fn freed_line(r: &ScanReport, w: usize) -> Line<'static> {
                 style::fg(),
             ));
         }
-        None => spans.push(Span::styled(
-            "needs key sizes (MEMORY USAGE), which this analysis did not read",
-            style::dim(),
-        )),
+        None => spans.push(Span::styled(FREED_NEEDS, style::dim())),
     }
     Line::from(fit(spans, w))
 }
 
 // ---------------------------------------------------------------------------
-// Two panes (from 120 columns)
+// Boxes (from 120 columns)
 // ---------------------------------------------------------------------------
 
-/// True when the two panes have something of their own to show: not while the first
+/// True when the boxes have something of their own to show: not while the first
 /// connect runs, nor after one that failed with nothing to show (those say so on one
 /// column, as at 80).
 fn two_pane_state(s: &Session) -> bool {
@@ -1082,68 +1179,486 @@ fn two_pane_state(s: &Session) -> bool {
     }
 }
 
-/// "Now" across the top, then "Things to look at" (the findings, the selected one
-/// explained under them, what is off) at the left and "Where the memory is" at the
-/// right, filling the rest of the height.
-fn two_panes(
+/// One way a column's two boxes under its filling box are drawn: each one's content
+/// rows, `None` when it is not drawn. A column's steps go from all of it to the least.
+type Step = [Option<u16>; 2];
+
+/// What the boxes under "Now" hold, in content rows: the input of [`box_layout`].
+#[derive(Debug, Clone, Default)]
+struct Wants {
+    now: u16,
+    /// Rows "Things to look at" keeps before the other boxes give up theirs (its header
+    /// and findings, at most [`THINGS_WANT`]).
+    things: u16,
+    /// Rows "Things to look at" needs to show every finding.
+    things_all: u16,
+    /// The left column's steps, "Selected" and "Off"; at least one.
+    left: Vec<Step>,
+    /// The right column's steps, "Freed by TTL" and "Slowest"; at least one.
+    right: Vec<Step>,
+}
+
+/// Where each box goes, borders included; a box that is not drawn is `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Boxes {
+    now: Rect,
+    things: Rect,
+    selected: Option<Rect>,
+    off: Option<Rect>,
+    memory: Rect,
+    freed: Option<Rect>,
+    slow: Option<Rect>,
+    /// Blank rows between two boxes: 1, or 0 once they were given up.
+    gap: u16,
+    /// The step each column draws (an index into [`Wants::left`] and [`Wants::right`]).
+    left_step: usize,
+    right_step: usize,
+}
+
+/// Content rows "Where the memory is" keeps before the boxes under it give up theirs.
+const FILL_MIN: u16 = 5;
+/// The content rows "Things to look at" and "Where the memory is" get at the least,
+/// once every other box has given up what it can.
+const FILL_FLOOR: u16 = 3;
+/// The most rows "Things to look at" keeps before the other boxes give up theirs: its
+/// header and five findings.
+const THINGS_WANT: u16 = 6;
+/// The columns' rows at the least (borders included); with fewer, one column.
+const COLS_MIN_H: u16 = 8;
+/// A box's top and bottom border.
+const BORDERS: u16 = 2;
+
+/// The widths of the two columns of boxes in a body `width` wide: the left (the
+/// findings) about 55%, one blank column, the right the rest.
+fn column_widths(width: u16) -> (u16, u16) {
+    let both = width.saturating_sub(1);
+    let left = super::widgets::split_at(both, THINGS_SHARE);
+    (left, both - left)
+}
+
+/// The rows a step's boxes take, borders and the blank rows above them included.
+fn step_cost(s: &Step, gap: u16) -> u16 {
+    s.iter().flatten().fold(0u16, |a, n| {
+        a.saturating_add(n.saturating_add(BORDERS + gap))
+    })
+}
+
+/// The step a column draws in `h` rows, and the outer height its filling box gets:
+/// the first step that leaves the filling box `want` content rows; else, when
+/// `give` allows giving up rows, the last step, if it leaves `FILL_FLOOR`.
+fn fit_column(h: u16, gap: u16, steps: &[Step], want: u16, give: bool) -> Option<(usize, u16)> {
+    let n = if give { steps.len() } else { 1 };
+    for (i, s) in steps.iter().take(n).enumerate() {
+        if let Some(fill) = h.checked_sub(step_cost(s, gap))
+            && fill >= want + BORDERS
+        {
+            return Some((i, fill));
+        }
+    }
+    if !give {
+        return None;
+    }
+    let last = steps.len().checked_sub(1)?;
+    let fill = h.checked_sub(step_cost(&steps[last], gap))?;
+    (fill >= FILL_FLOOR + BORDERS).then_some((last, fill))
+}
+
+/// What [`place`] decides: the gap, and each column's step with its filling box's
+/// outer height.
+type Placed = (u16, (usize, u16), (usize, u16));
+
+/// The gap, each column's step and its filling box's outer height in `area`, before
+/// "Things to look at" is held to what a taller terminal gives it.
+fn place(area: Rect, w: &Wants) -> Option<Placed> {
+    let (lw, rw) = column_widths(area.width);
+    if lw < 12 || rw < 12 || w.left.is_empty() || w.right.is_empty() {
+        return None;
+    }
+    let now_h = w.now.checked_add(BORDERS)?;
+    let h = area.height.checked_sub(now_h)?;
+    if h < COLS_MIN_H {
+        return None;
+    }
+    // The blank rows stay while every box is whole beside them.
+    if let Some(h1) = h.checked_sub(1)
+        && let Some(l) = fit_column(h1, 1, &w.left, w.things, false)
+        && let Some(r) = fit_column(h1, 1, &w.right, FILL_MIN, false)
+    {
+        return Some((1, l, r));
+    }
+    let l = fit_column(h, 0, &w.left, w.things, true)?;
+    let r = fit_column(h, 0, &w.right, FILL_MIN, true)?;
+    Some((0, l, r))
+}
+
+/// Where the boxes go in `area` (the body): "Now" across the top, the left column
+/// under it at the left and the right column at the right, a blank row between two
+/// boxes and a blank column between the columns.
+///
+/// When the rows do not fit, they are given up in this order: first the blank rows;
+/// then each column on its own goes through its steps (the right: "Slowest", then
+/// "Freed by TTL" short, then without it; the left: "Selected" short, then "Off" a
+/// reason at a time down to the line that counts them, then without "Selected"), while
+/// its filling box keeps [`THINGS_WANT`] or [`FILL_MIN`] rows; only then is the filling
+/// box squeezed, to [`FILL_FLOOR`] rows at the least. "Things to look at" never gets
+/// more rows than a taller terminal gives it (the rest stay blank under the column),
+/// so a shorter terminal never shows more findings. `None` when the columns would get fewer
+/// than [`COLS_MIN_H`] rows, when they are too narrow, or when a column does not fit
+/// even then: Overview is then drawn on one column.
+fn box_layout(area: Rect, w: &Wants) -> Option<Boxes> {
+    let (gap, (li, lraw), (ri, rfill)) = place(area, w)?;
+    // Held to the least a taller terminal gives it. With the blank rows every box is
+    // whole, and a taller terminal only gives it more.
+    let mut lfill = lraw;
+    if gap == 0 {
+        let reach = step_cost(&w.left[0], 1)
+            .saturating_add(step_cost(&w.right[0], 1))
+            .saturating_add(w.things_all)
+            .saturating_add(8);
+        for k in 1..=reach {
+            let taller = Rect {
+                height: area.height.saturating_add(k),
+                ..area
+            };
+            if taller.height == area.height {
+                break;
+            }
+            if let Some((_, (_, l), _)) = place(taller, w) {
+                lfill = lfill.min(l);
+            }
+        }
+    }
+    let (lw, rw) = column_widths(area.width);
+    let now_h = w.now + BORDERS;
+    let top = area.y + now_h + gap;
+    let stack = |x: u16, width: u16, fill: u16, step: &Step| {
+        let mut y = top;
+        [
+            Some(fill),
+            step[0].map(|n| n + BORDERS),
+            step[1].map(|n| n + BORDERS),
+        ]
+        .map(|h| {
+            h.map(|h| {
+                let r = Rect::new(x, y, width, h);
+                y = y.saturating_add(h).saturating_add(gap);
+                r
+            })
+        })
+    };
+    let [things, selected, off] = stack(area.x, lw, lfill, &w.left[li]);
+    let [memory, freed, slow] = stack(area.x.saturating_add(lw + 1), rw, rfill, &w.right[ri]);
+    Some(Boxes {
+        now: Rect {
+            height: now_h,
+            ..area
+        },
+        things: things?,
+        selected,
+        off,
+        memory: memory?,
+        freed,
+        slow,
+        gap,
+        left_step: li,
+        right_step: ri,
+    })
+}
+
+/// The left column's steps: everything; "Selected" short; without "Selected" (its
+/// finding is still in the list); then "Off" a reason at a time down to the line that
+/// counts them. A reason is the last thing to go. `sel` is "Selected"'s rows and its
+/// short form's, `off` the sizes "Off" can take, largest first.
+fn left_steps(sel: Option<(u16, u16)>, off: &[u16]) -> Vec<Step> {
+    let first = off.first().copied();
+    let mut out = vec![
+        [sel.map(|s| s.0), first],
+        [sel.map(|s| s.1.min(s.0)), first],
+        [None, first],
+    ];
+    out.extend(off.iter().skip(1).map(|o| [None, Some(*o)]));
+    out.dedup();
+    out
+}
+
+/// The right column's steps: everything; without "Slowest"; "Freed by TTL" short;
+/// without it. `freed` is its rows and its short form's.
+fn right_steps(freed: Option<(u16, u16)>, slow: Option<u16>) -> Vec<Step> {
+    let mut out = vec![
+        [freed.map(|f| f.0), slow],
+        [freed.map(|f| f.0), None],
+        [freed.map(|f| f.1.min(f.0)), None],
+        [None, None],
+    ];
+    out.dedup();
+    out
+}
+
+/// What the "Off" box holds: a stopped analysis's note, each reason that is off
+/// (wrapped), and the provider's notice.
+struct OffParts {
+    notes: Vec<Line<'static>>,
+    reasons: Vec<Vec<Line<'static>>>,
+    provider: Vec<Line<'static>>,
+    /// The notes there are: the stopped analysis's and the provider's, 0 to 2.
+    note_count: usize,
+    /// `v` is on: everything is meant to show, so the count line does not offer it.
+    more: bool,
+}
+
+impl OffParts {
+    fn new(app: &App, s: &Session, w: usize) -> Self {
+        let mut notes = Vec::new();
+        if stopped_early(s)
+            && let Some(r) = app.report()
+        {
+            notes.extend(wrap_lines(
+                &format!(
+                    " The analysis was stopped early: these come from {} keys only.",
+                    format::grouped(r.sampled_keys)
+                ),
+                w,
+                style::dim(),
+            ));
+        }
+        let reasons = off_reasons(app)
+            .iter()
+            .map(|r| wrap_lines(&format!(" Off: {}", off_text(r)), w, style::dim()))
+            .collect();
+        // The provider's notice wrapped, not cut: the box has the rows for it.
+        let provider: Vec<Line<'static>> = crate::conn::provider::notice(s.profile.provider)
+            .map(|n| wrap_lines(&format!(" ▲ {n}"), w, style::warning()))
+            .unwrap_or_default();
+        let note_count = usize::from(!notes.is_empty()) + usize::from(!provider.is_empty());
+        Self {
+            notes,
+            reasons,
+            provider,
+            note_count,
+            more: app.more_here(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.notes.is_empty() && self.reasons.is_empty() && self.provider.is_empty()
+    }
+
+    /// "Off" when it holds only reasons that are off, else "Notes".
+    fn title(&self) -> &'static str {
+        if self.note_count == 0 { "Off" } else { "Notes" }
+    }
+
+    /// The rows of each form it can take, largest first: everything; the notes, the
+    /// first reasons and a line that counts the rest, one reason less each time; one
+    /// line that counts the reasons and the notes.
+    fn sizes(&self) -> Vec<u16> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        let n = |v: usize| u16::try_from(v).unwrap_or(u16::MAX);
+        let lens: Vec<usize> = self.reasons.iter().map(Vec::len).collect();
+        let fixed = self.notes.len() + self.provider.len();
+        let mut out = vec![n(fixed + lens.iter().sum::<usize>())];
+        for j in (0..lens.len()).rev() {
+            out.push(n(fixed + lens[..j].iter().sum::<usize>() + 1));
+        }
+        out.push(1);
+        out.sort_unstable_by(|a, b| b.cmp(a));
+        out.dedup();
+        out
+    }
+
+    /// Its lines in `room` rows: the largest of [`OffParts::sizes`] that fits.
+    fn lines(self, room: usize, w: usize) -> Vec<Line<'static>> {
+        let lens: Vec<usize> = self.reasons.iter().map(Vec::len).collect();
+        let fixed = self.notes.len() + self.provider.len();
+        let all = fixed + lens.iter().sum::<usize>();
+        if all <= room {
+            let mut out = self.notes;
+            out.extend(self.reasons.into_iter().flatten());
+            out.extend(self.provider);
+            return out;
+        }
+        // Whole reasons while they leave a line for the count, with the notes.
+        let shown = (0..lens.len())
+            .rev()
+            .find(|&j| fixed + lens[..j].iter().sum::<usize>() < room)
+            .filter(|_| fixed < room);
+        // With `v` on, what it would offer is on already: say they do not fit.
+        let how = if self.more {
+            " do not fit"
+        } else {
+            ": v shows them"
+        };
+        let count = |reasons: usize, notes: usize| {
+            let r = if reasons == 1 { "reason" } else { "reasons" };
+            let n = if notes == 1 { "note" } else { "notes" };
+            let text = match (reasons, notes) {
+                (0, k) => format!(" … {k} {n}{how}"),
+                (k, 0) => format!(" … {k} more {r}{how}"),
+                (k, m) => format!(" … {k} more {r} and {m} {n}{how}"),
+            };
+            Line::from(Span::styled(trunc(&text, w), style::dim()))
+        };
+        match shown {
+            Some(j) => {
+                let mut out = self.notes;
+                let cut = self.reasons.len() - j;
+                out.extend(self.reasons.into_iter().take(j).flatten());
+                out.push(count(cut, 0));
+                out.extend(self.provider);
+                out
+            }
+            None => vec![count(self.reasons.len(), self.note_count)],
+        }
+    }
+}
+
+/// The selected finding explained, as the "Selected" box holds it: its sentence and
+/// its hint (for a recommendation), wrapped; its short form, the sentence on one line;
+/// and the `Area › Panel` `enter` opens, which the box's title says.
+fn selected_lines(f: &Finding, w: usize) -> (Vec<Line<'static>>, Vec<Line<'static>>, String) {
+    let (mark, st) = match f.severity {
+        Severity::Warn | Severity::Note => ("▲", style::warning()),
+        Severity::Info => ("●", style::dim()),
+    };
+    let to = match f.to.panel() {
+        Some(p) => format!("{} › {}", f.to.area().title(), p.name()),
+        None => f.to.area().title().to_string(),
+    };
+    let sentence = format!(" {mark} {}", f.text);
+    let mut full = wrap_lines(&sentence, w, st);
+    if !f.hint.is_empty() {
+        full.extend(wrap_lines(&format!(" {}", f.hint), w, style::fg()));
+    }
+    let short = vec![Line::from(Span::styled(trunc(&sentence, w), st))];
+    (full, short, to)
+}
+
+/// "Now" across the top, then the findings, the selected one explained and what is
+/// off in boxes at the left, the memory, what TTLs free and the slow log's slowest in
+/// boxes at the right (see [`box_layout`]). False, with nothing drawn, when they do not
+/// fit: Overview is then drawn on one column.
+fn draw_boxes(
     frame: &mut Frame,
     area: Rect,
     app: &App,
     s: &Session,
-    now: Vec<Line<'static>>,
+    now: &[Line<'static>],
     (now_left, now_right): (&str, &str),
-) {
-    let now_rows = u16::try_from(now.len()).unwrap_or(u16::MAX);
-    // "Now" in a frame of its own whose bottom border is the panes' top border.
-    let top = Rect {
-        height: now_rows + 2,
-        ..area
+) -> bool {
+    let (lw, rw) = column_widths(area.width);
+    let lw_in = usize::from(lw.saturating_sub(2));
+    let rw_in = usize::from(rw.saturating_sub(2));
+    let found = findings(app);
+    let sel = app.overview.sel.min(found.len().saturating_sub(1));
+    let at = place_col_for(&found, lw_in);
+    let selected = found.get(sel).map(|f| selected_lines(f, lw_in));
+    let off = OffParts::new(app, s, lw_in);
+    // What TTLs free and the slowest in the slow log, once an analysis is shown.
+    let report = if app.analysis_running() || !shows_analysis(app) {
+        None
+    } else {
+        app.report()
     };
-    // No section has the keys there: the findings do.
-    let inner = super::widgets::sections_focused(
+    let freed = report.map(|r| freed_box(r, rw_in));
+    let slow = report
+        .and_then(|_| slow_block(&app.views.server.slow.entries, rw_in))
+        .map(|b| b.rows);
+    let n = |v: usize| u16::try_from(v).unwrap_or(u16::MAX);
+    let things_all = n(found.len().max(1) + 1);
+    let wants = Wants {
+        now: n(now.len()),
+        things: things_all.clamp(FILL_FLOOR, THINGS_WANT),
+        things_all,
+        left: left_steps(
+            selected
+                .as_ref()
+                .map(|(full, short, _)| (n(full.len()), n(short.len().max(1)))),
+            &off.sizes(),
+        ),
+        right: right_steps(
+            freed.as_ref().map(|f| (n(f.full.len()), n(f.short.len()))),
+            slow.as_ref().map(|l| n(l.len())),
+        ),
+    };
+    let Some(b) = box_layout(area, &wants) else {
+        return false;
+    };
+    let inner = super::widgets::titled_box(frame, b.now, Title::new(now_left, now_right), false);
+    rows(frame, inner, now.to_vec(), None);
+    // "Things to look at" has the keys: `↑↓` move its selection, `enter` opens it.
+    let list_h = usize::from(b.things.height.saturating_sub(BORDERS + 1));
+    let drawn = found.len().min(list_h);
+    let (things_right, mem_right) = pane_rights(app, s, drawn);
+    let inner = super::widgets::titled_box(
         frame,
-        top,
-        &[Section {
-            title: Title::new(now_left, now_right),
-            rows: Some(now_rows),
-        }],
-        usize::MAX - 1,
+        b.things,
+        Title::new("Things to look at", &things_right),
+        true,
     );
-    rows(frame, inner[0], now, None);
-    let sep = area.y + now_rows + 1;
-    let bottom = Rect {
-        y: sep,
-        height: area.y + area.height - sep,
-        ..area
-    };
-    let left_w = super::widgets::split_at(area.width, THINGS_SHARE);
-    let (things_right, mem_right) = pane_rights(app, s);
-    let panes = super::widgets::frame_panes(
+    things_box(frame, inner, app, &found, sel, at);
+    if let (Some(r), Some((full, short, to))) = (b.selected, selected) {
+        let right = format!("enter opens {to}");
+        let inner = super::widgets::titled_box(frame, r, Title::new("Selected", &right), false);
+        let lines = if usize::from(inner.height) >= full.len() {
+            full
+        } else {
+            short
+        };
+        rows(frame, inner, lines, None);
+    }
+    if let Some(r) = b.off {
+        let right = match off.reasons.len() {
+            0 => String::new(),
+            1 => "1 reason".to_string(),
+            n => format!("{n} reasons"),
+        };
+        let inner = super::widgets::titled_box(frame, r, Title::new(off.title(), &right), false);
+        rows(
+            frame,
+            inner,
+            off.lines(usize::from(inner.height), lw_in),
+            None,
+        );
+    }
+    let inner = super::widgets::titled_box(
         frame,
-        bottom,
-        &[left_w, area.width - left_w],
-        &[
-            Title::new("Things to look at", &things_right),
-            Title::new("Where the memory is", &mem_right),
-        ],
-        0,
+        b.memory,
+        Title::new("Where the memory is", &mem_right),
+        false,
     );
-    // The panes' top border joins the frame of "Now": tees, not corners.
-    let tee = |frame: &mut Frame, x: u16, c: &str, st: Style| {
-        frame.render_widget(Span::styled(c.to_string(), st), Rect::new(x, sep, 1, 1));
-    };
-    tee(frame, area.x, "├", style::focus());
-    tee(frame, area.x + area.width - 1, "┤", style::border());
-    things_pane(frame, panes[0], app, s);
-    memory_pane(frame, panes[1], app, s);
+    memory_box(frame, inner, app, s);
+    if let (Some(r), Some(f)) = (b.freed, freed) {
+        let inner =
+            super::widgets::titled_box(frame, r, Title::new("Freed by TTL", &f.right), false);
+        let lines = if usize::from(inner.height) >= f.full.len() {
+            f.full
+        } else {
+            f.short
+        };
+        rows(frame, inner, lines, None);
+    }
+    if let (Some(r), Some(lines)) = (b.slow, slow) {
+        let inner = super::widgets::titled_box(
+            frame,
+            r,
+            Title::new("Slowest in the slow log", "Server › Slow log"),
+            false,
+        );
+        rows(frame, inner, lines, None);
+    }
+    true
 }
 
-/// The panes' right titles: how many findings and where from; the sample, or what an
+/// The boxes' right titles of the findings and the memory: how many findings (`7 of 8
+/// findings` when `drawn` of them fit) and where from; the sample, or what an
 /// analysis costs.
-fn pane_rights(app: &App, s: &Session) -> (String, String) {
+fn pane_rights(app: &App, s: &Session, drawn: usize) -> (String, String) {
     let n = findings(app).len();
     let found = match n {
         0 => String::new(),
+        n if drawn < n => format!("{drawn} of {n} findings"),
         1 => "1 finding".to_string(),
         n => format!("{n} findings"),
     };
@@ -1157,7 +1672,7 @@ fn pane_rights(app: &App, s: &Session) -> (String, String) {
     }
     if shows_analysis(app) {
         let r = app.report().expect("shows_analysis has a report");
-        // The time is in the context bar ("analyzed 14:02 UTC"); the pane's title has
+        // The time is in the context bar ("analyzed 14:02 UTC"); the box's title has
         // room for the sample only, so a stopped run says so on the left.
         let stopped = if stopped_early(s) {
             "stopped early"
@@ -1169,7 +1684,7 @@ fn pane_rights(app: &App, s: &Session) -> (String, String) {
             format!("{} sampled keys", format::grouped(r.sampled_keys)),
         );
     }
-    // The pane's title is short: on a cluster how many shards are summed, else that
+    // The box's title is short: on a cluster how many shards are summed, else that
     // nothing is read key by key.
     let right = if s.is_cluster() {
         before_right(s)
@@ -1190,73 +1705,15 @@ fn join_parts(parts: &[&str]) -> String {
         .join(" · ")
 }
 
-/// The left pane: the findings with their WHERE column (`↑↓` moves, `enter` goes),
-/// a rule, the selected finding explained in the words the app has for it and what
-/// `enter` opens; at the bottom what is off and why.
-fn things_pane(frame: &mut Frame, inner: Rect, app: &App, s: &Session) {
+/// "Things to look at": the findings with their WHERE column (`↑↓` moves, `enter`
+/// goes), as many as its rows hold, the selected one kept on screen.
+fn things_box(frame: &mut Frame, inner: Rect, app: &App, found: &[Finding], sel: usize, at: usize) {
     let w = usize::from(inner.width);
     let h = usize::from(inner.height);
+    app.overview.drawn_rows.set(0);
     if w == 0 || h == 0 {
         return;
     }
-    let found = findings(app);
-    let sel = app.overview.sel.min(found.len().saturating_sub(1));
-    // The bottom: what is off, the provider's notice, a stopped analysis.
-    let mut tail: Vec<Line<'static>> = Vec::new();
-    if stopped_early(s)
-        && let Some(r) = app.report()
-    {
-        tail.extend(wrap_lines(
-            &format!(
-                " The analysis was stopped early: these come from {} keys only.",
-                format::grouped(r.sampled_keys)
-            ),
-            w,
-            style::dim(),
-        ));
-    }
-    let provider = provider_rows(&s.profile, w);
-    // At most a third of the pane (all of them with `v`); when some do not fit, the
-    // last line says how many and that `v` shows them.
-    let cap = if app.more_here() { h } else { h / 3 };
-    let reasons: Vec<Vec<Line<'static>>> = off_reasons(app)
-        .iter()
-        .map(|r| wrap_lines(&format!(" Off: {}", off_text(r)), w, style::dim()))
-        .collect();
-    let room = cap.saturating_sub(tail.len() + provider.len());
-    let all: usize = reasons.iter().map(Vec::len).sum();
-    if all <= room {
-        tail.extend(reasons.into_iter().flatten());
-    } else {
-        // Whole reasons while they leave a line for the count.
-        let mut used = 0;
-        let mut shown = 0;
-        for r in &reasons {
-            if used + r.len() + 1 > room {
-                break;
-            }
-            used += r.len();
-            shown += 1;
-        }
-        let n = reasons.len() - shown;
-        tail.extend(reasons.into_iter().take(shown).flatten());
-        if room > 0 {
-            let s_ = if n == 1 { "reason" } else { "reasons" };
-            tail.push(Line::from(Span::styled(
-                trunc(&format!(" … {n} more {s_}: v shows them"), w),
-                style::dim(),
-            )));
-        }
-    }
-    tail.extend(provider);
-    let tail_h = tail.len().min(h);
-    let tail: Vec<Line<'static>> = tail.into_iter().take(tail_h).collect();
-    // The list: its head and its rows, then a rule; the explanation gets the rest, at
-    // least four rows when there is room.
-    let body_h = h - tail_h;
-    let want = found.len().max(1);
-    let list_h = want.min(body_h.saturating_sub(1 + 1 + 4).max(1));
-    let at = place_col_for(&found, w);
     let mut lines = vec![where_head_at("FINDING", "", w, at)];
     if found.is_empty() {
         let none = if shows_analysis(app) {
@@ -1266,84 +1723,23 @@ fn things_pane(frame: &mut Frame, inner: Rect, app: &App, s: &Session) {
         };
         lines.push(Line::from(Span::styled(trunc(none, w), style::dim())));
     } else {
+        let list_h = h - 1;
         let off = scroll_offset(sel, list_h);
-        let drawn = finding_rows_at(&found, sel, w, at)
+        let drawn: Vec<Line<'static>> = finding_rows_at(found, sel, w, at)
             .into_iter()
             .skip(off)
-            .take(list_h.min(body_h.saturating_sub(1)));
-        let before = lines.len();
+            .take(list_h)
+            .collect();
+        app.overview.drawn_rows.set(drawn.len());
         lines.extend(drawn);
-        app.overview.drawn_rows.set(lines.len() - before);
     }
-    if found.is_empty() {
-        app.overview.drawn_rows.set(0);
-    }
-    if let Some(f) = found.get(sel) {
-        lines.push(Line::from(Span::styled("─".repeat(w), style::border())));
-        let (mark, st) = match f.severity {
-            Severity::Warn | Severity::Note => ("▲", style::warning()),
-            Severity::Info => ("●", style::dim()),
-        };
-        // The sentence again only when its row had to cut it.
-        let whole = finding_fits(f, at);
-        if !whole {
-            lines.extend(wrap_lines(&format!(" {mark} {}", f.text), w, st));
-        }
-        if !f.hint.is_empty() {
-            if !whole {
-                lines.push(Line::default());
-            }
-            lines.extend(wrap_lines(&format!(" {}", f.hint), w, style::fg()));
-        }
-        if !whole || !f.hint.is_empty() {
-            lines.push(Line::default());
-        }
-        let to = match f.to.panel() {
-            Some(p) => format!("{} › {}", f.to.area().title(), p.name()),
-            None => f.to.area().title().to_string(),
-        };
-        lines.push(Line::from(fit(
-            vec![
-                Span::styled(" enter", style::focus()),
-                Span::styled(format!(" opens {to}"), style::dim()),
-            ],
-            w,
-        )));
-    }
-    lines.truncate(body_h);
     rows(frame, inner, lines, None);
-    let tail_area = Rect {
-        y: inner.y + inner.height - tail_h as u16,
-        height: tail_h as u16,
-        ..inner
-    };
-    rows(frame, tail_area, tail, None);
 }
 
-/// An "off" reason after the pane's "Off:": `Slow log is off: why` reads `Slow log:
-/// why`, so "off" is not said twice.
-fn off_text(r: &str) -> String {
-    for said in [" is off: ", " are off: "] {
-        if let Some((what, why)) = r.split_once(said) {
-            return format!("{what}: {why}");
-        }
-    }
-    r.to_string()
-}
-
-/// `text` wrapped to `w` in `st`, each line after the first indented under the first
-/// word after a leading mark.
-fn wrap_lines(text: &str, w: usize, st: Style) -> Vec<Line<'static>> {
-    super::patterns::wrap_words(text, w)
-        .into_iter()
-        .map(|l| Line::from(Span::styled(l, st)))
-        .collect()
-}
-
-/// The right pane: the server's headline, then before an analysis what one costs,
-/// while one runs its progress, and after it every top pattern that fits with its
-/// share and size, what TTLs free, and the slowest commands the slow log holds.
-fn memory_pane(frame: &mut Frame, inner: Rect, app: &App, s: &Session) {
+/// "Where the memory is": the server's headline, then before an analysis what one
+/// costs, while one runs its progress, and after it every top pattern that fits with
+/// its share and size.
+fn memory_box(frame: &mut Frame, inner: Rect, app: &App, s: &Session) {
     let w = usize::from(inner.width);
     let h = usize::from(inner.height);
     let mut prefix = wrap_spans(headline_spans(s), w, 1);
@@ -1354,34 +1750,19 @@ fn memory_pane(frame: &mut Frame, inner: Rect, app: &App, s: &Session) {
         blocks.push(analyzing_block(s, &e, w, true));
     } else if shows_analysis(app) {
         let r = app.report().expect("shows_analysis has a report");
-        let freed = freed_block(r, w);
-        let slow = slow_block(&app.views.server.slow.entries, w);
-        // What the memory block may take: the rest less the blocks after it, which go
-        // (the slow log first) when they would leave it fewer than three rows.
-        let room = h.saturating_sub(prefix.len());
-        let need = |b: &Option<Block>| b.as_ref().map_or(0, |b| 1 + b.head.len() + b.rows.len());
-        let mut after = vec![freed, slow];
-        while room.saturating_sub(1 + after.iter().map(need).sum::<usize>()) < 3
-            && after.iter().any(Option::is_some)
-        {
-            if let Some(last) = after.iter_mut().rev().find(|b| b.is_some()) {
-                *last = None;
-            }
-        }
+        // The rows under the patterns: why there are no sizes, that there are no keys.
+        let notes = usize::from(!r.sizes_available) + usize::from(r.patterns.is_empty());
+        let top = h.saturating_sub(prefix.len() + notes).max(1);
         // Every pattern when they fit; else one row less, and one for the rest.
-        let top = room
-            .saturating_sub(1 + after.iter().map(need).sum::<usize>())
-            .max(1);
         let named = if r.patterns.len() <= top {
             top
         } else {
             top - 1
         };
-        // The pane's title already says "Where the memory is": no heading again.
+        // The box's title already says "Where the memory is": no heading again.
         let mut patterns = memory_block(r, w, named, share_widths(w));
         patterns.head.clear();
         blocks.push(patterns);
-        blocks.extend(after.into_iter().flatten());
     } else {
         let e = estimate_for(Depth::Quick, app);
         let mut prompt = wrap_spans(
@@ -1417,6 +1798,56 @@ fn memory_pane(frame: &mut Frame, inner: Rect, app: &App, s: &Session) {
     rows(frame, inner, fit_blocks(prefix, blocks, h), None);
 }
 
+/// What the "Freed by TTL" box holds: the bars (all of it, short or not), or why it is
+/// not known (wrapped, and cut to one line when short); and its right title.
+struct Freed {
+    full: Vec<Line<'static>>,
+    short: Vec<Line<'static>>,
+    right: String,
+}
+
+fn freed_box(r: &ScanReport, w: usize) -> Freed {
+    let rows_ = freed_block(r, w).map(|b| b.rows).unwrap_or_default();
+    match expiry(r) {
+        Some(e) => Freed {
+            short: rows_.clone(),
+            full: rows_,
+            right: format!("of {}", format::bytes(e.total)),
+        },
+        None => Freed {
+            short: vec![Line::from(Span::styled(
+                trunc(&format!("   {FREED_NEEDS}"), w),
+                style::dim(),
+            ))],
+            full: rows_,
+            right: String::new(),
+        },
+    }
+}
+
+/// An "off" reason after the box's "Off:": `Slow log is off: why` reads `Slow log:
+/// why`, so "off" is not said twice.
+fn off_text(r: &str) -> String {
+    for said in [" is off: ", " are off: "] {
+        if let Some((what, why)) = r.split_once(said) {
+            return format!("{what}: {why}");
+        }
+    }
+    r.to_string()
+}
+
+/// `text` wrapped to `w` in `st`, each line after the first indented under the first
+/// word after a leading mark.
+fn wrap_lines(text: &str, w: usize, st: Style) -> Vec<Line<'static>> {
+    super::patterns::wrap_words(text, w)
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, st)))
+        .collect()
+}
+
+/// Why "Freed by TTL" is not known.
+const FREED_NEEDS: &str = "needs key sizes (MEMORY USAGE), which this analysis did not read";
+
 /// "FREED BY TTL" as bars: the memory that expires within an hour, a day and a week,
 /// and that never does, of the sample's total; or why it is not known.
 fn freed_block(r: &ScanReport, w: usize) -> Option<Block> {
@@ -1425,10 +1856,7 @@ fn freed_block(r: &ScanReport, w: usize) -> Option<Block> {
         return Some(Block::new(
             Some(head),
             wrap_spans(
-                vec![Span::styled(
-                    "   needs key sizes (MEMORY USAGE), which this analysis did not read",
-                    style::dim(),
-                )],
+                vec![Span::styled(format!("   {FREED_NEEDS}"), style::dim())],
                 w,
                 3,
             ),
@@ -1639,6 +2067,8 @@ mod tests {
     use crate::tui::app::{Effect, Msg, Screen};
     use crate::tui::fixtures;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use std::time::{Duration, Instant};
 
     fn key(c: KeyCode) -> KeyEvent {
@@ -1786,6 +2216,43 @@ mod tests {
             app.handle_key(key(KeyCode::Char('a')));
             for (w, h) in [(1, 1), (0, 0), (20, 5), (40, 12), (200, 3), (3, 40)] {
                 testing::render(&app, w, h);
+            }
+        }
+    }
+
+    /// Every size up to 60×16, and around where the boxes start, for each state the
+    /// boxes draw: no panic.
+    #[test]
+    fn every_size_does_not_panic() {
+        let mut with_more = all_six();
+        with_more.handle_key(key(KeyCode::Char('v')));
+        let apps = [
+            overview_app(false),
+            just_connected(Some(3)),
+            analyzing(),
+            all_six(),
+            with_more,
+            cluster_connected(),
+        ];
+        for app in &apps {
+            for w in 0..=60 {
+                for h in 0..=16 {
+                    testing::render(app, w, h);
+                }
+            }
+            for (w, h) in [
+                (119, 16),
+                (120, 10),
+                (120, 16),
+                (120, 24),
+                (121, 17),
+                (200, 60),
+                (u16::MAX, 6),
+            ] {
+                testing::render(app, w, h);
+            }
+            for h in 0..40 {
+                testing::render(app, 120, h);
             }
         }
     }
@@ -1987,9 +2454,15 @@ mod tests {
         assert!(short.contains("v shows them"), "{short}");
         let mut app = app;
         app.handle_key(key(KeyCode::Char('v')));
+        // There "Now" has every figure and every reason does not fit beside the
+        // findings' least rows: the line that counts them says they do not fit.
         let all = text_of(&app, 120, 22);
+        assert!(all.contains("more reasons do not fit"), "{all}");
+        assert!(!all.contains("v shows them"), "{all}");
+        // Taller, in the "Off" box.
+        let all = text_of(&app, 120, 36);
         assert!(!all.contains("more reason"), "{all}");
-        for want in ["Off: Slow log: ", "Off: Idle clients: "] {
+        for want in ["Off: Slow log: ", "Off: Idle clients: ", "─ Off ─"] {
             assert!(all.contains(want), "{want}:\n{all}");
         }
         let t = text_of(&app, 80, 24);
@@ -2033,6 +2506,693 @@ mod tests {
         insta::assert_snapshot!("analyzing_120x36", t);
     }
 
+    /// [`analyzing`] finished with sizes, so "Freed by TTL" has its bars.
+    fn analyzed_with_sizes() -> App {
+        let mut app = analyzing();
+        let (id, scan) = ids(&app);
+        let mut r = fixtures::report(true);
+        let mb = 1024 * 1024;
+        r.key_sizes = Some(Box::new(crate::model::KeySizes {
+            big_keys: Vec::new(),
+            ttl_bytes: [400 * mb, mb, 20 * mb, 60 * mb, 30 * mb, 10 * mb, 5 * mb],
+        }));
+        app.apply(Msg::ScanDone {
+            id,
+            scan,
+            report: Box::new(r),
+        });
+        app
+    }
+
+    /// [`analyzed_with_sizes`] with two parts off: every box of the layout is drawn.
+    fn all_six() -> App {
+        let mut app = analyzed_with_sizes();
+        let s = app.session.as_mut().unwrap();
+        let f = s.figures.as_mut().unwrap().server.as_mut().unwrap();
+        f.context.missing.push(crate::model::ContextGap::NoKeysizes);
+        f.context
+            .missing
+            .push(crate::model::ContextGap::MemoryStatsDenied);
+        app
+    }
+
+    /// The box titles of the layout from 120 columns, as they read in the top border.
+    const BOX_TITLES: [&str; 7] = [
+        "─ Now ─",
+        "─ Things to look at ─",
+        "─ Selected ─",
+        "─ Off ─",
+        "─ Where the memory is ─",
+        "─ Freed by TTL ─",
+        "─ Slowest in the slow log ─",
+    ];
+
+    /// Every box on `screen` is closed: each `┌` has a `┐` on its row, and under it a
+    /// `└` in its column with `┘` at the matching column.
+    fn boxes_closed(t: &Terminal<TestBackend>) {
+        let buf = t.backend().buffer();
+        let (w, h) = (buf.area.width, buf.area.height);
+        let sym = |x: u16, y: u16| buf[(x, y)].symbol().to_string();
+        for y in 0..h {
+            for x in 0..w {
+                if sym(x, y) != "┌" {
+                    continue;
+                }
+                let right = (x + 1..w)
+                    .find(|&xx| sym(xx, y) == "┐")
+                    .unwrap_or_else(|| panic!("open box at {x},{y}:\n{}", t.backend()));
+                let bottom = (y + 1..h)
+                    .find(|&yy| sym(x, yy) == "└")
+                    .unwrap_or_else(|| panic!("no bottom at {x},{y}:\n{}", t.backend()));
+                assert_eq!(sym(right, bottom), "┘", "{x},{y}:\n{}", t.backend());
+                for yy in y + 1..bottom {
+                    assert_eq!(sym(x, yy), "│", "{x},{yy}:\n{}", t.backend());
+                    assert_eq!(sym(right, yy), "│", "{right},{yy}:\n{}", t.backend());
+                }
+            }
+        }
+    }
+
+    /// The finding rows on screen: `›` or a blank cursor, then `▲` or `●` at column 4,
+    /// inside a frame that starts at column 0.
+    fn finding_rows_on(t: &Terminal<TestBackend>) -> usize {
+        let buf = t.backend().buffer();
+        (0..buf.area.height)
+            .filter(|&y| {
+                buf.area.width > 4
+                    && buf[(0, y)].symbol() == "│"
+                    && matches!(buf[(4, y)].symbol(), "▲" | "●")
+                    && matches!(buf[(2, y)].symbol(), "›" | " ")
+            })
+            .count()
+    }
+
+    #[test]
+    fn the_boxes_from_120_columns() {
+        // Every box, each titled and closed.
+        let app = all_six();
+        let t = testing::render(&app, 120, 36);
+        let text = t.backend().to_string();
+        for title in BOX_TITLES {
+            assert!(text.contains(title), "{title}:\n{text}");
+        }
+        for right in [
+            "8 findings",
+            "enter opens Analyze › Expiry",
+            "2 reasons",
+            "100,000 sampled keys",
+            "of 9.0G",
+            "Server › Slow log",
+        ] {
+            assert!(text.contains(right), "{right}:\n{text}");
+        }
+        boxes_closed(&t);
+        assert!(!text.contains("secret-value"), "{text}");
+        no_heading_without_rows(&text);
+        insta::assert_snapshot!("boxes_all_six_120x36", text);
+        boxes_closed(&testing::render(&app, 160, 45));
+
+        // No slow-log entries: no "Slowest" box, the others as they were.
+        let mut none = all_six();
+        none.views.server.slow.entries.clear();
+        let t = testing::render(&none, 120, 36);
+        let text = t.backend().to_string();
+        assert!(!text.contains("Slowest in the slow log"), "{text}");
+        assert!(text.contains("─ Freed by TTL ─"), "{text}");
+        boxes_closed(&t);
+        insta::assert_snapshot!("boxes_no_slow_120x36", text);
+
+        // No "Off" reasons: no "Off" box.
+        let t = testing::render(&analyzed_with_sizes(), 120, 36);
+        let text = t.backend().to_string();
+        assert!(!text.contains("─ Off ─"), "{text}");
+        boxes_closed(&t);
+
+        // `enter opens …` is the "Selected" box's title only.
+        let t = testing::render(&app, 120, 36).backend().to_string();
+        assert_eq!(t.matches("enter opens Analyze › Expiry").count(), 1, "{t}");
+
+        // A short terminal gives up the blank rows and "Slowest", then "Selected"; the
+        // reasons stay.
+        let t = testing::render(&app, 120, 24);
+        let text = t.backend().to_string();
+        assert!(!text.contains("Slowest in the slow log"), "{text}");
+        assert!(!text.contains("─ Selected ─"), "{text}");
+        for want in [
+            "5 of 8 findings",
+            "─ Off ─",
+            "Off: Big keys",
+            "Off: Data and overhead",
+            "within 1 h",
+            "never",
+        ] {
+            assert!(text.contains(want), "{want}:\n{text}");
+        }
+        boxes_closed(&t);
+        insta::assert_snapshot!("boxes_short_120x24", text);
+
+        // Shorter, the findings are cut: the title says how many show.
+        let text = testing::render(&app, 120, 18).backend().to_string();
+        assert!(text.contains("─ Things to look at ─"), "{text}");
+        assert!(text.contains(" of 8 findings"), "{text}");
+        assert!(text.contains("2 more reasons: v shows them"), "{text}");
+        // The least two panes had (17 rows here), then one column.
+        let text = testing::render(&app, 120, 17).backend().to_string();
+        assert!(text.contains("─ Things to look at ─"), "{text}");
+        let text = testing::render(&app, 120, 16).backend().to_string();
+        assert!(!text.contains("─ Things to look at ─"), "{text}");
+        assert!(text.contains("─ Keys ─"), "{text}");
+    }
+
+    /// Two reasons that the server refused (`overview_app_with` and the reads).
+    fn refused() -> App {
+        let mut app = overview_app_with(false, fixtures::perms_probes_off());
+        let (id, scan) = ids(&app);
+        let mut f = ov::tests::figures(None);
+        f.context.memory = None;
+        f.context
+            .missing
+            .push(crate::model::ContextGap::MemoryStatsDenied);
+        app.apply(Msg::Figures {
+            id,
+            scan,
+            figures: Figures {
+                server: Some(f),
+                nodes: Vec::new(),
+                failed: None,
+            },
+        });
+        app.apply(Msg::ServerReads {
+            id,
+            scan,
+            node: 0,
+            slow: None,
+            clients: Some(Err(crate::live::LiveError::Denied("CLIENT LIST".into()))),
+        });
+        app
+    }
+
+    /// [`all_six`] with five reasons and the provider's notice.
+    fn many_off() -> App {
+        let mut app = all_six();
+        let s = app.session.as_mut().unwrap();
+        s.profile.provider = Some(crate::model::Provider::ElasticacheServerless);
+        let f = s.figures.as_mut().unwrap().server.as_mut().unwrap();
+        f.context
+            .missing
+            .push(crate::model::ContextGap::MemoryStatsUnavailable);
+        f.context
+            .missing
+            .push(crate::model::ContextGap::KeyspaceUnavailable);
+        let (id, scan) = ids(&app);
+        app.apply(Msg::ServerReads {
+            id,
+            scan,
+            node: 0,
+            slow: None,
+            clients: Some(Err(crate::live::LiveError::Denied("CLIENT LIST".into()))),
+        });
+        app
+    }
+
+    /// [`analyzing`] stopped early with what it had.
+    fn stopped() -> App {
+        let mut app = analyzing();
+        let (id, scan) = ids(&app);
+        app.handle_key(key(KeyCode::Esc));
+        let mut r = fixtures::report(true);
+        r.sampled_keys = 4_200;
+        r.complete = false;
+        app.apply(Msg::ScanDone {
+            id,
+            scan,
+            report: Box::new(r),
+        });
+        app
+    }
+
+    /// `app` with `v` pressed.
+    fn with_v(mut app: App) -> App {
+        app.handle_key(key(KeyCode::Char('v')));
+        app
+    }
+
+    /// Every state the boxes and the one column draw, named.
+    fn states() -> Vec<(&'static str, App)> {
+        let mut provider = overview_app(false);
+        provider.session.as_mut().unwrap().profile.provider =
+            Some(crate::model::Provider::ElasticacheServerless);
+        let mut no_slow = all_six();
+        no_slow.views.server.slow.entries.clear();
+        let mut far = all_six();
+        for _ in 0..7 {
+            far.handle_key(key(KeyCode::Down));
+        }
+        vec![
+            ("before", overview_app(false)),
+            ("connected", just_connected(Some(3))),
+            ("analyzing", analyzing()),
+            ("all_six", all_six()),
+            ("no_off", analyzed_with_sizes()),
+            ("no_slow", no_slow),
+            ("far", far),
+            ("cluster", cluster_connected()),
+            ("refused", refused()),
+            ("many_off", many_off()),
+            ("stopped", stopped()),
+            ("provider", provider),
+            ("v_all_six", with_v(all_six())),
+            ("v_refused", with_v(refused())),
+            ("v_many_off", with_v(many_off())),
+            ("v_stopped", with_v(stopped())),
+        ]
+    }
+
+    /// The off reasons on screen: those shown (a box's `Off:` lines, the one column's
+    /// `·` rows) and those counted by a `… n more reasons` line.
+    fn reasons_seen(text: &str) -> (usize, usize) {
+        let shown = text
+            .lines()
+            .filter(|l| {
+                l.contains("│ Off: ")
+                    || (l.contains("│   · ")
+                        && !l.contains("· The analysis was stopped")
+                        && !l.contains("· Sizes need"))
+            })
+            .count();
+        let counted = text
+            .split("… ")
+            .skip(1)
+            .filter_map(|s| {
+                let n: String = s.chars().take_while(char::is_ascii_digit).collect();
+                s[n.len()..]
+                    .starts_with(" more reason")
+                    .then(|| n.parse::<usize>().ok())
+                    .flatten()
+            })
+            .sum();
+        (shown, counted)
+    }
+
+    /// Every reason a part is off is shown or counted, at every width and height that
+    /// has a row for it; with `v` the boxes show them all.
+    #[test]
+    fn no_off_reason_is_hidden() {
+        for (name, app) in states() {
+            let total = ov::off_reasons(&app).len();
+            let s = app.session.as_ref().unwrap();
+            for w in [80u16, 100, 119, 120, 140, 160, 200] {
+                // Height 6 leaves no row inside the frame.
+                for h in 7..=45u16 {
+                    let text = testing::render(&app, w, h).backend().to_string();
+                    let boxes = text.contains("─ Things to look at ─");
+                    // On one column after an analysis, "Keys" has no reasons (as on
+                    // main): the one case left, see the spec.
+                    if !boxes && !keys_reasons(&app, s) {
+                        continue;
+                    }
+                    let (shown, counted) = reasons_seen(&text);
+                    assert_eq!(
+                        shown + counted,
+                        total,
+                        "{name} {w}x{h}: {shown} shown + {counted} counted:\n{text}"
+                    );
+                    // With `v` the boxes give up "Selected" before a reason; a
+                    // count then says they do not fit.
+                    if boxes && app.more_here() && counted > 0 {
+                        assert!(!text.contains("─ Selected ─"), "{name} {w}x{h}:\n{text}");
+                        assert!(text.contains("do not fit"), "{name} {w}x{h}:\n{text}");
+                    }
+                    if boxes && app.more_here() && h >= 36 {
+                        assert_eq!(counted, 0, "{name} {w}x{h} with v:\n{text}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// In the boxes, a terminal a row shorter never shows more findings, and the switch
+    /// to one column never shows more either. (Below that, the one column fits its
+    /// blocks as below 120 columns, as on main.)
+    #[test]
+    fn a_shorter_terminal_never_shows_more_findings() {
+        for (name, app) in states() {
+            for w in [120u16, 140, 160, 200] {
+                let mut taller: Option<(usize, bool)> = None;
+                for h in (7..=60u16).rev() {
+                    let t = testing::render(&app, w, h);
+                    let drawn = finding_rows_on(&t);
+                    let boxes = t.backend().to_string().contains("─ Things to look at ─");
+                    if let Some((up, up_boxes)) = taller
+                        && up_boxes
+                    {
+                        assert!(
+                            drawn <= up,
+                            "{name} {w}x{h}: {drawn} findings, {up} one row taller:\n{}",
+                            t.backend()
+                        );
+                    }
+                    taller = Some((drawn, boxes));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_boxes_at_20_rows() {
+        // Two reasons, four (refused) and five with the provider's notice: each shown
+        // or counted, the box sized to what it shows.
+        for (name, app) in [
+            ("off2", all_six()),
+            ("off4", refused()),
+            ("off5_notice", many_off()),
+        ] {
+            let t = testing::render(&app, 120, 20);
+            let text = t.backend().to_string();
+            assert!(text.contains("─ Things to look at ─"), "{name}:\n{text}");
+            boxes_closed(&t);
+            let (shown, counted) = reasons_seen(&text);
+            assert_eq!(
+                shown + counted,
+                ov::off_reasons(&app).len(),
+                "{name}:\n{text}"
+            );
+            insta::assert_snapshot!(format!("boxes_{name}_120x20"), text);
+        }
+        // The provider's notice and a stopped analysis are notes, not parts off.
+        let text = testing::render(&many_off(), 120, 45).backend().to_string();
+        assert!(text.contains("─ Notes ─"), "{text}");
+        assert!(text.contains("5 reasons"), "{text}");
+        let text = testing::render(&stopped(), 120, 36).backend().to_string();
+        assert!(text.contains("─ Notes ─"), "{text}");
+        let text = testing::render(&all_six(), 120, 36).backend().to_string();
+        assert!(
+            text.contains("─ Off ─") && !text.contains("─ Notes ─"),
+            "{text}"
+        );
+    }
+
+    /// The focused box ("Things to look at") has its border in the focus colour; the
+    /// other boxes have the normal border.
+    #[test]
+    fn the_focused_box_is_drawn_in_the_focus_colour() {
+        use crate::tui::ui::style::Mode;
+        let app = all_six();
+        style::with_mode(Mode::Dark, || {
+            let t = testing::render(&app, 120, 36);
+            let buf = t.backend().buffer();
+            let lines: Vec<String> = (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect()
+                })
+                .collect();
+            let (focus, border) = (style::focus().fg, style::border().fg);
+            assert_ne!(focus, border);
+            let mut seen = 0;
+            for (y, l) in lines.iter().enumerate() {
+                let y = y as u16;
+                let cols: Vec<String> = l.chars().map(String::from).collect();
+                for (x, c) in cols.iter().enumerate() {
+                    if c != "┌" {
+                        continue;
+                    }
+                    let rest: String = cols[x..].concat();
+                    let focused = rest.starts_with("┌─ Things to look at ─");
+                    let cell = &buf[(x as u16, y)];
+                    let side = &buf[(x as u16, y + 1)];
+                    if focused {
+                        assert_eq!(cell.fg, focus.unwrap(), "Things corner");
+                        assert_eq!(side.fg, focus.unwrap(), "Things side");
+                        // Its title bold in the focus colour.
+                        let tx = x as u16 + 3;
+                        assert_eq!(buf[(tx, y)].symbol(), "T");
+                        assert_eq!(buf[(tx, y)].fg, focus.unwrap());
+                        assert!(
+                            buf[(tx, y)]
+                                .modifier
+                                .contains(ratatui::style::Modifier::BOLD)
+                        );
+                    } else {
+                        assert_eq!(cell.fg, border.unwrap(), "box at {x},{y}: {rest}");
+                        assert_eq!(side.fg, border.unwrap(), "box side at {x},{y}");
+                    }
+                    seen += 1;
+                }
+            }
+            // "Now" and the six boxes.
+            assert_eq!(seen, 7, "{}", t.backend());
+        });
+    }
+
+    /// PgUp and PgDn move by the finding rows drawn, at every size.
+    #[test]
+    fn drawn_rows_is_the_finding_rows_drawn() {
+        let sizes = [
+            (80, 24),
+            (120, 36),
+            (160, 45),
+            (120, 24),
+            (120, 16),
+            (120, 20),
+            (200, 60),
+        ];
+        let mut apps = vec![
+            all_six(),
+            just_connected(Some(3)),
+            analyzing(),
+            overview_app(false),
+        ];
+        // The selection further down the list, so it scrolls.
+        let mut far = all_six();
+        for _ in 0..7 {
+            far.handle_key(key(KeyCode::Down));
+        }
+        apps.push(far);
+        for app in &apps {
+            for (w, h) in sizes {
+                let t = testing::render(app, w, h);
+                let rows = crate::tui::ui::list_rows(Rect::new(0, 0, w, h), app);
+                assert_eq!(rows, finding_rows_on(&t), "{w}x{h}:\n{}", t.backend());
+            }
+        }
+    }
+
+    /// `↓` and `enter` do at every size what they do on one column at 80.
+    #[test]
+    fn the_findings_move_and_open_the_same_in_the_boxes() {
+        let sizes = [(80, 24), (120, 36), (160, 45), (120, 24), (120, 16)];
+        for downs in 0..4 {
+            let mut want = None;
+            for (w, h) in sizes {
+                let mut app = all_six();
+                let _ = text_of(&app, w, h);
+                for _ in 0..downs {
+                    let effects = app.handle_key(key(KeyCode::Down));
+                    assert!(effects.is_empty(), "{w}x{h}: {effects:?}");
+                    let _ = text_of(&app, w, h);
+                }
+                let sel = app.overview.sel;
+                let effects = app.handle_key(key(KeyCode::Enter));
+                let got = (sel, app.screen(), format!("{effects:?}"));
+                match &want {
+                    None => want = Some(got),
+                    Some(w0) => assert_eq!(&got, w0, "{w}x{h} after {downs} downs"),
+                }
+            }
+        }
+    }
+
+    /// Wants like [`all_six`]'s at 120 columns: "Now" 4 rows, 8 findings (it keeps 6
+    /// rows, 9 show them all), "Selected" 4 rows (1 short), "Off" two reasons of two
+    /// lines (4, 3 or 1 rows), "Freed by TTL" 4 bars, "Slowest" 2.
+    fn six() -> Wants {
+        Wants {
+            now: 4,
+            things: THINGS_WANT,
+            things_all: 9,
+            left: left_steps(Some((4, 1)), &[4, 3, 1]),
+            right: right_steps(Some((4, 4)), Some(2)),
+        }
+    }
+
+    /// The body of a `w` × `h` terminal: under the two top rows, over the footer.
+    fn body(w: u16, h: u16) -> Rect {
+        Rect::new(0, 2, w, h.saturating_sub(3))
+    }
+
+    /// No two boxes overlap, each is inside `area`, and the filling boxes have their
+    /// floor.
+    fn sane(area: Rect, b: &Boxes) {
+        let all: Vec<Rect> = [
+            Some(b.now),
+            Some(b.things),
+            b.selected,
+            b.off,
+            Some(b.memory),
+            b.freed,
+            b.slow,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        for (i, r) in all.iter().enumerate() {
+            assert_eq!(r.intersection(area), *r, "{r:?} outside {area:?}");
+            assert!(r.height > BORDERS && r.width >= 4, "{r:?}");
+            for o in &all[i + 1..] {
+                assert!(!r.intersects(*o), "{r:?} overlaps {o:?}");
+            }
+        }
+        assert!(b.things.height >= FILL_FLOOR + BORDERS, "{b:?}");
+        assert!(b.memory.height >= FILL_FLOOR + BORDERS, "{b:?}");
+    }
+
+    #[test]
+    fn the_box_layout() {
+        // 120×36: every box whole, a blank row between two, a blank column between the
+        // columns, both columns down to the body's last row.
+        let a = body(120, 36);
+        let b = box_layout(a, &six()).unwrap();
+        sane(a, &b);
+        assert_eq!((b.gap, b.left_step, b.right_step), (1, 0, 0));
+        assert_eq!(b.now, Rect::new(0, 2, 120, 6));
+        assert_eq!(b.things, Rect::new(0, 9, 65, 12));
+        assert_eq!(b.selected, Some(Rect::new(0, 22, 65, 6)));
+        assert_eq!(b.off, Some(Rect::new(0, 29, 65, 6)));
+        assert_eq!(b.memory, Rect::new(66, 9, 54, 14));
+        assert_eq!(b.freed, Some(Rect::new(66, 24, 54, 6)));
+        assert_eq!(b.slow, Some(Rect::new(66, 31, 54, 4)));
+        assert_eq!(b.off.unwrap().bottom(), a.bottom());
+        assert_eq!(b.slow.unwrap().bottom(), a.bottom());
+
+        // 160×45: the same boxes, the filling ones taller.
+        let a = body(160, 45);
+        let b = box_layout(a, &six()).unwrap();
+        sane(a, &b);
+        assert_eq!((b.gap, b.left_step, b.right_step), (1, 0, 0));
+        assert_eq!(b.things.height, 21);
+        assert_eq!(b.memory.height, 23);
+        assert_eq!(b.things.x + b.things.width + 1, b.memory.x);
+        assert_eq!(b.memory.right(), a.right());
+
+        // 120×30: the blank rows gone first, every box still whole; "Things to look
+        // at" no taller than one row up gives it (5 findings).
+        let b = box_layout(body(120, 30), &six()).unwrap();
+        assert_eq!((b.gap, b.left_step, b.right_step), (0, 0, 0));
+        assert_eq!(b.things.height, 8);
+        // 120×28: "Selected" short.
+        let b = box_layout(body(120, 28), &six()).unwrap();
+        assert_eq!(b.selected.unwrap().height, 1 + BORDERS);
+        assert_eq!(b.off.unwrap().height, 4 + BORDERS);
+
+        // 120×24: "Slowest" gone at the right; "Selected" gone at the left, "Off"
+        // still whole; the findings keep their six rows.
+        let a = body(120, 24);
+        let b = box_layout(a, &six()).unwrap();
+        sane(a, &b);
+        assert_eq!(b.gap, 0);
+        assert_eq!((b.slow, b.selected), (None, None));
+        assert_eq!(b.freed.unwrap().height, 4 + BORDERS);
+        assert_eq!(b.off.unwrap().height, 4 + BORDERS);
+        // Five findings: what one row taller gives it (the row left is blank).
+        assert_eq!(b.things.height, 5 + BORDERS + 1);
+
+        // 120×17, the least two panes had: "Things to look at" at its floor, "Off" its
+        // count line, the right column only "Where the memory is"; 120×16: one column.
+        let a = body(120, 17);
+        let b = box_layout(a, &six()).unwrap();
+        sane(a, &b);
+        assert_eq!(b.selected, None);
+        assert_eq!(b.off.unwrap().height, 1 + BORDERS);
+        assert_eq!(b.things.height, FILL_FLOOR + BORDERS);
+        assert_eq!((b.freed, b.slow), (None, None));
+        assert_eq!(box_layout(body(120, 16), &six()), None);
+
+        // Every height and a few widths: sane when it fits, and it fits from the
+        // least two panes had.
+        for w in [120, 121, 160, 200, 300, u16::MAX] {
+            for h in 0..80 {
+                let a = Rect::new(0, 0, w, h);
+                let b = box_layout(a, &six());
+                if h >= 4 + BORDERS + COLS_MIN_H {
+                    assert!(b.is_some(), "{w}x{h}");
+                }
+                if let Some(b) = b {
+                    sane(a, &b);
+                }
+            }
+        }
+        // Too narrow for two columns.
+        assert_eq!(box_layout(Rect::new(0, 0, 20, 60), &six()), None);
+    }
+
+    /// Rows are given up in order as the height falls: first the blank rows, then each
+    /// column's steps, then the filling boxes; "Off" is never dropped, and "Things to
+    /// look at" never shows more findings.
+    #[test]
+    fn the_boxes_give_up_rows_in_order() {
+        let wants = six();
+        let mut last: Option<Boxes> = None;
+        for h in (0..80u16).rev() {
+            let a = Rect::new(0, 0, 120, h);
+            let Some(b) = box_layout(a, &wants) else {
+                // Once it does not fit, it never fits lower down.
+                for lower in 0..h {
+                    assert_eq!(box_layout(Rect::new(0, 0, 120, lower), &wants), None);
+                }
+                break;
+            };
+            sane(a, &b);
+            // The blank rows only while every box is whole.
+            if b.gap == 1 {
+                assert_eq!((b.left_step, b.right_step), (0, 0), "{h}");
+            }
+            // The filling boxes squeezed only at the last step.
+            if b.things.height < wants.things + BORDERS {
+                assert_eq!(b.left_step, wants.left.len() - 1, "{h}");
+            }
+            if b.memory.height < FILL_MIN + BORDERS {
+                assert_eq!(b.right_step, wants.right.len() - 1, "{h}");
+            }
+            // "Off" is always there.
+            assert!(b.off.is_some(), "{h}");
+            if let Some(p) = last {
+                assert!(b.gap <= p.gap, "{h}");
+                if b.gap == p.gap {
+                    assert!(b.left_step >= p.left_step, "{h}");
+                    assert!(b.right_step >= p.right_step, "{h}");
+                }
+                // The findings it shows (8 of them at the most).
+                let shows = |b: &Boxes| (b.things.height - BORDERS - 1).min(8);
+                assert!(shows(&b) <= shows(&p), "{h}");
+            }
+            last = Some(b);
+        }
+        assert!(last.is_some());
+        // The steps, in order: the right column drops "Slowest" before "Freed by
+        // TTL" goes short or goes; the left one shortens "Selected", drops it, then
+        // gives up "Off" a reason at a time.
+        assert_eq!(
+            right_steps(Some((2, 1)), Some(3)),
+            vec![
+                [Some(2), Some(3)],
+                [Some(2), None],
+                [Some(1), None],
+                [None, None]
+            ]
+        );
+        assert_eq!(
+            left_steps(Some((4, 1)), &[5, 3, 1]),
+            vec![
+                [Some(4), Some(5)],
+                [Some(1), Some(5)],
+                [None, Some(5)],
+                [None, Some(3)],
+                [None, Some(1)]
+            ]
+        );
+    }
     #[test]
     fn the_findings_move_and_open_the_same_at_120_and_at_80_columns() {
         for (w, h) in [(80, 24), (120, 36), (160, 45)] {
@@ -2076,19 +3236,31 @@ mod tests {
         no_heading_without_rows(&t);
         insta::assert_snapshot!("analyzed_80x24", t);
         let t = text_of(&app, 120, 36);
-        // Two panes: what TTLs free as bars, and every pattern that fits.
+        // Boxes: what TTLs free as bars, and the patterns that fit, the rest on one row.
         for want in [
-            "FREED BY TTL",
+            "─ Freed by TTL ─",
+            "of 9.0G",
             "within 1 h",
             "within 7 d",
             "never",
-            "lock:{var}",
+            "3 other patterns",
         ] {
             assert!(t.contains(want), "{want}:\n{t}");
         }
-        assert!(!t.contains("other patterns"), "{t}");
+        // No box repeats its title inside.
+        for head in [
+            "FREED BY TTL",
+            "SLOWEST IN THE SLOW LOG",
+            "WHERE THE MEMORY IS",
+        ] {
+            assert!(!t.contains(head), "{head}:\n{t}");
+        }
+        // Taller, every pattern.
+        let tall = text_of(&app, 160, 45);
+        assert!(tall.contains("lock:{var}"), "{tall}");
+        assert!(!tall.contains("other patterns"), "{tall}");
         // The slowest entries by duration, command and time; never a key or argument.
-        assert!(t.contains("SLOWEST IN THE SLOW LOG"), "{t}");
+        assert!(t.contains("─ Slowest in the slow log ─"), "{t}");
         for (w, h) in [(80, 24), (120, 36), (160, 45)] {
             let any = text_of(&app, w, h);
             assert!(!any.contains("secret-value"), "{w}x{h}:\n{any}");
