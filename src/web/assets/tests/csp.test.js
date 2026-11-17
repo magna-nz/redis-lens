@@ -28,7 +28,7 @@ const scripts = files.filter((f) => f.endsWith('.js'));
 const pages = files.filter((f) => f.endsWith('.html'));
 
 test('the fixed file list is all there', () => {
-  const want = ['index.html', 'locked.html', 'app.css', 'app.js', 'api.js', 'ui.js', 'mock.js', 'mark.svg',
+  const want = ['index.html', 'locked.html', 'app.css', 'app.js', 'api.js', 'ui.js', 'keys.js', 'mock.js', 'mark.svg',
     'views/connections.js', 'views/overview.js', 'views/server.js', 'views/pubsub.js', 'views/cmdline.js',
     'views/browse.js', 'views/analyze.js', 'views/streams.js', 'views/search.js'];
   assert.deepEqual(files.slice().sort(), want.slice().sort());

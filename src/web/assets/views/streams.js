@@ -11,7 +11,7 @@
 // open and nothing goes to storage, the console or an address.
 
 import {
-  h, fill, DASH, fmtBytes, fmtGrouped, plural, notice, emptyState, readOnlyNote, errorText, table,
+  h, fill, DASH, fmtBytes, fmtGrouped, plural, notice, emptyState, errorText, table, writesOffLine, aboutThis, fillWhile, writesReason, listPick,
 } from '../ui.js';
 import { streamWriteText } from '../api.js';
 
@@ -91,11 +91,28 @@ export function entryText(item) {
   return fields.map((f) => `${f.name}=${f.value}`).join(' · ');
 }
 
-/** The row of the list to show: the one picked, else the first one. */
+/** Where the screen's one read-only line goes: in the stream's pane when one is shown (its
+ *  head has the writes), else in the list's. */
+export function readOnlyPlace({ shown = false } = {}) {
+  return shown ? 'stream' : 'streams';
+}
+
+/** The row of the list to show (`listPick`): the one picked, the first when none is
+ *  picked yet, and none when the one picked is no longer in the list (`pickGone`): no
+ *  other stream takes its place. */
 export function pickRow(list, id) {
   if (!list || !list.rows.length) return null;
-  return list.rows.find((r) => r.key.id === id) || list.rows[0];
+  const at = listPick(list.rows.map((r) => ({ key: r.key.id })), id ?? null);
+  return at.index >= 0 ? list.rows[at.index] : null;
 }
+
+/** Whether the stream picked is no longer in the list read now. */
+export function pickGone(list, id) {
+  return !!(list && Array.isArray(list.rows) && id !== null && id !== undefined && !list.rows.some((r) => r.key.id === id));
+}
+
+/** What the detail shows when the stream picked left the list. */
+export const STREAM_GONE = 'The stream picked is no longer in the list: its forms are closed. Pick another stream.';
 
 // ---------------------------------------------------------------------------------------
 // The view
@@ -124,10 +141,14 @@ export function mount(root, ctx, { head, body: area }) {
   let alive = true;
   const timers = [];
   const subtitle = head.subtitle;
-  const readAgain = h('button', { type: 'button', class: 'btn', text: 'Read again', onclick: () => load(true) });
+  const readAgain = h('button', { type: 'button', class: 'btn', text: 'Read again', 'data-act': 'refresh', onclick: () => load(true) });
   head.actions.append(readAgain);
-  const box = h('div', { class: 'stack-lg', 'aria-live': 'polite' });
+  const box = h('div', { class: 'stack-lg lv-area', 'aria-live': 'polite' });
+  area.classList.add('lv-area');
   area.append(box);
+  // From a wide window the list and the stream fill the window, each scrolling inside itself.
+  const unfill = fillWhile();
+  root.classList.add('lv-view');
 
   let seq = 0;
   /** Read the list. `quiet` (the poll): a form being filled in, or a pending list open, stay
@@ -179,6 +200,14 @@ export function mount(root, ctx, { head, body: area }) {
   }
 
   const writesOff = () => (store.list && store.list.writes) || null;
+  /** The one line that says why the writes are off, in the pane that is its place now: on
+   *  a read-only connection the read-only line with its button, else the server's reason. */
+  const offLine = (here) => {
+    const off = writesOff();
+    if (!off || here !== readOnlyPlace({ shown: !!pickRow(store.list, store.picked) })) return null;
+    const c = ctx.state().conn;
+    return h('div', { class: 'bar-why pane-note' }, c && c.readOnly ? writesOffLine(ctx, writesReason(off)) : notice(off, 'info'));
+  };
   const nodeName = (r) => r.endpoint || (typeof r.node === 'number' ? `node ${r.node + 1}` : DASH);
 
   function draw() {
@@ -202,7 +231,7 @@ export function mount(root, ctx, { head, body: area }) {
       fill(box, h('div', { class: 'card stack' },
         h('h2', { class: 'lbl', text: a.running || l.analysisRunning ? 'Analyzing' : 'No analysis yet' }),
         emptyState(a.running || l.analysisRunning ? 'The list fills in once the analysis is done.' : l.text,
-          a.running || l.analysisRunning ? null : h('button', { type: 'button', class: 'btn primary', text: 'Analyze', onclick: () => ctx.analyze('quick') }))));
+          a.running || l.analysisRunning ? null : h('button', { type: 'button', class: 'btn primary', text: 'Analyze', 'data-act': 'analyze', onclick: () => ctx.analyze('quick') }))));
       return;
     }
     if (l.status === 'none') {
@@ -213,15 +242,31 @@ export function mount(root, ctx, { head, body: area }) {
     }
     const row = pickRow(l, store.picked);
     if (row) store.picked = row.key.id;
+    // The stream picked left the list: its pending list, entries and claim form close with
+    // it, and no other stream is shown or marked open in its place.
+    const gone = pickGone(l, store.picked);
+    let closedEntries = false;
+    if (gone && (store.pending || store.entries || store.claim)) {
+      closedEntries = !!store.entries;
+      store.pending = null;
+      store.entries = null;
+      store.claim = null;
+    }
     const focusedId = box.contains(document.activeElement) ? document.activeElement.id : null;
     fill(box,
       store.error ? notice(store.error) : null,
-      writesOff() ? readOnlyNote(writesOff()) : null,
-      h('div', { class: 'browse streams' }, listCard(l, row), row ? detailCard(row) : null));
+      h('div', { class: 'lv streams' }, listCard(l, row), row ? detailCard(row) : gone ? goneCard() : null));
+    if (closedEntries) queueMicrotask(entriesClosed);
     if (focusedId) {
       const again = document.getElementById(focusedId);
       if (again) again.focus();
     }
+  }
+
+  function goneCard() {
+    return h('section', { class: 'card pane lv-detail stream-detail', 'data-pane': 'stream', 'aria-label': 'The stream' },
+      h('div', { class: 'pane-head' }, h('h2', { class: 'lbl', text: 'Stream' })),
+      h('div', { class: 'pane-scroll pane-body pad' }, notice(STREAM_GONE, 'info')));
   }
 
   function listCard(l, picked) {
@@ -234,13 +279,15 @@ export function mount(root, ctx, { head, body: area }) {
       draw();
       if (hadEntries) entriesClosed();
     };
-    return h('div', { class: 'card stack browse-col stream-list' },
-      h('div', { class: 'card-head' }, h('h2', { class: 'lbl', text: `Streams · ${l.rows.length}` })),
-      l.note ? h('p', { class: 'muted small', text: l.note }) : null,
+    return h('section', { class: 'card pane lv-list stream-list', 'data-pane': 'streams', 'aria-label': 'Streams' },
+      h('div', { class: 'pane-head' }, h('h2', { class: 'lbl', text: `Streams · ${l.rows.length}` })),
+      offLine('streams'),
+      h('div', { class: 'pane-scroll pane-body' },
+      l.note ? h('p', { class: 'muted small pad-x', text: l.note }) : null,
       table([
         {
           label: 'Stream', cls: 'keycell', cell: (r) => h('button', {
-            type: 'button', class: 'linkish mono clip', id: `stream-${r.key.id}`, text: r.key.name, 'aria-pressed': picked && r.key.id === picked.key.id ? 'true' : 'false',
+            type: 'button', class: 'linkish mono clip', id: `stream-${r.key.id}`, text: r.key.name, 'aria-pressed': picked && r.key.id === picked.key.id ? 'true' : 'false', 'data-row': r.key.id,
             title: r.gone ? r.text : `Show ${r.key.name}`, onclick: () => pick(r),
           }),
         },
@@ -251,15 +298,17 @@ export function mount(root, ctx, { head, body: area }) {
         { label: 'Oldest', cls: 'mono nowrap', cell: (r) => (r.gone ? DASH : r.oldest || DASH) },
         { label: 'Verdict', cls: 'nowrap', cell: (r) => (r.gone ? h('span', { class: 'badge', text: 'gone' }) : h('span', { class: r.verdict === 'ok' ? 'badge' : 'badge flagged', text: r.verdict === 'ok' ? 'ok' : `▲ ${r.verdict}` })) },
         l.cluster ? { label: 'Node', cls: 'mono nowrap', cell: (r) => nodeName(r) } : null,
-      ].filter(Boolean), l.rows.map((r) => ({ ...r, rowClass: picked && r.key.id === picked.key.id ? 'on' : '' })), { caption: 'The streams of the analysis', cls: 'streams' }));
+      ].filter(Boolean), l.rows.map((r) => ({ ...r, rowClass: picked && r.key.id === picked.key.id ? 'on' : '' })), { caption: 'The streams of the analysis', cls: 'streams' })));
   }
 
   // ---------- the stream's details ----------
 
   function detailCard(r) {
     if (r.gone) {
-      return h('div', { class: 'card stack browse-col stream-detail' },
-        h('h2', { class: 'key-title mono wrap-any', text: r.key.name }), notice(r.text || 'The key is gone, or no longer a stream.'));
+      return h('section', { class: 'card pane lv-detail stream-detail', 'data-pane': 'stream', 'aria-label': 'The stream' },
+        h('div', { class: 'pane-head' }, h('h2', { class: 'key-title mono clip', text: r.key.name, title: r.key.name })),
+        offLine('stream'),
+        h('div', { class: 'pane-scroll pane-body pad' }, notice(r.text || 'The key is gone, or no longer a stream.')));
     }
     const facts = [
       ['Length', `${countText(r.length)} entries`],
@@ -270,9 +319,21 @@ export function mount(root, ctx, { head, body: area }) {
       ['Entries added', countText(r.entriesAdded)],
       r.endpoint || typeof r.node === 'number' ? ['Node', nodeName(r)] : null,
     ].filter(Boolean);
-    return h('div', { class: 'card stack browse-col stream-detail' },
-      h('div', { class: 'value-head' }, h('h2', { class: 'key-title mono wrap-any', text: r.key.name }),
-        h('button', { type: 'button', class: 'btn quiet', text: 'Open on Keys', title: `Open ${r.key.name} on Browse › Keys`, onclick: () => ctx.openKey(r.key) })),
+    // The writes stay in sight: Claim and Trim open their forms below, unchanged.
+    const claimable = (r.groups || []).find((g) => g.pending) || null;
+    const tools = [
+      writesOff() ? null : h('button', {
+        type: 'button', class: 'btn', text: 'Claim…', 'data-act': 'stream.claim', disabled: !claimable,
+        title: claimable ? `Claim pending entries of ${claimable.name.name} (XAUTOCLAIM)` : 'Nothing is pending in any group of this stream.',
+        onclick: () => openClaim(r, claimable, null),
+      }),
+      writesOff() ? null : h('button', { type: 'button', class: 'btn danger', text: 'Trim…', 'data-act': 'stream.trim', title: 'Trim the stream (XTRIM): it asks first', onclick: () => openTrim(r) }),
+      h('button', { type: 'button', class: 'btn quiet', text: 'Open on Keys', title: `Open ${r.key.name} on Browse › Keys`, onclick: () => ctx.openKey(r.key) }),
+    ];
+    return h('section', { class: 'card pane lv-detail stream-detail', 'data-pane': 'stream', 'aria-label': 'The stream' },
+      h('div', { class: 'pane-head' }, h('h2', { class: 'key-title mono clip', text: r.key.name, title: r.key.name }), h('div', { class: 'pane-tools' }, tools)),
+      offLine('stream'),
+      h('div', { class: 'pane-scroll pane-body pad' },
       h('dl', { class: 'facts' }, facts.map(([k, v]) => h('div', null, h('dt', { text: k }), h('dd', { class: 'mono', text: v })))),
       r.verdicts.length ? h('div', { class: 'notes' }, r.verdicts.map((v) => notice(v.text))) : h('p', { class: 'note ok' }, h('span', { class: 'glyph', 'aria-hidden': 'true', text: '✓' }), h('span', { text: 'Nothing stands out.' })),
       r.leftOut ? h('p', { class: 'muted small', text: r.leftOut }) : null,
@@ -280,7 +341,7 @@ export function mount(root, ctx, { head, body: area }) {
       r.groups && r.groups.length ? r.groups.map((g) => groupBox(r, g)) : h('p', { class: 'muted', text: r.groupsText || 'No consumer groups: nothing reads this stream.' }),
       store.pending && store.pending.key === r.key.id ? pendingBox(r) : null,
       writesOff() ? null : trimForm(r),
-      entriesBox(r));
+      entriesBox(r)));
   }
 
   function groupBox(r, g) {
@@ -288,25 +349,25 @@ export function mount(root, ctx, { head, body: area }) {
     return h('section', { class: 'item-actions stack-sm', 'aria-label': `Group ${g.name.name}` },
       h('div', { class: 'toolbar' },
         h('h4', { class: 'mono strong wrap-any', text: g.name.name }),
-        h('button', { type: 'button', class: 'btn quiet', text: 'Pending entries', 'aria-label': `List the pending entries of ${g.name.name}`, onclick: () => listPending(r, g, null) })),
+        h('button', { type: 'button', class: 'btn quiet', text: 'Pending entries', 'aria-label': `List the pending entries of ${g.name.name}`, 'data-act': 'stream.pending', onclick: () => listPending(r, g, null) })),
       h('p', { class: 'muted small', text: groupLine(g) }),
       readers === null ? h('p', { class: 'muted small', text: 'XINFO CONSUMERS is not available for this user.' })
         : readers.length ? table([
-          { label: 'Consumer', cls: 'keycell mono', cell: (c) => `${c.stuck ? '▲ ' : ''}${c.name.name}` },
+          { label: 'Consumer', cls: 'keycell mono', cell: (c) => (c.stuck ? [h('span', { class: 'glyph', 'aria-hidden': 'true', text: '▲ ' }), h('span', { class: 'sr-only', text: 'stuck: ' }), c.name.name] : c.name.name) },
           { label: 'Pending', cls: 'mono right nowrap', cell: (c) => fmtGrouped(c.pending) },
           { label: 'Idle', cls: 'mono nowrap', cell: (c) => c.idle || DASH },
           { label: 'Inactive', cls: 'mono nowrap', cell: (c) => c.inactive || DASH },
           {
             label: '', cls: 'nowrap', cell: (c) => [
               c.pending ? h('button', {
-                type: 'button', class: 'btn quiet', text: 'Pending', 'aria-label': `List the pending entries of ${c.name.name}`, onclick: () => listPending(r, g, c),
+                type: 'button', class: 'btn quiet', text: 'Pending', 'data-open': '', 'aria-label': `List the pending entries of ${c.name.name}`, 'data-act': 'stream.pending', onclick: () => listPending(r, g, c),
               }) : null,
               writesOff() || !g.pending ? null : h('button', {
-                type: 'button', class: 'btn quiet', text: 'Claim', 'aria-label': `Claim pending entries of ${g.name.name} from ${c.name.name} (XAUTOCLAIM)`, onclick: () => openClaim(r, g, { name: c.name, idleMs: c.idleMs }),
+                type: 'button', class: 'btn quiet', text: 'Claim', 'aria-label': `Claim pending entries of ${g.name.name} from ${c.name.name} (XAUTOCLAIM)`, 'data-act': 'stream.claim', onclick: () => openClaim(r, g, { name: c.name, idleMs: c.idleMs }),
               }),
             ],
           },
-        ], readers, { caption: `The consumers of ${g.name.name}` })
+        ], readers, { caption: `The consumers of ${g.name.name}`, rowKey: (c) => `c:${g.name.id}:${c.name.id}` })
           : h('p', { class: 'muted small', text: 'No consumers.' }),
       readers && readers.some((c) => c.stuck) ? h('p', { class: 'muted small', text: '▲ stuck: holds pending entries and idle 30 minutes or more.' }) : null,
       writesOff() || !g.pending ? null : claimForm(r, g));
@@ -361,14 +422,14 @@ export function mount(root, ctx, { head, body: area }) {
         writesOff() ? null : {
           label: '', cls: 'nowrap', cell: (e) => [
             h('button', {
-              type: 'button', class: 'btn quiet', text: 'Ack', 'aria-label': `Acknowledge ${e.id} (XACK)`, onclick: (ev) => ack(r, p, e, ev.currentTarget),
+              type: 'button', class: 'btn quiet', text: 'Ack', 'aria-label': `Acknowledge ${e.id} (XACK)`, 'data-act': 'stream.ack', onclick: (ev) => ack(r, p, e, ev.currentTarget),
             }),
             group && group.pending ? h('button', {
-              type: 'button', class: 'btn quiet', text: 'Claim', 'aria-label': `Claim pending entries of ${group.name.name} from ${e.consumer.name} (XAUTOCLAIM)`, onclick: () => openClaim(r, group, { name: e.consumer, idleMs: e.idleMs }),
+              type: 'button', class: 'btn quiet', text: 'Claim', 'aria-label': `Claim pending entries of ${group.name.name} from ${e.consumer.name} (XAUTOCLAIM)`, 'data-act': 'stream.claim', onclick: () => openClaim(r, group, { name: e.consumer, idleMs: e.idleMs }),
             }) : null,
           ],
         },
-      ].filter(Boolean), p.entries, { caption: 'Pending entries' }) : h('p', { class: 'muted', text: 'Nothing is pending.' }),
+      ].filter(Boolean), p.entries, { caption: 'Pending entries', rowKey: (e) => `e:${e.id}` }) : h('p', { class: 'muted', text: 'Nothing is pending.' }),
       typeof p.max === 'number' && p.entries.length >= p.max ? h('p', { class: 'muted small', text: `The first ${fmtGrouped(p.max)} pending entries.` }) : null);
   }
 
@@ -423,6 +484,16 @@ export function mount(root, ctx, { head, body: area }) {
     if (box) box.focus();
   }
 
+  /** The head's Trim…: opens the trim form below (the form is the same) and goes into it. */
+  function openTrim(r) {
+    const d = document.getElementById(`trim-${r.key.id}`);
+    if (!d) return;
+    d.open = true;
+    d.scrollIntoView({ block: 'nearest' });
+    const first = d.querySelector('select, input');
+    if (first) first.focus();
+  }
+
   function claimForm(r, g) {
     const asked = store.claim && store.claim.key === r.key.id && store.claim.group === g.name.id ? store.claim : null;
     const from = asked ? asked.from : null;
@@ -472,8 +543,8 @@ export function mount(root, ctx, { head, body: area }) {
     const by = h('select', { class: 'field', id: byId }, h('option', { value: 'MAXLEN', text: 'MAXLEN: keep the newest entries' }), h('option', { value: 'MINID', text: 'MINID: drop entries older than an ID' }));
     const value = input('Value', '');
     const error = h('p', { class: 'form-error', role: 'alert' });
-    const button = h('button', { type: 'submit', class: 'btn', text: 'Trim' });
-    return h('details', { class: 'advanced' },
+    const button = h('button', { type: 'submit', class: 'btn danger', text: 'Trim' });
+    return h('details', { class: 'advanced', id: `trim-${r.key.id}` },
       h('summary', { text: 'Trim the stream (XTRIM)' }),
       h('form', {
         class: 'form', autocomplete: 'off',
@@ -527,7 +598,7 @@ export function mount(root, ctx, { head, body: area }) {
       h('h3', { class: 'lbl', text: v ? `Entries, newest first · ${fmtGrouped(v.items.length)} of ${countText(v.length ?? r.length)}` : 'Entries, newest first' }),
       h('button', { type: 'button', class: 'btn quiet', text: v ? 'Read again' : 'Show entries', disabled: e && e.reading, onclick: () => openEntries(r) }),
       e ? h('button', { type: 'button', class: 'btn quiet', text: 'Close', 'aria-label': 'Close the entries', onclick: closeEntries }) : null);
-    if (!e) return h('section', { class: 'stack-sm' }, head, h('p', { class: 'muted small', text: 'XREVRANGE, a page at a time. The list is not read again while the entries are open.' }));
+    if (!e) return h('section', { class: 'stack-sm' }, head, aboutThis('XREVRANGE, a page at a time. The list is not read again while the entries are open.'));
     if (e.error) return h('section', { class: 'stack-sm' }, head, notice(e.error));
     if (!v) return h('section', { class: 'stack-sm' }, head, h('p', { class: 'muted', text: 'Reading the entries…' }));
     if (v.gone || v.kind !== 'stream') return h('section', { class: 'stack-sm' }, head, notice(v.error || 'The key is gone, or no longer a stream.'));
@@ -536,8 +607,8 @@ export function mount(root, ctx, { head, body: area }) {
       v.items.length ? h('ul', { class: 'list items' }, v.items.map((it) => h('li', { class: 'row row-item cols-2 entry' },
         h('span', { class: 'mono small nowrap', text: it.name ?? '' }), h('span', { class: 'mono small wrap-any', text: entryText(it) })))) : h('p', { class: 'muted', text: 'The stream has no entries.' }),
       v.notice ? h('p', { class: 'muted small', text: v.notice }) : null,
-      h('p', { class: 'muted small' }, 'Each entry on one line; ', h('button', { type: 'button', class: 'linkish', text: 'Open on Keys', title: `Open ${r.key.name} on Browse › Keys`, onclick: () => ctx.openKey(r.key) }), ' shows an entry\'s fields whole, in a format.'),
-      v.more && !(typeof (v.length ?? r.length) === 'number' && v.items.length >= (v.length ?? r.length)) ? h('button', { type: 'button', class: 'btn', text: 'Show more', disabled: e.reading, onclick: () => openEntries(r, true) }) : null);
+      aboutThis(h('p', { class: 'muted small' }, 'Each entry on one line; ', h('button', { type: 'button', class: 'linkish', text: 'Open on Keys', title: `Open ${r.key.name} on Browse › Keys`, onclick: () => ctx.openKey(r.key) }), ' shows an entry\'s fields whole, in a format.')),
+      v.more && !(typeof (v.length ?? r.length) === 'number' && v.items.length >= (v.length ?? r.length)) ? h('button', { type: 'button', class: 'btn', text: 'Show more', disabled: e.reading, 'data-act': 'more', onclick: () => openEntries(r, true) }) : null);
   }
 
   // ---------- following the session ----------
@@ -553,6 +624,9 @@ export function mount(root, ctx, { head, body: area }) {
     const ended = s.analysis.status !== lastStatus && (s.analysis.status === 'done' || s.analysis.status === 'none');
     lastStatus = s.analysis.status;
     if (store.who !== before || ended) again = true;
+    // Another connection or run: the open forms (claim, trim) go at once, before the list is
+    // read again, so nothing typed for one connection is sent to another.
+    if (store.who !== before) draw();
     if (again && s.liveState === 'ready' && s.connected) {
       again = false;
       load();
@@ -588,6 +662,7 @@ export function mount(root, ctx, { head, body: area }) {
 
   return () => {
     alive = false;
+    unfill();
     offState();
     timers.forEach((t) => clearInterval(t));
   };

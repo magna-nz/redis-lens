@@ -8,7 +8,8 @@
 
 import {
   h, fill, refill, DASH, fmtBytes, fmtCount, fmtGrouped, fmtPercent, fmtDuration, fmtClock, plural, barPercent, meter, setVar,
-  table, pills, notice, emptyState, connectFirst, errorText, confirmDialog, copyText, fmtSignedBytes, fmtSignedCount, sparkline, expiryText,
+  table, pills, notice, emptyState, connectFirst, errorText, confirmDialog, copyText, fmtSignedBytes, fmtSignedCount, sparkline, expiryText, patternName,
+  openDialog, listPick, paneCard, aboutThis, fillWhile, glyphText, STALE_START_TEXT,
 } from '../ui.js';
 
 // ---------------------------------------------------------------------------------------
@@ -115,6 +116,32 @@ export function freedBars(freed) {
   return rows.map((r) => ({ ...r, pct: barPercent(r.bytes, max), share: typeof freed.total === 'number' && freed.total > 0 && typeof r.bytes === 'number' ? r.bytes / freed.total : null }));
 }
 
+const NODE_STATE = { scanned: '✓ analyzed', partial: '▲ partial', failed: '✗ failed' };
+
+/** Nodes as a list beside its detail: the rows, each with its key, and the picked one
+ *  (`listPick`: kept by its key across readings; one that is gone is said, not swapped). */
+export function nodesModel(d, picked = null) {
+  const rows = (d && Array.isArray(d.rows) ? d.rows : []).map((r, i) => ({ ...r, key: `n:${typeof r.index === 'number' ? r.index : i}` }));
+  const at = listPick(rows, picked);
+  return { rows, key: at.key, sel: at.index >= 0 ? rows[at.index] : null, gone: at.gone };
+}
+
+/** A node's detail, label and value, from its row only. */
+export function nodeFacts(r) {
+  const n = (v, f) => (typeof v === 'number' ? f(v) : DASH);
+  return [
+    ['Role', r.role || DASH],
+    ['Version', r.version || DASH],
+    ['Slots', r.slots || DASH],
+    ['Slot count', n(r.slotCount, fmtGrouped)],
+    ['State', NODE_STATE[r.status] || DASH],
+    ['Keys', n(r.keys, fmtGrouped)],
+    ['Memory', n(r.memory, fmtBytes)],
+    ['Sampled keys', n(r.sampledKeys, fmtGrouped)],
+    ['Patterns', n(r.patterns, fmtGrouped)],
+  ];
+}
+
 // ---------------------------------------------------------------------------------------
 // The memory, kept while other areas are shown
 // ---------------------------------------------------------------------------------------
@@ -151,6 +178,92 @@ export function requestStart(depth) {
   store.pendingStart = depth === 'deep' ? 'deep' : 'quick';
 }
 
+/** A panel's reading this page holds already for the session shown (Overview's "Freed by
+ *  TTL" takes Expiry's, when Expiry was opened since the analysis): never read for it. */
+export function heldPanel(id, state) {
+  if (state) follow(state);
+  const p = store.panels[id];
+  return p && p.data && !p.error ? p.data : null;
+}
+
+/** The choice Overview's one Analyze button opens: quick or deep, each with its estimate
+ *  (`GET /api/analysis`, the same estimates the ask on Analyze shows). `preferred` is
+ *  ticked; by default the quick one. */
+export function choiceModel(info, preferred = 'quick') {
+  const pick = preferred === 'deep' ? 'deep' : 'quick';
+  return ['quick', 'deep'].map((depth) => {
+    const e = info && Array.isArray(info.estimates) ? info.estimates.find((x) => x.depth === depth) || null : null;
+    return { depth, label: DEPTHS[depth], text: estimateText(e ? { ...e, depth } : null), checked: depth === pick };
+  });
+}
+
+/** What a key does in the ask (`askAnalyze`), from the control with the focus: `'analyze'`
+ *  (the Analyze button), `'cancel'`, `'choice'` (a Quick or Deep option) or anything else.
+ *  Enter starts the analysis only on the Analyze button and cancels on Cancel; anywhere
+ *  else it does nothing (a choice is picked with the arrows or Space, never submitted).
+ *  Returns `'start'`, `'cancel'` or `'none'`. */
+export function askKey(focused, key) {
+  if (key !== 'Enter') return 'none';
+  if (focused === 'analyze') return 'start';
+  if (focused === 'cancel') return 'cancel';
+  return 'none';
+}
+
+/** The ask with the choice in it: quick or deep, with what each costs; Analyze starts the
+ *  one ticked. A choice, not a confirm (docs/ui-redesign.md §11): it stays centred. Resolves
+ *  to the depth started, or null. */
+export async function askAnalyze(ctx, preferred = 'quick') {
+  let info;
+  try {
+    info = await ctx.api.getAnalysis();
+    store.info = info;
+  } catch (err) {
+    ctx.notify(errorText(err), 'error');
+    return null;
+  }
+  const options = choiceModel(info, preferred);
+  const depth = await openDialog({
+    title: 'Analyze the keys?',
+    // Marked with the session: an answer after the connection or database changed starts
+    // nothing, and the dialog closes by itself when it changes.
+    session: true,
+    onStale: () => ctx.notify(STALE_START_TEXT, 'info'),
+    build(close) {
+      // No form: Enter on a choice never submits. Only the Analyze button starts it
+      // (`askKey`); the focus starts on Cancel, as in every other question.
+      const radios = options.map((o) => h('input', { type: 'radio', name: 'analyze-depth', id: `analyze-${o.depth}`, value: o.depth, checked: o.checked }));
+      const picked = () => {
+        const on = radios.find((r) => r.checked);
+        return on ? on.value : null;
+      };
+      const cancel = h('button', { type: 'button', class: 'btn', text: 'Cancel', 'data-autofocus': true, 'data-ask': 'cancel', onclick: () => close(null) });
+      const start = h('button', { type: 'button', class: 'btn primary', text: 'Analyze', 'data-ask': 'analyze', onclick: () => close(picked()) });
+      const box = h('div', { class: 'form' },
+        h('fieldset', { class: 'group' }, h('legend', { text: 'How many keys' }),
+          options.map((o, i) => h('div', { class: 'check' }, radios[i], h('label', { htmlFor: radios[i].id }, h('span', { class: 'strong', text: o.label }), h('span', { class: 'hint', text: o.text }))))),
+        h('p', { class: 'muted', text: 'The panels show the results; the earlier ones stay until it has its own.' }),
+        h('div', { class: 'dialog-actions' }, cancel, start));
+      box.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        const t = e.target;
+        const does = askKey(t && t.dataset ? t.dataset.ask || (t.type === 'radio' ? 'choice' : null) : null, e.key);
+        e.preventDefault();
+        if (does === 'start') close(picked());
+        else if (does === 'cancel') close(null);
+      });
+      return box;
+    },
+  });
+  if (!depth) return null;
+  try {
+    await ctx.api.startAnalysis(depth);
+    return depth;
+  } catch (err) {
+    ctx.notify(errorText(err), 'error');
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------------------
 // The view
 // ---------------------------------------------------------------------------------------
@@ -185,21 +298,31 @@ export function mount(root, ctx, route) {
     progress,
     lastLine,
     pills(tabs().map((t) => ({ id: t.id, label: t.label, href: `#/analyze/${t.id}` })), tab, null, 'Analyze panels'));
-  const body = h('div', { class: 'stack-lg' });
+  // The panel's lists are one pane for the keys.
+  // Nodes has two panes of its own (the list and the node).
+  const body = h('div', { class: 'stack-lg', 'data-pane': tab === 'nodes' ? null : 'panel' });
   view.append(body);
+  // Nodes is a list and its detail, as Server's Slow log: from a wide window the two panes
+  // fill the height and scroll inside themselves (app.css).
+  const unfill = tab === 'nodes' ? fillWhile() : () => {};
+  if (tab === 'nodes') {
+    view.classList.add('lv-view');
+    body.classList.add('lv-area');
+  }
 
   function drawHead() {
     const a = ctx.state().analysis;
     status.textContent = statusText(a);
     const running = a.running;
     const start = (depth, primary) => h('button', {
-      type: 'button', class: primary ? 'btn primary' : 'btn', text: DEPTHS[depth], disabled: running,
+      type: 'button', class: primary ? 'btn primary' : 'btn', text: DEPTHS[depth], disabled: running, title: running ? 'An analysis is running: wait for it, or stop it.' : null,
+      'data-act': depth === 'quick' ? 'analyze' : null,
       onclick: () => ask(depth),
     });
     const r = a.report;
     refill(actions, [
       running ? h('button', { type: 'button', class: 'btn primary', text: a.status === 'stopping' ? 'Stopping…' : 'Stop', disabled: a.status === 'stopping', onclick: stop }) : null,
-      r && !running && !r.stopped ? h('button', { type: 'button', class: 'btn', text: 'Save as snapshot', onclick: (e) => save(e.currentTarget) }) : null,
+      r && !running && !r.stopped ? h('button', { type: 'button', class: 'btn', text: 'Save as snapshot', 'data-act': 'snapshot', onclick: (e) => save(e.currentTarget) }) : null,
       start('quick', !r && !running),
       start('deep', false),
     ]);
@@ -227,7 +350,8 @@ export function mount(root, ctx, route) {
       return;
     }
     const e = info.estimates.find((x) => x.depth === depth) || null;
-    const answer = await confirmDialog({ kind: 'ask', title: 'Analyze the keys?', text: estimateText(e), yes: 'Analyze', after: 'The panels show the results; the earlier ones stay until it has its own.' });
+    const answer = await confirmDialog({ kind: 'ask', title: 'Analyze the keys?', text: estimateText(e), yes: 'Analyze', after: 'The panels show the results; the earlier ones stay until it has its own.' },
+      { session: true, onStale: () => ctx.notify(STALE_START_TEXT, 'info') });
     if (!answer || !alive) return;
     try {
       await ctx.api.startAnalysis(depth);
@@ -338,8 +462,10 @@ export function mount(root, ctx, route) {
   }
 
   const openKey = (k) => ctx.openKey(k);
-  const keyButton = (k) => h('button', { type: 'button', class: 'linkish mono clip', text: k.name, title: `Open ${k.name} on Browse`, onclick: () => openKey(k) });
-  const patternButton = (p, node = null) => h('button', { type: 'button', class: 'linkish mono clip', text: p.name, title: `List the keys of ${p.name} on Browse`, onclick: () => ctx.openPattern(p, node) });
+  const keyButton = (k) => h('button', { type: 'button', class: 'linkish mono clip', 'data-open': '', text: k.name, title: `Open ${k.name} on Browse`, onclick: () => openKey(k) });
+  const patternButton = (p, node = null) => h('button', { type: 'button', class: 'linkish mono clip', 'data-open': '', 'aria-label': p.name, title: `List the keys of ${p.name} on Browse`, onclick: () => ctx.openPattern(p, node) }, patternName(p.name, { cls: '' }));
+  /** A figure with the warning mark in the warning colour (not in the text's). */
+  const flagged = (on, text) => (on ? [h('span', { class: 'glyph', 'aria-hidden': 'true', text: '▲ ' }), h('span', { class: 'sr-only', text: 'flagged: ' }), text] : text);
   const nodeName = (i) => {
     const s = ctx.state();
     const n = s.conn && typeof i === 'number' ? s.conn.nodes[i] : null;
@@ -367,14 +493,14 @@ export function mount(root, ctx, route) {
           { label: 'Key', cls: 'keycell', cell: (r) => keyButton(r.key) },
           { label: 'Type', cell: (r) => h('span', { class: 'badge mono', text: r.key.type || DASH }) },
           { label: 'Share', cls: 'barcell', cell: (r) => meter(barPercent(r.key.bytes, max)) },
-          { label: 'Size', cls: 'mono right nowrap', cell: (r) => `${r.big ? '▲ ' : ''}${fmtBytes(r.key.bytes)}` },
+          { label: 'Size', cls: 'mono right nowrap', cell: (r) => flagged(r.big, fmtBytes(r.key.bytes)) },
           { label: 'Length', cls: 'mono right nowrap', cell: length },
           { label: 'Encoding', cls: 'mono nowrap', cell: (r) => r.encoding || DASH },
           { label: 'Expires', cls: 'nowrap muted', cell: (r) => expiryText(r.key.ttl) || DASH },
           { label: 'Pattern', cls: 'keycell', cell: (r) => patternButton(r.pattern) },
           cluster ? { label: 'Node', cls: 'mono nowrap', cell: (r) => r.endpoint || nodeName(r.key.node) } : null,
-        ].filter(Boolean), rows, { caption: 'The biggest sampled keys', cls: 'big' }),
-        d.factsRead ? null : h('p', { class: 'muted small', text: 'Lengths and encodings are read for the listed keys when the panel opens.' }),
+        ].filter(Boolean), rows, { caption: 'The biggest sampled keys', cls: 'big', rowKey: (r, i) => r.key.id ?? `b:${i}` }),
+        d.factsRead ? null : aboutThis('Lengths and encodings are read for the listed keys when the panel opens.'),
         d.notes.map((t) => notice(t))));
   }
 
@@ -396,18 +522,18 @@ export function mount(root, ctx, route) {
     const list = h('div', { class: 'card col wide' },
       h('h2', { class: 'lbl', text: 'Patterns by TTL risk' }),
       d.empty ? emptyState(d.empty) : h('ul', { class: 'list' }, d.rows.map((r, i) => h('li', null, h('button', {
-        type: 'button', class: `row row-exp${sel === r ? ' on' : ''}`, 'aria-current': sel === r ? 'true' : null,
+        type: 'button', class: `row row-exp${sel === r ? ' on' : ''}`, 'aria-current': sel === r ? 'true' : null, 'data-row': `x:${i}`,
         onclick: () => {
           store.picked.expiry = i;
           drawBody();
         },
       },
       h('span', { class: 'glyph', 'aria-hidden': 'true', text: r.warning ? '▲' : '' }),
-      h('span', { class: 'name' }, h('span', { class: 'mono clip block', text: r.pattern.name }), h('span', { class: 'sub', text: `${r.status || DASH} · ~${fmtCount(r.estKeys)} keys` })),
+      h('span', { class: 'name' }, patternName(r.pattern.name, { cls: 'mono clip block' }), h('span', { class: 'sub', text: `${r.status || DASH} · ~${fmtCount(r.estKeys)} keys` })),
       h('span', { class: 'mono right', text: `${fmtPercent(r.noTtlRatio)} no TTL` }),
       h('span', { class: 'mono right', text: fmtBytes(r.estBytes) }))))));
     const detail = sel ? h('div', { class: 'card stack' },
-      h('h2', { class: 'mono key-title wrap-any', text: sel.pattern.name }),
+      h('h2', { class: 'key-title wrap-any' }, patternName(sel.pattern.name)),
       h('p', { text: `~${fmtGrouped(sel.estKeys)} keys · ${fmtBytes(sel.estBytes)} · ${sel.status || DASH}` }),
       sel.explain.map((t, i) => (i === 0 && sel.warning ? notice(t) : h('p', { class: 'muted', text: t }))),
       sel.ttlHist && d.ttlLabels.length === sel.ttlHist.length ? histogram(d.ttlLabels, sel.ttlHist) : null,
@@ -432,14 +558,14 @@ export function mount(root, ctx, route) {
     const trend = d.rows.some((r) => r.trend);
     return d.rows.length ? table([
       { label: 'Pattern', cls: 'keycell', cell: (r) => patternButton(r.pattern) },
-      { label: 'Change', cls: 'mono right nowrap', cell: (r) => `${r.change && r.change.alarming ? '▲ ' : ''}${r.change && typeof r.change.deltaBytes === 'number' ? fmtSignedBytes(r.change.deltaBytes) : fmtSignedCount(r.change && r.change.deltaKeys)}` },
+      { label: 'Change', cls: 'mono right nowrap', cell: (r) => flagged(!!(r.change && r.change.alarming), r.change && typeof r.change.deltaBytes === 'number' ? fmtSignedBytes(r.change.deltaBytes) : fmtSignedCount(r.change && r.change.deltaKeys)) },
       { label: '%', cls: 'mono right nowrap muted', cell: changePercent },
       { label: 'Now', cls: 'mono right nowrap', cell: (r) => (typeof r.bytesAfter === 'number' ? fmtBytes(r.bytesAfter) : fmtCount(r.keysAfter)) },
       { label: 'Keys', cls: 'mono right nowrap', cell: (r) => `${fmtCount(r.keysBefore)} → ${fmtCount(r.keysAfter)}` },
       { label: 'Why', cls: 'nowrap', cell: (r) => (r.change ? r.change.words || DASH : DASH) },
       { label: '', cls: 'barcell', cell: (r) => meter(barPercent(Math.abs((r.change && (r.change.deltaBytes ?? r.change.deltaKeys)) || 0), max), r.change && r.change.alarming ? 'warn' : '') },
       trend ? { label: 'Trend', cls: 'mono nowrap', cell: (r) => (r.trend ? h('span', { title: r.trend.ratioPerDay === null ? '' : `${fmtPercent(Math.abs(r.trend.ratioPerDay))} a day`, text: sparkline(r.trend.values) }) : '') } : null,
-    ].filter(Boolean), d.rows, { caption: 'Patterns that changed', cls: 'changes' }) : emptyState(d.empty || 'No pattern changed.');
+    ].filter(Boolean), d.rows, { caption: 'Patterns that changed', cls: 'changes', rowKey: (r, i) => `c:${i}` }) : emptyState(d.empty || 'No pattern changed.');
   }
 
   function drawChanges(d) {
@@ -504,14 +630,14 @@ export function mount(root, ctx, route) {
         { label: 'Type', cell: (r) => h('span', { class: 'badge mono', text: r.key.type || DASH }) },
         { label: 'Reads', cls: 'mono right nowrap', cell: (r) => (typeof r.key.freq === 'number' ? `${r.key.freq} of 255` : DASH) },
         { label: 'Heat', cls: 'barcell', cell: (r) => meter(barPercent(r.key.freq, max)) },
-        { label: 'Size', cls: 'mono right nowrap', cell: (r) => `${r.hotAndBig ? '▲ ' : ''}${fmtBytes(r.key.bytes)}` },
+        { label: 'Size', cls: 'mono right nowrap', cell: (r) => flagged(r.hotAndBig, fmtBytes(r.key.bytes)) },
         { label: 'Expires', cls: 'nowrap muted', cell: (r) => expiryText(r.key.ttl) || DASH },
         { label: 'Pattern', cls: 'keycell', cell: (r) => patternButton(r.pattern) },
         cluster ? { label: 'Node', cls: 'mono nowrap', cell: (r) => r.endpoint || nodeName(r.key.node) } : null,
-      ].filter(Boolean), d.rows, { caption: 'The most-read sampled keys', cls: 'hot' }),
+      ].filter(Boolean), d.rows, { caption: 'The most-read sampled keys', cls: 'hot', rowKey: (r, i) => r.key.id ?? `h:${i}` }),
       // The thresholds come only with rows; with none there is nothing to mark.
       d.empty || !d.rows.length ? null
-        : h('p', { class: 'muted small', text: `▲ hot and big: an LFU counter of ${fmtGrouped(d.hotFreq)} or more and ${fmtBytes(d.hotBigBytes)} or more.` }));
+        : h('p', { class: 'muted small' }, glyphText(`▲ hot and big: an LFU counter of ${fmtGrouped(d.hotFreq)} or more and ${fmtBytes(d.hotBigBytes)} or more.`)));
   }
 
   // ---------- Hot keys from the last Monitor run ----------
@@ -542,7 +668,7 @@ export function mount(root, ctx, route) {
       const parts = monitorLinkParts(m.text);
       fill(monitorBox, h('h2', { class: 'lbl', text: 'Hot keys from Monitor' }),
         h('p', { class: 'muted' }, parts.before, parts.link ? h('a', { href: '#/server/monitor', text: parts.link }) : null, parts.after),
-        h('p', { class: 'muted small', text: 'A Monitor run names the keys of the commands it sees; Hot keys ranks them once it stops.' }));
+        aboutThis('A Monitor run names the keys of the commands it sees; Hot keys ranks them once it stops.'));
       return;
     }
     if (m.status === 'pending') {
@@ -561,28 +687,61 @@ export function mount(root, ctx, route) {
         { label: 'Share', cls: 'mono right nowrap', cell: (x) => fmtPercent(x.share) },
         { label: 'Heat', cls: 'barcell', cell: (x) => meter(barPercent(x.count, max)) },
         { label: 'Pattern', cls: 'keycell', cell: (x) => patternButton(x.pattern) },
-      ], r.rows, { caption: 'The keys the last Monitor run named most', cls: 'hot' }),
+      ], r.rows, { caption: 'The keys the last Monitor run named most', cls: 'hot', rowKey: (x, i) => `m:${i}` }),
       h('p', { class: 'muted small', text: m.text }),
       r.endpoint ? h('p', { class: 'muted small', text: `Monitor ran on ${r.endpoint}.` }) : null,
       r.unknownText ? h('p', { class: 'muted small', text: r.unknownText }) : null,
       r.keysNote ? h('p', { class: 'muted small', text: r.keysNote }) : null);
   }
 
+  /** Nodes: the shards on the left, the picked one's detail on the right (from a wide
+   *  window; under the list on a narrow one). Picking a row reads nothing: the detail is
+   *  the row's own reading. */
   function drawNodes(d) {
-    const state = { scanned: '✓ analyzed', partial: '▲ partial', failed: '✗ failed' };
-    return h('div', { class: 'card stack' },
-      h('h2', { class: 'lbl', text: `Shards · ${d.rows.length}` }),
-      d.empty ? emptyState(d.empty) : table([
-        { label: 'Slots', cls: 'mono nowrap', cell: (r) => r.slots || DASH },
-        { label: 'Node', cls: 'mono nowrap', cell: (r) => r.endpoint || DASH },
-        { label: 'Role', cell: (r) => r.role || DASH },
-        { label: 'State', cls: 'nowrap', cell: (r) => state[r.status] },
-        { label: 'Keys', cls: 'mono right', cell: (r) => fmtCount(r.keys) },
-        { label: 'Memory', cls: 'mono right', cell: (r) => fmtBytes(r.memory) },
-        { label: 'Sampled', cls: 'mono right', cell: (r) => fmtCount(r.sampledKeys) },
-        { label: 'Patterns', cls: 'right', cell: (r) => (r.status === 'failed' ? DASH : h('button', { type: 'button', class: 'btn quiet', text: 'Show', 'aria-label': `Show the patterns of ${r.endpoint}`, onclick: () => ctx.openPattern(null, r.index) })) },
-      ], d.rows, { caption: 'One row per shard', cls: 'shards' }),
-      d.rows.filter((r) => r.note).map((r) => notice(`${r.endpoint}: ${r.note}`)));
+    if (d.empty) return h('div', { class: 'card' }, emptyState(d.empty));
+    const showButton = (r, cls, opens) => (r.status === 'failed' ? null : opens
+      ? h('button', { type: 'button', class: cls, text: 'Show', 'data-open': '', 'aria-label': `Show the patterns of ${r.endpoint}`, onclick: () => ctx.openPattern(null, r.index) })
+      : h('button', { type: 'button', class: cls, text: 'Show its patterns', onclick: () => ctx.openPattern(null, r.index) }));
+    let m = nodesModel(d, store.picked.nodes ?? null);
+    const rowsOf = () => m.rows.map((r) => ({ ...r, rowClass: r.key === m.key ? 'on' : '' }));
+    const list = table([
+      { label: 'Slots', cls: 'mono nowrap', cell: (r) => r.slots || DASH },
+      { label: 'Node', cls: 'mono nowrap', cell: (r) => r.endpoint || DASH },
+      { label: 'State', cls: 'nowrap', cell: (r) => glyphText(NODE_STATE[r.status] || DASH) },
+      { label: 'Keys', cls: 'mono right', cell: (r) => fmtCount(r.keys) },
+      { label: 'Memory', cls: 'mono right', cell: (r) => fmtBytes(r.memory) },
+      { label: '', cls: 'right', cell: (r) => showButton(r, 'btn quiet', true) || DASH },
+    ], rowsOf(), { caption: 'One row per shard', cls: 'nodes', rowKey: (r) => r.key });
+    const detail = paneCard({ id: 'node', label: 'The node', cls: 'lv-detail' });
+    const drawDetail = () => {
+      const r = m.sel;
+      const [head, scroll] = [detail.querySelector('.pane-head'), detail.querySelector('.pane-body')];
+      if (!r) {
+        fill(head, h('h2', { class: 'lbl', text: 'Node' }));
+        fill(scroll, h('p', { class: 'muted pad', text: m.gone ? 'That node is not in this reading any more.' : 'Pick a shard to see its node.' }));
+        return;
+      }
+      fill(head, h('h2', { class: 'mono key-title clip', text: r.endpoint || DASH, title: r.endpoint || null }), h('div', { class: 'pane-tools' }, showButton(r, 'btn', false)));
+      fill(scroll, h('div', { class: 'stack pad' },
+        h('dl', { class: 'facts' }, nodeFacts(r).map(([k, v]) => h('div', null, h('dt', { text: k }), h('dd', { class: 'mono' }, glyphText(v))))),
+        r.note ? notice(r.note) : null));
+    };
+    const pick = (key) => {
+      if (key === m.key) return;
+      store.picked.nodes = key;
+      m = nodesModel(d, key);
+      for (const tr of list.querySelectorAll('tr[data-row]')) tr.classList.toggle('on', tr.dataset.row === m.key);
+      drawDetail();
+    };
+    const listPane = paneCard({ id: 'nodes', label: 'Shards', title: h('h2', { class: 'lbl', text: `Shards · ${d.rows.length}` }), body: list, cls: 'lv-list' });
+    const follow = (e) => {
+      const row = e.target.closest ? e.target.closest('tr[data-row]') : null;
+      if (row && listPane.contains(row)) pick(row.dataset.row);
+    };
+    listPane.addEventListener('focusin', follow);
+    listPane.addEventListener('click', follow);
+    drawDetail();
+    return h('div', { class: 'lv' }, listPane, detail);
   }
 
   function drawSlots(d) {
@@ -600,23 +759,23 @@ export function mount(root, ctx, route) {
       store.slotsOrder = id;
       delete store.panels.slots;
       drawBody();
-    }, 'Order the hottest slots by');
+    }, 'Order the hottest slots by', { act: 'sort' });
     return h('div', { class: 'stack-lg' },
       h('div', { class: 'card stack' },
         h('div', { class: 'toolbar' }, h('h2', { class: 'lbl', text: 'Hottest slots' }), order,
-          h('button', { type: 'button', class: 'btn', text: 'Read again', onclick: () => drawBody(true) })),
+          h('button', { type: 'button', class: 'btn', text: 'Read again', 'data-act': 'refresh', onclick: () => drawBody(true) })),
         d.note ? notice(d.note, 'info') : null,
         d.empty || !d.hottest.length ? emptyState(d.empty || 'No slot has keys.') : table([
           { label: 'Slot', cls: 'mono right', cell: (r) => fig(r.slot, String) },
           { label: 'Node', cls: 'mono nowrap', cell: (r) => r.endpoint || DASH },
           ...cols([{ label: 'Sampled keys', cls: 'keycell', cell: (r) => (r.sampled.length ? h('span', { class: 'mono clip', text: r.sampled.map((k) => k.key.name).join(', ') }) : DASH) }]),
-        ], d.hottest, { caption: 'The hottest slots', cls: 'slots' })),
+        ], d.hottest, { caption: 'The hottest slots', cls: 'slots', rowKey: (r, i) => `s:${i}` })),
       h('div', { class: 'card stack' },
         h('h2', { class: 'lbl', text: 'Slot ranges' }),
         table([
           { label: 'Slots', cls: 'mono nowrap', cell: (r) => `${fig(r.start, String)}-${fig(r.end, String)}` },
           { label: 'Node', cls: 'mono nowrap', cell: (r) => r.endpoint || DASH },
-          { label: 'State', cell: (r) => (r.error ? `✗ ${r.error}` : r.status || DASH) },
+          { label: 'State', cell: (r) => (r.error ? glyphText(`✗ ${r.error}`) : r.status || DASH) },
           ...cols([]),
         ], d.ranges, { caption: 'Each shard\'s slot ranges', cls: 'slots' })));
   }
@@ -630,11 +789,11 @@ export function mount(root, ctx, route) {
       return;
     }
     const a = ctx.state().analysis;
-    const saveButton = h('button', { type: 'button', class: 'btn primary', text: 'Save as snapshot', disabled: !list.canSave || a.running, onclick: (e) => save(e.currentTarget) });
+    const saveButton = h('button', { type: 'button', class: 'btn primary', text: 'Save as snapshot', disabled: !list.canSave || a.running, title: list.saveOff || null, 'data-act': 'snapshot', onclick: (e) => save(e.currentTarget) });
     fill(body, h('div', { class: 'card stack' },
       h('div', { class: 'toolbar' }, h('h2', { class: 'lbl', text: `Snapshots${list.profile ? ` of ${list.profile}` : ''} · ${list.snapshots.length}` }), saveButton),
       list.saveOff ? notice(list.saveOff, 'info') : list.saved ? notice('This analysis is saved.', 'ok') : null,
-      h('p', { class: 'muted small', text: 'A snapshot keeps the patterns and example key names of an analysis, never a value or a credential. The next analysis compares against the newest one; Changes compares any two.' }),
+      aboutThis('A snapshot keeps the patterns and example key names of an analysis, never a value or a credential. The next analysis compares against the newest one; Changes compares any two.'),
       list.snapshots.length ? table([
         { label: 'Taken', cls: 'mono nowrap', cell: (r) => r.utc || DASH },
         { label: 'File', cls: 'mono wrap-any', cell: (r) => r.file },
@@ -642,7 +801,7 @@ export function mount(root, ctx, route) {
         {
           label: 'Compare', cls: 'right',
           cell: (r) => (r.current || !a.report ? '' : h('button', {
-            type: 'button', class: 'btn quiet', text: 'Compare', 'aria-label': `Compare this analysis with the snapshot of ${r.utc || r.file}`,
+            type: 'button', class: 'btn quiet', text: 'Compare', 'data-open': '', 'aria-label': `Compare this analysis with the snapshot of ${r.utc || r.file}`,
             onclick: async () => {
               try {
                 store.compare = { a: r.file, b: 'current' };
@@ -654,7 +813,7 @@ export function mount(root, ctx, route) {
             },
           })),
         },
-      ], list.snapshots, { caption: 'Saved snapshots, newest first' }) : emptyState('No snapshot of this connection yet.')));
+      ], list.snapshots, { caption: 'Saved snapshots, newest first', rowKey: (r) => r.file }) : emptyState('No snapshot of this connection yet.')));
   }
 
   function histogram(labels, counts) {
@@ -714,6 +873,7 @@ export function mount(root, ctx, route) {
 
   return () => {
     alive = false;
+    unfill();
     offs.forEach((off) => off());
   };
 }

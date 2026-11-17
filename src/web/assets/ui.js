@@ -611,12 +611,297 @@ export function maskCommand(line) {
 }
 
 /** The route in a location hash: `#/server/slowlog` is `{ name: 'server', sub: 'slowlog' }`.
- *  An unknown or empty hash gives `fallback`. */
+ *  A query after `?` is kept as it is: `#/browse?p=6162` is `{ name: 'browse', sub: null,
+ *  query: 'p=6162' }` (the view reads its own; Browse › Keys keeps what it shows there).
+ *  An unknown or empty hash gives `fallback`, with no query. */
 export function parseRoute(hash, names, fallback) {
-  const parts = String(hash ?? '').replace(/^#\/?/, '').split('/').filter(Boolean);
+  const raw = String(hash ?? '').replace(/^#\/?/, '');
+  const q = raw.indexOf('?');
+  const path = q < 0 ? raw : raw.slice(0, q);
+  const parts = path.split('/').filter(Boolean);
   const name = names.includes(parts[0]) ? parts[0] : fallback;
-  return { name, sub: name === parts[0] ? parts[1] ?? null : null };
+  const known = name === parts[0];
+  const route = { name, sub: known ? parts[1] ?? null : null };
+  if (known && q >= 0 && q + 1 < raw.length) route.query = raw.slice(q + 1);
+  return route;
 }
+
+/** The placeholders redis-lens's pattern inference writes (`src/pattern/`), and no other
+ *  text in braces: a key name may hold `{...}` of its own (a cluster hash tag). */
+export const PLACEHOLDERS = ['id', 'uuid', 'ulid', 'hash', 'ip', 'var'];
+const PLACEHOLDER_RE = new RegExp(`\\{(?:${PLACEHOLDERS.join('|')})\\}`, 'g');
+
+/** A pattern's name in parts, `{ text, ph }`, with `ph` true for each placeholder, so they
+ *  can be drawn in their own colour. A `literal` row (a key name kept as it is, not a
+ *  pattern) is one plain part. The parts joined give the name back exactly. */
+export function splitPlaceholders(name, literal = false) {
+  const s = String(name ?? '');
+  if (!s) return [];
+  if (literal) return [{ text: s, ph: false }];
+  const out = [];
+  let last = 0;
+  for (const m of s.matchAll(PLACEHOLDER_RE)) {
+    if (m.index > last) out.push({ text: s.slice(last, m.index), ph: false });
+    out.push({ text: m[0], ph: true });
+    last = m.index + m[0].length;
+  }
+  if (last < s.length) out.push({ text: s.slice(last), ph: false });
+  return out;
+}
+
+/** What one saved connection or Docker container shows in the top bar's connection menu:
+ *  its name, environment, address (as its card on Connections shows it) and what a click
+ *  connects to. Built field by field from the listing, so nothing else of a profile (its
+ *  URL, which may hold a user name) can reach the menu. */
+function connMenuItem(p, state) {
+  const c = state && state.conn;
+  const docker = p.docker === true;
+  const current = !!c && c.name === p.name && !!c.docker === docker;
+  let status = null;
+  if (current) status = state.connected ? 'connected' : state.connecting ? 'connecting' : state.failed ? 'failed' : null;
+  return {
+    key: `${docker ? 'docker' : 'saved'}:${p.name}`,
+    name: String(p.name ?? ''),
+    env: String(p.env || 'OTHER').toUpperCase(),
+    address: [p.address || DASH, p.tls ? 'TLS' : null, p.db ? `db ${p.db}` : null, docker ? 'Docker' : null].filter(Boolean).join(' · '),
+    docker,
+    target: docker ? { docker: String(p.container ?? p.name) } : { name: String(p.name ?? '') },
+    current,
+    status,
+  };
+}
+
+/** The connection menu: the saved connections, then the containers Docker discovery found. */
+export function connMenuModel(profiles, containers, state) {
+  return {
+    saved: (profiles || []).map((p) => connMenuItem(p, state)),
+    docker: (containers || []).map((p) => connMenuItem(p, state)),
+  };
+}
+
+/** The connection button: status dot, name, environment, and its accessible name. */
+export function connButtonModel(state) {
+  const s = state || {};
+  if ((s.connected || analyzing(s)) && s.conn) {
+    return { dot: s.lost || analyzing(s) ? 'busy' : 'ok', name: s.conn.name, env: String(s.conn.env || 'OTHER').toUpperCase(), note: analyzing(s) ? 'analyzing…' : null, aria: `Connected to ${s.conn.name}, ${s.conn.env}. Switch connection.` };
+  }
+  if (s.connecting) return { dot: 'busy', name: s.connecting.name, env: null, note: 'connecting…', aria: `Connecting to ${s.connecting.name}. Switch connection.` };
+  if (s.failed && s.conn) return { dot: 'bad', name: s.conn.name, env: null, note: 'failed', aria: `The connect to ${s.conn.name} failed. Switch connection.` };
+  return { dot: null, name: null, env: null, note: 'Not connected', aria: 'Not connected. Pick a connection.' };
+}
+
+/** The access button: Read-only or Writes on, for the connection the session is on. It
+ *  toggles the session's writes (`setSessionWrites(next)`), which the server asks about
+ *  before turning them on. Not shown without a connection. */
+export function accessModel(state) {
+  const s = state || {};
+  const c = s.conn;
+  if (!c || !(s.connected || analyzing(s))) return { show: false };
+  const on = !c.readOnly;
+  return {
+    show: true,
+    on,
+    next: !on,
+    label: on ? 'Writes on' : 'Read-only',
+    tone: on ? 'danger' : 'warn',
+    aria: on
+      ? `Writes on for ${c.name}. Turn writes off.`
+      : `Read-only: ${c.name} gets no writes. Turn writes on (it asks first).`,
+    title: on
+      ? 'Key edits, deletes and write commands reach the server; deletes, bulk actions and @dangerous commands still ask each time. Click to turn writes off.'
+      : `${c.writesOff || 'redis-lens sends no write to this connection.'} Click to turn writes on: it asks first.`,
+  };
+}
+
+/** The database control: `db N` from the state at once; the list (`getDbs`) is read only
+ *  when it is opened. On a cluster it says why there is no other database. */
+export function dbModel(state) {
+  const s = state || {};
+  const c = s.conn;
+  if (!c || !(s.connected || analyzing(s))) return { show: false };
+  const db = s.analysis && typeof s.analysis.db === 'number' ? s.analysis.db : 0;
+  const cluster = c.topology === 'cluster' || (Array.isArray(c.nodes) && c.nodes.length > 0);
+  return { show: true, db, label: `db ${db}`, off: cluster ? 'A cluster only has database 0.' : null };
+}
+
+/** Which session and run a database list belongs to: a list read for one is never shown
+ *  for another (a switch, an analysis or a reconnect starts a new run). */
+export function dbListKey(state) {
+  const s = state || {};
+  return s.conn ? `${s.conn.name}|${s.conn.docker}|${s.analysis ? s.analysis.run : 0}` : null;
+}
+
+/** What to keep of a database list that arrived: the list stamped with the key it was
+ *  asked for, or null when that key is not the current one any more (the reply is late). */
+export function dbListReply(sentKey, nowKey, dbs, error = null) {
+  if (sentKey === null || sentKey !== nowKey) return null;
+  return { who: sentKey, dbs: dbs ?? null, error: error ?? null };
+}
+
+/** Which item of a menu gets the focus after it is drawn. `items`: `{ key, current,
+ *  disabled }` in order. `had` is the key of the item that had the focus (null when none
+ *  did); `moved` whether the user has moved the focus in the menu since it opened. The item
+ *  that had it keeps it once the user has moved; otherwise the current item, else the
+ *  first. -1 leaves the focus where it is (the user moved it out of the items). */
+export function menuFocus(items, { had = null, moved = false } = {}) {
+  const usable = items.map((it, i) => ({ it, i })).filter(({ it }) => !it.disabled);
+  if (!usable.length) return -1;
+  if (moved && had !== null) {
+    const same = usable.find(({ it }) => it.key === had);
+    if (same) return same.i;
+  }
+  if (moved && had === null) return -1;
+  const current = usable.find(({ it }) => it.current);
+  return (current || usable[0]).i;
+}
+
+/** The node select on a cluster: one option per node, the picked one selected. Null when
+ *  there is nothing to pick. */
+export function nodeModel(state) {
+  const s = state || {};
+  const c = s.conn;
+  const nodes = c && Array.isArray(c.nodes) ? c.nodes : [];
+  if (!(s.connected || analyzing(s)) || nodes.length < 2) return null;
+  return {
+    picked: c.pickedNode,
+    options: nodes.map((n, i) => ({ value: n.id, text: `${n.address} · ${i + 1} of ${nodes.length}`, selected: n.id === c.pickedNode })),
+  };
+}
+
+/** The Live button and the interval beside it. */
+export function liveModel(state) {
+  const s = state || {};
+  const live = s.live !== false;
+  const every = s.polling ? s.polling.intervalSecs : null;
+  return {
+    enabled: !!s.connected,
+    live,
+    label: live ? 'Live' : 'Paused',
+    aria: live ? 'Live: pause the live figures' : 'Paused: resume the live figures',
+    every,
+    options: (s.polling ? s.polling.intervals : []).map((n) => ({ value: String(n), text: `every ${n} s` })),
+  };
+}
+
+/** The row a list beside its detail shows (Slow log, Clients, Nodes): the one picked,
+ *  found again by its key in the rows of the newest reading, so a reading that reorders the
+ *  list keeps it. `rows`: `{ key }` in order; `picked`: the key picked, or null for none
+ *  yet (then the first row). A picked row that is gone is not swapped for another: `gone`
+ *  is true and `index` -1, so the detail says so instead of showing a row the user did not
+ *  pick. */
+export function listPick(rows, picked) {
+  const list = rows || [];
+  if (picked === null || picked === undefined) {
+    return list.length ? { key: list[0].key, index: 0, gone: false } : { key: null, index: -1, gone: false };
+  }
+  const index = list.findIndex((r) => r.key === picked);
+  return { key: picked, index, gone: index < 0 };
+}
+
+/** Whether a reply may be drawn: it answers the newest ask (`seq`), for the session or node
+ *  still shown (`who`), and, when it was asked for one row, for the row still picked
+ *  (`pick`). A late reply (a slow poll overtaken by a newer one, a read for another node or
+ *  row) is dropped, so a list or a detail never shows a reading of something else. */
+export function replyFits(sent, now) {
+  if (!sent || !now) return false;
+  if (sent.seq !== now.seq) return false;
+  if ((sent.who ?? null) !== (now.who ?? null)) return false;
+  if (sent.pick !== undefined && sent.pick !== now.pick) return false;
+  return true;
+}
+
+// ---- The session mark: which connection, which connect of this page, which database ----
+
+/** Whether a state starts a new connect: connected now (an analysis's own reconnect
+ *  counts as connected), and not before, or to another server or at another time. The
+ *  page counts these (`noteState`), so a mark made before a reconnect never matches after. */
+export function connectStarted(prev, next) {
+  const on = (s) => !!(s && s.conn && (s.connected || analyzing(s)));
+  const id = (s) => (s && s.conn ? `${s.conn.name}|${s.conn.docker}|${s.conn.connectedAt}` : null);
+  return on(next) && (!on(prev) || id(prev) !== id(next));
+}
+
+/** Where a state is: the connection, which connect of this page it is (`connects`), and
+ *  the database. Browse marks its history entries with it, and a dialog that sends when
+ *  answered is marked with it when it opens. Null when not connected. */
+export function placeOf(state, connects = 0) {
+  const c = state && state.conn;
+  if (!c) return null;
+  return `${c.name}|${c.docker}|${connects}|${state.analysis ? state.analysis.db : 0}`;
+}
+
+/** Whether a dialog's answer may send: only on the connection, connect and database it
+ *  was opened for (its mark when it opened is the mark now), and only when it was opened
+ *  on a connection at all. */
+export function answerSends(atOpen, atAnswer) {
+  return atOpen !== null && atOpen !== undefined && atOpen === atAnswer;
+}
+
+/** What a dialog says when the connection changed under it. */
+export const STALE_TEXT = 'The connection changed: nothing was sent.';
+export const STALE_START_TEXT = 'The connection changed: nothing was started.';
+
+let connectsSeen = 0;
+let markState = null;
+const markWatchers = new Set();
+
+/** Every state the page hears (browse.js's `init` passes them on, from boot): counts the
+ *  connects, and tells the open dialogs the mark now. */
+export function noteState(s) {
+  if (connectStarted(markState, s)) connectsSeen += 1;
+  markState = s;
+  const mark = sessionMark();
+  for (const f of Array.from(markWatchers)) f(mark);
+}
+
+/** The connects this page has seen. */
+export function connectCount() {
+  return connectsSeen;
+}
+
+/** The mark of the session now. */
+export function sessionMark() {
+  return placeOf(markState, connectsSeen);
+}
+
+/** Calls `fn(mark)` on every state; returns the function that stops it. */
+export function watchSessionMark(fn) {
+  markWatchers.add(fn);
+  return () => markWatchers.delete(fn);
+}
+
+/** The colour role of a leading mark: ▲ the warning colour, ✗ danger, ✓ ok. */
+export const GLYPH_ROLES = { '▲': 'glyph', '✗': 'glyph bad', '✓': 'glyph good' };
+
+/** A text that starts with a mark and a space (`▲ partial`), split: `{ glyph, cls, rest }`;
+ *  without a mark, `glyph` and `cls` are null and `rest` is the whole text. */
+export function glyphParts(text) {
+  const s = String(text ?? '');
+  const g = s.charAt(0);
+  if (GLYPH_ROLES[g] && s.charAt(1) === ' ') return { glyph: g, cls: GLYPH_ROLES[g], rest: s.slice(2) };
+  return { glyph: null, cls: null, rest: s };
+}
+
+/** The server's own words for why writes are off, for the read-only line: its reason (it
+ *  can say why the profile is read-only), without its closing "Turn writes on in
+ *  Connections." (the line's button turns them on here). The fixed line when it sent none. */
+export function writesReason(text) {
+  const s = String(text ?? '').replace(/\s*Turn writes on in Connections\.\s*$/, '').trim();
+  return s || READ_ONLY_TEXT;
+}
+
+/** A poll's tick: `'read'` or `'skip'`. The first read always goes; after it, a tick reads
+ *  only while the figures are live and the page is shown, and never while the previous
+ *  read is still out (its reply is drawn when it comes, however slow). */
+export function pollTick({ inFlight = false, first = false, live = true, hidden = false } = {}) {
+  if (inFlight) return 'skip';
+  if (first) return 'read';
+  return live && !hidden ? 'read' : 'skip';
+}
+
+/** The words of the one read-only line a screen shows (drawn by `writesOffLine`). */
+export const READ_ONLY_TEXT = 'Edits are off: this connection is read-only.';
+export const WRITES_ON_TEXT = 'Turn writes on (w)';
 
 // ---------------------------------------------------------------------------------------
 // 2. DOM helpers and shared components
@@ -763,6 +1048,66 @@ export function envBadge(env) {
   return badge(name, name === 'PROD' ? 'env-prod' : '');
 }
 
+/** A pattern's name with its placeholders (`{id}`, `{uuid}`…) in their own colour. Its
+ *  text is the name exactly; a `literal` row is drawn plain. */
+export function patternName(name, { literal = false, cls = 'mono' } = {}) {
+  return h('span', { class: cls }, splitPlaceholders(name, literal).map((p) => (p.ph ? h('span', { class: 'ph', text: p.text }) : p.text)));
+}
+
+/** A button and the menu it opens (a disclosure: the menu holds ordinary buttons and links).
+ *  `build(close)` fills the menu when it opens and may fill it again later. Escape closes it
+ *  and gives the focus back to its button; so does a click outside it or the focus leaving
+ *  it; ↑ ↓ move between its items. */
+export function menuButton(button, menu, build) {
+  let open = false;
+  const items = () => Array.from(menu.querySelectorAll('button:not(:disabled), a[href], select, input'));
+  const close = (refocus = true) => {
+    if (!open) return;
+    open = false;
+    menu.hidden = true;
+    button.setAttribute('aria-expanded', 'false');
+    document.removeEventListener('pointerdown', outside, true);
+    if (refocus) button.focus({ preventScroll: true });
+  };
+  const outside = (e) => {
+    if (!menu.contains(e.target) && !button.contains(e.target)) close(false);
+  };
+  const show = () => {
+    open = true;
+    menu.hidden = false;
+    button.setAttribute('aria-expanded', 'true');
+    document.addEventListener('pointerdown', outside, true);
+    // `build` places the focus itself when it knows better (the current database); only
+    // when it left the focus outside the menu does the first item get it.
+    build(close);
+    if (menu.contains(document.activeElement)) return;
+    const first = items()[0];
+    if (first) first.focus({ preventScroll: true });
+  };
+  button.addEventListener('click', () => (open ? close() : show()));
+  const keys = (e) => {
+    if (!open) return;
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      const list = items();
+      if (!list.length) return;
+      e.preventDefault();
+      const at = list.indexOf(document.activeElement);
+      const next = e.key === 'ArrowDown' ? (at + 1) % list.length : (at <= 0 ? list.length - 1 : at - 1);
+      list[next].focus({ preventScroll: true });
+    }
+  };
+  menu.addEventListener('keydown', keys);
+  button.addEventListener('keydown', keys);
+  menu.addEventListener('focusout', (e) => {
+    if (open && e.relatedTarget && !menu.contains(e.relatedTarget) && e.relatedTarget !== button) close(false);
+  });
+  return { close, isOpen: () => open, refocusFirst: () => { const f = items()[0]; if (f) f.focus({ preventScroll: true }); } };
+}
+
 /** A calm empty or error state: one sentence, and an optional action. */
 export function emptyState(text, action = null) {
   return h('div', { class: 'empty' }, h('p', { text }), action);
@@ -778,12 +1123,62 @@ export function readOnlyNote(text) {
   return h('p', { class: 'note muted' }, icon('lock', 16), h('span', { text }));
 }
 
+/** The one read-only line of a screen, as Browse draws it: the lock, the reason, and the
+ *  button that turns writes on (the top bar's access button: the server asks first). */
+export function writesOffLine(ctx, text = READ_ONLY_TEXT) {
+  return h('div', { class: 'line read-only-line' }, readOnlyNote(text),
+    ctx && ctx.toggleWrites ? h('button', { type: 'button', class: 'linkish small', text: WRITES_ON_TEXT, onclick: () => ctx.toggleWrites() }) : null);
+}
+
+/** A text with a leading mark (`▲ partial`, `✗ failed`) drawn with the mark in its colour
+ *  role (`glyphParts`); a text without one is returned as it is. */
+export function glyphText(text) {
+  const p = glyphParts(text);
+  if (!p.glyph) return p.rest;
+  return [h('span', { class: p.cls, 'aria-hidden': 'true', text: `${p.glyph} ` }), p.rest];
+}
+
+/** A small "About this" disclosure for a screen's explanation: closed by default, so the
+ *  explanation is there when wanted and out of the way otherwise. */
+export function aboutThis(...lines) {
+  const kept = lines.flat().filter(Boolean);
+  if (!kept.length) return null;
+  return h('details', { class: 'about' }, h('summary', { text: 'About this' }), kept.map((t) => (typeof t === 'string' ? h('p', { class: 'muted small', text: t }) : t)));
+}
+
+/** The width from which Overview, Server and the screens with a list beside its detail fill
+ *  the window's height, their panes side by side (below it they stack and the page scrolls). */
+export const FILL_WIDE = '(min-width: 1100px)';
+
+/** Fill the window's height (`body.fill-view`, app.css) while the window matches `query`.
+ *  Returns the function that stops it (a view's unmount). */
+export function fillWhile(query = FILL_WIDE) {
+  const mq = typeof window !== 'undefined' && typeof window.matchMedia === 'function' ? window.matchMedia(query) : null;
+  const set = () => document.body.classList.toggle('fill-view', !mq || mq.matches);
+  set();
+  if (mq) mq.addEventListener('change', set);
+  return () => {
+    if (mq) mq.removeEventListener('change', set);
+    document.body.classList.remove('fill-view');
+  };
+}
+
+/** A pane as Browse builds one: a fixed head (its title and tools), then a body that
+ *  scrolls inside itself, then a foot. `id` names it for the keys (`data-pane`). */
+export function paneCard({ id = null, label = '', title = null, tools = null, body = null, foot = null, cls = '' } = {}) {
+  return h('section', { class: `card pane ${cls}`.trim(), 'data-pane': id, 'aria-label': label || null },
+    h('div', { class: 'pane-head' }, title, tools ? h('div', { class: 'pane-tools' }, tools) : null),
+    h('div', { class: 'pane-scroll pane-body' }, body),
+    h('div', { class: 'pane-foot' }, foot));
+}
+
 /** A semantic table with the mockup's row look. `columns`: `{ label, cls, cell(row) }`,
  *  where `cell` returns a string or a node. It sits in a box that scrolls sideways on a
- *  narrow screen. */
-export function table(columns, rows, { caption = '', cls = '' } = {}) {
+ *  narrow screen. `rowKey(row, i)`: the rows are rows of a list the keys move in (app.js),
+ *  each named by that key, so the selection stays on it when the table is drawn again. */
+export function table(columns, rows, { caption = '', cls = '', rowKey = null } = {}) {
   const head = h('tr', null, columns.map((c) => h('th', { scope: 'col', class: c.cls || '', text: c.label })));
-  const body = rows.map((row) => h('tr', { class: row.rowClass || '' }, columns.map((c) => h('td', { class: c.cls || '' }, c.cell(row)))));
+  const body = rows.map((row, i) => h('tr', { class: row.rowClass || '', 'data-row': rowKey ? String(rowKey(row, i)) : null }, columns.map((c) => h('td', { class: c.cls || '' }, c.cell(row)))));
   return h('div', { class: 'scroll-x' },
     h('table', { class: `tbl ${cls}`.trim() },
       caption ? h('caption', { class: 'sr-only', text: caption }) : null,
@@ -802,25 +1197,45 @@ let dialogSeq = 0;
 
 /** A modal dialog on the native `<dialog>` element: the browser keeps focus inside it,
  *  Escape closes it, and focus goes back to where it was. `build(close)` returns the body
- *  nodes; `close(result)` closes it. Returns a promise of the result (null when dismissed). */
-export function openDialog({ title, build, wide = false, onClose = null }) {
+ *  nodes; `close(result)` closes it. Returns a promise of the result (null when dismissed).
+ *
+ *  `session: true` for a dialog that sends something to the server when it is answered:
+ *  it is marked with the session (`sessionMark`) when it opens, closes by itself when the
+ *  connection, the connect or the database changes while it is open, and an answer given
+ *  after such a change resolves to null; either way `onStale()` says so. `build` gets
+ *  `holds()` as its third argument, for a dialog that sends from inside itself. */
+export function openDialog({ title, build, wide = false, onClose = null, session = false, onStale = null }) {
   return new Promise((resolve) => {
     dialogSeq += 1;
     const titleId = `dlg-title-${dialogSeq}`;
     let result = null;
+    const mark = session ? sessionMark() : null;
+    const holds = () => !session || answerSends(mark, sessionMark());
+    let stale = false;
     const dlg = h('dialog', { class: wide ? 'dialog wide' : 'dialog', 'aria-labelledby': titleId });
     const close = (value = null) => {
       result = value;
       if (dlg.open) dlg.close();
     };
+    const unwatch = session ? watchSessionMark((now) => {
+      if (!answerSends(mark, now) && dlg.open) {
+        stale = true;
+        close(null);
+      }
+    }) : null;
     const head = h('div', { class: 'dialog-head' },
       h('h2', { id: titleId, class: 'dialog-title', text: title }),
       h('button', { type: 'button', class: 'btn icon-btn quiet', 'aria-label': 'Close', onclick: () => close(null) }, icon('close', 18)));
     const body = h('div', { class: 'dialog-body' });
-    add(body, build(close, dlg));
+    add(body, build(close, dlg, holds));
     dlg.append(head, body);
     dlg.addEventListener('close', () => {
       dlg.remove();
+      if (unwatch) unwatch();
+      if (session && (stale || (result !== null && !holds()))) {
+        result = null;
+        if (onStale) onStale();
+      }
       if (onClose) onClose(result);
       resolve(result);
     });
@@ -836,9 +1251,11 @@ export function openDialog({ title, build, wide = false, onClose = null }) {
  *  (`code` is shown exactly, in a box; `after` is a muted line under it). Resolves to
  *  `{ typed }` when confirmed and null when cancelled. Cancel has the focus for a Yes/No
  *  question; for a typed one the text box does, and Yes stays off until the text matches. */
-export function confirmDialog(confirm) {
+export function confirmDialog(confirm, { session = false, onStale = null } = {}) {
   let state = confirmStart(confirm);
   return openDialog({
+    session,
+    onStale,
     title: confirm.title || 'Please confirm',
     build(close) {
       const error = h('p', { class: 'field-error', role: 'alert' });
@@ -901,7 +1318,7 @@ export function createToasts(region) {
   return function notify(text, kind = 'info') {
     if (!text) return;
     const toast = h('div', { class: `toast ${kind}` },
-      h('span', { 'aria-hidden': 'true', class: 'glyph', text: kind === 'error' ? '✗' : kind === 'ok' ? '✓' : '•' }),
+      h('span', { 'aria-hidden': 'true', class: kind === 'error' ? 'glyph bad' : 'glyph', text: kind === 'error' ? '✗' : kind === 'ok' ? '✓' : '•' }),
       h('span', { class: 'toast-text', text }),
       h('button', { type: 'button', class: 'btn icon-btn quiet', 'aria-label': 'Dismiss', onclick: () => toast.remove() }, icon('close', 16)));
     region.append(toast);
@@ -912,24 +1329,14 @@ export function createToasts(region) {
 
 /** A row of pills. `items`: `{ id, label, href? }`. With `href` they are links (tabs kept
  *  in the address); without, buttons that call `onPick(id)`. */
-export function pills(items, current, onPick = null, label = '') {
+export function pills(items, current, onPick = null, label = '', { act = null } = {}) {
   return h('div', { class: 'tabs', role: 'group', 'aria-label': label || null }, items.map((item) => {
     const on = item.id === current;
     if (item.href) {
-      return h('a', { class: on ? 'pill on' : 'pill', href: item.href, 'aria-current': on ? 'true' : null, text: item.label });
+      return h('a', { class: on ? 'pill on' : 'pill', href: item.href, 'aria-current': on ? 'true' : null, text: item.label, 'data-act': act });
     }
-    return h('button', { type: 'button', class: on ? 'pill on' : 'pill', 'aria-pressed': on ? 'true' : 'false', text: item.label, onclick: () => onPick && onPick(item.id) });
+    return h('button', { type: 'button', class: on ? 'pill on' : 'pill', 'aria-pressed': on ? 'true' : 'false', text: item.label, 'data-act': act, onclick: () => onPick && onPick(item.id) });
   }));
-}
-
-/** The node picker shown on a cluster: the views that read one node read the picked one. */
-export function nodePicker(conn, onPick) {
-  const nodes = conn && Array.isArray(conn.nodes) ? conn.nodes : [];
-  if (nodes.length < 2) return null;
-  const id = `node-pick-${(dialogSeq += 1)}`;
-  const select = h('select', { class: 'field', id, onchange: () => onPick(Number(select.value)) },
-    nodes.map((n, i) => h('option', { value: n.id, selected: n.id === conn.pickedNode, text: `${n.address} · ${i + 1} of ${nodes.length}` })));
-  return h('div', { class: 'picker' }, h('label', { htmlFor: id, text: 'Node' }), select);
 }
 
 /** Put text on the clipboard, at the user's click. The browser may refuse (no permission,

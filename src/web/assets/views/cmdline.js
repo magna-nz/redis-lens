@@ -1,4 +1,5 @@
-// The command line panel: one command at a time, drawn the way redis-cli draws replies.
+// The command line: a drawer docked to the bottom of the window on every screen, one
+// command at a time, drawn the way redis-cli draws replies.
 //
 // The redis-lens process decides what is sent: readonly commands go, writes go through
 // the write gate (the confirm dialog), and refusals come back in its own fixed wording.
@@ -89,6 +90,9 @@ export function helpLines(help, line) {
 /** Mount the panel once. `onClose` hides it. Returns `{ focus(), refresh() }`. */
 export function mount(root, ctx, onClose) {
   const access = h('span', { class: 'muted small' });
+  // On a read-only connection, the way to turn writes on, as every screen has it: the top
+  // bar's access button (the server asks first). A write sent anyway is refused by the gate.
+  const writesOn = h('button', { type: 'button', class: 'linkish small inline', text: 'Turn writes on', hidden: true, onclick: () => ctx.toggleWrites && ctx.toggleWrites() });
   const viewBox = h('div');
   const out = h('div', { class: 'box cmd-out', tabindex: '0', role: 'log', 'aria-live': 'polite', 'aria-label': 'Command output' });
   const helper = h('p', { class: 'cmd-help small', id: 'cmd-help' });
@@ -271,9 +275,21 @@ export function mount(root, ctx, onClose) {
     }
   });
 
+  // Escape closes the drawer from anywhere inside it: the output, the view pills, Clear,
+  // Close. The input handles its own Escape first (and marks the event handled).
+  if (!root.dataset.escape) {
+    root.dataset.escape = 'on';
+    root.addEventListener('keydown', (e) => {
+      if (drawerEscapes(e)) {
+        e.preventDefault();
+        onClose();
+      }
+    });
+  }
+
   fill(root,
     h('div', { class: 'cmd-head' },
-      h('div', null, h('h2', { class: 'lbl', text: 'Command line' }), access),
+      h('div', null, h('h2', { class: 'lbl', text: 'Command line' }), access, ' ', writesOn),
       h('div', { class: 'toolbar' },
         viewBox,
         h('button', {
@@ -281,7 +297,7 @@ export function mount(root, ctx, onClose) {
           onclick: () => {
             session.entries = [];
             drawOutput();
-            input.focus();
+            input.focus({ preventScroll: true });
           },
         }),
         h('button', { type: 'button', class: 'btn', text: 'Close', onclick: onClose }))),
@@ -299,6 +315,7 @@ export function mount(root, ctx, onClose) {
     const s = ctx.state();
     if (!s.connected || !s.conn) access.textContent = 'not connected: connect first';
     else access.textContent = `${s.conn.name} · ${s.conn.readOnly ? 'read-only: readonly commands' : 'writes ask as usual'}${session.pipeline ? ' · pipeline' : ''}`;
+    writesOn.hidden = !(s.connected && s.conn && s.conn.readOnly && ctx.toggleWrites);
 
     // The command names and help belong to one connection: forget them when it changes,
     // and read the names once the panel is open on a live connection.
@@ -331,5 +348,29 @@ export function mount(root, ctx, onClose) {
   drawOutput();
   refresh();
   busy(session.running);
-  return { focus: () => input.focus(), refresh };
+  /** Put a line in the input, typed in but not run (Go to's `:`): enter runs it, as ever. */
+  function setLine(text) {
+    input.value = String(text ?? '').slice(0, MAX_LINE);
+    cycle = null;
+    drawHelp();
+    input.focus({ preventScroll: true });
+    input.setSelectionRange(input.value.length, input.value.length);
+  }
+
+  return { focus: () => input.focus({ preventScroll: true }), refresh, setLine };
+}
+
+/** Whether a key press inside the drawer closes it: Escape without a modifier that no
+ *  control inside handled already (the input's own Escape). */
+export function drawerEscapes(e) {
+  return e.key === 'Escape' && !e.defaultPrevented && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey;
+}
+
+/** The drawer's state: `{ open }`. `toggle`, `open` and `close` give the next state and
+ *  where the focus goes (`input` when it opens, `toggle` when it closes with the focus
+ *  inside it). The drawer is the page's, not a route: the address never changes. */
+export function drawerStep(state, action, focusInside = false) {
+  const open = action === 'toggle' ? !state.open : action === 'open';
+  if (open === state.open) return { open, focus: open ? 'input' : null };
+  return { open, focus: open ? 'input' : focusInside ? 'toggle' : null };
 }

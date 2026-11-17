@@ -18,8 +18,9 @@
 import {
   h, fill, refill, DASH, fmtBytes, fmtCount, fmtGrouped, fmtPercent, plural, barPercent, meter,
   notice, emptyState, connectFirst, analyzing, errorText, copyText, expiryText, fmtSignedBytes,
-  openDialog, readOnlyNote, pills,
+  openDialog, readOnlyNote, pills, patternName, connectStarted, placeOf, noteState, connectCount, STALE_TEXT,
 } from '../ui.js';
+import { reasonLines, readOnlyLine } from '../keys.js';
 import * as streams from './streams.js';
 import * as search from './search.js';
 
@@ -190,30 +191,317 @@ export function valueFoot(v) {
 /** A whole Browse memory, as it starts. */
 export function blank() {
   return {
-    who: null, conn: null, tree: null, treeError: null, sort: null, node: null, filter: '', closed: new Set(),
-    picked: null, list: null, listError: null, listFilter: '', listShown: CHUNK, finding: null, back: null,
+    who: null, place: null, conn: null, tree: null, treeError: null, sort: null, node: null, filter: '', closed: new Set(),
+    picked: null, list: null, listError: null, listFilter: '', listShown: CHUNK, finding: null,
     value: null, valueError: null, valueId: null, item: null, shown: null, format: null, itemsShown: CHUNK,
-    dbs: null, dbsError: null, pending: null, bulk: null,
+    dbs: null, dbsError: null, bulk: null, anchor: 'patterns',
   };
 }
 
-/** Follow the session: another connection starts Browse afresh; a new run (an analysis, a
- *  database switch) drops the key list and the value, which redis-lens drops then too, and
- *  keeps the filter, the sort and the closed groups, as the TUI does. */
-export function follow(store, state) {
+// `connectStarted` and `placeOf` (the session mark) are ui.js's: the dialogs that send
+// when answered are marked with the same place as Browse's history entries.
+export { connectStarted, placeOf };
+
+/** The place and the run (an analysis, a database switch): what Browse holds is for one. */
+export function whoOf(state, connects = 0) {
+  const place = placeOf(state, connects);
+  return place === null ? null : `${place}|${state.analysis ? state.analysis.run : 0}`;
+}
+
+/** Follow the session: another connection (or a new connect) starts Browse afresh; a new
+ *  run (an analysis, a database switch) drops the key list and the value, which redis-lens
+ *  drops then too, and keeps the filter, the sort and the closed groups, as the TUI does. */
+export function follow(store, state, connects = 0) {
   const c = state.conn;
-  const conn = c ? `${c.name}|${c.docker}` : null;
-  const who = conn ? `${conn}|${state.analysis ? state.analysis.run : 0}` : null;
+  const conn = c ? `${c.name}|${c.docker}|${connects}` : null;
+  const who = whoOf(state, connects);
+  const place = placeOf(state, connects);
   if (conn !== store.conn) {
-    const pending = store.pending;
-    Object.assign(store, blank(), { conn, who, pending });
+    Object.assign(store, blank(), { conn, who, place });
     return 'reset';
   }
   if (who !== store.who) {
-    Object.assign(store, { who, tree: null, treeError: null, node: null, picked: null, list: null, listError: null, finding: null, back: null, value: null, valueError: null, valueId: null, item: null, shown: null, format: null, dbs: null, dbsError: null });
+    Object.assign(store, { who, place, tree: null, treeError: null, node: null, picked: null, list: null, listError: null, finding: null, value: null, valueError: null, valueId: null, item: null, shown: null, format: null, dbs: null, dbsError: null, anchor: 'patterns' });
     return 'run';
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------------------
+// Browse › Keys in the address (tested in tests/browse-route.test.js)
+//
+//   #/browse?p=<pattern id>&k=<key id>&find=<text>&node=<n>&sort=<s>
+//
+// `p` and `k` are the hex ids the API names patterns and keys by (src/web/keyname.rs: the
+// name's bytes in lowercase hex), so a binary name travels whole. `find` is the Find text,
+// percent-encoded. `node` is the "Patterns of" node's index, `sort` the patterns' sort. With
+// `find`, the key list is Find's and `p` is the pattern it goes back to. Nothing else goes
+// in the address: no connection, no credential, no value.
+// ---------------------------------------------------------------------------------------
+
+/** No pattern, key, Find, node or sort. */
+export const NO_PARAMS = Object.freeze({ p: null, k: null, find: null, node: null, sort: null });
+
+/** The longest id taken, as the server's (keyname.rs `MAX_ID`). */
+export const MAX_ID_DIGITS = 128 * 1024;
+/** The longest Find text kept from an address. */
+export const MAX_FIND = 1000;
+const ID_RE = /^(?:[0-9a-f]{2})+$/;
+
+const isId = (s) => typeof s === 'string' && s.length <= MAX_ID_DIGITS && ID_RE.test(s);
+const isFind = (s) => typeof s === 'string' && s.trim() !== '' && s.length <= MAX_FIND;
+const isNode = (n) => Number.isInteger(n) && n >= 0 && n <= 9999;
+const isSort = (s) => typeof s === 'string' && Object.hasOwn(SORT_LABELS, s);
+
+/** The Browse state in a route's query (the part after `?`). Unknown names, a repeated
+ *  name, bad hex, an empty Find and anything that does not decode are left out; it never
+ *  throws. */
+export function parseBrowseQuery(query) {
+  const out = { ...NO_PARAMS };
+  const seen = new Set();
+  for (const part of String(query ?? '').replace(/^\?/, '').split('&')) {
+    if (!part) continue;
+    const eq = part.indexOf('=');
+    const name = eq < 0 ? part : part.slice(0, eq);
+    if (!Object.hasOwn(NO_PARAMS, name) || seen.has(name)) continue;
+    seen.add(name);
+    let value;
+    try {
+      value = decodeURIComponent(eq < 0 ? '' : part.slice(eq + 1));
+    } catch {
+      continue;
+    }
+    if (name === 'p' || name === 'k') {
+      const id = value.toLowerCase();
+      if (isId(id)) out[name] = id;
+    } else if (name === 'find') {
+      if (isFind(value)) out.find = value;
+    } else if (name === 'node') {
+      if (/^\d{1,4}$/.test(value)) out.node = Number(value);
+    } else if (isSort(value)) out.sort = value;
+  }
+  return out;
+}
+
+/** The query for a Browse state, `''` when it holds nothing. `parseBrowseQuery` gives the
+ *  state back. */
+export function browseQuery(params) {
+  const p = params || NO_PARAMS;
+  const parts = [];
+  if (isId(p.p)) parts.push(`p=${p.p}`);
+  if (isId(p.k)) parts.push(`k=${p.k}`);
+  if (isFind(p.find)) parts.push(`find=${encodeURIComponent(p.find)}`);
+  if (isNode(p.node)) parts.push(`node=${p.node}`);
+  if (isSort(p.sort)) parts.push(`sort=${p.sort}`);
+  return parts.join('&');
+}
+
+/** The address of Browse › Keys showing a state. */
+export function browseHref(params) {
+  const q = browseQuery(params);
+  return q ? `#/browse?${q}` : '#/browse';
+}
+
+/** A state as an address holds it (what it can't hold left out). */
+export const cleanParams = (params) => parseBrowseQuery(browseQuery(params));
+
+/** Whether two states are the same. */
+export function sameParams(a, b) {
+  return browseQuery(a) === browseQuery(b);
+}
+
+/** Whether a state opens anything (a pattern, a key, a Find or a node); the sort alone
+ *  does not count. */
+export const opensAnything = (p) => !!p && (p.p !== null || p.k !== null || p.find !== null || p.node !== null);
+
+/** The state Browse shows now, from its memory. */
+export function shownParams(s) {
+  return cleanParams({ p: s.picked ? s.picked.id : null, k: s.valueId, find: s.finding, node: s.node, sort: s.sort });
+}
+
+/** Another area's jump on top of what Browse shows: opening a pattern drops the Find and
+ *  the key; Find and opening a key keep the rest. */
+export function linkFrom(base, change) {
+  const next = { ...NO_PARAMS, ...(base || {}), ...change };
+  if (change.p !== undefined && change.p !== null) {
+    if (change.find === undefined) next.find = null;
+    if (change.k === undefined) next.k = null;
+  }
+  return browseHref(next);
+}
+
+/** The list a state shows: Find's, the pattern's, or none. */
+const listOf = (p) => (p.find !== null ? `f:${p.find}` : p.p !== null ? `p:${p.p}` : null);
+
+/** What going from one state to another reads and drops. `from` and `to` are
+ *  `{ who, params }`, `who` the session and run (`follow`'s): another one starts over, so
+ *  everything `to` names is read. Otherwise only what changed: a new key reads only the
+ *  value, a new pattern or Find only its keys, a sort or node only the tree. A `to` without
+ *  a sort keeps the one shown. Nothing is read for the same state, unless `retry` says a
+ *  pane failed (`retryOf`) and the user asked for it again (a click or Enter on the open
+ *  row, Find with the same text): then that pane is read again. */
+export function routeLoads(from, to, retry = null) {
+  const b = to.params;
+  const fresh = !from || from.who !== to.who;
+  const a = fresh ? NO_PARAMS : from.params;
+  const list = listOf(b);
+  return {
+    tree: fresh || (b.sort !== null && b.sort !== a.sort) || b.node !== a.node,
+    keys: list !== null && (fresh || list !== listOf(a) || !!(retry && retry.keys)),
+    clearList: list === null && listOf(a) !== null,
+    value: b.k !== null && (fresh || b.k !== a.k || !!(retry && retry.value)),
+    clearValue: b.k === null && a.k !== null,
+  };
+}
+
+/** Which panes an explicit open of what is shown reads again: the key list when it shows
+ *  an error or no key, the value when it shows an error or the key is gone. A pane still
+ *  reading, or showing what it read, is not read again. `s`: Browse's memory. */
+export function retryOf(s) {
+  return {
+    keys: !!s.listError || !!(s.list && s.list.rows.length === 0),
+    value: !!s.valueError || !!(s.value && s.value.gone),
+  };
+}
+
+/** Whether a reply is still wanted: nothing was opened since it was asked for (`seq`), and
+ *  it is for what is shown (`id`: the key list's, the tree's sort and node, the value's
+ *  view). `sent` is taken before asking, `now` once it answers; a reply for something no
+ *  longer shown is dropped, never drawn under another title. */
+export function replyWanted(sent, now) {
+  return !!sent && !!now && sent.seq === now.seq && sent.id === now.id;
+}
+
+/** The tree's row of a pattern (a pattern row, or one in a group), or null. */
+export function treeRowOf(tree, id) {
+  if (!tree || id === null || id === undefined) return null;
+  for (const r of tree.rows || []) {
+    if (r.kind === 'pattern' && r.pattern.id === id) return r;
+    if (r.kind === 'group') for (const c of r.children) if (c.pattern.id === id) return c;
+  }
+  return null;
+}
+
+/** Whether every key of a pattern may be acted on at once (a bulk TTL or delete): only for
+ *  a row of the tree the server gave for this session. A pattern known only from an
+ *  address lists its keys and nothing more: its id could name any glob, and redis-lens
+ *  turns placeholders into `*`, so `{id}` alone would be the whole keyspace. */
+export function bulkAllowed(tree, id) {
+  return treeRowOf(tree, id) !== null;
+}
+
+/** Why a pattern's bulk actions are not offered, in the About panel. */
+export const BULK_NOT_LISTED = 'Bulk actions are offered only for a pattern listed in Patterns. This one came from an address, so only its keys are listed.';
+
+/** Whether an address's node can be used with the tree shown: `ok` (none, or a node the
+ *  analysis's patterns can be narrowed to), `drop` (not one: it is left out before any key
+ *  is read), `unknown` (no tree yet: wait for it). */
+export function nodeCheck(tree, node) {
+  if (node === null || node === undefined) return 'ok';
+  if (!tree || tree.source === 'none') return 'unknown';
+  return tree.source === 'analysis' && (tree.nodes || []).some((n) => n.index === node) ? 'ok' : 'drop';
+}
+
+/** What to do with a history entry Browse is shown on: `foreign` when it was shown for
+ *  another connection or database (`mark` is not `place`: it is passed over, not applied
+ *  and not rewritten); `keep` for a new entry that names nothing (the rail's link, a digit:
+ *  what Browse holds stays); `apply` otherwise (a link, a reload, Back and Forward). */
+export function entryPlan({ params, mark = null, place = null }) {
+  if (mark !== null && mark !== place) return 'foreign';
+  if (!opensAnything(params) && params.sort === null && mark === null) return 'keep';
+  return 'apply';
+}
+
+/** How the address follows what Browse shows: `push` a step, `replace` the current entry,
+ *  or `none`. `push`: the user opened something (a key added). `user`: a change the user
+ *  made in place (a sort, a node, a rename, a delete). An entry of another connection or
+ *  database (`foreign`) is never rewritten: what the user does is a new step after it, and
+ *  what Browse does on its own leaves it. The same address needs nothing. */
+export function urlStep({ push = false, user = false, same = false, foreign = false }) {
+  if (foreign) return push || user ? 'push' : 'none';
+  if (same) return 'none';
+  return push ? 'push' : 'replace';
+}
+
+/** Whether a link to `to` from `from` would only add a second entry for the screen shown:
+ *  the rail's Browse link or the Keys tab, clicked on Browse › Keys. Such a click does
+ *  nothing. Routes as `parseRoute` gives them. */
+export function linkStays(from, to) {
+  const keys = (r) => !!r && r.name === 'browse' && panelOf(r.sub) === 'keys';
+  return keys(from) && keys(to) && !to.query;
+}
+
+/** The address a Browse route is written as, when it is written another way: `#/browse/keys`
+ *  is `#/browse`. Null when it is already. */
+export function canonicalHref(route) {
+  if (!route || route.name !== 'browse' || route.sub !== 'keys') return null;
+  return route.query ? `#/browse?${route.query}` : '#/browse';
+}
+
+/** The reasons under the selected item's buttons, less those the value's notes above them
+ *  show already ("Field TTLs need Redis 7.4…"): a reason is said once in a pane. `offs`:
+ *  each button's reason or null; `said`: the notes' texts. */
+export function itemReasons(offs, said = []) {
+  const shown = new Set(said.filter(Boolean));
+  return offs.map((o) => (o && shown.has(o) ? null : o));
+}
+
+/** Where the one read-only line goes: under the value's action bar when a key is open and
+ *  its pane shows, else in the key list's pane. Never two at once. */
+export function readOnlyPlace({ valueOpen = false, shown = PANES } = {}) {
+  return valueOpen && shown.includes('value') ? 'value' : 'keys';
+}
+
+// ---------------------------------------------------------------------------------------
+// The three panes: which show at a width, and the breadcrumb (tests/browse-route.test.js)
+// ---------------------------------------------------------------------------------------
+
+export const PANES = ['patterns', 'keys', 'value'];
+/** The width of the panes' row from which all three fit, and from which two do (about
+ *  1,060px and 780px of the main column, less its padding). */
+export const WIDE = 1036;
+export const NARROW = 756;
+
+/** The panes shown at a width: all three when they fit; else the `anchor` pane and the
+ *  one to its right (the last two when it is the last); else the anchor pane alone. */
+export function paneLayout(width, anchor) {
+  const at = Math.max(0, PANES.indexOf(anchor));
+  if (width >= WIDE) return PANES.slice();
+  if (width >= NARROW) {
+    const from = Math.min(at, PANES.length - 2);
+    return PANES.slice(from, from + 2);
+  }
+  return [PANES[at]];
+}
+
+/** The anchor that shows `pane`: the same one when it shows already, else that pane. */
+export function revealPane(width, anchor, pane) {
+  return paneLayout(width, anchor).includes(pane) ? anchor : pane;
+}
+
+/** A name to show for an id from an address, before the server names it: its text when
+ *  that is plain, else the hex. */
+export function nameOfId(id) {
+  const text = textOfHex(id);
+  return text === null ? `0x${id}` : text;
+}
+
+/** The breadcrumb above the panes: `Patterns › user:{id}:cart › user:10293:cart`, or
+ *  `Patterns › Find: *cart* › key`. `list`: `{ kind: 'pattern', name, literal }`, `{ kind:
+ *  'find', text }` or null; `key`: the open key's name or null; `shown`: the panes shown;
+ *  `anchor`: the pane the layout is anchored on. Each part moves to its pane; `back` marks
+ *  the part just left of the panes shown (← reaches it), `next` the one just right of them
+ *  (→ on the open row reaches it). */
+export function crumbsModel({ list = null, key = null, shown = PANES, anchor = 'patterns' } = {}) {
+  const parts = [{ pane: 'patterns', kind: 'root', label: 'Patterns' }];
+  if (list) parts.push(list.kind === 'find' ? { pane: 'keys', kind: 'find', label: `Find: ${list.text}` } : { pane: 'keys', kind: 'pattern', label: list.name, literal: !!list.literal });
+  if (key !== null && key !== undefined) parts.push({ pane: 'value', kind: 'key', label: key });
+  const first = PANES.indexOf(shown[0]);
+  const last = PANES.indexOf(shown[shown.length - 1]);
+  return parts.map((p, i) => {
+    const at = PANES.indexOf(p.pane);
+    return { ...p, current: i === parts.length - 1, anchor: p.pane === anchor, off: !shown.includes(p.pane), back: at === first - 1, next: at === last + 1 };
+  });
 }
 
 // ---------------------------------------------------------------------------------------
@@ -274,8 +562,8 @@ export const NEW_KEY_TYPES = [['string', 'String'], ['hash', 'Hash'], ['list', '
 export function readOnlyText(conn) {
   if (!conn) return 'Connect first.';
   return conn.env === 'PROD'
-    ? 'Read-only: this is a production connection, so nothing is written to it. Turn writes on in Connections.'
-    : `Read-only: nothing is written to ${conn.name}. Turn writes on in Connections.`;
+    ? 'Read-only: this is a production connection, so nothing is written to it. Turn writes on with the top bar\'s Read-only button (w).'
+    : `Read-only: nothing is written to ${conn.name}. Turn writes on with the top bar's Read-only button (w).`;
 }
 
 /** Why a write that sends `cmds` is off now, or null when it may be tried: no
@@ -433,22 +721,53 @@ export function bulkRunLabel(b) {
 const store = blank();
 let active = null;
 
-/** Find keys by name (from the top bar). Runs now when Browse is shown, else when it is. */
-export function requestFind(text) {
-  store.pending = { find: text };
-  if (active) active.takePending();
+// The connects this page has seen (`connectStarted`), for the history marks. Counted from
+// boot on, whatever area is shown (app.js calls `init` before any view hears a state), by
+// ui.js's session mark, which the dialogs that send when answered share.
+let connects = 0;
+
+/** Called once at boot: count each new connect (`noteState`). */
+export function init(api) {
+  api.on('state', (s) => {
+    noteState(s);
+    connects = connectCount();
+  });
 }
 
-/** Open a key's value (`Name`), from Analyze or Overview. */
-export function requestKey(name) {
-  store.pending = { key: name };
-  if (active) active.takePending();
+/** The address of Browse › Keys with a change on top of what it shows (for Overview,
+ *  Analyze, Go to and the other panels): `{ p }` opens a pattern, `{ k }` a key, `{ find }`
+ *  runs Find, `{ node }` narrows the patterns. What Browse holds for another session is
+ *  not carried over. Going there reads what a click would, and is a step in the history. */
+export function hrefFor(change, state) {
+  const who = whoOf(state, connects);
+  return linkFrom(who && store.who === who ? shownParams(store) : NO_PARAMS, change);
 }
 
-/** List a pattern's keys (`Name`), narrowed to a node on a cluster when given. */
-export function requestPattern(name, node = null) {
-  store.pending = { pattern: name, node };
-  if (active) active.takePending();
+/** The address changed while Browse › Keys is shown (Back, Forward, a jump from another
+ *  area): show what it names, reading only what changed. */
+export function onRoute(route) {
+  if (active) active.applyRoute(route);
+}
+
+/** Another area's jump to the address shown already (Go to's Find with the same text, a
+ *  key opened again): read again the panes that failed (`retryOf`). False when Browse ›
+ *  Keys is not shown, so the caller goes there as usual. */
+export function reopen() {
+  return active ? active.reopen() : false;
+}
+
+/** What Browse holds already for the session and run of `state`: the tree's patterns
+ *  (from the analysis, or from the names read so far) and the keys of the list loaded.
+ *  Go to searches these; it reads nothing from the server. Empty for another session. */
+export function held(state) {
+  const who = whoOf(state, connects);
+  if (!who || store.who !== who) return { patterns: [], keys: [] };
+  const patterns = [];
+  for (const r of (store.tree && store.tree.rows) || []) {
+    if (r.kind === 'pattern') patterns.push(r.pattern);
+    else if (r.kind === 'group') for (const ch of r.children) patterns.push(ch.pattern);
+  }
+  return { patterns, keys: store.list ? store.list.rows.slice() : [] };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -471,7 +790,7 @@ const panelTabs = (panel) => pills(PANELS, panel, null, 'Browse panels');
 
 export function mount(root, ctx, route = null) {
   const panel = panelOf(route && route.sub);
-  if (panel === 'keys') return mountKeys(root, ctx);
+  if (panel === 'keys') return mountKeys(root, ctx, route);
   const state = ctx.state();
   const gate = connectFirst(state, { needsLive: true });
   const view = h('section', { class: 'view', 'aria-labelledby': 'browse-title' });
@@ -490,16 +809,17 @@ export function mount(root, ctx, route = null) {
   return (panel === 'streams' ? streams : search).mount(view, ctx, { head: { subtitle, actions }, body });
 }
 
-function mountKeys(root, ctx) {
+function mountKeys(root, ctx, route) {
   const state = ctx.state();
   const gate = connectFirst(state, { needsLive: true });
   const view = h('section', { class: 'view', 'aria-labelledby': 'browse-title' });
   root.append(view);
   if (gate) {
+    // Not connected: an address's pattern or key waits for a connection; nothing is read.
     view.append(h('h1', { class: 'title', id: 'browse-title', text: 'Browse' }), panelTabs('keys'), gate);
     return () => {};
   }
-  follow(store, state);
+  follow(store, state, connects);
 
   let alive = true;
   const timers = new Set();
@@ -511,41 +831,289 @@ function mountKeys(root, ctx) {
     timers.add(t);
   };
 
-  // ---------- the head: title, database, node ----------
-  const subtitle = h('p', { class: 'subtitle' });
-  const dbBox = h('div', { class: 'picker' });
-  const nodeBox = h('div', { class: 'picker' });
-  view.append(h('div', { class: 'view-head' },
-    h('div', null, h('h1', { class: 'title', id: 'browse-title', text: 'Browse' }), subtitle),
-    h('div', { class: 'actions' }, nodeBox, dbBox)),
-  panelTabs('keys'));
+  // The panes fill the window: the page itself does not scroll on a wide one (app.css).
+  document.body.classList.add('fill-view');
+  view.classList.add('browse-view');
 
-  // ---------- the three cards ----------
+  // ---------- the head: title, panels, the breadcrumb ----------
+  // The database is picked in the top bar (app.js); Browse reads the list on mount, as it
+  // did when the picker was here, and hands it to the top bar.
+  const subtitle = h('p', { class: 'subtitle' });
+  const crumbsBox = h('nav', { class: 'crumbs', 'aria-label': 'Where you are in Browse' });
+  // Back or Forward to an entry of another connection or database: said here, once.
+  const foreignBox = h('div', { class: 'foreign-note', role: 'status', hidden: true });
+  view.append(h('div', { class: 'browse-bar' },
+    h('h1', { class: 'title', id: 'browse-title', text: 'Browse' }),
+    panelTabs('keys'),
+    crumbsBox,
+    subtitle), foreignBox);
+  function showForeign(on) {
+    if (foreignBox.hidden === !on) return;
+    foreignBox.hidden = !on;
+    fill(foreignBox, on ? notice('That address was for another connection or database, so it is not shown here. What Browse holds for this one stays.', 'info') : null);
+  }
+
+  // ---------- the three panes ----------
   const patFilter = h('input', {
-    class: 'field mono', type: 'search', id: 'browse-pat-filter', placeholder: 'Filter patterns', autocomplete: 'off', spellcheck: false, value: store.filter,
+    class: 'field mono', type: 'search', id: 'browse-pat-filter', placeholder: 'Filter patterns', autocomplete: 'off', spellcheck: false, value: store.filter, 'data-act': 'filter',
     oninput: () => {
       store.filter = patFilter.value;
       drawRows();
     },
   });
   const sortBox = h('div', { class: 'picker' });
-  const patSource = h('p', { class: 'muted small' });
+  const nodeBox = h('div', { class: 'picker' });
+  const patCols = h('div', { class: 'cols-head pat-cols', 'aria-hidden': 'true' });
   const patRows = h('ul', { class: 'list tree', 'aria-label': 'Key patterns' });
-  const patFoot = h('div', { class: 'card-foot' });
-  const patCard = h('div', { class: 'card stack browse-col pats' },
-    h('div', { class: 'card-head' }, h('h2', { class: 'lbl', text: 'Key patterns' }), sortBox),
-    patSource,
-    h('div', null, h('label', { class: 'sr-only', htmlFor: 'browse-pat-filter', text: 'Filter the patterns' }), patFilter),
-    patRows, patFoot);
+  const patFoot = h('div', { class: 'pane-foot' });
+  const patCard = h('section', { class: 'card pane pats', 'data-pane': 'patterns', 'aria-label': 'Patterns' },
+    h('div', { class: 'pane-head' }, h('h2', { class: 'lbl', text: 'Patterns' }), h('div', { class: 'pane-tools' }, sortBox, nodeBox)),
+    h('div', { class: 'pane-filter' }, h('label', { class: 'sr-only', htmlFor: 'browse-pat-filter', text: 'Filter the patterns' }), patFilter),
+    patCols,
+    h('div', { class: 'pane-scroll' }, patRows),
+    patFoot);
 
-  const keysCard = h('div', { class: 'card stack browse-col keys' });
-  const valueCard = h('div', { class: 'card stack browse-col value', 'aria-live': 'polite', 'aria-busy': 'false' });
+  const keysCard = h('section', { class: 'card pane keys', 'data-pane': 'keys', 'aria-label': 'Keys' });
+  const valueCard = h('section', { class: 'card pane value', 'aria-live': 'polite', 'aria-busy': 'false', 'data-pane': 'value', 'aria-label': 'Value' });
   // A bulk action over a pattern's keys: its dry run, question, progress and summary.
   const bulkBox = h('section', { class: 'card stack bulk', 'aria-label': 'Bulk action', hidden: true });
-  view.append(bulkBox, h('div', { class: 'browse' }, patCard, keysCard, valueCard));
+  const panesBox = h('div', { class: 'browse panes' }, patCard, keysCard, valueCard);
+  const cards = { patterns: patCard, keys: keysCard, value: valueCard };
+  view.append(bulkBox, panesBox);
 
-  // ---------- the database picker ----------
+  // ---------- which panes show, and the breadcrumb ----------
+  // Three side by side on a wide window; below that the anchor pane and the one to its
+  // right; on a narrow one, one pane. The breadcrumb names each step and moves to it.
+  let shownPanes = PANES.slice();
+  function relayout() {
+    if (!alive) return;
+    shownPanes = paneLayout(panesBox.clientWidth, store.anchor);
+    const had = document.activeElement;
+    let lost = false;
+    for (const id of PANES) {
+      const off = !shownPanes.includes(id);
+      if (off && cards[id].contains(had)) lost = true;
+      cards[id].classList.toggle('pane-off', off);
+    }
+    panesBox.dataset.count = String(shownPanes.length);
+    drawCrumbs();
+    // The read-only line moves with the panes shown (one place only).
+    if (roMoved()) {
+      drawKeys();
+      if (store.value) drawValue();
+    }
+    if (lost) toPane(shownPanes.includes(store.anchor) ? store.anchor : shownPanes[0]);
+  }
+  /** Where the read-only line goes now (`readOnlyPlace`), and where it was drawn last. */
+  let roAt = null;
+  const roPlace = () => readOnlyPlace({ valueOpen: !!store.value, shown: shownPanes });
+  function toPane(id) {
+    if (ctx.focusPane) ctx.focusPane(cards[id]);
+  }
+  /** Show `pane` if it is hidden (a step down opened it, or Back went up to it). */
+  function reveal(pane) {
+    const next = revealPane(panesBox.clientWidth, store.anchor, pane);
+    if (next === store.anchor) return;
+    store.anchor = next;
+    relayout();
+  }
+  /** A breadcrumb part or ← / →: anchor on that pane and go into it. */
+  function goPane(id) {
+    store.anchor = id;
+    relayout();
+    toPane(id);
+  }
+  const sizes = typeof ResizeObserver === 'function' ? new ResizeObserver(() => relayout()) : null;
+  if (sizes) sizes.observe(panesBox);
+  // On a wide window the focus anchors the layout, so a narrower one keeps that pane.
+  panesBox.addEventListener('focusin', (e) => {
+    const pane = e.target && e.target.closest ? e.target.closest('[data-pane]') : null;
+    if (pane && panesBox.clientWidth >= WIDE && PANES.includes(pane.dataset.pane)) store.anchor = pane.dataset.pane;
+  });
+
+  function crumbList() {
+    if (store.finding !== null) return { kind: 'find', text: store.list && store.list.find ? store.list.find.glob : store.finding };
+    if (store.picked) return { kind: 'pattern', name: store.picked.name, literal: literalOf(store.picked) };
+    return null;
+  }
+  function crumbKey() {
+    if (!store.valueId) return null;
+    const v = store.value;
+    if (v && v.key && v.key.id === store.valueId) return v.key.name;
+    const row = store.list ? store.list.rows.find((r) => r.id === store.valueId) : null;
+    return row ? row.name : nameOfId(store.valueId);
+  }
+  function drawCrumbs() {
+    const parts = crumbsModel({ list: crumbList(), key: crumbKey(), shown: shownPanes, anchor: store.anchor });
+    const out = [];
+    parts.forEach((p, i) => {
+      if (i) out.push(h('span', { class: 'sep', 'aria-hidden': 'true', text: '›' }));
+      const label = p.kind === 'pattern' ? patternName(p.label, { literal: p.literal, cls: 'mono' }) : h('span', { class: p.kind === 'root' ? '' : 'mono', text: p.label });
+      out.push(h('button', {
+        type: 'button', class: `crumb${p.off ? ' off' : ''}`, 'aria-current': p.current ? 'location' : null,
+        'data-back': p.back ? '' : null, 'data-next': p.next ? '' : null, title: p.label,
+        onclick: () => goPane(p.pane),
+      }, label));
+    });
+    fill(crumbsBox, out);
+  }
+
+  // ---------- the address ----------
+  /** Whether the address shown is still Browse › Keys's (a reply may come after the user
+   *  left for another area: it must not write Browse's address over that one's). */
+  const onKeysRoute = () => {
+    const r = ctx.currentRoute ? ctx.currentRoute() : null;
+    return !r || (r.name === 'browse' && panelOf(r.sub) === 'keys');
+  };
+  /** Put what Browse shows in the address (`urlStep`): a new step in the history (`push`,
+   *  for what the user opened), or in place of the current one (`user`: a sort, a node, a
+   *  key renamed or deleted; neither: Browse's own correction, such as a sort no longer
+   *  offered). An entry of another connection or database is never rewritten. The
+   *  address then names what is shown, so nothing more is read. */
+  function syncUrl(push = false, { user = false } = {}) {
+    if (!alive || !onKeysRoute()) return;
+    const href = browseHref(shownParams(store));
+    const foreign = entryPlan({ params: NO_PARAMS, mark: entryMark(), place: store.place }) === 'foreign';
+    const step = urlStep({ push, user, same: window.location.hash === href, foreign });
+    if (step === 'push') {
+      showForeign(false);
+      if (window.location.hash === href) {
+        ctx.pushRoute(href);
+        markEntry();
+      } else ctx.navigate(href);
+    } else if (step === 'replace') {
+      ctx.replaceRoute(href);
+      markEntry();
+    } else if (!foreign) markEntry();
+  }
+  /** Open something (a click, Enter): a step in the history; the route change reads it.
+   *  Opening what is shown already adds no step: it reads again what failed (`retryOf`). */
+  function go(change) {
+    if (!alive) return;
+    const next = cleanParams({ ...shownParams(store), ...change });
+    if (sameParams(next, shownParams(store))) {
+      reopenShown(next);
+      return;
+    }
+    ctx.navigate(browseHref(next));
+  }
+  /** Open again what is shown, at the user's asking: the panes that failed are read again. */
+  function reopenShown(next = shownParams(store)) {
+    const foreign = entryPlan({ params: NO_PARAMS, mark: entryMark(), place: store.place }) === 'foreign';
+    // Shown over an entry of another connection: the user's open is a step after it.
+    if (foreign) syncUrl(true);
+    applyParams(next, { retry: retryOf(store) });
+  }
+  // Each history entry Browse shows is marked with the place it was shown for (`placeOf`:
+  // the connection, which connect, the database), so Back to an entry from another
+  // connection or database is not applied to this one: its pattern and key ids may name
+  // other keys there. An entry without a mark (a link, a page just opened) is applied to
+  // the connection there is. Entries of the same place stay good across a new analysis.
+  const entryMark = () => (ctx.routeTag ? ctx.routeTag() : null);
+  const markEntry = () => {
+    if (ctx.setRouteTag && onKeysRoute()) ctx.setRouteTag(store.place);
+  };
+  /** What a pattern id names: the tree's row, the pattern shown, or its name from the id. */
+  function patternRef(id) {
+    const r = rowOf(id);
+    if (r) return r.pattern;
+    if (store.picked && store.picked.id === id) return store.picked;
+    if (store.list && store.list.pattern && store.list.pattern.id === id) return store.list.pattern;
+    return { id, name: nameOfId(id), copy: null };
+  }
+  /** What a key id names: its row in the list, else its name from the id, with the type
+   *  another area knew (handed over in the history entry, never in the address). */
+  function keyRef(id) {
+    const row = store.list ? store.list.rows.find((r) => r.id === id) : null;
+    if (row) return row;
+    const data = ctx.routeData ? ctx.routeData() : null;
+    const type = data && data.keyType && data.keyType.id === id && typeof data.keyType.type === 'string' ? data.keyType.type : null;
+    return { id, name: nameOfId(id), type };
+  }
+
+  // An address whose node is not known yet (no tree): applied once the tree is read, so
+  // the keys are never read with a node the analysis does not have.
+  let pending = null;
+
+  /** Show the state an address names, reading only what changed (`routeLoads`). */
+  function applyParams(asked, { mounting = false, retry = null, mark = true } = {}) {
+    let next = asked;
+    if (mark) showForeign(false);
+    const check = store.treeError && !store.tree ? 'drop' : nodeCheck(store.tree, next.node);
+    if (check === 'unknown') {
+      pending = { next, retry, mark };
+      if (next.sort !== null) store.sort = next.sort;
+      store.node = next.node;
+      if (mark) markEntry();
+      drawKeys(opensAnything({ ...next, node: null }) ? 'Reading the patterns first…' : null);
+      return;
+    }
+    pending = null;
+    const dropped = check === 'drop';
+    if (dropped) next = { ...next, node: null };
+    const from = shownParams(store);
+    const loads = routeLoads({ who: store.who, params: from }, { who: store.who, params: next }, retry);
+    if (mark) markEntry();
+    if (next.sort !== null) store.sort = next.sort;
+    store.node = next.node;
+    if (loads.tree && !mounting) loadTree();
+    if (loads.clearList) {
+      listSeq += 1;
+      Object.assign(store, { picked: null, finding: null, list: null, listError: null, listFilter: '', listShown: CHUNK });
+      drawRows();
+      drawKeys();
+    } else if (!loads.keys && next.p !== from.p) {
+      // Under a Find, the pattern it goes back to changed: nothing to read.
+      store.picked = next.p !== null ? patternRef(next.p) : null;
+    }
+    if (loads.keys) {
+      store.picked = next.p !== null ? patternRef(next.p) : null;
+      if (next.find !== null) runFind(next.find);
+      else openPattern(store.picked);
+    }
+    if (loads.clearValue) {
+      valueSeq += 1;
+      Object.assign(store, { value: null, valueId: null, valueError: null, item: null, shown: null, format: null });
+      drawValue();
+      redrawKeyRows();
+    }
+    if (loads.value) openValue(keyRef(next.k));
+    if (loads.value) reveal('value');
+    else if (loads.keys) reveal('keys');
+    else if (loads.clearValue) reveal(store.list || store.listError ? 'keys' : 'patterns');
+    else if (loads.clearList) reveal('patterns');
+    drawCrumbs();
+    // A node the analysis does not have left the address too (in place).
+    if (dropped) syncUrl();
+  }
+
+  /** A route while Browse › Keys is shown: Back, Forward, a link, another area's jump. */
+  function applyRoute(r) {
+    if (!alive || !r || r.name !== 'browse' || panelOf(r.sub) !== 'keys') return;
+    const next = parseBrowseQuery(r.query);
+    const plan = entryPlan({ params: next, mark: entryMark(), place: store.place });
+    // Back to an entry of another connection or database: what is shown stays, the entry
+    // is left as it is, and a line says why.
+    if (plan === 'foreign') {
+      showForeign(true);
+      return;
+    }
+    // A new entry with no state (a link typed, `#/browse` from elsewhere): what Browse
+    // shows stays, as when it is opened from another area. Back to an entry that showed
+    // nothing (it is marked) does empty it.
+    if (plan === 'keep') {
+      showForeign(false);
+      syncUrl();
+      return;
+    }
+    applyParams(next);
+  }
+
+  // ---------- the database list, for the top bar's database control ----------
+  // The key is taken before asking, so a reply that arrives after a switch or a new run is
+  // not shown for the new one.
   async function loadDbs() {
+    const key = ctx.dbListKey ? ctx.dbListKey() : null;
     try {
       store.dbs = await ctx.api.getDbs();
       store.dbsError = null;
@@ -553,92 +1121,81 @@ function mountKeys(root, ctx) {
       store.dbs = null;
       store.dbsError = errorText(err);
     }
-    if (alive) drawDbs();
-  }
-
-  function drawDbs() {
-    const d = store.dbs;
-    if (!d) {
-      fill(dbBox, store.dbsError ? h('span', { class: 'muted small', text: `Database: ${store.dbsError}` }) : null);
-      return;
-    }
-    if (d.off) {
-      fill(dbBox, h('span', { class: 'muted small', text: d.off }));
-      return;
-    }
-    const select = h('select', {
-      class: 'field', id: 'browse-db',
-      onchange: async () => {
-        const db = Number(select.value);
-        select.disabled = true;
-        try {
-          const r = await ctx.api.switchDb(db);
-          ctx.notify(r.switched ? r.text || `Switched to db ${db}.` : `Already on db ${db}.`, 'ok');
-        } catch (err) {
-          ctx.notify(errorText(err), 'error');
-          select.value = String(d.current);
-        } finally {
-          select.disabled = false;
-        }
-      },
-    }, d.rows.map((r) => h('option', { value: String(r.db), selected: r.current, text: `db ${r.db} · ${plural(r.keys, 'key', 'keys')}` })));
-    fill(dbBox,
-      h('label', { htmlFor: 'browse-db', text: 'Database' }),
-      select,
-      h('span', { class: 'sr-only', text: [d.note, d.unread].filter(Boolean).join(' ') }));
-    select.title = [d.note, d.unread].filter(Boolean).join(' ');
+    if (alive && ctx.showDbs) ctx.showDbs(key, store.dbs, store.dbsError);
   }
 
   // ---------- the tree ----------
   let treeSeq = 0;
   async function loadTree() {
     const mine = (treeSeq += 1);
+    const asked = store.sort;
     try {
       const tree = await ctx.api.getBrowse({ sort: store.sort, node: store.node });
       if (!alive || mine !== treeSeq) return;
+      const knew = store.picked ? bulkAllowed(store.tree, store.picked.id) : null;
       store.tree = tree;
       store.treeError = null;
       store.sort = tree.sort;
+      // The address names the sort shown, so it is not asked for again.
+      if (asked !== null && asked !== tree.sort && !pending) syncUrl();
+      // The open pattern's About panel offers its bulk actions only once the tree lists it.
+      if (store.picked && !pending && knew !== bulkAllowed(tree, store.picked.id)) drawKeys();
     } catch (err) {
       if (!alive || mine !== treeSeq) return;
-      // A sort or node no longer offered (a new run): back to the defaults.
+      // A sort or node no longer offered (a new run, an address): back to the defaults, in
+      // the address too, so it is not asked for again.
       if ((err.status === 400 && store.sort) || (err.status === 422 && store.node !== null)) {
         store.sort = null;
         store.node = null;
+        if (!pending) syncUrl();
         loadTree();
         return;
       }
       store.treeError = errorText(err);
     }
     drawTree();
+    // An address waiting for the tree (its node): shown now, its node checked first.
+    if (pending) {
+      const p = pending;
+      pending = null;
+      applyParams(store.tree || store.treeError ? p.next : { ...p.next, node: null }, { retry: p.retry, mark: p.mark });
+    }
     const t = store.tree;
     // Names are read by redis-lens in the background: look again while it reads, and while
     // nothing is there yet (the live connection opening, an analysis starting).
     if (!store.treeError && t && ((t.names && t.names.reading) || t.source === 'none')) later(loadTree, 900);
   }
 
+  /** What a tree reply is for: the session and run, the sort and the node. */
+  const treeAsk = () => ({ seq: treeSeq, id: `${store.who}|${store.sort}|${store.node}` });
   async function moreNames(button) {
     button.disabled = true;
+    const sent = treeAsk();
     try {
-      store.tree = await ctx.api.moreNames({ sort: store.sort });
+      const tree = await ctx.api.moreNames({ sort: store.sort });
+      // A sort, node or run changed meanwhile: that tree is read already; this one is not
+      // drawn over it.
+      if (!alive || !replyWanted(sent, treeAsk())) return;
+      store.tree = tree;
       store.treeError = null;
     } catch (err) {
+      if (!alive || !replyWanted(sent, treeAsk())) return;
       ctx.notify(errorText(err), 'error');
     }
-    if (alive) drawTree();
+    drawTree();
   }
 
   function drawTree() {
     const t = store.tree;
     const report = ctx.state().analysis.report;
-    patSource.textContent = store.treeError ? '' : treeSource(t);
     subtitle.textContent = t ? subtitleText(t) : ' ';
-    // The sort: from names only keys and name.
+    // The sort: from names only keys and name. It is in the address, in place (not a step).
     if (t && t.sorts.length > 1) {
       const select = h('select', {
-        class: 'field', id: 'browse-sort',
+        class: 'field', id: 'browse-sort', 'data-act': 'sort',
         onchange: () => {
           store.sort = select.value;
+          syncUrl(false, { user: true });
           loadTree();
         },
       }, t.sorts.map((s) => h('option', { value: s, selected: s === t.sort, text: SORT_LABELS[s] || s })));
@@ -650,6 +1207,7 @@ function mountKeys(root, ctx) {
         class: 'field', id: 'browse-node',
         onchange: () => {
           store.node = select.value === '' ? null : Number(select.value);
+          syncUrl(false, { user: true });
           loadTree();
         },
       }, h('option', { value: '', selected: t.node === null, text: 'All nodes' }),
@@ -679,9 +1237,10 @@ function mountKeys(root, ctx) {
       for (const e of n.missing) if (!n.refused.includes(e) && !n.skipped.includes(e)) notes.push(notice(`${e}: not connected, so its key names are not read.`));
     }
     const more = n && !n.done && !n.reading && t.source === 'names'
-      ? h('button', { type: 'button', class: 'btn', text: 'Read 1,000 more names', onclick: (e) => moreNames(e.currentTarget) })
+      ? h('button', { type: 'button', class: 'btn', text: 'Read 1,000 more names', 'data-act': 'more', onclick: (e) => moreNames(e.currentTarget) })
       : null;
     refill(patFoot, [
+      store.treeError ? null : h('p', { class: 'muted small', text: treeSource(t) }),
       h('p', { class: 'muted small', text: treeFoot(t, report) }),
       t && t.source === 'names' ? h('p', { class: 'muted small', text: 'Browse reads key names with SCAN, 1,000 a call, and nothing else until a key is opened. Sizes, TTLs and types come from an analysis.' }) : null,
       more,
@@ -691,6 +1250,7 @@ function mountKeys(root, ctx) {
 
   function drawRows() {
     const t = store.tree;
+    drawPatCols(t);
     if (!t) {
       refill(patRows, h('li', { class: 'muted pad', text: store.treeError ? '' : 'Reading key names…' }));
       return;
@@ -705,62 +1265,81 @@ function mountKeys(root, ctx) {
       return;
     }
     const exact = treeExact(t, ctx.state().analysis.report);
+    // The share bar is drawn against the largest share shown, so the bars can be told apart.
+    let top = 0;
+    for (const r of t.rows) top = Math.max(top, typeof r.share === 'number' ? r.share : 0);
     const out = [];
     for (const r of rows) {
       if (r.kind === 'group') {
         const closed = store.closed.has(r.key) && !store.filter;
+        const sub = `${plural(r.children.length, 'pattern', 'patterns')} · ${figureKeys(r, exact)}`;
         out.push(h('li', null, h('button', {
-          type: 'button', class: 'row row-pat group', 'aria-expanded': closed ? 'false' : 'true',
-          title: r.reason || '',
+          type: 'button', class: 'row row-pat group', 'data-group': '', 'aria-expanded': closed ? 'false' : 'true', 'data-row': `g:${r.key}`,
+          title: [sub, r.reason].filter(Boolean).join(' · '),
           onclick: () => {
             if (store.closed.has(r.key)) store.closed.delete(r.key);
             else store.closed.add(r.key);
             drawRows();
           },
         },
-        h('span', { class: 'name' },
-          h('span', { class: 'mono clip block', text: `${closed ? '▸' : '▾'} ${r.label}` }),
-          h('span', { class: 'sub', text: `${plural(r.children.length, 'pattern', 'patterns')} · ${figureKeys(r, exact)}` })),
-        h('span', { class: 'glyph', 'aria-hidden': 'true', text: r.marked ? '▲' : '' }),
-        h('span', { class: 'mono right fig', text: figure(r, t) }))));
-        if (!closed) for (const c of r.children) out.push(patternRow(c, t, exact, true));
-      } else out.push(patternRow(r, t, exact, false));
+        h('span', { class: 'mono clip', text: `${closed ? '▸' : '▾'} ${r.label}` }),
+        h('span', { class: 'sr-only', text: sub }),
+        ...figureCells(r, t, top))));
+        if (!closed) for (const c of r.children) out.push(patternRow(c, t, exact, true, top));
+      } else out.push(patternRow(r, t, exact, false, top));
     }
     refill(patRows, out);
   }
 
   const figureKeys = (r, exact) => (r.kind === 'group' ? `${exact ? '' : '~'}${fmtCount(r.estKeys)} keys` : keysText(r, exact));
-  const figure = (r, t) => (t.sizes && typeof r.estBytes === 'number' ? fmtBytes(r.estBytes) : fmtPercent(r.share));
+  /** The memory (or, from names only, the keys), the share bar and %, and ▲. */
+  function figureCells(r, t, top) {
+    const fig = t.sizes && typeof r.estBytes === 'number' ? fmtBytes(r.estBytes) : `${r.kind === 'group' ? '' : r.literal === true ? '' : '~'}${fmtCount(r.estKeys)}`;
+    const bar = meter(barPercent(r.share, top || 1), 'thin');
+    bar.setAttribute('aria-hidden', 'true');
+    return [
+      h('span', { class: 'mono right fig', text: fig }),
+      bar,
+      h('span', { class: 'mono right fig muted share', text: fmtPercent(r.share) }),
+      h('span', { class: 'glyph', 'aria-hidden': 'true', text: r.marked ? '▲' : '' }),
+      r.marked ? h('span', { class: 'sr-only', text: 'marked: worth a look' }) : null,
+    ];
+  }
 
-  function patternRow(r, t, exact, child) {
-    const on = store.picked && store.picked.id === r.pattern.id && (!store.list || store.list.kind === 'pattern');
+  function drawPatCols(t) {
+    fill(patCols, t && t.rows.length
+      ? [h('span', { text: 'Pattern' }), h('span', { class: 'right', text: t.sizes ? 'Memory' : 'Keys' }), h('span'), h('span', { class: 'right share', text: 'Share' }), h('span')]
+      : null);
+  }
+
+  function patternRow(r, t, exact, child, top) {
+    const on = store.finding === null && store.picked && store.picked.id === r.pattern.id && (!store.list || store.list.kind === 'pattern');
     const change = r.change ? ` · ${r.change.words}${typeof r.change.deltaBytes === 'number' && r.change.deltaBytes !== 0 ? ` ${fmtSignedBytes(r.change.deltaBytes)}` : ''}` : '';
+    const sub = `${keysText(r, exact)}${r.type ? ` · ${r.type}` : ''}${change}`;
     return h('li', null, h('button', {
-      type: 'button', class: `row row-pat${child ? ' child' : ''}${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null,
-      onclick: () => openPattern(r.pattern, r),
+      type: 'button', class: `row row-pat${child ? ' child' : ''}${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null, 'data-row': `p:${r.pattern.id}`,
+      title: `${r.pattern.name} · ${sub}`,
+      onclick: () => go({ p: r.pattern.id, k: null, find: null }),
     },
-    h('span', { class: 'name' },
-      h('span', { class: 'mono clip block', text: r.pattern.name }),
-      h('span', { class: 'sub', text: `${keysText(r, exact)}${r.type ? ` · ${r.type}` : ''}${change}` })),
-    h('span', { class: 'glyph', 'aria-hidden': 'true', text: r.marked ? '▲' : '' }),
-    r.marked ? h('span', { class: 'sr-only', text: 'marked: worth a look' }) : null,
-    h('span', { class: 'mono right fig', text: figure(r, t) })));
+    patternName(r.pattern.name, { literal: r.literal === true, cls: 'mono clip' }),
+    h('span', { class: 'sr-only', text: sub }),
+    ...figureCells(r, t, top)));
   }
 
   /** The tree's row of a pattern, when it is in the tree shown. */
   function rowOf(id) {
-    const t = store.tree;
-    if (!t) return null;
-    for (const r of t.rows) {
-      if (r.kind === 'pattern' && r.pattern.id === id) return r;
-      if (r.kind === 'group') for (const c of r.children) if (c.pattern.id === id) return c;
-    }
-    return null;
+    return treeRowOf(store.tree, id);
   }
+
+  /** Whether a pattern is a literal key name in the tree shown (its `{…}` is not a placeholder). */
+  const literalOf = (pattern) => {
+    const r = pattern ? rowOf(pattern.id) : null;
+    return !!(r && r.literal === true);
+  };
 
   // ---------- a pattern's keys, and Find ----------
   let listSeq = 0;
-  async function openPattern(name, row = null) {
+  async function openPattern(name) {
     const mine = (listSeq += 1);
     store.picked = name;
     store.finding = null;
@@ -774,17 +1353,18 @@ function mountKeys(root, ctx) {
       const list = await ctx.api.getKeys({ pattern: name.id, node: store.node });
       if (!alive || mine !== listSeq) return;
       store.list = list;
+      // A pattern opened from an address is named by the server once its keys come.
+      if (list.pattern && list.pattern.id === name.id && !rowOf(name.id)) store.picked = list.pattern;
     } catch (err) {
       if (!alive || mine !== listSeq) return;
       store.listError = errorText(err);
     }
     drawKeys();
-    if (row === null) drawRows();
+    drawRows();
   }
 
   async function runFind(text) {
     const mine = (listSeq += 1);
-    if (!store.finding && store.picked) store.back = store.picked;
     store.finding = text;
     store.list = null;
     store.listError = null;
@@ -804,14 +1384,21 @@ function mountKeys(root, ctx) {
     drawKeys();
   }
 
+  /** What a key list reply is for: the list opened (`listSeq`) and its id. */
+  const listAsk = () => ({ seq: listSeq, id: store.list ? store.list.list : null });
   async function moreKeys(button) {
     const l = store.list;
     if (!l) return;
     button.disabled = true;
     button.textContent = 'Reading…';
+    const sent = listAsk();
     try {
-      store.list = mergeList(l, await ctx.api.moreKeys(l.list));
+      const next = await ctx.api.moreKeys(l.list);
+      // Another pattern, Find or Back meanwhile: this page is not that list's.
+      if (!alive || !replyWanted(sent, listAsk())) return;
+      store.list = mergeList(store.list, next);
     } catch (err) {
+      if (!alive || !replyWanted(sent, listAsk())) return;
       // A list redis-lens no longer keeps (it keeps the newest 16): read it again.
       if (err.status === 404) {
         if (l.kind === 'find' && store.finding) runFind(store.finding);
@@ -820,49 +1407,67 @@ function mountKeys(root, ctx) {
       }
       ctx.notify(errorText(err), 'error');
     }
-    if (alive) drawKeys();
+    drawKeys();
   }
 
+  /** Clear search: a step in the history, back to the pattern Find came from (its keys
+   *  read again, as before), or to no list. */
   function clearFind() {
-    store.finding = null;
-    store.list = null;
-    store.listError = null;
-    const back = store.back;
-    store.back = null;
-    if (back) openPattern(back);
-    else {
-      store.picked = null;
-      drawKeys();
-      drawRows();
-    }
+    go({ find: null });
+  }
+
+  /** The counts beside the key list's title: the pattern's keys and memory, or how many
+   *  keys Find has found. */
+  function keysCounts(l, row) {
+    if (store.finding !== null) return l ? `${fmtGrouped(l.loaded)} found${l.done ? '' : ' so far'}` : '';
+    if (!row) return '';
+    const t = store.tree;
+    const parts = [keysText(row, treeExact(t, ctx.state().analysis.report))];
+    if (t && t.sizes && typeof row.estBytes === 'number') parts.push(fmtBytes(row.estBytes));
+    return parts.join(' · ');
   }
 
   function drawKeys(busy = null) {
+    if (roMoved() && store.value) drawValue();
     const l = store.list;
-    const title = store.finding !== null
+    const finding = store.finding !== null;
+    const titleText = finding
       ? `Find: ${l && l.find ? l.find.glob : store.finding}`
       : store.picked ? store.picked.name : 'Keys';
+    const row = !finding && store.picked ? rowOf(store.picked.id) : null;
+    const counts = keysCounts(l, row);
     const addOff = keyOff(ctx.state().conn);
-    const head = h('div', { class: 'card-head' },
-      h('h2', { class: 'mono key-title clip', text: title, title }),
-      h('div', { class: 'row-actions' },
-        store.finding !== null ? h('button', { type: 'button', class: 'btn quiet', text: 'Clear search', onclick: clearFind }) : null,
-        h('button', { type: 'button', class: 'btn', text: 'Add key', disabled: !!addOff, title: addOff || 'Add a key with its first value. An existing key is never overwritten.', onclick: () => addKeyDialog() })));
+    const title = !finding && store.picked
+      ? h('h2', { class: 'key-title clip', title: titleText }, patternName(store.picked.name, { literal: literalOf(store.picked), cls: 'mono' }))
+      : h('h2', { class: `key-title clip${finding ? ' mono' : ' lbl'}`, text: titleText, title: titleText });
+    const head = h('div', { class: 'pane-head' },
+      h('div', { class: 'pane-title' }, title, counts ? h('span', { class: 'muted small fig', text: counts }) : null),
+      h('div', { class: 'pane-tools' },
+        finding ? h('button', { type: 'button', class: 'btn quiet', text: 'Clear search', onclick: clearFind }) : null,
+        h('button', { type: 'button', class: 'btn', text: 'Add key', disabled: !!addOff, title: addOff || 'Add a key with its first value. An existing key is never overwritten.', 'data-act': 'key.add', onclick: () => addKeyDialog() }),
+        !finding && store.picked ? aboutPattern(row, store.picked) : null));
+    // Why Add key is off, and the pattern's ▲ reason: a line each, above the rows.
+    const lines = [
+      addOff ? whyLines([addOff], 'keys') : null,
+      row && row.marked && row.reason ? h('p', { class: 'pane-note warn-line' }, h('span', { class: 'glyph', 'aria-hidden': 'true', text: '▲ ' }), row.reason) : null,
+    ];
     if (busy) {
-      fill(keysCard, head, h('p', { class: 'muted', text: busy }));
+      fill(keysCard, head, lines, h('p', { class: 'muted pad', text: busy }));
+      drawCrumbs();
       return;
     }
     if (store.listError) {
-      fill(keysCard, head, notice(store.listError));
+      fill(keysCard, head, lines, h('div', { class: 'pad' }, notice(store.listError)));
+      drawCrumbs();
       return;
     }
     if (!l) {
-      fill(keysCard, head, emptyState(store.tree && store.tree.rows.length ? 'Pick a pattern to list its keys, or find a key by name in the box at the top.' : 'Find a key by name in the box at the top, or pick a pattern once there are some.'));
+      fill(keysCard, head, lines, h('div', { class: 'pad' }, emptyState(store.tree && store.tree.rows.length ? 'Open a pattern to list its keys, or find a key by name with Go to.' : 'Find a key by name with Go to, or open a pattern once there are some.')));
+      drawCrumbs();
       return;
     }
-    const row = l.kind === 'pattern' && store.picked ? rowOf(store.picked.id) : null;
     const filter = h('input', {
-      class: 'field mono', type: 'search', id: 'browse-key-filter', placeholder: 'Filter the loaded keys', autocomplete: 'off', spellcheck: false, value: store.listFilter,
+      class: 'field mono', type: 'search', id: 'browse-key-filter', placeholder: 'Filter the loaded keys', autocomplete: 'off', spellcheck: false, value: store.listFilter, 'data-act': 'filter',
       oninput: () => {
         store.listFilter = filter.value;
         store.listShown = CHUNK;
@@ -873,24 +1478,25 @@ function mountKeys(root, ctx) {
     const showBox = h('div');
     drawKeyRows(rowsBox, showBox);
     const more = !l.done && !l.capped
-      ? h('button', { type: 'button', class: 'btn', text: `Load ${fmtGrouped(l.pageKeys)} more`, onclick: (e) => moreKeys(e.currentTarget) })
+      ? h('button', { type: 'button', class: 'btn', text: `Load ${fmtGrouped(l.pageKeys)} more`, 'data-act': 'more', onclick: (e) => moreKeys(e.currentTarget) })
       : null;
     const focused = keysCard.contains(document.activeElement) ? document.activeElement.id : null;
     fill(keysCard,
       head,
-      row ? patternSummary(row) : null,
-      l.kind === 'find' && l.find ? h('p', { class: 'muted small', text: /[*?[]/.test(l.find.text) ? 'A pattern, used as typed.' : `Names that contain ${l.find.text}.` }) : null,
-      h('div', null, h('label', { class: 'sr-only', htmlFor: 'browse-key-filter', text: 'Filter the loaded keys' }), filter),
-      h('div', { class: 'cols-head key-cols', 'aria-hidden': 'true' }, h('span', { text: 'Key' }), h('span', { text: 'Type' }), h('span', { class: 'right', text: 'Size' }), h('span', { class: 'right', text: 'Expires' })),
-      rowsBox,
-      showBox,
-      h('div', { class: 'card-foot' },
-        h('p', { class: 'muted small', text: [listFoot(l), l.cluster && l.cluster.nodesDone !== null && l.cluster.walk.length > 1 && !l.done ? `${l.cluster.nodesDone} of ${l.cluster.walk.length} nodes done.` : null].filter(Boolean).join(' ') }),
-        more,
+      lines,
+      l.kind === 'find' && l.find ? h('p', { class: 'pane-note muted small', text: /[*?[]/.test(l.find.text) ? 'A pattern, used as typed.' : `Names that contain ${l.find.text}.` }) : null,
+      h('div', { class: 'pane-filter' }, h('label', { class: 'sr-only', htmlFor: 'browse-key-filter', text: 'Filter the loaded keys' }), filter),
+      h('div', { class: 'cols-head key-cols', 'aria-hidden': 'true' }, h('span', { text: 'Key' }), h('span', { text: 'Type' }), h('span', { class: 'right', text: 'Size' }), h('span', { class: 'right', text: 'Length' }), h('span', { class: 'right', text: 'Expires' })),
+      h('div', { class: 'pane-scroll' }, rowsBox, showBox),
+      h('div', { class: 'pane-foot' },
+        h('div', { class: 'foot-line' },
+          h('p', { class: 'muted small', text: [listFoot(l), l.cluster && l.cluster.nodesDone !== null && l.cluster.walk.length > 1 && !l.done ? `${l.cluster.nodesDone} of ${l.cluster.walk.length} nodes done.` : null].filter(Boolean).join(' ') }),
+          more),
         listNotes(l).map((t) => notice(t))));
     if (focused === 'browse-key-filter') {
       filter.focus();
     }
+    drawCrumbs();
   }
 
   function drawKeyRows(box, showBox) {
@@ -899,20 +1505,20 @@ function mountKeys(root, ctx) {
     const rows = q ? l.rows.filter((r) => r.name.toLowerCase().includes(q)) : l.rows;
     const shown = rows.slice(0, store.listShown);
     const nodes = ctx.state().conn ? ctx.state().conn.nodes : [];
+    // The open key's writes are on the value pane's bar, with their keys (t, R, d reach
+    // them from this list too); its row carries none of its own.
     refill(box, shown.length ? shown.map((r) => {
       const on = store.valueId === r.id;
-      const open = on && store.value && store.value.key && store.value.key.id === r.id;
       return h('li', null, h('button', {
-        type: 'button', class: `row row-key${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null,
-        onclick: () => openValue(r),
+        type: 'button', class: `row row-key${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null, 'data-row': r.id,
+        onclick: () => go({ k: r.id }),
       },
       h('span', { class: 'mono clip', text: r.name, title: r.name }),
       h('span', { class: 'badge mono', text: r.type || DASH }),
       h('span', { class: 'mono right', text: fmtBytes(r.bytes) }),
-      h('span', { class: 'mono right muted', text: r.ttl || DASH }),
-      typeof r.node === 'number' && nodes[r.node] ? h('span', { class: 'sr-only', text: `on node ${nodes[r.node].address}` }) : null),
-      // The open key's own writes, beside its row as well as above its value.
-      open ? h('div', { class: 'row-tools', role: 'group', 'aria-label': `Write to ${r.name}` }, keyButtons(store.value, true)) : null);
+      h('span', { class: 'mono right muted', text: typeof r.length === 'number' ? fmtGrouped(r.length) : DASH }),
+      h('span', { class: `mono right${r.ttl === 'never' ? ' never' : ' muted'}`, text: r.ttl || DASH }),
+      typeof r.node === 'number' && nodes[r.node] ? h('span', { class: 'sr-only', text: `on node ${nodes[r.node].address}` }) : null));
     }) : h('li', { class: 'muted pad', text: q ? 'No loaded key matches the filter.' : listFoot(l) }));
     fill(showBox, rows.length > shown.length
       ? h('button', {
@@ -925,8 +1531,64 @@ function mountKeys(root, ctx) {
       : null);
   }
 
-  function patternSummary(r) {
+  /** "About this pattern", a panel that opens over the panes from the key list's head, so
+   *  the rows stay where they are: its figures, copying it, every key of it at once, and
+   *  the details. `r`: its row in the tree, null when the tree shown does not hold it. */
+  let aboutOpen = null;
+  // A click outside the open panel closes it, as the top bar's menus close.
+  let aboutOutside = null;
+  const dropOutside = () => {
+    if (aboutOutside) document.removeEventListener('pointerdown', aboutOutside, true);
+    aboutOutside = null;
+  };
+  function aboutPattern(r, pattern) {
+    const summary = h('summary', { class: 'btn', text: 'About ▾', title: 'About this pattern: its figures, the scan command, every key of it at once' });
+    const close = (refocus) => {
+      if (!box.open) return;
+      box.open = false;
+      if (refocus) summary.focus({ preventScroll: true });
+    };
+    // It stays open while the list is drawn again, for the same pattern.
+    const box = h('details', {
+      class: 'pop', open: aboutOpen === pattern.id,
+      ontoggle: () => {
+        if (box.open) {
+          aboutOpen = pattern.id;
+          dropOutside();
+          aboutOutside = (e) => {
+            if (!box.isConnected) dropOutside();
+            else if (!box.contains(e.target)) close(false);
+          };
+          document.addEventListener('pointerdown', aboutOutside, true);
+        } else {
+          if (aboutOpen === pattern.id) aboutOpen = null;
+          dropOutside();
+        }
+      },
+      // Esc closes it and the focus goes back to its button (not to the pane on the left).
+      onkeydown: (e) => {
+        if (e.key !== 'Escape' || !box.open) return;
+        e.preventDefault();
+        e.stopPropagation();
+        close(true);
+      },
+    },
+      summary,
+      h('div', { class: 'pop-body', role: 'group', 'aria-label': 'About this pattern' }, patternSummary(r, pattern)));
+    return box;
+  }
+
+  function patternSummary(r, pattern) {
     const t = store.tree;
+    const copyPattern = h('div', { class: 'row-actions' }, copyButton('Copy pattern', pattern.copy, 'the pattern', 'The pattern has control characters, so it is not copied: a pasted copy would name other keys.', { act: 'copy.pattern' }));
+    // Not a row of the tree the server gave (an address named it): its keys only, no bulk
+    // action (`bulkAllowed`).
+    if (!r) {
+      return h('div', { class: 'summary' },
+        h('p', { class: 'muted small', text: 'The patterns shown do not hold this one, so there are no figures for it here.' }),
+        copyPattern,
+        h('p', { class: 'muted small', text: BULK_NOT_LISTED }));
+    }
     const exact = treeExact(t, ctx.state().analysis.report);
     const parts = [keysText(r, exact)];
     if (t && t.sizes && typeof r.estBytes === 'number') parts.push(`${fmtBytes(r.estBytes)}, ${fmtPercent(r.share)} of memory`);
@@ -939,19 +1601,19 @@ function mountKeys(root, ctx) {
     if (r.examples.length) {
       details.push(h('p', { class: 'lbl', text: 'Example keys' }),
         h('ul', { class: 'list' }, r.examples.map((k) => h('li', null, h('button', {
-          type: 'button', class: 'row row-example', onclick: () => openValue(k),
+          type: 'button', class: 'row row-example', onclick: () => go({ k: k.id }),
         }, h('span', { class: 'mono clip', text: k.name }), h('span', { class: 'mono right', text: fmtBytes(k.bytes) }), h('span', { class: 'mono right muted', text: k.ttl || DASH }))))));
     }
     const command = r.command
-      ? h('div', { class: 'command' }, h('code', { class: 'mono wrap-any', text: `$ ${r.command}` }), copyButton('Copy command', r.command, 'the command'))
+      ? h('div', { class: 'command' }, h('code', { class: 'mono wrap-any', text: `$ ${r.command}` }), copyButton('Copy command', r.command, 'the command', null, { act: 'copy.command' }))
       : h('p', { class: 'muted small', text: 'No command to list them: the pattern has characters that are not safe to paste in every shell.' });
     details.push(command);
     return h('div', { class: 'summary' },
       h('p', { text: parts.join(' · ') }),
       r.marked && r.reason ? notice(r.reason) : r.reason ? h('p', { class: 'muted small', text: r.reason }) : null,
-      h('div', { class: 'row-actions' }, copyButton('Copy pattern', r.pattern.copy, 'the pattern', 'The pattern has control characters, so it is not copied: a pasted copy would name other keys.')),
-      bulkButtons(r.pattern),
-      h('details', { class: 'advanced' }, h('summary', { text: 'About this pattern' }), h('div', { class: 'details-body' }, details)));
+      copyPattern,
+      bulkAllowed(t, r.pattern.id) ? bulkButtons(r.pattern) : h('p', { class: 'muted small', text: BULK_NOT_LISTED }),
+      h('div', { class: 'details-body' }, details));
   }
 
   // ---------- a key's value ----------
@@ -994,12 +1656,16 @@ function mountKeys(root, ctx) {
     if (!v) return;
     button.disabled = true;
     button.textContent = 'Reading…';
+    // What a value reply is for: the key opened (`valueSeq`) and its view.
+    const valueAsk = () => ({ seq: valueSeq, id: store.value ? store.value.view : null });
+    const sent = valueAsk();
     try {
       const next = await ctx.api.moreValue(v.view);
-      if (!alive || store.value !== v) return;
+      if (!alive || !replyWanted(sent, valueAsk()) || store.value !== v) return;
       store.value = next;
       if (next.notice && next.items.length === v.items.length) ctx.notify(next.notice, 'info');
     } catch (err) {
+      if (!alive || !replyWanted(sent, valueAsk())) return;
       if (err.status === 404 && store.valueId) {
         openValue({ id: store.valueId, type: v.meta && v.meta.type });
         return;
@@ -1047,19 +1713,24 @@ function mountKeys(root, ctx) {
   }
 
   function drawValue(busy = null, key = null) {
+    // A key opened or closed: the read-only line moves between the two panes.
+    if (roMoved()) drawKeys();
     valueCard.setAttribute('aria-busy', busy ? 'true' : 'false');
     const v = store.value;
     const focusedName = valueCard.contains(document.activeElement) ? (document.activeElement.getAttribute('aria-label') || document.activeElement.textContent.trim()) : null;
     if (busy) {
-      fill(valueCard, key ? h('h2', { class: 'mono key-title wrap-any', text: key.name }) : null, h('p', { class: 'muted', text: busy }));
+      fill(valueCard, key ? h('div', { class: 'pane-head' }, h('h2', { class: 'mono key-title clip', text: key.name, title: key.name })) : null, h('p', { class: 'muted pad', text: busy }));
+      drawCrumbs();
       return;
     }
     if (store.valueError) {
-      fill(valueCard, notice(store.valueError));
+      fill(valueCard, h('div', { class: 'pad' }, notice(store.valueError)));
+      drawCrumbs();
       return;
     }
     if (!v) {
-      fill(valueCard, emptyState('Pick a key to see its value.'));
+      fill(valueCard, h('div', { class: 'pad' }, emptyState(store.list ? 'Open a key to see its value.' : 'Open a pattern, then one of its keys, to see its value.')));
+      drawCrumbs();
       return;
     }
     const s = ctx.state();
@@ -1068,42 +1739,45 @@ function mountKeys(root, ctx) {
     const name = v.key ? v.key.name : v.meta ? v.meta.name : '';
     const copyName = v.key ? v.key.copy : v.meta ? v.meta.copy : null;
     const shown = store.shown;
-    const parts = [
-      h('div', { class: 'value-head' },
-        h('h2', { class: 'mono key-title wrap-any', text: name }),
+    // The head stays put (name and type, the facts, the actions and why some are off); the
+    // items and the value scroll below it, the value box taking the height left.
+    const head = h('div', { class: 'value-top' },
+      h('div', { class: 'pane-head value-head' },
+        h('h2', { class: 'mono key-title clip', text: name, title: name }),
         h('span', { class: 'badge mono', text: v.type || v.kind })),
       h('p', { class: 'muted small', text: valueFacts(v, node) || DASH }),
-      v.pattern ? h('p', { class: 'muted small' }, 'Pattern ', h('span', { class: 'mono', text: v.pattern.name })) : null,
+      v.pattern ? h('p', { class: 'muted small clip' }, 'Pattern ', patternName(v.pattern.name, { literal: literalOf(v.pattern) })) : null,
       h('div', { class: 'row-actions' },
-        copyButton('Copy name', copyName, 'the key name', 'The name has control characters, so it is not copied: a pasted copy would name another key.'),
-        shown ? copyButton('Copy value', shown.copy, 'the value', shown.copyRefused || 'This value is not copied as text: show it as hex to copy it.') : null),
-      writeBar(v),
-    ];
+        copyButton('Copy name', copyName, 'the key name', 'The name has control characters, so it is not copied: a pasted copy would name another key.', { act: 'copy.name' }),
+        shown ? copyButton('Copy value', shown.copy, 'the value', shown.copyRefused || 'This value is not copied as text: show it as hex to copy it.', { act: 'copy.value' }) : null),
+      writeBar(v));
     const notes = [];
     if (v.gone) notes.push(notice(v.notice || 'The key no longer exists.'));
     if (v.error) notes.push(notice(v.error));
     if (v.message) notes.push(notice(v.message, 'info'));
     v.refused.forEach((t) => notes.push(notice(t)));
     if (v.fieldTtlsOff) notes.push(notice(v.fieldTtlsOff));
-    parts.push(notes);
 
-    if (v.items.length) parts.push(itemsBox(v));
-    if (v.module) parts.push(moduleBox(v.module));
-    if (shown) parts.push(shownBox(shown, v));
-    else if (v.items.length && store.item) parts.push(h('p', { class: 'muted small', text: 'Reading the item…' }));
+    const body = [notes];
+    if (v.items.length) body.push(itemsBox(v));
+    if (v.module) body.push(moduleBox(v.module));
+    if (shown) body.push(shownBox(shown, v));
+    else if (v.items.length && store.item) body.push(h('p', { class: 'muted small', text: 'Reading the item…' }));
 
     const foot = valueFoot(v);
-    if (!v.gone && (foot || v.more)) {
-      parts.push(h('div', { class: 'card-foot' },
-        h('p', { class: 'muted small', text: v.gone ? '' : foot }),
-        v.more ? h('button', { type: 'button', class: 'btn', text: 'Load more', onclick: (e) => moreValue(e.currentTarget) }) : null,
-        v.capped ? h('p', { class: 'muted small', text: `At most ${fmtGrouped(v.maxItems)} items are held.` }) : null));
-    }
-    fill(valueCard, parts);
+    const footBox = !v.gone && (foot || v.more)
+      ? h('div', { class: 'pane-foot' },
+        h('div', { class: 'foot-line' },
+          h('p', { class: 'muted small', text: v.gone ? '' : foot }),
+          v.more ? h('button', { type: 'button', class: 'btn', text: 'Load more', 'data-act': 'more', onclick: (e) => moreValue(e.currentTarget) }) : null),
+        v.capped ? h('p', { class: 'muted small', text: `At most ${fmtGrouped(v.maxItems)} items are held.` }) : null)
+      : null;
+    fill(valueCard, head, h('div', { class: 'value-body' }, body), footBox);
     if (focusedName) {
       const again = Array.from(valueCard.querySelectorAll('button, a, input, select')).find((el) => (el.getAttribute('aria-label') || el.textContent.trim()) === focusedName && !el.disabled);
       if (again) again.focus();
     }
+    drawCrumbs();
   }
 
   function itemsBox(v) {
@@ -1114,7 +1788,7 @@ function mountKeys(root, ctx) {
       const on = store.item && store.item.index === item.index;
       const cells = itemCells(v, item);
       return h('li', null, h('button', {
-        type: 'button', class: `row row-item cols-${cols.length}${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null,
+        type: 'button', class: `row row-item cols-${cols.length}${on ? ' on' : ''}`, 'aria-current': on ? 'true' : null, 'data-row': String(item.index),
         onclick: () => pickItem(item, 0),
       }, cells.map((c, i) => h('span', { class: `mono clip${i ? ' muted' : ''}`, text: c, title: c }))));
     }));
@@ -1137,9 +1811,10 @@ function mountKeys(root, ctx) {
   }
 
   function shownBox(shown, v) {
+    // The key (f) belongs to the group: its hint is on the label, once (app.js `applyHints`).
     const formats = shown.formats.length > 1
-      ? h('div', { class: 'tabs', role: 'group', 'aria-label': 'Show the value as' }, shown.formats.map((f) => h('button', {
-        type: 'button', class: shown.format === f ? 'pill small on' : 'pill small', 'aria-pressed': shown.format === f ? 'true' : 'false', text: f === 'text' ? 'Text' : f === 'hex' ? 'Hex' : f,
+      ? h('div', { class: 'tabs', role: 'group', 'aria-label': 'Show the value as' }, h('span', { class: 'lbl hint-label', 'data-hint-of': 'format', text: 'Show as' }), shown.formats.map((f) => h('button', {
+        type: 'button', class: shown.format === f ? 'pill small on' : 'pill small', 'aria-pressed': shown.format === f ? 'true' : 'false', text: f === 'text' ? 'Text' : f === 'hex' ? 'Hex' : f, 'data-act': 'format',
         onclick: () => pickFormat(f),
       })))
       : null;
@@ -1168,9 +1843,9 @@ function mountKeys(root, ctx) {
       m.missing.map((t) => notice(t)));
   }
 
-  function copyButton(label, value, what, refused = null) {
+  function copyButton(label, value, what, refused = null, { act = null } = {}) {
     return h('button', {
-      type: 'button', class: 'btn', text: label,
+      type: 'button', class: 'btn', text: label, 'data-act': act,
       onclick: async () => {
         if (value === null || value === undefined) {
           ctx.notify(refused || `There is nothing to copy for ${what}.`, 'info');
@@ -1203,23 +1878,21 @@ function mountKeys(root, ctx) {
   }
 
   /** A button for one write: off, saying why in its title, when it can't be sent. */
-  function writeButton(label, off, run, { primary = false, quiet = false, aria = null } = {}) {
+  function writeButton(label, off, run, { primary = false, quiet = false, danger = false, aria = null, act = null } = {}) {
+    const cls = primary ? 'btn primary' : quiet ? 'btn quiet' : 'btn';
     return h('button', {
-      type: 'button', class: primary ? 'btn primary' : quiet ? 'btn quiet' : 'btn', text: label, disabled: !!off, title: off || null, 'aria-label': aria,
+      type: 'button', class: danger ? `${cls} danger` : cls, text: label, disabled: !!off, title: off || null, 'aria-label': aria, 'data-act': act,
       onclick: (e) => run(e.currentTarget),
     });
   }
 
-  /** The key's own writes: its expiry, rename, delete. `beside` names the key in each
-   *  button's label, for the copies beside its row in the key list. */
-  function keyButtons(v, beside = false) {
+  /** The key's own writes: its expiry, rename, delete. */
+  function keyButtons(v) {
     const c = conn();
-    const name = v.key ? v.key.name : '';
-    const opt = (what) => (beside ? { quiet: true, aria: `${what} ${name}` } : {});
     return [
-      writeButton('Set expiry', keyOff(c, KEY_CMDS.ttl, v), () => ttlDialog(null), opt('Set the expiry of')),
-      writeButton('Rename', keyOff(c, KEY_CMDS.rename, v), () => renameDialog(), opt('Rename')),
-      writeButton('Delete key', keyOff(c, KEY_CMDS.delete, v), (b) => deleteKey(b), opt('Delete')),
+      writeButton('Set expiry', keyOff(c, KEY_CMDS.ttl, v), () => ttlDialog(null), { act: 'key.ttl' }),
+      writeButton('Rename', keyOff(c, KEY_CMDS.rename, v), () => renameDialog(), { act: 'key.rename' }),
+      writeButton('Delete key', keyOff(c, KEY_CMDS.delete, v), (b) => deleteKey(b), { danger: true, act: 'key.delete' }),
     ];
   }
 
@@ -1229,19 +1902,37 @@ function mountKeys(root, ctx) {
     const c = conn();
     const e = EDITS[v.kind];
     const buttons = [];
-    if (e && e.edit && !e.item) buttons.push(writeButton(e.edit.label, editOff(v) || keyOff(c, e.edit.cmds, v), (b) => startEdit(b, null)));
-    if (e && e.add) buttons.push(writeButton(e.add.label, keyOff(c, e.add.cmds, v), () => startAdd()));
+    if (e && e.edit && !e.item) buttons.push(writeButton(e.edit.label, editOff(v) || keyOff(c, e.edit.cmds, v), (b) => startEdit(b, null), { act: 'value.edit' }));
+    if (e && e.add) buttons.push(writeButton(e.add.label, keyOff(c, e.add.cmds, v), () => startAdd(), { act: 'item.add' }));
     buttons.push(...keyButtons(v));
-    let why;
-    if (c && c.readOnly) {
-      why = [readOnlyNote(readOnlyText(c)), h('a', { href: '#/connections', class: 'small', text: 'Open Connections' })];
-    } else {
-      const seen = new Set();
-      why = buttons.filter((b) => b.disabled && b.title && !seen.has(b.title) && seen.add(b.title)).map((b) => notice(b.title, 'info'));
-    }
     return h('div', { class: 'stack-sm write-bar' },
       h('div', { class: 'row-actions', role: 'group', 'aria-label': 'Write to this key' }, buttons),
-      why);
+      whyLines(buttons.map((b) => (b.disabled ? b.title : null)), 'value'));
+  }
+
+  /** Why the buttons of a bar that are off are off, as text under it (not only in their
+   *  titles): each reason once. A read-only connection's reason is one line on the whole
+   *  screen (`readOnlyPlace`): drawn only by the bar at `here` when that is its place,
+   *  with the button that turns writes on, as the top bar's does. */
+  function whyLines(offs, here = null) {
+    const c = conn();
+    const ro = c ? readOnlyText(c) : null;
+    const lines = reasonLines(here !== null && here === roPlace() ? offs : offs.filter((o) => o !== ro), ro);
+    if (!lines.length) return null;
+    return h('div', { class: 'bar-why' }, lines.map((t) => (t === readOnlyLine()
+      ? h('div', { class: 'line read-only-line' }, readOnlyNote('Edits are off: this connection is read-only.'),
+        ctx.toggleWrites ? h('button', { type: 'button', class: 'linkish small', text: 'Turn writes on (w)', onclick: () => ctx.toggleWrites() }) : null)
+      : notice(t, 'info'))));
+  }
+  /** Whether the read-only line's place moved since it was drawn (a key opened or closed,
+   *  the panes shown changed), on a read-only connection. */
+  function roMoved() {
+    const p = roPlace();
+    const c = conn();
+    if (p === roAt) return false;
+    const was = roAt;
+    roAt = p;
+    return was !== null && !!c && c.readOnly;
   }
 
   /** The writes of the selected field, element, member or entry, under the items. */
@@ -1255,16 +1946,17 @@ function mountKeys(root, ctx) {
     const buttons = [];
     if (e.edit) {
       const aria = v.kind === 'zset' ? `Edit the score of ${label}` : `Edit ${label}`;
-      buttons.push(writeButton(e.edit.label, editOff(v) || keyOff(c, e.edit.cmds, v), (b) => startEdit(b, item), { aria }));
+      buttons.push(writeButton(e.edit.label, editOff(v) || keyOff(c, e.edit.cmds, v), (b) => startEdit(b, item), { aria, act: 'item.edit' }));
     }
     if (e.fieldTtl) {
       const off = v.fieldTtls ? keyOff(c, e.fieldTtl.cmds, v) : v.fieldTtlsOff || 'Field TTLs need Redis 7.4 or later, or Valkey 9.0 or later.';
-      buttons.push(writeButton(e.fieldTtl.label, off, () => ttlDialog(item), { aria: `Set the TTL of ${label}` }));
+      buttons.push(writeButton(e.fieldTtl.label, off, () => ttlDialog(item), { aria: `Set the TTL of ${label}`, act: 'item.ttl' }));
     }
-    if (e.remove) buttons.push(writeButton(e.remove.label, keyOff(c, e.remove.cmds, v), (b) => removeItem(b, item), { aria: `Delete ${label}` }));
+    if (e.remove) buttons.push(writeButton(e.remove.label, keyOff(c, e.remove.cmds, v), (b) => removeItem(b, item), { aria: `Delete ${label}`, danger: true, act: 'item.delete' }));
     return h('div', { class: 'item-actions', role: 'group', 'aria-label': `Write to the selected ${label}` },
       h('p', { class: 'small muted wrap-any' }, 'Selected: ', h('span', { class: 'mono', text: label })),
       h('div', { class: 'row-actions' }, buttons),
+      whyLines(itemReasons(buttons.map((b) => (b.disabled ? b.title : null)), [v.fieldTtlsOff, ...v.refused])),
       e.noEdit ? h('p', { class: 'muted small', text: e.noEdit }) : null);
   }
 
@@ -1343,7 +2035,11 @@ function mountKeys(root, ctx) {
     const seq = formSeq;
     openDialog({
       title,
-      build(close) {
+      // Marked with the session: it closes when the connection or database changes, and
+      // nothing it holds is sent anywhere else (`holds` is checked before each send).
+      session: true,
+      onStale: () => ctx.notify(STALE_TEXT, 'info'),
+      build(close, dlg, holds) {
         const error = h('p', { class: 'form-error', role: 'alert' });
         const rows = [];
         const choices = () => {
@@ -1366,6 +2062,11 @@ function mountKeys(root, ctx) {
         // `check`: read and check the boxes first (an extra button such as "Remove the TTL"
         // sends without them).
         const go = async (sender, check = true) => {
+          if (!holds()) {
+            close(null);
+            ctx.notify(STALE_TEXT, 'info');
+            return;
+          }
           const values = {};
           for (const r of check ? rows : []) {
             if (r.row.hidden) continue;
@@ -1381,8 +2082,9 @@ function mountKeys(root, ctx) {
           error.textContent = '';
           try {
             const result = await sender(values);
+            const same = holds();
             close(true);
-            if (alive) done(result);
+            if (alive && same) done(result);
           } catch (err) {
             buttons.forEach((b) => { b.disabled = false; });
             if (err.cancelled || (value && stale(err))) {
@@ -1455,6 +2157,9 @@ function mountKeys(root, ctx) {
         valueSeq += 1;
         Object.assign(store, { value: null, valueId: null, valueError: null, item: null, shown: null, format: null });
       } else if (r.value) takeValue(r.value);
+      // A deleted key leaves the address, a renamed one is there under its new name; in
+      // place, so Back does not reopen what is gone.
+      syncUrl(false, { user: true });
     }
     drawKeys();
     drawValue();
@@ -1647,8 +2352,11 @@ function mountKeys(root, ctx) {
         store.format = null;
         store.itemsShown = CHUNK;
         takeValue(r.value);
+        // The new key is open: a step in the history, with nothing more to read.
+        syncUrl(true);
         drawKeys();
         drawValue();
+        reveal('value');
       },
     });
   }
@@ -1665,12 +2373,20 @@ function mountKeys(root, ctx) {
     return h('div', { class: 'stack-sm' },
       h('p', { class: 'lbl', text: 'Every key of the pattern' }),
       h('div', { class: 'row-actions' },
-        writeButton('Set a TTL on every key…', expire, () => bulkExpireDialog(pattern)),
-        writeButton('Delete every key…', remove, (b) => startBulk(b, pattern))),
-      c && c.readOnly ? null : h('p', { class: 'muted small', text: [expire || remove, 'A dry run counts the keys first: nothing is written until you confirm.'].filter(Boolean).join(' ') }));
+        writeButton('Set a TTL on every key…', expire, () => bulkExpireDialog(pattern), { act: 'pattern.bulkTtl' }),
+        writeButton('Delete every key…', remove, (b) => startBulk(b, pattern), { danger: true, act: 'pattern.bulkDelete' })),
+      c && c.readOnly ? whyLines([expire, remove], null) : h('p', { class: 'muted small', text: [expire || remove, 'A dry run counts the keys first: nothing is written until you confirm.'].filter(Boolean).join(' ') }));
+  }
+
+  /** A bulk action only for a pattern the tree lists, checked again as it starts. */
+  function bulkRefused(pattern) {
+    if (bulkAllowed(store.tree, pattern.id)) return false;
+    ctx.notify(BULK_NOT_LISTED, 'info');
+    return true;
   }
 
   function bulkExpireDialog(pattern) {
+    if (bulkRefused(pattern)) return;
     writeDialog({
       title: 'Set a TTL on every key of the pattern',
       sub: pattern.name,
@@ -1682,12 +2398,15 @@ function mountKeys(root, ctx) {
       ],
       yes: 'Count the keys',
       value: false,
-      send: (values) => ctx.api.startBulk({ pattern: pattern.id, action: 'expire', ttl: values.ttl }),
+      send: (values) => (bulkAllowed(store.tree, pattern.id)
+        ? ctx.api.startBulk({ pattern: pattern.id, action: 'expire', ttl: values.ttl })
+        : Promise.reject(new Error(BULK_NOT_LISTED))),
       done: (r) => takeBulk(r.bulk, true),
     });
   }
 
   async function startBulk(button, pattern) {
+    if (bulkRefused(pattern)) return;
     button.disabled = true;
     try {
       takeBulk((await ctx.api.startBulk({ pattern: pattern.id, action: 'delete' })).bulk, true);
@@ -1784,7 +2503,7 @@ function mountKeys(root, ctx) {
     }
     refill(bulkBox, [
       h('div', { class: 'card-head' },
-        h('h2', { class: 'bulk-title wrap-any', tabIndex: -1 }, `${b.title} `, h('span', { class: 'mono', text: b.pattern.name }), b.action === 'expire' && b.ttl ? ` · TTL ${b.ttl}` : ''),
+        h('h2', { class: 'bulk-title wrap-any', tabIndex: -1 }, `${b.title} `, patternName(b.pattern.name, { literal: literalOf(b.pattern) }), b.action === 'expire' && b.ttl ? ` · TTL ${b.ttl}` : ''),
         h('span', { class: `badge${b.prod ? ' env-prod' : ''}`, text: `${stage} · ${b.profile || ''}`.trim() })),
       bar,
       progress ? h('p', { role: 'status', text: progress.text }) : null,
@@ -1800,32 +2519,26 @@ function mountKeys(root, ctx) {
     }
   }
 
-  // ---------- what other areas asked for ----------
-  function takePending() {
-    const p = store.pending;
-    store.pending = null;
-    if (!p) return;
-    if (p.find) runFind(p.find);
-    else if (p.key) {
-      openValue(p.key);
-      if (!store.list) drawKeys();
-    } else if (p.pattern || typeof p.node === 'number') {
-      if (typeof p.node === 'number' && p.node !== store.node) {
-        store.node = p.node;
-        loadTree();
-      }
-      if (p.pattern) openPattern(p.pattern);
-    }
-  }
-
   // ---------- following the session ----------
   // The writes the server refused this session turn their buttons off.
   const refusedKey = (s) => (s.conn ? s.conn.refused.join(',') : '');
   let refusedNow = refusedKey(ctx.state());
   function onState(next) {
     if (!alive) return;
-    const what = follow(store, next);
+    const what = follow(store, next, connects);
     if (what) {
+      // What the address named belongs to the run before. Its entry stays as it is (Back
+      // goes to it: applied again on the same database, passed over on another), and what
+      // is shown now is a new step.
+      if (onKeysRoute()) {
+        const named = parseBrowseQuery(((ctx.currentRoute && ctx.currentRoute()) || {}).query);
+        if (opensAnything(named) || named.sort !== null) ctx.pushRoute(browseHref(shownParams(store)));
+        markEntry();
+      }
+      showForeign(false);
+      pending = null;
+      relayout();
+      drawRows();
       drawKeys();
       drawValue();
       loadTree();
@@ -1855,25 +2568,48 @@ function mountKeys(root, ctx) {
     if (alive) takeBulk(r.bulk);
   })];
 
-  active = { takePending };
+  // ---------- the address on mount ----------
+  // As `applyRoute` does for the same entry (`entryPlan`). A new entry with no state (the
+  // rail's link, a digit): show what Browse holds, and put it in the address in place. An
+  // entry shown for another connection or database (Back after a switch) is not applied
+  // and not rewritten: what Browse holds is shown, and a line says why. Otherwise (a
+  // reload, a link in a new tab, Back from another area, Back to an entry that showed
+  // nothing) the address is shown, reading only what Browse does not hold already, exactly
+  // what a click would read. Never anything else: the address carries no connection, so
+  // it never connects.
+  const fromAddress = parseBrowseQuery(route && route.query);
+  const plan = entryPlan({ params: fromAddress, mark: entryMark(), place: store.place });
+  let start;
+  if (plan === 'keep') {
+    start = shownParams(store);
+    if (opensAnything(start)) ctx.replaceRoute(browseHref(start));
+    markEntry();
+  } else if (plan === 'foreign') start = shownParams(store);
+  else start = fromAddress;
+
+  active = { applyRoute, reopen: () => (alive ? (reopenShown(parseBrowseQuery(((ctx.currentRoute && ctx.currentRoute()) || {}).query)), true) : false) };
   // Draw what is kept at once, then read what may have changed meanwhile.
-  drawDbs();
+  relayout();
   if (store.tree) drawTree();
   else drawRows();
   drawKeys();
   drawValue();
   drawBulk();
+  if (plan === 'foreign') {
+    // Shown as Browse holds it, without touching the entry (no mark either).
+    applyParams(start, { mounting: true, mark: false });
+    showForeign(true);
+  } else applyParams(start, { mounting: true });
   loadTree();
   loadDbs();
   refreshBulk();
-  if (store.pending) takePending();
-  else if (store.list && store.list.kind === 'pattern' && !store.list.done && store.picked) {
-    // Nothing to do: the list is as it was; more pages load on request.
-  }
 
   return () => {
     alive = false;
-    if (active && active.takePending === takePending) active = null;
+    dropOutside();
+    if (active && active.applyRoute === applyRoute) active = null;
+    if (sizes) sizes.disconnect();
+    document.body.classList.remove('fill-view');
     timers.forEach((t) => clearTimeout(t));
     offs.forEach((off) => off());
   };

@@ -83,7 +83,8 @@ test('streams: the subtitle, an entry\'s fields on a line, and which row is show
   assert.equal(entryText({ fields: [{ name: 'kind', value: 'paid' }, { name: 'order', value: '770100' }] }), 'kind=paid · order=770100');
   assert.equal(entryText({ fields: null }), '');
   assert.equal(pickRow(ready, '62').key.name, 'b');
-  assert.equal(pickRow(ready, 'ff').key.name, 'a', 'a stream gone from the list: the first one');
+  assert.equal(pickRow(ready, 'ff'), null, 'a stream gone from the list: none, never the first one');
+  assert.equal(pickRow(ready, null).key.name, 'a', 'nothing picked yet: the first one');
   assert.equal(pickRow(adaptStreams({ status: 'ready', rows: [] }), null), null);
 });
 

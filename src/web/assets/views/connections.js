@@ -35,6 +35,41 @@ const WRITES_HINT = 'With writes on, key edits, deletes and write commands reach
 /** What Docker discovery last found. Discovery pings every container, so it runs when
  *  the page first shows Connections and when "Look again" is pressed, not on every redraw. */
 let dockerFound = null;
+let dockerAsking = null;
+let dockerSeq = 0;
+
+/** What Docker discovery found, asked once and kept: Connections and the top bar's
+ *  connection menu share it, so opening the menu pings no container that was pinged
+ *  already. `again` asks Docker again ("Look again"). Each ask is numbered and only the
+ *  newest one is kept: an older reply that arrives after a newer ask is dropped, and its
+ *  caller gets the newest answer instead. */
+export function loadDocker(api, again = false) {
+  if (dockerFound && !again) return Promise.resolve(dockerFound);
+  if (dockerAsking && !again) return dockerAsking;
+  dockerSeq += 1;
+  const mine = dockerSeq;
+  const asking = api.listDocker().then(
+    (found) => {
+      // Not kept; the caller still gets an answer when the newer ask failed.
+      if (mine !== dockerSeq) return dockerAsking || dockerFound || found;
+      dockerAsking = null;
+      dockerFound = found;
+      return found;
+    },
+    (err) => {
+      if (mine !== dockerSeq && (dockerAsking || dockerFound)) return dockerAsking || dockerFound;
+      if (mine === dockerSeq) dockerAsking = null;
+      throw err;
+    },
+  );
+  dockerAsking = asking;
+  return asking;
+}
+
+/** What the last discovery found, without asking (null before the first). */
+export function dockerKnown() {
+  return dockerFound;
+}
 
 let fieldSeq = 0;
 const nextId = (name) => `f-${name}-${(fieldSeq += 1)}`;
@@ -71,18 +106,20 @@ export function mount(root, ctx) {
   const view = h('section', { class: 'view', 'aria-labelledby': 'conns-title' });
   root.append(view);
 
-  const addButton = h('button', { type: 'button', class: 'btn primary', text: 'Add a connection', onclick: () => addDialog(ctx, load) });
+  const addButton = h('button', { type: 'button', class: 'btn primary', text: 'Add a connection', 'data-act': 'conn.add', onclick: () => addDialog(ctx, load) });
   const head = h('div', { class: 'view-head' },
     h('div', null,
       h('h1', { class: 'title', id: 'conns-title', text: 'Connections' }),
       h('p', { class: 'subtitle', text: 'Connecting reads the server’s own figures and no key.' })),
     addButton);
-  const savedBox = h('div', null, h('div', { class: 'card' }, emptyState('Reading the saved connections…')));
-  const dockerBox = h('div', null, h('p', { class: 'muted', text: 'Looking for Redis and Valkey containers in Docker…' }));
-  const lookAgain = h('button', { type: 'button', class: 'btn quiet', text: 'Look again', onclick: () => loadDocker(true) });
+  const savedBox = h('div', { 'data-pane': 'saved' }, h('div', { class: 'card' }, emptyState('Reading the saved connections…')));
+  const dockerBox = h('div', { 'data-pane': 'docker' }, h('p', { class: 'muted', text: 'Looking for Redis and Valkey containers in Docker…' }));
+  const lookAgain = h('button', { type: 'button', class: 'btn quiet', text: 'Look again', 'data-act': 'refresh', onclick: () => drawDocker(true) });
+  const host = (typeof window !== 'undefined' && window.location && window.location.host) || '127.0.0.1';
   view.append(head, savedBox,
     h('div', { class: 'section-head' }, h('h2', { class: 'lbl', text: 'Found in Docker' }), lookAgain),
-    dockerBox);
+    dockerBox,
+    h('p', { class: 'muted small' }, 'Served by the redis-lens running in your terminal at ', h('span', { class: 'mono', text: host }), '. Only this computer can open it.'));
 
   async function load() {
     const state = ctx.state();
@@ -112,13 +149,13 @@ export function mount(root, ctx) {
         h('button', { type: 'button', class: 'btn primary', text: 'Add a connection', onclick: () => addDialog(ctx, load) }))), addButton);
   }
 
-  async function loadDocker(again = false) {
+  async function drawDocker(again = false) {
     lookAgain.disabled = true;
     try {
-      if (again || !dockerFound) dockerFound = await ctx.api.listDocker();
+      const found = await loadDocker(ctx.api, again);
       if (!alive) return;
-      refill(dockerBox, dockerFound.containers.length
-        ? h('div', { class: 'conn-grid' }, dockerFound.containers.map((p) => card(p)))
+      refill(dockerBox, found.containers.length
+        ? h('div', { class: 'conn-grid' }, found.containers.map((p) => card(p)))
         : h('p', { class: 'muted', text: 'No Redis or Valkey container is running. They show up here by themselves.' }), lookAgain);
     } catch (err) {
       if (alive) fill(dockerBox, notice(`Docker could not be asked: ${errorText(err)}`));
@@ -138,14 +175,15 @@ export function mount(root, ctx) {
 
     const main = mine && status !== 'failed'
       ? h('button', { type: 'button', class: 'btn main-action', text: status === 'connecting' ? 'Cancel' : 'Disconnect', onclick: () => disconnect() })
-      : h('button', { type: 'button', class: 'btn primary', text: status === 'failed' ? 'Connect again' : 'Connect', onclick: () => connect(p, main) });
+      : h('button', { type: 'button', class: 'btn primary', text: status === 'failed' ? 'Connect again' : 'Connect', 'data-open': '', onclick: () => connect(p, main) });
 
-    return h('article', { class: here ? 'card conn-card on' : 'card conn-card', 'aria-label': p.name },
+    // A card is a row of the list the keys move in: enter connects (never disconnects).
+    return h('article', { class: here ? 'card conn-card on' : 'card conn-card', 'aria-label': p.name, 'data-row': `${p.docker ? 'docker' : 'saved'}:${p.name}` },
       h('div', { class: 'conn-top' }, h('h3', { class: 'mono conn-name', text: p.name }), envBadge(p.env)),
       h('span', { class: 'mono conn-address', text: address }),
       h('div', { class: 'conn-meta' },
         h('span', { class: 'conn-status' },
-          h('span', { 'aria-hidden': 'true', class: status === 'limited' || status === 'failed' ? 'glyph' : here ? 'glyph good' : '', text: glyph }),
+          h('span', { 'aria-hidden': 'true', class: status === 'failed' ? 'glyph bad' : status === 'limited' ? 'glyph' : here ? 'glyph good' : '', text: glyph }),
           h('span', { text: text ? `${word}: ${text}` : word })),
         serverLine ? h('span', { text: serverLine }) : null,
         conn && conn.via ? h('span', { text: conn.via }) : null,
@@ -171,8 +209,8 @@ export function mount(root, ctx) {
           })) : null,
         p.docker ? null : h('div', { class: 'conn-more' },
           h('button', { type: 'button', class: 'btn quiet', text: 'Test', 'aria-label': `Test ${p.name}`, onclick: () => testDialog(ctx, p) }),
-          h('button', { type: 'button', class: 'btn quiet', text: 'Edit', 'aria-label': `Edit ${p.name}`, onclick: () => editDialog(ctx, p, load) }),
-          h('button', { type: 'button', class: 'btn quiet', text: 'Remove', 'aria-label': `Remove ${p.name}`, onclick: () => remove(p) }))));
+          h('button', { type: 'button', class: 'btn quiet', text: 'Edit', 'aria-label': `Edit ${p.name}`, 'data-act': 'conn.edit', onclick: () => editDialog(ctx, p, load) }),
+          h('button', { type: 'button', class: 'btn quiet danger', text: 'Remove', 'aria-label': `Remove ${p.name}`, 'data-act': 'conn.remove', onclick: () => remove(p) }))));
   }
 
   function connect(p, button) {
@@ -190,7 +228,7 @@ export function mount(root, ctx) {
       ctx.notify(errorText(err), err.cancelled ? 'info' : 'error');
     }
     if (alive) load();
-    if (alive) loadDocker();
+    if (alive) drawDocker();
   }
 
   async function disconnect() {
@@ -218,7 +256,7 @@ export function mount(root, ctx) {
   }
 
   load();
-  loadDocker();
+  drawDocker();
   return () => {
     alive = false;
   };
@@ -239,7 +277,7 @@ function testDialog(ctx, p) {
           fill(box,
             notice(r.summary, r.ok ? 'ok' : 'warn'),
             r.checks.length ? h('ul', { class: 'list' }, r.checks.map((c) => h('li', { class: 'row row-check' },
-              h('span', { 'aria-hidden': 'true', class: c.status === 'allowed' ? 'glyph good' : c.status === 'denied' ? 'glyph' : 'muted', text: glyph[c.status] }),
+              h('span', { 'aria-hidden': 'true', class: c.status === 'allowed' ? 'glyph good' : c.status === 'denied' ? 'glyph bad' : 'muted', text: glyph[c.status] }),
               h('span', null,
                 h('span', { class: 'mono name', text: c.name }),
                 h('span', { class: 'sr-only', text: ` ${word[c.status]}` }),
