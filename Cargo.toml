@@ -23,7 +23,7 @@ integration-tests = []
 anyhow = "1.0.104"
 # The web dashboard's HTTP server (src/web/), already in the tree through bollard.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
-base64 = "0.22.1"
+base64 = "0.23.1"
 bollard = "0.21.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 crossterm = "0.29.0"
@@ -32,7 +32,7 @@ directories = "6.0.0"
 flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }
 futures = "0.3.34"
 # The dashboard's session token and confirmation ids.
-getrandom = "0.3.4"
+getrandom = "0.4.3"
 # The dashboard's server loop: a header read timeout and a cap on connections, which
 # `axum::serve` does not set. Both already in the tree through axum.
 hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
